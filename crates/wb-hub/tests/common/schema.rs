@@ -39,11 +39,13 @@ impl Checker {
         assert_eq!(msg["jsonrpc"], "2.0", "{msg}");
         let params = &msg["params"];
         match (msg["method"].as_str(), msg.get("id")) {
-            (Some(method), _) if method.starts_with('_') => {}
             (Some(method), Some(id)) => {
-                request(from, method, params);
+                if !method.starts_with('_') {
+                    request(from, method, params);
+                }
                 self.asked.insert((from, id.to_string()), method.to_owned());
             }
+            (Some(method), None) if method.starts_with('_') => {}
             (Some(method), None) => notification(from, method, params),
             (None, Some(id)) => {
                 let method = self
@@ -55,6 +57,7 @@ impl Checker {
                         assert!(error["code"].is_i64(), "{msg}");
                         assert!(error["message"].is_string(), "{msg}");
                     }
+                    None if method.starts_with('_') => {}
                     None => response(from, &method, &msg["result"]),
                 }
             }

@@ -53,20 +53,9 @@ impl Hub {
             .collect()
     }
 
-    /// The messages agent `agent` received from the hub, after checking every one
-    /// against the schema (responses by the method of the fake's request).
+    /// The messages agent `agent` received from the hub, checked by [`received`].
     pub fn received(&self, agent: &str) -> Vec<Value> {
-        let mut checker = Checker::default();
-        let mut received = Vec::new();
-        for entry in self.record(agent) {
-            if let Some(sent) = entry.get("sent") {
-                checker.check(Side::Agent, sent);
-            } else if let Some(msg) = entry.get("recv") {
-                checker.check(Side::Client, msg);
-                received.push(msg.clone());
-            }
-        }
-        received
+        received(&self.record(agent))
     }
 
     /// The received messages with method `method`.
@@ -201,6 +190,23 @@ impl Client {
         self.request(json!({"t": "acp.prompt", "sid": sid,
                             "prompt": [{"type": "text", "text": text}]}))
     }
+}
+
+/// The messages a `--record` file says the fake received, after checking every one
+/// against the schema; the fake's own requests in it let responses be judged by the
+/// method they answer.
+pub fn received(record: &[Value]) -> Vec<Value> {
+    let mut checker = Checker::default();
+    let mut received = Vec::new();
+    for entry in record {
+        if let Some(sent) = entry.get("sent") {
+            checker.check(Side::Agent, sent);
+        } else if let Some(msg) = entry.get("recv") {
+            checker.check(Side::Client, msg);
+            received.push(msg.clone());
+        }
+    }
+    received
 }
 
 /// "Fold == live": kills every live agent, then compares each Summary from `list` and

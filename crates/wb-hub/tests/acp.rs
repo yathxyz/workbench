@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use common::acp::group_members;
+use common::acp::{fold_equals_live, group_members, stub};
 use common::fake::{Agent, text_of, updates};
-use common::{running, wait_gone};
+use common::{Client, Hub, PATIENCE, eventually, running, wait_gone};
 
 /// A cwd for the fake's sessions; it never touches it.
 const CWD: &str = "/srv/example";
@@ -48,7 +48,39 @@ fn cancelled() -> Value {
     json!({"outcome": {"outcome": "cancelled"}})
 }
 
+/// The content the `form` keyword quoted back after an `accept`.
+fn form_content(updates: &[Value]) -> Value {
+    let text = text_of(updates, "agent_message_chunk");
+    let quoted = text
+        .strip_prefix("form accept: ")
+        .unwrap_or_else(|| panic!("{text}"));
+    serde_json::from_str(quoted).unwrap()
+}
+
 // ---- the fake on its own ----
+
+#[test]
+fn schema_check_catches_what_the_schema_would_drop() {
+    use agent_client_protocol_schema::v1::SessionNotification;
+    use common::schema::conforms;
+    let chunk = json!({"sessionId": "s", "update": {"sessionUpdate": "agent_message_chunk",
+                       "messageId": "m", "content": {"type": "text", "text": "hi"}}});
+    conforms::<SessionNotification>("chunk", &chunk);
+    let mut unknown_key = chunk.clone();
+    unknown_key["update"]["colour"] = "red".into();
+    let bad_value = json!({"sessionId": "s", "update": {"sessionUpdate": "tool_call",
+                           "toolCallId": "t", "title": "x", "status": "maybe"}});
+    let mut missing = chunk.clone();
+    missing["update"]["content"] = json!({"type": "text"});
+    for (what, v) in [
+        ("an unknown key", unknown_key),
+        ("a bad value", bad_value),
+        ("a missing field", missing),
+    ] {
+        let caught = std::panic::catch_unwind(|| conforms::<SessionNotification>(what, &v));
+        assert!(caught.is_err(), "{what} passed: {v}");
+    }
+}
 
 #[test]
 fn fake_rejects_bad_arguments() {
@@ -75,9 +107,7 @@ fn fake_speaks_only_when_spoken_to_and_records_names_not_values() {
     let mut a = Agent::start(&[]);
     assert!(a.quiet_for(Duration::from_millis(300)));
     a.close_stdin();
-    let status = a
-        .exit_within(common::PATIENCE)
-        .expect("exit at end of stdin");
+    let status = a.exit_within(PATIENCE).expect("exit at end of stdin");
     assert!(status.success(), "{status}");
 
     let record = a.record();
@@ -267,10 +297,7 @@ fn keyword_form_echoes_the_content() {
     let content = json!({"colour": "green", "count": 3, "verbose": true, "targets": ["aarch64"]});
     a.respond(&req["id"], json!({"action": "accept", "content": content}));
     let (msgs, _) = a.until_response(&id);
-    assert_eq!(
-        text_of(&updates(&msgs), "agent_message_chunk"),
-        format!("form accept: {content}")
-    );
+    assert_eq!(form_content(&updates(&msgs)), content);
 
     let id = a.prompt(&session, "form");
     let (_, req) = a.until_request();
@@ -398,13 +425,20 @@ fn scenario_permission_asks_with_three_options() {
     a.respond(&req["id"], selected("allow-once"));
     let (_, response) = a.until_response(&id);
     assert_eq!(response["result"]["stopReason"], "end_turn");
-    // Exactly one response reached the fake.
-    let answers: Vec<Value> = a
-        .record()
-        .into_iter()
-        .filter(|e| e["recv"]["id"] == req["id"] && e["recv"].get("result").is_some())
+    // The record holds the fake's request and exactly one answer, and passes the check
+    // the hub tests run on it.
+    let received = common::acp::received(&a.record());
+    let answers: Vec<&Value> = received
+        .iter()
+        .filter(|m| m["id"] == req["id"] && m.get("result").is_some())
         .collect();
     assert_eq!(answers.len(), 1);
+    let sent: Vec<Value> = a
+        .record()
+        .iter()
+        .filter_map(|e| e.get("sent").cloned())
+        .collect();
+    assert_eq!(sent, [req]);
 }
 
 #[test]
@@ -445,6 +479,8 @@ fn scenario_agent_cancels_withdraws_its_request() {
     let (msgs, response) = a.until_response(&id);
     assert_eq!(response["result"]["stopReason"], "end_turn");
     assert_eq!(updates(&msgs).len(), 1);
+    let received = common::acp::received(&a.record());
+    assert_eq!(received.last().unwrap()["id"], "perm-1");
 }
 
 #[test]
@@ -480,6 +516,7 @@ fn scenario_elicitation_authenticates_through_a_request_scoped_form() {
     assert_eq!(req["params"]["sessionId"], session);
     a.respond(&req["id"], json!({"action": "cancel"}));
     a.until_response(&id);
+    common::acp::received(&a.record());
 }
 
 #[test]
@@ -508,7 +545,7 @@ fn scenario_crash_midturn_exits_1_after_boom() {
     let (_, req) = a.until_request();
     assert_eq!(req["method"], "session/request_permission");
     assert_eq!(a.next_raw(), None);
-    let status = a.exit_within(common::PATIENCE).unwrap();
+    let status = a.exit_within(PATIENCE).unwrap();
     assert_eq!(status.code(), Some(1));
     assert_eq!(a.stderr(), "boom\n");
 }
@@ -619,6 +656,7 @@ fn scenario_unknown_sends_what_no_client_knows() {
         "fs/read_text_file: -32601"
     );
     assert_eq!(response["result"]["stopReason"], "end_turn");
+    common::acp::received(&a.record());
 }
 
 #[test]
@@ -633,7 +671,7 @@ fn scenario_hang_never_answers_initialize() {
     a.request("initialize", common::fake::initialize_params());
     assert!(a.quiet_for(Duration::from_millis(500)));
     a.close_stdin();
-    assert!(a.exit_within(common::PATIENCE).unwrap().success());
+    assert!(a.exit_within(PATIENCE).unwrap().success());
 }
 
 #[test]
@@ -702,14 +740,14 @@ fn recorded_child(a: &Agent) -> u32 {
 fn scenario_crash_leave_child_leaves_sleep_in_its_group() {
     let (mut a, session) = scenario("crash-leave-child");
     a.prompt(&session, "go");
-    assert_eq!(a.exit_within(common::PATIENCE).unwrap().code(), Some(1));
+    assert_eq!(a.exit_within(PATIENCE).unwrap().code(), Some(1));
     let child = recorded_child(&a);
     assert!(running(child));
     assert_eq!(group_members(a.pid()), [child]);
     // `sleep` holds the fake's stdout open: no end of output yet.
     assert!(a.quiet_for(Duration::from_millis(200)));
     drop(a);
-    assert!(wait_gone(child, common::PATIENCE));
+    assert!(wait_gone(child, PATIENCE));
 }
 
 #[test]
@@ -717,12 +755,1133 @@ fn scenario_setsid_child_leaves_sleep_in_a_group_of_its_own() {
     let (mut a, session) = scenario("setsid-child");
     a.prompt(&session, "go");
     assert_eq!(a.next_raw(), None);
-    assert_eq!(a.exit_within(common::PATIENCE).unwrap().code(), Some(1));
+    assert_eq!(a.exit_within(PATIENCE).unwrap().code(), Some(1));
     let child = recorded_child(&a);
     assert!(group_members(a.pid()).is_empty());
     assert_eq!(group_members(child), [child]);
     drop(a);
     assert!(running(child), "the group kill reached it");
     common::signal(child, rustix::process::Signal::KILL);
-    assert!(wait_gone(child, common::PATIENCE));
+    assert!(wait_gone(child, PATIENCE));
+}
+
+// ---- the hub against the fake ----
+//
+// These need the hub's ACP actor (M3-H2). Until it is merged the hub answers every
+// `acp.*` request with `unknown_type`, so they are ignored; run them at integration
+// with `cargo test -p wb-hub --test acp -- --include-ignored`.
+
+/// Creates `sid` with `agent` and reads its events, replayed or live, until one of kind
+/// `e`; the `acp.open` reply and every event of `sid` up to that one.
+fn spawn_until(c: &mut Client, hub: &Hub, sid: &str, agent: &str, e: &str) -> (Value, Vec<Value>) {
+    let open = c.acp_spawn(sid, agent, &hub.home());
+    assert_eq!(open["new"], true, "{open}");
+    (open, c.events_until(sid, e))
+}
+
+/// Creates `sid` with `agent` and waits for setup to succeed; the `acp.open` reply.
+fn ready(c: &mut Client, hub: &Hub, sid: &str, agent: &str) -> Value {
+    spawn_until(c, hub, sid, agent, "session").0
+}
+
+fn epoch(open: &Value) -> u64 {
+    open["summary"]["createdAt"].as_u64().unwrap()
+}
+
+/// Answers the permission request `req`; the reply.
+fn permit(c: &mut Client, sid: &str, req: &Value, epoch: u64, option: &str) -> Value {
+    c.request(
+        json!({"t": "acp.permission", "sid": sid, "req": req, "epoch": epoch,
+                     "outcome": selected(option)["outcome"]}),
+    )
+}
+
+/// The pid in the first `spawn` event among `evs`, which is also the agent's pgid.
+fn agent_pid(evs: &[Value]) -> u32 {
+    let spawn = evs
+        .iter()
+        .find(|e| e["e"] == "spawn")
+        .expect("a spawn event");
+    u32::try_from(spawn["pid"].as_u64().unwrap()).unwrap()
+}
+
+/// The last `n` journal kinds of `sid`.
+fn tail(hub: &Hub, sid: &str, n: usize) -> Vec<String> {
+    let kinds = hub.kinds(sid);
+    kinds[kinds.len().saturating_sub(n)..].to_vec()
+}
+
+/// The ACP messages the agent received from the hub with a `result` (its answers).
+fn answers(hub: &Hub, agent: &str) -> Vec<Value> {
+    hub.received(agent)
+        .into_iter()
+        .filter(|m| m.get("result").is_some() || m.get("error").is_some())
+        .collect()
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_basic_turn_journal_facts_and_reset() {
+    let mut hub = Hub::with_scenarios(&["basic"]);
+    let mut c = hub.connect();
+    let open = c.acp_spawn("a1", "basic", &hub.home());
+    assert_eq!(open["new"], true);
+    assert_eq!(open["reset"], false);
+    let summary = &open["summary"];
+    assert_eq!(summary["kind"], "acp");
+    assert_eq!(summary["cwd"], hub.home());
+    assert_eq!(summary["acp"]["agent"], "basic");
+    assert_eq!(summary["acp"]["activity"], "setup");
+    for key in [
+        "protocolVersion",
+        "agentInfo",
+        "agentCapabilities",
+        "promptCapabilities",
+        "authMethods",
+        "modes",
+        "availableCommands",
+        "plan",
+        "usage",
+    ] {
+        assert!(
+            open["session"].get(key).is_some(),
+            "session.{key} missing: {open}"
+        );
+    }
+    c.event("a1", "session");
+    assert_eq!(c.acp_prompt("a1", "hello")["t"], "ok");
+    let end = c.event("a1", "turn_end");
+    assert_eq!(end["stopReason"], "end_turn");
+    assert_eq!(
+        hub.kinds("a1"),
+        [
+            "spawn", "session", "prompt", "update", "update", "update", "turn_end"
+        ]
+    );
+    let journal = hub.journal("a1");
+    assert_eq!(journal[0]["via"], "new");
+    assert_eq!(journal[1]["via"], "new");
+    assert_eq!(
+        journal[2]["prompt"],
+        json!([{"type": "text", "text": "hello"}])
+    );
+    // The agent's session id is the Summary's, so updates carry none.
+    assert!(journal[3..6].iter().all(|l| l.get("sessionId").is_none()));
+
+    let s = c.summary_until("a1", "the turn is over", |s| s["acp"]["activity"] == "none");
+    let acp = &s["acp"];
+    assert_eq!(acp["headSeq"], 7);
+    assert_eq!(acp["last"]["seq"], 7);
+    assert_eq!(acp["last"]["outcome"], "end_turn");
+    assert_eq!(acp["last"]["error"], Value::Null);
+    assert_eq!(acp["pending"], json!([]));
+    assert_eq!(acp["revivable"], true);
+    assert_eq!(acp["modeId"], "default");
+    assert_eq!(acp["title"], Value::Null);
+    let agent_session = acp["agentSessionId"].as_str().unwrap().to_owned();
+    assert!(agent_session.starts_with("fake-session-"));
+    assert!(acp["seenSeq"].as_u64().unwrap() < 7);
+    c.ok(json!({"t": "acp.seen", "sid": "a1", "seq": 1000}));
+    assert_eq!(c.summary("a1")["acp"]["seenSeq"], 7);
+    c.ok(json!({"t": "acp.seen", "sid": "a1", "seq": 1}));
+    assert_eq!(c.summary("a1")["acp"]["seenSeq"], 7);
+
+    // What the agent received.
+    let init = hub.received_calls("basic", "initialize");
+    assert_eq!(init.len(), 1);
+    assert_eq!(init[0]["params"]["protocolVersion"], 1);
+    assert_eq!(
+        init[0]["params"]["clientCapabilities"],
+        common::fake::initialize_params()["clientCapabilities"]
+    );
+    let new = hub.received_calls("basic", "session/new");
+    assert_eq!(
+        new[0]["params"],
+        json!({"cwd": hub.home(), "mcpServers": []})
+    );
+    let prompt = hub.received_calls("basic", "session/prompt");
+    assert_eq!(prompt[0]["params"]["sessionId"], agent_session);
+
+    // A fresh attach sees the materialised initialize result.
+    let mut c2 = hub.connect();
+    let reply = c2.ok(json!({"t": "acp.open", "sid": "a1", "since": 7, "epoch": epoch(&open)}));
+    assert_eq!(reply["new"], false);
+    assert_eq!(reply["reset"], false);
+    assert_eq!(reply["head"], 7);
+    assert_eq!(reply["session"]["protocolVersion"], 1);
+    assert_eq!(reply["session"]["agentInfo"]["name"], "wb-fake-acp");
+    assert_eq!(reply["session"]["modes"]["currentModeId"], "default");
+    let (evs, replayed) = c2.replay("a1");
+    assert!(evs.is_empty(), "{evs:?}");
+    assert_eq!(replayed["head"], 7);
+    assert_eq!(replayed["truncated"], false);
+
+    // `since` past the head, or another incarnation, resets to a replay from seq 1.
+    for open in [
+        json!({"t": "acp.open", "sid": "a1", "since": 100}),
+        json!({"t": "acp.open", "sid": "a1", "since": 7, "epoch": epoch(&open) + 1}),
+    ] {
+        let mut c3 = hub.connect();
+        let reply = c3.ok(open);
+        assert_eq!(reply["reset"], true, "{reply}");
+        let (evs, _) = c3.replay("a1");
+        let seqs: Vec<u64> = evs.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs.first(), Some(&1));
+        assert_eq!(seqs.last(), Some(&7));
+    }
+    drop((c, c2));
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_noise_goes_to_stderr_log_and_setup_succeeds() {
+    let mut hub = Hub::with_scenarios(&["noise"]);
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "noise");
+    assert_eq!(c.summary("a1")["alive"], true);
+    let log = hub.stderr_log("a1");
+    assert!(log.contains("wb_fake_acp: starting up"), "{log}");
+    assert!(log.len() < 1 << 20, "the over-long line reached stderr.log");
+    assert_eq!(c.acp_prompt("a1", "hi")["t"], "ok");
+    assert_eq!(c.event("a1", "turn_end")["stopReason"], "end_turn");
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_permission_first_answer_wins() {
+    let mut hub = Hub::with_scenarios(&["permission"]);
+    let mut c = hub.connect();
+    let open = ready(&mut c, &hub, "a1", "permission");
+    let epoch = epoch(&open);
+    assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
+    let perm = c.event("a1", "permission");
+    let req = perm["seq"].clone();
+    assert_eq!(perm["toolCall"]["title"], "Run `rm -rf build`");
+    assert_eq!(perm["options"].as_array().unwrap().len(), 3);
+    let s = c.summary("a1");
+    let pending = &s["acp"]["pending"];
+    assert_eq!(pending.as_array().unwrap().len(), 1, "{s}");
+    assert_eq!(pending[0]["req"], req);
+    assert_eq!(pending[0]["kind"], "permission");
+    assert_eq!(pending[0]["title"], "Run `rm -rf build`");
+    assert_eq!(s["acp"]["activity"], "turn");
+
+    // A second prompt during the turn is refused.
+    assert_eq!(c.acp_prompt("a1", "again")["code"], "busy");
+    assert_eq!(
+        permit(&mut c, "a1", &req, epoch + 1, "allow-once")["code"],
+        "stale"
+    );
+    assert_eq!(
+        permit(&mut c, "a1", &req, epoch, "nope")["code"],
+        "bad_option"
+    );
+
+    // Two connections answer at once: one wins.
+    let mut c2 = hub.connect();
+    c2.ok(json!({"t": "acp.open", "sid": "a1", "since": req}));
+    c2.replay("a1");
+    for (client, option) in [(&mut c, "allow-once"), (&mut c2, "reject-once")] {
+        client.send(
+            &json!({"t": "acp.permission", "rid": 900, "sid": "a1", "req": req,
+                            "epoch": epoch, "outcome": selected(option)["outcome"]}),
+        );
+    }
+    let a = c.reply(900);
+    let b = c2.reply(900);
+    let mut codes = [a["t"].as_str().unwrap(), b["t"].as_str().unwrap()];
+    codes.sort_unstable();
+    assert_eq!(codes, ["err", "ok"], "{a} {b}");
+    let loser = if a["t"] == "err" { &a } else { &b };
+    assert_eq!(loser["code"], "already_resolved");
+
+    let resolved = c.event("a1", "permission_resolved");
+    assert_eq!(resolved["req"], req);
+    assert_eq!(resolved["by"], "user");
+    assert_eq!(c.event("a1", "turn_end")["stopReason"], "end_turn");
+    assert_eq!(
+        permit(&mut c, "a1", &req, epoch, "allow-once")["code"],
+        "already_resolved"
+    );
+    let answered: Vec<Value> = answers(&hub, "permission");
+    assert_eq!(answered.len(), 1, "{answered:?}");
+    assert_eq!(answered[0]["result"]["outcome"], resolved["outcome"]);
+    let s = c.summary("a1");
+    assert_eq!(s["acp"]["pending"], json!([]));
+    assert!(s["acp"]["seenSeq"].as_u64() >= req.as_u64(), "{s}");
+    drop((c, c2));
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_permission_reconnect_replays_in_seq_order() {
+    let mut hub = Hub::with_scenarios(&["permission-reconnect"]);
+    let mut a = hub.connect();
+    let open = ready(&mut a, &hub, "a1", "permission-reconnect");
+    assert_eq!(a.acp_prompt("a1", "go")["t"], "ok");
+    assert_eq!(a.event("a1", "permission")["seq"], 120);
+    a.summary_until("a1", "all 200 events", |s| s["acp"]["headSeq"] == 200);
+    drop(a);
+
+    let mut b = hub.connect();
+    let reply = b.ok(json!({"t": "acp.open", "sid": "a1", "since": 0, "epoch": epoch(&open)}));
+    assert_eq!(reply["head"], 200);
+    assert_eq!(reply["reset"], false);
+    let (evs, replayed) = b.replay("a1");
+    assert_eq!(replayed["truncated"], false);
+    let seqs: Vec<u64> = evs.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert_eq!(seqs, (1..=200).collect::<Vec<u64>>());
+    assert_eq!(evs[119]["e"], "permission");
+    assert_eq!(
+        permit(&mut b, "a1", &json!(120), epoch(&open), "allow-once")["t"],
+        "ok"
+    );
+    assert_eq!(b.event("a1", "turn_end")["stopReason"], "end_turn");
+    drop(b);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_agent_cancels_its_own_request() {
+    let mut hub = Hub::with_scenarios(&["agent-cancels"]);
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "agent-cancels");
+    assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
+    let perm = c.event("a1", "permission");
+    let resolved = c.event("a1", "permission_resolved");
+    assert_eq!(resolved["req"], perm["seq"]);
+    assert_eq!(resolved["by"], "agent");
+    assert_eq!(c.event("a1", "turn_end")["stopReason"], "end_turn");
+    assert_eq!(c.summary("a1")["acp"]["pending"], json!([]));
+    let answered = answers(&hub, "agent-cancels");
+    assert_eq!(answered.len(), 1, "{answered:?}");
+    assert_eq!(answered[0]["id"], "perm-1");
+    assert_eq!(answered[0]["result"], cancelled());
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_form_and_url_elicitations() {
+    let mut hub = Hub::with_scenarios(&[]);
+    let mut c = hub.connect();
+    let open = ready(&mut c, &hub, "a1", "stub");
+    let epoch = epoch(&open);
+    assert_eq!(c.acp_prompt("a1", "form")["t"], "ok");
+    let ev = c.event("a1", "elicitation");
+    let req = ev["seq"].clone();
+    assert_eq!(ev["request"]["mode"], "form");
+    let s = c.summary("a1");
+    assert_eq!(s["acp"]["pending"][0]["kind"], "elicitation");
+    assert_eq!(s["acp"]["pending"][0]["title"], "Pick the build settings");
+    let answer = |c: &mut Client, response: Value| {
+        c.request(
+            json!({"t": "acp.elicitation", "sid": "a1", "req": req, "epoch": epoch,
+                         "response": response}),
+        )
+    };
+    for bad in [
+        json!({"colour": {"nested": "red"}}),
+        json!({"targets": ["x86_64", 1]}),
+    ] {
+        let reply = answer(&mut c, json!({"action": "accept", "content": bad}));
+        assert_eq!(reply["code"], "bad_request", "{reply}");
+    }
+    let stale = c.request(json!({"t": "acp.elicitation", "sid": "a1", "req": req,
+                                 "epoch": epoch + 1, "response": {"action": "decline"}}));
+    assert_eq!(stale["code"], "stale");
+    let content = json!({"colour": "blue", "count": 7, "verbose": false, "targets": ["riscv64"]});
+    assert_eq!(
+        answer(&mut c, json!({"action": "accept", "content": content}))["t"],
+        "ok"
+    );
+    let evs = c.events_until("a1", "turn_end");
+    let resolved = evs
+        .iter()
+        .find(|e| e["e"] == "elicitation_resolved")
+        .unwrap();
+    assert_eq!(resolved["req"], req);
+    assert_eq!(resolved["by"], "user");
+    let ups: Vec<Value> = evs
+        .iter()
+        .filter(|e| e["e"] == "update")
+        .map(|e| e["update"].clone())
+        .collect();
+    assert_eq!(form_content(&ups), content);
+
+    assert_eq!(c.acp_prompt("a1", "url")["t"], "ok");
+    let ev = c.event("a1", "elicitation");
+    assert_eq!(
+        ev["request"]["url"],
+        "https://example.org/wb-fake-acp/consent"
+    );
+    let reply = c.request(
+        json!({"t": "acp.elicitation", "sid": "a1", "req": ev["seq"],
+                                 "epoch": epoch, "response": {"action": "accept"}}),
+    );
+    assert_eq!(reply["t"], "ok");
+    let evs = c.events_until("a1", "turn_end");
+    let complete = evs
+        .iter()
+        .find(|e| e["e"] == "elicitation_complete")
+        .unwrap();
+    assert_eq!(complete["elicitationId"], ev["request"]["elicitationId"]);
+    assert_eq!(c.summary("a1")["acp"]["pending"], json!([]));
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor; takes 31 s"]
+fn hub_request_scoped_elicitation_pauses_the_setup_timer() {
+    let mut hub = Hub::with_scenarios(&["elicitation"]);
+    let mut c = hub.connect();
+    let (open, evs) = spawn_until(&mut c, &hub, "a1", "elicitation", "setup_error");
+    assert_eq!(evs.last().unwrap()["code"], "auth_required");
+    assert_eq!(c.summary("a1")["alive"], true);
+    c.send(&json!({"t": "acp.authenticate", "rid": 900, "sid": "a1", "methodId": "fake-login"}));
+    let ev = c.event("a1", "elicitation");
+    assert!(ev["request"].get("sessionId").is_none(), "{ev}");
+    assert!(ev["request"].get("requestId").is_some(), "{ev}");
+    // Longer than SETUP_IDLE_TIMEOUT: a pending request pauses it.
+    std::thread::sleep(wb_proto::limits::SETUP_IDLE_TIMEOUT + Duration::from_secs(1));
+    let s = c.summary("a1");
+    assert_eq!(s["alive"], true, "{s}");
+    assert_eq!(s["acp"]["activity"], "setup", "{s}");
+    let reply = c.request(
+        json!({"t": "acp.elicitation", "sid": "a1", "req": ev["seq"],
+                                 "epoch": epoch(&open),
+                                 "response": {"action": "accept", "content": {"token": "t"}}}),
+    );
+    assert_eq!(reply["t"], "ok");
+    let auth = c.reply(900);
+    assert_eq!(auth["t"], "ok", "{auth}");
+    let session = c.event("a1", "session");
+    assert_eq!(session["via"], "new");
+    assert!(!hub.kinds("a1").iter().any(|k| k == "exit"));
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_cancel_resolves_pending_and_ends_cancelled() {
+    let mut hub = Hub::with_scenarios(&["cancel"]);
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "cancel");
+    assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
+    let perm = c.event("a1", "permission");
+    c.ok(json!({"t": "acp.cancel", "sid": "a1"}));
+    let resolved = c.event("a1", "permission_resolved");
+    assert_eq!(resolved["req"], perm["seq"]);
+    assert_eq!(resolved["by"], "cancel");
+    assert_eq!(resolved["outcome"], cancelled()["outcome"]);
+    assert_eq!(c.event("a1", "turn_end")["stopReason"], "cancelled");
+    let received = hub.received("cancel");
+    let cancel_at = received
+        .iter()
+        .position(|m| m["method"] == "session/cancel")
+        .expect("session/cancel");
+    let answer_at = received
+        .iter()
+        .position(|m| m["result"] == cancelled())
+        .expect("the cancelled answer");
+    assert!(cancel_at < answer_at);
+    let s = c.summary_until("a1", "the turn is over", |s| s["acp"]["activity"] == "none");
+    assert_eq!(s["acp"]["last"]["outcome"], "cancelled");
+    // With no turn, cancel is a no-op.
+    let head = s["acp"]["headSeq"].clone();
+    c.ok(json!({"t": "acp.cancel", "sid": "a1"}));
+    assert_eq!(c.summary("a1")["acp"]["headSeq"], head);
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_crash_midturn_writes_the_death_invariant() {
+    let mut hub = Hub::with_scenarios(&["crash-midturn"]);
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "crash-midturn");
+    assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
+    let evs = c.events_until("a1", "exit");
+    let kinds: Vec<&str> = evs.iter().map(|e| e["e"].as_str().unwrap()).collect();
+    let at = |k: &str| {
+        kinds
+            .iter()
+            .position(|x| *x == k)
+            .unwrap_or_else(|| panic!("{kinds:?}"))
+    };
+    assert!(at("permission") < at("permission_resolved"));
+    assert!(at("permission_resolved") < at("turn_error"));
+    let resolved = &evs[at("permission_resolved")];
+    assert_eq!(resolved["by"], "hub");
+    assert_eq!(evs[at("turn_error")]["code"], "agent_exited");
+    let notice = &evs[at("notice")];
+    assert!(
+        notice["text"].as_str().unwrap().contains("boom"),
+        "{notice}"
+    );
+    let exit = evs.last().unwrap();
+    assert_eq!(exit["code"], 1);
+    assert_eq!(exit["reason"], "exited");
+    let s = c.summary("a1");
+    assert_eq!(s["alive"], false);
+    assert_eq!(s["acp"]["pending"], json!([]));
+    assert_eq!(s["acp"]["activity"], "none");
+    assert_eq!(s["acp"]["last"]["outcome"], "error");
+    assert_eq!(s["acp"]["last"]["error"]["code"], "agent_exited");
+    assert_eq!(s["acp"]["revivable"], true);
+    // No respawn.
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(hub.kinds("a1").iter().filter(|k| *k == "spawn").count(), 1);
+    assert_eq!(c.acp_prompt("a1", "again")["code"], "not_alive");
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_auth_waits_for_authenticate() {
+    let mut hub = Hub::with_scenarios(&["auth"]);
+    let mut c = hub.connect();
+    let (_, evs) = spawn_until(&mut c, &hub, "a1", "auth", "setup_error");
+    let err = evs.last().unwrap();
+    assert_eq!(err["code"], "auth_required");
+    assert_eq!(err["rpc"]["code"], -32000);
+    let s = c.summary("a1");
+    assert_eq!(s["alive"], true);
+    assert_eq!(s["acp"]["last"]["outcome"], "error");
+    assert_eq!(s["acp"]["last"]["error"]["code"], "auth_required");
+    let bad = c.request(json!({"t": "acp.authenticate", "sid": "a1", "methodId": "other"}));
+    assert_eq!(bad["code"], "bad_option");
+    c.ok(json!({"t": "acp.authenticate", "sid": "a1", "methodId": "fake-login"}));
+    let evs = c.events_until("a1", "session");
+    assert_eq!(evs[0]["e"], "authenticate");
+    assert_eq!(evs[0]["methodId"], "fake-login");
+    let methods: Vec<Value> = hub
+        .received("auth")
+        .iter()
+        .filter_map(|m| m.get("method").cloned())
+        .collect();
+    assert_eq!(
+        methods,
+        ["initialize", "session/new", "authenticate", "session/new"]
+    );
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_auth_with_only_terminal_methods_kills_the_agent() {
+    let mut hub = Hub::with_scenarios(&["auth-terminal"]);
+    let mut c = hub.connect();
+    let (_, evs) = spawn_until(&mut c, &hub, "a1", "auth-terminal", "exit");
+    let err = evs.iter().find(|e| e["e"] == "setup_error").unwrap();
+    assert_eq!(err["code"], "auth_required");
+    let s = c.summary("a1");
+    assert_eq!(s["alive"], false);
+    let bad = c.request(json!({"t": "acp.authenticate", "sid": "a1", "methodId": "fake-terminal"}));
+    assert_eq!(bad["code"], "bad_option", "{bad}");
+    assert!(
+        hub.received_calls("auth-terminal", "authenticate")
+            .is_empty()
+    );
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+/// Runs a turn on `sid`, kills the agent and waits for the exit; the Summary.
+fn turn_then_kill(c: &mut Client, sid: &str) -> Value {
+    assert_eq!(c.acp_prompt(sid, "go")["t"], "ok");
+    c.event(sid, "turn_end");
+    c.ok(json!({"t": "acp.kill", "sid": sid, "forget": false}));
+    c.event(sid, "exit");
+    c.summary_until(sid, "the agent is dead", |s| s["alive"] == false)
+}
+
+/// Revives `sid` and reads its events until both the `session` and the `notice` that
+/// a successful revive journals have arrived; those events.
+fn revive(c: &mut Client, sid: &str) -> Vec<Value> {
+    c.ok(json!({"t": "acp.revive", "sid": sid}));
+    let mut evs = c.events_until(sid, "session");
+    if !evs.iter().any(|e| e["e"] == "notice") {
+        evs.extend(c.events_until(sid, "notice"));
+    }
+    evs
+}
+
+/// The text of the `notice` among `evs`.
+fn notice_text(evs: &[Value]) -> String {
+    let notice = evs.iter().find(|e| e["e"] == "notice").expect("a notice");
+    notice["text"].as_str().unwrap().to_owned()
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_revive_resumes_when_resume_is_advertised() {
+    let mut hub = Hub::with_scenarios(&["revive-resume"]);
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "revive-resume");
+    let s = turn_then_kill(&mut c, "a1");
+    assert_eq!(s["acp"]["revivable"], true);
+    assert_eq!(s["acp"]["seenSeq"], s["acp"]["headSeq"]);
+    let exit = hub.journal("a1").pop().unwrap();
+    assert_eq!(exit["reason"], "killed");
+    let agent_session = s["acp"]["agentSessionId"].clone();
+    let evs = revive(&mut c, "a1");
+    assert_eq!(evs[0]["e"], "spawn");
+    assert_eq!(evs[0]["via"], "revive");
+    let session = evs.iter().find(|e| e["e"] == "session").unwrap();
+    assert_eq!(session["via"], "resume");
+    assert!(notice_text(&evs).contains("resume"), "{evs:?}");
+    let resume = hub.received_calls("revive-resume", "session/resume");
+    assert_eq!(resume.len(), 1);
+    assert_eq!(resume[0]["params"]["sessionId"], agent_session);
+    assert_eq!(resume[0]["params"]["cwd"], hub.home());
+    assert!(
+        hub.received_calls("revive-resume", "session/load")
+            .is_empty()
+    );
+    let s = c.summary_until("a1", "revived", |s| {
+        s["alive"] == true && s["acp"]["activity"] == "none"
+    });
+    assert_eq!(s["acp"]["agentSessionId"], agent_session);
+    assert_eq!(c.acp_prompt("a1", "again")["t"], "ok");
+    c.event("a1", "turn_end");
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_revive_loads_without_journaling_history() {
+    let mut hub = Hub::with_scenarios(&["revive-load"]);
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "revive-load");
+    let s = turn_then_kill(&mut c, "a1");
+    let head = s["acp"]["headSeq"].as_u64().unwrap();
+    let evs = revive(&mut c, "a1");
+    let session = evs.iter().find(|e| e["e"] == "session").unwrap();
+    assert_eq!(session["via"], "load");
+    assert!(notice_text(&evs).contains("load"), "{evs:?}");
+    let journal = hub.journal("a1");
+    let since_revive = &journal[usize::try_from(head).unwrap()..];
+    let updates: Vec<&Value> = since_revive
+        .iter()
+        .filter(|l| l["e"] == "update")
+        .map(|l| &l["update"])
+        .collect();
+    assert_eq!(updates.len(), 1, "history was journaled: {updates:?}");
+    assert_eq!(updates[0]["sessionUpdate"], "available_commands_update");
+    assert!(
+        hub.received_calls("revive-load", "session/resume")
+            .is_empty()
+    );
+    assert_eq!(hub.received_calls("revive-load", "session/load").len(), 1);
+    let mut c2 = hub.connect();
+    let reply = c2.ok(json!({"t": "acp.open", "sid": "a1", "since": 0}));
+    assert_eq!(reply["session"]["availableCommands"][0]["name"], "review");
+    c2.replay("a1");
+    drop((c, c2));
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_revive_failure_makes_the_session_unrevivable() {
+    let mut hub = Hub::with_scenarios(&["revive-fail"]);
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "revive-fail");
+    turn_then_kill(&mut c, "a1");
+    c.ok(json!({"t": "acp.revive", "sid": "a1"}));
+    let evs = c.events_until("a1", "exit");
+    let err = evs.iter().find(|e| e["e"] == "setup_error").unwrap();
+    assert_eq!(err["code"], "revive_failed");
+    assert_eq!(hub.received_calls("revive-fail", "session/resume").len(), 1);
+    assert_eq!(hub.received_calls("revive-fail", "session/load").len(), 1);
+    let s = c.summary_until("a1", "dead again", |s| s["alive"] == false);
+    assert_eq!(s["acp"]["revivable"], false);
+    assert_eq!(
+        c.request(json!({"t": "acp.revive", "sid": "a1"}))["code"],
+        "not_revivable"
+    );
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_unknown_variants_and_methods() {
+    let mut hub = Hub::with_scenarios(&["unknown"]);
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "unknown");
+    assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
+    let evs = c.events_until("a1", "turn_end");
+    let future = evs
+        .iter()
+        .find(|e| e["e"] == "update" && e["update"]["sessionUpdate"] == "fake_future_update")
+        .expect("the unknown variant, journaled");
+    assert_eq!(future["update"]["detail"], json!({"answer": 42}));
+    let ups: Vec<Value> = evs
+        .iter()
+        .filter(|e| e["e"] == "update")
+        .map(|e| e["update"].clone())
+        .collect();
+    assert_eq!(
+        text_of(&ups, "agent_message_chunk"),
+        "fs/read_text_file: -32601"
+    );
+    // Neither the agent's request nor its unknown notification is journaled.
+    assert_eq!(
+        hub.kinds("a1"),
+        ["spawn", "session", "prompt", "update", "update", "turn_end"]
+    );
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_protocol_version_2_is_an_agent_error() {
+    let mut hub = Hub::with_scenarios(&["version"]);
+    let mut c = hub.connect();
+    let (_, evs) = spawn_until(&mut c, &hub, "a1", "version", "exit");
+    let err = evs.iter().find(|e| e["e"] == "setup_error").unwrap();
+    assert_eq!(err["code"], "agent_error");
+    assert_eq!(c.summary("a1")["alive"], false);
+    assert!(hub.received_calls("version", "session/new").is_empty());
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor; takes 30 s"]
+fn hub_silent_initialize_times_out() {
+    let mut hub = Hub::with_scenarios(&["hang"]);
+    let mut c = hub.connect();
+    let started = Instant::now();
+    c.acp_spawn("a1", "hang", &hub.home());
+    let evs = c.events_until_within("a1", "setup_error", Duration::from_secs(40));
+    assert_eq!(evs.last().unwrap()["code"], "timeout");
+    assert!(started.elapsed() >= wb_proto::limits::SETUP_IDLE_TIMEOUT - Duration::from_secs(1));
+    c.event("a1", "exit");
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_set_mode_journals_the_mode() {
+    let mut hub = Hub::with_scenarios(&["set-mode"]);
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "set-mode");
+    c.ok(json!({"t": "acp.set_mode", "sid": "a1", "modeId": "plan"}));
+    assert_eq!(c.event("a1", "mode")["modeId"], "plan");
+    assert_eq!(c.summary("a1")["acp"]["modeId"], "plan");
+    let bad = c.request(json!({"t": "acp.set_mode", "sid": "a1", "modeId": "nope"}));
+    assert_eq!(bad["code"], "bad_option");
+    let sent = hub.received_calls("set-mode", "session/set_mode");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["params"]["modeId"], "plan");
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_kill_forget_outlasts_a_stubborn_agent_then_respawns_fresh() {
+    let mut hub = Hub::with_scenarios(&["kill-stubborn", "basic"]);
+    let mut w = hub.connect();
+    w.ok(json!({"t": "watch"}));
+    let mut c = hub.connect();
+    let (open, evs) = spawn_until(&mut c, &hub, "a1", "kill-stubborn", "session");
+    let pid = agent_pid(&evs);
+    assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
+    c.event("a1", "update");
+    let started = Instant::now();
+    c.ok(json!({"t": "acp.kill", "sid": "a1", "forget": true}));
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_secs(5) && took < Duration::from_secs(9),
+        "{took:?}"
+    );
+    assert!(!running(pid));
+    assert!(group_members(pid).is_empty());
+    let notes: Vec<Value> = hub
+        .record("kill-stubborn")
+        .iter()
+        .filter_map(|e| e.get("note").cloned())
+        .collect();
+    assert_eq!(notes, ["env", "stdin_eof", "sigterm"]);
+    for client in [&mut c, &mut w] {
+        let gone = client.until("gone", |m| m["t"] == "gone");
+        assert_eq!(gone["sid"], "a1");
+        assert_eq!(gone["epoch"], epoch(&open));
+    }
+    for ext in ["json", "jsonl"] {
+        assert!(
+            !hub.acp_file(&format!("a1.{ext}")).exists(),
+            "a1.{ext} kept"
+        );
+    }
+    let (open2, evs) = spawn_until(&mut c, &hub, "a1", "basic", "session");
+    assert_ne!(epoch(&open2), epoch(&open));
+    let seqs: Vec<&Value> = evs.iter().map(|e| &e["seq"]).collect();
+    assert_eq!(seqs, [1, 2], "not a fresh transcript");
+    drop((c, w));
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_kills_what_a_crashed_agent_left_in_its_group() {
+    let mut hub = Hub::with_scenarios(&["crash-leave-child"]);
+    let mut c = hub.connect();
+    let (_, evs) = spawn_until(&mut c, &hub, "a1", "crash-leave-child", "session");
+    let pgid = agent_pid(&evs);
+    assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
+    c.event("a1", "exit");
+    let note = hub
+        .record("crash-leave-child")
+        .into_iter()
+        .find(|e| e["note"] == "child")
+        .expect("a child note");
+    let child = u32::try_from(note["childPid"].as_u64().unwrap()).unwrap();
+    eventually(Duration::from_secs(3), "the group is empty", || {
+        group_members(pgid).is_empty()
+    });
+    assert!(!running(child));
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_leaves_a_child_that_left_the_group() {
+    let mut hub = Hub::with_scenarios(&["setsid-child"]);
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "setsid-child");
+    assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
+    c.event("a1", "exit");
+    let note = hub
+        .record("setsid-child")
+        .into_iter()
+        .find(|e| e["note"] == "child")
+        .expect("a child note");
+    let child = u32::try_from(note["childPid"].as_u64().unwrap()).unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    let survived = running(child);
+    common::signal(child, rustix::process::Signal::KILL);
+    assert!(
+        survived,
+        "the hub killed a process outside the agent's group"
+    );
+    assert!(wait_gone(child, PATIENCE));
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+/// `replay-large`'s message `m` after coalescing: its 20 chunks in order.
+fn large_message(m: usize) -> String {
+    (0..20)
+        .map(|c| {
+            let mut text = format!("[{m:03}.{c:02}]");
+            text.extend(std::iter::repeat_n('x', (5 << 10) - text.len()));
+            text
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_large_replay_is_capped_coalesced_and_ascending() {
+    let mut hub = Hub::with_scenarios(&["replay-large"]);
+    let mut a = hub.connect();
+    let open = ready(&mut a, &hub, "a1", "replay-large");
+    assert_eq!(a.acp_prompt("a1", "go")["t"], "ok");
+    drop(a);
+    // spawn, session, prompt, 10 messages of 20 chunks, the permission at 204, then 190
+    // more messages: 4004 events before the ticks.
+    let mut c = hub.connect();
+    let s = c.summary_until("a1", "the chunks and a tick", |s| {
+        s["acp"]["headSeq"].as_u64().unwrap() > 4004
+    });
+    assert_eq!(s["acp"]["pending"][0]["req"], 204);
+
+    let mut b = hub.connect();
+    let reply = b.ok(json!({"t": "acp.open", "sid": "a1", "since": 0, "epoch": epoch(&open)}));
+    let head = reply["head"].as_u64().unwrap();
+    let from = reply["from"].as_u64().unwrap();
+    let (evs, replayed) = b.replay("a1");
+    assert_eq!(replayed["head"], head);
+    assert_eq!(replayed["truncated"], true);
+    assert!(from > 204, "from {from}");
+    let seqs: Vec<u64> = evs.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "not ascending: {seqs:?}"
+    );
+    assert_eq!(seqs.last(), Some(&head));
+    let pinned = evs
+        .iter()
+        .position(|e| e["seq"] == 204)
+        .expect("the pending permission");
+    assert_eq!(evs[pinned]["e"], "permission");
+    // Only the pinned event lies below `from`, so it comes first.
+    assert_eq!(pinned, 0);
+    assert!(seqs[1..].iter().all(|s| *s >= from));
+    let size: usize = evs.iter().map(|e| e.to_string().len()).sum();
+    let cap = wb_proto::limits::ACP_REPLAY_MAX;
+    assert!(size <= cap + (128 << 10), "replay of {size} bytes");
+    assert!(size >= 3 << 20, "replay of only {size} bytes");
+    for ev in &evs[pinned + 1..] {
+        let u = &ev["update"];
+        let id = u["messageId"].as_str().unwrap_or_default();
+        if let Some(m) = id.strip_prefix("big-") {
+            let m: usize = m.parse().unwrap();
+            assert_eq!(
+                u["content"]["text"].as_str().unwrap(),
+                large_message(m),
+                "big-{m}"
+            );
+        }
+    }
+    let live = b.until("a live event", |m| m["t"] == "acp.ev");
+    assert_eq!(live["ev"]["seq"], head + 1);
+    assert_eq!(
+        permit(&mut b, "a1", &json!(204), epoch(&open), "allow-once")["t"],
+        "ok"
+    );
+    b.event("a1", "turn_end");
+    drop((b, c));
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_kill9_midturn_is_normalised_at_restart() {
+    let mut hub = Hub::with_scenarios(&["permission"]);
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "permission");
+    assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
+    let perm = c.event("a1", "permission");
+    drop(c);
+    hub.kill9();
+    hub.restart();
+    let journal = hub.journal("a1");
+    let n = journal.len();
+    let last3: Vec<&Value> = journal[n - 3..].iter().collect();
+    assert_eq!(last3[0]["e"], "permission_resolved");
+    assert_eq!(last3[0]["req"], perm["seq"]);
+    assert_eq!(last3[0]["by"], "hub");
+    assert_eq!(last3[1]["e"], "turn_error");
+    assert_eq!(last3[1]["code"], "interrupted");
+    assert_eq!(last3[2]["e"], "exit");
+    assert_eq!(last3[2]["reason"], "hub_restart");
+    let mut c = hub.connect();
+    let s = c.summary("a1");
+    assert_eq!(s["alive"], false);
+    assert_eq!(s["acp"]["revivable"], true);
+    assert_eq!(s["acp"]["pending"], json!([]));
+    assert_eq!(s["acp"]["activity"], "none");
+    c.ok(json!({"t": "acp.open", "sid": "a1", "since": n as u64}));
+    c.replay("a1");
+    c.ok(json!({"t": "acp.revive", "sid": "a1"}));
+    assert_eq!(c.event("a1", "session")["via"], "resume");
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_sigterm_midturn_writes_hub_restart_and_ends_the_group() {
+    let mut hub = Hub::with_scenarios(&["permission"]);
+    let mut c = hub.connect();
+    let (_, evs) = spawn_until(&mut c, &hub, "a1", "permission", "session");
+    let pid = agent_pid(&evs);
+    assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
+    c.event("a1", "permission");
+    drop(c);
+    hub.terminate();
+    assert!(wait_gone(pid, PATIENCE));
+    assert_eq!(
+        tail(&hub, "a1", 3),
+        ["permission_resolved", "turn_error", "exit"]
+    );
+    let journal = hub.journal("a1");
+    assert_eq!(journal[journal.len() - 2]["code"], "interrupted");
+    assert_eq!(journal[journal.len() - 1]["reason"], "hub_restart");
+    hub.restart();
+    let mut c = hub.connect();
+    assert_eq!(c.summary("a1")["acp"]["revivable"], true);
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_journal_write_fault_fails_closed_and_recovers() {
+    let mut hub = Hub::start_with_env(
+        |config| stub(config, "basic", &["--scenario", "basic"]),
+        &[("WB_HUB_TEST_FAIL_WRITE_AT", "5")],
+    );
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "basic");
+    // spawn 1, session 2, prompt 3, update 4; the second update's append fails.
+    assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
+    let s = c.summary_until("a1", "faulted and dead", |s| {
+        s["fault"]["code"] == "journal_write" && s["alive"] == false
+    });
+    assert_eq!(s["acp"]["headSeq"], 4);
+    assert_eq!(hub.kinds("a1"), ["spawn", "session", "prompt", "update"]);
+    assert_eq!(c.acp_prompt("a1", "again")["code"], "faulted");
+    // A kill retries the death-invariant lines; they take seqs 5 and 6.
+    c.ok(json!({"t": "acp.kill", "sid": "a1", "forget": false}));
+    let s = c.summary_until("a1", "the fault cleared", |s| s["fault"].is_null());
+    assert_eq!(s["acp"]["headSeq"], 6);
+    assert_eq!(tail(&hub, "a1", 2), ["turn_error", "exit"]);
+    assert_eq!(s["acp"]["revivable"], true);
+    c.ok(json!({"t": "acp.revive", "sid": "a1"}));
+    c.summary_until("a1", "revived", |s| s["alive"] == true);
+    let journal = hub.journal("a1");
+    assert_eq!(journal[6]["e"], "spawn");
+    assert_eq!(journal[6]["via"], "revive");
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_quarantines_a_garbage_journal() {
+    let mut hub = Hub::with_scenarios(&["basic"]);
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "basic");
+    turn_then_kill(&mut c, "a1");
+    drop(c);
+    hub.terminate();
+    let meta = std::fs::read_to_string(hub.acp_file("a1.json")).unwrap();
+    let mut meta: Value = serde_json::from_str(&meta).unwrap();
+    meta["sid"] = "x".into();
+    std::fs::write(hub.acp_file("x.json"), meta.to_string()).unwrap();
+    let spawn = std::fs::read_to_string(hub.acp_file("a1.jsonl")).unwrap();
+    let first = spawn.lines().next().unwrap();
+    std::fs::write(
+        hub.acp_file("x.jsonl"),
+        format!("not a journal line\n{first}\n"),
+    )
+    .unwrap();
+    hub.restart();
+
+    let mut c = hub.connect();
+    let x = c.summary("x");
+    assert_eq!(x["fault"]["code"], "load_failed");
+    assert_eq!(x["alive"], false);
+    assert_eq!(x["acp"]["revivable"], false);
+    assert_eq!(c.summary("a1")["fault"], Value::Null);
+    let names: Vec<String> = std::fs::read_dir(hub.acp_file(""))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    for ext in ["json", "jsonl"] {
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("x.quarantine-") && n.ends_with(&format!(".{ext}"))),
+            "no quarantined .{ext} in {names:?}"
+        );
+    }
+    assert!(!hub.acp_file("x.json").exists());
+    c.ok(json!({"t": "acp.kill", "sid": "x", "forget": true}));
+    let after: Vec<String> = std::fs::read_dir(hub.acp_file(""))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        after
+            .iter()
+            .filter(|n| n.starts_with("x.quarantine-"))
+            .count(),
+        2,
+        "{after:?}"
+    );
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_exec_failure_writes_only_setup_error() {
+    let mut hub = Hub::start_with(|config| {
+        config["agents"]["missing"] =
+            json!({"label": "Missing", "argv": ["/nonexistent/wb-agent"]});
+    });
+    let mut c = hub.connect();
+    let (_, evs) = spawn_until(&mut c, &hub, "a1", "missing", "setup_error");
+    assert_eq!(evs.last().unwrap()["code"], "spawn_failed");
+    assert_eq!(hub.kinds("a1"), ["setup_error"]);
+    let s = c.summary("a1");
+    assert_eq!(s["alive"], false);
+    assert_eq!(s["acp"]["last"]["error"]["code"], "spawn_failed");
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_acp_open_errors() {
+    let hub = Hub::with_scenarios(&["basic"]);
+    let mut c = hub.connect();
+    assert_eq!(c.acp_open("nope", 0)["code"], "not_found");
+    assert_eq!(c.acp_prompt("nope", "hi")["code"], "not_found");
+    let unknown = c.request(json!({"t": "acp.open", "sid": "a1", "since": 0,
+                                   "spawn": {"agent": "absent", "cwd": hub.home()}}));
+    assert_eq!(unknown["code"], "unknown_agent");
+    c.spawn("p1", &["sleep", "1000"]);
+    let mismatch = c.request(json!({"t": "acp.open", "sid": "p1", "since": 0,
+                                    "spawn": {"agent": "basic", "cwd": hub.home()}}));
+    assert_eq!(mismatch["code"], "kind_mismatch");
+    ready(&mut c, &hub, "a1", "basic");
+    assert_eq!(c.attach("a1")["code"], "kind_mismatch");
+}
+
+#[test]
+#[ignore = "at integration: needs the M3-H2 ACP actor"]
+fn hub_builds_the_agent_environment_from_scratch() {
+    let hub = Hub::with_scenarios(&["basic"]);
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "basic");
+    let record = hub.record("basic");
+    let env = record.iter().find(|e| e["note"] == "env").unwrap();
+    let names: Vec<&str> = env["names"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "HOME",
+            "LOGNAME",
+            "PATH",
+            "RUST_LOG",
+            "SHELL",
+            "USER",
+            "WB_SESSION",
+            "WB_SET"
+        ]
+    );
+    assert_eq!(env["SHELL"], hub.shell);
+    assert_eq!(env["WB_SESSION"], "a1");
+    for canary in common::CANARIES {
+        assert!(!names.contains(&canary), "{canary} reached the agent");
+    }
 }
