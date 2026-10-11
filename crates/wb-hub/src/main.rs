@@ -1,4 +1,4 @@
-//! `wb-hub`: owns the PTY sessions of one host and serves them on `hub.sock`.
+//! `wb-hub`: owns the PTY and ACP sessions of one host and serves them on `hub.sock`.
 //!
 //! `unsafe` is denied everywhere except `pty/spawn.rs`, which allows it for the
 //! `pre_exec` closure.
@@ -44,6 +44,8 @@ pub struct Ctx {
     pub started_at: u64,
     /// `stateDir/pty`.
     pub pty_dir: PathBuf,
+    /// `stateDir/acp`.
+    pub acp_dir: PathBuf,
     /// Test builds only: `pty.input` of exactly this text panics the session actor.
     #[cfg(debug_assertions)]
     pub test_panic_input: Option<String>,
@@ -96,11 +98,14 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
     let child_umask = rustix::process::umask(Mode::from_raw_mode(0o077));
 
     let pty_dir = cfg.state_dir.join("pty");
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&pty_dir)
-        .with_context(|| format!("creating {}", pty_dir.display()))?;
+    let acp_dir = cfg.state_dir.join("acp");
+    for dir in [&pty_dir, &acp_dir] {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+    }
     let lock_path = cfg.state_dir.join("hub.lock");
     let lock_file = OpenOptions::new()
         .create(true)
@@ -111,7 +116,9 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
         .with_context(|| format!("opening {}", lock_path.display()))?;
     flock(&lock_file, FlockOperation::NonBlockingLockExclusive)
         .with_context(|| format!("another wb-hub holds {}", lock_path.display()))?;
-    store::remove_tmp(&pty_dir).with_context(|| format!("cleaning {}", pty_dir.display()))?;
+    for dir in [&pty_dir, &acp_dir] {
+        store::remove_tmp(dir).with_context(|| format!("cleaning {}", dir.display()))?;
+    }
     let ctx = Arc::new(Ctx {
         cfg,
         ident,
@@ -119,6 +126,7 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
         registry: Registry::default(),
         started_at: now_ms(),
         pty_dir,
+        acp_dir,
         #[cfg(debug_assertions)]
         test_panic_input: std::env::var("WB_HUB_TEST_PANIC_INPUT").ok(),
     });
@@ -164,8 +172,8 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Starts a dead actor for every PTY record in the state directory. A record that fails
-/// to load is quarantined and its session shows the fault.
+/// Starts a dead actor for every PTY and ACP record in the state directory. A record
+/// that fails to load is quarantined and its session shows the fault.
 async fn load_sessions(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
     let sids =
         store::sids(&ctx.pty_dir).with_context(|| format!("listing {}", ctx.pty_dir.display()))?;
@@ -178,6 +186,15 @@ async fn load_sessions(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
             };
         let (created_at, rx) = ctx.registry.load(&sid, created_at);
         pty::start(ctx.clone(), sid, created_at, rx, from);
+    }
+    let sids =
+        store::sids(&ctx.acp_dir).with_context(|| format!("listing {}", ctx.acp_dir.display()))?;
+    for sid in sids {
+        if ctx.registry.kind(&sid).is_some() {
+            warn!(%sid, "an ACP record has the sid of a PTY session; not loading it");
+            continue;
+        }
+        acp::load(ctx, sid).await;
     }
     info!(sessions = ctx.registry.list().len(), "loaded");
     Ok(())
