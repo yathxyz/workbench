@@ -534,8 +534,8 @@ body.listening #st-buf-text { color: var(--ink-red); }
 #side-term .body { background: var(--term-bg); overflow: hidden; position: relative; }
 #side-term .xterm { padding: 8px 6px 6px 10px; height: 100%; box-sizing: border-box; }
 .cm-panels { background: var(--panel-2) !important; color: var(--fg) !important; font: 12.5px var(--mono); border-top: 1px solid var(--line) !important; }
-.cm-fat-cursor { background: var(--accent) !important; color: var(--panel) !important; }
-.cm-focused .cm-fat-cursor { background: var(--accent) !important; }
+.cm-fat-cursor { background: var(--cursor) !important; color: var(--panel) !important; }
+.cm-focused .cm-fat-cursor { background: var(--cursor) !important; }
 .cm-tooltip-autocomplete { font: 13px var(--mono); background: var(--panel) !important; border: 1px solid var(--line-strong) !important; }
 .cm-tooltip-autocomplete li[aria-selected] { background: var(--accent) !important; color: var(--panel) !important; }
 
