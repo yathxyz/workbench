@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{FakeHub, INDEX, ORIGIN, Req, SECRET, Web, fixture, run_to_exit};
+use common::{FakeHub, HOST, INDEX, ORIGIN, Req, SECRET, Web, fixture, run_to_exit};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use wb_proto::hub::HubRequest;
@@ -67,6 +67,7 @@ async fn the_floor_refuses_before_anything_else() {
                 web.req(method, path)
                     .set("Origin", "http://evil.example.org"),
             ),
+            ("two hosts", web.req(method, path).add("Host", HOST)),
             ("null origin", web.req(method, path).set("Origin", "null")),
             (
                 "two origins",
@@ -344,6 +345,7 @@ async fn the_api_surface_of_m0() {
 
     for (method, path) in [
         ("OPTIONS", "/api/info"),
+        ("OPTIONS", "/api/board"),
         ("OPTIONS", "/"),
         ("DELETE", "/api/board"),
         ("POST", "/api/info"),
