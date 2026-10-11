@@ -285,7 +285,7 @@ async fn the_api_surface_of_m0() {
     assert_eq!(
         info["hub"],
         json!({"status": "up", "version": "0.1.0", "build": null, "proto": 1,
-               "startedAt": 1_700_000_000_000u64})
+               "startedAt": 1_700_000_000_000u64, "stale": false})
     );
 
     let sessions = web.req("GET", "/api/sessions").send().await;

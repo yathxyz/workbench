@@ -59,6 +59,24 @@ fn spawn_and_echo() {
     assert_eq!(s["createdAt"], r["epoch"]);
 }
 
+/// A card retries `spawn` until it sees a hello, so a retry that reaches a live session
+/// must attach to it, never replace its shell.
+#[test]
+fn a_spawn_on_a_live_session_attaches_without_respawning() {
+    let hub = Hub::start();
+    let mut a = hub.connect();
+    let first = a.spawn("retry", &["bash"]);
+    a.input("retry", "echo MARK$((2+1))\r");
+    a.output_until("retry", "MARK3");
+
+    let mut b = hub.connect();
+    let r = b.spawn("retry", &["bash"]);
+    assert_eq!(r["new"], false, "{r}");
+    assert_eq!(r["pid"], first["pid"], "{r}");
+    assert_eq!(r["epoch"], first["epoch"], "{r}");
+    assert!(r["replay"].as_str().unwrap().contains("MARK3"), "{r}");
+}
+
 #[test]
 fn a_second_connection_attaches_with_replay() {
     let hub = Hub::start();

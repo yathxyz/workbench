@@ -166,6 +166,7 @@ impl Ring {
     }
 
     /// Everything the ring holds.
+    #[cfg(test)]
     pub fn text(&self) -> String {
         let (a, b) = self.buf.as_slices();
         let bytes = [a, b].concat();

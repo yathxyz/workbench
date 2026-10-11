@@ -1,5 +1,5 @@
-# `nix flake check`: package (with cargo test), clippy, fmt, the end-to-end security suite, the
-# browser suite, the VM test.
+# `nix flake check`: package (with cargo test), clippy, fmt, the black-box conformance suite, the
+# end-to-end security suite, the browser suite, the VM test.
 {
   pkgs,
   self,
@@ -45,6 +45,24 @@ in
         touch $out
       '';
 
+  # tests/test_daemon.py over the harness: real wb-hub, wb-web and Caddy, as in `security`.
+  conformance =
+    pkgs.runCommand "workbench-conformance"
+      {
+        nativeBuildInputs = [
+          pkgs.python3
+          pkgs.bashInteractive
+          pkgs.coreutils
+          pkgs.caddy
+          workbench
+        ];
+      }
+      ''
+        export HOME=$TMPDIR BASH=${pkgs.bashInteractive}/bin/bash
+        python3 -I ${tests}/test_daemon.py --web-root ${workbench-web}
+        touch $out
+      '';
+
   # Real wb-hub and wb-web behind a real Caddy on loopback; sockets stay under $TMPDIR (/build).
   security =
     pkgs.runCommand "workbench-security"
@@ -64,9 +82,8 @@ in
       '';
 
   # tests/ui.mjs (the frontend's) in headless Chromium from nixpkgs. It starts the harness from
-  # WB_HARNESS and imports Playwright from WB_PLAYWRIGHT. WB_HARNESS_TCP lets the browser reach
-  # the harness's Caddy on 127.0.0.1:18443; the sandbox's private network namespace makes that
-  # safe, and the harness refuses it anywhere else.
+  # WB_HARNESS and imports Playwright from WB_PLAYWRIGHT. The browser reaches the harness's Caddy
+  # through ui.mjs's own 127.0.0.1:18443 forwarder, which accepts only this build's uid.
   ui =
     pkgs.runCommand "workbench-ui"
       {
@@ -81,7 +98,6 @@ in
         WB_PLAYWRIGHT = "${pkgs.playwright-driver}/index.mjs";
         WB_HARNESS = "${tests}/harness.py";
         WB_WEB_ROOT = "${workbench-web}";
-        WB_HARNESS_TCP = "1";
         # Chromium and its headless shell; the default launch uses the headless shell.
         PLAYWRIGHT_BROWSERS_PATH = pkgs.playwright-driver.browsers.override {
           withFirefox = false;

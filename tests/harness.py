@@ -26,7 +26,8 @@ Shells: bash from $BASH, else /run/current-system/sw/bin/bash when it exists, el
 sh (/bin/sh) as a second shell for tests.
 
 Test mode (the default) gives the hub a temporary HOME and environment canaries, and exits
-when stdin closes. --dogfood uses the real HOME, no canaries, ignores stdin, and still uses a
+when stdin closes. The stdin lines "stop hub" and "start hub" stop wb-hub (SIGTERM) and start
+it again, acknowledged on stderr with "harness: wb-hub stopped" / "harness: wb-hub started". --dogfood uses the real HOME, no canaries, ignores stdin, and still uses a
 temporary state directory and a fresh, empty boards directory.
 
 Binaries come from --bin-dir, else from PATH. The web root comes from --web-root or
@@ -369,20 +370,39 @@ def main():
               f"logs in {h.root}; kill -HUP {os.getpid()} restarts wb-web", file=sys.stderr)
     else:
         def watch_stdin():
-            while sys.stdin.buffer.read(4096):
-                pass
+            for line in sys.stdin.buffer:
+                if line.strip() in (b"stop hub", b"start hub"):
+                    events.append(line.strip().decode())
+                    wake.set()
             events.append(signal.SIGTERM)
             wake.set()
 
         threading.Thread(target=watch_stdin, daemon=True).start()
 
     status = 0
+    hub_stopped = False
     try:
         while True:
             wake.wait(0.5)
             wake.clear()
             while events:
-                if events.pop(0) != signal.SIGHUP:
+                event = events.pop(0)
+                if event == "stop hub":
+                    h.stop_proc(h.hub)
+                    hub_stopped = True
+                    print("harness: wb-hub stopped", file=sys.stderr, flush=True)
+                    continue
+                if event == "start hub":
+                    try:
+                        h.start_hub()
+                    except RuntimeError as e:
+                        print(f"harness: {e}\n{h.log_tail('hub')}", file=sys.stderr)
+                        status = 1
+                        return status
+                    hub_stopped = False
+                    print("harness: wb-hub started", file=sys.stderr, flush=True)
+                    continue
+                if event != signal.SIGHUP:
                     return status
                 try:
                     h.restart_web()
@@ -392,6 +412,8 @@ def main():
                     status = 1
                     return status
             for name, proc in (("wb-hub", h.hub), ("wb-web", h.web), ("caddy", h.caddy)):
+                if name == "wb-hub" and hub_stopped:
+                    continue
                 if proc.poll() is not None:
                     print(f"harness: {name} exited with {proc.returncode}", file=sys.stderr)
                     status = 1

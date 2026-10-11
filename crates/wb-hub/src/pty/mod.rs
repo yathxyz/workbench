@@ -47,8 +47,6 @@ const KILL_AFTER: Duration = Duration::from_secs(3);
 const HOLD_IDLE: Duration = Duration::from_millis(20);
 /// How long an attach to a full-screen app keeps the PTY one row short.
 const NUDGE: Duration = Duration::from_millis(50);
-/// What a snapshot contains when the alternate screen is active (DESIGN §3.4.3).
-const ALT_SCREEN: &str = "\x1b[?1049h";
 
 /// A request to a session actor.
 pub enum Cmd {
@@ -572,7 +570,7 @@ impl Pty {
             .and_then(|r| self.ring.since(r.out));
         let resumed = tail.is_some();
         let replay = tail.unwrap_or_else(|| self.vt.as_mut().map(Vt::snapshot).unwrap_or_default());
-        let nudge = !resumed && replay.contains(ALT_SCREEN);
+        let nudge = !resumed && self.vt.as_ref().is_some_and(Vt::alternate_screen);
         reply.ok(&PtyOpenReply {
             new: false,
             pid: self.pid,
