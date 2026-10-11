@@ -348,7 +348,8 @@ in
           last = journal_tail("a1", 1)[-1]
           assert last["e"] == "exit" and last["reason"] == "hub_restart", last
           tail = journal_tail("a3", 3)
-          got = [(e["e"], e.get("req"), e.get("by"), e.get("code"), e.get("reason")) for e in tail]
+          # `code` is turn_error's reason code; on `exit` it is the agent's exit status, which is not checked.
+          got = [(e["e"], e.get("req"), e.get("by"), e.get("code") if e["e"] != "exit" else None, e.get("reason")) for e in tail]
           assert got == [("permission_resolved", a3_req, "hub", None, None), ("turn_error", None, None, "interrupted", None),
                          ("exit", None, None, None, "hub_restart")], tail
           wb.succeed("systemctl start workbench-hub")
