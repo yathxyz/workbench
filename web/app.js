@@ -677,18 +677,27 @@ class JsRepl {
 
 // Real PTY through canvasd. The daemon keeps the session alive across reloads and replays recent output.
 // A real shell on the server (/pty, §3.5.1). Nothing auto-runs: `spawn` is true only on the first open of a card made in
-// this page and on Enter on an ended or not-found card; page loads and reconnects attach with `resume` (SEC-2, F-A6).
+// this page and on Enter on an ended or not-found card, and only until that open is sent; page loads and reconnects attach
+// with `resume` (SEC-2, F-A6).
 const IN_CHUNK = 262144;   // characters per `in` message: worst-case JSON escaping stays under the web's message cap
 const EXIT_TEXT = {
   hub_restart: 'the Workbench hub restarted: press Enter to start a new shell',
   killed: 'process killed: press Enter to start a new one',
   spawn_failed: 'could not start: press Enter to try again',
 };
+// Board, server or host text written into a terminal: control characters show escaped, so the text cannot rewrite the
+// prompt it sits in (SEC-2), and a long value is cut with a visible mark.
+function plain(s) {
+  const t = String(s).replace(/[\x00-\x1f\x7f-\x9f]/g, c => '\\x' + c.charCodeAt(0).toString(16).padStart(2, '0'));
+  return t.length > 200 ? t.slice(0, 200) + '…' : t;
+}
+// A card's shell is a name in the hub's syntax for one (DELTA-1 §B.5); anything else on a board is never shown or sent.
+const shellName = n => /^[a-z0-9-]{1,32}$/.test(n.shell || '') ? n.shell : '';
 class PtyBackend {
   constructor(n, term, L) { this.n = n; this.t = term; this.L = L; this.spawn = !!n._spawn; delete n._spawn; this.tries = 0; this.connect(); }
   openMsg() {
     const n = this.n, m = { t: 'open', id: n.id, cmd: n.cmd || '', parent: n.spawnFrom || '', cwd: n.cwd || '', tmux: n.tmux || '', cols: this.t.cols, rows: this.t.rows, env: { CANVAS_NODE: pathOf(n.id), ...(n.env || {}) }, spawn: this.spawn };
-    if (this.spawn && n.shell) m.shell = n.shell;
+    if (this.spawn && shellName(n)) m.shell = n.shell;
     if (!this.spawn && this.resume) m.resume = this.resume;
     return JSON.stringify(m);
   }
@@ -699,20 +708,19 @@ class PtyBackend {
     if (h) { this.n.hostUrl = h.url; rpcFor(h); } else delete this.n.hostUrl;
     this.parked = false; this.final = false; this.helloSeen = false;
     const ws = this.ws = new WebSocket(hWs(h, '/pty'));
-    ws.onopen = () => { ws.send(this.openMsg()); if (h) { this.tries = 0; hostUp(h); } };
+    ws.onopen = () => { ws.send(this.openMsg()); this.spawn = false; if (h) { this.tries = 0; hostUp(h); } };   // a reconnect never spawns
     ws.onmessage = ev => {
       let m; try { m = JSON.parse(ev.data); } catch { return; }
       if (m.t === 'hello') {
         this.dead = false; this.exitReason = null; this.helloSeen = true; this.tries = 0; this.epoch = m.epoch;
-        this.spawn = false;   // only now: a socket that closes before hello (1013, a restart) retries the spawn
         this.final = false;   // a respawn on the socket a failed open left open is live again
         this.L?.el.classList.remove('net-wait');
         if (m.stream != null) this.resume = { stream: m.stream, out: m.out };
         if (m.tmux) { if (this.n.tmuxSess !== m.tmux || !!this.n.tmuxAdopted !== !!m.adopted) { this.n.tmuxSess = m.tmux; this.n.tmuxAdopted = !!m.adopted; retag(this.n); } if (m.attached && m.cwd) this.n.cwdLive = m.cwd; }
         if (m.new) {
           if (this.lost || (this.helloed && !this.respawning)) this.t.write('\r\n\x1b[33m[new shell: the server had no session for this card]\x1b[0m\r\n');
-          if (this.n.replay) {
-            const r = this.n.replay; delete this.n.replay; dirty();
+          if (this.n._replay) {   // set only by spawnChild in this page, never saved: a board cannot type into a new shell
+            const r = this.n._replay; delete this.n._replay;
             setTimeout(() => { this.t.write('\x1b[38;5;179m↺ replaying the parent’s input\x1b[0m\r\n'); this.send(r); }, 800);
           }
         } else if (m.resumed) this.t.write(m.replay || '');   // the ring tail after our offset: the scrollback stays
@@ -728,9 +736,12 @@ class PtyBackend {
       else if (m.t === 'error') {
         if (!this.helloSeen) this.final = true;   // a failed open: the server closes 1000, nothing to reconnect to (F-A4)
         this.dead = true;
-        if (m.code === 'not_found') { this.lost = true; this.t.write(`\r\n\x1b[33m[No session: press Enter to start ${this.n.cmd || this.n.shell || 'a shell'}]\x1b[0m\r\n`); }
-        else if (m.code === 'bad_request' && this.n.shell && INFO?.defaultShell && /^shell .* not available/.test(m.error || '')) this.offerDefault();
-        else this.t.write('\r\n\x1b[31m' + m.error + '\x1b[0m\r\n');
+        if (m.code === 'not_found') {
+          const env = Object.keys(this.n.env || {});   // a board's env changes what starts too (PROMPT_COMMAND, BASH_ENV)
+          this.lost = true; this.t.write(`\r\n\x1b[33m[No session: press Enter to start ${plain(this.n.cmd || shellName(this.n) || 'a shell')}${env.length ? ' with env ' + plain(env.join(' ')) : ''}]\x1b[0m\r\n`);
+        }
+        else if (m.code === 'bad_request' && shellName(this.n) && INFO?.defaultShell && /^shell .* not available/.test(m.error || '')) this.offerDefault();
+        else this.t.write('\r\n\x1b[31m' + plain(m.error) + '\x1b[0m\r\n');
       }
     };
     ws.onclose = ev => {
@@ -738,7 +749,7 @@ class PtyBackend {
       if (h) {
         hostDown(h);
         if (hostAuto(this.n)) { this.tries = (this.tries || 0) + 1; setTimeout(() => this.connect(), Math.min(15000, 1200 * 2 ** Math.min(this.tries, 4))); }
-        else { this.parked = true; this.t.write(`\r\n\x1b[2m[@${h.name} is unreachable. ↻ on the folder tab, or entering the workspace, reconnects.]\x1b[0m\r\n`); }
+        else { this.parked = true; this.t.write(`\r\n\x1b[2m[@${plain(h.name)} is unreachable. ↻ on the folder tab, or entering the workspace, reconnects.]\x1b[0m\r\n`); }
         return;
       }
       // §3.5.4: 1000/1008/1009 are final and keep the card's state; 1013 waits for the hub; the rest back off.
@@ -765,14 +776,14 @@ class PtyBackend {
     this.t.write('\r\n\x1b[2m[this session was ended elsewhere: press Enter to start a new one]\x1b[0m\r\n');
     try { this.ws?.close(); } catch {}
   }
-  offerDefault() { this.shellOffer = true; this.t.write(`\r\n\x1b[33m[the shell ${this.n.shell} is not available here: press Enter to start ${INFO.defaultShell}]\x1b[0m\r\n`); }
+  offerDefault() { this.shellOffer = true; this.t.write(`\r\n\x1b[33m[the shell ${shellName(this.n)} is not available here: press Enter to start ${plain(INFO.defaultShell)}]\x1b[0m\r\n`); }
   // Enter on an ended or not-found card: an explicit spawn with the card's shell, or the default one the card offered
   respawn() {
-    if (!this.shellOffer && this.n.shell && INFO?.shells && INFO.defaultShell && !INFO.shells.includes(this.n.shell)) return this.offerDefault();
+    if (!this.shellOffer && shellName(this.n) && INFO?.shells && INFO.defaultShell && !INFO.shells.includes(this.n.shell)) return this.offerDefault();
     if (this.shellOffer) { this.shellOffer = false; this.n.shell = INFO.defaultShell; updateTitle(this.n); dirty(); }
     this.dead = false; this.respawning = true; this.spawn = true;
     // after a failed open the server is closing this socket (1000), so the spawn needs a new one
-    if (this.ws?.readyState === 1 && !this.final) this.ws.send(this.openMsg()); else this.connect();
+    if (this.ws?.readyState === 1 && !this.final) { this.ws.send(this.openMsg()); this.spawn = false; } else this.connect();
   }
   send(d) {
     if (this.ws?.readyState !== 1) return;
@@ -789,12 +800,41 @@ class PtyBackend {
   }
   // only the tab the user is looking at sizes the PTY (ROB-8)
   resize(cols, rows) { if (this.ws?.readyState === 1 && document.visibilityState === 'visible' && document.hasFocus() && activeId === this.n.id) this.ws.send(JSON.stringify({ t: 'resize', cols, rows })); }
-  // the card goes: a wb-* tmux session dies with it, an adopted one is only detached (the daemon decides); detachOnly forces a detach
-  kill() { this.disposed = true; clearTimeout(this.timer); WAKE.delete(this); if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ t: 'kill', session: this.detachOnly ? false : undefined })); setTimeout(() => this.ws?.close(), 50); }
+  // the card goes: a wb-* tmux session dies with it, an adopted one is only detached (the daemon decides); detachOnly forces a detach.
+  // Without an open socket the kill waits for the server; a connecting socket is dropped before it can send its open.
+  kill() {
+    this.disposed = true; clearTimeout(this.timer); WAKE.delete(this);
+    const session = this.detachOnly ? false : undefined;
+    if (this.ws?.readyState === 1) { this.ws.send(JSON.stringify({ t: 'kill', session })); setTimeout(() => this.ws?.close(), 50); }
+    else { try { this.ws?.close(); } catch {} new PtyReap(this.n.id, session, this.host); }
+  }
   // the card went in another tab: close here, the session is not ours to end
   dispose() { this.disposed = true; clearTimeout(this.timer); WAKE.delete(this); try { this.ws?.close(); } catch {} }
   // end the process (session=true also kills a tmux session) but keep the card: it shows the exit and Enter starts anew
   end(session) { if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ t: 'kill', session })); }
+}
+// The kill of a card removed while its socket was down (§3.5.1): attach without spawning once the server is back, then end
+// the session. It lives in this page only, so a reload before the server returns leaves the session running.
+class PtyReap {
+  constructor(id, session, h) { this.id = id; this.session = session; this.h = h; this.tries = 0; this.connect(); }
+  connect() {
+    clearTimeout(this.timer); WAKE.delete(this); this.waitHub = false;
+    const ws = this.ws = new WebSocket(hWs(this.h, '/pty'));
+    ws.onopen = () => ws.send(JSON.stringify({ t: 'open', id: this.id, spawn: false }));
+    ws.onmessage = ev => {
+      let m; try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.t === 'hello') { this.done = true; ws.send(JSON.stringify({ t: 'kill', session: this.session })); setTimeout(() => ws.close(), 50); }
+      else if (m.t === 'error' || m.t === 'gone') { this.done = true; ws.close(); }   // no session left to end
+    };
+    ws.onclose = ev => {
+      if (this.done || [1000, 1008, 1009].includes(ev.code)) return;
+      WAKE.add(this);
+      if (ev.code === 1013) { this.waitHub = true; this.timer = setTimeout(() => this.wake(), 30000); return; }
+      netKick();
+      if (NET.state !== 'signed_out' && NET.state !== 'forbidden') this.timer = setTimeout(() => this.connect(), backoff(this.tries++));
+    };
+  }
+  wake() { if (this.ws?.readyState > 1) { this.tries = 0; this.connect(); } }
 }
 class Offline {
   constructor(n, term) { term.write('\x1b[33mThis node is a real shell. Start canvasd to run it:\x1b[0m\r\n  python3 daemon/canvasd.py --open\r\n'); }
@@ -1453,7 +1493,7 @@ function mountNode(n) {
     if (n.file) B('⌁', 'File-backed: ' + n.file + ' (reloads when the file changes)', () => toast('Backed by ' + n.file));
   } else if (n.kind === 'web') {
     B('↻', 'Reload', () => webGo(n, live[n.id]));
-    B('↗', 'Open in a browser tab', () => window.open(n.url || 'about:blank', '_blank', 'noopener'));
+    B('↗', 'Open in a browser tab', () => { if (webUrlOk(n.url)) window.open(n.url, '_blank', 'noopener'); else toast('Only http and https URLs open in a tab.'); });
   } else if (n.kind === 'sketch') {
     B('Aa', 'Turn the ink on this card into a page (needs Claude with images)', () => sketchToPage(n));
     B('⌫', 'Clear the ink on this card', () => sketchClear(n));
@@ -1491,7 +1531,7 @@ function badgeOf(n) {
   if (n.kind === 'frame' && n.owner && S.nodes[n.owner]) return '✦ ' + S.nodes[n.owner].name;
   if (n.kind === 'artifact') return n.head ? 'v ' + String(n.head).slice(0, 6) : '';
   if (n.kind === 'ghost') return n.alias ? 'copy' : n.journalDay && !n.noteId ? 'journal' : n.noteId ? 'note' : n.linkTitle ? 'link' : n.tmuxTarget ? 'tmux' : n.procPid ? 'process' : n.unitName ? (n.unitState || 'unit') : n.hardlink ? 'hardlink' : n.link ? 'symlink' : n.mount ? 'mount' : n.dir ? 'directory' : 'file';
-  if (n.kind === 'term') return n.backend === 'pty' ? n.shell || 'shell' : 'sim shell';
+  if (n.kind === 'term') return n.backend === 'pty' ? shellName(n) || 'shell' : 'sim shell';
   if (n.kind === 'repl') return n.lang === 'js' ? 'js' : (n.cmd || '').split(' ')[0].replace('python3', 'py');
   return { buffer: 'page', ref: 'ref', agent: 'agent' }[n.kind] || n.kind;
 }
@@ -1712,9 +1752,9 @@ function spawnChild(n, name) {
     child.cwd = n.cwd; child.env = { ...(n.env || {}) };
     child.spawnNote = `branched from ${pathOf(n.id)}: started in ${n.cwd}, inherited ${Object.keys(child.env).length} env var(s)`;
   }
-  if (n.kind === 'term' && n.backend === 'pty') { child.env = { ...(n.env || {}) }; if (n.shell) child.shell = n.shell; }
+  if (n.kind === 'term' && n.backend === 'pty') { child.env = { ...(n.env || {}) }; if (shellName(n)) child.shell = n.shell; }
   if (n.kind === 'repl' && n.lang === 'js') { child.history = [...(n.history || [])]; child.replayFrom = pathOf(n.id); }
-  if (n.kind === 'repl' && n.lang !== 'js') child.replay = n.inputLog || '';
+  if (n.kind === 'repl' && n.lang !== 'js') child._replay = n.inputLog || '';
   if (n.kind === 'agent') { child.turns = (n.turns || []).map(t => ({ ...t })); child.log = [...(n.log || []).filter(m => !m.live).map(m => ({ ...m })), { t: 'note', text: `Forked from ${pathOf(n.id)} after ${child.turns.length} turn(s). This branch continues on its own.` }]; child.tier = n.tier; }
   S.edges.push({ id: uid('e'), from: n.id, to: child.id, type: 'spawn' });
   addNode(child);
@@ -1824,7 +1864,7 @@ function renderEdges() {
     const mx = .125 * p1.x + .375 * c1.x + .375 * c2.x + .125 * p2.x, my = .125 * p1.y + .375 * c1.y + .375 * c2.y + .125 * p2.y;
     const lg = svgEl('g', { class: `elabel e-${e.type}-l`, transform: `translate(${mx},${my})` });
     const w = e.type.length * 7 + 14;
-    lg.append(svgEl('rect', { x: -w / 2, y: -10, width: w, height: 20, rx: 10 }));
+    lg.append(svgEl('rect', { x: -w / 2, y: -10, width: w, height: 20 }));
     const tx = svgEl('text', { 'text-anchor': 'middle', y: 4 }); tx.textContent = e.type; lg.append(tx);
     const title = svgEl('title'); title.textContent = e.persp ? 'symlink on the host (follows the filesystem)' : 'Click to change type · Shift-click to delete'; lg.append(title);
     if (e.persp) { out.push(lg); continue; }
@@ -2759,7 +2799,7 @@ const AGENT_TOOLS = [
       const k = { page: 'buffer', shell: 'term', repl: 'repl', agent: 'agent' }[kind]; if (!k) throw new Error('unknown kind ' + kind);
       const par = parent && findNode(parent), nr = near && findNode(near);
       if (par && par.kind === k) return pathOf(spawnChild(par, name).id);
-      const extra = { term: { backend: DAEMON ? 'pty' : 'fake', cwd: DAEMON ? undefined : '/home/me', env: {} }, repl: { lang: 'js', history: [] }, buffer: { text: str(text) || `# ${clean(name)}\n\n- ` }, agent: { log: [], turns: [], tier: 'quick' } }[k];
+      const extra = { term: { backend: DAEMON ? 'pty' : 'fake', shell: shellDefault(), cwd: DAEMON ? undefined : '/home/me', env: {} }, repl: { lang: 'js', history: [] }, buffer: { text: str(text) || `# ${clean(name)}\n\n- ` }, agent: { log: [], turns: [], tier: 'quick' } }[k];
       const w = k === 'buffer' ? 420 : 520, h = k === 'buffer' ? 300 : 340, base = nr || par || n0();
       const pos = base ? freeSpot(base.x + base.w + 60, base.y, w, h) : (c => freeSpot(c.x - w / 2, c.y - h / 2, w, h))(viewCenterWorld());
       const m = addNode({ kind: k, name: clean(name), ...pos, w, h, ...extra });
@@ -3188,7 +3228,7 @@ function rgShellHere() {
   const { e } = rgCur(), fsh = isFs(RG.dir) ? fsSplit(RG.dir.slice(3)) : null, fsDir = fsh ? fsh.p : null, folder = !isFs(RG.dir) && RG.dir !== 'root' ? S.nodes[RG.dir] : null;
   setView('canvas');
   const c = viewCenterWorld(), w = 560, h = 320, hf = fsh?.h ? hostFolder(fsh.h) : null;
-  const n = addNode({ kind: 'term', backend: DAEMON ? 'pty' : 'fake', name: 'sh' + (nodeList().filter(m => m.kind === 'term').length + 1), env: {}, ...freeSpot(c.x - w / 2, c.y - h / 2, w, h), w, h,
+  const n = addNode({ kind: 'term', backend: DAEMON ? 'pty' : 'fake', shell: shellDefault(), name: 'sh' + (nodeList().filter(m => m.kind === 'term').length + 1), env: {}, ...freeSpot(c.x - w / 2, c.y - h / 2, w, h), w, h,
     cwd: fsDir ? fsDir.replace(/^~/, DAEMON ? '~' : '/home/me') : DAEMON ? undefined : '/home/me', in: folder ? folder.id : hf ? hf.id : undefined });
   if (hf) adopt(n, hf, null, true);
   jumpNode(n, 1, () => live[n.id]?.term?.focus());
@@ -3587,7 +3627,7 @@ function graphDraw() {
     ctx.beginPath();
     if (g.kind === 'buffer' || g.kind === 'ghost') ctx.arc(p.x, p.y, rad, 0, Math.PI * 2);
     else if (g.kind === 'folder') { const w = rad * 1.5; ctx.moveTo(p.x - w, p.y - rad * .7); ctx.lineTo(p.x - w * .3, p.y - rad * .7); ctx.lineTo(p.x - w * .15, p.y - rad); ctx.lineTo(p.x + w, p.y - rad); ctx.lineTo(p.x + w, p.y + rad); ctx.lineTo(p.x - w, p.y + rad); ctx.closePath(); }
-    else ctx.roundRect(p.x - rad, p.y - rad, rad * 2, rad * 2, rad * .35);
+    else ctx.rect(p.x - rad, p.y - rad, rad * 2, rad * 2);
     if (g.kind === 'ghost') { ctx.fillStyle = C.bg; ctx.fill(); ctx.setLineDash([3, 2]); ctx.strokeStyle = C.muted; ctx.lineWidth = 1.2 / z; ctx.stroke(); ctx.setLineDash([]); }
     else { ctx.fill(); ctx.stroke(); }
     if (g.id === G.sel) { ctx.beginPath(); ctx.arc(p.x, p.y, rad + 5 / z, 0, Math.PI * 2); ctx.strokeStyle = C.accent; ctx.lineWidth = 2 / z; ctx.stroke(); }
@@ -3810,7 +3850,7 @@ async function dispatchTask(t, { host, shell } = {}) {
   if (!n) n = nodeList().find(m => m.kind === 'term' && tagsOf(m).includes('agent') && (!h || fsHostKey(m) === h.url) && live[m.id]?.backend && !live[m.id].backend.dead && !live[m.id].backend.parked) || null;
   if (!n) {
     const hf = h ? hostFolder(h) : null, c = viewCenterWorld(), w = 640, hh = 400;
-    const sh = addNode({ kind: 'term', backend: DAEMON ? 'pty' : 'fake', name: 'agent' + (nodeList().filter(m => m.kind === 'term').length + 1), env: {}, in: hf ? hf.id : undefined, ...freeSpot(c.x - w / 2, c.y - hh / 2, w, hh), w, h: hh });
+    const sh = addNode({ kind: 'term', backend: DAEMON ? 'pty' : 'fake', shell: shellDefault(), name: 'agent' + (nodeList().filter(m => m.kind === 'term').length + 1), env: {}, in: hf ? hf.id : undefined, ...freeSpot(c.x - w / 2, c.y - hh / 2, w, hh), w, h: hh });
     if (hf) adopt(sh, hf, null, true);
     throw new Error('no shell with #agent' + (h ? ' on @' + h.name : '') + ': opened ' + pathOf(sh.id) + '. Start your agent there and dispatch again.');
   }

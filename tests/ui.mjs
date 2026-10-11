@@ -626,14 +626,17 @@ const REQ = [], WSL = [];
 ctx.on('request', r => REQ.push({ r, m: r.method(), url: r.url(), h: r.headers(), t: Date.now() }));
 const status = async e => (await e.r.response().catch(() => null))?.status();
 const puts = (since = 0) => REQ.filter(e => e.m === 'PUT' && e.url === ORIGIN + '/api/board' && e.t >= since);
-async function dpage(boot = true) {
-  const p = await ctx.newPage(); watchErrors(p);
+// Each socket's first open and first hello, into WSL.
+function record(p) {
   p.on('websocket', ws => {
     const w = { url: ws.url(), p, t: Date.now(), open: null, hello: null, closed: null }; WSL.push(w);
     ws.on('framesent', f => { if (w.open) return; try { const m = JSON.parse(f.payload); if (m.t === 'open') w.open = m; } catch {} });
     ws.on('framereceived', f => { if (w.hello) return; try { const m = JSON.parse(f.payload); if (m.t === 'hello') { w.hello = m; w.helloT = Date.now(); } } catch {} });
     ws.on('close', () => { w.closed = Date.now(); });
   });
+}
+async function dpage(boot = true) {
+  const p = await ctx.newPage(); watchErrors(p); record(p);
   await p.goto(ORIGIN + '/');
   if (boot) await until(() => p.evaluate(() => window.__canvas?.BOOTED));
   return p;
@@ -671,6 +674,25 @@ await section('daemon boot', async () => {
   await settled(A);
 });
 
+// DELTA-1 §A.4: index.html preloads a font file, and the service worker caches every font file fonts.css names at
+// install, so a launch after one visit renders in them offline. Its own context: the daemon context blocks workers.
+await section('§A.4', async () => {
+  const css = await (await api('/fonts/fonts.css')).text(), want = [...css.matchAll(/url\("([^"]+)"\)/g)].map(m => '/fonts/' + m[1]);
+  const html = await (await api('/')).text(), pre = [...html.matchAll(/<link [^>]*rel="preload"[^>]*>/g)].map(l => l[0].match(/href="([^"]+)"/)?.[1]).filter(Boolean).map(h => new URL(h, ORIGIN + '/').pathname);
+  check('§A.4: index.html preloads a font file fonts.css names', pre.length > 0 && pre.every(h => want.includes(h)), JSON.stringify({ pre, want }));
+  const sctx = await browser.newContext({ serviceWorkers: 'allow' });
+  try {
+    const p = await sctx.newPage(); await p.goto(ORIGIN + '/icon.svg');
+    const have = await p.evaluate(async () => {
+      await navigator.serviceWorker.register('/sw.js');
+      await Promise.race([navigator.serviceWorker.ready, new Promise((_, no) => setTimeout(() => no(new Error('no active service worker after 15 s')), 15000))]);
+      const out = []; for (const k of await caches.keys()) for (const q of await (await caches.open(k)).keys()) out.push(new URL(q.url).pathname);
+      return out;
+    });
+    check('§A.4: the service worker caches every font file fonts.css names when it installs', want.length >= 4 && want.every(w => have.includes(w)), JSON.stringify({ want, have }));
+  } finally { await sctx.close(); }
+});
+
 // DELTA-1 §A.5 in both schemes: square corners, Modus backgrounds, the terminal theme, the mono face, no blur
 await section('§A.5', async () => {
   const MODUS = { light: { bgDim: 'rgb(239, 233, 221)', bgMain: '#fbf7f0' }, dark: { bgDim: 'rgb(29, 34, 53)', bgMain: '#0d0e1c' } };
@@ -683,7 +705,8 @@ await section('§A.5', async () => {
       for (const sh of bs.split(/,(?![^(]*\))/)) { const n = sh.replace(/[a-z-]+\([^)]*\)|inset/g, '').trim().split(/\s+/).map(parseFloat); if ((n[2] || 0) > 0) blurred.push((e.id || e.className || e.tagName) + (ps || '') + ': ' + bs); }
     }
     return {
-      radius: ['.node', '#add-shell', '#repl-menu', '#pal-in'].map(s => cs(s, 'borderTopLeftRadius')), body: cs('body', 'backgroundColor'),
+      radius: ['.node', '#add-shell', '#repl-menu', '#pal-in', '.frame.shape-round'].map(s => cs(s, 'borderTopLeftRadius')), body: cs('body', 'backgroundColor'),
+      edgeLabels: document.querySelectorAll('#edges rect').length, pills: [...document.querySelectorAll('#edges rect')].filter(r => parseFloat(r.getAttribute('rx') || 0) > 0).length,
       termBg: term?.options.theme.background?.toLowerCase(),
       fontCheck: document.fonts.check('13px "JetBrainsMono Nerd Font Mono"'),
       fontLoaded: [...document.fonts].some(f => f.family.replace(/"/g, '') === 'JetBrainsMono Nerd Font Mono' && f.status === 'loaded'),
@@ -694,10 +717,31 @@ await section('§A.5', async () => {
     await A.emulateMedia({ colorScheme: how === 'auto' ? scheme : scheme === 'dark' ? 'light' : 'dark' });   // the override must beat the system scheme
     await A.evaluate(t => window.__canvas.setTheme(t), how); await sleep(300);
     const l = await looks(), m = MODUS[scheme];
-    check(`§A.5 ${scheme} (${how === 'auto' ? 'prefers-color-scheme' : 'data-theme'}): radius 0, Modus backgrounds, terminal bg-main, mono face loaded, no blurred shadow`,
-      l.radius.every(r => r === '0px') && l.body === m.bgDim && l.termBg === m.bgMain && l.fontCheck && l.fontLoaded && !l.blurred.length, JSON.stringify(l));
+    check(`§A.5 ${scheme} (${how === 'auto' ? 'prefers-color-scheme' : 'data-theme'}): radius 0, square edge labels, Modus backgrounds, terminal bg-main, mono face loaded, no blurred shadow`,
+      l.radius.every(r => r === '0px') && l.edgeLabels > 0 && !l.pills && l.body === m.bgDim && l.termBg === m.bgMain && l.fontCheck && l.fontLoaded && !l.blurred.length, JSON.stringify(l));
   }
   await A.evaluate(() => window.__canvas.setTheme('auto')); await A.emulateMedia({ colorScheme: 'light' }); await settled(A);
+  // the graph view's glyphs are canvas paths, out of reach of computed styles
+  const g = await A.evaluate(async () => {
+    const C = window.__canvas, P = CanvasRenderingContext2D.prototype, keep = { roundRect: P.roundRect, rect: P.rect }, n = { roundRect: 0, rect: 0 };
+    for (const k in keep) P[k] = function (...a) { n[k]++; return keep[k].apply(this, a); };
+    try { C.setView('graph'); await new Promise(r => setTimeout(r, 800)); } finally { Object.assign(P, keep); C.setView('canvas'); }
+    return n;
+  });
+  check('§A.5: the graph view draws square glyphs, never a rounded rectangle', g.rect > 0 && g.roundRect === 0, JSON.stringify(g));
+});
+
+// DELTA-1 §B.5: every new-terminal path starts the device's shell; here the agent tool's
+await section('§B.5', async () => {
+  st = await A.evaluate(async () => {
+    const C = window.__canvas, before = new Set(Object.keys(C.S.nodes));
+    await C.AGENT_TOOLS.find(t => t.name === 'create_node').run({ kind: 'shell', name: 'b5' });
+    const made = Object.values(C.S.nodes).filter(n => !before.has(n.id)), r = { want: C.shellDefault(), got: made.map(n => n.shell) };
+    made.forEach(n => C.removeNode(n.id));
+    return r;
+  });
+  check('§B.5: a shell made by the create_node tool carries the default shell', !!st.want && st.got.length === 1 && st.got[0] === st.want, JSON.stringify(st));
+  await settled(A);
 });
 
 // N32: web cards open only http(s); their frames never get allow-same-origin
@@ -708,12 +752,16 @@ await section('N32', async () => {
     const typed = C.newWeb('javascript:window.__n32=3'), ok = C.newWeb('http://127.0.0.1:9/');
     let tool; try { await C.AGENT_TOOLS.find(t => t.name === 'open_web').run({ url: 'javascript:window.__n32=4' }); tool = 'ran'; } catch (e) { tool = 'refused'; }
     await new Promise(r => setTimeout(r, 300));
+    const opened = [], open = window.open, tabs = n => [...C.live[n.id].el.querySelectorAll('button')].filter(b => b.textContent === '↗');
+    window.open = u => { opened.push(String(u)); return null; };
+    try { for (const n of [...bad, ok]) for (const b of tabs(n)) b.click(); } finally { window.open = open; }
     const r = { srcs: bad.map(n => frameOf(n).getAttribute('src')), notes: bad.map(n => C.live[n.id].note.textContent), typed: typed.url, typedSrc: frameOf(typed).getAttribute('src'), tool, ran: window.__n32 ?? null,
-      okSrc: frameOf(ok).getAttribute('src'), sandbox: frameOf(ok).getAttribute('sandbox') };
+      okSrc: frameOf(ok).getAttribute('src'), sandbox: frameOf(ok).getAttribute('sandbox'), buttons: [...bad, ok].map(n => tabs(n).length), opened };
     for (const n of [...bad, typed, ok]) C.removeNode(n.id);
     return r;
   });
   check('N32: javascript: and data: web cards are refused; an http card\'s frame has no allow-same-origin', st.srcs.every(s => s === null) && st.notes.every(t => t.startsWith('Refused')) && st.typed === '' && st.typedSrc === null && st.tool === 'refused' && st.ran === null && st.okSrc === 'http://127.0.0.1:9/' && !/allow-same-origin/.test(st.sandbox), JSON.stringify(st));
+  check('N32: ↗ opens a tab only for the http card', st.buttons.every(k => k === 2) && st.opened.length === 2 && st.opened.every(u => u === 'http://127.0.0.1:9/'), JSON.stringify({ buttons: st.buttons, opened: st.opened }));
   await settled(A);
 });
 
@@ -792,7 +840,7 @@ await section('N36', async () => {
 // DELTA-1 §B.6: the new-terminal action offers /api/info.shells; the next one defaults to the last pick. The page is
 // given a second shell when the server offers fewer than two, since the picker only opens for a choice.
 await section('§B.6', async () => {
-  const P = await ctx.newPage(); watchErrors(P);
+  const P = await ctx.newPage(); watchErrors(P); record(P);
   await P.route('**/api/info', r => r.fetch().then(async res => {
     const info = await res.json(); if (!(info.shells?.length >= 2)) Object.assign(info, { shells: ['bash', 'sh'], defaultShell: info.defaultShell || 'bash' });
     await r.fulfill({ response: res, json: info });
@@ -814,6 +862,9 @@ await section('§B.6', async () => {
     const two = await P.evaluate(id => window.__canvas.S.nodes[id]?.shell, second);
     check('§B.6: the picker lists /api/info.shells; the card keeps and shows the shell; the next terminal defaults to the last pick',
       [...listed].sort().join() === [...info.shells].sort().join() && listed[0] === info.def && one.shell === pick && one.badge?.includes(pick) && listed2[0] === pick && two === pick, JSON.stringify({ listed, info, one, listed2, two }));
+    const sent = id => ptyOf(P, id).some(w => w.open?.spawn === true && w.open?.shell === pick);
+    await until(() => sent(first) && sent(second), 5000);
+    check('§B.6: both terminals\' /pty opens spawn with the picked shell', sent(first) && sent(second), JSON.stringify([first, second].map(id => ptyOf(P, id).map(w => w.open))));
     await P.evaluate(ids => ids.forEach(id => window.__canvas.removeNode(id)), [first, second].filter(Boolean));
     await settled(P);
   } finally { await P.close(); }
@@ -892,11 +943,14 @@ await section('N7/N8', async () => {
 });
 await section('cleanup', async () => { await T.evaluate(id => window.__canvas.removeNode(id), tid); await settled(T); await T.close(); await A.close(); });
 
-// N30: a board with cmd and env, loaded in a fresh page, runs nothing
+// N30: a board with cmd and env, loaded in a fresh page, runs nothing. The No session line shows a board's cmd with its
+// control characters escaped and names its env (SEC-2), and a board's `replay` is never typed into the shell Enter starts.
 await section('N30', async () => {
-  const pwned = path.join(TMP, 'pwned30');
+  const pwned = path.join(TMP, 'pwned30'), replayed = path.join(TMP, 'replayed30');
   const cur = await api('/api/board'), etag = cur.headers.get('ETag'), board = await cur.json();
   board.nodes.n30 = { id: 'n30', kind: 'term', backend: 'pty', name: 'n30', x: 100, y: 100, w: 500, h: 260, cmd: `touch '${pwned}'`, env: { BASH_ENV: path.join(TMP, 'x') } };
+  board.nodes.n30e = { id: 'n30e', kind: 'term', backend: 'pty', name: 'n30e', x: 100, y: 400, w: 1400, h: 260, cmd: 'echo n30e\x1b[2K\rbash', env: { PROMPT_COMMAND: 'true' } };
+  board.nodes.n30r = { id: 'n30r', kind: 'term', backend: 'pty', name: 'n30r', x: 100, y: 700, w: 500, h: 260, env: {}, replay: `touch '${replayed}'\r` };
   const r = await api('/api/board', { method: 'PUT', headers: { 'Content-Type': 'application/json', 'If-Match': etag }, body: JSON.stringify(board) });
   const before = (await sessions()).map(s => s.sid).sort().join();
   const P = await dpage();
@@ -904,7 +958,14 @@ await section('N30', async () => {
   const after = (await sessions()).map(s => s.sid).sort().join(), text = await termText(P, 'n30');
   check('N30: a cmd/env card from the board spawns nothing and says No session: press Enter', r.status === 204 && text.includes('No session: press Enter') && !fs.existsSync(pwned) && after === before && !after.split(',').includes('n30'),
     JSON.stringify({ put: r.status, before, after, file: fs.existsSync(pwned), text: text.slice(0, 200) }));
-  await P.evaluate(() => window.__canvas.removeNode('n30')); await settled(P); await P.close();
+  await until(async () => (await termText(P, 'n30e')).includes('No session'), 8000);
+  const etext = (await termText(P, 'n30e')).split('\n').join('');
+  check('N30: the No session line shows a board cmd\'s control characters escaped and names its env', etext.includes('start echo n30e\\x1b[2K\\x0dbash with env PROMPT_COMMAND]'), JSON.stringify(etext.slice(0, 300)));
+  await until(async () => (await termText(P, 'n30r')).includes('No session'), 8000);
+  await typeIn(P, 'n30r', '\r');
+  const spawned = await until(async () => (await sessions()).find(s => s.sid === 'n30r')?.alive, 8000); await sleep(2500);
+  check('N30: Enter on a board card with replay starts its shell and types nothing into it', !!spawned && !fs.existsSync(replayed), JSON.stringify({ spawned: !!spawned, typed: fs.existsSync(replayed) }));
+  await P.evaluate(() => ['n30', 'n30e', 'n30r'].forEach(id => window.__canvas.removeNode(id))); await settled(P); await P.close();
 });
 
 // DELTA-1 §C.1: Enter between a failed open's error and the server's 1000 close starts the shell on a new socket.
@@ -938,6 +999,47 @@ await section('§C.1', async () => {
       mine.length === 2 && !mine[1].again && mine[1].spawn === true && !text.includes('connection closed') && text.includes('[new shell') && dead === false, JSON.stringify({ mine, dead, tail: text.slice(-300) }));
     await P.evaluate(id => window.__canvas.removeNode(id), id); await settled(P);
   } finally { await P.close(); }
+});
+
+// SEC-2 (§3.5.1): a spawn is sent once. Each card's first /pty socket here takes the open and closes 1011 before any hello,
+// as a hub lost after spawning would; the reconnect must attach (spawn:false), and the mock then answers not_found.
+await section('SEC-2 reconnect', async () => {
+  const P = await ctx.newPage(); watchErrors(P);
+  const log = [];
+  await P.routeWebSocket(/\/pty$/, ws => {
+    let first = true;
+    ws.onMessage(m => {
+      let o; try { o = JSON.parse(m); } catch { return; }
+      if (o.t !== 'open' || !first) return;
+      first = false; log.push({ id: o.id, spawn: o.spawn });
+      if (log.filter(e => e.id === o.id).length === 1) return void setTimeout(() => ws.close({ code: 1011 }), 100);
+      ws.send(JSON.stringify({ t: 'error', error: 'no session', code: 'not_found' }));
+      setTimeout(() => ws.close({ code: 1000 }), 200);
+    });
+  });
+  try {
+    await P.goto(ORIGIN + '/'); await until(() => P.evaluate(() => window.__canvas?.BOOTED));
+    const id = await P.evaluate(() => window.__canvas.addNode({ kind: 'term', backend: 'pty', name: 'sec2', x: 300, y: 300, w: 500, h: 260, env: {} }).id);
+    await until(async () => (await termText(P, id)).includes('No session: press Enter'), 10000);
+    const mine = log.filter(e => e.id === id);
+    check('SEC-2: a socket closed after a spawn but before hello reconnects with spawn:false and offers Enter', mine.length === 2 && mine[0].spawn === true && mine[1].spawn === false, JSON.stringify(mine));
+    await P.evaluate(id => window.__canvas.removeNode(id), id); await settled(P);
+  } finally { await P.close(); }
+});
+
+// §3.5.1: removing a card while its socket waits for the network still ends its session once the server is back
+await section('kill while reconnecting', async () => {
+  const P = await dpage();
+  try {
+    const id = await newTerm(P, 'reap');
+    netCut();
+    const waiting = await until(() => P.evaluate(id => window.__canvas.live[id]?.el.classList.contains('net-wait'), id), 8000);
+    await P.evaluate(id => window.__canvas.removeNode(id), id);
+    await sleep(500); netBack();
+    const gone = await until(async () => !(await sessions()).some(s => s.sid === id), 20000);
+    check('§3.5.1: a card removed while it reconnects ends its session when the server is back', waiting && gone, JSON.stringify({ waiting, gone, left: (await sessions()).filter(s => s.sid === id) }));
+    await settled(P);
+  } finally { netBack(); await P.close(); }
 });
 
 // N1-N3: the login page and expired sign-ins, by swapping the test Caddy's config through its admin socket (N-6)
