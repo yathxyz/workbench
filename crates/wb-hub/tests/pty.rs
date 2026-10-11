@@ -94,6 +94,57 @@ fn kill_with_forget_then_reopen_gives_a_new_incarnation() {
 }
 
 #[test]
+fn an_open_during_a_forgetting_exit_gets_a_new_incarnation_and_keeps_its_input() {
+    let hub = Hub::start();
+    let mut a = hub.connect();
+    let first = a.spawn("race", &[&hub.shell]);
+    let shell = first["pid"].as_u64().unwrap() as u32;
+    let epoch = first["epoch"].as_u64().unwrap();
+    // A background job that ignores SIGHUP keeps the slave open, so after the shell exits
+    // the session drains output for the full drain period before the forget completes.
+    a.input(
+        "race",
+        "(trap '' HUP; exec sleep 300) & echo BG=$!=END$((7*7))\r",
+    );
+    let out = a.output_until("race", "=END49");
+    let (before, _) = out.rsplit_once("=END49").unwrap();
+    let bg: u32 = before
+        .rsplit_once("BG=")
+        .and_then(|(_, pid)| pid.parse().ok())
+        .unwrap_or_else(|| panic!("no background pid in {out:?}"));
+    a.send(&json!({"t": "pty.kill", "rid": 100, "sid": "race", "forget": true}));
+    // Reaped, not just a zombie: the session has seen the exit and is draining.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while fs::exists(format!("/proc/{shell}")).unwrap() {
+        assert!(std::time::Instant::now() < deadline, "the shell survived");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Within the drain: open with spawn and type at once, without waiting for the reply.
+    let mut b = hub.connect();
+    b.send(
+        &json!({"t": "pty.open", "rid": 100, "sid": "race", "cols": 80, "rows": 24,
+                   "spawn": {"argv": [&hub.shell]}}),
+    );
+    b.input("race", "echo AFTER$((2+3))\r");
+    let r = b.until("the open reply", |m| m["rid"] == 100);
+    assert_eq!(r["t"], "ok", "{r}");
+    assert!(
+        r["epoch"].as_u64().unwrap() > epoch,
+        "the open joined the forgotten incarnation: {r}"
+    );
+    b.output_until("race", "AFTER5");
+    let list = b.ok(json!({"t": "list"}));
+    assert_eq!(list["sessions"][0]["pty"]["pid"], r["pid"], "{list}");
+    let reply = a.until("the kill reply", |m| m["rid"] == 100);
+    assert_eq!(reply["t"], "ok", "{reply}");
+    assert!(
+        wait_gone(bg, Duration::from_secs(6)),
+        "background job {bg} survived"
+    );
+}
+
+#[test]
 fn hub_environment_canaries_do_not_reach_the_child() {
     let hub = Hub::start();
     let mut c = hub.connect();

@@ -123,7 +123,7 @@ pub fn open(ctx: Arc<Ctx>, sid: String, open: Open) -> Pin<Box<dyn Future<Output
 #[derive(PartialEq, Eq)]
 enum Phase {
     Running,
-    /// Removed from the registry; queued opens are routed again.
+    /// Removed from the registry; queued commands are routed again, in order.
     Forgotten,
     /// The hub is stopping; every request is refused.
     Stopped,
@@ -168,6 +168,8 @@ struct Pty {
     stopping: Option<oneshot::Sender<()>>,
     /// `pty.kill{forget:true}` replies, sent after the exit and the forget.
     forgets: Vec<Reply>,
+    /// An open whose exit handling forgot this session; routed again before the queue.
+    rerouted: Option<Open>,
 }
 
 impl Pty {
@@ -196,6 +198,7 @@ impl Pty {
             killing: false,
             stopping: None,
             forgets: Vec::new(),
+            rerouted: None,
         }
     }
 
@@ -237,14 +240,14 @@ impl Pty {
             }
         }
         if self.phase == Phase::Forgotten {
+            // One at a time and in order, so input sent after an open follows it to the
+            // new incarnation the open creates.
             rx.close();
+            if let Some(o) = self.rerouted.take() {
+                redeliver(&self.ctx, &self.sid, Cmd::Open(o)).await;
+            }
             while let Some(cmd) = rx.recv().await {
-                match cmd {
-                    Cmd::Open(o) => {
-                        tokio::spawn(open(self.ctx.clone(), self.sid.clone(), o));
-                    }
-                    cmd => cmd.refuse(ErrorCode::NotFound, "the session was forgotten"),
-                }
+                redeliver(&self.ctx, &self.sid, cmd).await;
             }
         } else {
             while let Some(cmd) = rx.recv().await {
@@ -307,6 +310,18 @@ impl Pty {
         match spawn {
             Some(spawn) if self.pid.is_none() || self.status.is_some() => {
                 self.finish_exit();
+                if self.phase != Phase::Running {
+                    // The exit completed a `pty.kill{forget:true}`: the open belongs to
+                    // the next incarnation.
+                    self.rerouted = Some(Open {
+                        viewer,
+                        cols,
+                        rows,
+                        spawn: Some(spawn),
+                        reply,
+                    });
+                    return;
+                }
                 self.spawn(viewer, size, spawn, reply);
             }
             _ => {
@@ -565,6 +580,23 @@ impl Pty {
             }),
             acp: None,
         });
+    }
+}
+
+/// Delivers a command that reached a forgotten actor to whatever now holds `sid`: an
+/// open is routed as a new request, anything else goes to the current session, if any.
+async fn redeliver(ctx: &Arc<Ctx>, sid: &str, cmd: Cmd) {
+    const FORGOTTEN: &str = "the session was forgotten";
+    match cmd {
+        Cmd::Open(o) => open(ctx.clone(), sid.to_owned(), o).await,
+        cmd => match ctx.registry.sender(sid) {
+            Some(tx) => {
+                if let Err(unsent) = tx.send(cmd).await {
+                    unsent.0.refuse(ErrorCode::NotFound, FORGOTTEN);
+                }
+            }
+            None => cmd.refuse(ErrorCode::NotFound, FORGOTTEN),
+        },
     }
 }
 
