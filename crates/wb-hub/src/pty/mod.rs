@@ -677,6 +677,8 @@ impl Pty {
         self.pid = pid;
         self.master = Some(master);
         self.child = Some(child);
+        // The stream continues, but a character the last child left unfinished does not.
+        self.decoder = OutStream::new();
         self.eof = false;
         self.killing = false;
         self.fg = None;
@@ -685,6 +687,10 @@ impl Pty {
         self.poll_at = Some(now + FG_POLL);
         self.snapshot_at = Some(now + SNAPSHOT_EVERY);
         self.save(false);
+        // `list` shows the new process before the opener hears of it. Nothing reaches the
+        // viewer's queue before the `ok`: output is fanned out only by the loop.
+        self.add_viewer(viewer);
+        self.publish();
         reply.ok(&PtyOpenReply {
             new: true,
             pid,
@@ -696,8 +702,6 @@ impl Pty {
             resumed: false,
             replay: None,
         });
-        self.attach(viewer);
-        self.publish();
     }
 
     /// The exec failed: the session stays as a corpse with `exit{reason:"spawn_failed"}`
@@ -705,7 +709,6 @@ impl Pty {
     fn spawn_failed(&mut self, e: &std::io::Error, reply: Reply) {
         let msg = format!("spawn failed: {e}");
         warn!(argv = ?self.rec.argv, "{msg}");
-        reply.err(ErrorCode::SpawnFailed, msg);
         let reason = ExitReason::SpawnFailed;
         self.rec.exit = Some(Exit {
             code: None,
@@ -721,7 +724,9 @@ impl Pty {
         });
         self.fan_out(&exit);
         self.save(false);
+        // `list` shows the corpse before the opener hears of the failure.
         self.publish();
+        reply.err(ErrorCode::SpawnFailed, msg);
     }
 
     /// The cwd of a live `cwd_from`, then `cwd`, then `$HOME`; the first that is a
@@ -738,14 +743,19 @@ impl Pty {
     }
 
     fn attach(&mut self, viewer: Viewer) {
-        {
-            let mut viewers = lock(&self.viewers);
-            if viewers.iter().any(|v| v.id == viewer.id) {
-                return;
-            }
-            viewers.push(viewer);
+        if self.add_viewer(viewer) {
+            self.publish();
         }
-        self.publish();
+    }
+
+    /// Adds `viewer` unless its connection is attached already; whether it was added.
+    fn add_viewer(&self, viewer: Viewer) -> bool {
+        let mut viewers = lock(&self.viewers);
+        if viewers.iter().any(|v| v.id == viewer.id) {
+            return false;
+        }
+        viewers.push(viewer);
+        true
     }
 
     /// Makes `size` the desired size. `force` applies it to the PTY even when it is
