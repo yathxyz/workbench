@@ -123,15 +123,7 @@ async fn the_floor_refuses_before_anything_else() {
 async fn an_authenticated_upgrade_to_an_unknown_path_is_404() {
     let hub = FakeHub::start();
     let web = Web::start(&hub.path);
-    for path in [
-        "/",
-        "/index.html",
-        "/api/info",
-        "/ptyx",
-        "/pty/",
-        "/mcp",
-        "/acp",
-    ] {
+    for path in ["/", "/index.html", "/api/info", "/ptyx", "/pty/", "/mcp"] {
         let res = upgrade(&web, path).send().await;
         assert_eq!(res.status, 404, "{path}");
     }

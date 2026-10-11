@@ -767,9 +767,7 @@ fn scenario_setsid_child_leaves_sleep_in_a_group_of_its_own() {
 
 // ---- the hub against the fake ----
 //
-// These need the hub's ACP actor (M3-H2). Until it is merged the hub answers every
-// `acp.*` request with `unknown_type`, so they are ignored; run them at integration
-// with `cargo test -p wb-hub --test acp -- --include-ignored`.
+// Each one runs a real wb-hub with the fake in its agent table.
 
 /// Creates `sid` with `agent` and reads its events, replayed or live, until one of kind
 /// `e`; the `acp.open` reply and every event of `sid` up to that one.
@@ -820,7 +818,6 @@ fn answers(hub: &Hub, agent: &str) -> Vec<Value> {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_basic_turn_journal_facts_and_reset() {
     let mut hub = Hub::with_scenarios(&["basic"]);
     let mut c = hub.connect();
@@ -934,7 +931,6 @@ fn hub_basic_turn_journal_facts_and_reset() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_noise_goes_to_stderr_log_and_setup_succeeds() {
     let mut hub = Hub::with_scenarios(&["noise"]);
     let mut c = hub.connect();
@@ -950,7 +946,6 @@ fn hub_noise_goes_to_stderr_log_and_setup_succeeds() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_permission_first_answer_wins() {
     let mut hub = Hub::with_scenarios(&["permission"]);
     let mut c = hub.connect();
@@ -1017,7 +1012,6 @@ fn hub_permission_first_answer_wins() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_permission_reconnect_replays_in_seq_order() {
     let mut hub = Hub::with_scenarios(&["permission-reconnect"]);
     let mut a = hub.connect();
@@ -1046,7 +1040,6 @@ fn hub_permission_reconnect_replays_in_seq_order() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_agent_cancels_its_own_request() {
     let mut hub = Hub::with_scenarios(&["agent-cancels"]);
     let mut c = hub.connect();
@@ -1067,7 +1060,6 @@ fn hub_agent_cancels_its_own_request() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_form_and_url_elicitations() {
     let mut hub = Hub::with_scenarios(&[]);
     let mut c = hub.connect();
@@ -1138,7 +1130,6 @@ fn hub_form_and_url_elicitations() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor; takes 31 s"]
 fn hub_request_scoped_elicitation_pauses_the_setup_timer() {
     let mut hub = Hub::with_scenarios(&["elicitation"]);
     let mut c = hub.connect();
@@ -1170,7 +1161,6 @@ fn hub_request_scoped_elicitation_pauses_the_setup_timer() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_cancel_resolves_pending_and_ends_cancelled() {
     let mut hub = Hub::with_scenarios(&["cancel"]);
     let mut c = hub.connect();
@@ -1204,7 +1194,6 @@ fn hub_cancel_resolves_pending_and_ends_cancelled() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_crash_midturn_writes_the_death_invariant() {
     let mut hub = Hub::with_scenarios(&["crash-midturn"]);
     let mut c = hub.connect();
@@ -1247,7 +1236,6 @@ fn hub_crash_midturn_writes_the_death_invariant() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_auth_waits_for_authenticate() {
     let mut hub = Hub::with_scenarios(&["auth"]);
     let mut c = hub.connect();
@@ -1279,7 +1267,6 @@ fn hub_auth_waits_for_authenticate() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_auth_with_only_terminal_methods_kills_the_agent() {
     let mut hub = Hub::with_scenarios(&["auth-terminal"]);
     let mut c = hub.connect();
@@ -1325,7 +1312,6 @@ fn notice_text(evs: &[Value]) -> String {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_revive_resumes_when_resume_is_advertised() {
     let mut hub = Hub::with_scenarios(&["revive-resume"]);
     let mut c = hub.connect();
@@ -1361,7 +1347,6 @@ fn hub_revive_resumes_when_resume_is_advertised() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_revive_loads_without_journaling_history() {
     let mut hub = Hub::with_scenarios(&["revive-load"]);
     let mut c = hub.connect();
@@ -1395,7 +1380,6 @@ fn hub_revive_loads_without_journaling_history() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_revive_failure_makes_the_session_unrevivable() {
     let mut hub = Hub::with_scenarios(&["revive-fail"]);
     let mut c = hub.connect();
@@ -1418,7 +1402,6 @@ fn hub_revive_failure_makes_the_session_unrevivable() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_unknown_variants_and_methods() {
     let mut hub = Hub::with_scenarios(&["unknown"]);
     let mut c = hub.connect();
@@ -1449,7 +1432,6 @@ fn hub_unknown_variants_and_methods() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_protocol_version_2_is_an_agent_error() {
     let mut hub = Hub::with_scenarios(&["version"]);
     let mut c = hub.connect();
@@ -1463,7 +1445,6 @@ fn hub_protocol_version_2_is_an_agent_error() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor; takes 30 s"]
 fn hub_silent_initialize_times_out() {
     let mut hub = Hub::with_scenarios(&["hang"]);
     let mut c = hub.connect();
@@ -1478,7 +1459,6 @@ fn hub_silent_initialize_times_out() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_set_mode_journals_the_mode() {
     let mut hub = Hub::with_scenarios(&["set-mode"]);
     let mut c = hub.connect();
@@ -1496,7 +1476,6 @@ fn hub_set_mode_journals_the_mode() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_kill_forget_outlasts_a_stubborn_agent_then_respawns_fresh() {
     let mut hub = Hub::with_scenarios(&["kill-stubborn", "basic"]);
     let mut w = hub.connect();
@@ -1541,7 +1520,6 @@ fn hub_kill_forget_outlasts_a_stubborn_agent_then_respawns_fresh() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_kills_what_a_crashed_agent_left_in_its_group() {
     let mut hub = Hub::with_scenarios(&["crash-leave-child"]);
     let mut c = hub.connect();
@@ -1564,7 +1542,6 @@ fn hub_kills_what_a_crashed_agent_left_in_its_group() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_leaves_a_child_that_left_the_group() {
     let mut hub = Hub::with_scenarios(&["setsid-child"]);
     let mut c = hub.connect();
@@ -1601,7 +1578,6 @@ fn large_message(m: usize) -> String {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_large_replay_is_capped_coalesced_and_ascending() {
     let mut hub = Hub::with_scenarios(&["replay-large"]);
     let mut a = hub.connect();
@@ -1666,7 +1642,6 @@ fn hub_large_replay_is_capped_coalesced_and_ascending() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_kill9_midturn_is_normalised_at_restart() {
     let mut hub = Hub::with_scenarios(&["permission"]);
     let mut c = hub.connect();
@@ -1701,7 +1676,6 @@ fn hub_kill9_midturn_is_normalised_at_restart() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_sigterm_midturn_writes_hub_restart_and_ends_the_group() {
     let mut hub = Hub::with_scenarios(&["permission"]);
     let mut c = hub.connect();
@@ -1726,8 +1700,10 @@ fn hub_sigterm_midturn_writes_hub_restart_and_ends_the_group() {
     fold_equals_live(&mut hub);
 }
 
+// The hub reads WB_HUB_TEST_FAIL_WRITE_AT only in debug builds; nix runs these tests
+// against the release binary, which has no hook.
+#[cfg(debug_assertions)]
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_journal_write_fault_fails_closed_and_recovers() {
     let mut hub = Hub::start_with_env(
         |config| stub(config, "basic", &["--scenario", "basic"]),
@@ -1759,7 +1735,6 @@ fn hub_journal_write_fault_fails_closed_and_recovers() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_quarantines_a_garbage_journal() {
     let mut hub = Hub::with_scenarios(&["basic"]);
     let mut c = hub.connect();
@@ -1817,7 +1792,6 @@ fn hub_quarantines_a_garbage_journal() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_exec_failure_writes_only_setup_error() {
     let mut hub = Hub::start_with(|config| {
         config["agents"]["missing"] =
@@ -1835,7 +1809,6 @@ fn hub_exec_failure_writes_only_setup_error() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_acp_open_errors() {
     let hub = Hub::with_scenarios(&["basic"]);
     let mut c = hub.connect();
@@ -1853,7 +1826,6 @@ fn hub_acp_open_errors() {
 }
 
 #[test]
-#[ignore = "at integration: needs the M3-H2 ACP actor"]
 fn hub_builds_the_agent_environment_from_scratch() {
     let hub = Hub::with_scenarios(&["basic"]);
     let mut c = hub.connect();

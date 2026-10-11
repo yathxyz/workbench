@@ -26,8 +26,9 @@ Shells: bash from $BASH, else /run/current-system/sw/bin/bash when it exists, el
 sh (/bin/sh) as a second shell for tests.
 
 Agents: `stub` runs wb-fake-acp (the scripted test agent, the package's `fake` output) from
---bin-dir, else PATH, without --scenario, so it acts on prompt keywords. Test mode refuses to
-start without it; --dogfood registers no agent.
+--bin-dir, else PATH, without --scenario, so it acts on prompt keywords. `stuck` runs it with
+--scenario kill-stubborn (it ignores stdin EOF and SIGTERM, and its prompts never end), for the
+ui check N39. Test mode refuses to start without it; --dogfood registers no agent.
 
 Test mode (the default) gives the hub a temporary HOME and environment canaries, and exits
 when stdin closes. The stdin lines "stop hub" and "start hub" stop wb-hub (SIGTERM) and start
@@ -144,7 +145,13 @@ class Harness:
         self.dogfood = dogfood
         self.tcp = tcp
         self.bash = resolve_bash()
-        self.agents = {} if dogfood else {"stub": {"label": "Stub", "argv": [self.bin("wb-fake-acp")], "env": {}}}
+        self.agents = {}
+        if not dogfood:
+            fake = self.bin("wb-fake-acp")
+            self.agents = {
+                "stub": {"label": "Stub", "argv": [fake], "env": {}},
+                "stuck": {"label": "Stuck", "argv": [fake, "--scenario", "kill-stubborn"], "env": {}},
+            }
         self.root = Path(tempfile.mkdtemp(prefix="wb-"))
         self.secret = secrets.token_hex(32)
         self.secret_file = self.root / "proxy-secret"
