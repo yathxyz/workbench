@@ -1,0 +1,13 @@
+# Test Caddy for tests/harness.py: the same header_up line the deployed proxy uses. The secret
+# is read from Caddy's environment on every request, so it never appears in this file.
+{
+	admin unix/{$WB_CADDY_ADMIN}
+	auto_https off
+	persist_config off
+}
+
+http://127.0.0.1:18443 {
+	reverse_proxy 127.0.0.1:18090 {
+		header_up X-Workbench-Proxy-Secret {env.CADDY_UPSTREAM_SECRET_WORKBENCH}
+	}
+}
