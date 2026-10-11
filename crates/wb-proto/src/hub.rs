@@ -84,6 +84,13 @@ pub enum HubMessage {
         pid: u32,
         started_at: u64,
         agents: Vec<Agent>,
+        /// Names of the configured shells that had an executable path when this
+        /// connection opened, in the hub's config order. Empty from an older hub.
+        #[serde(default)]
+        shells: Vec<String>,
+        /// The shell a [`SpawnPty`] without `shell` gets. Empty from an older hub.
+        #[serde(default)]
+        default_shell: String,
     },
     /// Success reply to the request with this `rid`; `result` holds the reply fields.
     #[serde(rename = "ok")]
@@ -199,11 +206,25 @@ pub struct Agent {
 }
 
 /// How to start a PTY child.
+///
+/// The program is always one of the hub's configured shells, never a path the client
+/// names. The hub executes the shell's first configured path that exists and is
+/// executable, checked again at every spawn, and gives the child `argv` with `argv[0]`
+/// replaced by that path. `argv[0]` is neither executed nor looked up; clients send the
+/// shell's name there. `argv[1..]` go to the shell unchanged, for example
+/// `["-c", cmd]`. When `argv` has a single item, the hub appends the shell's configured
+/// `args` instead, which start it as an interactive shell.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpawnPty {
     /// 1..=256 items, at most 256 KiB in total.
     pub argv: Vec<String>,
+    /// The name of a shell in the hub's hello `shells`, never a path. Absent means the
+    /// shell the session last ran when this is a respawn, and the hub's `defaultShell`
+    /// otherwise. An unknown or unavailable name gets `bad_request`
+    /// "shell <name> not available".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
     /// Absolute path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,

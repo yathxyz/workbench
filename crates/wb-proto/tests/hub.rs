@@ -89,13 +89,16 @@ fn server_hello() {
     let msg: HubMessage = round_trip(json!({
         "t": "hello", "proto": 1, "server": "wb-hub", "version": "0.1.0",
         "build": "0123abcd", "host": "example", "pid": 1234, "startedAt": 1791460000000u64,
-        "agents": [{"name": "claude", "label": "Claude"}, {"name": "codex", "label": "Codex"}]
+        "agents": [{"name": "claude", "label": "Claude"}, {"name": "codex", "label": "Codex"}],
+        "shells": ["bash", "nu", "zsh"], "defaultShell": "bash"
     }));
     let HubMessage::Hello {
         proto,
         build,
         started_at,
         agents,
+        shells,
+        default_shell,
         ..
     } = msg
     else {
@@ -105,15 +108,41 @@ fn server_hello() {
     assert_eq!(build.as_deref(), Some("0123abcd"));
     assert_eq!(started_at, 1791460000000);
     assert_eq!(agents[1].label, "Codex");
+    assert_eq!(shells, ["bash", "nu", "zsh"]);
+    assert_eq!(default_shell, "bash");
 }
 
 #[test]
 fn server_hello_without_build() {
     let msg: HubMessage = round_trip(json!({
         "t": "hello", "proto": 1, "server": "wb-hub", "version": "0.1.0",
-        "host": "example", "pid": 1234, "startedAt": 1791460000000u64, "agents": []
+        "host": "example", "pid": 1234, "startedAt": 1791460000000u64, "agents": [],
+        "shells": [], "defaultShell": "bash"
     }));
     assert!(matches!(msg, HubMessage::Hello { build: None, .. }));
+}
+
+#[test]
+fn server_hello_from_an_older_hub_without_shells() {
+    let msg: HubMessage = serde_json::from_str(
+        r#"{"t":"hello","proto":1,"server":"wb-hub","version":"0.1.0","host":"example",
+            "pid":1234,"startedAt":1791460000000,"agents":[]}"#,
+    )
+    .unwrap();
+    let HubMessage::Hello {
+        shells,
+        default_shell,
+        ..
+    } = &msg
+    else {
+        panic!("{msg:?}")
+    };
+    assert!(shells.is_empty());
+    assert_eq!(default_shell, "");
+    // A newer hub always sends both fields.
+    let back: Value = serde_json::from_slice(&line::encode(&msg)).unwrap();
+    assert_eq!(back["shells"], json!([]));
+    assert_eq!(back["defaultShell"], "");
 }
 
 #[test]
@@ -337,6 +366,7 @@ fn pty_open_requests() {
         req,
         HubRequest::PtyOpen {
             spawn: Some(SpawnPty {
+                shell: None,
                 cwd: None,
                 cwd_from: None,
                 env: None,
@@ -346,6 +376,19 @@ fn pty_open_requests() {
             ..
         }
     ));
+
+    let req: HubRequest = round_trip(json!({
+        "t": "pty.open", "rid": 7, "sid": "n_k3m9x2", "cols": 80, "rows": 24,
+        "spawn": {"argv": ["nu", "-c", "ls"], "shell": "nu"}
+    }));
+    let HubRequest::PtyOpen {
+        spawn: Some(spawn), ..
+    } = req
+    else {
+        panic!("{req:?}")
+    };
+    assert_eq!(spawn.shell.as_deref(), Some("nu"));
+    assert_eq!(spawn.argv, ["nu", "-c", "ls"]);
 
     let req: HubRequest =
         round_trip(json!({"t": "pty.open", "rid": 6, "sid": "ghost", "cols": 80, "rows": 24}));

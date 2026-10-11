@@ -241,6 +241,7 @@ impl Relay {
             .collect();
         SpawnPty {
             argv,
+            shell: None,
             cwd,
             cwd_from,
             env: (!env.is_empty()).then_some(env),

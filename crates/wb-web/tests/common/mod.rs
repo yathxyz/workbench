@@ -558,6 +558,8 @@ async fn serve(
         pid: 1,
         started_at: 1_700_000_000_000,
         agents: Vec::new(),
+        shells: Vec::new(),
+        default_shell: String::new(),
     };
     if tx.write_all(&line::encode(&hello)).await.is_err() {
         return;

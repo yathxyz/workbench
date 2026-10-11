@@ -89,6 +89,7 @@ async fn open_in_out_exit_are_relayed() {
         rows: 30,
         spawn: Some(SpawnPty {
             argv: vec![SHELL.into()],
+            shell: None,
             cwd: None,
             cwd_from: None,
             env: Some(BTreeMap::from([("CANVAS_NODE".into(), "a1".into())])),
@@ -225,6 +226,7 @@ async fn a_second_open_detaches_first_and_maps_the_spawn_fields() {
             rows: 20,
             spawn: Some(SpawnPty {
                 argv: vec![SHELL.into(), "-c".into(), "htop -d 5".into()],
+                shell: None,
                 cwd: Some("/home/alice/src".into()),
                 cwd_from: Some("a1".into()),
                 env: Some(BTreeMap::from([("CANVAS_NODE".into(), "b2".into())])),

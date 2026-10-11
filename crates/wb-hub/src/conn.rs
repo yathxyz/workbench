@@ -154,6 +154,8 @@ fn hello(ctx: &Ctx) -> HubMessage {
                 label: a.label.clone(),
             })
             .collect(),
+        shells: Vec::new(),
+        default_shell: String::new(),
     }
 }
 
@@ -445,6 +447,7 @@ mod tests {
     fn spawn(argv: &[&str]) -> SpawnPty {
         SpawnPty {
             argv: argv.iter().map(|a| (*a).into()).collect(),
+            shell: None,
             cwd: None,
             cwd_from: None,
             env: None,
