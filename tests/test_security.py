@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""End-to-end security regressions T-S1..T-S15 over real wb-hub, wb-web and Caddy.
+"""End-to-end security regressions T-S1..T-S15 over real wb-hub, wb-web and Caddy, plus the
+harness's own exposure.
 
   python3 -I tests/test_security.py --web-root DIR [--bin-dir DIR]
 
@@ -11,7 +12,6 @@ import argparse
 import base64
 import json
 import os
-import socket
 import subprocess
 import sys
 import tempfile
@@ -24,7 +24,6 @@ import harness  # noqa: E402
 import wbctl  # noqa: E402
 
 WEB = harness.WEB_ADDR
-CADDY = harness.CADDY_ADDR
 ORIGIN = harness.PUBLIC_ORIGIN
 HOST = ORIGIN.split("://", 1)[1]
 SECRET = wbctl.SECRET_HEADER
@@ -70,6 +69,27 @@ def free_port_listening(port):
     return harness.can_connect_tcp(("127.0.0.1", port))
 
 
+def tcp_listeners(pid):
+    """The local addresses (hex, as in /proc/net/tcp*) of every TCP socket `pid` listens on."""
+    inodes = set()
+    for fd in os.listdir(f"/proc/{pid}/fd"):
+        try:
+            link = os.readlink(f"/proc/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if link.startswith("socket:["):
+            inodes.add(link[len("socket:["):-1])
+    found = []
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        with open(table) as f:
+            next(f)
+            for line in f:
+                cols = line.split()
+                if cols[3] == "0A" and cols[9] in inodes:
+                    found.append(cols[1])
+    return found
+
+
 def pty_list(h):
     return [s for s in wbctl.hub_sessions(h.hub_sock) if s.get("kind") == "pty"]
 
@@ -83,6 +103,17 @@ def main():
     t = Suite()
     with harness.Harness(a.web_root, a.bin_dir) as h:
         good = h.secret
+        caddy = h.caddy_sock
+
+        def mode(path):
+            return os.stat(path).st_mode & 0o777
+
+        # The harness's Caddy adds the secret to every request, so only the harness user may
+        # reach it: a unix socket, and no TCP listener for other users or hosts.
+        listeners = tcp_listeners(h.caddy.pid)
+        t.check("harness Caddy: no TCP listener; caddy.sock 0600 in a 0700 directory",
+                not listeners and (mode(caddy), mode(os.path.dirname(caddy))) == (0o600, 0o700),
+                repr((listeners, oct(mode(caddy)), oct(mode(os.path.dirname(caddy))))))
 
         def auth(origin=None, secret=good, host=HOST):
             hd = [("Host", host)]
@@ -158,11 +189,11 @@ def main():
             "t": "open", "id": "pwn", "cmd": f"touch {pwned}", "parent": "", "cwd": "",
             "cols": 80, "rows": 24, "env": {}}).encode())
         results = []
-        for label, addr, host in (("direct", WEB, f"{WEB[0]}:{WEB[1]}"), ("via Caddy", CADDY, HOST)):
+        for label, addr, host in (("direct", WEB, f"{WEB[0]}:{WEB[1]}"), ("via Caddy", caddy, HOST)):
             key = base64.b64encode(os.urandom(16)).decode()
             handshake = (f"GET /pty?token= HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
                          f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
-            with socket.create_connection(addr, timeout=10) as s:
+            with wbctl.connect(addr, timeout=10) as s:
                 s.sendall(handshake.encode())
                 resp = b""
                 try:
@@ -205,19 +236,19 @@ def main():
         t.check("T-S9 wb-web's log has no token, secret or X-Token value", not leaked, repr(leaked))
 
         # S10: Caddy overwrites a client-supplied secret header; the same header direct is refused.
-        via = request("GET", "/api/info", auth(secret=flipped), addr=CADDY)[0]
+        via = request("GET", "/api/info", auth(secret=flipped), addr=caddy)[0]
         direct = request("GET", "/api/info", auth(secret=flipped))[0]
         t.check("T-S10 wrong client secret: 200 via Caddy, 403 direct", (via, direct) == (200, 403), repr((via, direct)))
 
         # S11: a /pty session works through Caddy; cross-origin OPTIONS gets no CORS headers.
-        caddy_ep = wbctl.Endpoint(ORIGIN)
+        caddy_ep = wbctl.Endpoint(ORIGIN, unix=caddy)
         r = wbctl.pty_session(caddy_ep, "t-s11", spawn=True, send="echo ECHO-$((6*7))", expect="ECHO-42")
         t.check("T-S11 /pty through Caddy: 101 and echo", r["status"] == 101 and r["matched"] == "ECHO-42",
                 repr({k: r[k] for k in ("status", "error", "close", "matched")}))
         st_f, hd_f, _ = request("OPTIONS", "/api/board", auth(FOREIGN, secret=None) + [
-            ("Access-Control-Request-Method", "PUT")], addr=CADDY)
+            ("Access-Control-Request-Method", "PUT")], addr=caddy)
         st_m, hd_m, _ = request("OPTIONS", "/api/board", auth(ORIGIN, secret=None) + [
-            ("Access-Control-Request-Method", "PUT")], addr=CADDY)
+            ("Access-Control-Request-Method", "PUT")], addr=caddy)
         cors = [k for k in list(hd_f) + list(hd_m) if k.startswith("access-control-")]
         t.check("T-S11 OPTIONS via Caddy: foreign Origin 403, matching Origin 405, no Access-Control-*",
                 (st_f, st_m) == (403, 405) and not cors, repr((st_f, st_m, cors)))
@@ -225,7 +256,7 @@ def main():
         # S12: a /pty message above 2 MiB closes that socket; the hub and the PTY carry on.
         r = wbctl.pty_session(caddy_ep, "t-s12", spawn=True, send="echo ALIVE-$((1+1))", expect="ALIVE-2")
         ok_open = r["matched"] == "ALIVE-2"
-        status, _, ws = wbctl.ws_connect(CADDY, "/pty", caddy_ep.headers())
+        status, _, ws = wbctl.ws_connect(caddy, "/pty", caddy_ep.headers())
         close = "no 101"
         if status == 101:
             close = "still open"
@@ -248,9 +279,6 @@ def main():
                 repr((ok_open, h.hub.poll(), r2["matched"], r2["error"])))
 
         # S13: socket and directory modes.
-        def mode(path):
-            return os.stat(path).st_mode & 0o777
-
         t.check("T-S13 hub.sock 0600 in a 0700 directory",
                 (mode(h.hub_sock), mode(os.path.dirname(h.hub_sock))) == (0o600, 0o700),
                 oct(mode(h.hub_sock)))

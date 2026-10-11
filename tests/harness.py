@@ -4,11 +4,14 @@
   python3 -I tests/harness.py --web-root DIR [--bin-dir DIR] [--dogfood]
 
 Prints one JSON line on stdout once everything listens:
-  {web, caddy, hubSocket, webSocket, caddyAdmin, stateDir, boardsDir, notesDir}
+  {web, caddy, caddySocket, hubSocket, webSocket, caddyAdmin, stateDir, boardsDir, notesDir}
 
-wb-web listens on 127.0.0.1:18090 and trusts 127.0.0.1; Caddy listens on 127.0.0.1:18443
-(the publicOrigin) and injects the proxy secret. SIGHUP restarts wb-web only, so shells keep
-running in the hub. SIGTERM or SIGINT stops everything and deletes the temporary directory.
+wb-web listens on 127.0.0.1:18090 and trusts 127.0.0.1. Caddy injects the proxy secret and
+listens only on caddySocket, a 0600 unix socket in the 0700 temporary directory, for the site
+http://127.0.0.1:18443 (caddy, the publicOrigin): a TCP listener would hand the secret to every
+local user. A browser reaches it through `ssh -L 18443:<caddySocket> <host>`. SIGHUP restarts
+wb-web only, so shells keep running in the hub. SIGTERM or SIGINT stops everything and deletes
+the temporary directory.
 
 Test mode (the default) gives the hub a temporary HOME and environment canaries, and exits
 when stdin closes. --dogfood uses the real HOME, no canaries, ignores stdin, and still uses a
@@ -34,7 +37,6 @@ import time
 from pathlib import Path
 
 WEB_ADDR = ("127.0.0.1", 18090)
-CADDY_ADDR = ("127.0.0.1", 18443)
 PUBLIC_ORIGIN = "http://127.0.0.1:18443"
 CADDYFILE = Path(__file__).resolve().parent / "caddy" / "live.Caddyfile"
 
@@ -87,6 +89,7 @@ class Harness:
         self.hub_sock = str(self.root / "run" / "hub" / "hub.sock")
         self.web_sock = str(self.root / "run" / "web" / "web.sock")
         self.caddy_admin = str(self.root / "caddy-admin.sock")
+        self.caddy_sock = str(self.root / "caddy.sock")
         self.boards_dir = self.root / "boards"
         self.notes_dir = self.root / "notes"
         self.home = Path(pwd.getpwuid(os.getuid()).pw_dir) if dogfood else self.root / "home"
@@ -182,18 +185,18 @@ class Harness:
         env.update({
             "CADDY_UPSTREAM_SECRET_WORKBENCH": self.secret,
             "WB_CADDY_ADMIN": self.caddy_admin,
+            "WB_CADDY_SOCKET": self.caddy_sock,
             "XDG_CONFIG_HOME": str(self.root / "caddy"),
             "XDG_DATA_HOME": str(self.root / "caddy"),
         })
         argv = [self.bin("caddy"), "run", "--config", str(CADDYFILE), "--adapter", "caddyfile"]
         self.caddy = self.spawn("caddy", argv, env)
-        wait_until(lambda: can_connect_tcp(CADDY_ADDR), "caddy", self.caddy)
+        wait_until(lambda: can_connect_unix(self.caddy_sock), "caddy", self.caddy)
 
     def start(self):
-        # A stale listener would pass the readiness checks and answer for the new processes.
-        for addr in (WEB_ADDR, CADDY_ADDR):
-            if can_connect_tcp(addr):
-                raise RuntimeError(f"{addr[0]}:{addr[1]} is already in use")
+        # A stale listener would pass the readiness check and answer for the new wb-web.
+        if can_connect_tcp(WEB_ADDR):
+            raise RuntimeError(f"{WEB_ADDR[0]}:{WEB_ADDR[1]} is already in use")
         for name, step in (("hub", self.start_hub), ("web", self.start_web), ("caddy", self.start_caddy)):
             try:
                 step()
@@ -225,6 +228,7 @@ class Harness:
         return {
             "web": f"http://{WEB_ADDR[0]}:{WEB_ADDR[1]}",
             "caddy": PUBLIC_ORIGIN,
+            "caddySocket": self.caddy_sock,
             "hubSocket": self.hub_sock,
             "webSocket": self.web_sock,
             "caddyAdmin": self.caddy_admin,
@@ -272,8 +276,8 @@ def main():
         return 1
     print(json.dumps(h.info()), flush=True)
     if a.dogfood:
-        print(f"harness: open {PUBLIC_ORIGIN}; logs in {h.root}; kill -HUP {os.getpid()} restarts wb-web",
-              file=sys.stderr)
+        print(f"harness: ssh -L 18443:{h.caddy_sock} <this host>, then open {PUBLIC_ORIGIN}; "
+              f"logs in {h.root}; kill -HUP {os.getpid()} restarts wb-web", file=sys.stderr)
     else:
         def watch_stdin():
             while sys.stdin.buffer.read(4096):

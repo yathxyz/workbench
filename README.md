@@ -29,14 +29,17 @@ cargo test --workspace
 nix flake check -L          # package, clippy, fmt, security (end to end), vm (needs KVM)
 ```
 
-`tests/harness.py` starts wb-hub, wb-web and a test Caddy on loopback with temporary
-configuration and prints their addresses as one JSON line:
+`tests/harness.py` starts wb-hub, wb-web and a test Caddy with temporary configuration and
+prints their addresses as one JSON line:
 
 ```sh
 python3 -I tests/harness.py --bin-dir target/debug --web-root "$(nix build --no-link --print-out-paths .#workbench-web)"
 ```
 
-Add `--dogfood` to use your real home directory for shells, then open
+The test Caddy adds the proxy secret to every request it forwards, so it listens only on a unix
+socket in the harness's private temporary directory (`caddySocket` in the JSON line), never on
+TCP. Add `--dogfood` to use your real home directory for shells, forward the socket from the
+machine your browser runs on with `ssh -L 18443:<caddySocket> <host>`, then open
 `http://127.0.0.1:18443`. `kill -HUP <harness pid>` restarts wb-web while the shells keep running.
 
 ## Deploy

@@ -2,10 +2,11 @@
 """Small Workbench client for tests (stdlib only).
 
 Web commands speak the browser's /pty WebSocket through the proxy, sending Host and Origin
-from --url (and the proxy secret only when --secret-file is given, for direct access):
+from --url (and the proxy secret only when --secret-file is given, for direct access). --unix
+connects to a unix socket, such as the harness's Caddy, instead of the host and port of --url:
 
-  wbctl.py [--url URL] pty-open SID [--spawn] [--cmd CMD] [--send TEXT] [--expect REGEX]
-  wbctl.py [--url URL] pty-attach SID [--resume STREAM,OUT] [--send TEXT] [--expect REGEX]
+  wbctl.py [--url URL] [--unix PATH] pty-open SID [--spawn] [--cmd CMD] [--send TEXT] [--expect REGEX]
+  wbctl.py [--url URL] [--unix PATH] pty-attach SID [--resume STREAM,OUT] [--send TEXT] [--expect REGEX]
 
 Hub commands speak NDJSON on hub.sock directly (run them as the hub's user):
 
@@ -124,12 +125,27 @@ def encode_frame(opcode, payload):
     return head + mask + (int.from_bytes(payload, "big") ^ key).to_bytes(n, "big")
 
 
+def connect(addr, timeout=10.0, source=None):
+    """A connected stream socket: `addr` is (host, port), or the path of a unix socket."""
+    if not isinstance(addr, str):
+        return socket.create_connection(addr, timeout=timeout, source_address=source)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(addr)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
 def ws_connect(addr, target, headers, source=None, timeout=10.0):
     """Send an upgrade request with exactly `headers` (plus the WebSocket handshake fields).
 
-    Returns (status, response_headers, body_or_websocket): a WebSocket on 101, else the body bytes.
+    `addr` is as for connect(). Returns (status, response_headers, body_or_websocket): a
+    WebSocket on 101, else the body bytes.
     """
-    sock = socket.create_connection(addr, timeout=timeout, source_address=source)
+    sock = connect(addr, timeout, source)
     key = base64.b64encode(os.urandom(16)).decode()
     lines = [f"GET {target} HTTP/1.1"]
     lines += [f"{k}: {v}" for k, v in headers]
@@ -170,8 +186,13 @@ def ws_connect(addr, target, headers, source=None, timeout=10.0):
 
 
 def http_request(addr, method, target, headers, body=None, source=None, timeout=10.0):
-    """One HTTP request with exactly `headers` (duplicates allowed). Returns (status, headers, body)."""
-    conn = http.client.HTTPConnection(addr[0], addr[1], timeout=timeout, source_address=source)
+    """One HTTP request with exactly `headers` (duplicates allowed); `addr` is as for connect().
+
+    Returns (status, headers, body).
+    """
+    # The host argument is unused: the socket is already connected and Host comes from `headers`.
+    conn = http.client.HTTPConnection("localhost", timeout=timeout)
+    conn.sock = connect(addr, timeout, source)
     try:
         conn.putrequest(method, target, skip_host=True, skip_accept_encoding=True)
         for k, v in headers:
@@ -186,11 +207,14 @@ def http_request(addr, method, target, headers, body=None, source=None, timeout=
 
 
 class Endpoint:
-    """Where a web client connects, and the headers that pass the floor through that path."""
+    """Where a web client connects, and the headers that pass the floor through that path.
 
-    def __init__(self, url, origin=None, secret=None):
+    Host and Origin come from `url`; the connection goes to `unix` when given, else to its host and port.
+    """
+
+    def __init__(self, url, origin=None, secret=None, unix=None):
         u = urllib.parse.urlsplit(url)
-        self.addr = (u.hostname, u.port or 80)
+        self.addr = unix or (u.hostname, u.port or 80)
         self.host = u.netloc
         self.origin = origin or f"{u.scheme}://{u.netloc}"
         self.secret = secret
@@ -313,6 +337,7 @@ def parse_resume(s):
 def main():
     p = argparse.ArgumentParser(prog="wbctl.py", description=__doc__.splitlines()[0])
     p.add_argument("--url", default=os.environ.get("WB_URL", DEFAULT_URL), help="proxy (or wb-web) base URL")
+    p.add_argument("--unix", help="connect to this unix socket instead of the host and port of --url")
     p.add_argument("--origin", help="Origin header (default: the origin of --url)")
     p.add_argument("--secret-file", help="send the proxy secret from this file (direct access only)")
     p.add_argument("--hub", default=DEFAULT_HUB, help="hub socket for sessions/raw")
@@ -337,7 +362,7 @@ def main():
 
     if a.command in ("pty-open", "pty-attach"):
         secret = open(a.secret_file).read().strip() if a.secret_file else None
-        ep = Endpoint(a.url, a.origin, secret)
+        ep = Endpoint(a.url, a.origin, secret, a.unix)
         res = pty_session(
             ep,
             a.sid,
