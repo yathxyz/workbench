@@ -8,6 +8,10 @@ connects to a unix socket, such as the harness's Caddy, instead of the host and 
   wbctl.py [...] pty-open SID [--spawn] [--cmd CMD] [--shell NAME] [--send TEXT] [--expect REGEX] [--wait-exit]
   wbctl.py [...] pty-attach SID [--resume STREAM,OUT] [--send TEXT] [--expect REGEX] [--wait-exit]
   wbctl.py [...] pty-kill SID             kills and forgets the session; waits for the close
+  wbctl.py [...] acp-new SID --agent NAME --cwd DIR [ACTION...]
+  wbctl.py [...] acp-attach SID [--since N] [ACTION...]
+  wbctl.py [...] acp-revive SID [ACTION...]
+  wbctl.py [...] acp-kill SID [--forget]  without --forget waits for the exit, with it for the close
   wbctl.py [...] api-mv SRC DST           POST /api/mv; prints {status, body}
   wbctl.py [...] bench [--samples N] [--flood-bytes SIZE] [--ssh-rtt-ms MS]
 
@@ -15,6 +19,16 @@ Hub commands speak NDJSON on hub.sock directly (run them as the hub's user or ro
 
   wbctl.py [--hub PATH] sessions          prints {"sessions": [...]} from `list`
   wbctl.py [--hub PATH] raw JSON          prints the hub's hello, then every line up to the reply
+
+The acp commands speak /acp: acp-new opens with the spawn fields (agent and cwd, a directory on
+the hub's host) and waits for the setup to succeed, acp-revive revives a dead session and waits
+for its new `session` event, acp-attach only attaches. ACTION is any of --prompt TEXT (sent as one
+text block), --permission OPTION (answer the pending permission, or the one the prompt raises,
+with that optionId or option kind), --until-permission (stop at a pending permission instead of
+the turn's end) and --expect REGEX (matched against the agent text that arrives live). They wait
+for the turn's end after a prompt or an answer. The result carries the hello, `info`, every
+journal event, `createdAt` (the epoch), `pending` (unresolved permission requests), `text` and
+`ok`.
 
 Every command but raw prints one JSON object on stdout. pty-open sends spawn:true with --spawn
 and leaves spawn out otherwise; pty-attach sends spawn:false. --send types TEXT plus Enter;
@@ -314,6 +328,192 @@ def pty_session(ep, sid, spawn=None, cmd="", shell=None, env=None, resume=None, 
     return result
 
 
+SETUP_END = ("session", "setup_error", "exit")
+TURN_END = ("turn_end", "turn_error")
+
+
+class AcpCard:
+    """One /acp socket (DESIGN 3.5.2). `result` collects what the server sent: the hello, `info`
+    (an `info` without `session` keeps the previous session, as the server omits it when
+    unchanged), every journal event in `events` (the replay, then live ones), `replayed`, `errors`,
+    `gone` and the close code. Requests carry a rid, which the server echoes on `error`."""
+
+    def __init__(self, ep, sid, timeout=20.0):
+        self.sid = sid
+        self.deadline = time.monotonic() + timeout
+        self.rid = 0
+        self.ws = None
+        self.closed = False
+        self.result = {"status": None, "hello": None, "info": None, "events": [], "replayed": None, "errors": [],
+                       "gone": None, "close": None, "timedOut": False}
+        status, _, ws = ws_connect(ep.addr, "/acp", ep.headers(), timeout=timeout)
+        self.result["status"] = status
+        if status == 101:
+            self.ws = ws
+        else:
+            self.closed = True
+
+    def send(self, t, **fields):
+        self.rid += 1
+        self.ws.send_json({"t": t, "rid": self.rid, **fields})
+        return self.rid
+
+    def handle(self, m):
+        r = self.result
+        t = m.get("t")
+        if t == "hello":
+            r["hello"] = m
+            r["info"] = m.get("info")
+        elif t == "ev":
+            r["events"].append(m["ev"])
+        elif t == "replayed":
+            r["replayed"] = m
+        elif t == "info":
+            info = dict(m["info"])
+            if "session" not in info and r["info"] and "session" in r["info"]:
+                info["session"] = r["info"]["session"]
+            r["info"] = info
+        elif t == "error":
+            r["errors"].append(m)
+        elif t == "gone":
+            r["gone"] = m
+
+    def wait(self, done):
+        """Read until done() holds, a new error arrives, or the socket closes or times out; returns done()."""
+        r = self.result
+        errors = len(r["errors"])
+        try:
+            while not self.closed and not done() and len(r["errors"]) == errors:
+                self.handle(self.ws.recv_json(self.deadline - time.monotonic()))
+        except WsClosed as e:
+            self.closed, r["close"] = True, e.code
+        except TimeoutError:
+            self.closed, r["timedOut"] = True, True
+        except OSError as e:
+            self.closed, r["close"] = True, type(e).__name__
+        return bool(done())
+
+    def open(self, since=0, epoch=None, agent=None, cwd=None):
+        """Send `open` and read the hello and the replay; True once `replayed` arrived."""
+        if self.ws is None:
+            return False
+        fields = {"id": self.sid, "since": since}
+        for k, v in (("epoch", epoch), ("agent", agent), ("cwd", cwd)):
+            if v is not None:
+                fields[k] = v
+        self.send("open", **fields)
+        return self.wait(lambda: self.result["replayed"] is not None)
+
+    def cursor(self):
+        """The highest seq this socket knows of."""
+        head = (self.result["replayed"] or {}).get("head", 0)
+        return max([head] + [e["seq"] for e in self.result["events"]])
+
+    def since(self, seq, kinds):
+        return [e for e in self.result["events"] if e["seq"] > seq and e.get("e") in kinds]
+
+    def pending_permissions(self):
+        resolved = {e.get("req") for e in self.result["events"] if e.get("e") == "permission_resolved"}
+        return [e for e in self.result["events"] if e.get("e") == "permission" and e["seq"] not in resolved]
+
+    def text(self, after=0):
+        """The text of the agent's message chunks after seq `after`."""
+        out = []
+        for e in self.since(after, ("update",)):
+            u = e.get("update") or {}
+            c = u.get("content") or {}
+            if u.get("sessionUpdate") == "agent_message_chunk" and c.get("type") == "text":
+                out.append(c.get("text", ""))
+        return "".join(out)
+
+    def error_for(self, rid):
+        return next((e for e in self.result["errors"] if e.get("rid") == rid), None)
+
+    def epoch(self):
+        return (self.result["info"] or {}).get("createdAt")
+
+    def answer(self, perm, choice, epoch=None):
+        """Answer the `permission` event `perm` with the option whose optionId, else whose kind, is
+        `choice`; `epoch` defaults to this session's."""
+        options = perm.get("options") or []
+        option = next((o for o in options if o.get("optionId") == choice), None) or next(
+            (o for o in options if o.get("kind") == choice), {"optionId": choice})
+        return self.send("permission", req=perm["seq"], epoch=self.epoch() if epoch is None else epoch,
+                         outcome={"outcome": "selected", "optionId": option["optionId"]})
+
+    def close(self):
+        if self.ws is not None:
+            self.ws.close()
+
+
+def acp_session(ep, sid, agent=None, cwd=None, since=0, revive=False, prompt=None, permission=None,
+                until_permission=False, expect=None, kill=None, timeout=20.0):
+    """Open /acp for `sid` (with spawn fields when `agent` is given) and run these steps in order,
+    each only when asked for and only while the previous ones succeeded:
+
+    1. with `agent`: wait for the setup's outcome, which must be a `session` event;
+    2. `revive`: send revive and wait for a `session` event after it;
+    3. `prompt`: send it as one text block;
+    4. `permission`: wait for a pending permission (from before, or raised by the prompt) and
+       answer it with that optionId or option kind;
+    5. wait: for a pending permission with `until_permission`, else for the turn's end after a
+       prompt or an answer; `expect` must then match the agent text that arrived live (with
+       nothing else to wait for, wait for the match);
+    6. `kill` True or False: send kill{forget}; with forget wait for the close (1000 after the
+       late ok), else for the exit event.
+
+    The result is the card's plus `ok`, `createdAt` (the epoch), `pending` (unresolved permission
+    requests with their option ids), `text` (the live agent text) and `matched`.
+    """
+    card = AcpCard(ep, sid, timeout)
+    r = card.result
+    r.update(ok=False, createdAt=None, pending=[], text="", matched=None)
+    if card.ws is None:
+        return r
+    mark = 0
+    try:
+        ok = card.open(since, agent=agent, cwd=cwd if agent is not None else None)
+        mark = card.cursor()
+        if ok and agent is not None:
+            ok = card.wait(lambda: card.since(0, SETUP_END)) and card.since(0, SETUP_END)[-1]["e"] == "session"
+        if ok and revive:
+            card.send("revive")
+            ok = card.wait(lambda: card.since(mark, SETUP_END)) and card.since(mark, SETUP_END)[-1]["e"] == "session"
+        turn = card.cursor()
+        if ok and prompt is not None:
+            card.send("prompt", blocks=[{"type": "text", "text": prompt}])
+        if ok and permission is not None:
+            ok = card.wait(lambda: card.pending_permissions() or card.since(turn, TURN_END)) and bool(
+                card.pending_permissions())
+            if ok:
+                card.answer(card.pending_permissions()[-1], permission)
+        if ok and until_permission:
+            ok = card.wait(card.pending_permissions)
+        elif ok and (prompt is not None or permission is not None):
+            ok = card.wait(lambda: card.since(turn, TURN_END))
+        if ok and expect is not None:
+            if prompt is None and permission is None and not until_permission:
+                card.wait(lambda: re.search(expect, card.text(mark)))
+            m = re.search(expect, card.text(mark))
+            r["matched"] = m.group(0) if m else None
+            ok = m is not None
+        if ok and kill is not None:
+            card.send("kill", forget=kill)
+            if kill:
+                card.wait(lambda: False)
+                ok = r["close"] == 1000
+            else:
+                ok = card.wait(lambda: card.since(mark, ("exit",)))
+        r["ok"] = ok and not r["errors"]
+    finally:
+        card.close()
+    r["createdAt"] = card.epoch()
+    r["pending"] = [{"req": e["seq"], "options": [o.get("optionId") for o in e.get("options") or []]}
+                    for e in card.pending_permissions()]
+    r["text"] = card.text(mark)
+    return r
+
+
 class HubClient:
     """NDJSON client for hub.sock: reads the server hello, answers with ours."""
 
@@ -518,6 +718,21 @@ def main():
         else:
             s.add_argument("--resume", type=parse_resume, metavar="STREAM,OUT")
     sub.add_parser("pty-kill").add_argument("sid")
+    for name in ("acp-new", "acp-attach", "acp-revive"):
+        s = sub.add_parser(name)
+        s.add_argument("sid")
+        if name == "acp-new":
+            s.add_argument("--agent", required=True)
+            s.add_argument("--cwd", required=True, help="absolute directory on the hub's host")
+        if name == "acp-attach":
+            s.add_argument("--since", type=int, default=0)
+        s.add_argument("--prompt", help="send this text as a prompt")
+        s.add_argument("--permission", metavar="OPTION", help="answer the pending permission with this optionId or kind")
+        s.add_argument("--until-permission", action="store_true", help="wait for a pending permission, not the turn's end")
+        s.add_argument("--expect", help="the live agent text must match this regex")
+    k = sub.add_parser("acp-kill")
+    k.add_argument("sid")
+    k.add_argument("--forget", action="store_true")
     m = sub.add_parser("api-mv")
     m.add_argument("src")
     m.add_argument("dst")
@@ -541,6 +756,16 @@ def main():
         res = bench(ep, a.samples, a.flood_bytes, a.ssh_rtt_ms, a.timeout)
         print(json.dumps(res))
         return 0 if all(v is not False for v in res["budgets"].values()) else 1
+    if a.command.startswith("acp-"):
+        if a.command == "acp-kill":
+            res = acp_session(ep, a.sid, kill=a.forget, timeout=a.timeout)
+        else:
+            res = acp_session(ep, a.sid, agent=getattr(a, "agent", None), cwd=getattr(a, "cwd", None),
+                              since=getattr(a, "since", 0), revive=a.command == "acp-revive", prompt=a.prompt,
+                              permission=a.permission, until_permission=a.until_permission, expect=a.expect,
+                              timeout=a.timeout)
+        print(json.dumps(res))
+        return 0 if res["ok"] else 1
     if a.command == "pty-kill":
         res = pty_session(ep, a.sid, kill=True, timeout=a.timeout)
         print(json.dumps(res))

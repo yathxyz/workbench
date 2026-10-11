@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""End-to-end security regressions T-S1..T-S17, T-S21 (server half) and T-S23 over real wb-hub,
-wb-web and Caddy, plus the harness's own exposure and its Caddy modes.
+"""End-to-end security regressions T-S1..T-S17, T-S21 (server half), T-S22, T-S23 and T-S24 over
+real wb-hub, wb-web and Caddy, with the harness's `stub` agent (wb-fake-acp), plus the harness's
+own exposure and its Caddy modes.
 
   python3 -I tests/test_security.py --web-root DIR [--bin-dir DIR]
 
@@ -29,6 +30,7 @@ HOST = ORIGIN.split("://", 1)[1]
 SECRET = wbctl.SECRET_HEADER
 FOREIGN = "https://evil.example.org"
 FORBIDDEN = {"error": "forbidden"}
+MIB = 1024 * 1024
 
 
 class Suite:
@@ -369,20 +371,15 @@ def main():
                 all(r["close"] == 1000 for r in ghost.values()), repr({k: r["close"] for k, r in ghost.items()}))
         t.check("T-S17 no file; hub list has no ghost",
                 not pwned2.exists() and not (h.root / "pwned3").exists() and "ghost" not in sids(h), repr(sids(h)))
-        st, _, ws = wbctl.ws_connect(WEB, "/acp", auth(ORIGIN))
-        if st == 404:
-            t.skip("T-S17 /acp open without agent and cwd", "/acp is 404 in this build (the relay lands in M3)")
-        else:
-            m = None
-            if st == 101:
-                try:
-                    ws.send_json({"t": "open", "id": "ghost2", "since": 0})
-                    m = ws.recv_json()
-                except (wbctl.WsClosed, OSError, TimeoutError) as e:
-                    m = repr(e)
-                ws.close()
-            t.check("T-S17 /acp open without agent and cwd: not_found; no session",
-                    isinstance(m, dict) and m.get("code") == "not_found" and "ghost2" not in sids(h), repr((st, m)))
+        card = wbctl.AcpCard(caddy_ep, "ghost2", timeout=10)
+        card.open(0)
+        card.wait(lambda: False)
+        card.close()
+        r = card.result
+        time.sleep(0.5)
+        t.check("T-S17 /acp open without agent and cwd: error not_found, no hello, close 1000; no session",
+                [e.get("code") for e in r["errors"]] == ["not_found"] and r["hello"] is None and r["close"] == 1000
+                and "ghost2" not in sids(h), repr({k: r[k] for k in ("status", "errors", "hello", "close")}))
 
         # S21, server half (the browser half is ui N30): a board node carrying cmd and env is stored
         # as data and starts nothing, and opening its card without spawn finds no session.
@@ -415,6 +412,72 @@ def main():
                 (st_d, st_c) == (200, 200) and etag == hd_d.get("etag") and etag not in (None, '"empty"')
                 and "content-encoding" not in hd_c, repr((st_d, st_c, etag, hd_d.get("etag"), hd_c.get("content-encoding"))))
         t.check("T-S23 PUT via Caddy with that ETag: 204", st_p == 204, repr(st_p))
+
+        # S22: an answer with the epoch of an ended incarnation gets `stale`, and the agent receives
+        # nothing. The hub resolves a request and sends the answer in one step, so the request
+        # still pending afterwards shows nothing went out; the stub then finishes its turn (PONG)
+        # only once the answer with the current epoch arrives.
+        home = str(h.home)
+        first = wbctl.acp_session(caddy_ep, "t-s22", agent="stub", cwd=home, kill=True)
+        card = wbctl.AcpCard(caddy_ep, "t-s22")
+        stale = pending = answered = perm = None
+        try:
+            if card.open(0, agent="stub", cwd=home) and card.wait(lambda: card.since(0, wbctl.SETUP_END)):
+                card.send("prompt", blocks=[{"type": "text", "text": "ask-permission"}])
+                if card.wait(card.pending_permissions):
+                    perm = card.pending_permissions()[0]
+                    rid = card.answer(perm, "allow_once", epoch=first["createdAt"])
+                    card.wait(lambda: card.error_for(rid))
+                    stale = card.error_for(rid)
+                    pending = [p["req"] for s in wbctl.hub_sessions(h.hub_sock) if s["sid"] == "t-s22"
+                               for p in (s.get("acp") or {}).get("pending", [])]
+                    turn = card.cursor()
+                    card.answer(perm, "allow_once")
+                    answered = card.wait(lambda: card.since(turn, wbctl.TURN_END))
+        finally:
+            card.close()
+        resolved = [e for e in card.result["events"] if e.get("e") == "permission_resolved"]
+        t.check("T-S22 setup: two incarnations, the second with a pending permission",
+                first["ok"] and first["createdAt"] not in (None, card.epoch()) and perm is not None,
+                repr((first["ok"], first["createdAt"], card.epoch(), first["errors"], card.result["errors"])))
+        t.check("T-S22 acp.permission with a stale epoch: error stale", (stale or {}).get("code") == "stale", repr(stale))
+        t.check("T-S22 the request is still pending after the stale answer: the agent got nothing",
+                perm is not None and pending == [perm["seq"]], repr(pending))
+        t.check("T-S22 the answer with the current epoch resolves it once, by the user, and the turn ends with PONG",
+                answered is True and [(e.get("req"), e.get("by")) for e in resolved] == [(perm["seq"], "user")]
+                and "PONG" in card.text(), repr((answered, resolved, card.text()[-200:], card.result["errors"])))
+        wbctl.acp_session(caddy_ep, "t-s22", kill=True)
+
+        # S24: an /acp message above 9 MiB and an /rpc message above 32 MiB close that socket with
+        # 1009; the hub and wb-web carry on. The /acp message is a valid open of an unknown sid, so
+        # a missing cap would show as its not_found and a close 1000 instead; /rpc ignores what
+        # clients send, so there a missing cap shows as the socket staying open.
+        def oversized(path, msg, size):
+            status, _, ws = wbctl.ws_connect(WEB, path, auth(ORIGIN))
+            if status != 101:
+                return f"HTTP {status}"
+            deadline = time.monotonic() + 15
+            try:
+                ws.send_text(json.dumps(dict(msg, pad="x" * size)))
+                while time.monotonic() < deadline:
+                    ws.recv_text(deadline - time.monotonic())
+            except wbctl.WsClosed as e:
+                return e.code
+            except (OSError, TimeoutError) as e:
+                return type(e).__name__
+            finally:
+                ws.sock.close()
+            return "still open"
+
+        closed = {
+            "/acp": oversized("/acp", {"t": "open", "id": "t-s24", "since": 0}, 9 * MIB),
+            "/rpc": oversized("/rpc", {"t": "noop"}, 32 * MIB),
+        }
+        t.check("T-S24 /acp above 9 MiB and /rpc above 32 MiB: socket closed (1009 or reset)",
+                all(c in (1009, None, "ConnectionResetError", "BrokenPipeError") for c in closed.values()), repr(closed))
+        st = request("GET", "/api/info", auth())[0]
+        t.check("T-S24 hub and wb-web unaffected", h.hub.poll() is None and h.web.poll() is None and st == 200
+                and "t-s24" not in sids(h), repr((h.hub.poll(), h.web.poll(), st)))
 
         # The Caddy modes ui uses (N1-N3), swapped through the admin socket: expired answers API and
         # WebSocket paths with a 302 to /oauth2/sign_in, loginpage with a 200 HTML page; static
