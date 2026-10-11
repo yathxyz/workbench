@@ -1,5 +1,7 @@
 # `nix flake check`: package (with cargo test), clippy, fmt, the black-box conformance suite, the
-# end-to-end security suite, the browser suite, the VM test, the module's assertions.
+# end-to-end security suite, the browser suite, the adapter probe against the stub, the VM test,
+# the module's assertions. The harness registers wb-fake-acp (the package's `fake` output) as
+# its `stub` agent, so every check that starts it has that output on PATH.
 {
   pkgs,
   self,
@@ -18,6 +20,7 @@ in
 
   clippy = workbench.overrideAttrs (old: {
     pname = "workbench-clippy";
+    outputs = [ "out" ];
     nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.clippy ];
     buildPhase = ''
       runHook preBuild
@@ -55,6 +58,7 @@ in
           pkgs.coreutils
           pkgs.caddy
           workbench
+          workbench.fake
         ];
       }
       ''
@@ -73,6 +77,7 @@ in
           pkgs.coreutils
           pkgs.caddy
           workbench
+          workbench.fake
         ];
       }
       ''
@@ -94,6 +99,7 @@ in
           pkgs.coreutils
           pkgs.caddy
           workbench
+          workbench.fake
         ];
         WB_PLAYWRIGHT = "${pkgs.playwright-driver}/index.mjs";
         WB_HARNESS = "${tests}/harness.py";
@@ -112,6 +118,17 @@ in
         node ${tests}/ui.mjs
         touch $out
       '';
+
+  # lib.adapterCheck against the stub, so the probe and its plumbing run here too; the real
+  # adapters run in the consumer's flake.
+  adapters = self.lib.adapterCheck {
+    inherit pkgs;
+    agents.stub = {
+      label = "Stub";
+      package = workbench.fake;
+      exe = "bin/wb-fake-acp";
+    };
+  };
 
   vm = pkgs.testers.runNixOSTest (import ./vm.nix { inherit self; });
 

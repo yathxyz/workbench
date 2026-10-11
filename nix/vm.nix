@@ -1,8 +1,9 @@
-# VM test, PTY steps (40-nix-deploy-security 1.7 with DESIGN 9.4's edits; the ACP parts arrive
-# with the agents): boot, the network edge, a PTY surviving a web restart and resuming from the
-# ring, confinement and environment inside a card, nothing auto-running, kill-forget then reopen,
-# a nushell card, a deploy-style switch, an OOM kill, hub.sock peer credentials, and a hub
-# stop/start that leaves a corpse with the last screen.
+# VM test (40-nix-deploy-security 1.7 with DESIGN 9.4's edits): boot, the network edge, a PTY
+# and an ACP card with a pending permission surviving a web restart, confinement and environment
+# inside a card, nothing auto-running, kill-forget then reopen for both kinds, a nushell card, a
+# deploy-style switch, an OOM kill, hub.sock peer credentials, and a hub stop/start that leaves
+# a PTY corpse with the last screen, journals ending in the death invariant, and a revivable
+# agent. The agent is `stub`, wb-fake-acp acting on prompt keywords.
 { self }:
 let
   secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -49,6 +50,11 @@ in
           publicOrigin = "http://wb.test";
           firewall.interface = "eth1";
           proxySecretFile = "${pkgs.writeText "proxy-secret" secret}";
+          agents.stub = {
+            label = "Stub";
+            package = self.packages.${pkgs.stdenv.hostPlatform.system}.fake-acp;
+            exe = "bin/wb-fake-acp";
+          };
         };
 
         # Canaries: set-environment exports (a login would pick them up) and the hub's own environment.
@@ -107,6 +113,7 @@ in
       WRONG = "${wrongSecret}"
       HOME = "${nodes.wb.users.users.alice.home}"
       HUB_SOCK = "/run/workbench-hub/hub.sock"
+      ACP_DIR = f"{HOME}/.local/state/workbench/hub/acp"
 
 
       def first(pattern, text):
@@ -142,6 +149,16 @@ in
           return int(first(tag + "=([0-9]+)", r["output"])), r["output"]
 
 
+      def journal_tail(sid, n):
+          """The last n events of an ACP session's journal, without seq and ts."""
+          lines = wb.succeed(f"tail -n {n} {ACP_DIR}/{sid}.jsonl").splitlines()
+          return [{k: v for k, v in json.loads(line).items() if k not in ("seq", "ts")} for line in lines]
+
+
+      def last_session(r):
+          return [e for e in r["events"] if e["e"] == "session"][-1]
+
+
       def main_pid(unit):
           return wb.succeed(f"systemctl show -p MainPID --value {unit}").strip()
 
@@ -172,10 +189,13 @@ in
           code = http_code(wb, direct, "Host: wb.test", f"X-Workbench-Proxy-Secret: {SECRET}", prefix="runuser -u bob -- ")
           assert code == "403", f"bob on wb: {code}"
 
-      with subtest("3/4: a PTY survives a web restart and resumes from the ring"):
+      with subtest("3/4: a PTY and an ACP card survive a web restart"):
           r = wbctl("pty-open s1 --spawn --send 'echo MARK$((0+1)); echo PID=$$' --expect 'PID=[0-9]+'")
           shell_pid = first("PID=([0-9]+)", r["output"])
           stream, mark_out = r["hello"]["stream"], r["lastOut"]
+          r = wbctl(f"acp-new a1 --agent stub --cwd {HOME} --prompt ask-permission --until-permission")
+          assert len(r["pending"]) == 1, r["pending"]
+          a1_req, a1_epoch = r["pending"][0]["req"], r["createdAt"]
           hub_pid = main_pid("workbench-hub")
           wb.succeed("systemctl restart workbench-web")
           wb.wait_for_unit("workbench-web.service")
@@ -188,6 +208,11 @@ in
           r = wbctl(f"pty-attach s1 --resume {stream},{mark_out}")
           assert r["hello"]["resumed"] is True, r["hello"]
           assert "TAIL2" in r["replay"] and "MARK1" not in r["replay"], r["replay"]
+          # The same incarnation, with the same request still pending; answering it ends the turn.
+          r = wbctl("acp-attach a1")
+          assert r["createdAt"] == a1_epoch and [p["req"] for p in r["pending"]] == [a1_req], r
+          r = wbctl("acp-attach a1 --permission allow_once --expect PONG")
+          assert r["pending"] == [], r["pending"]
 
       with subtest("5: confinement and environment inside a card"):
           rc, out = in_card("s1", "T1", "sudo -n true")
@@ -248,6 +273,15 @@ in
           assert r["close"] == 1000, r
           r = wbctl("pty-open k1 --spawn")
           assert r["hello"]["new"] is True and r["hello"]["epoch"] != epoch, r["hello"]
+          r = wbctl(f"acp-new a2 --agent stub --cwd {HOME} --prompt stream")
+          epoch = r["createdAt"]
+          wbctl("acp-kill a2 --forget")
+          # The kill returned only once the session was gone: no registry entry, no files.
+          assert all(s["sid"] != "a2" for s in sessions()), sessions()
+          wb.succeed(f"test -z \"$(find {ACP_DIR} -maxdepth 1 -name 'a2.*')\"")
+          r = wbctl(f"acp-new a2 --agent stub --cwd {HOME}")
+          assert r["hello"]["status"] == "new" and r["createdAt"] != epoch, r["hello"]
+          assert not [e for e in r["events"] if e["e"] == "prompt"], r["events"]
 
       with subtest("5d: a nushell card"):
           hello = json.loads(wb.succeed(f"wbctl --hub {HUB_SOCK} raw '{{\"t\":\"list\",\"rid\":1}}'").splitlines()[0])
@@ -278,6 +312,8 @@ in
           assert "MARK1" in (r["replay"] or ""), r
           info = json.loads(proxy.succeed("curl -sf http://wb.test/api/info"))
           assert info["hub"]["stale"] is False, info["hub"]
+          r = wbctl("acp-attach a1 --prompt ask-permission --permission allow_once --expect PONG")
+          assert r["createdAt"] == a1_epoch, r["createdAt"]
 
       with subtest("7: an OOM kill takes the card, never the hub"):
           cmd = shlex.quote("exec python3 -c 'b = bytearray(1 << 30)'")
@@ -299,13 +335,22 @@ in
           assert int(n) > 0, "alice got no hello"
           wb.succeed(f"chmod 0700 /run/workbench-hub && chmod 0600 {HUB_SOCK}")
 
-      with subtest("9: hub stop and start leave a corpse with the last screen"):
+      with subtest("9: hub stop and start: a PTY corpse, the death invariant, a revive"):
+          # a3 is mid-turn, waiting for a permission, when the hub stops.
+          r = wbctl(f"acp-new a3 --agent stub --cwd {HOME} --prompt ask-permission --until-permission")
+          a3_req = r["pending"][0]["req"]
           cgroup = wb.succeed("systemctl show -p ControlGroup --value workbench-hub").strip()
           assert cgroup, "no control group"
           wb.succeed("systemctl stop workbench-hub")
           procs = f"/sys/fs/cgroup{cgroup}/cgroup.procs"
           wb.succeed(f"test ! -e {procs} || test -z \"$(cat {procs})\"")
           wb.fail(f"kill -0 {shell_pid}")
+          last = journal_tail("a1", 1)[-1]
+          assert last["e"] == "exit" and last["reason"] == "hub_restart", last
+          tail = journal_tail("a3", 3)
+          got = [(e["e"], e.get("req"), e.get("by"), e.get("code"), e.get("reason")) for e in tail]
+          assert got == [("permission_resolved", a3_req, "hub", None, None), ("turn_error", None, None, "interrupted", None),
+                         ("exit", None, None, None, "hub_restart")], tail
           wb.succeed("systemctl start workbench-hub")
           out = json.loads(wb.wait_until_succeeds(f"wbctl --hub {HUB_SOCK} sessions", timeout=30))
           s1 = next(s for s in out["sessions"] if s["sid"] == "s1")
@@ -314,5 +359,10 @@ in
           r = wbctl("pty-attach s1 --wait-exit", retry=True)
           assert r["hello"]["new"] is False and "MARK1" in (r["replay"] or ""), r
           assert r["exit"]["reason"] == "hub_restart", r["exit"]
+          states = {s["sid"]: s["state"] for s in json.loads(proxy.succeed("curl -sf http://wb.test/api/sessions"))["sessions"]}
+          # a1 was idle, so it is detached; a3's interrupted turn shows as an error until seen.
+          assert states.get("a1") == "detached" and states.get("a3") == "error", states
+          r = wbctl("acp-revive a1 --prompt ask-permission --permission allow_once --expect PONG")
+          assert last_session(r)["via"] == "resume", last_session(r)
     '';
 }

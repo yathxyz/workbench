@@ -25,6 +25,10 @@ interface but lo (the nix build sandbox, `unshare -rn`), where no other user can
 Shells: bash from $BASH, else /run/current-system/sw/bin/bash when it exists, else PATH; and
 sh (/bin/sh) as a second shell for tests.
 
+Agents: `stub` runs wb-fake-acp (the scripted test agent, the package's `fake` output) from
+--bin-dir, else PATH, without --scenario, so it acts on prompt keywords. Test mode refuses to
+start without it; --dogfood registers no agent.
+
 Test mode (the default) gives the hub a temporary HOME and environment canaries, and exits
 when stdin closes. The stdin lines "stop hub" and "start hub" stop wb-hub (SIGTERM) and start
 it again, acknowledged on stderr with "harness: wb-hub stopped" / "harness: wb-hub started". --dogfood uses the real HOME, no canaries, ignores stdin, and still uses a
@@ -139,6 +143,8 @@ class Harness:
         self.bin_dir = bin_dir
         self.dogfood = dogfood
         self.tcp = tcp
+        self.bash = resolve_bash()
+        self.agents = {} if dogfood else {"stub": {"label": "Stub", "argv": [self.bin("wb-fake-acp")], "env": {}}}
         self.root = Path(tempfile.mkdtemp(prefix="wb-"))
         self.secret = secrets.token_hex(32)
         self.secret_file = self.root / "proxy-secret"
@@ -149,7 +155,6 @@ class Harness:
         self.boards_dir = self.root / "boards"
         self.notes_dir = self.root / "notes"
         self.home = Path(pwd.getpwuid(os.getuid()).pw_dir) if dogfood else self.root / "home"
-        self.bash = resolve_bash()
         self.hub = self.web = self.caddy = self.tcp_server = None
 
         for d in ("run/hub", "run/web", "state", "caddy"):
@@ -174,7 +179,7 @@ class Harness:
                 "passEnv": PASS_ENV,
                 "setEnv": {"__NIXOS_SET_ENVIRONMENT_DONE": "1", "WB_SOCKET": self.web_sock},
             },
-            "agents": {},
+            "agents": self.agents,
         }
         self.web_config = {
             "listen": f"{WEB_ADDR[0]}:{WEB_ADDR[1]}",
@@ -199,11 +204,17 @@ class Harness:
         return str(path)
 
     def bin(self, name):
-        """wb-hub and wb-web from --bin-dir when given; everything else from PATH."""
-        path = os.path.join(self.bin_dir, name) if self.bin_dir and name.startswith("wb-") else shutil.which(name)
+        """wb-* from --bin-dir when given, everything else from PATH. wb-fake-acp falls back to PATH:
+        the package installs it in its `fake` output, apart from wb-hub and wb-web."""
+        path = None
+        if self.bin_dir and name.startswith("wb-"):
+            path = os.path.join(self.bin_dir, name)
+            if name == "wb-fake-acp" and not os.access(path, os.X_OK):
+                path = None
+        path = path or shutil.which(name)
         if not path or not os.access(path, os.X_OK):
             raise RuntimeError(f"{name} not found (use --bin-dir or PATH)")
-        return path
+        return os.path.abspath(path)
 
     def base_env(self):
         user = pwd.getpwuid(os.getuid()).pw_name
@@ -357,7 +368,11 @@ def main():
     for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
         signal.signal(s, on_signal)
 
-    h = Harness(a.web_root, a.bin_dir, a.dogfood, tcp=os.environ.get("WB_HARNESS_TCP") == "1")
+    try:
+        h = Harness(a.web_root, a.bin_dir, a.dogfood, tcp=os.environ.get("WB_HARNESS_TCP") == "1")
+    except RuntimeError as e:
+        print(f"harness: {e}", file=sys.stderr)
+        return 1
     try:
         h.start()
     except (RuntimeError, OSError) as e:

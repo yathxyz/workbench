@@ -16,7 +16,13 @@
       packages.${system} = {
         default = workbench;
         inherit workbench workbench-web vendor;
+        # The scripted ACP agent the VM, ui and conformance checks register as `stub`.
+        fake-acp = workbench.fake;
       };
+
+      # lib.adapterCheck { pkgs, agents }: a check that runs real ACP adapters against a real
+      # wb-hub, offline and initialize-only (nix/adapter-check.nix). For the consumer's flake.
+      lib.adapterCheck = import ./nix/adapter-check.nix;
 
       nixosModules.workbench = import ./nix/module.nix self;
       nixosModules.default = self.nixosModules.workbench;
