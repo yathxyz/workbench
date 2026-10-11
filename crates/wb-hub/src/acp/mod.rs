@@ -596,6 +596,9 @@ struct Acp {
     /// What the watchers and viewers last got, and when.
     published: Option<(Summary, AcpSessionInfo)>,
     published_at: Option<Instant>,
+    /// Holds Summaries back while `finalise` writes the death lines, so watchers see
+    /// the end state once, never a user kill's interim `error` (ROB-13).
+    quiet: bool,
     /// When the setup gives up on a silent agent.
     setup_at: Option<Instant>,
     /// When a held-back `headSeq` change goes out.
@@ -632,6 +635,7 @@ impl Acp {
             replayed_rx,
             published: None,
             published_at: None,
+            quiet: false,
             setup_at: None,
             info_at: None,
             meta_at: None,
@@ -680,6 +684,11 @@ impl Acp {
             self.create(o).await;
         }
         while self.phase == Phase::Running {
+            // A due record goes to disk before the next event: revive depends on `init`,
+            // and a hub killed after the `session` line must still find it (10 §7.4).
+            if self.meta_at.is_some_and(|at| at <= Instant::now()) {
+                self.save_meta().await;
+            }
             let setup_at = self.setup_at.filter(|_| self.setup_waiting());
             let rpc_at = self.rpc_deadline();
             let stage_at = self.stage.and_then(|(_, at)| at);
@@ -1106,6 +1115,9 @@ impl Acp {
     /// Publishes a change to the watchers and the attached connections: at once, unless
     /// only `headSeq` changed, which goes out at most every 500 ms (deviation 10).
     fn publish(&mut self) {
+        if self.quiet {
+            return;
+        }
         let (summary, session) = self.snapshot();
         if let Some((last, last_session)) = &self.published {
             if *last == summary && *last_session == session {
@@ -2079,6 +2091,7 @@ impl Acp {
             signal,
             reason,
         });
+        self.quiet = true;
         for body in lines {
             if !self.record(body) {
                 break;
@@ -2091,6 +2104,7 @@ impl Acp {
         if user_kill && self.fault.is_none() {
             self.set_seen(self.facts.head_seq);
         }
+        self.quiet = false;
         self.publish();
         if !self.forgets.is_empty() {
             self.phase = Phase::Forget;
