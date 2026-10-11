@@ -30,6 +30,7 @@ use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, broadcast, watch};
+use wb_proto::hub::Summary;
 
 use crate::auth::Floor;
 use crate::config::Config;
@@ -40,7 +41,16 @@ use crate::static_files::Assets;
 #[derive(Clone, Debug)]
 pub enum FeedMsg {
     Hub(HubStatus),
-    Board { etag: String },
+    /// A session's Summary changed.
+    Session(Box<Summary>),
+    /// The hub forgot incarnation `epoch` of `sid`.
+    Gone {
+        sid: String,
+        epoch: u64,
+    },
+    Board {
+        etag: String,
+    },
 }
 
 pub struct App {

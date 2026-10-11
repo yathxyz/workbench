@@ -31,7 +31,6 @@ pub struct Config {
     pub notes_dir: PathBuf,
     /// Names the board file; also reported to the frontend.
     pub host: String,
-    pub shell: String,
     /// Absent or `null` disables `sample`.
     pub sample: Option<Sample>,
 }
@@ -87,10 +86,6 @@ impl Config {
                 "{key} must be shorter than {SOCKET_PATH_MAX} bytes"
             );
         }
-        ensure!(
-            Path::new(&self.shell).is_absolute(),
-            "shell must be an absolute path"
-        );
         ensure!(
             valid_host(&self.host),
             "host must match [A-Za-z0-9][A-Za-z0-9._-]*"
@@ -236,7 +231,6 @@ mod tests {
                 "boardsDir": "/home/alice/boards",
                 "notesDir": "/home/alice/notes",
                 "host": "box1",
-                "shell": "/bin/bash",
             });
             Fixture { dir, cfg }
         }

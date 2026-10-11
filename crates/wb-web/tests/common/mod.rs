@@ -22,15 +22,18 @@ use tokio_tungstenite::tungstenite::http::HeaderName;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{WebSocketStream, client_async};
 use tokio_util::codec::{FramedRead, LinesCodec};
-use wb_proto::hub::{ErrorCode, HubMessage, HubRequest, PROTO, PtyOpenReply, SessionsReply};
+use wb_proto::hub::{
+    Agent, CaptureReply, ErrorCode, Exit, ExitReason, Fg, HubMessage, HubRequest, Kind, PROTO,
+    PtyFacts, PtyOpenReply, SessionsReply, Summary,
+};
 use wb_proto::limits::MAX_LINE;
 use wb_proto::line;
 
 pub const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 pub const HOST: &str = "wb.example.org";
 pub const ORIGIN: &str = "http://wb.example.org";
-/// Never run: the fake hub only records the argv.
-pub const SHELL: &str = "/test/bin/sh";
+/// The fake hub's default shell; never run, the fake hub only records the argv.
+pub const DEFAULT_SHELL: &str = "bash";
 pub const INDEX: &str = "<!doctype html><title>t</title>";
 pub const WAIT: Duration = Duration::from_secs(10);
 
@@ -53,7 +56,6 @@ pub fn fixture(dir: &Path, hub_socket: &Path) -> Value {
         "boardsDir": dir.join("boards"),
         "notesDir": dir.join("notes"),
         "host": "testhost",
-        "shell": SHELL,
     })
 }
 
@@ -387,6 +389,66 @@ where
     }
 }
 
+/// A PTY Summary: `running` puts a non-leader group in front, so the state is
+/// `running`, else `idle`; a dead one is `exited`.
+pub fn pty_summary(sid: &str, epoch: u64, alive: bool, running: bool) -> Summary {
+    Summary {
+        sid: sid.into(),
+        kind: Kind::Pty,
+        host: "testhost".into(),
+        created_at: epoch,
+        updated_at: epoch + 1,
+        alive,
+        viewers: 0,
+        cwd: "/home/alice".into(),
+        fault: None,
+        pty: Some(PtyFacts {
+            argv: vec!["/bin/bash".into(), "-i".into()],
+            pid: alive.then_some(4242),
+            fg: (alive && running).then(|| Fg {
+                comm: "make".into(),
+                pgid: 4300,
+                leader: false,
+            }),
+            exit: (!alive).then_some(Exit {
+                code: Some(0),
+                signal: None,
+                reason: ExitReason::Exited,
+                at: epoch + 1,
+            }),
+        }),
+        acp: None,
+    }
+}
+
+/// What the fake hub's hello announces.
+#[derive(Clone)]
+pub struct Hello {
+    pub proto: u32,
+    pub version: String,
+    pub build: Option<String>,
+    pub agents: Vec<Agent>,
+    pub shells: Vec<String>,
+    pub default_shell: String,
+}
+
+impl Default for Hello {
+    fn default() -> Hello {
+        Hello {
+            proto: PROTO,
+            version: "0.1.0".into(),
+            build: None,
+            agents: Vec::new(),
+            shells: vec![DEFAULT_SHELL.into(), "zsh".into()],
+            default_shell: DEFAULT_SHELL.into(),
+        }
+    }
+}
+
+/// What the fake hub answers to the next `pty.capture`; `Ok("")` when nothing was
+/// scripted.
+pub type CaptureResult = Result<&'static str, (ErrorCode, &'static str)>;
+
 /// What the fake hub answers to the next `pty.open`.
 pub enum OpenReply {
     Ok(PtyOpenReply),
@@ -417,6 +479,14 @@ enum Inject {
 
 type Requests = watch::Sender<Vec<(usize, HubRequest)>>;
 
+/// The scripted answers every connection shares.
+#[derive(Default)]
+struct Script {
+    sessions: Mutex<Vec<Summary>>,
+    opens: Mutex<VecDeque<OpenReply>>,
+    captures: Mutex<VecDeque<CaptureResult>>,
+}
+
 /// A hub on a unix socket. Connections are numbered from 0 in accept order; every
 /// request is recorded with its connection number.
 pub struct FakeHub {
@@ -424,36 +494,44 @@ pub struct FakeHub {
     _dir: tempfile::TempDir,
     requests: watch::Receiver<Vec<(usize, HubRequest)>>,
     conns: Arc<Mutex<Vec<mpsc::UnboundedSender<Inject>>>>,
-    opens: Arc<Mutex<VecDeque<OpenReply>>>,
+    script: Arc<Script>,
     accept: tokio::task::JoinHandle<()>,
 }
 
 impl FakeHub {
     pub fn start() -> FakeHub {
-        FakeHub::start_with_proto(PROTO)
+        FakeHub::start_with(Hello::default())
     }
 
     /// A hub whose hello announces `proto`.
     pub fn start_with_proto(proto: u32) -> FakeHub {
+        FakeHub::start_with(Hello {
+            proto,
+            ..Hello::default()
+        })
+    }
+
+    /// A hub whose hello says `hello`.
+    pub fn start_with(hello: Hello) -> FakeHub {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hub.sock");
-        FakeHub::listen(dir, path, proto)
+        FakeHub::listen(dir, path, hello)
     }
 
     /// A hub on a path chosen before it starts, for a web that is already running.
     pub fn start_at(dir: tempfile::TempDir, path: PathBuf) -> FakeHub {
-        FakeHub::listen(dir, path, PROTO)
+        FakeHub::listen(dir, path, Hello::default())
     }
 
-    fn listen(dir: tempfile::TempDir, path: PathBuf, proto: u32) -> FakeHub {
+    fn listen(dir: tempfile::TempDir, path: PathBuf, hello: Hello) -> FakeHub {
         let listener = UnixListener::bind(&path).unwrap();
         let (record, requests) = watch::channel(Vec::new());
         let record = Arc::new(record);
         let conns = Arc::new(Mutex::new(Vec::new()));
-        let opens = Arc::new(Mutex::new(VecDeque::new()));
+        let script = Arc::new(Script::default());
         let accept = tokio::spawn({
             let conns = conns.clone();
-            let opens = opens.clone();
+            let script = script.clone();
             async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -465,7 +543,15 @@ impl FakeHub {
                         conns.push(tx);
                         conns.len() - 1
                     };
-                    tokio::spawn(serve(id, stream, proto, record.clone(), rx, opens.clone()));
+                    let conn = serve(
+                        id,
+                        stream,
+                        hello.clone(),
+                        record.clone(),
+                        rx,
+                        script.clone(),
+                    );
+                    tokio::spawn(conn);
                 }
             }
         });
@@ -474,7 +560,7 @@ impl FakeHub {
             _dir: dir,
             requests,
             conns,
-            opens,
+            script,
             accept,
         }
     }
@@ -520,7 +606,17 @@ impl FakeHub {
 
     /// Scripts the reply to the next `pty.open`.
     pub fn reply_next_open(&self, reply: OpenReply) {
-        self.opens.lock().unwrap().push_back(reply);
+        self.script.opens.lock().unwrap().push_back(reply);
+    }
+
+    /// Scripts the reply to the next `pty.capture`.
+    pub fn reply_next_capture(&self, reply: CaptureResult) {
+        self.script.captures.lock().unwrap().push_back(reply);
+    }
+
+    /// The sessions later `watch` and `list` replies carry.
+    pub fn set_sessions(&self, sessions: Vec<Summary>) {
+        *self.script.sessions.lock().unwrap() = sessions;
     }
 
     /// Stops accepting and closes every connection; the socket file is removed.
@@ -542,24 +638,24 @@ impl Drop for FakeHub {
 async fn serve(
     id: usize,
     stream: UnixStream,
-    proto: u32,
+    hello: Hello,
     record: Arc<Requests>,
     mut inject: mpsc::UnboundedReceiver<Inject>,
-    opens: Arc<Mutex<VecDeque<OpenReply>>>,
+    script: Arc<Script>,
 ) {
     let (rx, mut tx) = stream.into_split();
     let mut lines = FramedRead::new(rx, LinesCodec::new_with_max_length(MAX_LINE));
     let hello = HubMessage::Hello {
-        proto,
+        proto: hello.proto,
         server: "wb-hub".into(),
-        version: "0.1.0".into(),
-        build: None,
+        version: hello.version,
+        build: hello.build,
         host: "testhost".into(),
         pid: 1,
         started_at: 1_700_000_000_000,
-        agents: Vec::new(),
-        shells: Vec::new(),
-        default_shell: String::new(),
+        agents: hello.agents,
+        shells: hello.shells,
+        default_shell: hello.default_shell,
     };
     if tx.write_all(&line::encode(&hello)).await.is_err() {
         return;
@@ -572,10 +668,23 @@ async fn serve(
                 record.send_modify(|all| all.push((id, req.clone())));
                 match req {
                     HubRequest::Watch { rid } | HubRequest::List { rid } => {
-                        HubMessage::ok(rid, &SessionsReply { sessions: Vec::new() })
+                        let sessions = script.sessions.lock().unwrap().clone();
+                        HubMessage::ok(rid, &SessionsReply { sessions })
+                    }
+                    HubRequest::PtyCapture { rid, .. } => {
+                        let scripted = script.captures.lock().unwrap().pop_front();
+                        match scripted.unwrap_or(Ok("")) {
+                            Ok(text) => HubMessage::ok(rid, &CaptureReply { text: text.into() }),
+                            Err((code, message)) => HubMessage::Err {
+                                rid: Some(rid),
+                                sid: None,
+                                code,
+                                message: message.into(),
+                            },
+                        }
                     }
                     HubRequest::PtyOpen { rid, .. } => {
-                        let scripted = opens.lock().unwrap().pop_front();
+                        let scripted = script.opens.lock().unwrap().pop_front();
                         match scripted {
                             Some(OpenReply::Err(code, message)) => HubMessage::Err {
                                 rid: Some(rid),

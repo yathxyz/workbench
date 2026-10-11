@@ -5,7 +5,9 @@ mod common;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use common::{FakeHub, OpenReply, SHELL, Web, Ws, next_json, read_to_close, send_json, spawned};
+use common::{
+    DEFAULT_SHELL, FakeHub, Hello, OpenReply, Web, Ws, next_json, read_to_close, send_json, spawned,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
@@ -23,7 +25,7 @@ async fn up() -> (FakeHub, Web) {
     (hub, web)
 }
 
-/// An open as the unchanged prototype frontend sends it: no `spawn`.
+/// An open as a page load or reconnect sends it, minus `resume`: no `spawn`.
 fn open(id: &str) -> Value {
     json!({
         "t": "open", "id": id, "cmd": "", "parent": "", "cwd": "", "tmux": "",
@@ -33,6 +35,17 @@ fn open(id: &str) -> Value {
 
 fn is_open(r: &HubRequest) -> bool {
     matches!(r, HubRequest::PtyOpen { .. })
+}
+
+/// The `spawn` field of every `pty.open` so far, in order.
+fn spawns(hub: &FakeHub) -> Vec<Option<SpawnPty>> {
+    hub.requests()
+        .into_iter()
+        .filter_map(|(_, r)| match r {
+            HubRequest::PtyOpen { spawn, .. } => Some(spawn),
+            _ => None,
+        })
+        .collect()
 }
 
 fn is_input(r: &HubRequest) -> bool {
@@ -81,19 +94,13 @@ async fn open_in_out_exit_are_relayed() {
     );
     let (conn, req) = hub.wait_for(is_open).await;
     assert_ne!(conn, 0, "the card has a hub connection of its own");
-    // M0: an absent `spawn` spawns.
+    // An absent `spawn` attaches only (SEC-2).
     let want = HubRequest::PtyOpen {
         rid: rid_of(&req),
         sid: "a1".into(),
         cols: 100,
         rows: 30,
-        spawn: Some(SpawnPty {
-            argv: vec![SHELL.into()],
-            shell: None,
-            cwd: None,
-            cwd_from: None,
-            env: Some(BTreeMap::from([("CANVAS_NODE".into(), "a1".into())])),
-        }),
+        spawn: None,
         resume: None,
     };
     assert_eq!(req, want);
@@ -225,7 +232,7 @@ async fn a_second_open_detaches_first_and_maps_the_spawn_fields() {
             cols: 90,
             rows: 20,
             spawn: Some(SpawnPty {
-                argv: vec![SHELL.into(), "-c".into(), "htop -d 5".into()],
+                argv: vec![DEFAULT_SHELL.into(), "-c".into(), "htop -d 5".into()],
                 shell: None,
                 cwd: Some("/home/alice/src".into()),
                 cwd_from: Some("a1".into()),
@@ -287,6 +294,118 @@ async fn a_second_open_detaches_first_and_maps_the_spawn_fields() {
     assert_eq!(
         next_json(&mut ws).await,
         json!({"t": "out", "d": "now", "out": 45})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nothing_spawns_without_spawn_true() {
+    let (hub, web) = up().await;
+    let mut ws = web.ws("/pty").await;
+    let flags = [
+        None,
+        Some(json!(false)),
+        Some(json!(null)),
+        Some(json!("true")),
+        Some(json!(1)),
+    ];
+    for (i, flag) in flags.iter().enumerate() {
+        let mut msg = open(&format!("n{i}"));
+        msg["cmd"] = "make".into();
+        msg["shell"] = "zsh".into();
+        if let Some(flag) = flag {
+            msg["spawn"] = flag.clone();
+        }
+        send_json(&mut ws, msg).await;
+        assert_eq!(next_json(&mut ws).await["t"], "hello");
+    }
+    assert_eq!(spawns(&hub), vec![None; flags.len()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spawn_passes_the_shell_through() {
+    // argv[0] names the shell; without one from the browser it is the hello's default.
+    let hub = FakeHub::start_with(Hello {
+        shells: vec!["fish".into(), "zsh".into()],
+        default_shell: "fish".into(),
+        ..Hello::default()
+    });
+    let web = Web::start(&hub.path);
+    web.wait_hub("up").await;
+    let mut ws = web.ws("/pty").await;
+    let opens = [
+        json!({"shell": "zsh"}),
+        json!({"shell": "zsh", "cmd": "make"}),
+        json!({}),
+        json!({"shell": "", "cmd": "make"}),
+        // The hub validates the name and answers bad_request for an unknown one.
+        json!({"shell": "/bin/sh"}),
+    ];
+    for (i, fields) in opens.iter().enumerate() {
+        let mut msg = open(&format!("s{i}"));
+        msg["spawn"] = true.into();
+        for (k, v) in fields.as_object().unwrap() {
+            msg[k] = v.clone();
+        }
+        send_json(&mut ws, msg).await;
+        assert_eq!(next_json(&mut ws).await["t"], "hello");
+    }
+    let spawn = |argv: &[&str], shell: Option<&str>, id: &str| {
+        Some(SpawnPty {
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            shell: shell.map(str::to_owned),
+            cwd: None,
+            cwd_from: None,
+            env: Some(BTreeMap::from([("CANVAS_NODE".into(), id.into())])),
+        })
+    };
+    assert_eq!(
+        spawns(&hub),
+        [
+            spawn(&["zsh"], Some("zsh"), "s0"),
+            spawn(&["zsh", "-c", "make"], Some("zsh"), "s1"),
+            spawn(&["fish"], None, "s2"),
+            spawn(&["fish", "-c", "make"], None, "s3"),
+            spawn(&["/bin/sh"], Some("/bin/sh"), "s4"),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_passes_through() {
+    let (hub, web) = up().await;
+    let mut ws = web.ws("/pty").await;
+    let mut msg = open("r1");
+    msg["resume"] = json!({"stream": 7, "out": 1234});
+    send_json(&mut ws, msg).await;
+    assert_eq!(next_json(&mut ws).await["t"], "hello");
+    // A malformed resume is dropped, not guessed at.
+    let mut msg = open("r2");
+    msg["resume"] = json!({"stream": "7"});
+    send_json(&mut ws, msg).await;
+    assert_eq!(next_json(&mut ws).await["t"], "hello");
+    let resumes: Vec<(String, Option<Resume>, bool)> = hub
+        .requests()
+        .into_iter()
+        .filter_map(|(_, r)| match r {
+            HubRequest::PtyOpen {
+                sid, resume, spawn, ..
+            } => Some((sid, resume, spawn.is_some())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        resumes,
+        [
+            (
+                "r1".into(),
+                Some(Resume {
+                    stream: 7,
+                    out: 1234
+                }),
+                false
+            ),
+            ("r2".into(), None, false),
+        ]
     );
 }
 
@@ -359,21 +478,64 @@ async fn an_attach_to_a_dead_session_sends_replay_then_exit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_open_sends_error_and_keeps_the_socket() {
+async fn a_failed_open_sends_error_then_closes_1000() {
     let (hub, web) = up().await;
     hub.reply_next_open(OpenReply::Err(ErrorCode::NotFound, "no session e5"));
     let mut ws = web.ws("/pty").await;
     let mut msg = open("e5");
     msg["spawn"] = false.into();
     send_json(&mut ws, msg).await;
+    let (code, texts) = read_to_close(&mut ws).await;
+    assert_eq!(code, 1000);
     assert_eq!(
-        next_json(&mut ws).await,
-        json!({"t": "error", "error": "no session e5", "code": "not_found"})
+        texts,
+        [json!({"t": "error", "error": "no session e5", "code": "not_found"})]
     );
-    // Enter on the card re-sends open on the same socket.
-    send_json(&mut ws, open("e5")).await;
-    assert_eq!(next_json(&mut ws).await["t"], "hello");
-    assert_eq!(hub.wait_count(2, is_open).await.len(), 2);
+
+    // A refused spawn ends the same way.
+    hub.reply_next_open(OpenReply::Err(
+        ErrorCode::BadRequest,
+        "shell nu not available",
+    ));
+    let mut ws = web.ws("/pty").await;
+    let mut msg = open("e6");
+    msg["spawn"] = true.into();
+    msg["shell"] = "nu".into();
+    send_json(&mut ws, msg).await;
+    let (code, texts) = read_to_close(&mut ws).await;
+    assert_eq!(code, 1000);
+    assert_eq!(
+        texts,
+        [json!({"t": "error", "error": "shell nu not available", "code": "bad_request"})]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reloaded_session_closes_1011_so_the_card_reopens() {
+    let (hub, web) = up().await;
+    let (mut ws, conn) = attached(&hub, &web, "l12").await;
+    // Another sid's async error is not this card's.
+    hub.send(
+        conn,
+        HubMessage::Err {
+            rid: None,
+            sid: Some("zz".into()),
+            code: ErrorCode::Internal,
+            message: "session reloaded".into(),
+        },
+    );
+    hub.send(
+        conn,
+        HubMessage::Err {
+            rid: None,
+            sid: Some("l12".into()),
+            code: ErrorCode::Internal,
+            message: "session reloaded".into(),
+        },
+    );
+    let (code, texts) = read_to_close(&mut ws).await;
+    assert_eq!(code, 1011);
+    assert!(texts.is_empty(), "{texts:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,6 +1,6 @@
-//! `/rpc` (design §3.5.3). M0 sends the feed only: `hub{…}` on connect and on every
-//! change, and `board{etag}` after every board write. Client messages are read for the
-//! cap and the keepalive, and otherwise ignored.
+//! `/rpc` (design §3.5.3), the feed so far: `hub{…}` and `sessions{…}` on connect and
+//! whenever the hub comes up, then `session`, `gone` and `board{etag}` as they happen.
+//! Client messages are read for the cap and the keepalive, and otherwise ignored.
 
 use axum::Router;
 use axum::body::Bytes;
@@ -14,7 +14,7 @@ use tokio::sync::broadcast::error::RecvError;
 use wb_proto::limits::WS_MAX_RPC;
 
 use crate::http::{Keepalive, Tick, close, send_json, upgrade_required, ws_close, ws_too_big};
-use crate::hub::HubStatus;
+use crate::hub::{HubStatus, with_state};
 use crate::{AppState, FeedMsg};
 
 const ROUTE: &str = "/rpc";
@@ -36,31 +36,39 @@ async fn upgrade(
     }
 }
 
-/// `hub{status, version?, build?, startedAt?}`.
+/// `hub{status, version?, build?, startedAt?, stale?}`.
 fn hub_msg(status: &HubStatus) -> Value {
     let mut msg = json!({"t": "hub", "status": status.name()});
-    if let HubStatus::Up {
-        version,
-        build,
-        started_at,
-        ..
-    } = status
-    {
-        msg["version"] = version.as_str().into();
-        msg["startedAt"] = (*started_at).into();
-        if let Some(build) = build {
+    if let HubStatus::Up(info) = status {
+        msg["version"] = info.version.as_str().into();
+        msg["startedAt"] = info.started_at.into();
+        msg["stale"] = info.stale.into();
+        if let Some(build) = &info.build {
             msg["build"] = build.as_str().into();
         }
     }
     msg
 }
 
+/// The hub status, and while the hub is up every session it knows.
+fn snapshot(app: &AppState) -> Vec<Value> {
+    let status = app.hub.status.borrow().clone();
+    let mut msgs = vec![hub_msg(&status)];
+    if let HubStatus::Up(_) = status {
+        let sessions: Vec<Value> = app.hub.sessions().iter().map(with_state).collect();
+        msgs.push(json!({"t": "sessions", "sessions": sessions}));
+    }
+    msgs
+}
+
 async fn run(app: AppState, mut ws: WebSocket) {
-    // Subscribe before reading the status, so no change falls between the two.
+    // Subscribe before the snapshot, so no change falls between the two. A change in
+    // both arrives twice, and applying it again is harmless.
     let mut feed = app.feed.subscribe();
-    let first = hub_msg(&app.hub.status.borrow());
-    if send_json(&mut ws, &first).await.is_err() {
-        return;
+    for msg in snapshot(&app) {
+        if send_json(&mut ws, &msg).await.is_err() {
+            return;
+        }
     }
     let stop = app.stopped();
     tokio::pin!(stop);
@@ -76,10 +84,16 @@ async fn run(app: AppState, mut ws: WebSocket) {
                 }
             },
             msg = feed.recv() => match msg {
-                Ok(FeedMsg::Hub(status)) => hub_msg(&status),
-                Ok(FeedMsg::Board { etag }) => json!({"t": "board", "etag": etag}),
-                // Missed messages: the status is all that can be resent.
-                Err(RecvError::Lagged(_)) => hub_msg(&app.hub.status.borrow()),
+                // The control task fills the session map before it reports up.
+                Ok(FeedMsg::Hub(HubStatus::Up(_))) => snapshot(&app),
+                Ok(FeedMsg::Hub(status)) => vec![hub_msg(&status)],
+                Ok(FeedMsg::Session(session)) => {
+                    vec![json!({"t": "session", "session": with_state(&session)})]
+                }
+                Ok(FeedMsg::Gone { sid, epoch }) => vec![json!({"t": "gone", "sid": sid, "epoch": epoch})],
+                Ok(FeedMsg::Board { etag }) => vec![json!({"t": "board", "etag": etag})],
+                // Missed messages: resend what can be resent.
+                Err(RecvError::Lagged(_)) => snapshot(&app),
                 Err(RecvError::Closed) => return,
             },
             tick = keepalive.tick() => match tick {
@@ -93,8 +107,10 @@ async fn run(app: AppState, mut ws: WebSocket) {
             },
             () = &mut stop => return ws_close(ws, ROUTE, close::RESTART, "wb-web restarting").await,
         };
-        if send_json(&mut ws, &out).await.is_err() {
-            return;
+        for msg in out {
+            if send_json(&mut ws, &msg).await.is_err() {
+                return;
+            }
         }
     }
 }

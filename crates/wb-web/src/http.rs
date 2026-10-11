@@ -7,7 +7,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use axum::extract::{FromRequest, FromRequestParts, Path, Request};
+use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request};
 use axum::http::header::CACHE_CONTROL;
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode};
@@ -76,6 +76,20 @@ impl<S: Send + Sync, T: DeserializeOwned + Send> FromRequestParts<S> for Param<T
         match Path::<T>::from_request_parts(parts, state).await {
             Ok(Path(t)) => Ok(Param(t)),
             Err(_) => Err(ApiError::new(StatusCode::BAD_REQUEST, "bad path")),
+        }
+    }
+}
+
+/// Query parameters. A malformed one is 400 JSON.
+pub struct ApiQuery<T>(pub T);
+
+impl<S: Send + Sync, T: DeserializeOwned> FromRequestParts<S> for ApiQuery<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(t)) => Ok(ApiQuery(t)),
+            Err(_) => Err(ApiError::new(StatusCode::BAD_REQUEST, "bad query")),
         }
     }
 }
