@@ -2168,27 +2168,25 @@ impl Pump {
                 reply.ok(&ok);
                 let mut sent = true;
                 for ev in replay.events {
-                    // Paced: the next event waits until the queue is below its cap. A
+                    // Paced: each event waits until it fits under the queue's cap. A
                     // replaced attachment stops its replay before the next event.
-                    if outq.room().await.is_err() || cancel.load(Ordering::Relaxed) {
-                        sent = false;
-                        break;
-                    }
                     let msg = HubMessage::AcpEv {
                         sid: sid.clone(),
                         ev: Box::new(ev),
                     };
-                    outq.push_reply(line(&msg));
+                    if !outq.push_paced(line(&msg), &cancel).await {
+                        sent = false;
+                        break;
+                    }
                 }
-                if sent && !cancel.load(Ordering::Relaxed) {
-                    let msg = HubMessage::AcpReplayed {
-                        sid,
-                        head,
-                        truncated: replay.truncated,
-                    };
-                    outq.push_reply(line(&msg));
-                }
-                sent
+                let msg = HubMessage::AcpReplayed {
+                    sid,
+                    head,
+                    truncated: replay.truncated,
+                };
+                // The held-back live events follow into a drained queue, so they never
+                // meet the paced replay's tail at the cap.
+                sent && outq.push_paced(line(&msg), &cancel).await && outq.drained(&cancel).await
             }
         };
         let _ = done.send(Replayed {

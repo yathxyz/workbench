@@ -1642,6 +1642,67 @@ fn hub_large_replay_is_capped_coalesced_and_ascending() {
 }
 
 #[test]
+fn hub_slow_reader_gets_the_paced_replay_then_the_live_events() {
+    let mut hub = Hub::with_scenarios(&[]);
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "stub");
+    turn_then_kill(&mut c, "a1");
+    drop(c);
+    hub.terminate();
+    // 70,000 small notices: the replay keeps the last 4 MiB of them, about 6 MB on the
+    // wire, more than CONN_QUEUE and the socket together, so it is paced.
+    let path = hub.acp_file("a1.jsonl");
+    let journal = std::fs::read_to_string(&path).unwrap();
+    let last: Value = serde_json::from_str(journal.lines().last().unwrap()).unwrap();
+    let (mut head, ts) = (last["seq"].as_u64().unwrap(), last["ts"].as_u64().unwrap());
+    let mut more = String::new();
+    for _ in 0..70_000 {
+        head += 1;
+        more += &json!({"seq": head, "ts": ts, "e": "notice", "level": "info", "text": "n"})
+            .to_string();
+        more.push('\n');
+    }
+    std::fs::write(&path, journal + &more).unwrap();
+    hub.restart();
+
+    let mut b = hub.connect();
+    assert_eq!(
+        b.ok(json!({"t": "acp.open", "sid": "a1", "since": 0}))["head"],
+        head
+    );
+    // While b reads nothing its queue fills and the replay waits. Viewers come and go
+    // meanwhile; their `acp.info`s wait in b's backlog.
+    for _ in 0..60 {
+        let mut o = hub.connect();
+        o.ok(json!({"t": "acp.open", "sid": "a1", "since": head}));
+    }
+    // b now reads at about 2 MB/s, slower than the hub sends.
+    let (mut n, mut seq) = (0, 0);
+    let replayed = loop {
+        let m = b
+            .next()
+            .unwrap_or_else(|| panic!("closed after {n} messages, at seq {seq}"));
+        n += 1;
+        if n % 20 == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        match m["t"].as_str() {
+            Some("acp.ev") => {
+                let s = m["ev"]["seq"].as_u64().unwrap();
+                assert!(s > seq, "{s} after {seq}");
+                seq = s;
+            }
+            Some("acp.replayed") => break m,
+            _ => {}
+        }
+    };
+    assert_eq!(replayed["head"], head);
+    assert_eq!(seq, head);
+    assert!(n > 50_000, "a replay of only {n} messages");
+    b.until("a held-back acp.info", |m| m["t"] == "acp.info");
+}
+
+#[test]
 fn hub_kill9_midturn_is_normalised_at_restart() {
     let mut hub = Hub::with_scenarios(&["permission"]);
     let mut c = hub.connect();

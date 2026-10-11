@@ -9,6 +9,7 @@
 
 use std::collections::VecDeque;
 use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
@@ -92,6 +93,46 @@ impl OutQ {
             self.changed.notify_waiters();
         }
         line
+    }
+
+    /// Waits until `line` fits under the cap, or the queue is empty, then queues it
+    /// (10-hub §4.3), so a replay never takes the queue past the cap. Whether it was
+    /// queued: not once the queue is closed or `cancel` is set, which a replaced
+    /// replay sees under the queue's lock, before the reply of the open that replaced
+    /// it.
+    pub async fn push_paced(&self, line: Arc<[u8]>, cancel: &AtomicBool) -> bool {
+        let queued = self
+            .wait(|st| {
+                if st.closed || st.finished || cancel.load(Ordering::Relaxed) {
+                    Some(false)
+                } else if st.bytes == 0 || st.bytes + line.len() <= CONN_QUEUE {
+                    st.bytes += line.len();
+                    st.q.push_back(line.clone());
+                    Some(true)
+                } else {
+                    None
+                }
+            })
+            .await;
+        if queued {
+            self.changed.notify_waiters();
+        }
+        queued
+    }
+
+    /// Waits until the writer has taken everything queued. Whether it did: not once
+    /// the queue is closed or `cancel` is set.
+    pub async fn drained(&self, cancel: &AtomicBool) -> bool {
+        self.wait(|st| {
+            if st.closed || cancel.load(Ordering::Relaxed) {
+                Some(false)
+            } else if st.q.is_empty() {
+                Some(true)
+            } else {
+                None
+            }
+        })
+        .await
     }
 
     /// Waits until the queue is below the cap.
@@ -181,6 +222,74 @@ mod tests {
         assert!(!waiter.is_finished());
         q.pop().await.unwrap();
         assert_eq!(waiter.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn push_paced_waits_until_the_line_fits() {
+        let q = Arc::new(OutQ::default());
+        let go = Arc::new(AtomicBool::new(false));
+        assert!(q.push_paced(line(10 << 20), &go).await);
+        let paced = |n| {
+            let (q, go) = (q.clone(), go.clone());
+            tokio::spawn(async move { q.push_paced(line(n), &go).await })
+        };
+        let pusher = paced(1);
+        tokio::task::yield_now().await;
+        assert!(!pusher.is_finished());
+        assert_eq!(q.pop().await.unwrap().len(), 10 << 20);
+        assert!(pusher.await.unwrap());
+        assert!(q.push_paced(line(CONN_QUEUE - 1), &go).await);
+        let pusher = paced(1);
+        tokio::task::yield_now().await;
+        assert!(
+            !pusher.is_finished(),
+            "1 + (CONN_QUEUE - 1) + 1 is over the cap"
+        );
+        assert_eq!(q.pop().await.unwrap().len(), 1);
+        assert!(pusher.await.unwrap());
+
+        // Cancelled while it waits: nothing is queued once there is room.
+        let pusher = paced(1);
+        tokio::task::yield_now().await;
+        go.store(true, Ordering::Relaxed);
+        assert_eq!(q.pop().await.unwrap().len(), CONN_QUEUE - 1);
+        assert!(!pusher.await.unwrap());
+        assert_eq!(q.pop().await.unwrap().len(), 1);
+        go.store(false, Ordering::Relaxed);
+        q.close();
+        assert!(!q.push_paced(line(1), &go).await);
+    }
+
+    #[tokio::test]
+    async fn drained_waits_for_the_writer() {
+        let q = Arc::new(OutQ::default());
+        let go = Arc::new(AtomicBool::new(false));
+        assert!(q.drained(&go).await);
+        q.push_reply(line(3));
+        q.push_reply(line(4));
+        let drained = || {
+            let (q, go) = (q.clone(), go.clone());
+            tokio::spawn(async move { q.drained(&go).await })
+        };
+        let waiter = drained();
+        tokio::task::yield_now().await;
+        q.pop().await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        q.pop().await.unwrap();
+        assert!(waiter.await.unwrap());
+
+        // Cancelled while it waits: it ends at the next change.
+        q.push_reply(line(5));
+        q.push_reply(line(6));
+        let waiter = drained();
+        tokio::task::yield_now().await;
+        go.store(true, Ordering::Relaxed);
+        q.pop().await.unwrap();
+        assert!(!waiter.await.unwrap());
+        go.store(false, Ordering::Relaxed);
+        q.close();
+        assert!(!q.drained(&go).await);
     }
 
     #[tokio::test]
