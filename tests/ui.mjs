@@ -869,10 +869,15 @@ await section('N7/N8', async () => {
   const tries = ptyOf(T, tid, t0).length;
   check('N7: hub down shows the chip, and a 1013 socket does not retry in a loop', chip === 'hub down' && tries <= 1, JSON.stringify({ chip, tries }));
   await hubCtl('start');
-  // The exit text can arrive when the hub stops; the toast waits for wb-web to see the hub again.
-  await until(async () => (await termText(T, tid)).includes(EXIT_HUB) && /hub restarted/.test(await T.evaluate(() => document.querySelector('#toast').textContent)), 20000);
-  st = await T.evaluate(id => ({ toast: document.querySelector('#toast').textContent, attn: window.__canvas.attnItems().filter(a => a.key === id).length }), tid);
-  check('N7: after the hub restarts the card shows the hub_restart text, the toast says so, and the card is not "ended"', (await termText(T, tid)).includes(EXIT_HUB) && /hub restarted/.test(st.toast) && st.attn === 0, JSON.stringify(st));
+  // The exit text first arrives when the hub stops. The reconnect's hello then resets the screen, and the corpse's exit
+  // prints the text again a moment later, so the check waits for the reconnected card and judges one snapshot of the page.
+  const n7 = () => T.evaluate(({ id, EXIT_HUB }) => {
+    const C = window.__canvas, b = C.live[id].backend, buf = C.live[id].term.buffer.active, rows = [];
+    for (let i = 0; i < buf.length; i++) rows.push(buf.getLine(i).translateToString(true));
+    return { text: rows.join('\n').includes(EXIT_HUB), back: b.ws?.readyState === 1 && b.dead && b.exitReason === 'hub_restart', toast: document.querySelector('#toast').textContent, attn: C.attnItems().filter(a => a.key === id).length };
+  }, { id: tid, EXIT_HUB });
+  st = await until(async () => { const s = await n7(); return s.text && s.back && /hub restarted/.test(s.toast) ? s : null; }, 20000) || await n7();
+  check('N7: after the hub restarts the card shows the hub_restart text, the toast says so, and the card is not "ended"', st.text && st.back && /hub restarted/.test(st.toast) && st.attn === 0, JSON.stringify(st));
   // N8 (amended): a live shell, then a wiped stateDir: the card says No session, and Enter starts a shell with the marker.
   // The card already shows both lines from N7, so the check counts new ones.
   const count = async k => (await termText(T, tid)).split(k).length - 1, NOSESS = '[No session: press Enter', MARKER = '[new shell';
