@@ -771,7 +771,8 @@ class PtyBackend {
     if (!this.shellOffer && this.n.shell && INFO?.shells && INFO.defaultShell && !INFO.shells.includes(this.n.shell)) return this.offerDefault();
     if (this.shellOffer) { this.shellOffer = false; this.n.shell = INFO.defaultShell; updateTitle(this.n); dirty(); }
     this.dead = false; this.respawning = true; this.spawn = true;
-    if (this.ws?.readyState === 1) this.ws.send(this.openMsg()); else this.connect();
+    // after a failed open the server is closing this socket (1000), so the spawn needs a new one
+    if (this.ws?.readyState === 1 && !this.final) this.ws.send(this.openMsg()); else this.connect();
   }
   send(d) {
     if (this.ws?.readyState !== 1) return;
