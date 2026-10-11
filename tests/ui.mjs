@@ -577,6 +577,38 @@ check('t cycles the keyword in the page; d pastes title + body into a shell tagg
 await p.keyboard.press('T'); await sleep(200);
 st = await p.evaluate(async ({ pg, sh }) => { const C = window.__canvas; const text = C.live[pg].view.state.doc.toString(); const r = await C.AGENT_TOOLS.find(x => x.name === 'set_task').run({ task: 'todo:3', keyword: 'DONE' }); const text2 = C.live[pg].view.state.doc.toString(); C.setView('canvas'); C.removeNode(pg); C.removeNode(sh); return { text, r, text2 }; }, tk);
 check('T cycles back (NEXT → TODO); set_task writes a keyword by reference', /- TODO Write the v15 tests/.test(st.text) && st.r === 'board:/todo:3 → DONE' && /- DONE Write the v15 tests/.test(st.text2), JSON.stringify(st));
+// ---- fix 1 rendering without a server (30 §1.2-§1.4, F-A19): diffs, elicitation forms, url requests, agent text as text
+st = await p.evaluate(() => {
+  const C = window.__canvas, A = C.AcpBackend.prototype, rows = d => [...d.querySelectorAll('pre > div')].map(r => r.className + ':' + r.textContent);
+  const lines = (k, f) => Array.from({ length: k }, (_, i) => f(i)).join('\n');
+  const fresh = C.lineDiff({ path: '/w/new.txt', oldText: null, newText: 'x\ny' });
+  const many = rows(C.lineDiff({ path: '/w/m', oldText: lines(30, i => 'l' + i), newText: lines(30, i => (i === 15 ? 'L15' : 'l' + i)) }));
+  const f = C.elicitForm({ type: 'object', required: ['name'], properties: { color: { type: 'string', enum: ['red', 'green'] }, n: { type: 'integer', minimum: 1, maximum: 5 }, ok: { type: 'boolean' }, tags: { type: 'array', items: { type: 'string', enum: ['a', 'b', 'c'] } }, name: { type: 'string', minLength: 2 } } });
+  const q = (k, s) => f.el.querySelector(`.fld[data-key="${k}"] ${s}`), empty = f.check();
+  q('name', 'input').value = 'x'; const short = f.check();
+  q('name', 'input').value = 'xy'; q('n', 'input').value = '9'; const big = f.check();
+  q('n', 'input').value = '3'; q('color', 'select').value = 'green'; q('ok', 'input').checked = true; q('tags', 'input[value="b"]').checked = true;
+  const full = f.check();
+  const url = u => { const d = A.elicitPanel.call({ answerElicitation() {} }, 1, { request: { mode: 'url', url: u, message: 'Sign in', elicitationId: 'e' } }); return { off: d.querySelector('button.open').disabled, host: d.querySelector('code b')?.textContent ?? null, links: d.querySelectorAll('a').length }; };
+  const XSS = '<img src=x onerror="window.__xss=1">';
+  const perm = A.permPanel.call({ n: { agent: 'stub' }, answerPermission() {} }, 1, { toolCall: { title: XSS, kind: 'edit', content: [{ type: 'diff', path: '/w/' + XSS, oldText: 'a', newText: '<script>window.__xss=2</script>' }] },
+    options: [{ optionId: 'y', name: 'Allow', kind: 'allow_once' }, { optionId: 'a', name: 'Always', kind: 'allow_always' }, { optionId: 'n', name: 'Reject', kind: 'reject_once' }] });
+  document.body.append(perm);
+  const out = { diff: rows(C.lineDiff({ path: '/w/a.txt', oldText: 'a\nb\nc', newText: 'a\nB\nc' })), fresh: rows(fresh), freshPath: fresh.querySelector('.dp').textContent, many,
+    empty, short, big, full, js: url('javascript:alert(1)'), data: url('data:text/html,<b>x</b>'), http: url('http://example.org/'), https: url('https://example.org/login?x=1'),
+    markup: perm.querySelectorAll('img, script').length, title: perm.querySelector('.ph .tt').textContent, btns: [...perm.querySelectorAll('.acts button')].map(b => (b.className || '-') + '|' + b.dataset.kind + '|' + b.textContent),
+    button: document.querySelector('#add-acp')?.disabled };
+  perm.remove(); return out;
+});
+await sleep(300);
+check('fix 1 (no server): lineDiff marks the changed lines, keeps 3 lines of context, folds the rest, and shows a missing oldText as a new file',
+  st.diff.join() === 'ctx:  a,del:- b,add:+ B,ctx:  c' && st.fresh.join() === 'add:+ x,add:+ y' && st.freshPath === '/w/new.txt (new file)' && st.many.length === 10 && st.many[0] === 'gap:… 12 unchanged lines' && st.many[4] === 'del:- l15' && st.many[5] === 'add:+ L15' && st.many[9] === 'gap:… 11 unchanged lines', JSON.stringify({ diff: st.diff, fresh: st.fresh, many: st.many }));
+check('fix 1 (no server): an elicitation form checks required, minLength and maximum, and returns the exact content',
+  !st.empty.ok && st.empty.err === 'name is required' && st.short.err === 'name: at least 2 characters' && st.big.err === 'n: at most 5' && st.full.ok && JSON.stringify(st.full.content) === JSON.stringify({ color: 'green', n: 3, ok: true, tags: ['b'], name: 'xy' }), JSON.stringify({ empty: st.empty, short: st.short, big: st.big, full: st.full }));
+check('F-A19 (no server): a url request can be opened only when it is https:, shows its host in bold, and renders no link',
+  st.js.off && st.data.off && st.http.off && !st.https.off && st.https.host === 'example.org' && st.js.host === null && [st.js, st.data, st.http, st.https].every(u => u.links === 0), JSON.stringify({ js: st.js, data: st.data, http: st.http, https: st.https }));
+check('fix 1 (no server): agent text in a permission request stays text; allow_always says remembered; reject is not the primary button; the Agent button is off in the demo',
+  st.markup === 0 && st.title.startsWith('<img') && await p.evaluate(() => window.__xss === undefined) && st.btns[0] === 'go|allow_once|Allow' && st.btns[1] === 'go|allow_always|Always · remembered by stub' && st.btns[2] === '-|reject_once|Reject' && st.button === true, JSON.stringify({ markup: st.markup, btns: st.btns, button: st.button }));
 await p.close();
 check('N16 demo: the inlined page asks fonts.googleapis.com for nothing', !demoHosts.has('fonts.googleapis.com'), [...demoHosts].join());
 
@@ -626,12 +658,12 @@ const REQ = [], WSL = [];
 ctx.on('request', r => REQ.push({ r, m: r.method(), url: r.url(), h: r.headers(), t: Date.now() }));
 const status = async e => (await e.r.response().catch(() => null))?.status();
 const puts = (since = 0) => REQ.filter(e => e.m === 'PUT' && e.url === ORIGIN + '/api/board' && e.t >= since);
-// Each socket's first open and first hello, into WSL.
+// Each socket's first open and first hello, into WSL; an /acp socket also keeps every frame (sent, recv).
 function record(p) {
   p.on('websocket', ws => {
-    const w = { url: ws.url(), p, t: Date.now(), open: null, hello: null, closed: null }; WSL.push(w);
-    ws.on('framesent', f => { if (w.open) return; try { const m = JSON.parse(f.payload); if (m.t === 'open') w.open = m; } catch {} });
-    ws.on('framereceived', f => { if (w.hello) return; try { const m = JSON.parse(f.payload); if (m.t === 'hello') { w.hello = m; w.helloT = Date.now(); } } catch {} });
+    const w = { url: ws.url(), p, t: Date.now(), open: null, hello: null, closed: null, sent: [], recv: [] }, acp = w.url.endsWith('/acp'); WSL.push(w);
+    ws.on('framesent', f => { let m; try { m = JSON.parse(f.payload); } catch { return; } if (acp) w.sent.push(m); if (!w.open && m.t === 'open') w.open = m; });
+    ws.on('framereceived', f => { let m; try { m = JSON.parse(f.payload); } catch { return; } if (acp) w.recv.push(m); if (!w.hello && m.t === 'hello') { w.hello = m; w.helloT = Date.now(); } });
     ws.on('close', () => { w.closed = Date.now(); });
   });
 }
@@ -1041,6 +1073,433 @@ await section('kill while reconnecting', async () => {
     await settled(P);
   } finally { netBack(); await P.close(); }
 });
+
+// ---- fix 1: acp cards (30 §10 N17-N26; DESIGN §9.5 N27-N29, N39, N41, N42) against the stub agent: wb-fake-acp under the
+// agent key `stub`, scripted by prompt keyword (DESIGN §9.2). N26 needs no agent; the others skip when /api/info lists no
+// `stub`. One card (AID) carries most checks in turn; each check leaves it idle.
+const ACWD = fs.mkdtempSync(path.join(TMP, 'acp-'));
+const acpWs = (p, id, since = 0) => WSL.filter(w => w.p === p && w.url.endsWith('/acp') && w.t >= since && (!id || w.open?.id === id));
+const acpSent = (p, id, t, since = 0) => acpWs(p, id, since).flatMap(w => w.sent.filter(m => m.t === t));
+// Journal events the page received after seq `after`, once each, from sockets opened since `since` (a new session's seq
+// starts again at 1, so a check across Start new session passes `since`).
+const acpEvs = (p, id, e, after = 0, since = 0) => {
+  const m = new Map();
+  for (const w of acpWs(p, id, since)) for (const f of w.recv) if (f.t === 'ev' && f.ev?.seq > after && (!e || f.ev.e === e)) m.set(f.ev.seq, f.ev);
+  return [...m.values()].sort((a, b) => a.seq - b.seq);
+};
+const acpView = (p, id) => p.evaluate(id => {
+  const C = window.__canvas, L = C.live[id], b = L?.backend; if (!b) return null;
+  const vis = e => !!e && !e.hidden && !e.closest('[hidden]'), st = L.body.querySelector('.ag-state');
+  return { st: b.state(), tx: b.stateText(), badge: L.hdr.querySelector('.badge').textContent, seq: b.seq, epoch: b.epoch, alive: !!b.sum?.alive, activity: b.sum?.acp?.activity, promptable: b.promptable(),
+    items: b.items.map(i => i.k + ':' + (i.k === 'tool' ? i.status + ' ' + (i.title || '') : i.text || '')), asst: L.body.querySelectorAll('.ag-log .ag-asst').length,
+    perm: L.body.querySelectorAll('.ag-perm').length, form: L.body.querySelectorAll('.ag-form').length, url: L.body.querySelectorAll('.ag-url').length,
+    state: vis(st) ? st.textContent : '', revive: vis(L.revive), ta: L.ta.value, ro: L.ta.readOnly, go: L.body.querySelector('.ag-row .go').textContent,
+    mode: L.body.querySelector('.ag-mode').value, modes: [...L.body.querySelectorAll('.ag-mode option')].map(o => o.value) };
+}, id);
+const toastOf = p => p.evaluate(() => document.querySelector('#toast')?.textContent || '');
+const acpClick = (p, id, sel) => p.evaluate(({ id, sel }) => { const b = window.__canvas.live[id].body.querySelector(sel); b?.click(); return !!b; }, { id, sel });
+const acpIdle = (p, id, ms = 20000) => until(async () => { const v = await acpView(p, id); return v?.promptable && (v.st === 'idle' || v.st === 'done') ? v : null; }, ms);
+async function acpNew(p) {   // through newAgentCard (30 §1.1): the picker only when there is more than one agent, then the folder
+  const before = await p.evaluate(() => Object.keys(window.__canvas.S.nodes));
+  await p.evaluate(() => window.__canvas.newAgentCard());
+  if (await p.evaluate(() => document.querySelector('#ask').hidden)) { await p.fill('#pal-in', 'stub'); await sleep(200); await p.keyboard.press('Enter'); }
+  await until(() => p.evaluate(() => !document.querySelector('#ask').hidden), 5000);
+  await p.fill('#ask-in', ACWD); await p.keyboard.press('Enter');
+  return until(() => p.evaluate(before => Object.values(window.__canvas.S.nodes).find(n => n.kind === 'acp' && !before.includes(n.id))?.id, before));
+}
+// Brings a card into view: a far zoom hides card bodies (visibility), and Playwright only types into visible fields.
+const acpShow = (p, id) => p.evaluate(id => { const C = window.__canvas; C.jumpNode(C.S.nodes[id]); }, id);
+async function acpSay(p, id, text) {   // the composer, as a user types it
+  await until(async () => (await acpView(p, id))?.promptable, 20000);
+  await acpShow(p, id);
+  const ta = `.node[data-id="${id}"] .ag-in textarea`;
+  await p.fill(ta, text); await p.press(ta, 'Enter');
+}
+// A second page whose /acp sockets pass through a route: `hold` keeps server frames back until release(), `refuse` closes
+// new sockets 1011 at once, kick() drops the open ones with 1011, and drop(frame) keeps a page frame from the server.
+async function gatedPage() {
+  const P = await ctx.newPage(); watchErrors(P);
+  const g = { hold: false, refuse: false, drop: () => false, sent: [], recv: [], socks: [] };
+  const code = c => ([1005, 1006, 1015].includes(c) ? 1011 : c || 1000);   // codes a close frame cannot carry
+  await P.routeWebSocket(/\/acp$/, ws => {
+    if (g.refuse) return void ws.close({ code: 1011 });
+    const server = ws.connectToServer(), s = { ws, server, buf: [] }; g.socks.push(s);
+    const parse = m => { try { return JSON.parse(m); } catch { return null; } };
+    ws.onMessage(m => { const o = parse(m); g.sent.push(o); if (!g.drop(o)) server.send(m); });
+    server.onMessage(m => { g.recv.push(parse(m)); if (g.hold) s.buf.push(m); else ws.send(m); });
+    ws.onClose(c => server.close({ code: code(c) }));
+    server.onClose(c => ws.close({ code: code(c) }));
+  });
+  g.release = () => { g.hold = false; for (const s of g.socks) while (s.buf.length) s.ws.send(s.buf.shift()); };
+  g.kick = () => { for (const s of g.socks.splice(0)) { s.ws.close({ code: 1011 }); s.server.close({ code: 1000 }); } };
+  await P.goto(ORIGIN + '/'); await until(() => P.evaluate(() => window.__canvas?.BOOTED));
+  return { P, g };
+}
+let AP = null, AID = null, STUB = false, STUCK = false;
+await section('acp boot', async () => {
+  AP = await dpage();
+  st = await AP.evaluate(() => ({ agents: (window.__canvas.INFO?.agents || []).map(a => a.name), off: document.querySelector('#add-acp').disabled }));
+  STUB = st.agents.includes('stub'); STUCK = st.agents.includes('stuck');
+  check('fix 1: the Agent button is enabled exactly when the server lists agents', st.off === !st.agents.length, JSON.stringify(st));
+});
+// N26 needs no agent: a board acp card mounts, and opens (if the server has /acp) without spawn fields
+await section('N26', async () => {
+  const cur = await api('/api/board'), etag = cur.headers.get('ETag'), board = await cur.json();
+  board.nodes.n26a = { id: 'n26a', kind: 'agent', name: 'old-chat', x: 100, y: 1300, w: 400, h: 300, tier: 'quick', turns: [{}], log: [{ t: 'user', text: 'hi' }, { t: 'assistant', text: 'hello' }] };
+  board.nodes.n26b = { id: 'n26b', kind: 'acp', name: 'agent26', agent: 'stub', cwd: ACWD, x: 600, y: 1300, w: 560, h: 520 };
+  const r = await api('/api/board', { method: 'PUT', headers: { 'Content-Type': 'application/json', 'If-Match': etag }, body: JSON.stringify(board) });
+  const P = await dpage();
+  try {
+    await sleep(1500);
+    st = await P.evaluate(() => { const C = window.__canvas, a = C.S.nodes.n26a, b = C.S.nodes.n26b; return { a: a && { kind: a.kind, text: a.text, log: 'log' in a, turns: 'turns' in a }, b: b && { kind: b.kind, agent: b.agent, cwd: b.cwd }, mounted: !!C.live.n26b?.backend }; });
+    const spawned = acpWs(P, 'n26b').some(w => 'agent' in w.open || 'cwd' in w.open);
+    check('N26: migrateV9 still turns a legacy agent node into a page and leaves an acp node as it was; a board acp card opens without spawn fields',
+      r.status === 204 && st.a?.kind === 'buffer' && /\(former agent node\)/.test(st.a.text) && /> hi\n\nhello/.test(st.a.text) && !st.a.log && !st.a.turns && st.b?.kind === 'acp' && st.b.agent === 'stub' && st.b.cwd === ACWD && st.mounted && !spawned, JSON.stringify({ put: r.status, st, spawned }));
+    await P.evaluate(() => ['n26a', 'n26b'].forEach(id => window.__canvas.removeNode(id))); await settled(P);
+  } finally { await P.close(); }
+});
+// F-A1, F-A2, F-A3, F-A4, F-A5 and seen on mocked /acp sockets: the server side is scripted here, so these run without an
+// agent. `script(s, n)` answers the n-th open of a card; `s.on` takes the frames after it.
+await section('acp mocked', async () => {
+  const P = await ctx.newPage(); watchErrors(P);
+  const socks = []; let script = () => {};
+  await P.routeWebSocket(/\/acp$/, ws => {
+    const s = { ws, sent: [] }; socks.push(s);
+    ws.onMessage(m => { let o; try { o = JSON.parse(m); } catch { return; } s.sent.push(o); if (o.t === 'open' && !s.open) { s.open = o; script(s, socks.filter(x => x.open?.id === o.id).length); } else s.on?.(o); });
+  });
+  const send = (s, ...ms) => { for (const m of ms) s.ws.send(JSON.stringify(m)); };
+  const info = (id, epoch, head, x = {}) => ({ sid: id, kind: 'acp', host: 'h', createdAt: epoch, updatedAt: epoch, alive: true, viewers: 1, cwd: ACWD, state: x.state || 'idle',
+    acp: { agent: 'stub', agentSessionId: 'a', revivable: true, activity: 'none', pending: [], headSeq: head, seenSeq: x.seen ?? head, title: null, modeId: null } });
+  const hello = (id, epoch, head, x = {}) => ({ t: 'hello', status: 'attached', info: info(id, epoch, head, x), head, from: x.from ?? 1, reset: !!x.reset });
+  const ev = (seq, e, x = {}) => ({ t: 'ev', ev: { seq, ts: seq, e, ...x } });
+  const opensOf = id => socks.filter(s => s.open?.id === id);
+  try {
+    await P.goto(ORIGIN + '/'); await until(() => P.evaluate(() => window.__canvas?.BOOTED));
+    // F-A4: a failed open is final; Start new session then opens with the spawn fields
+    script = (s, n) => {
+      if (n === 1) { send(s, { t: 'error', error: 'no session', code: 'not_found' }); setTimeout(() => s.ws.close({ code: 1000 }), 100); }
+      else send(s, hello(s.open.id, 500, 2), ev(1, 'spawn', { pid: 1, via: 'new' }), ev(2, 'session', { via: 'new', sessionId: 'a' }), { t: 'replayed', head: 2, truncated: false });
+    };
+    const m1 = await P.evaluate(cwd => window.__canvas.addNode({ kind: 'acp', name: 'm1', agent: 'stub', cwd, x: 3000, y: 3400, w: 560, h: 420, _spawn: false }).id, ACWD);
+    await sleep(4000);
+    const v1 = await acpView(P, m1), n1 = opensOf(m1).length;
+    await acpClick(P, m1, '.ag-state .acts button.go');
+    const v1b = await until(async () => { const v = await acpView(P, m1); return v.promptable ? v : null; }, 5000), o2 = opensOf(m1)[1]?.open;
+    check('F-A4 (mocked): an open that gets not_found makes one socket and shows No session; Start new session opens again with agent and cwd from since 0',
+      n1 === 1 && !('agent' in opensOf(m1)[0].open) && v1.st === 'exited' && /No session for this card/.test(v1.state) && !!v1b && o2?.agent === 'stub' && o2.cwd === ACWD && o2.since === 0, JSON.stringify({ n1, v1: v1 && { st: v1.st, state: v1.state }, o2 }));
+    await P.evaluate(id => window.__canvas.removeNode(id), m1);
+
+    // F-A5 and F-A1: a prompt lost with its socket stays in the composer; the reconnect sends since and epoch; reset clears
+    let echo = false;
+    script = (s, n) => {
+      if (n === 1) { send(s, hello(s.open.id, 1000, 2), ev(1, 'spawn', { pid: 1, via: 'new' }), ev(2, 'session', { via: 'new', sessionId: 'a' }), { t: 'replayed', head: 2, truncated: false }); s.on = o => { if (o.t === 'prompt') s.ws.close({ code: 1011 }); }; }
+      else if (n === 2) {
+        send(s, hello(s.open.id, 1000, 3), ev(3, 'update', { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'still here' }, messageId: 'x' } }), { t: 'replayed', head: 3, truncated: false });
+        s.on = o => { if (o.t === 'prompt') { echo = true; send(s, ev(4, 'prompt', { prompt: o.blocks })); setTimeout(() => s.ws.close({ code: 1011 }), 300); } };
+      } else if (n === 3) {
+        send(s, hello(s.open.id, 2000, 2, { reset: true }), ev(1, 'spawn', { pid: 2, via: 'new' }), ev(2, 'permission', { toolCall: { toolCallId: 't1', title: 'Edit a file', kind: 'edit' }, options: [{ optionId: 'y', name: 'Allow', kind: 'allow_once' }, { optionId: 'n', name: 'Reject', kind: 'reject_once' }] }), { t: 'replayed', head: 2, truncated: false });
+        s.on = o => { if (o.t === 'permission') send(s, { t: 'error', error: 'stale', code: 'stale', rid: o.rid }); if (o.t === 'kill' && o.forget) setTimeout(() => s.ws.close({ code: 1000 }), 300); };
+      } else send(s, hello(s.open.id, 3000, 1, { state: 'done', seen: 0 }), ev(1, 'spawn', { pid: 3, via: 'new' }), { t: 'replayed', head: 1, truncated: false });
+    };
+    const m2 = await P.evaluate(cwd => window.__canvas.addNode({ kind: 'acp', name: 'm2', agent: 'stub', cwd, x: 3000, y: 3400, w: 560, h: 420 }).id, ACWD);
+    const TEXT = 'mocked prompt';
+    await acpSay(P, m2, TEXT);
+    const back = await until(async () => { const v = await acpView(P, m2); return opensOf(m2).length === 2 && v.promptable && v.asst === 1 ? v : null; }, 10000), o2b = opensOf(m2)[1]?.open;
+    check('F-A5 (mocked): a prompt whose socket dropped before the echo is back in the composer, editable, after the reconnect; the reconnect sends since and epoch',
+      !!back && back.ta === TEXT && !back.ro && back.go === 'Send' && o2b?.since === 2 && o2b.epoch === 1000 && !('agent' in o2b), JSON.stringify({ back: back && { ta: back.ta, ro: back.ro, go: back.go }, o2b }));
+    await acpSay(P, m2, TEXT);
+    const cleared = await until(async () => { const v = await acpView(P, m2); return echo && v.ta === '' && !v.ro ? v : null; }, 5000);
+    check('F-A5 (mocked): the echo of this tab\'s prompt empties the composer', !!cleared, JSON.stringify(await acpView(P, m2)));
+    const reset = await until(async () => { const v = await acpView(P, m2); return opensOf(m2).length === 3 && v.epoch === 2000 && v.perm === 1 ? v : null; }, 10000), o3 = opensOf(m2)[2]?.open;
+    check('F-A1 (mocked): a hello with reset clears the transcript and the replay from seq 1 rebuilds it, with the pending permission', !!reset && o3?.since === 4 && o3.epoch === 1000 && reset.asst === 0 && !reset.items.some(x => x.startsWith('user:')) && reset.seq === 2, JSON.stringify({ o3, items: reset?.items, seq: reset?.seq }));
+    await acpClick(P, m2, '.ag-perm button[data-kind="allow_once"]');
+    const answer = await until(() => opensOf(m2)[2].sent.find(m => m.t === 'permission'), 5000);   // the route hears it a little later
+    const stale = await until(async () => /belongs to an ended session/.test(await toastOf(P)) && (await acpView(P, m2)).perm === 0, 5000);
+    check('F-A2 (mocked): an answer carries the epoch and the option; stale toasts "this request belongs to an ended session" and drops the panel', answer?.req === 2 && answer.epoch === 2000 && answer.outcome?.outcome === 'selected' && answer.outcome.optionId === 'y' && answer.rid != null && stale, JSON.stringify({ answer, toast: await toastOf(P) }));
+    // F-A3: Start new session waits for the close 1000, never shows ended, and opens fresh; seen goes for a done state
+    await P.evaluate(id => {
+      const C = window.__canvas, L = C.live[id], b = L.hdr.querySelector('.badge'); window.__m3 = [];
+      new MutationObserver(() => window.__m3.push(b.textContent)).observe(b, { childList: true, characterData: true, subtree: true });
+      C.jumpNode(C.S.nodes[id]); C.CMDS.find(c => c.l.startsWith('Agent: start a new session')).run();
+    }, m2);
+    const fresh = await until(async () => { const v = await acpView(P, m2); return v.epoch === 3000 ? v : null; }, 10000), o4 = opensOf(m2)[3]?.open, badges = await P.evaluate(() => [...new Set(window.__m3)]);
+    const kill = opensOf(m2)[2].sent.find(m => m.t === 'kill'), seen = await until(() => opensOf(m2)[3]?.sent.find(m => m.t === 'seen'), 5000);
+    check('F-A3 (mocked): Start new session sends kill forget, shows ending…, waits for the close, then opens with agent and cwd from since 0 and a fresh transcript',
+      kill?.forget === true && badges.some(t => /ending…$/.test(t)) && !badges.some(t => /· ended$/.test(t)) && !!fresh && o4?.agent === 'stub' && o4.since === 0 && fresh.items.length === 1, JSON.stringify({ kill, badges, o4, items: fresh?.items }));
+    check('§3.4.6 (mocked): a done card that is active in a visible, focused page sends seen with the head seq', seen?.seq === 1, JSON.stringify(opensOf(m2)[3]?.sent));
+    await P.evaluate(id => window.__canvas.removeNode(id), m2);
+  } finally { await P.close(); }
+});
+if (!STUB) for (const n of ['N17', 'N18', 'N19', 'N20', 'N21', 'N22', 'N23', 'N24', 'N25', 'N27', 'N28', 'N29', 'N39', 'N41', 'N42']) skip(n, 'no stub agent in /api/info.agents (wb-fake-acp registered as `stub` in the test hub)');
+else {
+  await section('N17', async () => {
+    await AP.evaluate(() => {   // every text the new card's badge shows, from its first paint
+      const seen = window.__n17b = [];
+      window.__n17o = new MutationObserver(() => { const b = document.querySelector('.node.k-acp .badge'); if (b && seen.at(-1) !== b.textContent) seen.push(b.textContent); });
+      window.__n17o.observe(document.body, { childList: true, subtree: true, characterData: true });
+    });
+    const id = AID = await acpNew(AP);
+    await until(async () => { const v = await acpView(AP, id); return v?.promptable && v.tx === 'idle'; }, 20000);
+    const seen = await AP.evaluate(() => { window.__n17o.disconnect(); return window.__n17b.map(t => t.split(' · ').at(-1)); }), open = acpWs(AP, id)[0]?.open;
+    check('N17: newAgentCard opens with agent and cwd from since 0, and the badge goes … → idle', open?.agent === 'stub' && open?.cwd === ACWD && open?.since === 0 && seen[0] === '…' && seen.at(-1) === 'idle', JSON.stringify({ open, seen }));
+    // A page takes the focus, so the turn's end stays done until the card is looked at.
+    const nb = await AP.evaluate(() => { const C = window.__canvas, b = C.addNode({ kind: 'buffer', name: 'n17', x: 3000, y: 3000, w: 300, h: 200, text: '# n17' }); C.jumpNode(b); return b.id; });
+    await AP.evaluate(id => { const b = window.__canvas.live[id].hdr.querySelector('.badge'); window.__n17 = []; new MutationObserver(() => window.__n17.push(b.className)).observe(b, { attributes: true }); }, id);
+    const v0 = await acpView(AP, id), seen0 = acpSent(AP, id, 'seen').length;
+    await AP.evaluate(id => window.__canvas.live[id].backend.input('stream\r'), id);
+    const done = await until(async () => { const v = await acpView(AP, id); return v.st === 'done' ? v : null; }, 20000, 50);
+    await sleep(500);
+    const states = await AP.evaluate(() => [...new Set(window.__n17)]), chunks = acpEvs(AP, id, 'update', v0.seq).filter(e => e.update?.sessionUpdate === 'agent_message_chunk').length, noSeen = acpSent(AP, id, 'seen').length === seen0;
+    check('N17: "stream" renders its chunks in one .ag-asst item, and the turn goes running → done while the card is not looked at', !!done && done.asst === v0.asst + 1 && chunks >= 2 && states.includes('badge st-running') && states.includes('badge st-done') && noSeen, JSON.stringify({ states, asst: [v0.asst, done?.asst], chunks, noSeen }));
+    await AP.evaluate(id => window.__canvas.jumpNode(window.__canvas.S.nodes[id]), id);
+    const idle = await until(async () => { const v = await acpView(AP, id); return v.st === 'idle' ? v : null; }, 10000);
+    const sent = acpSent(AP, id, 'seen');
+    check('N17: once the card is active in a visible, focused page, seen goes with the head seq and the state becomes idle', !!idle && sent.length === seen0 + 1 && sent.at(-1).seq === done?.seq, JSON.stringify({ sent, st: idle?.st, head: done?.seq }));
+    await AP.evaluate(nb => window.__canvas.removeNode(nb), nb);
+  });
+  await section('N18', async () => {
+    const id = AID, s0 = (await acpView(AP, id)).seq;
+    await acpSay(AP, id, 'tool');
+    const v = await acpIdle(AP, id);
+    const sts = acpEvs(AP, id, 'update', s0).map(e => e.update).filter(u => /^tool_call/.test(u?.sessionUpdate || '')).map(u => u.status || (u.sessionUpdate === 'tool_call' ? 'pending' : '')).filter((x, i, a) => x && x !== a[i - 1]);
+    st = await AP.evaluate(id => { const t = [...window.__canvas.live[id].body.querySelectorAll('.ag-log .ag-tool')].at(-1); return t && { status: t.dataset.status, glyph: t.querySelector('.tg').textContent, add: t.querySelectorAll('.ag-diff .add').length, del: t.querySelectorAll('.ag-diff .del').length }; }, id);
+    check('N18: "tool" goes pending → in_progress → completed and its diff has .add and .del rows', !!v && sts.join() === 'pending,in_progress,completed' && st?.status === 'completed' && st.glyph === '✓' && st.add > 0 && st.del > 0, JSON.stringify({ sts, st }));
+  });
+  await section('N19', async () => {
+    const id = AID; await settled(AP);
+    const { P: B, g } = await gatedPage();
+    try {
+      await until(async () => (await acpView(B, id))?.promptable, 20000);
+      const s0 = (await acpView(AP, id)).seq;
+      await acpSay(AP, id, 'perm');
+      const both = await until(async () => (await acpView(AP, id)).perm === 1 && (await acpView(B, id)).perm === 1, 15000);
+      const btns = await AP.evaluate(id => [...window.__canvas.live[id].body.querySelectorAll('.ag-perm button')].map(b => b.dataset.kind + '|' + b.textContent), id);
+      g.hold = true;   // B hears nothing more until its own click went out
+      await acpClick(AP, id, '.ag-perm button[data-kind="allow_once"]');
+      const goneA = await until(async () => (await acpView(AP, id)).perm === 0, 10000), res = await until(() => acpEvs(AP, id, 'permission_resolved', s0)[0], 5000);
+      const stillB = (await acpView(B, id)).perm === 1;
+      await acpClick(B, id, '.ag-perm button[data-kind="allow_once"]');
+      await until(() => g.sent.some(m => m?.t === 'permission'), 5000); await sleep(500); g.release();
+      const goneB = await until(async () => (await acpView(B, id)).perm === 0, 10000), late = await until(async () => /already answered/.test(await toastOf(B)), 5000);
+      check('N19: a permission shows in both pages; allow in one clears the other, whose late click toasts already answered', both && goneA && res?.by === 'user' && stillB && goneB && late && g.recv.some(m => m?.t === 'error' && m.code === 'already_resolved'), JSON.stringify({ both, goneA, res, stillB, goneB, late, toast: await toastOf(B) }));
+      check('N19: the allow_always button says the agent remembers it', btns.some(x => /^allow_always\|.+ · remembered by /.test(x)), btns.join(' / '));
+      await acpIdle(AP, id);
+    } finally { await B.close(); }
+  });
+  await section('N20', async () => {
+    const id = AID, s0 = (await acpView(AP, id)).seq;
+    await acpSay(AP, id, 'form');
+    const ev = await until(() => acpEvs(AP, id, 'elicitation', s0)[0], 15000);
+    await until(async () => (await acpView(AP, id)).form === 1, 5000);
+    st = await AP.evaluate(({ id, schema }) => {
+      const box = window.__canvas.live[id].body.querySelector('.ag-form'), acc = [...box.querySelectorAll('.acts button')].find(b => b.textContent === 'Accept');
+      const need = new Set(schema.required || []), want = {}, kinds = [], fire = e => e.dispatchEvent(new Event('input', { bubbles: true }));
+      const fill = (k, p) => {
+        const row = box.querySelector(`.fld[data-key="${CSS.escape(k)}"]`), sel = row.querySelector('select'), many = row.querySelectorAll('.multi input'), inp = row.querySelector('input, textarea');
+        if (sel) { const o = [...sel.options].find(o => o.value !== ''); sel.value = o.value; want[k] = o.value; kinds.push('enum'); fire(sel); }
+        else if (many.length) { many[0].checked = true; want[k] = [many[0].value]; kinds.push('multi'); fire(many[0]); }
+        else if (inp?.type === 'checkbox') { inp.checked = true; want[k] = true; kinds.push('boolean'); fire(inp); }
+        else if (inp?.type === 'number') { const v = p.minimum ?? 1; inp.value = String(v); want[k] = v; kinds.push(p.type); fire(inp); }
+        else if (inp) { const v = 'n20'.padEnd(p.minLength || 0, 'x'); inp.value = v; want[k] = v; kinds.push('string'); fire(inp); }
+      };
+      const props = Object.entries(schema.properties || {});
+      for (const [k, p] of props) if (!need.has(k)) fill(k, p);
+      const before = acc.disabled;
+      for (const [k, p] of props) if (need.has(k)) fill(k, p);
+      const after = acc.disabled; acc.click();
+      return { before, after, want, kinds, need: [...need] };
+    }, { id, schema: ev?.request?.requestedSchema || {} });
+    const res = await until(() => acpEvs(AP, id, 'elicitation_resolved', s0)[0], 10000);
+    const sorted = o => JSON.stringify(Object.keys(o || {}).sort().map(k => [k, o[k]]));
+    // The hub journals the response it forwards verbatim (10 §11.3 `elicitation`), so the journal shows what the stub got.
+    check('N20: a form shows enum, integer, boolean and multi-select fields; Accept stays off until the required field is filled; the stub gets the exact content',
+      ['enum', 'integer', 'boolean', 'multi'].every(k => st.kinds.includes(k)) && st.need.length > 0 && st.before === true && st.after === false && res?.response?.action === 'accept' && sorted(res.response.content) === sorted(st.want), JSON.stringify({ st, res }));
+    await acpIdle(AP, id);
+  });
+  await section('N21', async () => {
+    const id = AID, s0 = (await acpView(AP, id)).seq;
+    await AP.evaluate(() => { window.__opened = []; window.open = (...a) => { window.__opened.push(a); return null; }; });   // no real tab
+    await acpSay(AP, id, 'url');
+    const ev = await until(() => acpEvs(AP, id, 'elicitation', s0)[0], 15000);
+    await until(async () => (await acpView(AP, id)).url === 1, 5000);
+    const href = String(ev?.request?.url || '');
+    st = await AP.evaluate(id => {
+      const C = window.__canvas, d = C.live[id].body.querySelector('.ag-url'), o = d.querySelector('button.open');
+      const js = C.AcpBackend.prototype.elicitPanel.call({ answerElicitation() {} }, 1, { request: { mode: 'url', url: 'javascript:alert(1)', message: 'm', elicitationId: 'x' } });
+      return { off: o.disabled, host: d.querySelector('code b')?.textContent ?? null, links: d.querySelectorAll('a').length, jsOff: js.querySelector('button.open').disabled };
+    }, id);
+    if (!st.off) await acpClick(AP, id, '.ag-url button.open');
+    const opened = await AP.evaluate(() => window.__opened);
+    const waiting = await until(async () => (await acpView(AP, id)).items.some(x => /waiting/.test(x)), 5000);
+    const complete = await until(() => acpEvs(AP, id, 'elicitation_complete', s0)[0], 15000);
+    const shown = await until(async () => (await acpView(AP, id)).items.some(x => /completed/.test(x)), 5000);
+    const u = href.startsWith('https:') ? new URL(href) : null;
+    check('N21: Open is disabled for a javascript: URL; for https: it shows the host, opens with noopener, sends accept, and the log waits until elicitation/complete',
+      st.jsOff && !!u && !st.off && st.host === u.host && st.links === 0 && opened.length === 1 && opened[0][0] === u.href && /noopener/.test(opened[0][2]) && acpSent(AP, id, 'elicitation').some(m => m.response?.action === 'accept') && waiting && !!complete && shown, JSON.stringify({ href, st, opened, waiting, complete: !!complete, shown }));
+    await acpIdle(AP, id);
+  });
+  await section('N22', async () => {
+    const id = AID, s0 = (await acpView(AP, id)).seq, c0 = acpSent(AP, id, 'cancel').length;
+    await acpSay(AP, id, 'slow');
+    await until(async () => (await acpView(AP, id)).activity === 'turn', 10000);
+    await AP.click(`.node[data-id="${id}"] .ag-row .stop`);
+    const end = await until(() => acpEvs(AP, id, 'turn_end', s0)[0], 15000), v = await until(async () => { const v = await acpView(AP, id); return v.st === 'idle' ? v : null; }, 10000);
+    check('N22: Stop sends cancel; the turn ends cancelled and the card is idle, not done', acpSent(AP, id, 'cancel').length === c0 + 1 && end?.stopReason === 'cancelled' && !!v, JSON.stringify({ cancels: acpSent(AP, id, 'cancel').length - c0, end, st: v?.st }));
+    const m0 = await acpView(AP, id), other = m0.modes.find(m => m !== m0.mode);
+    if (other != null) await AP.selectOption(`.node[data-id="${id}"] .ag-mode`, other);
+    const follow = await until(async () => { const v = await acpView(AP, id); return acpEvs(AP, id, null, m0.seq).some(e => e.e === 'mode' || e.update?.sessionUpdate === 'current_mode_update') && v.mode === other ? v : null; }, 10000);
+    check('N22: the mode select (two modes) sends set_mode and follows the mode the agent reports', m0.modes.length === 2 && other != null && acpSent(AP, id, 'set_mode').some(m => m.modeId === other) && !!follow, JSON.stringify({ modes: m0.modes, mode: m0.mode, other, sent: acpSent(AP, id, 'set_mode'), now: follow?.mode }));
+  });
+  await section('N24', async () => {
+    const id = AID;
+    await acpSay(AP, id, 'perm');
+    await until(async () => { const v = await acpView(AP, id); return v.perm === 1 && v.st === 'waiting_permission'; }, 15000);
+    st = await AP.evaluate(id => { const C = window.__canvas; C.statusRender(); const chip = [...document.querySelectorAll('#st-host .stc')].find(b => b.textContent.startsWith('✦')); return { chip: chip?.textContent, bad: chip?.classList.contains('bad'), attn: C.attnItems().filter(i => i.key === id).map(i => i.name) }; }, id);
+    check('N24: a card waiting for permission makes the ✦ chip read 1 waiting with class bad, and Attention says needs permission', /· 1 waiting$/.test(st.chip || '') && st.bad && st.attn.some(n => /needs permission$/.test(n)), JSON.stringify(st));
+    await acpClick(AP, id, '.ag-perm button[data-kind="allow_once"]'); await acpIdle(AP, id);
+    const pg = await AP.evaluate(() => window.__canvas.addNode({ kind: 'buffer', name: 'n24', x: 3000, y: 2000, w: 420, h: 240, text: '# n24\n\n- TODO Say hello from n24\n- TODO Second n24 task\n' }).id);
+    await sleep(500);
+    const s1 = (await acpView(AP, id)).seq;
+    const r = await AP.evaluate(async () => { const C = window.__canvas, t = C.allTasks().find(t => /Say hello from n24/.test(t.text)); try { return await C.dispatchTask(t); } catch (e) { return { error: e.message }; } });
+    const prompt = await until(() => acpEvs(AP, id, 'prompt', s1).find(e => JSON.stringify(e.prompt).includes('Say hello from n24')), 10000);
+    const addr = await AP.evaluate(id => window.__canvas.addrOf(window.__canvas.S.nodes[id]), id), text1 = await AP.evaluate(pg => window.__canvas.live[pg].view.state.doc.toString(), pg);
+    check('N24: dispatchTask sends the task to the idle acp card and writes session:: with its address', !!addr && r.session === addr && !!prompt && text1.includes('session:: ' + addr), JSON.stringify({ r, addr, prompt: !!prompt, text1 }));
+    await acpIdle(AP, id);
+    await acpSay(AP, id, 'slow');
+    await until(async () => (await acpView(AP, id)).activity === 'turn', 10000);
+    const r2 = await AP.evaluate(async shell => { const C = window.__canvas, t = C.allTasks().find(t => /Second n24 task/.test(t.text)); try { return await C.dispatchTask(t, { shell }); } catch (e) { return { error: e.message }; } }, r.shell);
+    const text2 = await AP.evaluate(pg => window.__canvas.live[pg].view.state.doc.toString(), pg);
+    check('N24: dispatch to a busy card fails with is busy and writes no session:: into the task', /is busy/.test(r2.error || '') && !/Second n24 task\n\s+session::/.test(text2), JSON.stringify({ r2, text2 }));
+    await acpClick(AP, id, '.ag-row .stop'); await acpIdle(AP, id);   // N22 clicks Stop for real; here the n24 page may cover it
+    await AP.evaluate(pg => window.__canvas.removeNode(pg), pg);
+  });
+  await section('N23', async () => {
+    const id = AID, before = (await acpIdle(AP, id))?.items || [];
+    if (!await hubCtl('stop')) return skip('N23', 'the harness did not acknowledge "stop hub"');
+    await sleep(1000); await hubCtl('start');
+    const v = await until(async () => { const v = await acpView(AP, id); return v.revive && (v.st === 'detached' || v.st === 'error') ? v : null; }, 40000);
+    await AP.evaluate(id => window.__canvas.live[id].revive.click(), id);
+    const back = await until(async () => { const v = await acpView(AP, id); return v.alive && v.promptable ? v : null; }, 30000);
+    const intact = !!back && before.length > 0 && before.every((x, i) => back.items[i] === x);
+    if (back) await acpSay(AP, id, 'stream');
+    const more = back && await until(async () => { const v = await acpView(AP, id); return v.asst > back.asst && v.promptable ? v : null; }, 20000);
+    check('N23: after a hub restart the card is detached or interrupted with ↻; ↻ revives it with its transcript, and a new prompt works', !!v && acpSent(AP, id, 'revive').length >= 1 && intact && !!more, JSON.stringify({ st: v?.st, revive: v?.revive, intact, before: before.length, after: back?.items.length, more: !!more }));
+  });
+  await section('N25', async () => {
+    const id = AID, epoch = (await acpIdle(AP, id))?.epoch;
+    await settled(AP); await AP.close();   // the session stays: a page that goes sends no kill
+    // the test hook: the node leaves the board without a kill, as a lost card would
+    const cur = await api('/api/board'), etag = cur.headers.get('ETag'), board = await cur.json(); delete board.nodes[id];
+    const r = await api('/api/board', { method: 'PUT', headers: { 'Content-Type': 'application/json', 'If-Match': etag }, body: JSON.stringify(board) });
+    AP = await dpage();
+    const item = await until(() => AP.evaluate(id => { const i = window.__canvas.attnItems().find(i => i.key === 'orphan:' + id); return i && { name: i.name, attn: i.attn, meta: i.meta }; }, id), 10000);
+    const t1 = Date.now();
+    if (item) await AP.evaluate(id => window.__canvas.attnItems().find(i => i.key === 'orphan:' + id).go(), id);
+    const w = await until(() => acpWs(AP, id, t1).find(w => w.hello), 10000);
+    check('N25: a live session with no card is listed as running without a card; adopting it makes a card with the same id that attaches without spawning',
+      r.status === 204 && /running without a card$/.test(item?.name || '') && item.attn === 'bad' && item.meta === ACWD && !!w && !('agent' in w.open) && w.hello.info?.createdAt === epoch && await AP.evaluate(id => window.__canvas.S.nodes[id]?.kind === 'acp', id), JSON.stringify({ put: r.status, item, open: w?.open, epoch, got: w?.hello?.info?.createdAt }));
+    await acpIdle(AP, id);
+  });
+  await section('N27', async () => {
+    const id = AID;
+    for (let i = 0; i < 6; i++) { await acpSay(AP, id, 'stream'); await acpIdle(AP, id); }
+    await acpSay(AP, id, 'perm');
+    await until(async () => (await acpView(AP, id)).perm === 1, 15000); await sleep(500);
+    const head = (await acpView(AP, id)).seq, logOf = () => AP.evaluate(id => [...window.__canvas.live[id].body.querySelectorAll('.ag-log > *')].map(e => e.className + ':' + e.textContent), id), dom0 = await logOf();
+    await settled(AP); await AP.reload(); await until(() => AP.evaluate(() => window.__canvas?.BOOTED));
+    const after = await until(async () => { const v = await acpView(AP, id); return v?.perm === 1 && v.seq >= head ? v : null; }, 20000);
+    await sleep(500);
+    const dom1 = await logOf();
+    await acpClick(AP, id, '.ag-perm button[data-kind="allow_once"]');
+    const res = await until(() => acpEvs(AP, id, 'permission_resolved', head)[0], 10000);
+    check('N27: a reload with a pending permission renders every item in order, and the permission panel answers', !!after && dom1.length === dom0.length && dom1.every((t, i) => t === dom0[i]) && res?.by === 'user', JSON.stringify({ n0: dom0.length, n1: dom1.length, at: dom1.findIndex((t, i) => t !== dom0[i]), res }));
+    await acpIdle(AP, id);
+  });
+  await section('N28', async () => {
+    const id = AID, before = await acpIdle(AP, id);
+    netCut();
+    await until(() => AP.evaluate(id => window.__canvas.live[id].el.classList.contains('net-wait'), id), 10000);
+    if (!await hubCtl('stop')) { netBack(); return skip('N28', 'the harness did not acknowledge "stop hub"'); }
+    fs.rmSync(H.stateDir, { recursive: true, force: true }); await hubCtl('start');
+    // the same sid again, from another client: a new incarnation the card has not seen
+    const r = spawnSync('python3', ['-I', path.join(path.dirname(HARNESS), 'wbctl.py'), '--hub', H.hubSocket, 'raw', JSON.stringify({ t: 'acp.open', rid: 1, sid: id, since: 0, spawn: { agent: 'stub', cwd: ACWD } })], { encoding: 'utf8', timeout: 20000 });
+    const t1 = Date.now(); netBack();
+    const w = await until(() => acpWs(AP, id, t1).find(w => w.hello), 40000), after = await until(async () => { const v = await acpView(AP, id); return v?.promptable ? v : null; }, 20000);
+    const first = w?.recv.find(m => m.t === 'ev');
+    check('N28: a hello with reset (stateDir wiped, the session recreated) clears the card and repopulates its transcript from seq 1',
+      r.status === 0 && w?.hello.reset === true && w.open.epoch === before?.epoch && first?.ev.seq === 1 && !!after && after.epoch !== before.epoch && after.asst === 0 && after.items.length < before.items.length, JSON.stringify({ wbctl: r.status, err: (r.stderr || '').slice(0, 200), reset: w?.hello?.reset, first: first?.ev, before: before?.items.length, after: after?.items }));
+  });
+  await section('N29', async () => {
+    const id = AID; await acpIdle(AP, id); await settled(AP);
+    const { P: S2, g } = await gatedPage();
+    try {
+      await until(async () => (await acpView(S2, id))?.promptable, 20000);
+      await acpSay(AP, id, 'perm');
+      await until(async () => (await acpView(S2, id)).perm === 1 && (await acpView(AP, id)).perm === 1, 15000);
+      const old = (await acpView(S2, id)).epoch;
+      g.refuse = true; g.kick();   // the stale tab loses its socket and stays off while the other tab starts a new session
+      await until(() => S2.evaluate(id => window.__canvas.live[id].el.classList.contains('net-wait'), id), 5000);
+      const t1 = Date.now();
+      await AP.evaluate(id => { const C = window.__canvas; C.jumpNode(C.S.nodes[id]); C.CMDS.find(c => c.l.startsWith('Agent: start a new session')).run(); }, id);
+      const fresh = await until(async () => { const v = await acpView(AP, id); return v.promptable && v.epoch !== old ? v : null; }, 30000);
+      const opens = g.sent.filter(m => m?.t === 'open').length;
+      g.hold = true; g.refuse = false;   // it reconnects, but hears nothing before it answers the old request
+      await until(() => g.sent.filter(m => m?.t === 'open').length > opens, 40000);
+      const clicked = await acpClick(S2, id, '.ag-perm button[data-kind="allow_once"]');
+      await until(() => g.sent.some(m => m?.t === 'permission'), 5000); await sleep(800); g.release();
+      const toast = await until(async () => /belongs to an ended session/.test(await toastOf(S2)), 10000);
+      await sleep(1000);
+      const got = acpEvs(AP, id, null, 0, t1).filter(e => /^permission/.test(e.e));
+      check('N29: a stale tab that answers a permission after Start new session in another tab toasts "this request belongs to an ended session", and the new session gets nothing',
+        !!fresh && clicked && g.sent.find(m => m?.t === 'permission')?.epoch === old && g.recv.some(m => m?.t === 'error' && m.code === 'stale') && toast && !got.length, JSON.stringify({ fresh: !!fresh, clicked, sent: g.sent.find(m => m?.t === 'permission'), errors: g.recv.filter(m => m?.t === 'error'), toast: await toastOf(S2), got }));
+    } finally { await S2.close(); }
+  });
+  // N39 needs an agent that only SIGKILL ends: `stuck` = wb-fake-acp --scenario kill-stubborn, which ignores EOF and SIGTERM
+  // and never ends a prompt (the keyword stub has no such prompt). The name shares no fuzzy match with `stub` (acpNew).
+  await section('N39', async () => {
+    if (!STUCK) return skip('N39', 'no `stuck` agent (wb-fake-acp --scenario kill-stubborn) in /api/info.agents');
+    const id = await AP.evaluate(cwd => window.__canvas.addNode({ kind: 'acp', name: 'n39', agent: 'stuck', cwd, x: 3000, y: 2600, w: 560, h: 400 }).id, ACWD);
+    await until(async () => (await acpView(AP, id))?.promptable, 20000);
+    await AP.evaluate(id => window.__canvas.live[id].backend.input('n39\r'), id);   // a turn that never ends
+    const turn = await until(async () => (await acpView(AP, id)).activity === 'turn', 10000);
+    await AP.evaluate(id => {
+      const L = window.__canvas.live[id], b = L.hdr.querySelector('.badge'), s = L.body.querySelector('.ag-state'); window.__n39 = [];
+      new MutationObserver(() => window.__n39.push(b.textContent + ' | ' + (s.hidden ? '' : s.textContent))).observe(L.el, { childList: true, characterData: true, subtree: true, attributes: true });
+    }, id);
+    const e0 = (await acpView(AP, id)).epoch;
+    await AP.evaluate(id => { const C = window.__canvas; C.jumpNode(C.S.nodes[id]); C.CMDS.find(c => c.l.startsWith('Agent: start a new session')).run(); }, id);
+    const fresh = await until(async () => { const v = await acpView(AP, id); return v.promptable && v.epoch !== e0 ? v : null; }, 40000);
+    const seen = await AP.evaluate(() => [...new Set(window.__n39)]);
+    check('N39: Start new session on a card whose agent ignores SIGTERM shows ending…, then a fresh transcript, never ended elsewhere', !!turn && seen.some(t => /ending…/.test(t)) && !seen.some(t => /· ended |ended elsewhere/.test(t)) && !!fresh && fresh.asst === 0, JSON.stringify({ turn: !!turn, seen: seen.slice(0, 12), fresh: fresh && fresh.items }));
+    await AP.evaluate(id => window.__canvas.removeNode(id), id);
+  });
+  await section('N41', async () => {
+    const t1 = Date.now();
+    const id = await AP.evaluate(cwd => window.__canvas.addNode({ kind: 'acp', name: 'n41', agent: 'stub', cwd, x: 3000, y: 2600, w: 560, h: 400, _spawn: false }).id, ACWD);
+    await sleep(10000);
+    const ws = acpWs(AP, id, t1), v = await acpView(AP, id);
+    check('N41: an /acp open that gets not_found makes exactly one socket in 10 s, and the card offers Start new session',
+      ws.length === 1 && ws[0].recv.some(m => m.t === 'error' && m.code === 'not_found') && v.st === 'exited' && /No session for this card/.test(v.state) && /Start new session/.test(v.state), JSON.stringify({ sockets: ws.length, recv: ws.map(w => w.recv.map(m => m.t + (m.code ? ':' + m.code : ''))), st: v?.st, state: v?.state }));
+    await AP.evaluate(id => window.__canvas.removeNode(id), id);
+  });
+  await section('N42', async () => {
+    const id = AID; await acpIdle(AP, id); await settled(AP);
+    const { P: D, g } = await gatedPage();
+    try {
+      await until(async () => (await acpView(D, id))?.promptable, 20000);
+      g.drop = m => m?.t === 'prompt';   // the prompt never arrives, so there is no echo
+      const ta = `.node[data-id="${id}"] .ag-in textarea`, TEXT = 'n42 draft survives a restart';
+      await acpShow(D, id); await D.fill(ta, TEXT); await D.press(ta, 'Enter');
+      const pending = await until(async () => { const v = await acpView(D, id); return v.ro && v.go === 'Sending…' ? v : null; }, 5000);
+      await webRestart();
+      const back = await until(async () => { const v = await acpView(D, id); return v?.promptable ? v : null; }, 30000);
+      check('N42: a prompt typed before a wb-web restart, with no echo, is still in the composer after the reconnect',
+        !!pending && !!back && back.ta === TEXT && !back.ro && back.go === 'Send' && g.sent.filter(m => m?.t === 'open').length >= 2, JSON.stringify({ pending: !!pending, back: back && { ta: back.ta, ro: back.ro, go: back.go } }));
+    } finally { await D.close(); }
+  });
+  await section('acp cleanup', async () => { await AP.evaluate(id => window.__canvas.removeNode(id), AID); await settled(AP); });
+}
+await AP?.close();
 
 // N1-N3: the login page and expired sign-ins, by swapping the test Caddy's config through its admin socket (N-6)
 const CADDY = path.join(path.dirname(HARNESS), 'caddy');
