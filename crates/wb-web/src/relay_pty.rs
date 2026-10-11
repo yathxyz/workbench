@@ -31,13 +31,16 @@ async fn upgrade(
     State(app): State<AppState>,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    match ws {
-        Ok(ws) => ws
-            .max_message_size(WS_MAX_PTY)
-            .max_frame_size(WS_MAX_PTY)
-            .on_upgrade(move |socket| run(app, socket)),
-        Err(_) => upgrade_required(),
-    }
+    let Ok(ws) = ws else {
+        return upgrade_required();
+    };
+    let running = app.socket();
+    ws.max_message_size(WS_MAX_PTY)
+        .max_frame_size(WS_MAX_PTY)
+        .on_upgrade(move |socket| async move {
+            run(app, socket).await;
+            drop(running);
+        })
 }
 
 /// Why the relay stopped.
@@ -53,21 +56,21 @@ const HUB_LOST: End = End::Close(close::HUB_LOST, "hub connection lost");
 async fn run(app: AppState, mut ws: WebSocket) {
     let status = app.hub.status.borrow().clone();
     let reason = match status {
-        HubStatus::Up { .. } => None,
+        HubStatus::Up(_) => None,
         HubStatus::Down => Some("hub unavailable"),
         HubStatus::Incompatible { .. } => Some("hub incompatible"),
     };
     if let Some(reason) = reason {
         return ws_close(ws, ROUTE, close::HUB_UNAVAILABLE, reason).await;
     }
-    let hub = match HubConn::connect(&app.cfg.hub_socket).await {
-        Ok((hub, _)) => hub,
+    let (hub, info) = match HubConn::connect(&app.cfg.hub_socket).await {
+        Ok(conn) => conn,
         Err(_) => return ws_close(ws, ROUTE, close::HUB_UNAVAILABLE, "hub unavailable").await,
     };
     let stop = app.stopped();
     tokio::pin!(stop);
     let mut relay = Relay {
-        shell: app.cfg.shell.clone(),
+        default_shell: info.default_shell,
         hub,
         next_rid: 0,
         cur: None,
@@ -116,7 +119,9 @@ async fn run(app: AppState, mut ws: WebSocket) {
 }
 
 struct Relay {
-    shell: String,
+    /// From this connection's hello; names the shell in `argv[0]` when the browser
+    /// names none.
+    default_shell: String,
     hub: HubConn,
     next_rid: u64,
     /// The attached sid; only its events reach the browser.
@@ -220,12 +225,16 @@ impl Relay {
         Ok(())
     }
 
+    /// The hub runs one of its configured shells, never a path from here, and puts
+    /// that shell's path in `argv[0]`; the web sends the name there (DELTA-1 §B.2).
     fn spawn(&self, m: &Map<String, Value>) -> SpawnPty {
+        let shell = Some(text(m, "shell")).filter(|s| !s.is_empty());
+        let name = shell.unwrap_or(&self.default_shell).to_owned();
         let cmd = text(m, "cmd");
         let argv = if cmd.is_empty() {
-            vec![self.shell.clone()]
+            vec![name]
         } else {
-            vec![self.shell.clone(), "-c".into(), cmd.into()]
+            vec![name, "-c".into(), cmd.into()]
         };
         let cwd = Some(text(m, "cwd"))
             .filter(|c| !c.is_empty())
@@ -241,7 +250,7 @@ impl Relay {
             .collect();
         SpawnPty {
             argv,
-            shell: None,
+            shell: shell.map(str::to_owned),
             cwd,
             cwd_from,
             env: (!env.is_empty()).then_some(env),
@@ -281,8 +290,10 @@ impl Relay {
                     tracing::debug!(?code, message, "hub refused a request");
                     return Ok(());
                 }
-                // The socket stays open: Enter on the card sends a new open.
-                json!({"t": "error", "error": message, "code": code})
+                let error = json!({"t": "error", "error": message, "code": code});
+                send_json(ws, &error).await.map_err(|_| End::Gone)?;
+                // Final: the card shows the error, and Enter opens a new socket.
+                return Err(End::Close(close::FINAL, "open failed"));
             }
             HubMessage::Err {
                 rid: None,
@@ -290,13 +301,18 @@ impl Relay {
                 code,
                 message,
             } => {
-                if code == ErrorCode::InputOverflow
-                    && sid.as_deref().is_some_and(|s| self.is_cur(s))
-                {
-                    json!({"t": "out", "d": OVERFLOW_NOTICE})
-                } else {
-                    tracing::warn!(?code, message, "hub error");
-                    return Ok(());
+                let cur = sid.as_deref().is_some_and(|s| self.is_cur(s));
+                match code {
+                    ErrorCode::InputOverflow if cur => json!({"t": "out", "d": OVERFLOW_NOTICE}),
+                    // "session reloaded": the hub dropped the attachment, so the browser
+                    // reconnects and opens again with `resume`.
+                    ErrorCode::Internal if cur => {
+                        return Err(End::Close(close::HUB_LOST, "session reloaded"));
+                    }
+                    _ => {
+                        tracing::warn!(?code, message, "hub error");
+                        return Ok(());
+                    }
                 }
             }
             HubMessage::PtyOut { sid, d, out } if self.is_cur(&sid) => {
@@ -353,10 +369,9 @@ impl Relay {
     }
 }
 
-/// M0 only: the unchanged frontend sends no `spawn`, so an absent flag spawns. From M1
-/// on an absent flag means attach only (SEC-2).
+/// Only `spawn: true` may start a process; absent means attach only (SEC-2).
 fn spawn_requested(m: &Map<String, Value>) -> bool {
-    m.get("spawn").is_none_or(|s| *s == Value::Bool(true))
+    m.get("spawn") == Some(&Value::Bool(true))
 }
 
 fn text<'a>(m: &'a Map<String, Value>, key: &str) -> &'a str {
@@ -378,8 +393,8 @@ mod tests {
     }
 
     #[test]
-    fn absent_spawn_spawns_in_m0_and_anything_but_true_does_not() {
-        assert!(spawn_requested(&obj(json!({"t": "open"}))));
+    fn only_spawn_true_spawns() {
+        assert!(!spawn_requested(&obj(json!({"t": "open"}))));
         assert!(spawn_requested(&obj(json!({"spawn": true}))));
         for v in [json!(false), json!(null), json!("true"), json!(1)] {
             assert!(!spawn_requested(&obj(json!({"spawn": v}))), "{v}");

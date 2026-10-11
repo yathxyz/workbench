@@ -30,6 +30,7 @@ use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, broadcast, watch};
+use wb_proto::hub::Summary;
 
 use crate::auth::Floor;
 use crate::config::Config;
@@ -40,7 +41,16 @@ use crate::static_files::Assets;
 #[derive(Clone, Debug)]
 pub enum FeedMsg {
     Hub(HubStatus),
-    Board { etag: String },
+    /// A session's Summary changed.
+    Session(Box<Summary>),
+    /// The hub forgot incarnation `epoch` of `sid`.
+    Gone {
+        sid: String,
+        epoch: u64,
+    },
+    Board {
+        etag: String,
+    },
 }
 
 pub struct App {
@@ -52,6 +62,9 @@ pub struct App {
     /// Serialises board writes.
     pub board_lock: Mutex<()>,
     shutdown: watch::Receiver<bool>,
+    /// Upgraded sockets still running. axum stops tracking a connection once it is
+    /// upgraded, so shutdown waits on this count for their close frames.
+    sockets: watch::Sender<usize>,
 }
 
 pub type AppState = Arc<App>;
@@ -61,6 +74,21 @@ impl App {
     pub async fn stopped(&self) {
         let mut shutdown = self.shutdown.clone();
         let _ = shutdown.wait_for(|stopping| *stopping).await;
+    }
+
+    /// Counts a socket as running until the returned guard drops.
+    pub fn socket(&self) -> Socket {
+        self.sockets.send_modify(|n| *n += 1);
+        Socket(self.sockets.clone())
+    }
+}
+
+/// A running WebSocket, which shutdown waits for.
+pub struct Socket(watch::Sender<usize>);
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
     }
 }
 
@@ -119,6 +147,7 @@ async fn run(config: &Path) -> Result<()> {
         feed,
         board_lock: Mutex::new(()),
         shutdown,
+        sockets: watch::channel(0).0,
     });
     tokio::spawn(async move {
         tokio::select! {
@@ -133,8 +162,14 @@ async fn run(config: &Path) -> Result<()> {
     let graceful = app.clone();
     let server = axum::serve(listener, service)
         .with_graceful_shutdown(async move { graceful.stopped().await });
+    let mut sockets = app.sockets.subscribe();
+    let served = async {
+        server.into_future().await?;
+        let _ = sockets.wait_for(|n| *n == 0).await;
+        Ok::<_, std::io::Error>(())
+    };
     tokio::select! {
-        served = server.into_future() => served.context("server failed")?,
+        served = served => served.context("server failed")?,
         () = async {
             app.stopped().await;
             tokio::time::sleep(SHUTDOWN_GRACE).await;
