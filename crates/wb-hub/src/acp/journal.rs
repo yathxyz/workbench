@@ -319,8 +319,14 @@ mod tests {
         }
     }
 
+    /// Held by the tests that reach the torn-tail `warn!`. tracing caches a callsite's interest
+    /// process-wide, so a first hit from a thread with no subscriber, racing the subscriber
+    /// below, could leave that `warn!` disabled for it.
+    static TORN_WARN: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_torn_final_line_is_truncated_and_logged() {
+        let _torn = crate::lock(&TORN_WARN);
         let path = fresh_dir("torn").join("s.jsonl");
         let (mut j, _) = Journal::open(&path).unwrap();
         write_all(&mut j, &[spawn(), session()]);
@@ -416,6 +422,7 @@ mod tests {
 
     #[test]
     fn bytes_left_by_a_failed_truncation_heal() {
+        let _torn = crate::lock(&TORN_WARN);
         let path = fresh_dir("heal").join("s.jsonl");
         let (mut j, _) = Journal::open(&path).unwrap();
         write_all(&mut j, &[spawn()]);
