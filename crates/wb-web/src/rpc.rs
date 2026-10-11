@@ -27,13 +27,16 @@ async fn upgrade(
     State(app): State<AppState>,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    match ws {
-        Ok(ws) => ws
-            .max_message_size(WS_MAX_RPC)
-            .max_frame_size(WS_MAX_RPC)
-            .on_upgrade(move |socket| run(app, socket)),
-        Err(_) => upgrade_required(),
-    }
+    let Ok(ws) = ws else {
+        return upgrade_required();
+    };
+    let running = app.socket();
+    ws.max_message_size(WS_MAX_RPC)
+        .max_frame_size(WS_MAX_RPC)
+        .on_upgrade(move |socket| async move {
+            run(app, socket).await;
+            drop(running);
+        })
 }
 
 /// `hub{status, version?, build?, startedAt?, stale?}`.
