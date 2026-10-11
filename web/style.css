@@ -291,6 +291,88 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 .ag-row .go { border: 1px solid var(--accent); background: var(--accent); color: var(--panel); border-radius: var(--radius); padding: 4px 14px; cursor: pointer; font-weight: 500; }
 .ag-row .stop { border: 1px solid var(--line); background: var(--panel); border-radius: var(--radius); padding: 4px 12px; cursor: pointer; }
 .k-agent .lod { background: var(--buf-bg); }
+/* ACP agent cards (30 §1): the shared .ag-* transcript above, plus plan, tool calls, diffs, pending requests and state.
+   Agent text is Noto Sans (--ui); chrome, tools and diffs stay mono. Semantic colours: running info, waiting warn,
+   error err, done ok; detached and exited are a hollow dot. */
+.k-acp .body { display: flex; flex-direction: column; background: var(--buf-bg); }
+.k-acp .lod { background: var(--buf-bg); }
+.hdr .dot.st-running { background: var(--info); }
+.hdr .dot.st-waiting_permission, .hdr .dot.st-waiting_input { background: var(--warn); }
+.hdr .dot.st-error { background: var(--err); }
+.hdr .dot.st-done { background: var(--ok); }
+.hdr .dot.st-detached, .hdr .dot.st-exited { background: transparent; box-shadow: inset 0 0 0 1px var(--muted); }
+.badge.st-running { color: var(--info); border-color: var(--info); background: var(--info-bg); }
+.badge.st-waiting_permission, .badge.st-waiting_input { color: var(--warn); border-color: var(--warn); background: var(--warn-bg); }
+.badge.st-error { color: var(--err); border-color: var(--err); background: var(--err-bg); }
+.badge.st-done { color: var(--ok); border-color: var(--ok); background: var(--ok-bg); }
+.ag-plan { flex: none; max-height: 30%; overflow: auto; border-bottom: 1px solid var(--line); background: var(--panel-2); padding: 4px 12px; font: 12px/1.45 var(--mono); }
+.ag-plan summary { cursor: pointer; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: .08em; font-size: 10.5px; }
+.ag-plan .pe { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); }
+.ag-plan .pe.in_progress { color: var(--info); font-weight: 500; }
+.ag-plan .pe.completed { color: var(--fg); }
+.k-acp .ag-sep { align-self: stretch; border-top: 1px dashed var(--line); margin: 2px 0; }
+.k-acp .ag-note.err { color: var(--err); }
+.k-acp .ag-note.warn { color: var(--warn); }
+.ag-thought { align-self: flex-start; max-width: 92%; color: var(--muted); font-size: 12.5px; }
+.ag-thought summary { cursor: pointer; font: 11px var(--mono); text-transform: uppercase; letter-spacing: .08em; }
+.ag-thought .ag-msg { font-style: italic; }
+.k-acp .ag-tool { align-self: stretch; color: var(--fg); }
+.k-acp .ag-tool[data-status="failed"] { border-left-color: var(--err); }
+.k-acp .ag-tool .th { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+.k-acp .ag-tool .tt { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.k-acp .ag-tool .tg { flex: none; width: 1em; text-align: center; color: var(--muted); }
+.k-acp .ag-tool .tg.in_progress { color: var(--info); }
+.k-acp .ag-tool .tg.completed { color: var(--ok); }
+.k-acp .ag-tool .tg.failed { color: var(--err); }
+.k-acp .ag-tool .tl { color: var(--muted); overflow-wrap: anywhere; }
+.k-acp .ag-tool pre, .k-acp .ag-pend pre { margin: 4px 0 0; padding: 4px 6px; max-height: 60em; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+  font: 11.5px/1.4 var(--mono); color: var(--fg); background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); }
+.k-acp pre.clip { max-height: 28em; overflow: hidden; }
+.k-acp .more { margin-top: 2px; border: 1px solid var(--line); background: var(--panel); color: var(--muted); border-radius: var(--radius); padding: 1px 8px; font: 11px var(--mono); cursor: pointer; }
+.k-acp .more:hover { color: var(--fg); border-color: var(--line-strong); }
+.ag-diff { margin-top: 4px; }
+.ag-diff .dp { font: 500 11.5px var(--mono); color: var(--pipe); overflow-wrap: anywhere; }
+.ag-diff pre { padding: 0; white-space: pre; overflow: auto; }
+.ag-diff pre > div { padding: 0 6px; min-width: max-content; }
+.ag-diff .add { background: var(--ok-bg); }
+.ag-diff .del { background: var(--err-bg); }
+.ag-diff .ctx { color: var(--muted); }
+.ag-diff .gap { color: var(--muted); font-style: italic; background: var(--panel); }
+.ag-pend { flex: none; max-height: 55%; overflow: auto; display: grid; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--line); background: var(--panel); }
+.ag-pend:not(:has(> :not([hidden]))) { display: none; }
+.ag-perm, .ag-form, .ag-url, .ag-state { display: grid; gap: 5px; padding: 6px 8px; font-size: 12.5px; border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: var(--radius); background: var(--buf-bg); }
+.ag-state { border-left-color: var(--line-strong); }
+.ag-state[hidden] { display: none; }
+.ag-pend .ph { display: flex; gap: 6px; align-items: baseline; min-width: 0; font-family: var(--mono); }
+.ag-pend .ph b { color: var(--warn); font-weight: 600; }
+.ag-pend .ph .tt { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.ag-pend .kind { flex: none; font: 500 10px var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); border: 1px solid var(--line); border-radius: var(--radius); padding: 0 5px; }
+.ag-pend .msg { font-family: var(--ui); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ag-pend .hint, .ag-pend .org { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.ag-pend .warn { color: var(--warn); }
+.ag-pend .err { color: var(--err); font-size: 12px; }
+.ag-pend .err:empty { display: none; }
+.ag-pend .acts { display: flex; flex-wrap: wrap; gap: 6px; }
+.ag-pend button { border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: var(--radius); padding: 3px 10px; font: 12px var(--mono); cursor: pointer; }
+.ag-pend button:hover:not(:disabled) { border-color: var(--line-strong); }
+.ag-pend button.go { border-color: var(--accent); background: var(--accent); color: var(--panel); font-weight: 500; }
+.ag-pend button[data-kind^="reject"] { color: var(--err); border-color: var(--err); }
+.ag-pend button:disabled { opacity: .5; cursor: not-allowed; }
+.ag-pend .sent { opacity: .6; pointer-events: none; }
+.ag-url code { font: 12px var(--mono); overflow-wrap: anywhere; color: var(--muted); }
+.ag-url code b { color: var(--fg); font-weight: 700; }
+.ag-form .fields { display: grid; gap: 6px; }
+.ag-form .fld { display: grid; gap: 2px; }
+.ag-form .lbl { font: 500 11.5px var(--mono); }
+.ag-form input:not([type="checkbox"]), .ag-form select, .ag-form textarea { box-sizing: border-box; width: 100%; padding: 3px 6px; font: 12.5px var(--ui);
+  color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+.ag-form textarea { resize: vertical; min-height: 4em; }
+.ag-form .multi { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.ag-form .multi label, .ag-form label { display: inline-flex; gap: 4px; align-items: center; }
+.k-acp .ag-row { justify-content: flex-end; }
+.k-acp .ag-mode { margin-right: auto; font: 11.5px var(--mono); padding: 3px 4px; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+.k-acp .ag-row button:disabled { opacity: .5; cursor: not-allowed; }
+.k-acp .ag-in textarea:disabled, .k-acp .ag-in textarea:read-only { color: var(--muted); background: var(--panel-2); }
 
 /* ------------------------------------------------------------ v3: app shell, views, side pane */
 body:not([data-view="canvas"]) .c-only { display: none !important; }

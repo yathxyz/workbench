@@ -236,7 +236,7 @@ async function netProbe() {
   if (r.status === 403) return netSet('forbidden');
   let info = null; if (r.ok) try { info = await r.json(); } catch {}
   if (!info) return netSet('down');
-  Object.assign(INFO, info); hubSeen(info.hub); netSet('up');
+  Object.assign(INFO, info); hubSeen(info.hub); acpButton(); netSet('up');
 }
 function netSet(s) {
   const was = NET.state; NET.state = s; clearTimeout(NET.timer);
@@ -260,8 +260,8 @@ function authBar() {
 }
 function wakeAll() { for (const w of [...WAKE]) w.wake(); }
 addEventListener('online', () => { wakeAll(); netKick(); });
-addEventListener('focus', () => { if (NET.state !== 'up') netKick(); const L = live[activeId]; if (L?.term) L.backend?.resize?.(L.term.cols, L.term.rows); });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { wakeAll(); if (NET.state !== 'up') netKick(); } });
+addEventListener('focus', () => { if (NET.state !== 'up') netKick(); const L = live[activeId]; if (L?.term) L.backend?.resize?.(L.term.cols, L.term.rows); L?.backend?.maybeSeen?.(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { wakeAll(); if (NET.state !== 'up') netKick(); live[activeId]?.backend?.maybeSeen?.(); } });
 addEventListener('beforeunload', e => { if (DAEMON && !SAVE.leaving && SAVE.pending && (SAVE.paused || SAVE.err)) { e.preventDefault(); e.returnValue = ''; } });
 // One persistent strip; only the highest-priority key shows. A string action starting with / is a link.
 const BARS = {}, BAR_ORDER = ['auth', 'forbidden', 'conflict', 'save', 'hub'];
@@ -279,7 +279,7 @@ function barRender() {
 }
 // Session facts from /rpc: sessions replaces, session upserts, gone deletes and leaves a tombstone (§3.5.3).
 const SESS = {}, TOMBS = new Set();
-function sessChanged(sid) { if (S?.nodes[sid]) updateTitle(S.nodes[sid]); clearTimeout(sessChanged.t); sessChanged.t = setTimeout(statusRender, 250); }
+function sessChanged(sid) { if (S?.nodes[sid]) { updateTitle(S.nodes[sid]); live[sid]?.backend?.refresh?.(); } clearTimeout(sessChanged.t); sessChanged.t = setTimeout(statusRender, 250); }
 function sessPut(x) { if (x?.sid && !TOMBS.has(x.sid + ' ' + x.createdAt)) { SESS[x.sid] = x; sessChanged(x.sid); } }
 const RPC_EVENTS = {
   hub: m => hubStatus(m),
@@ -302,7 +302,7 @@ function hubStatus(m) {
 }
 function hubSeen(hub) {
   if (!hub?.startedAt) return;   // a probe while the hub is down must not forget the start time its return is compared with
-  if (HUB_STARTED && hub.startedAt !== HUB_STARTED) toast('The Workbench hub restarted at ' + hhmm(hub.startedAt) + ': shells and agents ended. Enter restarts a shell.', 8000);
+  if (HUB_STARTED && hub.startedAt !== HUB_STARTED) toast('The Workbench hub restarted at ' + hhmm(hub.startedAt) + ': shells and agents ended. Enter restarts a shell; ↻ revives an agent.', 8000);
   HUB_STARTED = hub.startedAt;
 }
 function netChip() {
@@ -806,24 +806,402 @@ class PtyBackend {
     this.disposed = true; clearTimeout(this.timer); WAKE.delete(this);
     const session = this.detachOnly ? false : undefined;
     if (this.ws?.readyState === 1) { this.ws.send(JSON.stringify({ t: 'kill', session })); setTimeout(() => this.ws?.close(), 50); }
-    else { try { this.ws?.close(); } catch {} new PtyReap(this.n.id, session, this.host); }
+    else { try { this.ws?.close(); } catch {} new Reap('/pty', { t: 'open', id: this.n.id, spawn: false }, { t: 'kill', session }, undefined, this.host); }
   }
   // the card went in another tab: close here, the session is not ours to end
   dispose() { this.disposed = true; clearTimeout(this.timer); WAKE.delete(this); try { this.ws?.close(); } catch {} }
   // end the process (session=true also kills a tmux session) but keep the card: it shows the exit and Enter starts anew
   end(session) { if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ t: 'kill', session })); }
 }
+// ------------------------------------------------------------------ agent cards: the `acp` kind (30 §1, DESIGN §3.5.2)
+// Agent output is untrusted. Every string from the agent, its tool calls and its requests reaches the page through
+// textContent (el()), never innerHTML. URLs stay text; only an https: one opens, and only on an explicit click (F-A19).
+const PROMPT_MAX = 8388608;   // bytes of UTF-8 in one prompt's blocks (F-A17)
+const ACP_STATES = new Set(['idle', 'running', 'waiting_permission', 'waiting_input', 'done', 'error', 'exited', 'detached']);
+const ACP_BAD = new Set(['waiting_permission', 'waiting_input', 'error']);
+const CHUNK_KIND = { user_message_chunk: 'user', agent_message_chunk: 'asst', agent_thought_chunk: 'thought' };
+const TOOL_GLYPH = { pending: '○', in_progress: '◐', completed: '✓', failed: '✗' };
+const PLAN_GLYPH = { pending: '○', in_progress: '◐', completed: '●' };
+const agentLabel = name => (INFO?.agents || []).find(a => a.name === name)?.label || name || 'agent';
+const vtext = v => (v == null ? '' : typeof v === 'string' ? v : typeof v === 'object' ? JSON.stringify(v) : String(v));
+const blockText = b => !b || typeof b !== 'object' ? '' : b.type === 'text' ? vtext(b.text) : b.type === 'image' ? '[image]' : b.type === 'audio' ? '[audio]'
+  : b.type === 'resource_link' ? vtext(b.name || b.uri) : b.type === 'resource' ? vtext(b.resource?.uri) : '';
+const urlHost = u => { try { return new URL(u).host || 'the page'; } catch { return 'the page'; } };
+class AcpBackend {
+  constructor(n, L) {
+    this.n = n; this.L = L; this.spawn = !!n._spawn; delete n._spawn;   // spawn fields only for a card made in this page (SEC-2)
+    this.seq = 0; this.epoch = null; this.sum = null; this.session = {}; this.tries = 0; this.rid = 0; this.rids = new Map();
+    this.items = []; this.changed = new Set(); this.byMsg = new Map(); this.byTool = new Map(); this.pending = new Map(); this.waiting = new Map();
+    this.panels = new Map(); this.draft = null; this.seenSent = 0;
+    this.connect();
+  }
+  get dead() { return this.gone || this.missing || !this.sum?.alive; }
+  get parked() { return false; }
+  state() { return this.gone || this.missing ? 'exited' : ACP_STATES.has(this.sum?.state) ? this.sum.state : ''; }
+  stateText() { return this.restarting ? 'ending…' : this.gone ? 'ended' : this.missing ? 'no session' : (this.sum?.state || '…').replace(/_/g, ' '); }
+  promptable() { return !this.dead && !this.sum.fault && this.sum.acp?.activity === 'none' && this.draft == null && this.replayed && this.ws?.readyState === 1; }
+  modeNow() { return this.modeSeen ?? (this.sum?.acp?.modeId || this.session.modes?.currentModeId || ''); }   // the agent's latest word wins
+  mode() { return this.modeWanted ?? this.modeNow(); }
+  connect() {
+    if (this.disposed) return;
+    clearTimeout(this.timer); WAKE.delete(this);
+    this.waitHub = false; this.final = false; this.opened = false; this.helloSeen = false; this.replayed = false;   // per connection (F-A4)
+    const n = this.n, ws = this.ws = new WebSocket(hWs(null, '/acp'));
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ t: 'open', id: n.id, since: this.seq, ...(this.spawn ? { agent: n.agent, cwd: n.cwd } : this.epoch != null ? { epoch: this.epoch } : {}) }));
+      this.opened = true;
+    };
+    ws.onmessage = ev => { if (ws !== this.ws) return; let m; try { m = JSON.parse(ev.data); } catch { return; } this.onMessage(m); };
+    ws.onclose = ev => { if (ws === this.ws) this.onClose(ev); };
+    this.schedule();
+  }
+  onMessage(m) {
+    if (m.t === 'hello') {
+      const info = m.info || {};
+      this.helloSeen = true; this.tries = 0; this.spawn = false; this.missing = false; this.gone = false; this.failed = null;
+      this.L.el.classList.remove('net-wait');
+      if (m.reset) this.clear();   // F-A1: transcript, pending and cursor, before the replay
+      if (info.createdAt !== this.epoch) this.seenSent = 0;
+      this.epoch = info.createdAt ?? null;   // F-A2: sent on reopen, permission and elicitation
+      if (m.from > this.seq + 1) this.add({ k: 'note', text: '… earlier messages not shown (replay truncated)' });
+      this.setInfo(info);
+    } else if (m.t === 'ev') this.fold(m.ev);
+    else if (m.t === 'replayed') { this.seq = Math.max(this.seq, m.head || 0); this.replayed = true; if (this.draft != null) this.draftBack(); this.schedule(); }
+    else if (m.t === 'info') this.setInfo(m.info || {});
+    else if (m.t === 'error') this.onError(m);
+    else if (m.t === 'gone') this.goneElsewhere(m.epoch);
+  }
+  onError(m) {
+    const ctx = m.rid != null ? this.rids.get(m.rid) : null, name = this.n.name, why = vtext(m.error) || vtext(m.code);
+    if (ctx) this.rids.delete(m.rid);
+    if (!this.helloSeen && !ctx) {   // a failed open: the web closes 1000 and nothing reconnects (F-A4)
+      this.final = true;
+      if (m.code === 'not_found' || this.spawn) this.missing = true;   // a spawning open that failed left no session either
+      this.failed = m.code === 'not_found' ? null : why;
+      return this.schedule();
+    }
+    if (ctx?.t === 'kill' && this.restarting) {
+      if (m.code === 'not_found') return this.renew();   // already forgotten: start the new session straight away
+      this.restarting = false;
+    }
+    if (m.code === 'stale') toast(name + ': this request belongs to an ended session');
+    else if (m.code === 'already_resolved') toast(name + ': already answered elsewhere');
+    else if (ctx) toast(name + ': ' + why);
+    else this.add({ k: 'note', cls: 'err', text: why });
+    const p = ctx?.req != null && ctx.epoch === this.epoch ? this.pending.get(ctx.req) : null;
+    if (p) { if (m.code === 'stale' || m.code === 'already_resolved') this.pending.delete(ctx.req); else p.sent = false; }
+    if (ctx?.t === 'prompt') this.draftBack();
+    if (ctx?.t === 'set_mode') this.modeWanted = null;
+    this.schedule();
+  }
+  onClose(ev) {
+    if (this.disposed) return;
+    if (this.restarting && ev.code === 1000) return this.renew();   // the kill-forget finished: a new session (F-A3)
+    this.restarting = false; this.replayed = false;
+    // §3.5.4: 1000/1008/1009 are final and keep the card's state; 1013 waits for the hub; the rest back off.
+    if (this.final || this.gone || [1000, 1008, 1009].includes(ev.code)) {
+      this.final = true; WAKE.delete(this); this.L.el.classList.remove('net-wait');
+      if (ev.code === 1008 || ev.code === 1009) this.failed = 'connection closed: ' + (ev.code === 1009 ? 'message too big' : 'protocol error') + ' (' + ev.code + ')';
+      else if (!this.missing && !this.gone && !this.failed) this.failed = 'connection closed';
+      if (this.draft != null) this.draftBack();
+      return this.schedule();
+    }
+    this.L.el.classList.add('net-wait'); WAKE.add(this); this.schedule();
+    if (ev.code === 1013) { this.waitHub = true; this.timer = setTimeout(() => this.wake(), 30000); return; }
+    netKick();
+    if (NET.state !== 'signed_out' && NET.state !== 'forbidden') this.timer = setTimeout(() => this.connect(), backoff(this.tries++));
+  }
+  wake() { if (!this.disposed && !this.final && this.ws?.readyState > 1) { this.tries = 0; this.connect(); } }
+  reconnect() { if (!this.disposed && this.ws?.readyState > 1) { this.tries = 0; this.failed = null; this.connect(); } }
+  // /rpc or /acp `gone`: the session was forgotten in another tab or by wb; never respawn on our own (ROB-19)
+  goneElsewhere(epoch) {
+    if (this.disposed || this.restarting || this.gone) return;
+    if (epoch != null && (epoch === this.ended || (this.epoch != null && epoch !== this.epoch))) return;   // F-A3: our own restart's old epoch
+    this.gone = true; this.final = true; clearTimeout(this.timer); WAKE.delete(this); this.L.el.classList.remove('net-wait');
+    try { this.ws?.close(); } catch {}
+    if (this.draft != null) this.draftBack();
+    this.schedule();
+  }
+  setInfo(info) {
+    const { session, ...sum } = info;
+    if (session) this.session = session;
+    this.sum = sum; sessPut(sum); this.schedule();
+  }
+  refresh() {   // sessChanged: /rpc may carry a fresher summary of the same incarnation
+    const s = SESS[this.n.id]; if (s && s.createdAt === this.epoch) this.sum = s;
+    this.schedule(); this.maybeSeen();
+  }
+  send(m, ctx, early) {   // early: also before this connection's hello, for requests the epoch guards
+    if (!this.opened || this.ws?.readyState !== 1 || !(early || this.helloSeen)) return false;
+    if (ctx) { m.rid = ++this.rid; this.rids.set(m.rid, ctx); if (this.rids.size > 100) this.rids.delete(this.rids.keys().next().value); }
+    this.ws.send(JSON.stringify(m)); return true;
+  }
+  prompt(text, composer) {   // throws when it cannot be sent, so dispatchTask reports it before it writes session::
+    const blocks = [{ type: 'text', text }];
+    if (new TextEncoder().encode(JSON.stringify(blocks)).length > PROMPT_MAX) throw new Error(this.n.name + ': the prompt is over 8 MiB');
+    if (!this.promptable()) {
+      const s = this.sum;
+      throw new Error(this.n.name + (this.dead ? ' is not running' : s.fault ? ' has a fault: ' + vtext(s.fault.message) : s.acp?.activity !== 'none' || this.draft != null ? ' is busy' : ' is not connected'));
+    }
+    this.send({ t: 'prompt', blocks }, { t: 'prompt' });
+    if (composer) this.draft = text;   // F-A5: the composer keeps the text until this prompt's echo
+    this.schedule();
+  }
+  submit() { const text = this.L.ta.value; if (!text.trim() || this.draft != null) return; try { this.prompt(text, true); } catch (e) { toast(e.message); } }
+  input(d) {   // duck typing: a trailing \r prompts (or throws); anything else drafts into the composer
+    if (!d.endsWith('\r')) { this.L.ta.value += d; return; }
+    this.prompt(d.slice(0, -1));
+  }
+  echoed() { this.draft = null; this.L.ta.value = ''; }
+  draftBack() { this.draft = null; this.schedule(); }   // the text never left the composer
+  cancel() { this.send({ t: 'cancel' }); }
+  setMode(modeId) { if (this.send({ t: 'set_mode', modeId }, { t: 'set_mode' })) this.modeWanted = modeId; else toast(this.n.name + ': not connected'); this.schedule(); }
+  revive() { if (!this.send({ t: 'revive' }, { t: 'revive' })) toast(this.n.name + ': not connected'); }
+  authenticate(methodId) { if (!this.send({ t: 'authenticate', methodId }, { t: 'authenticate' })) toast(this.n.name + ': not connected'); }
+  answer(req, t, body) {
+    const p = this.pending.get(req); if (!p || p.sent) return;
+    if (this.gone || this.missing) { this.pending.delete(req); this.schedule(); return toast(this.n.name + ': this request belongs to an ended session'); }
+    if (!this.send({ t, req, epoch: this.epoch, ...body }, { t, req, epoch: this.epoch }, true)) return toast(this.n.name + ': not connected');
+    p.sent = true; this.schedule();
+  }
+  answerPermission(req, optionId) { this.answer(req, 'permission', { outcome: optionId ? { outcome: 'selected', optionId } : { outcome: 'cancelled' } }); }
+  answerElicitation(req, response) { this.answer(req, 'elicitation', { response }); }
+  // Start new session (F-A3): forget this one, wait for the close 1000, then open a new one with the spawn fields
+  restart() {
+    if (this.restarting || this.disposed) return;
+    if (this.gone || this.missing) return this.renew();
+    if (!this.send({ t: 'kill', forget: true }, { t: 'kill' })) return toast(this.n.name + ': not connected; reconnect first');
+    this.restarting = true; this.ended = this.epoch; this.schedule();
+  }
+  renew() {
+    const old = this.ws; this.ws = null; try { old?.close(); } catch {}
+    this.restarting = false; this.missing = false; this.gone = false; this.failed = null; this.sum = null; this.session = {}; this.draft = null;
+    this.clear(); this.spawn = true; this.tries = 0; this.connect();
+  }
+  end() { this.send({ t: 'kill', forget: false }, { t: 'end' }); }   // the card stays, detached and revivable
+  // The card goes: forget the session. Without an open socket the kill waits for the server (as for PTY cards).
+  kill() {
+    if (this.disposed) return;
+    const ws = this.ws, epoch = this.epoch, ended = this.gone || this.missing;
+    if (!ended && this.opened && ws?.readyState === 1) {
+      this.stop(); ws.send(JSON.stringify({ t: 'kill', forget: true }));
+      setTimeout(() => { try { ws.close(); } catch {} }, 5000);   // the web closes 1000 after the ok; the hub has the kill either way
+      return;
+    }
+    this.dispose();
+    if (!ended) new Reap('/acp', { t: 'open', id: this.n.id, since: this.seq }, { t: 'kill', forget: true }, m => epoch == null || m.info?.createdAt === epoch);
+  }
+  stop() { this.disposed = true; clearTimeout(this.timer); WAKE.delete(this); cancelAnimationFrame(this.raf); }
+  dispose() { this.stop(); try { this.ws?.close(); } catch {} }   // the card went in another tab: close here, the session is not ours to end
+  maybeSeen() {   // seen only when the user can see the result (§3.4.6)
+    const s = this.sum, a = s?.acp;
+    if (!a || activeId !== this.n.id || document.visibilityState !== 'visible' || !document.hasFocus()) return;
+    if ((s.state !== 'done' && s.state !== 'error') || a.headSeq <= a.seenSeq || this.seenSent >= a.headSeq) return;
+    if (this.send({ t: 'seen', seq: a.headSeq })) this.seenSent = a.headSeq;
+  }
+  text(max = 40) {   // the transcript's last lines as plain text: read_node, snapshots, the navigator
+    const out = [];
+    for (let i = this.items.length - 1; i >= 0 && out.length < max; i--) {
+      const it = this.items[i], t = it.k === 'user' ? '› ' + it.text : it.k === 'asst' ? it.text : it.k === 'note' ? '· ' + it.text
+        : it.k === 'tool' ? '⚙ ' + (vtext(it.kind) || 'tool') + ' ' + vtext(it.title) + ' [' + vtext(it.status) + ']' : '';
+      if (t) out.unshift(...t.split('\n').slice(-(max - out.length)));
+    }
+    return out.join('\n');
+  }
+  clear() {
+    this.items = []; this.changed.clear(); this.byMsg.clear(); this.byTool.clear(); this.pending.clear(); this.waiting.clear();
+    this.seq = 0; this.cleared = true; this.authNeeded = false; this.modeSeen = undefined;
+  }
+  add(it) { this.items.push(it); this.changed.add(it); return it; }
+  fold(ev) {
+    if (!ev || !(ev.seq > this.seq)) return;   // the cursor: an event never applies twice
+    this.seq = ev.seq;
+    try { this.apply(ev); } catch (e) { console.warn('acp: event ' + ev.seq + ' not shown', e); }
+    this.schedule();
+  }
+  apply(ev) {
+    switch (ev.e) {
+      case 'prompt': {
+        const text = (Array.isArray(ev.prompt) ? ev.prompt : []).map(blockText).join('');
+        this.add({ k: 'user', text, closed: true });
+        if (this.draft != null && text === this.draft) this.echoed();
+        break;
+      }
+      case 'update': this.update(ev.update || {}); break;
+      case 'turn_end': this.add(ev.stopReason === 'end_turn' ? { k: 'sep' } : { k: 'note', text: 'stopped: ' + vtext(ev.stopReason) }); break;
+      case 'turn_error': this.add({ k: 'note', cls: 'err', text: 'turn failed: ' + vtext(ev.message) }); break;
+      case 'setup_error':
+        this.add({ k: 'note', cls: 'err', text: (ev.code === 'revive_failed' ? 'could not revive: ' : 'setup failed: ') + vtext(ev.message) });
+        if (ev.code === 'auth_required') this.authNeeded = true;
+        break;
+      case 'permission':
+        this.pending.set(ev.seq, { kind: 'permission', toolCall: ev.toolCall && typeof ev.toolCall === 'object' ? ev.toolCall : {}, options: Array.isArray(ev.options) ? ev.options : [] });
+        if (ev.toolCall?.toolCallId != null) this.tool(ev.toolCall);
+        break;
+      case 'permission_resolved': {
+        const p = this.pending.get(ev.req), o = ev.outcome || {}, opt = p?.options.find(x => x?.optionId === o.optionId), by = ev.by && ev.by !== 'user' ? ' (by ' + vtext(ev.by) + ')' : '';
+        this.pending.delete(ev.req);
+        const verb = /^allow/.test(vtext(opt?.kind)) ? 'allowed' : /^reject/.test(vtext(opt?.kind)) ? 'rejected' : 'answered';
+        this.add({ k: 'note', text: o.outcome === 'selected' ? verb + ': ' + vtext(opt?.name || o.optionId) + by : 'permission cancelled' + by });
+        break;
+      }
+      case 'elicitation': this.pending.set(ev.seq, { kind: 'elicitation', request: ev.request && typeof ev.request === 'object' ? ev.request : {} }); break;
+      case 'elicitation_resolved': {
+        const q = this.pending.get(ev.req)?.request || {}, r = ev.response || {}, by = ev.by && ev.by !== 'user' ? ' (by ' + vtext(ev.by) + ')' : '';
+        this.pending.delete(ev.req);
+        if (q.mode === 'url' && r.action === 'accept') { const host = urlHost(q.url); this.waiting.set(vtext(q.elicitationId), this.add({ k: 'note', text: 'waiting for ' + host + '…', host })); }
+        else this.add({ k: 'note', text: 'question ' + ({ accept: 'answered', decline: 'declined', cancel: 'cancelled' }[r.action] || 'answered') + by });
+        break;
+      }
+      case 'elicitation_complete': {
+        const id = vtext(ev.elicitationId), it = this.waiting.get(id);
+        if (it) { this.waiting.delete(id); it.text = it.host + ': completed'; this.changed.add(it); } else this.add({ k: 'note', text: 'completed' });
+        break;
+      }
+      case 'spawn': this.authNeeded = false; this.add({ k: 'note', text: ev.via === 'revive' ? 'agent restarted to revive the session' : 'agent started' }); break;
+      case 'session': this.authNeeded = false; this.add({ k: 'note', text: ev.via === 'load' ? 'resumed via load' : ev.via === 'resume' ? 'resumed' : 'session ready' }); break;
+      case 'authenticate': this.add({ k: 'note', text: 'authenticating…' }); break;
+      case 'mode': this.modeSeen = vtext(ev.modeId); this.add({ k: 'note', text: 'mode: ' + vtext((this.session.modes?.availableModes || []).find(x => x?.id === ev.modeId)?.name || ev.modeId) }); break;
+      case 'notice': this.add({ k: 'note', cls: ev.level === 'error' ? 'err' : ev.level === 'warn' ? 'warn' : '', text: vtext(ev.text) }); break;
+      case 'exit': this.add({ k: 'note', text: 'agent exited' + (ev.reason ? ' (' + vtext(ev.reason) + ')' : '') }); break;
+    }
+  }
+  update(u) {
+    const k = CHUNK_KIND[u.sessionUpdate];
+    if (k) {   // a chunk joins the open item of its kind and messageId, else the last item when neither has one
+      const mid = u.messageId == null ? null : vtext(u.messageId), key = k + '\n' + mid, last = this.items[this.items.length - 1];
+      let it = mid != null ? this.byMsg.get(key) : last?.k === k && last.mid == null && !last.closed ? last : null;
+      if (!it) { it = this.add({ k, text: '', mid }); if (mid != null) this.byMsg.set(key, it); }
+      it.text += blockText(u.content); this.changed.add(it);
+      return;
+    }
+    if (u.sessionUpdate === 'tool_call' || u.sessionUpdate === 'tool_call_update') this.tool(u);
+    else if (u.sessionUpdate === 'plan') this.session = { ...this.session, plan: { entries: Array.isArray(u.entries) ? u.entries : [] } };
+    else if (u.sessionUpdate === 'current_mode_update') this.modeSeen = vtext(u.currentModeId);
+  }
+  tool(u) {   // tool_call and tool_call_update merge into one item per toolCallId; content replaces (ACP)
+    const id = vtext(u.toolCallId); let it = this.byTool.get(id);
+    if (!it) { it = this.add({ k: 'tool', id, status: 'pending' }); this.byTool.set(id, it); }
+    for (const f of ['title', 'kind', 'status', 'content', 'locations']) if (u[f] != null) it[f] = u[f];
+    this.changed.add(it);
+  }
+  schedule() { if (!this.raf && !this.disposed) this.raf = requestAnimationFrame(() => { this.raf = 0; this.render(); }); }
+  render() {
+    const L = this.L, log = L.logEl; if (this.disposed || !log) return;
+    const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    if (this.cleared) { this.cleared = false; log.replaceChildren(); for (const P of this.panels.values()) P.remove(); this.panels.clear(); }
+    for (const it of this.changed) { if (!it.el) log.append(it.el = acpItemEl(it)); acpFill(it); }
+    this.changed.clear();
+    if (stick) log.scrollTop = log.scrollHeight;
+    this.renderPlan(); this.renderPending(); this.paint();
+  }
+  renderPlan() {
+    const box = $('.ag-plan', this.L.body), es = Array.isArray(this.session.plan?.entries) ? this.session.plan.entries : [], key = JSON.stringify(es);
+    if (key === this.planKey) return; this.planKey = key;
+    box.hidden = !es.length;
+    let d = box.firstChild; if (!d) { d = el('details'); d.open = true; box.append(d); }
+    const st = e => (PLAN_GLYPH[e?.status] ? e.status : 'pending');
+    d.replaceChildren(el('summary', '', 'Plan ' + es.filter(e => e?.status === 'completed').length + '/' + es.length), ...es.map(e => el('div', 'pe ' + st(e), PLAN_GLYPH[st(e)] + ' ' + vtext(e?.content))));
+  }
+  renderPending() {
+    const box = $('.ag-pend', this.L.body), sp = this.stateSpec(), key = sp ? sp.key : '';
+    if (key !== this.stateKey) { this.stateKey = key; acpStatePanel($('.ag-state', box), sp, this); }
+    for (const [req, P] of this.panels) if (!this.pending.has(req)) { P.remove(); this.panels.delete(req); }
+    for (const [req, p] of this.pending) {   // one panel per request, in req order; a kept panel keeps a half-filled form
+      let P = this.panels.get(req);
+      if (!P) {
+        P = p.kind === 'permission' ? this.permPanel(req, p) : this.elicitPanel(req, p); this.panels.set(req, P);
+        const next = [...this.panels].filter(([r]) => r > req).sort((a, b) => a[0] - b[0])[0];
+        box.insertBefore(P, next ? next[1] : null);
+      }
+      P.classList.toggle('sent', !!p.sent);
+    }
+  }
+  stateSpec() {
+    const s = this.sum, a = s?.acp, renew = ['Start new session', () => this.restart(), 'go'];
+    const runs = 'Start new session runs ' + agentLabel(this.n.agent) + ' in ' + (vtext(this.n.cwd) || '(no folder)') + '.';
+    if (this.restarting) return { key: 'ending', text: 'Ending the session…' };
+    if (this.gone) return { key: 'gone', text: 'This session was ended elsewhere.', hint: runs, acts: [renew] };
+    if (this.missing) return { key: 'missing ' + this.failed, text: this.failed ? 'Could not open the session: ' + this.failed : 'No session for this card.', hint: runs, acts: [renew] };
+    if (this.failed) return { key: 'failed ' + this.failed, text: this.failed[0].toUpperCase() + this.failed.slice(1) + '.', acts: [['Reconnect', () => this.reconnect(), 'go']] };
+    if (!s) return null;
+    if (s.fault) return { key: 'fault ' + s.fault.message, text: 'Fault: ' + vtext(s.fault.message) };
+    if (!s.alive && !a?.revivable) return { key: 'ended', text: 'The session ended and cannot be revived.', hint: runs, acts: [renew] };   // F-A16
+    if (this.authNeeded && s.alive && a?.activity === 'none') return { key: 'auth ' + JSON.stringify(this.session.authMethods), auth: true, text: agentLabel(this.n.agent) + ' needs a login.', acts: [renew] };
+    return null;
+  }
+  permPanel(req, p) {
+    const tc = p.toolCall, d = el('div', 'ag-perm'), h = el('div', 'ph');
+    h.append(el('b', '', 'Permission'), el('span', 'tt', vtext(tc.title) || 'tool call')); if (tc.kind) h.append(el('span', 'kind', vtext(tc.kind)));
+    d.append(h);
+    const diff = Array.isArray(tc.content) ? tc.content.find(c => c?.type === 'diff') : null;
+    if (diff) d.append(lineDiff(diff));
+    else if (tc.rawInput != null) { const j = JSON.stringify(tc.rawInput, null, 1) || ''; d.append(el('pre', 'raw', j.length > 2048 ? j.slice(0, 2048) + '…' : j)); }
+    const row = el('div', 'acts');
+    for (const o of p.options) {   // no keyboard shortcut: a stray Enter must not approve a tool
+      const kind = vtext(o?.kind), always = kind === 'allow_always' || kind === 'reject_always';
+      const b = el('button', kind.startsWith('allow') ? 'go' : '', vtext(o?.name || o?.optionId) + (always ? ' · remembered by ' + agentLabel(this.n.agent) : ''));
+      b.type = 'button'; b.dataset.kind = kind;
+      if (always) b.title = 'The agent stores this rule and applies it to its future sessions on this server';
+      b.onclick = () => this.answerPermission(req, vtext(o?.optionId));
+      row.append(b);
+    }
+    d.append(row); return d;
+  }
+  elicitPanel(req, p) {
+    const q = p.request, answer = r => this.answerElicitation(req, r), btn = (label, cls, fn) => { const b = el('button', cls, label); b.type = 'button'; b.onclick = fn; return b; };
+    const decline = btn('Decline', '', () => answer({ action: 'decline' })), cancel = btn('Cancel', '', () => answer({ action: 'cancel' })), row = el('div', 'acts');
+    if (q.mode === 'url') {   // F-A19: the full origin, never auto-opened, only https:
+      const d = el('div', 'ag-url'), code = el('code', 'u');
+      let u = null; try { u = new URL(vtext(q.url)); } catch {}
+      const ok = u?.protocol === 'https:' && !!u.host, open = btn(ok ? 'Open ' + u.host : 'Open', 'go open', () => { window.open(u.href, '_blank', 'noopener,noreferrer'); answer({ action: 'accept' }); });
+      if (ok) { code.append('https://', el('b', '', u.host), u.pathname + u.search + u.hash); open.title = 'Opens ' + u.origin + ' in a new tab'; }
+      else { code.textContent = vtext(q.url); open.disabled = true; open.title = 'Only https: addresses open from an agent card'; }
+      d.append(el('div', 'msg', vtext(q.message)), ok ? el('div', 'org', 'Origin: ' + u.origin) : el('div', 'warn', 'Not an https: address: it cannot be opened from here.'), code);
+      row.append(open, decline, cancel); d.append(row); return d;
+    }
+    const d = el('div', 'ag-form'); d.append(el('div', 'msg', vtext(q.message)));
+    if (q.mode !== 'form' && !q.requestedSchema) { d.append(el('div', 'warn', 'This kind of question is not supported here (' + vtext(q.mode) + ').')); row.append(decline, cancel); d.append(row); return d; }
+    const f = elicitForm(q.requestedSchema), err = el('div', 'err'), accept = btn('Accept', 'go', () => { const r = check(); if (r.ok) answer({ action: 'accept', content: r.content }); });
+    const check = () => { const r = f.check(); accept.disabled = !r.ok; err.textContent = r.ok ? '' : r.err; return r; };
+    f.el.addEventListener('input', check); f.el.addEventListener('change', check);
+    row.append(accept, decline, cancel); d.append(f.el, err, row); check(); return d;
+  }
+  paint() {
+    const L = this.L, s = this.sum, a = s?.acp, ta = L.ta, go = $('.ag-row .go', L.body), sel = $('.ag-mode', L.body);   // .ag-row: the state panel has a .go too
+    const off = this.restarting || this.gone || this.missing || !s || !s.alive || a?.activity === 'setup';
+    ta.disabled = off; ta.readOnly = this.draft != null;
+    ta.placeholder = this.restarting ? 'Ending the session…' : this.gone || this.missing ? 'No session: Start new session, or ⑂ for a new card'
+      : !s ? 'Connecting…' : !s.alive ? (a?.revivable ? 'Detached: ↻ revive to continue' : 'Ended: Start new session, or ⑂ for a new card')
+      : a?.activity === 'setup' ? 'Starting…' : 'Message ' + agentLabel(this.n.agent) + ' (Enter sends, Shift+Enter is a new line)';
+    go.disabled = off || !this.promptable();
+    go.textContent = this.draft != null ? 'Sending…' : 'Send';
+    $('.ag-row .stop', L.body).hidden = !(s?.alive && a?.activity === 'turn');
+    const modes = (Array.isArray(this.session.modes?.availableModes) ? this.session.modes.availableModes : []).filter(m => m && m.id != null);
+    sel.hidden = modes.length < 2;
+    const mk = JSON.stringify(modes.map(m => [m.id, m.name]));
+    if (sel.dataset.key !== mk) { sel.dataset.key = mk; sel.replaceChildren(...modes.map(m => { const o = el('option', '', vtext(m.name || m.id)); o.value = vtext(m.id); o.title = vtext(m.description); return o; })); }
+    if (this.modeWanted != null && this.modeWanted === this.modeNow()) this.modeWanted = null;
+    if (sel.value !== this.mode()) sel.value = this.mode();
+    if (L.revive) L.revive.hidden = !(s && !s.alive && a?.revivable && !this.gone && !this.missing && !this.restarting);
+    const st = this.state(), tx = this.stateText();
+    $('.dot', L.hdr).className = 'dot' + (st ? ' st-' + st : '');
+    if (tx !== this.badgeText) { this.badgeText = tx; updateTitle(this.n); }
+    $('.badge', L.hdr).className = 'badge' + (st ? ' st-' + st : '');
+  }
+}
 // The kill of a card removed while its socket was down (§3.5.1): attach without spawning once the server is back, then end
-// the session. It lives in this page only, so a reload before the server returns leaves the session running.
-class PtyReap {
-  constructor(id, session, h) { this.id = id; this.session = session; this.h = h; this.tries = 0; this.connect(); }
+// the session, but only when `mine(hello)` says it is still the one the card had. It lives in this page only, so a reload
+// before the server returns leaves the session running.
+class Reap {
+  constructor(path, open, kill, mine = () => true, h = null) { Object.assign(this, { path, open, kill, mine, h, tries: 0 }); this.connect(); }
   connect() {
     clearTimeout(this.timer); WAKE.delete(this); this.waitHub = false;
-    const ws = this.ws = new WebSocket(hWs(this.h, '/pty'));
-    ws.onopen = () => ws.send(JSON.stringify({ t: 'open', id: this.id, spawn: false }));
+    const ws = this.ws = new WebSocket(hWs(this.h, this.path));
+    ws.onopen = () => ws.send(JSON.stringify(this.open));
     ws.onmessage = ev => {
       let m; try { m = JSON.parse(ev.data); } catch { return; }
-      if (m.t === 'hello') { this.done = true; ws.send(JSON.stringify({ t: 'kill', session: this.session })); setTimeout(() => ws.close(), 50); }
+      if (m.t === 'hello') { this.done = true; if (this.mine(m)) ws.send(JSON.stringify(this.kill)); setTimeout(() => ws.close(), 50); }
       else if (m.t === 'error' || m.t === 'gone') { this.done = true; ws.close(); }   // no session left to end
     };
     ws.onclose = ev => {
@@ -835,6 +1213,183 @@ class PtyReap {
     };
   }
   wake() { if (this.ws?.readyState > 1) { this.tries = 0; this.connect(); } }
+}
+function acpItemEl(it) {
+  if (it.k === 'thought') { const d = el('details', 'ag-thought'); d.append(el('summary', '', 'thinking'), el('div', 'ag-msg')); return d; }
+  return el('div', { user: 'ag-msg ag-user', asst: 'ag-msg ag-asst', tool: 'ag-tool', sep: 'ag-sep' }[it.k] || 'ag-note');
+}
+function acpFill(it) {
+  const e = it.el;
+  if (it.k === 'user' || it.k === 'asst') e.textContent = it.text;
+  else if (it.k === 'thought') e.lastChild.textContent = it.text;
+  else if (it.k === 'note') { e.textContent = it.text; e.classList.toggle('err', it.cls === 'err'); e.classList.toggle('warn', it.cls === 'warn'); }
+  else if (it.k === 'tool') {
+    const st = TOOL_GLYPH[it.status] ? it.status : 'pending', h = el('div', 'th'), locs = Array.isArray(it.locations) ? it.locations : [];
+    h.append(el('span', 'tg ' + st, TOOL_GLYPH[st]), el('b', '', vtext(it.kind) || 'tool'), el('span', 'tt', vtext(it.title)));
+    const parts = [h];
+    if (locs.length) parts.push(el('div', 'tl', locs.map(l => vtext(l?.path) + (l?.line != null ? ':' + vtext(l.line) : '')).join('  ')));
+    for (const c of Array.isArray(it.content) ? it.content : []) parts.push(toolContent(c));
+    e.replaceChildren(...parts); e.dataset.status = st;
+  }
+}
+function toolContent(c) {
+  if (c?.type === 'diff') return lineDiff(c);
+  if (c?.type === 'terminal') return el('div', 'ag-note', '[terminal output not available]');
+  const t = blockText(c?.content), lines = t.split('\n').length, pre = el('pre', lines > 20 ? 'clip' : '', t);
+  if (lines <= 20) return pre;
+  const box = el('div'), more = el('button', 'more', 'show all ' + lines + ' lines');
+  more.type = 'button'; more.onclick = () => { pre.classList.remove('clip'); more.remove(); };
+  box.append(pre, more); return box;
+}
+function acpStatePanel(box, sp, b) {
+  box.hidden = !sp; box.replaceChildren(); if (!sp) return;
+  box.append(el('div', 'msg', sp.text));
+  if (sp.auth) {   // agent-handled methods are buttons; the others need a shell (§1.4)
+    for (const m of Array.isArray(b.session.authMethods) ? b.session.authMethods : []) {
+      if (!m || typeof m !== 'object') continue;
+      if (!m.type || m.type === 'agent') { const x = el('button', 'go', 'Log in: ' + vtext(m.name || m.id)); x.type = 'button'; x.title = vtext(m.description); x.onclick = () => b.authenticate(vtext(m.id)); box.append(x); }
+      else box.append(el('div', 'hint', vtext(m.name || m.id) + (m.description ? ': ' + vtext(m.description) : '') + '. Log in from a shell card on this server, then Start new session.'));
+    }
+  }
+  if (sp.hint) box.append(el('div', 'hint', sp.hint));
+  if (sp.acts) { const row = el('div', 'acts'); for (const [label, fn, cls] of sp.acts) { const x = el('button', cls || '', label); x.type = 'button'; x.onclick = fn; row.append(x); } box.append(row); }
+}
+// A tool call's diff content (30 §1.2): common prefix and suffix trimmed, an LCS over the middle when it is small enough,
+// 3 lines of context around each change.
+function lineDiff(d) {
+  const box = el('div', 'ag-diff'), path = vtext(d.path), oldT = d.oldText == null ? null : vtext(d.oldText), newT = vtext(d.newText);
+  const a = oldT == null ? [] : oldT.split('\n'), b = newT.split('\n');
+  box.append(el('div', 'dp', path + (oldT == null ? ' (new file)' : '')));
+  if ((oldT || '').length + newT.length > 200000) {
+    box.append(el('div', 'gap', 'diff too large: ' + path + ' (' + a.length + ' → ' + b.length + ' lines)'));
+    const t = el('button', 'more', 'show new text'); t.type = 'button'; t.onclick = () => t.replaceWith(el('pre', '', newT));
+    box.append(t); return box;
+  }
+  let p = 0; while (p < a.length && p < b.length && a[p] === b[p]) p++;
+  let s = 0; while (s < a.length - p && s < b.length - p && a[a.length - 1 - s] === b[b.length - 1 - s]) s++;
+  const am = a.slice(p, a.length - s), bm = b.slice(p, b.length - s), ops = a.slice(0, p).map(x => ['=', x]), m = am.length, n = bm.length;
+  if (m * n <= 1e6) {
+    const T = Array.from({ length: m + 1 }, () => new Uint32Array(n + 1));
+    for (let i = m - 1; i >= 0; i--) for (let j = n - 1; j >= 0; j--) T[i][j] = am[i] === bm[j] ? T[i + 1][j + 1] + 1 : Math.max(T[i + 1][j], T[i][j + 1]);
+    let i = 0, j = 0;
+    while (i < m && j < n) { if (am[i] === bm[j]) { ops.push(['=', am[i]]); i++; j++; } else if (T[i + 1][j] >= T[i][j + 1]) ops.push(['-', am[i++]]); else ops.push(['+', bm[j++]]); }
+    while (i < m) ops.push(['-', am[i++]]);
+    while (j < n) ops.push(['+', bm[j++]]);
+  } else { for (const x of am) ops.push(['-', x]); for (const x of bm) ops.push(['+', x]); }
+  for (const x of a.slice(a.length - s)) ops.push(['=', x]);
+  const keep = ops.map(() => false);
+  ops.forEach(([o], i) => { if (o !== '=') for (let k = Math.max(0, i - 3); k <= Math.min(ops.length - 1, i + 3); k++) keep[k] = true; });
+  const pre = el('pre');
+  for (let i = 0; i < ops.length;) {
+    if (keep[i]) { const [o, t] = ops[i++]; pre.append(el('div', o === '+' ? 'add' : o === '-' ? 'del' : 'ctx', (o === '=' ? ' ' : o) + ' ' + t)); continue; }
+    let j = i; while (j < ops.length && !keep[j]) j++;
+    pre.append(el('div', 'gap', '… ' + (j - i) + ' unchanged line' + (j - i === 1 ? '' : 's'))); i = j;
+  }
+  box.append(pre); return box;
+}
+// An elicitation form from requestedSchema (30 §1.4): one control per property, in object order.
+function elicitForm(schema) {
+  const props = schema && typeof schema.properties === 'object' && schema.properties ? schema.properties : {};
+  const need = new Set(Array.isArray(schema?.required) ? schema.required : []), box = el('div', 'fields'), fields = [];
+  const choices = p => {
+    if (Array.isArray(p.enum)) return p.enum.map((v, i) => ({ v: vtext(v), t: vtext(Array.isArray(p.enumNames) ? p.enumNames[i] ?? v : v) }));
+    const alt = p.oneOf || p.anyOf;
+    return Array.isArray(alt) && alt.length && alt.every(o => o && typeof o === 'object' && 'const' in o) ? alt.map(o => ({ v: vtext(o.const), t: vtext(o.title ?? o.const) })) : null;
+  };
+  for (const [key, raw] of Object.entries(props)) {
+    const p = raw && typeof raw === 'object' ? raw : {}, req = need.has(key), row = el('div', 'fld'), f = { key, p, req };
+    row.dataset.key = key;
+    row.append(el('span', 'lbl', vtext(p.title || key) + (req ? ' *' : '')));
+    const opts = p.type === 'string' ? choices(p) : null, items = p.type === 'array' && p.items && typeof p.items === 'object' ? choices(p.items) : null;
+    if (opts) {
+      const s = f.ctl = el('select'); if (!req) s.append(Object.assign(el('option', '', ''), { value: '' }));
+      for (const o of opts) s.append(Object.assign(el('option', '', o.t), { value: o.v }));
+      if (p.default != null) s.value = vtext(p.default);
+      f.get = () => s.value || undefined;
+    } else if (p.type === 'string') {
+      const type = { email: 'email', uri: 'url', date: 'date', 'date-time': 'datetime-local' }[p.format] || 'text';
+      const i = f.ctl = p.maxLength > 200 && type === 'text' ? el('textarea') : Object.assign(el('input'), { type });
+      if (p.default != null) i.value = type === 'datetime-local' ? vtext(p.default).slice(0, 16) : vtext(p.default);
+      f.get = () => (i.value === '' ? undefined : type === 'datetime-local' ? new Date(i.value).toISOString() : i.value);
+    } else if (p.type === 'number' || p.type === 'integer') {
+      const i = f.ctl = Object.assign(el('input'), { type: 'number' });
+      if (p.minimum != null) i.min = vtext(p.minimum); if (p.maximum != null) i.max = vtext(p.maximum); i.step = p.type === 'integer' ? '1' : 'any';
+      if (p.default != null) i.value = vtext(p.default);
+      f.get = () => (i.value === '' ? undefined : Number(i.value));
+    } else if (p.type === 'boolean') {
+      const i = f.ctl = Object.assign(el('input'), { type: 'checkbox', checked: p.default === true });
+      f.get = () => i.checked;
+    } else if (items) {
+      const g = f.ctl = el('div', 'multi'), def = Array.isArray(p.default) ? p.default.map(vtext) : [];
+      for (const o of items) { const l = el('label'), c = Object.assign(el('input'), { type: 'checkbox', value: o.v, checked: def.includes(o.v) }); l.append(c, ' ' + o.t); g.append(l); }
+      f.get = () => { const v = $$('input:checked', g).map(c => c.value); return v.length ? v : undefined; };
+    } else { f.ctl = el('span', 'warn', 'unsupported field (' + vtext(p.type || 'no type') + ')'); f.get = () => undefined; f.bad = true; }
+    row.append(f.ctl); if (p.description) row.append(el('span', 'hint', vtext(p.description)));
+    box.append(row); fields.push(f);
+  }
+  const check = () => {
+    const content = {};
+    for (const { key, p, req, get, bad } of fields) {
+      const v = get(), name = vtext(p.title || key);
+      if (bad) { if (req) return { ok: false, err: name + ' cannot be filled in here' }; continue; }
+      if (v === undefined) { if (req) return { ok: false, err: name + ' is required' }; continue; }
+      if (typeof v === 'string') {
+        if (p.minLength != null && v.length < p.minLength) return { ok: false, err: name + ': at least ' + p.minLength + ' characters' };
+        if (p.maxLength != null && v.length > p.maxLength) return { ok: false, err: name + ': at most ' + p.maxLength + ' characters' };
+        if (typeof p.pattern === 'string') { let re = null; try { re = new RegExp(p.pattern, 'u'); } catch {} if (re && !re.test(v)) return { ok: false, err: name + ' does not have the expected form' }; }
+      }
+      if (typeof v === 'number') {
+        if (!Number.isFinite(v) || (p.type === 'integer' && !Number.isInteger(v))) return { ok: false, err: name + ' must be ' + (p.type === 'integer' ? 'a whole number' : 'a number') };
+        if (p.minimum != null && v < p.minimum) return { ok: false, err: name + ': at least ' + p.minimum };
+        if (p.maximum != null && v > p.maximum) return { ok: false, err: name + ': at most ' + p.maximum };
+      }
+      if (Array.isArray(v)) {
+        if (p.minItems != null && v.length < p.minItems) return { ok: false, err: name + ': pick at least ' + p.minItems };
+        if (p.maxItems != null && v.length > p.maxItems) return { ok: false, err: name + ': pick at most ' + p.maxItems };
+      }
+      content[key] = v;
+    }
+    return { ok: true, content };
+  };
+  return { el: box, check };
+}
+function newAgentCard() {
+  const ag = DAEMON ? INFO?.agents || [] : [];
+  if (!ag.length) return toast(DAEMON ? 'No agents are configured on this server.' : 'Agent cards run on the Workbench server.');
+  const go = a => askName('Folder for the agent', defaultCwd(), cwd => {
+    if (!cwd.startsWith('/')) return toast('The folder must be an absolute path.');
+    newAt('acp', { agent: a.name, cwd, w: 560, h: 520 });
+  });
+  if (ag.length === 1) return go(ag[0]);
+  openPicker('Agent', ag.map(a => ({ k: 'agent', l: a.label || a.name, s: a.name, run: () => go(a) })));
+}
+function acpButton() { const b = $('#add-acp'); if (b) b.disabled = !DAEMON || !(INFO?.agents || []).length; }
+function defaultCwd() {
+  const a = activeId && S.nodes[activeId];
+  if (a && (a.kind === 'term' || a.kind === 'repl')) { const c = a.cwdLive || SESS[a.id]?.cwd; if (c) return c; }
+  if (a?.kind === 'acp' && a.cwd) return a.cwd;
+  return INFO?.home || '';
+}
+// An alive session with no card on this board (a "load theirs" conflict, or a tab that missed a card): a card with the
+// same id attaches to it and never spawns (N25).
+function adoptOrphan(s) {
+  if (S.nodes[s.sid]) return jumpNode(S.nodes[s.sid]);
+  const acp = s.kind === 'acp', c = viewCenterWorld(), w = 560, h = acp ? 520 : 320;
+  const base = acp ? { kind: 'acp', agent: s.acp?.agent || '', cwd: s.cwd || '' } : { kind: 'term', backend: 'pty', env: {}, ...(s.cwd ? { cwd: s.cwd } : {}) };
+  const n = addNode({ id: s.sid, name: (acp ? 'agent' : 'shell') + (nodeList().length + 1), ...base, ...freeSpot(c.x - w / 2, c.y - h / 2, w, h), w, h, _spawn: false });
+  jumpNode(n);
+}
+function mountAcp(n, L) {
+  if (!DAEMON) { L.body.append(el('div', 'ag-note', 'Agent cards run on the Workbench server.')); return; }
+  L.body.innerHTML = '<div class="ag-plan" hidden></div><div class="ag-log" aria-live="polite"></div><div class="ag-pend"><div class="ag-state" hidden></div></div>'
+    + '<form class="ag-in"><textarea rows="2"></textarea><div class="ag-row"><select class="ag-mode" title="Agent mode" hidden></select>'
+    + '<button type="button" class="stop" hidden>Stop</button><button type="submit" class="go">Send</button></div></form>';
+  L.logEl = $('.ag-log', L.body); L.ta = $('textarea', L.body);
+  const b = L.backend = new AcpBackend(n, L);
+  $('.ag-in', L.body).addEventListener('submit', e => { e.preventDefault(); b.submit(); });
+  L.ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); b.submit(); } });
+  $('.ag-row .stop', L.body).onclick = () => b.cancel();
+  $('.ag-mode', L.body).onchange = e => b.setMode(e.target.value);
 }
 class Offline {
   constructor(n, term) { term.write('\x1b[33mThis node is a real shell. Start canvasd to run it:\x1b[0m\r\n  python3 daemon/canvasd.py --open\r\n'); }
@@ -918,7 +1473,7 @@ function placeFrame(n) {
 //         stack = the folder collapses into a deck; items keep their places for when it is spread out again.
 const PAD = 28, GAP = 24, LABEL_H = 32, DECK = { w: 300, h: 230 };
 const FSHAPES = ['folder', 'box', 'round'], FICON = { free: '◻', pack: '▦', tile: '⊞', stack: '❐' };   // v18.1: ribbon (PaperWM row) removed; old boards' ribbon folders load as tile
-const KIND_GLYPH = { term: '$', repl: '›', buffer: '¶', agent: '✦', ref: '❝', frame: '▭', artifact: '◧', web: '⌾', sketch: '✎', ghost: '◌' };
+const KIND_GLYPH = { term: '$', repl: '›', buffer: '¶', agent: '✦', acp: '✦', ref: '❝', frame: '▭', artifact: '◧', web: '⌾', sketch: '✎', ghost: '◌' };
 const kidsOf = fid => Object.values(S.nodes).filter(m => m.in === fid);
 const byOrder = (a, b) => (a.order ?? 0) - (b.order ?? 0) || a.y - b.y || a.x - b.x;
 function descendants(fid, out = []) { for (const k of kidsOf(fid)) { out.push(k); if (k.kind === 'frame') descendants(k.id, out); } return out; }
@@ -1469,7 +2024,7 @@ function mountNode(n) {
   e.style.zIndex = ++topZ;
   const L = live[n.id] = { el: e, hdr, body, lod, ink };
   const btns = $('.btns', hdr);
-  const B = (label, title, fn) => { const b = el('button', 'hb'); b.textContent = label; b.title = title; b.onclick = ev => { ev.stopPropagation(); fn(b); }; btns.append(b); };
+  const B = (label, title, fn) => { const b = el('button', 'hb'); b.textContent = label; b.title = title; b.onclick = ev => { ev.stopPropagation(); fn(b); }; btns.append(b); return b; };
   if (n.kind === 'term' || n.kind === 'repl') {
     if (n.tmux) B('⇠', 'Adopted tmux session ' + n.tmux + ': detach (the card goes, the session keeps running)', () => removeNode(n.id));
     B('⑂', 'Branch: spawn a child that inherits this node’s context', () => spawnChild(n));
@@ -1485,6 +2040,11 @@ function mountNode(n) {
     B('↗', 'Jump to the source', () => jumpRef(n));
   } else if (n.kind === 'agent') {
     B('⑂', 'Branch: fork this conversation into a child agent', () => spawnChild(n));
+  } else if (n.kind === 'acp') {
+    B('⑂', 'New session: same agent, same folder (a new conversation, not a fork)', () => spawnChild(n));
+    B('⇢', 'Send the selected text along pipe edges', () => pipeFrom(n));
+    L.revive = B('↻', 'Revive: restart the agent and resume this conversation', () => L.backend?.revive());
+    L.revive.hidden = true;
   } else if (n.kind === 'artifact') {
     B('↻', 'Reload the page', () => artMount(n, live[n.id]));
     B('✎', 'Edit the source as a page; publish it back from the palette', () => artifactSourcePage(n));
@@ -1507,6 +2067,7 @@ function mountNode(n) {
   else if (n.kind === 'buffer') mountBuffer(n, L);
   else if (n.kind === 'ref') mountRef(n, L);
   else if (n.kind === 'agent') mountAgent(n, L);
+  else if (n.kind === 'acp') mountAcp(n, L);
   else if (n.kind === 'artifact') mountArtifact(n, L);
   else if (n.kind === 'web') mountWeb(n, L);
   else if (n.kind === 'sketch') mountSketch(n, L);
@@ -1533,6 +2094,7 @@ function badgeOf(n) {
   if (n.kind === 'ghost') return n.alias ? 'copy' : n.journalDay && !n.noteId ? 'journal' : n.noteId ? 'note' : n.linkTitle ? 'link' : n.tmuxTarget ? 'tmux' : n.procPid ? 'process' : n.unitName ? (n.unitState || 'unit') : n.hardlink ? 'hardlink' : n.link ? 'symlink' : n.mount ? 'mount' : n.dir ? 'directory' : 'file';
   if (n.kind === 'term') return n.backend === 'pty' ? shellName(n) || 'shell' : 'sim shell';
   if (n.kind === 'repl') return n.lang === 'js' ? 'js' : (n.cmd || '').split(' ')[0].replace('python3', 'py');
+  if (n.kind === 'acp') return agentLabel(n.agent) + ' · ' + (live[n.id]?.backend?.stateText() || (SESS[n.id]?.state || '…').replace(/_/g, ' '));
   return { buffer: 'page', ref: 'ref', agent: 'agent' }[n.kind] || n.kind;
 }
 function updateTitle(n) {
@@ -1669,6 +2231,7 @@ function activate(id) {
   if (L.el.parentNode === nodesEl && +L.el.style.zIndex < topZ) L.el.style.zIndex = ++topZ;
   $$('#tp-list .tp-row').forEach(r => r.classList.toggle('on', r.dataset.id === id));
   updateSideCtx();
+  L.backend?.maybeSeen?.();
 }
 function wireNode(n, L, port, rs) {
   L.el.addEventListener('pointerdown', () => activate(n.id));
@@ -1717,7 +2280,7 @@ function addNode(n) {
   if (!('in' in n)) { const t = containerAt(n.x + Math.min(40, n.w / 2), n.y + 20, new Set([n.id])); if (t && t.mode !== 'stack') n.in = t.id; }
   if (!n.in || !S.nodes[n.in]) delete n.in;
   if (n.in && S.nodes[n.in].mode === 'pack') n.order = 1e9;
-  n._spawn = true;   // made in this page: its first open may spawn (SEC-2); `_` keys are never saved
+  if (n._spawn !== false) n._spawn = true;   // made in this page: its first open may spawn (SEC-2), unless adopted; `_` keys are never saved
   S.nodes[n.id] = n; mount(n);
   SEP.keep = n; if (n.in) relayout(S.nodes[n.in], true); else separate(null, n); SEP.keep = null;
   restack(); renderEdges(); activate(n.id); renderTree(); dirty(); return n;
@@ -1726,7 +2289,7 @@ function newAt(kind, extra = {}) {
   const c = viewCenterWorld(), w = extra.w || (kind === 'frame' ? 760 : kind === 'buffer' ? 460 : 560), h = extra.h || (kind === 'frame' ? 460 : 320);
   const jitter = () => Math.round((Math.random() - .5) * 60);
   const count = Object.values(S.nodes).filter(m => m.kind === kind).length + 1;
-  const names = { term: 'shell', repl: 'repl', buffer: 'page', frame: 'folder', agent: 'agent', artifact: 'artifact', web: 'web', sketch: 'sketch' };
+  const names = { term: 'shell', repl: 'repl', buffer: 'page', frame: 'folder', agent: 'agent', acp: 'agent', artifact: 'artifact', web: 'web', sketch: 'sketch' };
   return addNode({ kind, name: names[kind] + count, x: Math.round(c.x - w / 2) + jitter(), y: Math.round(c.y - h / 2) + jitter(), w, h, ...extra });
 }
 function removeNode(id) {
@@ -1755,6 +2318,7 @@ function spawnChild(n, name) {
   if (n.kind === 'term' && n.backend === 'pty') { child.env = { ...(n.env || {}) }; if (shellName(n)) child.shell = n.shell; }
   if (n.kind === 'repl' && n.lang === 'js') { child.history = [...(n.history || [])]; child.replayFrom = pathOf(n.id); }
   if (n.kind === 'repl' && n.lang !== 'js') child._replay = n.inputLog || '';
+  if (n.kind === 'acp') { child.agent = n.agent; child.cwd = n.cwd; }   // a new session in the same folder, not a fork
   if (n.kind === 'agent') { child.turns = (n.turns || []).map(t => ({ ...t })); child.log = [...(n.log || []).filter(m => !m.live).map(m => ({ ...m })), { t: 'note', text: `Forked from ${pathOf(n.id)} after ${child.turns.length} turn(s). This branch continues on its own.` }]; child.tier = n.tier; }
   S.edges.push({ id: uid('e'), from: n.id, to: child.id, type: 'spawn' });
   addNode(child);
@@ -1766,6 +2330,7 @@ function selectionOf(n) {
   const L = live[n.id];
   if (L.term) return L.term.getSelection();
   if (L.view) { const st = L.view.state, s = st.selection.main; return s.empty ? st.doc.lineAt(s.head).text : st.sliceDoc(s.from, s.to); }
+  if (n.kind === 'acp') { const s = getSelection(); return s && L.body.contains(s.anchorNode) ? String(s) : ''; }
   return '';
 }
 function pipeFrom(n) {
@@ -1778,7 +2343,7 @@ function pipeFrom(n) {
     if (t.kind === 'buffer') {
       const doc = L.view.state.doc, ins = `\n*from ${pathOf(n.id)}:*\n\`\`\`\n${text.replace(/\s+$/, '')}\n\`\`\`\n`;
       L.view.dispatch({ changes: { from: doc.length, insert: ins }, scrollIntoView: true });
-    } else if (t.kind === 'agent' && L.ta) {
+    } else if ((t.kind === 'agent' || t.kind === 'acp') && L.ta) {   // drafts into the composer, never sends
       L.ta.value = (L.ta.value ? L.ta.value + '\n' : '') + text; L.ta.focus();
     } else if (L.backend) {
       L.backend.input(text.replace(/\r?\n/g, '\r').replace(/\r$/, '') + (n.kind === 'buffer' ? '\r' : ''));
@@ -2018,6 +2583,7 @@ function snapshotText(n, max = 12) {
   const L = live[n.id]; if (!L) return '';
   if (L.term) return termLines(L, max).join('\n');
   if (n.kind === 'buffer') return (n.text || '').split('\n').slice(0, max).join('\n');
+  if (n.kind === 'acp') return L.backend?.text(max) || '';
   if (n.kind === 'agent') return (n.log || []).filter(m => m.text).slice(-6).map(m => (m.t === 'user' ? '› ' : '') + m.text).join('\n');
   if (n.kind === 'web') return n.url || '';
   if (n.kind === 'sketch') return `${S.strokes.filter(x => x.owner === n.id).length} strokes`;
@@ -2139,6 +2705,7 @@ $$('.sw').forEach(b => b.onclick = () => { inkColor = b.dataset.color; $$('.sw')
 $('#add-artifact').onclick = () => newArtifact('artifact' + (nodeList().filter(n => n.kind === 'artifact').length + 1));
 $('#add-emacs').onclick = () => askName('File to open in Emacs', INFO?.notes ? INFO.notes + '/' : '~/', f => newEmacs(f));
 $('#add-web').onclick = () => askName('Address', 'https://', u => newWeb(u));
+$('#add-acp').onclick = () => newAgentCard();
 $('#add-sketch').onclick = () => newSketch();
 if ($('#add-agent')) $('#add-agent').onclick = () => { const n = newAt('agent', { w: 520, h: 440, log: [{ t: 'note', text: 'Ask me about the board, or tell me what to change.' }], turns: [], tier: 'quick' }); setTimeout(() => live[n.id]?.ta?.focus(), 50); };
 $('#open-today').onclick = () => openToday();
@@ -2348,6 +2915,12 @@ cmd('Handwriting → ask the assistant', () => inkAsk(), '', () => INK.ids.lengt
 cmd('Show or hide drawing tools', () => toggleDock('draw'));
 cmd('Show or hide the add bar', () => toggleDock('new'));
 cmd('New Emacs buffer…', onCanvas(() => $('#add-emacs').click()), '', () => DAEMON);
+cmd('New agent card…', onCanvas(() => newAgentCard()), '', () => DAEMON && (INFO?.agents || []).length);
+{
+  const acpActive = () => S.nodes[activeId]?.kind === 'acp' ? live[activeId]?.backend : null;
+  cmd('Agent: start a new session in the active card (ends the current one)', () => acpActive()?.restart(), '', () => !!acpActive());
+  cmd('Agent: end the active card\'s session (the card stays, ↻ revives)', () => acpActive()?.end(), '', () => !!acpActive()?.sum?.alive);
+}
 cmd('New browser window…', onCanvas(() => $('#add-web').click()));
 cmd('New sketch (write on it with the pen)', onCanvas(() => newSketch()));
 cmd('New shell', onCanvas(() => $('#add-shell').click()));
@@ -2359,7 +2932,7 @@ cmd('New folder…', () => askName('New folder name', '', name => { if (VIEW !==
 cmd('Open today’s journal', () => openToday());
 cmd('Move the active item to a folder…', () => { const n = S.nodes[activeId]; pickFolder(`Move ${n.name} to…`, f => adopt(n, f, null)); }, '', () => !!S.nodes[activeId]);
 cmd('Rename the active item…', () => { const n = S.nodes[activeId]; askName('Rename ' + n.name, n.name, v => { n.name = clean(v); n.kind === 'frame' ? placeFrame(n) : updateAllTitles(); renderTree(); dirty(); }); }, '', () => !!S.nodes[activeId]);
-cmd('Branch the active shell, REPL or agent', () => spawnChild(S.nodes[activeId]), '', () => ['term', 'repl', 'agent'].includes(S.nodes[activeId]?.kind));
+cmd('Branch the active shell, REPL or agent', () => spawnChild(S.nodes[activeId]), '', () => ['term', 'repl', 'agent', 'acp'].includes(S.nodes[activeId]?.kind));
 cmd('Compact everything', onCanvas(() => compact('all')), 'c');
 cmd('Compact the selection', onCanvas(() => compact('selection')), 'c', () => PICKED.size > 0);
 cmd('Select all items in the view', onCanvas(() => { for (const n of Object.values(S.nodes)) if (!stashed(n) && !n.in) pickToggle(n.id, true); }));
@@ -2767,6 +3340,7 @@ const AGENT_TOOLS = [
       syncBuffers();
       if (n.kind === 'buffer') return (n.text || '').slice(0, 8000);
       if (live[n.id]?.term) return termLines(live[n.id], 80).join('\n') || '(empty)';
+      if (n.kind === 'acp') return live[n.id]?.backend?.text(40) ?? '(not mounted)';
       if (n.kind === 'agent') return (n.log || []).slice(-10).map(l => `${l.t}: ${l.text || l.name}`).join('\n');
       return n.text || '';
     } },
@@ -2793,13 +3367,13 @@ const AGENT_TOOLS = [
       pulse(n.id);
       return `ok, ${pathOf(n.id)} now has ${v.state.doc.lines} lines`;
     } },
-  { name: 'create_node', description: 'Create a node. kind is page, shell, repl or agent. parent (a node path of the same kind) makes it a spawned child that inherits context; near (a node path) places it beside that node. Returns the new path.',
-    inputSchema: { type: 'object', properties: { kind: { type: 'string', enum: ['page', 'shell', 'repl', 'agent'] }, name: { type: 'string' }, text: { type: 'string', description: 'initial markdown for a page' }, parent: { type: 'string' }, near: { type: 'string' } }, required: ['kind', 'name'] },
+  { name: 'create_node', description: 'Create a node. kind is page, shell or repl. parent (a node path of the same kind) makes it a spawned child that inherits context; near (a node path) places it beside that node. Returns the new path.',
+    inputSchema: { type: 'object', properties: { kind: { type: 'string', enum: ['page', 'shell', 'repl'] }, name: { type: 'string' }, text: { type: 'string', description: 'initial markdown for a page' }, parent: { type: 'string' }, near: { type: 'string' } }, required: ['kind', 'name'] },
     run: ({ kind, name, text, parent, near }) => {
-      const k = { page: 'buffer', shell: 'term', repl: 'repl', agent: 'agent' }[kind]; if (!k) throw new Error('unknown kind ' + kind);
+      const k = { page: 'buffer', shell: 'term', repl: 'repl' }[kind]; if (!k) throw new Error('unknown kind ' + kind);
       const par = parent && findNode(parent), nr = near && findNode(near);
       if (par && par.kind === k) return pathOf(spawnChild(par, name).id);
-      const extra = { term: { backend: DAEMON ? 'pty' : 'fake', shell: shellDefault(), cwd: DAEMON ? undefined : '/home/me', env: {} }, repl: { lang: 'js', history: [] }, buffer: { text: str(text) || `# ${clean(name)}\n\n- ` }, agent: { log: [], turns: [], tier: 'quick' } }[k];
+      const extra = { term: { backend: DAEMON ? 'pty' : 'fake', shell: shellDefault(), cwd: DAEMON ? undefined : '/home/me', env: {} }, repl: { lang: 'js', history: [] }, buffer: { text: str(text) || `# ${clean(name)}\n\n- ` } }[k];
       const w = k === 'buffer' ? 420 : 520, h = k === 'buffer' ? 300 : 340, base = nr || par || n0();
       const pos = base ? freeSpot(base.x + base.w + 60, base.y, w, h) : (c => freeSpot(c.x - w / 2, c.y - h / 2, w, h))(viewCenterWorld());
       const m = addNode({ kind: k, name: clean(name), ...pos, w, h, ...extra });
@@ -3140,7 +3714,7 @@ function rgLabel(key) {
 }
 const rgList = () => { const all = rgEntries(RG.dir), f = RG.filter.toLowerCase(); return f ? all.filter(e => fuzzy(f, e.name)) : all; };
 function rgCur() { const l = rgList(); const i = clamp(RG.sel[RG.dir] ?? 0, 0, Math.max(0, l.length - 1)); RG.sel[RG.dir] = i; return { list: l, i, e: l[i] }; }
-const RG_GLYPH = { frame: '▸', fsdir: '▸', file: '·', buffer: '¶', term: '$', repl: '›', agent: '✦', ref: '❝', artifact: '◧', persp: '⊳', itag: '#', inote: '¶', iblock: '§', ijournal: '▸', ghost: '◌', itmux: '⌗', itmuxw: '▭', iproc: '⚙', iunit: '⊙', iattn: '!' };
+const RG_GLYPH = { frame: '▸', fsdir: '▸', file: '·', buffer: '¶', term: '$', repl: '›', agent: '✦', acp: '✦', ref: '❝', artifact: '◧', persp: '⊳', itag: '#', inote: '¶', iblock: '§', ijournal: '▸', ghost: '◌', itmux: '⌗', itmuxw: '▭', iproc: '⚙', iunit: '⊙', iattn: '!' };
 function rgRow(e, on, cur) {
   const r = el('div', 'rg-row' + (on ? ' on' : '') + (e.dir ? ' dir' : '') + (RG.marks.has(e.key) ? ' marked' : '') + (RG.clip?.keys.includes(e.key) ? ' cut' : '') + (e.n && stashed(e.n) ? ' dim' : ''));
   r.innerHTML = '<span class="g"></span><span class="nm"></span><span class="mt"></span>';
@@ -3175,6 +3749,7 @@ function rgPreview(e) {
     const n = e.n, L = live[n.id];
     if (n.kind === 'buffer') pre.textContent = pageText(n);
     else if (L?.term) pre.textContent = termLines(L, 60).join('\n');
+    else if (n.kind === 'acp') pre.textContent = L?.backend?.text(60) || '';
     else if (n.kind === 'agent') pre.textContent = (n.log || []).filter(m => m.text).slice(-12).map(m => (m.t === 'user' ? '› ' : m.t === 'tool' ? '⚙ ' : '') + (m.text || m.name)).join('\n\n');
     else pre.textContent = n.text || '';
     const meta = el('div', 'rg-meta'); meta.textContent = [badgeOf(n), folderPath(n) ? 'in ' + folderPath(n) + '/' : 'loose on the canvas', n.cwd && n.kind === 'term' ? 'cwd ' + n.cwd : ''].filter(Boolean).join(' · ');
@@ -3760,6 +4335,7 @@ function renderOutline() {
     if (n.kind === 'buffer') { const t = pageText(n), links = (t.match(/\[\[[^\]]+\]\]/g) || []).length, bl = backlinksOf(n).length, todo = (t.match(/^\s*[-*+]\s+(TODO|NEXT|WAITING|HOLD|SOMEDAY|DOING|NOW|LATER)\s/gm) || []).length; meta = [`${t.split('\n').length} lines`, links && `${links} links out`, bl && `${bl} in`, todo && `${todo} open tasks`].filter(Boolean).join(' · '); }
     else if (n.kind === 'term') meta = n.backend === 'pty' ? 'real shell' : (live[n.id]?.backend?.cwd || n.cwd || '');
     else if (n.kind === 'repl') meta = n.lang === 'js' ? `JavaScript · ${(n.history || []).length} inputs` : n.cmd;
+    else if (n.kind === 'acp') meta = agentLabel(n.agent) + ' · ' + (SESS[n.id]?.state || '…').replace(/_/g, ' ');
     else if (n.kind === 'agent') meta = `${(n.turns || []).length} turns · ${({ quick: 'Fast', default: 'Expert', complex: 'Heavy' })[n.tier] || ''}`;
     else if (n.kind === 'ref') meta = 'from ' + (n.srcLabel || '?');
     const pipes = S.edges.filter(e => e.from === n.id && e.type !== 'spawn').map(e => `${e.type} → ${S.nodes[e.to]?.name}`);
@@ -3847,12 +4423,13 @@ async function dispatchTask(t, { host, shell } = {}) {
   const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host);
   let n = shell ? findNode(shell) : null;
   if (shell && !n) throw new Error('no shell at ' + shell);
+  if (!n) n = nodeList().find(m => m.kind === 'acp' && ['idle', 'done'].includes(SESS[m.id]?.state) && live[m.id]?.backend?.promptable()) || null;   // an idle agent card first
   if (!n) n = nodeList().find(m => m.kind === 'term' && tagsOf(m).includes('agent') && (!h || fsHostKey(m) === h.url) && live[m.id]?.backend && !live[m.id].backend.dead && !live[m.id].backend.parked) || null;
   if (!n) {
     const hf = h ? hostFolder(h) : null, c = viewCenterWorld(), w = 640, hh = 400;
     const sh = addNode({ kind: 'term', backend: DAEMON ? 'pty' : 'fake', shell: shellDefault(), name: 'agent' + (nodeList().filter(m => m.kind === 'term').length + 1), env: {}, in: hf ? hf.id : undefined, ...freeSpot(c.x - w / 2, c.y - hh / 2, w, hh), w, h: hh });
     if (hf) adopt(sh, hf, null, true);
-    throw new Error('no shell with #agent' + (h ? ' on @' + h.name : '') + ': opened ' + pathOf(sh.id) + '. Start your agent there and dispatch again.');
+    throw new Error('no idle agent card or shell with #agent' + (h ? ' on @' + h.name : '') + ': opened ' + pathOf(sh.id) + '. Start your agent there and dispatch again.');
   }
   const L = live[n.id], text = taskText(t); if (!L?.backend) throw new Error(n.name + ' is not running');
   L.backend.input(text + '\r'); pulse(n.id); if (VIEW === 'canvas') jumpNode(n);
@@ -4742,7 +5319,7 @@ async function boot() {
   if (DAEMON) { BOARD_CAM = S.cam; S.cam = camLoad() || { x: 0, y: 0, z: 1, ...S.cam }; }
   migrateV9();
   if (DAEMON) hostsLoad();
-  perspChip(); { const ah = $('#add-host'); if (ah) ah.disabled = !DAEMON; }
+  perspChip(); { const ah = $('#add-host'); if (ah) ah.disabled = !DAEMON; } acpButton();
   if (perspCur() === 'fs') setTimeout(() => { perspEdgesRebuild(); renderLinks(); }, 300);
   hashInit();
   if (separateAll()) { restack(); renderLinks(); }
@@ -4885,6 +5462,7 @@ function autoTags(n) {
   const t = [];
   if (n.kind === 'frame') { t.push('aggregator'); if (n.host) t.push('host'); if (n.unitState) t.push(n.unitState); if (n.tmuxState) t.push(n.tmuxState); }
   if (n.kind === 'term') { const first = (n.cmd || '').trim().split(/\s+/)[0]?.split('/').pop() || ''; if ((n.fg && AGENT_RE.test(n.fg)) || AGENT_RE.test(first)) t.push('agent'); if (n.tmux) t.push('tmux'); }
+  if (n.kind === 'acp') t.push('agent');   // the state is never a tag: tags write the board
   if (n.emacs) t.push('emacs');
   return t;
 }
@@ -6158,6 +6736,16 @@ function attnItems() {
   }
   for (const n of nodeList()) if (n.kind === 'term' && live[n.id]?.backend?.dead && live[n.id].backend.exitReason !== 'hub_restart') items.push({ key: n.id, name: n.name + ' ended', kind: 'iattn', attn: 'bad', n, dir: false, meta: 'shell exited' });
   for (const n of nodeList()) if (n.kind === 'term' && live[n.id]?.backend?.parked) items.push({ key: n.id, name: n.name + ' parked', kind: 'iattn', attn: 'bad', n, dir: false, meta: 'host unreachable' });
+  for (const n of nodeList()) {   // agent cards, from the session feed (§3.4.6)
+    const s = n.kind === 'acp' && SESS[n.id], a = s?.acp, it = { key: n.id, kind: 'iattn', n, dir: false };
+    if (!s) continue;
+    if (s.state === 'waiting_permission') items.push({ ...it, name: n.name + ' needs permission', attn: 'bad', meta: a?.pending?.find(p => p.kind === 'permission')?.title || '' });
+    else if (s.state === 'waiting_input') items.push({ ...it, name: n.name + ' asks a question', attn: 'bad', meta: a?.pending?.[0]?.title || '' });
+    else if (s.state === 'error') items.push({ ...it, name: n.name + ' failed', attn: 'bad', meta: s.fault?.message || a?.last?.error?.message || a?.last?.outcome || '' });
+    else if (s.state === 'done') items.push({ ...it, name: n.name + ' finished', attn: '', meta: agentLabel(n.agent) });
+  }
+  if (DAEMON && S) for (const s of Object.values(SESS)) if (s.alive && !S.nodes[s.sid])   // running invisibly otherwise
+    items.push({ key: 'orphan:' + s.sid, name: (s.kind === 'acp' ? agentLabel(s.acp?.agent) : s.pty?.fg?.comm || 'shell') + ' running without a card', kind: 'iattn', attn: 'bad', dir: false, meta: s.cwd || '', go: () => adoptOrphan(s) });
   const due = RV.loaded ? rvQueue().dueNow.length : 0; if (due) items.push({ key: 'attn:review', name: due + ' card' + (due === 1 ? '' : 's') + ' due', kind: 'iattn', dir: false, meta: 'review', go: () => setView('review') });
   for (const t of allTasks()) { if (COL[t.kw] === 'DONE') continue; const due = taskDue(t); if (due && due <= TODAY) items.push({ key: 'attn:' + taskKey(t), name: (due < TODAY ? 'overdue ' : 'due today ') + plainTask(t.text).slice(0, 60), kind: 'iattn', attn: due < TODAY ? 'bad' : '', dir: false, meta: taskAddr(t), go: () => taskOpen(t) }); else if (COL[t.kw] === 'NEXT' && !t.session) items.push({ key: 'attn:' + taskKey(t), name: 'NEXT ' + plainTask(t.text).slice(0, 60), kind: 'iattn', dir: false, meta: taskAddr(t), go: () => taskOpen(t) }); }
   return items;
@@ -6167,10 +6755,12 @@ function attnCount() { try { return attnItems().length; } catch { return 0; } }
 function statusCounts() {
   const hosts = DAEMON ? allHosts() : [], down = hosts.filter(h => HOSTCONN[h.url]?.down).length;
   let failed = 0; for (const d of Object.values(UNITS.data)) failed += (d?.units || []).filter(u => u.active === 'failed').length;
-  const agents = nodeList().filter(n => n.kind === 'term' && tagsOf(n).includes('agent') && !live[n.id]?.backend?.dead).length;
+  const acps = nodeList().filter(n => n.kind === 'acp'), st = n => SESS[n.id]?.state;
+  const agents = nodeList().filter(n => n.kind === 'term' && tagsOf(n).includes('agent') && !live[n.id]?.backend?.dead).length + acps.filter(n => st(n) && st(n) !== 'exited' && st(n) !== 'detached').length;
+  const waiting = acps.filter(n => ACP_BAD.has(st(n))).length;
   const due = RV.loaded ? rvQueue().dueNow.length : null;
   const open = allTasks().filter(t => COL[t.kw] !== 'DONE'), tasks = open.length, dueToday = open.filter(t => taskDue(t) && taskDue(t) <= TODAY).length;
-  return { hosts: hosts.length, down, failed, agents, due, tasks, dueToday };
+  return { hosts: hosts.length, down, failed, agents, waiting, due, tasks, dueToday };
 }
 function statusRender() {
   const box = $('#st-host'); if (!box) return;
@@ -6178,7 +6768,10 @@ function statusRender() {
   const add = (text, title, cls, fn) => { const b = el('button', 'stc' + (cls ? ' ' + cls : ''), text); b.title = title; b.onclick = fn; box.append(b); };
   if (DAEMON && c.hosts) add((c.hosts - c.down) + '/' + c.hosts + ' hosts', 'Hosts from hosts.json: reachable / all. Click: the navigator root lists them.', c.down ? 'bad' : '', () => { setView('ranger'); rgGo('root'); });
   if (DAEMON || !DAEMON) add('✗ ' + c.failed, c.failed ? c.failed + ' failed unit(s). Click: units, failed first.' : 'No failed units. Click: units.', c.failed ? 'bad' : '', () => { goAddr('unit:'); });
-  add('✦ ' + c.agents, c.agents + ' shell(s) running an agent. Click: filter the canvas by #agent.', '', () => { setView('canvas'); tagFilter('agent'); });
+  add('✦ ' + c.agents + (c.waiting ? ' · ' + c.waiting + ' waiting' : ''), c.agents + ' agent card(s) and shell(s) running an agent' + (c.waiting ? ', ' + c.waiting + ' waiting for you. Click: the first waiting card.' : '. Click: filter the canvas by #agent.'), c.waiting ? 'bad' : '', () => {
+    const w = nodeList().find(n => n.kind === 'acp' && ACP_BAD.has(SESS[n.id]?.state));
+    if (w) jumpNode(w); else { setView('canvas'); tagFilter('agent'); }
+  });
   if (c.due != null) add('▦ ' + c.due, c.due + ' flashcard(s) due. Click: review.', c.due ? 'warn' : '', () => setView('review'));
   add('☐ ' + c.tasks + (c.dueToday ? ' (' + c.dueToday + ' due)' : ''), c.tasks + ' open task(s) on the board and in the notes' + (c.dueToday ? ', ' + c.dueToday + ' scheduled or due by today' : '') + '. Click: the tasks view.', c.dueToday ? 'warn' : '', () => setView('tasks'));
   const a = attnCount(); add('! ' + a, a ? a + ' item(s) need a look. Click: the Attention list (addresses).' : 'Nothing needs a look.', a ? 'bad' : '', () => { setView('ranger'); rgGo('attn:'); });
@@ -6213,6 +6806,6 @@ AGENT_TOOLS.push(
   { name: 'host_status', description: 'Health of a host: load, memory, disk, uptime, shells, tmux sessions, unit counts (failed names). host: a name from hosts.json (empty = the serving daemon).', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
     run: async ({ host } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j = await (await hFetch(h, '/api/status')).json(); const gb = b => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}` + (j.sessions?.tmux != null ? ', tmux sessions ' + j.sessions.tmux : ''), j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
-window.__canvas = { setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk };  // for tests and debugging
+window.__canvas = { setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 boot();
 })();
