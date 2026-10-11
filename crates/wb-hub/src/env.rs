@@ -64,10 +64,12 @@ pub fn check_client_env(env: &BTreeMap<String, String>) -> Result<(), String> {
     Ok(())
 }
 
-/// The complete environment of a PTY child. `hub_env` looks a name up in the hub's own
-/// environment; `client` must have passed [`check_client_env`].
+/// The complete environment of a PTY child running the shell at `shell`. `hub_env` looks
+/// a name up in the hub's own environment; `client` must have passed
+/// [`check_client_env`].
 pub fn pty_env(
     child: &ChildConfig,
+    shell: &str,
     who: &Identity,
     sid: &str,
     client: Option<&BTreeMap<String, String>>,
@@ -77,7 +79,7 @@ pub fn pty_env(
         ("HOME", who.home.as_str()),
         ("USER", &who.user),
         ("LOGNAME", &who.logname),
-        ("SHELL", &child.shell),
+        ("SHELL", shell),
         ("WB_SESSION", sid),
         ("TERM", "xterm-256color"),
         ("COLORTERM", "truecolor"),
@@ -105,7 +107,6 @@ mod tests {
 
     fn child() -> ChildConfig {
         ChildConfig {
-            shell: "/bin/bash".into(),
             pass_env: vec!["LANG".into(), "EDITOR".into(), "MISSING".into()],
             set_env: [("PATH", "/set/bin"), ("EDITOR", "vi")]
                 .into_iter()
@@ -139,7 +140,7 @@ mod tests {
     }
 
     fn build(client: Option<&BTreeMap<String, String>>) -> BTreeMap<String, String> {
-        pty_env(&child(), &who(), "n_abc", client, hub_env)
+        pty_env(&child(), "/bin/sh", &who(), "n_abc", client, hub_env)
             .into_iter()
             .map(|(k, v)| (k.into_string().unwrap(), v.into_string().unwrap()))
             .collect()
@@ -162,7 +163,7 @@ mod tests {
             ("LANG", "C.UTF-8"),
             ("LOGNAME", "alice"),
             ("PATH", "/set/bin"),
-            ("SHELL", "/bin/bash"),
+            ("SHELL", "/bin/sh"),
             ("TERM", "xterm-256color"),
             ("USER", "alice"),
             ("WB_SESSION", "n_abc"),
@@ -177,6 +178,7 @@ mod tests {
             ("WB_SESSION", "other"),
             ("TERM", "dumb"),
             ("HOME", "/tmp"),
+            ("SHELL", "/evil/sh"),
             ("CANVAS_NODE", "n_abc"),
         ]);
         let env = build(Some(&client));
@@ -184,6 +186,7 @@ mod tests {
         assert_eq!(env["WB_SESSION"], "n_abc");
         assert_eq!(env["TERM"], "xterm-256color");
         assert_eq!(env["HOME"], "/home/alice");
+        assert_eq!(env["SHELL"], "/bin/sh");
         assert_eq!(env["CANVAS_NODE"], "n_abc");
     }
 
