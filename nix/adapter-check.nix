@@ -44,7 +44,8 @@ pkgs.runCommand "workbench-adapters"
     passAsFile = [ "agents" ];
   }
   ''
-    export HOME=$TMPDIR BASH=${pkgs.bashInteractive}/bin/bash
+    # wb-hub reads HOME, USER and LOGNAME for its children; the sandbox sets none of them.
+    export HOME=$TMPDIR USER=nixbld LOGNAME=nixbld BASH=${pkgs.bashInteractive}/bin/bash
     python3 -I ${tests}/adapter_probe.py --agents "$agentsPath"
     touch $out
   ''

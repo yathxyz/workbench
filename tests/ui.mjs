@@ -1087,8 +1087,10 @@ const acpEvs = (p, id, e, after = 0, since = 0) => {
   for (const w of acpWs(p, id, since)) for (const f of w.recv) if (f.t === 'ev' && f.ev?.seq > after && (!e || f.ev.e === e)) m.set(f.ev.seq, f.ev);
   return [...m.values()].sort((a, b) => a.seq - b.seq);
 };
-const acpView = (p, id) => p.evaluate(id => {
+// The card paints once per frame (30 §1.3): a view waits out a pending paint, so its DOM shows every frame taken so far.
+const acpView = (p, id) => p.evaluate(async id => {
   const C = window.__canvas, L = C.live[id], b = L?.backend; if (!b) return null;
+  for (let i = 0; b.raf && i < 10; i++) await new Promise(r => { requestAnimationFrame(() => r()); setTimeout(r, 100); });
   const vis = e => !!e && !e.hidden && !e.closest('[hidden]'), st = L.body.querySelector('.ag-state');
   return { st: b.state(), tx: b.stateText(), badge: L.hdr.querySelector('.badge').textContent, seq: b.seq, epoch: b.epoch, alive: !!b.sum?.alive, activity: b.sum?.acp?.activity, promptable: b.promptable(),
     items: b.items.map(i => i.k + ':' + (i.k === 'tool' ? i.status + ' ' + (i.title || '') : i.text || '')), asst: L.body.querySelectorAll('.ag-log .ag-asst').length,
