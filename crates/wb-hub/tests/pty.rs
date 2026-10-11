@@ -299,6 +299,23 @@ fn a_line_over_max_line_closes_the_connection() {
 }
 
 #[test]
+fn owed_replies_arrive_after_the_client_stops_sending() {
+    let hub = Hub::start();
+    let mut a = hub.connect();
+    a.spawn("half", &[&hub.shell]);
+    // `list` is answered at once; `pty.kill{forget:true}` only after the child exited.
+    let mut c = hub.connect();
+    c.send(&json!({"t": "list", "rid": 1}));
+    c.send(&json!({"t": "pty.kill", "rid": 2, "sid": "half", "forget": true}));
+    c.shutdown_write();
+    let mut replies = Vec::new();
+    while let Some(m) = c.next() {
+        replies.push((m["t"].clone(), m["rid"].clone()));
+    }
+    assert_eq!(replies, [(json!("ok"), json!(1)), (json!("ok"), json!(2))]);
+}
+
+#[test]
 fn a_large_paste_arrives_whole() {
     let hub = Hub::start();
     let mut c = hub.connect();

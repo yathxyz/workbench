@@ -205,6 +205,11 @@ impl Client {
         self.w.write_all(line.as_bytes()).unwrap();
     }
 
+    /// Shuts down the sending side only; the hub sees end of input.
+    pub fn shutdown_write(&self) {
+        self.w.shutdown(std::net::Shutdown::Write).unwrap();
+    }
+
     pub fn write_raw(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.w.write_all(bytes)
     }

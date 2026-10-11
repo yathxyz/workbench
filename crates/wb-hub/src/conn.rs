@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustix::process::geteuid;
 use serde::Serialize;
@@ -25,6 +26,9 @@ use crate::pty::{self, Cmd, Open};
 const ARGV_MAX: usize = 256;
 /// Most bytes in all of `SpawnPty.argv`.
 const ARGV_BYTES_MAX: usize = 256 << 10;
+/// How long a connection whose client stopped sending may take to deliver the replies
+/// it still owes; a `pty.kill{forget:true}` waits for the exit, up to about 3 s.
+const LINGER: Duration = Duration::from_secs(10);
 
 pub type ConnId = u64;
 
@@ -377,8 +381,9 @@ impl Conn {
         }
     }
 
+    /// Ends the connection after its input ended. The client may have shut down only its
+    /// sending side, so the replies it is still owed go out first, within [`LINGER`].
     async fn close(self) {
-        self.outq.close();
         self.ctx.registry.unwatch(self.id);
         for sid in &self.opened {
             if let Some(tx) = self.ctx.registry.sender(sid) {
@@ -389,6 +394,20 @@ impl Conn {
                 let _ = tx.send(detach).await;
             }
         }
+        let owed = async {
+            // A reply holds its permit until it is queued.
+            let _ = self.permits.acquire_many(REQS_IN_FLIGHT as u32).await;
+            self.outq.finish();
+            self.outq.closed().await;
+        };
+        let _ = tokio::time::timeout(LINGER, async {
+            tokio::select! {
+                () = owed => {}
+                () = self.outq.closed() => {}
+            }
+        })
+        .await;
+        self.outq.close();
     }
 }
 

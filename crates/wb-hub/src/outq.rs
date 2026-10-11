@@ -4,6 +4,8 @@
 //! [`CONN_QUEUE`] closes the connection instead, except that an empty queue admits an
 //! event of any size. Replies are always admitted; the connection's reader stops
 //! reading requests while the queue is at the cap, so replies are bounded too.
+//!
+//! A finished queue admits nothing more but still delivers what it holds.
 
 use std::collections::VecDeque;
 use std::pin::pin;
@@ -29,12 +31,13 @@ struct State {
     q: VecDeque<Arc<[u8]>>,
     bytes: usize,
     closed: bool,
+    finished: bool,
 }
 
 impl OutQ {
     pub fn push_event(&self, line: Arc<[u8]>) -> Result<(), Closed> {
         let mut st = lock(&self.st);
-        if st.closed {
+        if st.closed || st.finished {
             return Err(Closed);
         }
         if st.bytes > 0 && st.bytes + line.len() > CONN_QUEUE {
@@ -52,12 +55,18 @@ impl OutQ {
 
     pub fn push_reply(&self, line: Arc<[u8]>) {
         let mut st = lock(&self.st);
-        if st.closed {
+        if st.closed || st.finished {
             return;
         }
         st.bytes += line.len();
         st.q.push_back(line);
         drop(st);
+        self.changed.notify_waiters();
+    }
+
+    /// Ignores later pushes; [`pop`](Self::pop) ends once the queue is empty.
+    pub fn finish(&self) {
+        lock(&self.st).finished = true;
         self.changed.notify_waiters();
     }
 
@@ -67,11 +76,11 @@ impl OutQ {
         self.changed.notify_waiters();
     }
 
-    /// The next line to write, or `None` once the queue is closed.
+    /// The next line to write, or `None` once the queue is closed, or finished and empty.
     pub async fn pop(&self) -> Option<Arc<[u8]>> {
         let line = self
             .wait(|st| {
-                if st.closed {
+                if st.closed || (st.finished && st.q.is_empty()) {
                     return Some(None);
                 }
                 let line = st.q.pop_front()?;
@@ -172,6 +181,27 @@ mod tests {
         assert!(!waiter.is_finished());
         q.pop().await.unwrap();
         assert_eq!(waiter.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_finished_queue_delivers_what_it_holds_then_ends() {
+        let q = Arc::new(OutQ::default());
+        q.push_reply(line(3));
+        q.finish();
+        q.push_reply(line(4));
+        assert_eq!(q.push_event(line(5)), Err(Closed));
+        assert_eq!(q.pop().await.unwrap().len(), 3);
+        assert_eq!(q.pop().await, None);
+
+        // A pop already waiting on an empty queue ends too.
+        let q = Arc::new(OutQ::default());
+        let popper = tokio::spawn({
+            let q = q.clone();
+            async move { q.pop().await }
+        });
+        tokio::task::yield_now().await;
+        q.finish();
+        assert_eq!(popper.await.unwrap(), None);
     }
 
     #[tokio::test]
