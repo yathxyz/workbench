@@ -21,9 +21,6 @@ in
         pkgs,
         ...
       }:
-      let
-        home = config.users.users.alice.home;
-      in
       {
         imports = [ self.nixosModules.workbench ];
         virtualisation.memorySize = 2048;
@@ -54,16 +51,6 @@ in
         environment.variables.ANTHROPIC_API_KEY = "leak-canary";
         environment.sessionVariables.WB_CANARY = "$(echo canary-from-set-environment)";
         systemd.services.workbench-hub.environment.WB_TEST_CANARY = "leak-canary-2";
-
-        # The read-only paths exist, so the units mount them read-only rather than skipping them.
-        systemd.tmpfiles.rules = map (d: "d ${home}/${d} 0700 alice users -") [
-          ".ssh"
-          ".config"
-          ".config/systemd"
-          ".local"
-          ".local/share"
-          ".local/share/systemd"
-        ];
 
         environment.systemPackages = [
           pkgs.git
@@ -180,6 +167,12 @@ in
           assert rc != 0 and "Read-only file system" in out, out
           rc, out = in_card("s1", "T5", "mkdir -p ~/.config/systemd/user/x")
           assert rc != 0 and "Read-only file system" in out, out
+          # The writable parents cannot be moved aside to make a fresh ~/.config/systemd.
+          for i, d in enumerate([".config", ".local", ".local/share"]):
+              rc, out = in_card("s1", f"T5{'abc'[i]}", f"mv ~/{d} ~/{d}.x")
+              assert rc != 0 and "busy" in out.lower(), out
+          rc, out = in_card("s1", "T5d", "touch ~/.config/wb-probe && rm ~/.config/wb-probe")
+          assert rc == 0, out
           rc, out = in_card("s1", "T6", "nix path-info /run/current-system")
           assert rc == 0, out
           rc, out = in_card("s1", "T7", "command -v ls git")
@@ -198,8 +191,10 @@ in
           assert wb.succeed(f"cat /proc/{shell_pid}/oom_score_adj").strip() == "800"
           assert wb.succeed(f"cat /proc/{hub_pid}/oom_score_adj").strip() == "100"
           for unit in ["workbench-hub", "workbench-web"]:
-              opts = wb.succeed(f"awk '$5 == \"{HOME}/.ssh\" {{print $6}}' /proc/{main_pid(unit)}/mountinfo").strip()
-              assert opts.split(",")[0] == "ro", f"{unit}: ~/.ssh mount options {opts!r}"
+              for d, want in [(".ssh", "ro"), (".config/systemd", "ro"), (".local/share/systemd", "ro"),
+                              (".config", "rw"), (".local", "rw"), (".local/share", "rw")]:
+                  opts = wb.succeed(f"awk '$5 == \"{HOME}/{d}\" {{print $6}}' /proc/{main_pid(unit)}/mountinfo").strip()
+                  assert opts.split(",")[0] == want, f"{unit}: ~/{d} mount options {opts!r}"
 
       with subtest("8: hub.sock peer credentials"):
           rc, out = wb.execute(as_user("bob", f"socat -t2 - UNIX-CONNECT:{HUB_SOCK} </dev/null 2>&1"))

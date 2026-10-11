@@ -84,11 +84,21 @@ let
     sample = null;
   };
 
-  # Both units: the card-side escape hatches the brief closes.
+  # Both units: the card-side escape hatches the brief closes. The tmpfiles rules below create
+  # them, so a unit that cannot mount one fails instead of running without it.
   readOnlyUserPaths = [
-    "-${home}/.ssh"
-    "-${home}/.config/systemd"
-    "-${home}/.local/share/systemd"
+    "${home}/.ssh"
+    "${home}/.config/systemd"
+    "${home}/.local/share/systemd"
+  ];
+
+  # The writable parents of the read-only paths below $HOME, bound onto themselves in both
+  # units. A mount point cannot be renamed, so a card cannot move ~/.config aside and create a
+  # fresh ~/.config/systemd that the user manager would read outside NoNewPrivileges.
+  pinnedUserPaths = [
+    "${home}/.config"
+    "${home}/.local"
+    "${home}/.local/share"
   ];
 
   isIPv4 = s: builtins.match "[0-9]{1,3}(\\.[0-9]{1,3}){3}" s != null;
@@ -281,6 +291,12 @@ in
       lib.filterAttrs (_: a: a.package != null) cfg.agents
     );
 
+    # Without these directories systemd could not mount the paths above. Mode "-" leaves an
+    # existing parent's mode alone.
+    systemd.tmpfiles.rules =
+      map (d: "d ${d} - ${cfg.user} ${userCfg.group} -") pinnedUserPaths
+      ++ map (d: "d ${d} 0700 ${cfg.user} ${userCfg.group} -") readOnlyUserPaths;
+
     systemd.slices.workbench = {
       description = "Workbench: hub, web, shells and agents";
       sliceConfig = {
@@ -322,6 +338,7 @@ in
         NoNewPrivileges = true;
         InaccessiblePaths = [ "-/run/user" ];
         ReadOnlyPaths = readOnlyUserPaths;
+        BindPaths = pinnedUserPaths;
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
         ProtectKernelLogs = true;
@@ -363,6 +380,7 @@ in
         # Boards, notes, state and /api/mv; the read-only paths below take precedence inside it.
         ReadWritePaths = [ home ];
         ReadOnlyPaths = readOnlyUserPaths;
+        BindPaths = pinnedUserPaths;
         PrivateDevices = true;
         ProtectClock = true;
         ProtectHostname = true;
