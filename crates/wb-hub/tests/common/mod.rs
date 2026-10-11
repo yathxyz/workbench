@@ -1,4 +1,11 @@
 //! A real `wb-hub` in a temporary directory, and a blocking line client for it.
+//!
+//! Each test binary uses its own subset of these helpers.
+#![allow(dead_code)]
+
+pub mod acp;
+pub mod fake;
+pub mod schema;
 
 use std::collections::VecDeque;
 use std::fs;
@@ -313,20 +320,25 @@ impl Client {
         self.next_rid += 1;
         msg["rid"] = rid.into();
         self.send(&msg);
+        self.reply(rid)
+    }
+
+    /// The `ok` or `err` with `rid`. Other messages read meanwhile stay queued, in order,
+    /// for [`next`](Self::next).
+    pub fn reply(&mut self, rid: u64) -> Value {
+        if let Some(i) = self.pending.iter().position(|m| m["rid"] == rid) {
+            return self.pending.remove(i).unwrap();
+        }
         let deadline = Instant::now() + PATIENCE;
-        let mut seen = VecDeque::new();
-        let reply = loop {
+        loop {
             let m = self
                 .read_line(deadline)
                 .expect("connection closed before the reply");
             if m["rid"] == rid {
-                break m;
+                return m;
             }
-            seen.push_back(m);
-        };
-        seen.extend(self.pending.drain(..));
-        self.pending = seen;
-        reply
+            self.pending.push_back(m);
+        }
     }
 
     pub fn ok(&mut self, msg: Value) -> Value {
@@ -427,7 +439,7 @@ impl Client {
                 Ok(_) => {}
                 Err(e) if e.kind() == ErrorKind::ConnectionReset => return None,
                 Err(e) if is_timeout(&e) => {
-                    assert!(Instant::now() < deadline, "no message within {PATIENCE:?}");
+                    assert!(Instant::now() < deadline, "no message in time");
                 }
                 Err(e) => panic!("{e}"),
             }
