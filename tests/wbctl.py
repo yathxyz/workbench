@@ -5,26 +5,41 @@ Web commands speak the browser's /pty WebSocket through the proxy, sending Host 
 from --url (and the proxy secret only when --secret-file is given, for direct access). --unix
 connects to a unix socket, such as the harness's Caddy, instead of the host and port of --url:
 
-  wbctl.py [--url URL] [--unix PATH] pty-open SID [--spawn] [--cmd CMD] [--send TEXT] [--expect REGEX]
-  wbctl.py [--url URL] [--unix PATH] pty-attach SID [--resume STREAM,OUT] [--send TEXT] [--expect REGEX]
+  wbctl.py [...] pty-open SID [--spawn] [--cmd CMD] [--shell NAME] [--send TEXT] [--expect REGEX] [--wait-exit]
+  wbctl.py [...] pty-attach SID [--resume STREAM,OUT] [--send TEXT] [--expect REGEX] [--wait-exit]
+  wbctl.py [...] pty-kill SID             kills and forgets the session; waits for the close
+  wbctl.py [...] api-mv SRC DST           POST /api/mv; prints {status, body}
+  wbctl.py [...] bench [--samples N] [--flood-bytes SIZE] [--ssh-rtt-ms MS]
 
-Hub commands speak NDJSON on hub.sock directly (run them as the hub's user):
+Hub commands speak NDJSON on hub.sock directly (run them as the hub's user or root):
 
   wbctl.py [--hub PATH] sessions          prints {"sessions": [...]} from `list`
-  wbctl.py [--hub PATH] raw JSON          sends one request; prints every line up to its reply
+  wbctl.py [--hub PATH] raw JSON          prints the hub's hello, then every line up to the reply
 
-pty-* and sessions print one JSON object on stdout; raw prints one line per message. --send types
-TEXT plus Enter; --expect waits until the live output (after the hello) matches REGEX.
-Exit status: 0 ok, 1 failed, 2 usage.
+Every command but raw prints one JSON object on stdout. pty-open sends spawn:true with --spawn
+and leaves spawn out otherwise; pty-attach sends spawn:false. --send types TEXT plus Enter;
+--expect waits until the live output (after the hello) matches REGEX; --wait-exit waits for the
+exit message. The result carries the hello's stream and `lastOut`, the offset to resume from.
+
+bench measures keystroke echo: a card runs cat with the terminal's echo off, and each sample is
+the time from sending one character to receiving it back. It then floods a second card with
+`yes | head -c SIZE`, drained like a browser by a separate process, and measures echo again
+while the flood drains. Budgets (DESIGN 9.6): echo p50 below 1.5x --ssh-rtt-ms (evaluated only
+when given) and echo p99 during the flood below 50 ms.
+
+Exit status: 0 ok (bench: every evaluated budget holds), 1 failed, 2 usage.
 """
 
 import argparse
 import base64
 import http.client
+import itertools
 import json
+import multiprocessing
 import os
 import re
 import socket
+import string
 import struct
 import sys
 import time
@@ -228,57 +243,72 @@ class Endpoint:
         return h
 
 
-def pty_session(ep, sid, spawn, cmd="", resume=None, send=None, expect=None, timeout=20.0, cols=80, rows=24):
-    """Open /pty, send `open`, wait for hello; optionally type a line and wait for live output.
+def pty_session(ep, sid, spawn=None, cmd="", shell=None, env=None, resume=None, send=None, expect=None,
+                wait_exit=False, kill=False, timeout=20.0, cols=80, rows=24):
+    """Open /pty and send `open`; after the hello, optionally type a line, then wait as asked.
 
-    The result keeps the hello's `replay` apart from `output`, the live `out` text after it.
+    `spawn` None leaves the field out, which means false from M1 on. After the hello the session
+    waits until `expect` matches the live output, `exit` arrived (`wait_exit`), or, with `kill`,
+    sends a forgetting kill and waits for the close. `gone` and `error` end it after the close.
+    Cursor position queries in the live output are answered as a terminal would (nushell waits
+    for them). The result keeps the hello's `replay` apart from `output`, the live `out` text
+    after it, and `lastOut`, the stream offset after the last text received.
     """
-    result = {"status": None, "hello": None, "replay": None, "output": "", "matched": None,
-              "exit": None, "gone": None, "error": None, "close": None}
+    result = {"status": None, "hello": None, "replay": None, "output": "", "lastOut": None, "matched": None,
+              "exit": None, "gone": None, "error": None, "close": None, "timedOut": False}
     status, _, ws = ws_connect(ep.addr, "/pty", ep.headers(), timeout=timeout)
     result["status"] = status
     if status != 101:
         return result
-    msg = {"t": "open", "id": sid, "cmd": cmd, "parent": "", "cwd": "", "cols": cols, "rows": rows, "env": {}, "spawn": spawn}
+    msg = {"t": "open", "id": sid, "cmd": cmd, "parent": "", "cwd": "", "cols": cols, "rows": rows, "env": env or {}}
+    if spawn is not None:
+        msg["spawn"] = spawn
+    if shell is not None:
+        msg["shell"] = shell
     if resume is not None:
         msg["resume"] = resume
     deadline = time.monotonic() + timeout
 
-    def next_msg():
-        left = deadline - time.monotonic()
-        if left <= 0:
-            raise TimeoutError("deadline passed")
-        return ws.recv_json(left)
+    def handle(m):
+        t = m.get("t")
+        if t == "hello":
+            result["hello"] = m
+            result["replay"] = m.get("replay")
+            result["lastOut"] = m.get("out")
+        elif t == "out":
+            d = m.get("d", "")
+            result["output"] += d
+            result["lastOut"] = m.get("out", result["lastOut"])
+            for _ in range(d.count("\x1b[6n")):
+                ws.send_json({"t": "in", "d": "\x1b[1;1R"})
+        elif t in ("exit", "gone", "error"):
+            result[t] = m
+
+    def done():
+        if result["gone"] is not None or result["error"] is not None or kill:
+            return False  # read on until the server closes
+        if expect is not None and result["matched"] is None:
+            found = re.search(expect, result["output"])
+            if not found:
+                return False
+            result["matched"] = found.group(0)
+        return not wait_exit or result["exit"] is not None
 
     try:
         ws.send_json(msg)
-        while result["hello"] is None:
-            m = next_msg()
-            if m.get("t") == "hello":
-                result["hello"] = m
-                result["replay"] = m.get("replay")
-            elif m.get("t") == "error":
-                result["error"] = m
-                return result
-        if send is not None:
-            ws.send_json({"t": "in", "d": send + "\r"})
-        while expect is not None:
-            found = re.search(expect, result["output"])
-            if found:
-                result["matched"] = found.group(0)
-                break
-            m = next_msg()
-            t = m.get("t")
-            if t == "out":
-                result["output"] += m.get("d", "")
-            elif t in ("exit", "gone", "error"):
-                result[t] = m
-                if t != "exit":
-                    break
+        while result["hello"] is None and result["error"] is None:
+            handle(ws.recv_json(deadline - time.monotonic()))
+        if result["hello"] is not None:
+            if send is not None:
+                ws.send_json({"t": "in", "d": send + "\r"})
+            if kill:
+                ws.send_json({"t": "kill"})
+        while not done():
+            handle(ws.recv_json(deadline - time.monotonic()))
     except WsClosed as e:
         result["close"] = e.code
     except TimeoutError:
-        pass
+        result["timedOut"] = True
     finally:
         ws.close()
     return result
@@ -334,6 +364,136 @@ def parse_resume(s):
     return {"stream": int(stream), "out": int(out)}
 
 
+def api_mv(ep, src, dst, timeout=10.0):
+    body = json.dumps({"src": src, "dst": dst}).encode()
+    status, _, data = http_request(ep.addr, "POST", "/api/mv", ep.headers() + [("Content-Type", "application/json")],
+                                   body, timeout=timeout)
+    return {"status": status, "body": data.decode(errors="replace")}
+
+
+def open_frame(sid, cmd="", spawn=None):
+    msg = {"t": "open", "id": sid, "cmd": cmd, "parent": "", "cwd": "", "cols": 80, "rows": 24, "env": {}}
+    if spawn is not None:
+        msg["spawn"] = spawn
+    return msg
+
+
+class EchoCard:
+    """A card running cat with the terminal's echo off, so each typed byte comes back once, from cat."""
+
+    def __init__(self, ep, sid, timeout):
+        status, _, self.ws = ws_connect(ep.addr, "/pty", ep.headers(), timeout=timeout)
+        if status != 101:
+            raise RuntimeError(f"/pty upgrade for {sid}: HTTP {status}")
+        cmd = "stty -echo -icanon min 1 time 0 && echo WB-BENCH-READY && exec cat"
+        self.ws.send_json(open_frame(sid, cmd, spawn=True))
+        text = ""
+        deadline = time.monotonic() + timeout
+        while "WB-BENCH-READY" not in text:
+            m = self.ws.recv_json(deadline - time.monotonic())
+            if m.get("t") in ("exit", "gone", "error"):
+                raise RuntimeError(f"echo card {sid}: {m}")
+            text += m.get("d", "") if m.get("t") == "out" else ""
+        self.letters = itertools.cycle(string.ascii_letters)
+        for _ in range(5):  # warm-up; also lets cat start reading
+            self.rtt()
+
+    def rtt(self, timeout=5.0):
+        ch = next(self.letters)
+        t0 = time.perf_counter()
+        self.ws.send_json({"t": "in", "d": ch})
+        deadline = time.monotonic() + timeout
+        while True:
+            m = self.ws.recv_json(deadline - time.monotonic())
+            if m.get("t") == "out" and ch in m.get("d", ""):
+                return time.perf_counter() - t0
+            if m.get("t") in ("exit", "gone", "error"):
+                raise RuntimeError(f"echo card: {m}")
+
+    def measure(self, n, keep_going=lambda: True):
+        samples = []
+        while len(samples) < n and keep_going():
+            samples.append(self.rtt())
+            time.sleep(0.01)
+        return samples
+
+
+def stats(samples):
+    s = sorted(samples)
+    if not s:
+        return {"n": 0}
+
+    def ms(x):
+        return round(x * 1000, 2)
+
+    return {"n": len(s), "p50Ms": ms(s[len(s) // 2]), "p99Ms": ms(s[min(len(s) - 1, int(len(s) * 0.99))]),
+            "maxMs": ms(s[-1])}
+
+
+def drain(ep, sid, cmd, timeout, started, report):
+    """Run `cmd` in a new card and read its output like a browser until it exits.
+
+    A socket the server closes (a slow viewer) is reattached without spawning.
+    """
+    chars, spawn = 0, True
+    t0 = time.monotonic()
+    deadline = t0 + timeout
+    while time.monotonic() < deadline:
+        try:
+            status, _, ws = ws_connect(ep.addr, "/pty", ep.headers())
+            if status != 101:
+                report.put({"error": f"/pty upgrade: HTTP {status}"})
+                return
+            try:
+                ws.send_json(open_frame(sid, cmd, spawn=spawn))
+                spawn = False
+                while True:
+                    m = ws.recv_json(deadline - time.monotonic())
+                    t = m.get("t")
+                    if t == "out":
+                        chars += len(m.get("d", ""))
+                        started.set()
+                    elif t == "exit":
+                        report.put({"chars": chars, "seconds": round(time.monotonic() - t0, 2), "exit": m})
+                        return
+                    elif t in ("gone", "error"):
+                        report.put({"error": m})
+                        return
+            finally:
+                ws.close()
+        except (WsClosed, OSError):
+            continue
+    report.put({"error": "timed out", "chars": chars})
+
+
+def bench(ep, samples, flood_bytes, ssh_rtt_ms, timeout):
+    tag = os.getpid()
+    echo_sid, flood_sid = f"bench-echo-{tag}", f"bench-flood-{tag}"
+    try:
+        echo = EchoCard(ep, echo_sid, timeout)
+        try:
+            base = echo.measure(samples)
+            ctx = multiprocessing.get_context("fork")
+            started, report = ctx.Event(), ctx.Queue()
+            proc = ctx.Process(target=drain, args=(ep, flood_sid, f"yes | head -c {flood_bytes}", 600, started, report),
+                               daemon=True)
+            proc.start()
+            during = echo.measure(samples, proc.is_alive) if started.wait(timeout) else []
+            flood = report.get(timeout=600)
+            proc.join()
+        finally:
+            echo.ws.close()
+    finally:
+        for sid in (echo_sid, flood_sid):
+            pty_session(ep, sid, kill=True, timeout=10)
+    base_s, during_s = stats(base), stats(during)
+    budgets = {
+        "echoP50Below1.5xSshRtt": base_s["p50Ms"] < 1.5 * ssh_rtt_ms if ssh_rtt_ms else None,
+        "floodEchoP99Below50Ms": during_s["p99Ms"] < 50 if during else False,
+    }
+    return {"echo": base_s, "flood": dict(flood, bytes=flood_bytes, echo=during_s), "budgets": budgets}
+
+
 def main():
     p = argparse.ArgumentParser(prog="wbctl.py", description=__doc__.splitlines()[0])
     p.add_argument("--url", default=os.environ.get("WB_URL", DEFAULT_URL), help="proxy (or wb-web) base URL")
@@ -348,36 +508,65 @@ def main():
         s.add_argument("sid")
         s.add_argument("--send", help="type this line (plus Enter) after the hello")
         s.add_argument("--expect", help="wait until the live output matches this regex")
+        s.add_argument("--wait-exit", action="store_true", help="wait for the exit message")
         s.add_argument("--cols", type=int, default=80)
         s.add_argument("--rows", type=int, default=24)
         if name == "pty-open":
             s.add_argument("--spawn", action="store_true", help="send spawn:true (start a process if none runs)")
             s.add_argument("--cmd", default="", help="command for a spawn; empty means a shell")
+            s.add_argument("--shell", help="shell name for a spawn (default: the hub's defaultShell)")
         else:
             s.add_argument("--resume", type=parse_resume, metavar="STREAM,OUT")
+    sub.add_parser("pty-kill").add_argument("sid")
+    m = sub.add_parser("api-mv")
+    m.add_argument("src")
+    m.add_argument("dst")
+    b = sub.add_parser("bench")
+    b.add_argument("--samples", type=int, default=200)
+    b.add_argument("--flood-bytes", default="200M", help="head -c SIZE for the flood card")
+    b.add_argument("--ssh-rtt-ms", type=float, help="ssh round-trip time to compare echo p50 against")
     sub.add_parser("sessions")
     r = sub.add_parser("raw")
     r.add_argument("json", help="one hub request, e.g. '{\"t\":\"list\",\"rid\":1}'")
     a = p.parse_args()
 
-    if a.command in ("pty-open", "pty-attach"):
-        secret = open(a.secret_file).read().strip() if a.secret_file else None
-        ep = Endpoint(a.url, a.origin, secret, a.unix)
-        res = pty_session(
-            ep,
-            a.sid,
-            spawn=a.command == "pty-open" and a.spawn,
-            cmd=a.cmd if a.command == "pty-open" else "",
-            resume=getattr(a, "resume", None),
-            send=a.send,
-            expect=a.expect,
-            timeout=a.timeout,
-            cols=a.cols,
-            rows=a.rows,
-        )
+    if a.command in ("sessions", "raw"):
+        return hub_command(a)
+    secret = open(a.secret_file).read().strip() if a.secret_file else None
+    ep = Endpoint(a.url, a.origin, secret, a.unix)
+    if a.command == "api-mv":
+        print(json.dumps(api_mv(ep, a.src, a.dst, a.timeout)))
+        return 0
+    if a.command == "bench":
+        res = bench(ep, a.samples, a.flood_bytes, a.ssh_rtt_ms, a.timeout)
         print(json.dumps(res))
-        ok = res["hello"] is not None and (a.expect is None or res["matched"] is not None)
-        return 0 if ok else 1
+        return 0 if all(v is not False for v in res["budgets"].values()) else 1
+    if a.command == "pty-kill":
+        res = pty_session(ep, a.sid, kill=True, timeout=a.timeout)
+        print(json.dumps(res))
+        return 0 if res["close"] == 1000 and res["error"] is None else 1
+    opening = a.command == "pty-open"
+    res = pty_session(
+        ep,
+        a.sid,
+        spawn=(True if a.spawn else None) if opening else False,
+        cmd=a.cmd if opening else "",
+        shell=a.shell if opening else None,
+        resume=None if opening else a.resume,
+        send=a.send,
+        expect=a.expect,
+        wait_exit=a.wait_exit,
+        timeout=a.timeout,
+        cols=a.cols,
+        rows=a.rows,
+    )
+    print(json.dumps(res))
+    ok = (res["hello"] is not None and (a.expect is None or res["matched"] is not None)
+          and (not a.wait_exit or res["exit"] is not None))
+    return 0 if ok else 1
+
+
+def hub_command(a):
     if a.command == "sessions":
         print(json.dumps({"sessions": hub_sessions(a.hub)}))
         return 0

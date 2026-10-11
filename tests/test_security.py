@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""End-to-end security regressions T-S1..T-S15 over real wb-hub, wb-web and Caddy, plus the
-harness's own exposure.
+"""End-to-end security regressions T-S1..T-S17, T-S21 (server half) and T-S23 over real wb-hub,
+wb-web and Caddy, plus the harness's own exposure and its Caddy modes.
 
   python3 -I tests/test_security.py --web-root DIR [--bin-dir DIR]
 
@@ -92,6 +92,23 @@ def tcp_listeners(pid):
 
 def pty_list(h):
     return [s for s in wbctl.hub_sessions(h.hub_sock) if s.get("kind") == "pty"]
+
+
+def sids(h):
+    return sorted(s["sid"] for s in wbctl.hub_sessions(h.hub_sock))
+
+
+def read_until(ws, pattern, timeout=10.0):
+    """Live /pty output until it contains `pattern`; returns the text, or None on close or timeout."""
+    text = ""
+    deadline = time.monotonic() + timeout
+    try:
+        while pattern not in text:
+            m = ws.recv_json(deadline - time.monotonic())
+            text += m.get("d", "") if m.get("t") == "out" else ""
+    except (wbctl.WsClosed, OSError, TimeoutError):
+        return None
+    return text
 
 
 def main():
@@ -300,6 +317,137 @@ def main():
         t.check("T-S14 env canaries absent from a card",
                 r["matched"] is not None and not leaked, repr((r["matched"], leaked)))
         t.check("T-S14 WB_SESSION, TERM and SHELL present", r["matched"] is not None and not missing, repr(missing))
+
+        # S16: /api/mv refuses a destination under the sealed paths, directly and through a symlinked
+        # parent; the source stays where it was.
+        home = h.home
+        for d in (".ssh", ".config/systemd/user", ".local/share/systemd", "x", "mv-src"):
+            (home / d).mkdir(parents=True, exist_ok=True)
+        for link, target in (("sshlink", ".ssh"), ("cfglink", ".config"), ("sharelink", ".local/share")):
+            (home / link).symlink_to(home / target)
+        json_auth = auth(ORIGIN) + [("Content-Type", "application/json")]
+        cases = [
+            ("~/.ssh/authorized_keys", ".ssh/authorized_keys"),
+            ("~/.config/systemd/user/x.service", ".config/systemd/user/x.service"),
+            ("~/.local/share/systemd/x", ".local/share/systemd/x"),
+            (f"{home}/.ssh/authorized_keys", ".ssh/authorized_keys"),
+            ("~/.ssh", ".ssh/authorized_keys"),  # an existing directory: dst/<basename(src)>
+            ("~/x/../.ssh/authorized_keys", ".ssh/authorized_keys"),
+            ("~/sshlink/authorized_keys", ".ssh/authorized_keys"),
+            ("~/cfglink/systemd/user/x.service", ".config/systemd/user/x.service"),
+            ("~/sharelink/systemd/x", ".local/share/systemd/x"),
+        ]
+        bad = []
+        for i, (dst, landed) in enumerate(cases):
+            src = home / "mv-src" / str(i) / "authorized_keys"
+            src.parent.mkdir()
+            src.write_text("ssh-ed25519 AAAA test\n")
+            st, _, body = request("POST", "/api/mv", json_auth, json.dumps({"src": str(src), "dst": dst}).encode())
+            if st != 400 or (home / landed).exists() or not src.exists():
+                bad.append((dst, st, body[:80], (home / landed).exists()))
+                (home / landed).unlink(missing_ok=True)
+        t.check("T-S16 /api/mv into ~/.ssh, ~/.config/systemd, ~/.local/share/systemd: 400, no file", not bad, repr(bad))
+        ok_src, ok_dst = home / "mv-ok", home / "mv-ok-moved"
+        ok_src.write_text("x")
+        st, _, body = request("POST", "/api/mv", json_auth, json.dumps({"src": str(ok_src), "dst": str(ok_dst)}).encode())
+        t.check("T-S16 control: an ordinary move gives 200", st == 200 and ok_dst.exists() and not ok_src.exists(),
+                repr((st, body[:80])))
+
+        # S17: an open without spawn:true never spawns, whatever its cmd and env say.
+        pwned2, bash_env = h.root / "pwned2", h.root / "bash-env"
+        bash_env.write_text(f"touch {h.root}/pwned3\n")
+        ghost = {}
+        for label, spawn in (("absent", None), ("false", False)):
+            r = wbctl.pty_session(caddy_ep, "ghost", spawn=spawn, cmd=f"touch {pwned2}",
+                                  env={"BASH_ENV": str(bash_env)}, timeout=10)
+            ghost[label] = r
+        time.sleep(0.5)
+        t.check("T-S17 /pty open with spawn absent or false: error not_found, no hello",
+                all((r["error"] or {}).get("code") == "not_found" and r["hello"] is None for r in ghost.values()),
+                repr({k: (r["error"], r["hello"] is not None) for k, r in ghost.items()}))
+        t.check("T-S17 the socket closes 1000 after that error",
+                all(r["close"] == 1000 for r in ghost.values()), repr({k: r["close"] for k, r in ghost.items()}))
+        t.check("T-S17 no file; hub list has no ghost",
+                not pwned2.exists() and not (h.root / "pwned3").exists() and "ghost" not in sids(h), repr(sids(h)))
+        st, _, ws = wbctl.ws_connect(WEB, "/acp", auth(ORIGIN))
+        if st == 404:
+            t.skip("T-S17 /acp open without agent and cwd", "/acp is 404 in this build (the relay lands in M3)")
+        else:
+            m = None
+            if st == 101:
+                try:
+                    ws.send_json({"t": "open", "id": "ghost2", "since": 0})
+                    m = ws.recv_json()
+                except (wbctl.WsClosed, OSError, TimeoutError) as e:
+                    m = repr(e)
+                ws.close()
+            t.check("T-S17 /acp open without agent and cwd: not_found; no session",
+                    isinstance(m, dict) and m.get("code") == "not_found" and "ghost2" not in sids(h), repr((st, m)))
+
+        # S21, server half (the browser half is ui N30): a board node carrying cmd and env is stored
+        # as data and starts nothing, and opening its card without spawn finds no session.
+        before = sids(h)
+        pwned21 = h.root / "pwned21"
+        node = {"id": "t-s21", "kind": "term", "backend": "pty", "name": "t-s21", "x": 0, "y": 0, "w": 400,
+                "h": 300, "cmd": f"touch {pwned21}", "env": {"BASH_ENV": str(bash_env)}}
+        board = {"v": 5, "nodes": {"t-s21": node}, "edges": [], "strokes": [], "shapes": [], "views": {},
+                 "cam": {"x": 0, "y": 0, "z": 0.5}}
+        etag = request("GET", "/api/board", auth())[1].get("etag", "")
+        st_put = request("PUT", "/api/board", json_auth + [("If-Match", etag)], json.dumps(board).encode())[0]
+        st_get, _, back = request("GET", "/api/board", auth())
+        r = wbctl.pty_session(caddy_ep, "t-s21", spawn=False, timeout=10)
+        time.sleep(0.5)
+        t.check("T-S21 a board with a cmd/env node is stored as data (PUT 204, GET returns it)",
+                (st_put, st_get) == (204, 200) and body_json(back) == board, repr((st_put, st_get, back[:80])))
+        t.check("T-S21 nothing spawned; its card opens not_found",
+                sids(h) == before and (r["error"] or {}).get("code") == "not_found" and not pwned21.exists(),
+                repr((before, sids(h), r["error"])))
+
+        # S23: the board ETag passes Caddy unchanged (the vhost never compresses), and a PUT through
+        # Caddy with it succeeds.
+        st_d, hd_d, _ = request("GET", "/api/board", auth())
+        st_c, hd_c, body_c = request("GET", "/api/board", [("Host", HOST), ("Accept-Encoding", "gzip, zstd, br")],
+                                     addr=caddy)
+        etag = hd_c.get("etag")
+        st_p = request("PUT", "/api/board", [("Host", HOST), ("Origin", ORIGIN), ("Content-Type", "application/json"),
+                                             ("If-Match", etag or "")], body_c, addr=caddy)[0]
+        t.check("T-S23 GET /api/board via Caddy: same ETag as direct, not compressed",
+                (st_d, st_c) == (200, 200) and etag == hd_d.get("etag") and etag not in (None, '"empty"')
+                and "content-encoding" not in hd_c, repr((st_d, st_c, etag, hd_d.get("etag"), hd_c.get("content-encoding"))))
+        t.check("T-S23 PUT via Caddy with that ETag: 204", st_p == 204, repr(st_p))
+
+        # The Caddy modes ui uses (N1-N3), swapped through the admin socket: expired answers API and
+        # WebSocket paths with a 302 to /oauth2/sign_in, loginpage with a 200 HTML page; static
+        # files and /oauth2/* work in every mode, and a socket opened before a swap keeps working.
+        want = {
+            "expired": (302, "/oauth2/sign_in", "", 200, 200, 302),
+            "loginpage": (200, None, "text/html", 200, 200, 200),
+            "live": (200, None, "application/json", 200, 200, 101),
+        }
+        got, survived = {}, None
+        st, _, kept = wbctl.ws_connect(caddy, "/pty", caddy_ep.headers())
+        assert st == 101, f"/pty upgrade via Caddy: {st}"
+        try:
+            kept.send_json({"t": "open", "id": "t-s11", "cmd": "", "parent": "", "cwd": "", "cols": 80, "rows": 24,
+                            "env": {}, "spawn": False})
+            kept.recv_json()
+            for mode in want:
+                h.caddy_mode(mode)
+                st_b, hd_b, _ = request("GET", "/api/board", [("Host", HOST)], addr=caddy)
+                got[mode] = (st_b, hd_b.get("location"), hd_b.get("content-type", "").split(";")[0],
+                             request("GET", "/", [("Host", HOST)], addr=caddy)[0],
+                             request("GET", "/oauth2/sign_in?rd=%2Ficon.svg", [("Host", HOST)], addr=caddy)[0],
+                             upgrade("/pty", caddy_ep.headers(), addr=caddy)[0])
+                if mode == "expired":
+                    kept.send_json({"t": "in", "d": "echo KEPT-$((2+3))\r"})
+                    survived = read_until(kept, "KEPT-5") is not None
+        except (RuntimeError, OSError, wbctl.WsClosed, TimeoutError) as e:
+            got["error"] = repr(e)[:500]
+            h.caddy_mode("live")
+        finally:
+            kept.close()
+        t.check("harness Caddy: live, expired and loginpage modes swap through the admin socket", got == want, repr(got))
+        t.check("harness Caddy: a /pty socket opened before a reload keeps working", survived is True, repr(survived))
 
         # S15: wb-web fails closed on a bad secret or config and never listens.
         port = 18091

@@ -13,6 +13,18 @@ local user. A browser reaches it through `ssh -L 18443:<caddySocket> <host>`. SI
 wb-web only, so shells keep running in the hub. SIGTERM or SIGINT stops everything and deletes
 the temporary directory.
 
+Caddy modes: tests/caddy/{live,expired,loginpage}.Caddyfile. Caddy starts in live mode; swap
+with
+  caddy reload --address unix/<caddyAdmin> --config tests/caddy/<mode>.Caddyfile --adapter caddyfile
+from any directory and with no extra environment (Harness.caddy_mode does this).
+
+WB_HARNESS_TCP=1 also forwards TCP 127.0.0.1:18443 to caddySocket, so a browser in the same
+network namespace can open `caddy`. It is refused unless the network namespace has no
+interface but lo (the nix build sandbox, `unshare -rn`), where no other user can connect.
+
+Shells: bash from $BASH, else /run/current-system/sw/bin/bash when it exists, else PATH; and
+sh (/bin/sh) as a second shell for tests.
+
 Test mode (the default) gives the hub a temporary HOME and environment canaries, and exits
 when stdin closes. --dogfood uses the real HOME, no canaries, ignores stdin, and still uses a
 temporary state directory and a fresh, empty boards directory.
@@ -37,8 +49,10 @@ import time
 from pathlib import Path
 
 WEB_ADDR = ("127.0.0.1", 18090)
+CADDY_TCP = ("127.0.0.1", 18443)
 PUBLIC_ORIGIN = "http://127.0.0.1:18443"
-CADDYFILE = Path(__file__).resolve().parent / "caddy" / "live.Caddyfile"
+CADDY_DIR = Path(__file__).resolve().parent / "caddy"
+SYSTEM_BASH = "/run/current-system/sw/bin/bash"
 
 # Copied by value into the hub's environment when set, and listed in child.passEnv.
 PASS_ENV = ["PATH", "LANG", "LOCALE_ARCHIVE", "TZDIR", "TERMINFO_DIRS", "NIX_PATH", "NIX_PROFILES",
@@ -66,6 +80,46 @@ def can_connect_tcp(addr):
         return False
 
 
+def resolve_bash():
+    """$BASH, else the NixOS system bash when it exists, else bash from PATH (DELTA-1 C.4)."""
+    bash = os.environ.get("BASH") or (SYSTEM_BASH if os.path.exists(SYSTEM_BASH) else shutil.which("bash"))
+    if not bash or not os.path.isabs(bash):
+        raise RuntimeError("no absolute bash: set $BASH")
+    return bash
+
+
+def private_netns():
+    """True when this network namespace has no interface but lo."""
+    with open("/proc/net/dev") as f:
+        names = [line.split(":", 1)[0].strip() for line in f.readlines()[2:]]
+    return names == ["lo"]
+
+
+def relay(client, path):
+    """Copy bytes both ways between a TCP client and the unix socket at `path`."""
+    with client, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as upstream:
+        try:
+            upstream.connect(path)
+        except OSError:
+            return
+
+        def copy(src, dst):
+            try:
+                while data := src.recv(1 << 16):
+                    dst.sendall(data)
+            except OSError:
+                pass
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+        back = threading.Thread(target=copy, args=(upstream, client), daemon=True)
+        back.start()
+        copy(client, upstream)
+        back.join()
+
+
 def can_connect_unix(path):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -79,10 +133,11 @@ def can_connect_unix(path):
 
 
 class Harness:
-    def __init__(self, web_root, bin_dir=None, dogfood=False):
+    def __init__(self, web_root, bin_dir=None, dogfood=False, tcp=False):
         self.web_root = str(Path(web_root).resolve())
         self.bin_dir = bin_dir
         self.dogfood = dogfood
+        self.tcp = tcp
         self.root = Path(tempfile.mkdtemp(prefix="wb-"))
         self.secret = secrets.token_hex(32)
         self.secret_file = self.root / "proxy-secret"
@@ -93,10 +148,8 @@ class Harness:
         self.boards_dir = self.root / "boards"
         self.notes_dir = self.root / "notes"
         self.home = Path(pwd.getpwuid(os.getuid()).pw_dir) if dogfood else self.root / "home"
-        self.shell = os.environ.get("BASH") or shutil.which("bash")
-        if not self.shell or not os.path.isabs(self.shell):
-            raise RuntimeError("no absolute bash: set $BASH")
-        self.hub = self.web = self.caddy = None
+        self.bash = resolve_bash()
+        self.hub = self.web = self.caddy = self.tcp_server = None
 
         for d in ("run/hub", "run/web", "state", "caddy"):
             (self.root / d).mkdir(mode=0o700, parents=True)
@@ -111,8 +164,12 @@ class Harness:
             "socket": self.hub_sock,
             "stateDir": str(self.root / "state" / "hub"),
             "host": host,
+            "shells": [
+                {"name": "bash", "paths": [self.bash], "args": ["-i"]},
+                {"name": "sh", "paths": ["/bin/sh"], "args": ["-i"]},
+            ],
+            "defaultShell": "bash",
             "child": {
-                "shell": self.shell,
                 "passEnv": PASS_ENV,
                 "setEnv": {"__NIXOS_SET_ENVIRONMENT_DONE": "1", "WB_SOCKET": self.web_sock},
             },
@@ -130,7 +187,6 @@ class Harness:
             "boardsDir": str(self.boards_dir),
             "notesDir": str(self.notes_dir),
             "host": host,
-            "shell": self.shell,
             "sample": None,
         }
         self.hub_json = self.write_json("hub.json", self.hub_config)
@@ -159,9 +215,9 @@ class Harness:
     def log(self, name):
         return open(self.root / f"{name}.log", "ab")
 
-    def spawn(self, name, argv, env):
+    def spawn(self, name, argv, env, cwd=None):
         with self.log(name) as log:
-            return subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            return subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 
     def log_tail(self, name, n=20):
         try:
@@ -180,20 +236,45 @@ class Harness:
         self.web = self.spawn("web", [self.bin("wb-web"), "--config", self.web_json], self.base_env())
         wait_until(lambda: can_connect_tcp(WEB_ADDR), "wb-web", self.web)
 
-    def start_caddy(self):
+    def caddy_env(self):
         env = self.base_env()
-        env.update({
-            "CADDY_UPSTREAM_SECRET_WORKBENCH": self.secret,
-            "WB_CADDY_ADMIN": self.caddy_admin,
-            "WB_CADDY_SOCKET": self.caddy_sock,
-            "XDG_CONFIG_HOME": str(self.root / "caddy"),
-            "XDG_DATA_HOME": str(self.root / "caddy"),
-        })
-        argv = [self.bin("caddy"), "run", "--config", str(CADDYFILE), "--adapter", "caddyfile"]
-        self.caddy = self.spawn("caddy", argv, env)
+        env.update({"XDG_CONFIG_HOME": str(self.root / "caddy"), "XDG_DATA_HOME": str(self.root / "caddy")})
+        return env
+
+    def start_caddy(self):
+        env = self.caddy_env()
+        env["CADDY_UPSTREAM_SECRET_WORKBENCH"] = self.secret
+        argv = [self.bin("caddy"), "run", "--config", str(CADDY_DIR / "live.Caddyfile"), "--adapter", "caddyfile"]
+        # The Caddyfiles name their sockets relative to the working directory: self.root.
+        self.caddy = self.spawn("caddy", argv, env, cwd=self.root)
         wait_until(lambda: can_connect_unix(self.caddy_sock), "caddy", self.caddy)
 
+    def caddy_mode(self, mode):
+        """Swap the test Caddy to tests/caddy/<mode>.Caddyfile through its admin socket."""
+        argv = [self.bin("caddy"), "reload", "--address", f"unix/{self.caddy_admin}",
+                "--config", str(CADDY_DIR / f"{mode}.Caddyfile"), "--adapter", "caddyfile"]
+        r = subprocess.run(argv, env=self.caddy_env(), stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=30)
+        if r.returncode != 0:
+            raise RuntimeError(f"caddy reload {mode} failed:\n{r.stderr[-2000:]}")
+
+    def start_tcp(self):
+        self.tcp_server = socket.create_server(CADDY_TCP)
+
+        def serve():
+            while True:
+                try:
+                    client, _ = self.tcp_server.accept()
+                except OSError:
+                    return
+                threading.Thread(target=relay, args=(client, self.caddy_sock), daemon=True).start()
+
+        threading.Thread(target=serve, daemon=True).start()
+
     def start(self):
+        if self.tcp and not private_netns():
+            raise RuntimeError("WB_HARNESS_TCP needs a network namespace with only lo (the nix sandbox, "
+                               "unshare -rn): elsewhere other users could reach the secret-injecting proxy")
         # A stale listener would pass the readiness check and answer for the new wb-web.
         if can_connect_tcp(WEB_ADDR):
             raise RuntimeError(f"{WEB_ADDR[0]}:{WEB_ADDR[1]} is already in use")
@@ -202,6 +283,8 @@ class Harness:
                 step()
             except RuntimeError as e:
                 raise RuntimeError(f"{e}\n--- {name}.log ---\n{self.log_tail(name)}") from None
+        if self.tcp:
+            self.start_tcp()
         return self
 
     @staticmethod
@@ -220,6 +303,12 @@ class Harness:
         self.start_web()
 
     def stop(self):
+        if self.tcp_server is not None:
+            try:
+                self.tcp_server.shutdown(socket.SHUT_RDWR)  # wakes the accept() thread
+            except OSError:
+                pass
+            self.tcp_server.close()
         for proc in (self.caddy, self.web, self.hub):
             self.stop_proc(proc)
         shutil.rmtree(self.root, ignore_errors=True)
@@ -267,10 +356,10 @@ def main():
     for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
         signal.signal(s, on_signal)
 
-    h = Harness(a.web_root, a.bin_dir, a.dogfood)
+    h = Harness(a.web_root, a.bin_dir, a.dogfood, tcp=os.environ.get("WB_HARNESS_TCP") == "1")
     try:
         h.start()
-    except RuntimeError as e:
+    except (RuntimeError, OSError) as e:
         print(f"harness: {e}", file=sys.stderr)
         h.stop()
         return 1
