@@ -6,10 +6,12 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::http::not_found;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/artifact/{node}", get(artifact))
+        // Deleting artifacts is a removed feature (design §3.5.5), not a wrong method.
+        .route("/artifact/{node}", get(artifact).delete(not_found))
         .route("/db/{node}", get(db))
 }
 

@@ -150,20 +150,20 @@ fn not_modified(req: &HeaderMap, etag: &HeaderValue) -> bool {
         .any(|t| t == "*" || t.strip_prefix("W/").unwrap_or(t).as_bytes() == etag.as_bytes())
 }
 
-/// The router's fallback: GET/HEAD of an asset, 404 for other paths, 405 for other
-/// methods.
+/// The router's fallback: GET/HEAD of an asset, 404 for any other path whatever the
+/// method, 405 for other methods on an asset.
 pub async fn serve(
     State(app): State<AppState>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    if method != Method::GET && method != Method::HEAD {
-        return ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into_response();
-    }
     let Some(asset) = app.assets.0.get(uri.path()) else {
         return ApiError::new(StatusCode::NOT_FOUND, "not found").into_response();
     };
+    if method != Method::GET && method != Method::HEAD {
+        return ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into_response();
+    }
     let mut res = if not_modified(&headers, &asset.etag) {
         StatusCode::NOT_MODIFIED.into_response()
     } else {

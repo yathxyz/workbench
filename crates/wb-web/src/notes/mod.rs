@@ -8,7 +8,7 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::http::{ApiError, Param};
+use crate::http::{ApiError, Param, not_found};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -16,7 +16,8 @@ pub fn routes() -> Router<AppState> {
         .route("/links", get(links))
         .route("/cards", get(cards))
         .route("/reviews", get(reviews))
-        .route("/tasks", get(tasks))
+        // Creating tasks is a removed feature (design §3.5.5), not a wrong method.
+        .route("/tasks", get(tasks).post(not_found))
         .route("/task/{id}", get(task))
 }
 

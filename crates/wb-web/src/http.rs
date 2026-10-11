@@ -80,6 +80,11 @@ impl<S: Send + Sync, T: DeserializeOwned + Send> FromRequestParts<S> for Param<T
     }
 }
 
+/// The answer for a path, or a method on a path, that does not exist.
+pub async fn not_found() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "not found")
+}
+
 /// The answer to a plain GET on a socket route.
 pub fn upgrade_required() -> Response {
     ApiError::new(StatusCode::BAD_REQUEST, "websocket upgrade required").into_response()

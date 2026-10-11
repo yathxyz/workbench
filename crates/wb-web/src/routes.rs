@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::middleware::{from_fn_with_state, map_response};
 use axum::response::Response;
 
-use crate::http::{ApiError, no_store};
+use crate::http::{ApiError, no_store, not_found};
 use crate::{
     AppState, artifacts, auth, board, fsapi, host, info, notes, relay_acp, relay_pty, rpc,
     static_files,
@@ -44,10 +44,6 @@ pub fn app(state: AppState) -> Router {
 
 async fn api_no_store(res: Response) -> Response {
     no_store(res)
-}
-
-async fn not_found() -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, "not found")
 }
 
 async fn method_not_allowed() -> ApiError {
