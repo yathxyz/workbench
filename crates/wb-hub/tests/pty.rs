@@ -4,6 +4,7 @@ mod common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -197,6 +198,31 @@ fn hub_environment_canaries_do_not_reach_the_child() {
         !env.contains("/elsewhere") && !env.contains("forged"),
         "a client value overrode the hub's"
     );
+}
+
+#[test]
+fn a_relative_argv0_is_searched_in_the_child_path_only() {
+    // The hub's own PATH finds bash; the child's PATH is what counts.
+    let hub = Hub::start_with(|cfg| cfg["child"]["passEnv"] = json!([]));
+    let mut c = hub.connect();
+    let argv = json!({"argv": ["bash", "-c", "echo RAN$((1+1))"]});
+    let r =
+        c.request(json!({"t": "pty.open", "sid": "rel", "cols": 80, "rows": 24, "spawn": argv}));
+    assert_eq!(r["code"], "spawn_failed", "{r}");
+    assert_eq!(r["message"], "argv[0] not found in child PATH: bash", "{r}");
+
+    let shell = Path::new(&hub.shell);
+    let dir = shell.parent().unwrap().to_str().unwrap();
+    let name = shell.file_name().unwrap().to_str().unwrap();
+    let hub = Hub::start_with(|cfg| {
+        cfg["child"]["passEnv"] = json!([]);
+        cfg["child"]["setEnv"]["PATH"] = format!("/nonexistent:{dir}").into();
+    });
+    let mut c = hub.connect();
+    let argv = json!({"argv": [name, "-c", "echo $0 RAN$((1+1))"]});
+    c.ok(json!({"t": "pty.open", "sid": "rel", "cols": 80, "rows": 24, "spawn": argv}));
+    // argv[0] stays as the client sent it.
+    c.output_until("rel", &format!("{name} RAN2"));
 }
 
 /// Run by `another_uid_gets_zero_bytes` inside a user namespace; not a test of its own.

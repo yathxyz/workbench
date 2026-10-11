@@ -1,7 +1,9 @@
-//! What the hub reads from `/proc`.
+//! What the hub reads from `/proc`, and where a child's program is.
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
+use rustix::fs::{Access, access};
 use rustix::process::{Pid, Signal, kill_process};
 
 /// Sends `sig` to every process whose session id is `leader` (field 6 of
@@ -46,9 +48,50 @@ pub fn cwd(pid: u32) -> Option<String> {
         .ok()
 }
 
+/// The program to run for `argv0`: an absolute path as is, a relative one searched in
+/// `path`, the child's `PATH` (never the hub's). The first executable regular file wins.
+/// Relative `PATH` entries are skipped: they would resolve against the hub's directory.
+pub fn resolve_argv0(argv0: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    let name = Path::new(argv0);
+    if name.is_absolute() {
+        return Some(name.to_owned());
+    }
+    std::env::split_paths(path?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file() && access(p, Access::EXEC_OK).is_ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn argv0_is_resolved_in_the_given_path_only() {
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe.parent().unwrap();
+        let name = exe.file_name().unwrap().to_str().unwrap();
+        // A non-executable file earlier in PATH is skipped.
+        let plain = fresh_dir();
+        std::fs::write(plain.join(name), "not a program").unwrap();
+        let path = std::env::join_paths([Path::new("relative"), &plain, dir]).unwrap();
+        assert_eq!(resolve_argv0(name, Some(&path)), Some(exe.clone()));
+        assert_eq!(resolve_argv0(name, Some(plain.as_os_str())), None);
+        assert_eq!(resolve_argv0(name, None), None);
+        assert_eq!(
+            resolve_argv0("/bin/anything", None),
+            Some(PathBuf::from("/bin/anything"))
+        );
+        std::fs::remove_dir_all(plain).unwrap();
+    }
+
+    /// A fresh directory under `$TMPDIR`.
+    fn fresh_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wb-procfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn session_is_counted_after_the_last_paren() {

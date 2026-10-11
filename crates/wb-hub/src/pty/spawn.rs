@@ -6,6 +6,7 @@
 use std::ffi::OsString;
 use std::io;
 use std::os::fd::{BorrowedFd, OwnedFd};
+use std::path::Path;
 use std::process::Stdio;
 
 use rustix::fs::{Mode, OFlags};
@@ -20,9 +21,11 @@ pub struct Spawned {
     pub master: OwnedFd,
 }
 
-/// Starts `argv` on a new PTY of `size`, with exactly `env`, in `cwd`, as the leader
-/// of a new session whose controlling terminal is the PTY.
+/// Starts `program` with `argv` (`argv[0]` included, unchanged) on a new PTY of `size`,
+/// with exactly `env`, in `cwd`, as the leader of a new session whose controlling
+/// terminal is the PTY.
 pub fn spawn(
+    program: &Path,
     argv: &[String],
     env: &[(OsString, OsString)],
     cwd: &str,
@@ -36,11 +39,12 @@ pub fn spawn(
     let slave = ioctl_tiocgptpeer(&master, flags)?;
     tcsetwinsize(&master, size)?;
 
-    let (program, args) = argv
+    let (arg0, args) = argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty argv"))?;
     let mut cmd = Command::new(program);
-    cmd.args(args)
+    cmd.arg0(arg0)
+        .args(args)
         .env_clear()
         .envs(env.iter().map(|(k, v)| (k, v)))
         .current_dir(cwd)

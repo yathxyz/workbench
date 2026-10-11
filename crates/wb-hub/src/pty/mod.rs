@@ -355,13 +355,24 @@ impl Pty {
             spawn.env.as_ref(),
             |name| std::env::var_os(name),
         );
-        let spawned = spawn::spawn(&spawn.argv, &env, &cwd, size, ctx.child_umask)
-            .and_then(|s| Ok((AsyncFd::new(s.master)?, s.child)));
+        let child_path = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.as_os_str());
+        let spawned = match procfs::resolve_argv0(&spawn.argv[0], child_path) {
+            Some(program) => spawn::spawn(&program, &spawn.argv, &env, &cwd, size, ctx.child_umask)
+                .and_then(|s| Ok((AsyncFd::new(s.master)?, s.child)))
+                .map_err(|e| format!("spawn failed: {e}")),
+            None => Err(format!(
+                "argv[0] not found in child PATH: {}",
+                spawn.argv[0]
+            )),
+        };
         let (master, child) = match spawned {
             Ok(spawned) => spawned,
-            Err(e) => {
-                warn!(sid = %self.sid, argv = ?spawn.argv, "spawn failed: {e}");
-                reply.err(ErrorCode::SpawnFailed, format!("spawn failed: {e}"));
+            Err(msg) => {
+                warn!(sid = %self.sid, argv = ?spawn.argv, "{msg}");
+                reply.err(ErrorCode::SpawnFailed, msg);
                 if self.ctx.registry.abandon(&self.sid, self.created_at) {
                     self.phase = Phase::Forgotten;
                 }

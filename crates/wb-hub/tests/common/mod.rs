@@ -27,6 +27,11 @@ pub struct Hub {
 
 impl Hub {
     pub fn start() -> Hub {
+        Hub::start_with(|_| {})
+    }
+
+    /// A hub whose `hub.json` is changed by `edit` before it starts.
+    pub fn start_with(edit: impl FnOnce(&mut Value)) -> Hub {
         static N: AtomicUsize = AtomicUsize::new(0);
         // A short name under `$TMPDIR`: `sun_path` holds 108 bytes.
         let dir = std::env::temp_dir().join(format!(
@@ -38,12 +43,13 @@ impl Hub {
         fs::create_dir_all(dir.join("home")).unwrap();
         let socket = dir.join("hub.sock");
         let shell = find_bash();
-        let config = json!({
+        let mut config = json!({
             "socket": socket,
             "stateDir": dir.join("state"),
             "host": "example",
             "child": {"shell": shell, "passEnv": ["PATH"], "setEnv": {"WB_SET": "from-config"}},
         });
+        edit(&mut config);
         let config_path = dir.join("hub.json");
         fs::write(&config_path, config.to_string()).unwrap();
         let log = fs::File::create(dir.join("hub.log")).unwrap();
