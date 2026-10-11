@@ -59,6 +59,9 @@ in
         # Small enough for the OOM step; the specialisation raises it to prove a switch applies
         # slice changes without restarting the hub.
         systemd.slices.workbench.sliceConfig.MemoryMax = "400M";
+        # The OOM step needs the cgroup OOM killer; the test instrumentation's panic_on_oom = 2
+        # would panic the whole VM instead.
+        boot.kernel.sysctl."vm.panic_on_oom" = 0;
         specialisation.changed.configuration = {
           services.workbench.logLevel = lib.mkForce "debug";
           systemd.slices.workbench.sliceConfig.MemoryMax = lib.mkForce "500M";
