@@ -1,0 +1,14 @@
+[package]
+name = "wb-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "wb"
+path = "src/main.rs"
+
+[dependencies]
+wb-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true

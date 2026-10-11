@@ -1,0 +1,24 @@
+[package]
+name = "wb-hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "wb-fake-acp"
+path = "src/bin/wb-fake-acp.rs"
+
+[dependencies]
+wb-proto.workspace = true
+anyhow.workspace = true
+rustix = { workspace = true, features = ["pty", "termios", "process", "fs"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "process", "signal", "time", "fs", "sync"] }
+tokio-util = { workspace = true, features = ["codec"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+vt100.workspace = true
+
+[dev-dependencies]
+agent-client-protocol-schema.workspace = true
