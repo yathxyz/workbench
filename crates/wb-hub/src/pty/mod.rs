@@ -5,7 +5,7 @@
 
 mod io;
 mod out;
-mod spawn;
+pub mod spawn;
 mod vt;
 
 use std::os::unix::process::ExitStatusExt;

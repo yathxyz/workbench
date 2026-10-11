@@ -14,22 +14,26 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 use wb_proto::hub::{
-    Agent, ErrorCode, HubMessage, HubRequest, PROTO, Resume, SessionsReply, SpawnPty,
+    Agent, ErrorCode, HubMessage, HubRequest, Kind, PROTO, Resume, SessionsReply, SpawnAcp,
+    SpawnPty,
 };
 use wb_proto::limits::{CAPTURE_MAX, HELLO_TIMEOUT, MAX_LINE, PTY_INPUT_FRAME, REQS_IN_FLIGHT};
 use wb_proto::line::encode;
 
 use crate::Ctx;
+use crate::acp::{self, Act};
 use crate::env::check_client_env;
 use crate::outq::OutQ;
 use crate::pty::{self, Cmd, Open};
+use crate::registry::SessionCmd;
 
 /// Most items in `SpawnPty.argv`.
 const ARGV_MAX: usize = 256;
 /// Most bytes in all of `SpawnPty.argv`.
 const ARGV_BYTES_MAX: usize = 256 << 10;
 /// How long a connection whose client stopped sending may take to deliver the replies
-/// it still owes; a `pty.kill{forget:true}` waits for the exit, up to about 3 s.
+/// it still owes; a `kill{forget:true}` waits for the exit, up to about 3 s for a PTY
+/// and about 8 s for an agent.
 const LINGER: Duration = Duration::from_secs(10);
 /// `pty.capture` lines when the request names none.
 const CAPTURE_DEFAULT: u32 = 200;
@@ -302,7 +306,7 @@ impl Conn {
                 if !valid_sid(&sid) {
                     return self.error(None, None, ErrorCode::BadRequest, "invalid sid".into());
                 }
-                if let Some(tx) = self.ctx.registry.sender(&sid) {
+                if let Some(tx) = self.ctx.registry.sender::<Cmd>(&sid) {
                     let _ = tx.send(Cmd::Resize { cols, rows }).await;
                 }
             }
@@ -315,18 +319,67 @@ impl Conn {
                 self.to_session(rid, sid, |reply| Cmd::Capture { lines, reply })
                     .await;
             }
-            HubRequest::AcpOpen { .. }
-            | HubRequest::AcpDetach { .. }
-            | HubRequest::AcpPrompt { .. }
-            | HubRequest::AcpCancel { .. }
-            | HubRequest::AcpPermission { .. }
-            | HubRequest::AcpElicitation { .. }
-            | HubRequest::AcpSetMode { .. }
-            | HubRequest::AcpSeen { .. }
-            | HubRequest::AcpRevive { .. }
-            | HubRequest::AcpAuthenticate { .. }
-            | HubRequest::AcpKill { .. }
-            | HubRequest::Unknown => {
+            HubRequest::AcpOpen {
+                rid,
+                sid,
+                since,
+                epoch,
+                spawn,
+            } => self.acp_open(rid, sid, since, epoch, spawn).await,
+            HubRequest::AcpDetach { rid, sid } => {
+                let conn = self.id;
+                self.to_session(rid, sid, |reply| acp::Cmd::Detach {
+                    conn,
+                    reply: Some(reply),
+                })
+                .await;
+            }
+            HubRequest::AcpPrompt { rid, sid, prompt } => {
+                self.act(rid, sid, Act::Prompt(prompt)).await;
+            }
+            HubRequest::AcpCancel { rid, sid } => self.act(rid, sid, Act::Cancel).await,
+            HubRequest::AcpPermission {
+                rid,
+                sid,
+                req,
+                epoch,
+                outcome,
+            } => {
+                let act = Act::Permission {
+                    req,
+                    epoch,
+                    outcome,
+                };
+                self.act(rid, sid, act).await;
+            }
+            HubRequest::AcpElicitation {
+                rid,
+                sid,
+                req,
+                epoch,
+                response,
+            } => {
+                let act = Act::Elicitation {
+                    req,
+                    epoch,
+                    response,
+                };
+                self.act(rid, sid, act).await;
+            }
+            HubRequest::AcpSetMode { rid, sid, mode_id } => {
+                self.act(rid, sid, Act::SetMode(mode_id)).await;
+            }
+            HubRequest::AcpSeen { rid, sid, seq } => self.act(rid, sid, Act::Seen(seq)).await,
+            HubRequest::AcpRevive { rid, sid } => self.act(rid, sid, Act::Revive).await,
+            HubRequest::AcpAuthenticate {
+                rid,
+                sid,
+                method_id,
+            } => self.act(rid, sid, Act::Authenticate(method_id)).await,
+            HubRequest::AcpKill { rid, sid, forget } => {
+                self.act(rid, sid, Act::Kill { forget }).await;
+            }
+            HubRequest::Unknown => {
                 self.error(
                     rid,
                     None,
@@ -352,6 +405,9 @@ impl Conn {
         if let Some(Err(msg)) = spawn.as_ref().map(check_spawn) {
             return self.error(Some(rid), None, ErrorCode::BadRequest, msg);
         }
+        if let Some(Err(msg)) = self.kind_check::<Cmd>(&sid) {
+            return self.error(Some(rid), None, ErrorCode::KindMismatch, msg);
+        }
         let open = Open {
             viewer: self.viewer(),
             cols,
@@ -364,12 +420,56 @@ impl Conn {
         pty::open(self.ctx.clone(), sid, open).await;
     }
 
-    async fn to_session(&self, rid: u64, sid: String, cmd: impl FnOnce(Reply) -> Cmd) {
+    async fn acp_open(
+        &mut self,
+        rid: u64,
+        sid: String,
+        since: u64,
+        epoch: Option<u64>,
+        spawn: Option<SpawnAcp>,
+    ) {
         if !valid_sid(&sid) {
             return self.error(Some(rid), None, ErrorCode::BadRequest, "invalid sid".into());
         }
+        if let Some(Err(msg)) = self.kind_check::<acp::Cmd>(&sid) {
+            return self.error(Some(rid), None, ErrorCode::KindMismatch, msg);
+        }
+        let open = acp::Open {
+            viewer: self.viewer(),
+            since,
+            epoch,
+            spawn,
+            reply: self.reply(rid).await,
+        };
+        self.opened.insert(sid.clone());
+        acp::open(self.ctx.clone(), sid, open).await;
+    }
+
+    async fn act(&self, rid: u64, sid: String, act: Act) {
+        self.to_session(rid, sid, |reply| acp::Cmd::Act { act, reply })
+            .await;
+    }
+
+    /// `Some(Err)` if `sid` is a session of the other kind than `C`.
+    fn kind_check<C: SessionCmd>(&self, sid: &str) -> Option<Result<(), String>> {
+        let kind = self.ctx.registry.kind(sid)?;
+        Some(if kind == C::KIND {
+            Ok(())
+        } else {
+            let kind = if kind == Kind::Pty { "pty" } else { "acp" };
+            Err(format!("{sid} is a {kind} session"))
+        })
+    }
+
+    async fn to_session<C: SessionCmd>(&self, rid: u64, sid: String, cmd: impl FnOnce(Reply) -> C) {
+        if !valid_sid(&sid) {
+            return self.error(Some(rid), None, ErrorCode::BadRequest, "invalid sid".into());
+        }
+        if let Some(Err(msg)) = self.kind_check::<C>(&sid) {
+            return self.error(Some(rid), None, ErrorCode::KindMismatch, msg);
+        }
         let reply = self.reply(rid).await;
-        match self.ctx.registry.sender(&sid) {
+        match self.ctx.registry.sender::<C>(&sid) {
             Some(tx) => {
                 if let Err(unsent) = tx.send(cmd(reply)).await {
                     unsent
@@ -389,7 +489,7 @@ impl Conn {
             let msg = format!("pty.input is limited to {PTY_INPUT_FRAME} bytes");
             return self.error(None, Some(sid), ErrorCode::BadRequest, msg);
         }
-        if let Some(tx) = self.ctx.registry.sender(&sid) {
+        if let Some(tx) = self.ctx.registry.sender::<Cmd>(&sid) {
             let from = self.outq.clone();
             let _ = tx.send(Cmd::Input { d, from }).await;
         }
@@ -426,13 +526,12 @@ impl Conn {
     /// sending side, so the replies it is still owed go out first, within [`LINGER`].
     async fn close(self) {
         self.ctx.registry.unwatch(self.id);
+        let conn = self.id;
         for sid in &self.opened {
-            if let Some(tx) = self.ctx.registry.sender(sid) {
-                let detach = Cmd::Detach {
-                    conn: self.id,
-                    reply: None,
-                };
-                let _ = tx.send(detach).await;
+            if let Some(tx) = self.ctx.registry.sender::<Cmd>(sid) {
+                let _ = tx.send(Cmd::Detach { conn, reply: None }).await;
+            } else if let Some(tx) = self.ctx.registry.sender::<acp::Cmd>(sid) {
+                let _ = tx.send(acp::Cmd::Detach { conn, reply: None }).await;
             }
         }
         let owed = async {

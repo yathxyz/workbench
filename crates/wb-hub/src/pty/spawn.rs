@@ -1,6 +1,7 @@
-//! Starting a PTY child. This is the only module of the hub with `unsafe` code: the
-//! `pre_exec` closure, which runs between `fork` and `exec` and therefore makes only
-//! async-signal-safe raw syscalls (rustix's linux_raw backend: no allocation, no locks).
+//! Starting a PTY child or an ACP agent. This is the only module of the hub with `unsafe`
+//! code: the `pre_exec` closures, which run between `fork` and `exec` and therefore make
+//! only async-signal-safe raw syscalls (rustix's linux_raw backend: no allocation, no
+//! locks).
 #![allow(unsafe_code)]
 
 use std::ffi::OsString;
@@ -64,10 +65,40 @@ pub fn spawn(
     Ok(Spawned { child, master })
 }
 
-/// In the child, after std has made the slave fds 0-2 and changed directory.
-fn child_setup(umask: Mode) -> io::Result<()> {
+/// Starts the agent `program` with `args` (not including `argv[0]`), exactly `env`, in
+/// `cwd`, with piped stdio, as the leader of a new process group in the hub's session
+/// (DESIGN §3.4.5: `process_group(0)`, never `setsid`).
+pub fn spawn_agent(
+    program: &Path,
+    args: &[String],
+    env: &[(OsString, OsString)],
+    cwd: &str,
+    child_umask: Mode,
+) -> io::Result<Child> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(false);
+    // SAFETY: as in `spawn`; the closure only calls rustix syscall wrappers.
+    unsafe {
+        cmd.pre_exec(move || {
+            lower(child_umask);
+            Ok(())
+        });
+    }
+    cmd.spawn()
+}
+
+/// In a child before exec: the user's umask, and an OOM score that makes the kernel
+/// prefer the children over the hub (best effort).
+fn lower(umask: Mode) {
     rustix::process::umask(umask);
-    // Prefer the children over the hub when the OOM killer runs; best effort.
     if let Ok(fd) = rustix::fs::open(
         c"/proc/self/oom_score_adj",
         OFlags::WRONLY | OFlags::CLOEXEC,
@@ -75,6 +106,11 @@ fn child_setup(umask: Mode) -> io::Result<()> {
     ) {
         let _ = rustix::io::write(&fd, b"800");
     }
+}
+
+/// In the child, after std has made the slave fds 0-2 and changed directory.
+fn child_setup(umask: Mode) -> io::Result<()> {
+    lower(umask);
     rustix::process::setsid()?;
     // SAFETY: fd 0 is the PTY slave, which std placed there before running this closure.
     let stdin = unsafe { BorrowedFd::borrow_raw(0) };
