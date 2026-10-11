@@ -2,4 +2,6 @@
 
 mod facts;
 mod journal;
+mod lines;
 mod replay;
+mod rpc;
