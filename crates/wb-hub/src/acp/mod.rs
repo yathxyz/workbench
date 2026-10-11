@@ -1020,6 +1020,9 @@ impl Acp {
             return;
         };
         if self.proc.is_some() || self.journal.is_none() {
+            // An agent that outlives its SIGKILL holds the fault: the probe waits
+            // another period rather than firing again at once.
+            self.probe_at = self.proc.is_some().then(|| Instant::now() + PROBE_EVERY);
             return;
         }
         let lines = if self.facts.running {
