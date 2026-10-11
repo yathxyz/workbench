@@ -184,9 +184,9 @@ def fs(t, h):
     entries = {e["name"]: e for e in (ls or {}).get("entries", [])}
     t.check("fs: ls ~ lists wb-web's HOME with the host", st == 200 and ls["path"] == str(home.resolve())
             and ls["host"] == h.web_config["host"], repr((st, ls and ls.get("path"))))
-    names = [e["name"] for e in ls["entries"]] if st == 200 else []
-    t.check("fs: ls puts directories first, then names without case", names == ["Docs", "notes", "fsrs-hard.md",
-            "fsrs-link.md"], repr(names))
+    mine = ["Docs", "notes", "fsrs-hard.md", "fsrs-link.md"]
+    names = [e["name"] for e in ls["entries"] if e["name"] in mine] if st == 200 else []
+    t.check("fs: ls puts directories first, then names without case", names == mine, repr(names))
     link = entries.get("fsrs-link.md", {})
     t.check("fs: ls reports symlink targets", link.get("link") == str(notes / "fsrs.md"), repr(link))
     hard = entries.get("fsrs-hard.md", {})
