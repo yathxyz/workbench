@@ -301,8 +301,9 @@ function hubStatus(m) {
   netChip();
 }
 function hubSeen(hub) {
-  if (HUB_STARTED && hub?.startedAt && hub.startedAt !== HUB_STARTED) toast('The Workbench hub restarted at ' + hhmm(hub.startedAt) + ': shells and agents ended. Enter restarts a shell.', 8000);
-  HUB_STARTED = hub?.startedAt;
+  if (!hub?.startedAt) return;   // a probe while the hub is down must not forget the start time its return is compared with
+  if (HUB_STARTED && hub.startedAt !== HUB_STARTED) toast('The Workbench hub restarted at ' + hhmm(hub.startedAt) + ': shells and agents ended. Enter restarts a shell.', 8000);
+  HUB_STARTED = hub.startedAt;
 }
 function netChip() {
   const c = $('#st-net'); if (!c) return;
@@ -698,11 +699,13 @@ class PtyBackend {
     if (h) { this.n.hostUrl = h.url; rpcFor(h); } else delete this.n.hostUrl;
     this.parked = false; this.final = false; this.helloSeen = false;
     const ws = this.ws = new WebSocket(hWs(h, '/pty'));
-    ws.onopen = () => { ws.send(this.openMsg()); this.spawn = false; if (h) { this.tries = 0; hostUp(h); } };
+    ws.onopen = () => { ws.send(this.openMsg()); if (h) { this.tries = 0; hostUp(h); } };
     ws.onmessage = ev => {
       let m; try { m = JSON.parse(ev.data); } catch { return; }
       if (m.t === 'hello') {
         this.dead = false; this.exitReason = null; this.helloSeen = true; this.tries = 0; this.epoch = m.epoch;
+        this.spawn = false;   // only now: a socket that closes before hello (1013, a restart) retries the spawn
+        this.final = false;   // a respawn on the socket a failed open left open is live again
         this.L?.el.classList.remove('net-wait');
         if (m.stream != null) this.resume = { stream: m.stream, out: m.out };
         if (m.tmux) { if (this.n.tmuxSess !== m.tmux || !!this.n.tmuxAdopted !== !!m.adopted) { this.n.tmuxSess = m.tmux; this.n.tmuxAdopted = !!m.adopted; retag(this.n); } if (m.attached && m.cwd) this.n.cwdLive = m.cwd; }
@@ -768,7 +771,7 @@ class PtyBackend {
     if (!this.shellOffer && this.n.shell && INFO?.shells && INFO.defaultShell && !INFO.shells.includes(this.n.shell)) return this.offerDefault();
     if (this.shellOffer) { this.shellOffer = false; this.n.shell = INFO.defaultShell; updateTitle(this.n); dirty(); }
     this.dead = false; this.respawning = true; this.spawn = true;
-    if (this.ws?.readyState === 1) { this.ws.send(this.openMsg()); this.spawn = false; } else this.connect();
+    if (this.ws?.readyState === 1) this.ws.send(this.openMsg()); else this.connect();
   }
   send(d) {
     if (this.ws?.readyState !== 1) return;
@@ -786,7 +789,7 @@ class PtyBackend {
   // only the tab the user is looking at sizes the PTY (ROB-8)
   resize(cols, rows) { if (this.ws?.readyState === 1 && document.visibilityState === 'visible' && document.hasFocus() && activeId === this.n.id) this.ws.send(JSON.stringify({ t: 'resize', cols, rows })); }
   // the card goes: a wb-* tmux session dies with it, an adopted one is only detached (the daemon decides); detachOnly forces a detach
-  kill() { this.disposed = true; clearTimeout(this.timer); WAKE.delete(this); try { this.ws.send(JSON.stringify({ t: 'kill', session: this.detachOnly ? false : undefined })); } catch {} setTimeout(() => this.ws?.close(), 50); }
+  kill() { this.disposed = true; clearTimeout(this.timer); WAKE.delete(this); if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ t: 'kill', session: this.detachOnly ? false : undefined })); setTimeout(() => this.ws?.close(), 50); }
   // the card went in another tab: close here, the session is not ours to end
   dispose() { this.disposed = true; clearTimeout(this.timer); WAKE.delete(this); try { this.ws?.close(); } catch {} }
   // end the process (session=true also kills a tmux session) but keep the card: it shows the exit and Enter starts anew

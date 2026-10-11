@@ -2,14 +2,16 @@
 //
 //   WB_PLAYWRIGHT=<playwright>/index.mjs WB_HARNESS=tests/harness.py node tests/ui.mjs <web-root>
 //
-// <web-root> is the built web output (`nix build .#workbench-web`: web/ plus vendor/ and fonts/). The harness takes
-// wb-hub, wb-web and caddy from PATH; the Caddy configs for the expired and login-page modes sit next to it in caddy/.
+// <web-root> (or $WB_WEB_ROOT) is the built web output (`nix build .#workbench-web`: web/ plus vendor/ and fonts/). The
+// harness takes wb-hub, wb-web and caddy from PATH; the Caddy configs for the expired and login-page modes sit next to
+// it in caddy/.
 // Each check prints ok, FAIL or skip. The exit status is 0 only when every check ran and passed.
 //
 // Demo phase: the page inlined the way tools/build-artifact.py inlines it, opened from file://.
 // Daemon phase: the harness's Caddy listens only on a unix socket. A forwarder on 127.0.0.1:18443 (the harness's
 // publicOrigin) joins the browser to it and drops connections from every other local user, who would otherwise
-// reach a shell through the proxy secret Caddy adds.
+// reach a shell through the proxy secret Caddy adds. The harness runs without WB_HARNESS_TCP, whose TCP entry would
+// take that port; the forwarder stays because N6 cuts it.
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -580,7 +582,10 @@ check('N16 demo: the inlined page asks fonts.googleapis.com for nothing', !demoH
 // ---------------- daemon phase: wb-hub, wb-web and Caddy from the harness
 const PORT = 18443, ORIGIN = `http://127.0.0.1:${PORT}`;
 const EXIT_HUB = 'the Workbench hub restarted';   // app.js EXIT_TEXT.hub_restart
-const harness = spawn('python3', ['-I', HARNESS, '--web-root', ROOT], { stdio: ['pipe', 'pipe', 'pipe'] });
+// Without WB_HARNESS_TCP: the browser goes through the forwarder below, which N6 cuts, and the harness's own TCP
+// entry would take its port.
+const { WB_HARNESS_TCP, ...harnessEnv } = process.env;
+const harness = spawn('python3', ['-I', HARNESS, '--web-root', ROOT], { stdio: ['pipe', 'pipe', 'pipe'], env: harnessEnv });
 let hlog = ''; harness.stderr.on('data', d => { hlog += d; });
 const H = await new Promise((res, rej) => {
   let out = ''; harness.stdout.on('data', d => { out += d; const i = out.indexOf('\n'); if (i >= 0) try { res(JSON.parse(out.slice(0, i))); } catch (e) { rej(e); } });
@@ -863,16 +868,21 @@ await section('N7/N8', async () => {
   const tries = ptyOf(T, tid, t0).length;
   check('N7: hub down shows the chip, and a 1013 socket does not retry in a loop', chip === 'hub down' && tries <= 1, JSON.stringify({ chip, tries }));
   await hubCtl('start');
-  await until(async () => (await termText(T, tid)).includes(EXIT_HUB), 20000);
+  // The exit text can arrive when the hub stops; the toast waits for wb-web to see the hub again.
+  await until(async () => (await termText(T, tid)).includes(EXIT_HUB) && /hub restarted/.test(await T.evaluate(() => document.querySelector('#toast').textContent)), 20000);
   st = await T.evaluate(id => ({ toast: document.querySelector('#toast').textContent, attn: window.__canvas.attnItems().filter(a => a.key === id).length }), tid);
   check('N7: after the hub restarts the card shows the hub_restart text, the toast says so, and the card is not "ended"', (await termText(T, tid)).includes(EXIT_HUB) && /hub restarted/.test(st.toast) && st.attn === 0, JSON.stringify(st));
-  // N8 (amended): a wiped stateDir means no session; Enter starts one and says so
+  // N8 (amended): a live shell, then a wiped stateDir: the card says No session, and Enter starts a shell with the marker.
+  // The card already shows both lines from N7, so the check counts new ones.
+  const count = async k => (await termText(T, tid)).split(k).length - 1, NOSESS = '[No session: press Enter', MARKER = '[new shell';
+  await typeIn(T, tid, '\r'); await until(async () => (await sessions()).find(s => s.sid === tid)?.alive, 10000);
+  const n0 = await count(NOSESS), m0 = await count(MARKER);
   await hubCtl('stop'); fs.rmSync(H.stateDir, { recursive: true, force: true }); await hubCtl('start');
-  await until(async () => (await termText(T, tid)).includes('[No session: press Enter'), 20000);
-  const noSess = (await termText(T, tid)).includes('[No session: press Enter');
+  const noSess = await until(async () => await count(NOSESS) > n0, 20000);
   await typeIn(T, tid, '\r');
-  await until(async () => (await termText(T, tid)).includes('[new shell'), 10000);
-  check('N8: after a stateDir wipe the card says No session; Enter starts a shell with the [new shell] marker', noSess && (await termText(T, tid)).includes('[new shell'), (await termText(T, tid)).slice(-300));
+  const marker = await until(async () => await count(MARKER) > m0, 10000);
+  const alive = !!(await sessions()).find(s => s.sid === tid)?.alive;
+  check('N8: after a stateDir wipe the card says No session; Enter starts a shell with the [new shell] marker', noSess && marker && alive, JSON.stringify({ noSess, marker, alive, tail: (await termText(T, tid)).slice(-300) }));
 });
 await section('cleanup', async () => { await T.evaluate(id => window.__canvas.removeNode(id), tid); await settled(T); await T.close(); await A.close(); });
 
@@ -894,11 +904,10 @@ await section('N30', async () => {
 // N1-N3: the login page and expired sign-ins, by swapping the test Caddy's config through its admin socket (N-6)
 const CADDY = path.join(path.dirname(HARNESS), 'caddy');
 function caddyMode(mode) {
-  const r = spawnSync('caddy', ['reload', '--config', path.join(CADDY, mode + '.Caddyfile'), '--adapter', 'caddyfile', '--address', 'unix/' + H.caddyAdmin],
-    { env: { ...process.env, WB_CADDY_ADMIN: H.caddyAdmin, WB_CADDY_SOCKET: H.caddySocket }, encoding: 'utf8' });
+  const r = spawnSync('caddy', ['reload', '--config', path.join(CADDY, mode + '.Caddyfile'), '--adapter', 'caddyfile', '--address', 'unix/' + H.caddyAdmin], { encoding: 'utf8' });
   if (r.status !== 0) throw new Error(`caddy reload ${mode}: ${r.stderr}`);
 }
-if (!['expired', 'loginpage'].every(m => fs.existsSync(path.join(CADDY, m + '.Caddyfile')))) for (const n of ['N1', 'N2', 'N3']) skip(n, `no expired/loginpage Caddyfile in ${CADDY} (M1-N open request)`);
+if (!['expired', 'loginpage'].every(m => fs.existsSync(path.join(CADDY, m + '.Caddyfile')))) for (const n of ['N1', 'N2', 'N3']) skip(n, `no expired/loginpage Caddyfile in ${CADDY}`);
 else {
   const LS_KEY = 'canvas-proto-board-v5';
   for (const [n, mode, kind] of [['N1', 'loginpage', 'not_json'], ['N2', 'expired', 'signed_out']]) await section(n, async () => {
