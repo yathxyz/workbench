@@ -1,4 +1,11 @@
 //! A real `wb-hub` in a temporary directory, and a blocking line client for it.
+//!
+//! Each test binary uses its own subset of these helpers.
+#![allow(dead_code)]
+
+pub mod acp;
+pub mod fake;
+pub mod schema;
 
 use std::collections::VecDeque;
 use std::fs;
@@ -427,7 +434,7 @@ impl Client {
                 Ok(_) => {}
                 Err(e) if e.kind() == ErrorKind::ConnectionReset => return None,
                 Err(e) if is_timeout(&e) => {
-                    assert!(Instant::now() < deadline, "no message within {PATIENCE:?}");
+                    assert!(Instant::now() < deadline, "no message in time");
                 }
                 Err(e) => panic!("{e}"),
             }
