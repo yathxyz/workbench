@@ -1467,7 +1467,7 @@ else {
       await sleep(1000);
       const got = acpEvs(AP, id, null, 0, t1).filter(e => /^permission/.test(e.e));
       check('N29: a stale tab that answers a permission after Start new session in another tab toasts "this request belongs to an ended session", and the new session gets nothing',
-        !!fresh && clicked && g.sent.find(m => m?.t === 'permission')?.epoch === old && g.recv.some(m => m?.t === 'error' && m.code === 'stale') && toast && !got.length, JSON.stringify({ fresh: !!fresh, clicked, sent: g.sent.find(m => m?.t === 'permission'), errors: g.recv.filter(m => m?.t === 'error'), toast: await toastOf(S2), got }));
+        !!fresh && clicked && g.sent.find(m => m?.t === 'permission')?.epoch === old && g.recv.some(m => m?.t === 'error' && m.code === 'stale') && toast && !got.length, JSON.stringify({ fresh: !!fresh, clicked, sent: g.sent.find(m => m?.t === 'permission') ?? null, errors: g.recv.filter(m => m?.t === 'error'), toast: await toastOf(S2), got }));
     } finally { await S2.close(); }
   });
   // N39 needs an agent that only SIGKILL ends: `stuck` = wb-fake-acp --scenario kill-stubborn, which ignores EOF and SIGTERM
