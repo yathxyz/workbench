@@ -11,6 +11,10 @@ pub struct OutStream {
 }
 
 impl OutStream {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// The text of `bytes`, after any held tail; `None` if nothing is ready.
     pub fn push(&mut self, bytes: &[u8]) -> Option<String> {
         let joined;
@@ -91,6 +95,11 @@ impl Ring {
     /// The stream offset after the newest byte.
     pub fn end(&self) -> u64 {
         self.end
+    }
+
+    /// The text after stream offset `from`, or `None` if the ring no longer holds it.
+    pub fn since(&self, from: u64) -> Option<String> {
+        todo!("M1-H1: ring text since {from} of {}", self.end)
     }
 
     /// Everything the ring holds.
