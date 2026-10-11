@@ -28,9 +28,9 @@ pub struct Hub {
 impl Hub {
     pub fn start() -> Hub {
         static N: AtomicUsize = AtomicUsize::new(0);
-        // Short and under /tmp: `sun_path` holds 108 bytes.
-        let dir = PathBuf::from(format!(
-            "/tmp/wb-{}-{}",
+        // A short name under `$TMPDIR`: `sun_path` holds 108 bytes.
+        let dir = std::env::temp_dir().join(format!(
+            "wb-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
