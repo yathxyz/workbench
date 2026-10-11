@@ -4,6 +4,7 @@
 //! `pre_exec` closure.
 #![deny(unsafe_code)]
 
+mod acp;
 mod config;
 mod conn;
 mod env;
