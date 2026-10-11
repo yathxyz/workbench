@@ -1,0 +1,5 @@
+$ tui --inline\r\n
+first line\r\n
+second line\r\n
+\e[?2004h\e[?1003h\e[?1005h\e[?1h\e=\e[?25l\e[?1004h
+\e[10;20Hplaced\e[4;38;2;9;99;199m

@@ -1,0 +1,29 @@
+$ printf colours\r\n
+\e[31mred\e[m \e[1;32mbold green\e[m \e[2mdim\e[m \e[3mitalic\e[m \e[4munderline\e[m \e[7minverse\e[m\r\n
+\e[38;5;208m256 orange\e[m \e[48;5;24m256 background\e[m \e[91mbright red\e[m \e[104mbright blue background\e[m\r\n
+\e[38;2;255;100;0mtruecolor\e[m \e[48;2;0;64;128mtruecolor background\e[m \e[1;3;4;38;2;1;2;3;48;2;250;251;252mall at once\e[m\r\n
+\e[38;2;0;255;128mgradient row 00\e[m \e[48;5;232m shade \e[m\r\n
+\e[38;2;16;239;128mgradient row 01\e[m \e[48;5;233m shade \e[m\r\n
+\e[38;2;32;223;128mgradient row 02\e[m \e[48;5;234m shade \e[m\r\n
+\e[38;2;48;207;128mgradient row 03\e[m \e[48;5;235m shade \e[m\r\n
+\e[38;2;64;191;128mgradient row 04\e[m \e[48;5;236m shade \e[m\r\n
+\e[38;2;80;175;128mgradient row 05\e[m \e[48;5;237m shade \e[m\r\n
+\e[38;2;96;159;128mgradient row 06\e[m \e[48;5;238m shade \e[m\r\n
+\e[38;2;112;143;128mgradient row 07\e[m \e[48;5;239m shade \e[m\r\n
+\e[38;2;128;127;128mgradient row 08\e[m \e[48;5;240m shade \e[m\r\n
+\e[38;2;144;111;128mgradient row 09\e[m \e[48;5;241m shade \e[m\r\n
+\e[38;2;160;95;128mgradient row 10\e[m \e[48;5;242m shade \e[m\r\n
+\e[38;2;176;79;128mgradient row 11\e[m \e[48;5;243m shade \e[m\r\n
+\e[38;2;192;63;128mgradient row 12\e[m \e[48;5;244m shade \e[m\r\n
+\e[38;2;208;47;128mgradient row 13\e[m \e[48;5;245m shade \e[m\r\n
+\e[38;2;224;31;128mgradient row 14\e[m \e[48;5;246m shade \e[m\r\n
+\e[38;2;240;15;128mgradient row 15\e[m \e[48;5;247m shade \e[m\r\n
+$ echo wide\r\n
+漢字かな交じり文 한국어 😀🎉 ｗｉｄｅ\r\n
+combining: é ñ ä\r\n
+\e[1;38;2;200;0;200m粗体の漢字\e[m|after\r\n
+a row whose background runs to the edge\e[44m\e[K\e[m\r\n
+tab\tstop\tnext\r\n
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx漢\r\n
+\e[43myyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\e[m\r\n
+$ \e[1;33m

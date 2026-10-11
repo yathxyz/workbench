@@ -1,0 +1,17 @@
+a0\r\n
+a1\r\n
+a2\r\n
+a3\r\n
+a4\r\n
+BBBBBBBBBBBBBBBBBBB5bbbbbbbbb6\r\n
+c7\r\n
+CCCCCCCCCCCCCCCCCCC8   x9\r\n
+DDDDDDDDDDDDDDDDDD10\r\n
+d11\r\n
+d12\r\n
+d13\r\n
+EEEEEEEEEEEEEEEEEE14eeeeeeeeeeeee15\r\n
+FFFFFFFFFFFFFFFFFF16  f17\r\n
+g18\r\n
+g19\r\n
+$ 
