@@ -1,0 +1,25 @@
+# The harness's test Caddy with the sign-in expired: API and WebSocket requests get the 302 to
+# /oauth2/sign_in that the fleet's forward_auth block sends. Static files are still served, so
+# a page can boot and show its signed-out state. Same sockets as live.Caddyfile.
+{
+	admin unix/caddy-admin.sock
+	auto_https off
+	persist_config off
+}
+
+http://127.0.0.1:18443 {
+	bind unix/caddy.sock|0600
+	@app path /api/* /pty /acp /rpc
+	handle /oauth2/* {
+		respond "signed in" 200
+	}
+	handle @app {
+		redir * /oauth2/sign_in 302
+	}
+	handle {
+		reverse_proxy 127.0.0.1:18090 {
+			header_up X-Workbench-Proxy-Secret {env.CADDY_UPSTREAM_SECRET_WORKBENCH}
+			stream_close_delay 5m
+		}
+	}
+}

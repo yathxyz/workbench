@@ -1,0 +1,26 @@
+# The harness's test Caddy answering API and WebSocket requests with a 200 HTML login page, as
+# a misrouted identity provider would. Static files are still served. Same sockets as
+# live.Caddyfile.
+{
+	admin unix/caddy-admin.sock
+	auto_https off
+	persist_config off
+}
+
+http://127.0.0.1:18443 {
+	bind unix/caddy.sock|0600
+	@app path /api/* /pty /acp /rpc
+	handle /oauth2/* {
+		respond "signed in" 200
+	}
+	handle @app {
+		header Content-Type "text/html; charset=utf-8"
+		respond "<!doctype html><title>Sign in</title><form method=post action=/oauth2/sign_in><button>Sign in</button></form>" 200
+	}
+	handle {
+		reverse_proxy 127.0.0.1:18090 {
+			header_up X-Workbench-Proxy-Secret {env.CADDY_UPSTREAM_SECRET_WORKBENCH}
+			stream_close_delay 5m
+		}
+	}
+}

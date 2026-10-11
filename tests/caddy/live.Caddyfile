@@ -1,19 +1,22 @@
-# Test Caddy for tests/harness.py: the same header_up line the deployed proxy uses. The secret
-# is read from Caddy's environment on every request, so it never appears in this file.
-#
-# Caddy listens only on a 0600 unix socket inside the harness's 0700 directory. A TCP
-# listener would add the secret for every local user (and every host that can reach the
-# port), so only the harness user can reach it; a browser gets there through
-# `ssh -L 18443:<socket> <host>`, which keeps Host and Origin at 127.0.0.1:18443.
+# The harness's test Caddy, normal mode: it injects the proxy secret, as the fleet vhost does.
+# Caddy runs in the harness's temporary directory, so the relative socket paths land there.
+# expired.Caddyfile and loginpage.Caddyfile keep the same sockets, so `caddy reload` through the
+# admin socket swaps between the three without dropping the listener.
 {
-	admin unix/{$WB_CADDY_ADMIN}
+	admin unix/caddy-admin.sock
 	auto_https off
 	persist_config off
 }
 
 http://127.0.0.1:18443 {
-	bind unix/{$WB_CADDY_SOCKET}|0600
-	reverse_proxy 127.0.0.1:18090 {
-		header_up X-Workbench-Proxy-Secret {env.CADDY_UPSTREAM_SECRET_WORKBENCH}
+	bind unix/caddy.sock|0600
+	handle /oauth2/* {
+		respond "signed in" 200
+	}
+	handle {
+		reverse_proxy 127.0.0.1:18090 {
+			header_up X-Workbench-Proxy-Secret {env.CADDY_UPSTREAM_SECRET_WORKBENCH}
+			stream_close_delay 5m
+		}
 	}
 }
