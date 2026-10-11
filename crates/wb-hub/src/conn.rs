@@ -315,7 +315,18 @@ impl Conn {
                 self.to_session(rid, sid, |reply| Cmd::Capture { lines, reply })
                     .await;
             }
-            HubRequest::Unknown => {
+            HubRequest::AcpOpen { .. }
+            | HubRequest::AcpDetach { .. }
+            | HubRequest::AcpPrompt { .. }
+            | HubRequest::AcpCancel { .. }
+            | HubRequest::AcpPermission { .. }
+            | HubRequest::AcpElicitation { .. }
+            | HubRequest::AcpSetMode { .. }
+            | HubRequest::AcpSeen { .. }
+            | HubRequest::AcpRevive { .. }
+            | HubRequest::AcpAuthenticate { .. }
+            | HubRequest::AcpKill { .. }
+            | HubRequest::Unknown => {
                 self.error(
                     rid,
                     None,

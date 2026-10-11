@@ -4,6 +4,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use wb_proto::hub::*;
+use wb_proto::journal::EventBody;
 use wb_proto::line;
 
 /// Parses `json` as `T`, encodes it again with `line::encode`, and asserts that the
@@ -578,14 +579,11 @@ fn pty_and_watch_events() {
 
 #[test]
 fn unknown_t_is_unknown() {
-    let req: HubRequest = serde_json::from_str(
-        r#"{"t":"acp.open","rid":5,"sid":"n_1","since":0,"spawn":{"agent":"claude","cwd":"/"}}"#,
-    )
-    .unwrap();
+    let req: HubRequest =
+        serde_json::from_str(r#"{"t":"acp.fork","rid":5,"sid":"n_1","into":"n_2"}"#).unwrap();
     assert_eq!(req, HubRequest::Unknown);
     let msg: HubMessage =
-        serde_json::from_str(r#"{"t":"acp.ev","sid":"n_1","ev":{"seq":1,"ts":2,"e":"spawn"}}"#)
-            .unwrap();
+        serde_json::from_str(r#"{"t":"acp.usage","sid":"n_1","tokens":{"used":1}}"#).unwrap();
     assert_eq!(msg, HubMessage::Unknown);
 }
 
@@ -665,4 +663,328 @@ fn unknown_enum_values_are_unknown() {
 fn missing_rid_is_an_error() {
     assert!(serde_json::from_str::<HubRequest>(r#"{"t":"list"}"#).is_err());
     assert!(serde_json::from_str::<HubRequest>(r#"{"rid":1}"#).is_err());
+}
+
+fn session_info_full() -> Value {
+    json!({
+        "protocolVersion": 1,
+        "agentInfo": {"name": "claude-agent-acp", "version": "0.9.0"},
+        "agentCapabilities": {"loadSession": true,
+                              "promptCapabilities": {"image": true, "audio": false,
+                                                     "embeddedContext": true},
+                              "sessionCapabilities": {"resume": {}, "close": {}}},
+        "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true},
+        "authMethods": [{"id": "login", "name": "Log in", "description": null}],
+        "modes": {"currentModeId": "default",
+                  "availableModes": [{"id": "default", "name": "Default"},
+                                     {"id": "plan", "name": "Plan", "description": "Read only"}]},
+        "availableCommands": [{"name": "review", "description": "Review the diff", "input": null}],
+        "plan": {"entries": [{"content": "Fix it", "priority": "high", "status": "in_progress"}]},
+        "usage": {"used": 1200, "size": 200000, "cost": null}
+    })
+}
+
+fn session_info_empty() -> Value {
+    json!({
+        "protocolVersion": null, "agentInfo": null, "agentCapabilities": null,
+        "promptCapabilities": null, "authMethods": null, "modes": null,
+        "availableCommands": null, "plan": null, "usage": null
+    })
+}
+
+#[test]
+fn acp_session_info() {
+    let info: AcpSessionInfo = round_trip(session_info_full());
+    assert_eq!(info.protocol_version, Some(1));
+    assert_eq!(info.prompt_capabilities.unwrap()["image"], true);
+    assert_eq!(info.modes.unwrap()["availableModes"][1]["id"], "plan");
+
+    let info: AcpSessionInfo = round_trip(session_info_empty());
+    assert_eq!(info, AcpSessionInfo::default());
+    assert_eq!(
+        serde_json::to_value(AcpSessionInfo::default()).unwrap(),
+        session_info_empty()
+    );
+
+    // A peer that sends fewer fields, or more, still parses.
+    let info: AcpSessionInfo =
+        serde_json::from_value(json!({"protocolVersion": 1, "configOptions": []})).unwrap();
+    assert_eq!(
+        info,
+        AcpSessionInfo {
+            protocol_version: Some(1),
+            ..AcpSessionInfo::default()
+        }
+    );
+}
+
+#[test]
+fn acp_open_requests() {
+    let req: HubRequest = round_trip(json!({
+        "t": "acp.open", "rid": 8, "sid": "n_agent1", "since": 0,
+        "spawn": {"agent": "claude", "cwd": "/home/alice/proj/x"}
+    }));
+    assert_eq!(
+        req,
+        HubRequest::AcpOpen {
+            rid: 8,
+            sid: "n_agent1".into(),
+            since: 0,
+            epoch: None,
+            spawn: Some(SpawnAcp {
+                agent: "claude".into(),
+                cwd: "/home/alice/proj/x".into()
+            })
+        }
+    );
+
+    let req: HubRequest = round_trip(json!({
+        "t": "acp.open", "rid": 9, "sid": "n_agent1", "since": 790,
+        "epoch": 1791460000000u64
+    }));
+    assert_eq!(
+        req,
+        HubRequest::AcpOpen {
+            rid: 9,
+            sid: "n_agent1".into(),
+            since: 790,
+            epoch: Some(1791460000000),
+            spawn: None
+        }
+    );
+
+    let req: HubRequest =
+        round_trip(json!({"t": "acp.open", "rid": 10, "sid": "n_agent1", "since": 0}));
+    assert!(matches!(
+        req,
+        HubRequest::AcpOpen {
+            epoch: None,
+            spawn: None,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn acp_open_replies() {
+    let reply = AcpOpenReply {
+        new: false,
+        summary: serde_json::from_value(summary_acp()).unwrap(),
+        session: serde_json::from_value(session_info_full()).unwrap(),
+        head: 815,
+        from: 120,
+        reset: false,
+    };
+    let json = json!({
+        "t": "ok", "rid": 9, "new": false, "summary": summary_acp(),
+        "session": session_info_full(), "head": 815, "from": 120, "reset": false
+    });
+    assert_eq!(
+        serde_json::to_value(HubMessage::ok(9, &reply)).unwrap(),
+        json
+    );
+    let msg: HubMessage = round_trip(json);
+    let HubMessage::Ok { rid: 9, result } = msg else {
+        panic!("{msg:?}")
+    };
+    let back: AcpOpenReply = serde_json::from_value(Value::Object(result)).unwrap();
+    assert_eq!(back, reply);
+
+    let fresh: AcpOpenReply = round_trip(json!({
+        "new": true, "summary": summary_acp_fresh_faulted(), "session": session_info_empty(),
+        "head": 0, "from": 1, "reset": true
+    }));
+    assert!(fresh.new && fresh.reset);
+    assert_eq!(fresh.session, AcpSessionInfo::default());
+}
+
+#[test]
+fn acp_requests() {
+    let blocks = json!([
+        {"type": "text", "text": "Fix the flaky test"},
+        {"type": "resource_link", "uri": "file:///home/alice/proj/x/a.rs", "name": "a.rs"}
+    ]);
+    let req: HubRequest =
+        round_trip(json!({"t": "acp.prompt", "rid": 11, "sid": "n_agent1", "prompt": blocks}));
+    let HubRequest::AcpPrompt { prompt, .. } = req else {
+        panic!("{req:?}")
+    };
+    assert_eq!(prompt.len(), 2);
+    assert_eq!(prompt[0]["text"], "Fix the flaky test");
+
+    let selected = json!({"outcome": "selected", "optionId": "allow"});
+    let req: HubRequest = round_trip(json!({
+        "t": "acp.permission", "rid": 12, "sid": "n_agent1", "req": 812,
+        "epoch": 1791460000000u64, "outcome": selected
+    }));
+    assert_eq!(
+        req,
+        HubRequest::AcpPermission {
+            rid: 12,
+            sid: "n_agent1".into(),
+            req: 812,
+            epoch: 1791460000000,
+            outcome: selected
+        }
+    );
+    round_trip::<HubRequest>(json!({
+        "t": "acp.permission", "rid": 13, "sid": "n_agent1", "req": 812,
+        "epoch": 1791460000000u64, "outcome": {"outcome": "cancelled"}
+    }));
+
+    let accept = json!({"action": "accept", "content": {"branch": "dev", "tags": ["a"]}});
+    let req: HubRequest = round_trip(json!({
+        "t": "acp.elicitation", "rid": 14, "sid": "n_agent1", "req": 813,
+        "epoch": 1791460000000u64, "response": accept
+    }));
+    assert_eq!(
+        req,
+        HubRequest::AcpElicitation {
+            rid: 14,
+            sid: "n_agent1".into(),
+            req: 813,
+            epoch: 1791460000000,
+            response: accept
+        }
+    );
+
+    let sid = || "n_agent1".to_owned();
+    for (json, expected) in [
+        (
+            json!({"t": "acp.detach", "rid": 15, "sid": "n_agent1"}),
+            HubRequest::AcpDetach {
+                rid: 15,
+                sid: sid(),
+            },
+        ),
+        (
+            json!({"t": "acp.cancel", "rid": 16, "sid": "n_agent1"}),
+            HubRequest::AcpCancel {
+                rid: 16,
+                sid: sid(),
+            },
+        ),
+        (
+            json!({"t": "acp.set_mode", "rid": 17, "sid": "n_agent1", "modeId": "plan"}),
+            HubRequest::AcpSetMode {
+                rid: 17,
+                sid: sid(),
+                mode_id: "plan".into(),
+            },
+        ),
+        (
+            json!({"t": "acp.seen", "rid": 18, "sid": "n_agent1", "seq": 815}),
+            HubRequest::AcpSeen {
+                rid: 18,
+                sid: sid(),
+                seq: 815,
+            },
+        ),
+        (
+            json!({"t": "acp.revive", "rid": 19, "sid": "n_agent1"}),
+            HubRequest::AcpRevive {
+                rid: 19,
+                sid: sid(),
+            },
+        ),
+        (
+            json!({"t": "acp.authenticate", "rid": 20, "sid": "n_agent1", "methodId": "login"}),
+            HubRequest::AcpAuthenticate {
+                rid: 20,
+                sid: sid(),
+                method_id: "login".into(),
+            },
+        ),
+        (
+            json!({"t": "acp.kill", "rid": 21, "sid": "n_agent1", "forget": true}),
+            HubRequest::AcpKill {
+                rid: 21,
+                sid: sid(),
+                forget: true,
+            },
+        ),
+        (
+            json!({"t": "acp.kill", "rid": 22, "sid": "n_agent1", "forget": false}),
+            HubRequest::AcpKill {
+                rid: 22,
+                sid: sid(),
+                forget: false,
+            },
+        ),
+    ] {
+        assert_eq!(round_trip::<HubRequest>(json), expected);
+    }
+}
+
+#[test]
+fn acp_requests_need_their_fields() {
+    for line in [
+        r#"{"t":"acp.open","sid":"n_1","since":0}"#,
+        r#"{"t":"acp.open","rid":1,"sid":"n_1"}"#,
+        r#"{"t":"acp.open","rid":1,"sid":"n_1","since":0,"spawn":{"agent":"claude"}}"#,
+        r#"{"t":"acp.prompt","rid":1,"sid":"n_1","prompt":{"type":"text"}}"#,
+        r#"{"t":"acp.permission","rid":1,"sid":"n_1","req":2,"outcome":{"outcome":"cancelled"}}"#,
+        r#"{"t":"acp.elicitation","rid":1,"sid":"n_1","epoch":3,"response":{"action":"cancel"}}"#,
+        r#"{"t":"acp.set_mode","rid":1,"sid":"n_1"}"#,
+        r#"{"t":"acp.seen","rid":1,"sid":"n_1"}"#,
+        r#"{"t":"acp.kill","rid":1,"sid":"n_1"}"#,
+    ] {
+        assert!(serde_json::from_str::<HubRequest>(line).is_err(), "{line}");
+    }
+}
+
+#[test]
+fn acp_events() {
+    let ev = json!({"seq": 812, "ts": 1791460120000u64, "e": "permission",
+                    "toolCall": {"toolCallId": "c1", "title": "Run `rm -rf build`"},
+                    "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]});
+    let msg: HubMessage = round_trip(json!({"t": "acp.ev", "sid": "n_agent1", "ev": ev}));
+    let HubMessage::AcpEv { sid, ev } = msg else {
+        panic!("{msg:?}")
+    };
+    assert_eq!(sid, "n_agent1");
+    assert_eq!(ev.seq, 812);
+    assert!(matches!(ev.body, EventBody::Permission { .. }));
+
+    let msg: HubMessage = round_trip(json!({
+        "t": "acp.replayed", "sid": "n_agent1", "head": 815, "truncated": true
+    }));
+    assert_eq!(
+        msg,
+        HubMessage::AcpReplayed {
+            sid: "n_agent1".into(),
+            head: 815,
+            truncated: true
+        }
+    );
+
+    let msg: HubMessage = round_trip(json!({
+        "t": "acp.info", "sid": "n_agent1", "summary": summary_acp(),
+        "session": session_info_full()
+    }));
+    let HubMessage::AcpInfo {
+        sid,
+        summary,
+        session,
+    } = msg
+    else {
+        panic!("{msg:?}")
+    };
+    assert_eq!(sid, "n_agent1");
+    assert_eq!(summary.acp.unwrap().head_seq, 815);
+    assert_eq!(session.usage.unwrap()["size"], 200000);
+}
+
+/// An `acp.ev` whose event kind this version does not know still arrives, with its
+/// cursor, so a client can skip it and move on.
+#[test]
+fn acp_ev_with_an_unknown_event_kind() {
+    let msg: HubMessage = serde_json::from_str(
+        r#"{"t":"acp.ev","sid":"n_1","ev":{"seq":5,"ts":6,"e":"compaction","tokens":10}}"#,
+    )
+    .unwrap();
+    let HubMessage::AcpEv { ev, .. } = msg else {
+        panic!("{msg:?}")
+    };
+    assert_eq!((ev.seq, ev.ts, ev.body), (5, 6, EventBody::Unknown));
 }

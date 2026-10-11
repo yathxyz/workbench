@@ -5,12 +5,14 @@
 //! [`HubMessage::Ok`] or [`HubMessage::Err`], with the same `rid`. The fields of an `ok`
 //! reply depend on the request, so the client matches the reply by `rid` and decodes its
 //! `result` into the reply type of the request it sent: [`SessionsReply`],
-//! [`PtyOpenReply`], [`CaptureReply`], or nothing for `{}`.
+//! [`PtyOpenReply`], [`CaptureReply`], [`AcpOpenReply`], or nothing for `{}`.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+use crate::journal::JournalEvent;
 
 /// Protocol version carried by both hellos.
 pub const PROTO: u32 = 1;
@@ -62,6 +64,78 @@ pub enum HubRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         lines: Option<u32>,
     },
+    /// Attach to an ACP session, creating it when `spawn` is present and the sid is
+    /// unknown. Reply: [`AcpOpenReply`], then the replay as `acp.ev`, then
+    /// `acp.replayed`, then live events.
+    #[serde(rename = "acp.open")]
+    AcpOpen {
+        rid: u64,
+        sid: String,
+        /// Replay the events after this seq.
+        since: u64,
+        /// The incarnation the client last saw; a different one means `reset`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        epoch: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spawn: Option<SpawnAcp>,
+    },
+    /// Stop events for `sid` on this connection. Reply: `{}`.
+    #[serde(rename = "acp.detach")]
+    AcpDetach { rid: u64, sid: String },
+    /// Send a prompt: ACP content blocks, verbatim. Reply: `{}` once written.
+    #[serde(rename = "acp.prompt")]
+    AcpPrompt {
+        rid: u64,
+        sid: String,
+        prompt: Vec<Value>,
+    },
+    /// Cancel the turn and every pending request. Reply: `{}`.
+    #[serde(rename = "acp.cancel")]
+    AcpCancel { rid: u64, sid: String },
+    /// Answer the permission request `req` with an ACP `RequestPermissionOutcome`,
+    /// verbatim. Reply: `{}`.
+    #[serde(rename = "acp.permission")]
+    AcpPermission {
+        rid: u64,
+        sid: String,
+        req: u64,
+        epoch: u64,
+        outcome: Value,
+    },
+    /// Answer the elicitation `req` with an ACP elicitation response, verbatim.
+    /// Reply: `{}`.
+    #[serde(rename = "acp.elicitation")]
+    AcpElicitation {
+        rid: u64,
+        sid: String,
+        req: u64,
+        epoch: u64,
+        response: Value,
+    },
+    /// Switch the session mode. Reply: `{}` after the agent answers.
+    #[serde(rename = "acp.set_mode")]
+    AcpSetMode {
+        rid: u64,
+        sid: String,
+        mode_id: String,
+    },
+    /// The client has seen the events up to `seq`. Reply: `{}`.
+    #[serde(rename = "acp.seen")]
+    AcpSeen { rid: u64, sid: String, seq: u64 },
+    /// Start the agent again and resume or load its session. Reply: `{}` once started.
+    #[serde(rename = "acp.revive")]
+    AcpRevive { rid: u64, sid: String },
+    /// Run an agent-handled auth method after a failed setup. Reply: `{}` after the
+    /// agent answers.
+    #[serde(rename = "acp.authenticate")]
+    AcpAuthenticate {
+        rid: u64,
+        sid: String,
+        method_id: String,
+    },
+    /// End the agent; with `forget`, also delete the session. Reply: `{}`.
+    #[serde(rename = "acp.kill")]
+    AcpKill { rid: u64, sid: String, forget: bool },
     /// Any request type this version does not know.
     #[serde(other)]
     Unknown,
@@ -126,6 +200,24 @@ pub enum HubMessage {
         code: Option<i32>,
         signal: Option<i32>,
         reason: ExitReason,
+    },
+    /// A journal event of an attached ACP session: the replay, then live.
+    #[serde(rename = "acp.ev")]
+    AcpEv { sid: String, ev: Box<JournalEvent> },
+    /// The replay of an `acp.open` is complete.
+    #[serde(rename = "acp.replayed")]
+    AcpReplayed {
+        sid: String,
+        head: u64,
+        /// The oldest events were dropped to fit `ACP_REPLAY_MAX`.
+        truncated: bool,
+    },
+    /// An attached ACP session's Summary or session info changed.
+    #[serde(rename = "acp.info")]
+    AcpInfo {
+        sid: String,
+        summary: Box<Summary>,
+        session: Box<AcpSessionInfo>,
     },
     /// A session's Summary changed (sent to watchers).
     #[serde(rename = "session")]
@@ -234,6 +326,15 @@ pub struct SpawnPty {
     /// Extra environment, at most 32 entries; cannot override keys the hub sets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<BTreeMap<String, String>>,
+}
+
+/// How to start an ACP agent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnAcp {
+    /// A name from the hub's agent table.
+    pub agent: String,
+    /// Absolute path of an existing directory.
+    pub cwd: String,
 }
 
 /// Where a viewer's terminal stopped: honoured if `stream` matches and the ring still
@@ -428,6 +529,47 @@ pub struct PtyOpenReply {
     pub resumed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replay: Option<String>,
+}
+
+/// The latest materialised ACP values of a session, so a card is usable even when the
+/// replay was truncated. Every field is null until known; all but `protocolVersion`
+/// are verbatim ACP values.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpSessionInfo {
+    /// From the `initialize` result.
+    pub protocol_version: Option<u64>,
+    /// From the `initialize` result.
+    pub agent_info: Option<Value>,
+    /// From the `initialize` result.
+    pub agent_capabilities: Option<Value>,
+    /// `agentCapabilities.promptCapabilities` of the `initialize` result.
+    pub prompt_capabilities: Option<Value>,
+    /// From the `initialize` result.
+    pub auth_methods: Option<Value>,
+    /// The session's modes, with the current mode id.
+    pub modes: Option<Value>,
+    /// The last `available_commands_update`.
+    pub available_commands: Option<Value>,
+    /// The last `plan` update.
+    pub plan: Option<Value>,
+    /// The last `usage_update`.
+    pub usage: Option<Value>,
+}
+
+/// `ok` reply fields of `acp.open`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AcpOpenReply {
+    /// The session was created by this request.
+    pub new: bool,
+    pub summary: Summary,
+    pub session: AcpSessionInfo,
+    /// The head seq the replay runs up to.
+    pub head: u64,
+    /// The first seq the replay covers.
+    pub from: u64,
+    /// The replay starts from seq 1 and the client must drop what it holds.
+    pub reset: bool,
 }
 
 /// `ok` reply fields of `pty.capture`.
