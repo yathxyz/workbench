@@ -1117,9 +1117,11 @@ async function acpSay(p, id, text) {   // the composer, as a user types it
 }
 // A second page whose /acp sockets pass through a route: `hold` keeps server frames back until release(), `refuse` closes
 // new sockets 1011 at once, kick() drops the open ones with 1011, and drop(frame) keeps a page frame from the server.
+// rpcDrop(frame) keeps a server frame on /rpc from the page.
 async function gatedPage() {
   const P = await ctx.newPage(); watchErrors(P);
-  const g = { hold: false, refuse: false, drop: () => false, sent: [], recv: [], socks: [] };
+  const g = { hold: false, refuse: false, drop: () => false, rpcDrop: () => false, sent: [], recv: [], socks: [] };
+  await P.routeWebSocket(/\/rpc$/, ws => { const server = ws.connectToServer(); server.onMessage(m => { if (!g.rpcDrop(JSON.parse(m))) ws.send(m); }); });
   const code = c => ([1005, 1006, 1015].includes(c) ? 1011 : c || 1000);   // codes a close frame cannot carry
   await P.routeWebSocket(/\/acp$/, ws => {
     if (g.refuse) return void ws.close({ code: 1011 });
@@ -1233,24 +1235,29 @@ await section('acp mocked', async () => {
 if (!STUB) for (const n of ['N17', 'N18', 'N19', 'N20', 'N21', 'N22', 'N23', 'N24', 'N25', 'N27', 'N28', 'N29', 'N39', 'N41', 'N42']) skip(n, 'no stub agent in /api/info.agents (wb-fake-acp registered as `stub` in the test hub)');
 else {
   await section('N17', async () => {
-    await AP.evaluate(() => {   // every text the new card's badge shows, from its first paint
-      const seen = window.__n17b = [];
-      window.__n17o = new MutationObserver(() => { const b = document.querySelector('.node.k-acp .badge'); if (b && seen.at(-1) !== b.textContent) seen.push(b.textContent); });
+    await AP.evaluate(() => {   // every text each acp card's badge shows, from its first paint, by card id
+      const seen = window.__n17b = {};
+      window.__n17o = new MutationObserver(() => {
+        for (const n of document.querySelectorAll('.node.k-acp')) { const b = n.querySelector('.badge'), s = seen[n.dataset.id] ||= []; if (b && s.at(-1) !== b.textContent) s.push(b.textContent); }
+      });
       window.__n17o.observe(document.body, { childList: true, subtree: true, characterData: true });
     });
     const id = AID = await acpNew(AP);
     await until(async () => { const v = await acpView(AP, id); return v?.promptable && v.tx === 'idle'; }, 20000);
-    const seen = await AP.evaluate(() => { window.__n17o.disconnect(); return window.__n17b.map(t => t.split(' · ').at(-1)); }), open = acpWs(AP, id)[0]?.open;
+    const seen = await AP.evaluate(id => { window.__n17o.disconnect(); return (window.__n17b[id] || []).map(t => t.split(' · ').at(-1)); }, id), open = acpWs(AP, id)[0]?.open;
     check('N17: newAgentCard opens with agent and cwd from since 0, and the badge goes … → idle', open?.agent === 'stub' && open?.cwd === ACWD && open?.since === 0 && seen[0] === '…' && seen.at(-1) === 'idle', JSON.stringify({ open, seen }));
     // A page takes the focus, so the turn's end stays done until the card is looked at.
     const nb = await AP.evaluate(() => { const C = window.__canvas, b = C.addNode({ kind: 'buffer', name: 'n17', x: 3000, y: 3000, w: 300, h: 200, text: '# n17' }); C.jumpNode(b); return b.id; });
     await AP.evaluate(id => { const b = window.__canvas.live[id].hdr.querySelector('.badge'); window.__n17 = []; new MutationObserver(() => window.__n17.push(b.className)).observe(b, { attributes: true }); }, id);
-    const v0 = await acpView(AP, id), seen0 = acpSent(AP, id, 'seen').length;
+    const v0 = await acpView(AP, id), seen0 = acpSent(AP, id, 'seen').length, recv0 = acpWs(AP, id).map(w => w.recv.length);
     await AP.evaluate(id => window.__canvas.live[id].backend.input('stream\r'), id);
     const done = await until(async () => { const v = await acpView(AP, id); return v.st === 'done' ? v : null; }, 20000, 50);
     await sleep(500);
+    // The three chunks come at once and the card paints once per frame (30 §1.3), so `running` is checked in the info
+    // frames the card took (its state is info.state) and `done` in the painted badge.
+    const infos = acpWs(AP, id).flatMap((w, i) => w.recv.slice(recv0[i] || 0)).filter(f => f.t === 'info').map(f => f.info?.state).filter((s, i, a) => s !== a[i - 1]);
     const states = await AP.evaluate(() => [...new Set(window.__n17)]), chunks = acpEvs(AP, id, 'update', v0.seq).filter(e => e.update?.sessionUpdate === 'agent_message_chunk').length, noSeen = acpSent(AP, id, 'seen').length === seen0;
-    check('N17: "stream" renders its chunks in one .ag-asst item, and the turn goes running → done while the card is not looked at', !!done && done.asst === v0.asst + 1 && chunks >= 2 && states.includes('badge st-running') && states.includes('badge st-done') && noSeen, JSON.stringify({ states, asst: [v0.asst, done?.asst], chunks, noSeen }));
+    check('N17: "stream" renders its chunks in one .ag-asst item, and the turn goes running → done while the card is not looked at', !!done && done.asst === v0.asst + 1 && chunks >= 2 && infos.indexOf('running') >= 0 && infos.indexOf('running') < infos.lastIndexOf('done') && states.includes('badge st-done') && noSeen, JSON.stringify({ infos, states, asst: [v0.asst, done?.asst], chunks, noSeen }));
     await AP.evaluate(id => window.__canvas.jumpNode(window.__canvas.S.nodes[id]), id);
     const idle = await until(async () => { const v = await acpView(AP, id); return v.st === 'idle' ? v : null; }, 10000);
     const sent = acpSent(AP, id, 'seen');
@@ -1304,6 +1311,8 @@ else {
       };
       const props = Object.entries(schema.properties || {});
       for (const [k, p] of props) if (!need.has(k)) fill(k, p);
+      // A required enum has no empty option, so it starts on its first choice (30 §1.4); clear it to see Accept wait.
+      for (const k of need) { const sel = box.querySelector(`.fld[data-key="${CSS.escape(k)}"] select`); if (sel) { sel.selectedIndex = -1; fire(sel); } }
       const before = acc.disabled;
       for (const [k, p] of props) if (need.has(k)) fill(k, p);
       const after = acc.disabled; acc.click();
@@ -1376,8 +1385,9 @@ else {
   await section('N23', async () => {
     const id = AID, before = (await acpIdle(AP, id))?.items || [];
     if (!await hubCtl('stop')) return skip('N23', 'the harness did not acknowledge "stop hub"');
-    await sleep(1000); await hubCtl('start');
-    const v = await until(async () => { const v = await acpView(AP, id); return v.revive && (v.st === 'detached' || v.st === 'error') ? v : null; }, 40000);
+    await sleep(1000); const t1 = Date.now(); await hubCtl('start');
+    // ↻ shows from the exit the card saw before the stop; it revives only once the card is attached to the new hub.
+    const v = await until(async () => { const v = await acpView(AP, id); return v.revive && (v.st === 'detached' || v.st === 'error') && acpWs(AP, id, t1).some(w => w.hello && !w.closed) ? v : null; }, 40000);
     await AP.evaluate(id => window.__canvas.live[id].revive.click(), id);
     const back = await until(async () => { const v = await acpView(AP, id); return v.alive && v.promptable ? v : null; }, 30000);
     const intact = !!back && before.length > 0 && before.every((x, i) => back.items[i] === x);
@@ -1437,7 +1447,10 @@ else {
       await acpSay(AP, id, 'perm');
       await until(async () => (await acpView(S2, id)).perm === 1 && (await acpView(AP, id)).perm === 1, 15000);
       const old = (await acpView(S2, id)).epoch;
-      g.refuse = true; g.kick();   // the stale tab loses its socket and stays off while the other tab starts a new session
+      // The stale tab loses its socket and stays off while the other tab starts a new session; /rpc's `gone` would tell
+      // it first (ROB-19), so it is held back here and the answer reaches the hub's epoch check.
+      g.rpcDrop = m => m.t === 'gone' && m.sid === id;
+      g.refuse = true; g.kick();
       await until(() => S2.evaluate(id => window.__canvas.live[id].el.classList.contains('net-wait'), id), 5000);
       const t1 = Date.now();
       await AP.evaluate(id => { const C = window.__canvas; C.jumpNode(C.S.nodes[id]); C.CMDS.find(c => c.l.startsWith('Agent: start a new session')).run(); }, id);

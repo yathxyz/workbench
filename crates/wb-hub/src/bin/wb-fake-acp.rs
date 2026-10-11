@@ -557,7 +557,7 @@ impl Fake {
     }
 
     fn stream_turn(&mut self) -> &'static str {
-        let id = self.message_id();
+        let id = self.turn_id("msg");
         for part in ["Streaming ", "three ", "chunks."] {
             self.chunk("agent_message_chunk", &id, part);
         }
@@ -565,7 +565,7 @@ impl Fake {
     }
 
     async fn tool_turn(&mut self) -> &'static str {
-        let call = format!("tool-{}", self.turn);
+        let call = self.turn_id("tool");
         let path = format!("{}/notes.txt", self.cwd.trim_end_matches('/'));
         self.update(json!({
             "sessionUpdate": "tool_call", "toolCallId": call, "title": "Edit notes.txt",
@@ -584,7 +584,7 @@ impl Fake {
     }
 
     async fn permission_turn(&mut self) -> &'static str {
-        let call = format!("call-{}", self.turn);
+        let call = self.turn_id("call");
         let tool = json!({"toolCallId": call, "title": "Run `rm -rf build`", "kind": "execute", "status": "pending"});
         let mut announce = tool.clone();
         announce["sessionUpdate"] = "tool_call".into();
@@ -605,7 +605,7 @@ impl Fake {
     }
 
     async fn ask_permission_turn(&mut self) -> &'static str {
-        let tool = json!({"toolCallId": format!("call-{}", self.turn), "title": "Reply with PONG",
+        let tool = json!({"toolCallId": self.turn_id("call"), "title": "Reply with PONG",
                           "kind": "think", "status": "pending"});
         let params = self.permission_params(tool);
         let answer = self.ask("session/request_permission", params).await;
@@ -667,7 +667,7 @@ impl Fake {
     }
 
     async fn slow_turn(&mut self) -> &'static str {
-        let id = self.message_id();
+        let id = self.turn_id("msg");
         for i in 1..=300 {
             if self.cancelled {
                 break;
@@ -686,7 +686,7 @@ impl Fake {
                 &format!("before {i}"),
             );
         }
-        let tool = json!({"toolCallId": format!("call-{}", self.turn), "title": "Run `make check`",
+        let tool = json!({"toolCallId": self.turn_id("call"), "title": "Run `make check`",
                           "kind": "execute", "status": "pending"});
         let params = self.permission_params(tool);
         let id = self.request("session/request_permission", params);
@@ -706,7 +706,7 @@ impl Fake {
 
     async fn agent_cancels_turn(&mut self) -> &'static str {
         let id = json!(format!("perm-{}", self.turn));
-        let tool = json!({"toolCallId": format!("call-{}", self.turn), "title": "Delete the cache",
+        let tool = json!({"toolCallId": self.turn_id("call"), "title": "Delete the cache",
                           "kind": "delete", "status": "pending"});
         let params = self.permission_params(tool);
         self.request_as(id.clone(), "session/request_permission", params);
@@ -717,7 +717,7 @@ impl Fake {
     }
 
     fn crash_turn(&mut self) -> &'static str {
-        let tool = json!({"toolCallId": format!("call-{}", self.turn), "title": "Run `make`",
+        let tool = json!({"toolCallId": self.turn_id("call"), "title": "Run `make`",
                           "kind": "execute", "status": "pending"});
         let params = self.permission_params(tool);
         self.request("session/request_permission", params);
@@ -747,7 +747,7 @@ impl Fake {
         let mut asked = None;
         for m in 0..LARGE_MESSAGES {
             if m == LARGE_PIN_AFTER {
-                let tool = json!({"toolCallId": format!("call-{}", self.turn), "title": "Run `make dist`",
+                let tool = json!({"toolCallId": self.turn_id("call"), "title": "Run `make dist`",
                                   "kind": "execute", "status": "pending"});
                 let params = self.permission_params(tool);
                 asked = Some(self.request("session/request_permission", params));
@@ -814,13 +814,15 @@ impl Fake {
         })
     }
 
-    fn message_id(&self) -> String {
-        format!("msg-{}", self.turn)
+    /// This turn's message or tool call id. ACP ids are unique within a session, and a
+    /// revived session's new process counts turns from 1 again, so the pid is in it.
+    fn turn_id(&self, kind: &str) -> String {
+        format!("{kind}-{}-{}", std::process::id(), self.turn)
     }
 
     /// One chunk of this turn's agent message.
     fn say(&mut self, text: &str) {
-        let id = self.message_id();
+        let id = self.turn_id("msg");
         self.chunk("agent_message_chunk", &id, text);
     }
 
