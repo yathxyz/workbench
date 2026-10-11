@@ -1139,11 +1139,11 @@ async function gatedPage() {
   await P.goto(ORIGIN + '/'); await until(() => P.evaluate(() => window.__canvas?.BOOTED));
   return { P, g };
 }
-let AP = null, AID = null, STUB = false, STUCK = false;
+let AP = null, AID = null, STUB = false, STUCK = false, RECONNECT = false;
 await section('acp boot', async () => {
   AP = await dpage();
   st = await AP.evaluate(() => ({ agents: (window.__canvas.INFO?.agents || []).map(a => a.name), off: document.querySelector('#add-acp').disabled }));
-  STUB = st.agents.includes('stub'); STUCK = st.agents.includes('stuck');
+  STUB = st.agents.includes('stub'); STUCK = st.agents.includes('stuck'); RECONNECT = st.agents.includes('reconnect');
   check('fix 1: the Agent button is enabled exactly when the server lists agents', st.off === !st.agents.length, JSON.stringify(st));
 });
 // N26 needs no agent: a board acp card mounts, and opens (if the server has /acp) without spawn fields
@@ -1445,17 +1445,30 @@ else {
     await AP.evaluate(pg => window.__canvas.removeNode(pg), pg);
   });
   await section('N23', async () => {
-    const id = AID, before = (await acpIdle(AP, id))?.items || [];
-    if (!await hubCtl('stop')) return skip('N23', 'the harness did not acknowledge "stop hub"');
+    const id = AID, name = await AP.evaluate(id => window.__canvas.S.nodes[id].name, id), before = (await acpIdle(AP, id))?.items || [];
+    // A page takes the focus, so the interrupted turn stays unseen until the card is looked at.
+    const nb = await AP.evaluate(() => { const C = window.__canvas, b = C.addNode({ kind: 'buffer', name: 'n23', x: 3000, y: 3000, w: 300, h: 200, text: '# n23' }); C.jumpNode(b); return b.id; });
+    const seen0 = acpSent(AP, id, 'seen').length;
+    await AP.evaluate(id => window.__canvas.live[id].backend.input('slow\r'), id);
+    const turn = await until(async () => (await acpView(AP, id)).activity === 'turn', 15000);
+    if (!await hubCtl('stop')) { await AP.evaluate(nb => window.__canvas.removeNode(nb), nb); return skip('N23', 'the harness did not acknowledge "stop hub"'); }
     await sleep(1000); const t1 = Date.now(); await hubCtl('start');
-    // ↻ shows from the exit the card saw before the stop; it revives only once the card is attached to the new hub.
-    const v = await until(async () => { const v = await acpView(AP, id); return v.revive && (v.st === 'detached' || v.st === 'error') && acpWs(AP, id, t1).some(w => w.hello && !w.closed) ? v : null; }, 40000);
+    // ↻ shows from the exit the card saw before the stop; the state is read once the card is attached to the new hub.
+    const err = await until(async () => { const v = await acpView(AP, id); return v.st === 'error' && v.revive && acpWs(AP, id, t1).some(w => w.hello && !w.closed) ? v : null; }, 40000);
+    const head = await AP.evaluate(id => window.__canvas.live[id].backend.sum?.acp?.headSeq, id), last = acpEvs(AP, id, 'turn_error').at(-1);
+    const attn = await AP.evaluate(id => window.__canvas.attnItems().filter(i => i.key === id).map(i => i.name), id), unseen = acpSent(AP, id, 'seen').length === seen0;
+    check('N23: a mid-turn hub restart shows error (interrupted) with ↻ and "failed" in Attention while the card is not looked at, and sends no seen',
+      turn && !!err && last?.code === 'interrupted' && attn.includes(name + ' failed') && unseen, JSON.stringify({ turn, st: (await acpView(AP, id))?.st, last, attn, unseen }));
+    await AP.evaluate(id => window.__canvas.jumpNode(window.__canvas.S.nodes[id]), id);
+    const det = await until(async () => { const v = await acpView(AP, id); return v.st === 'detached' && v.revive ? v : null; }, 10000), seen = acpSent(AP, id, 'seen');
+    check('N23: once the card is looked at, seen goes with the head seq and the state becomes detached with ↻', !!det && seen.length === seen0 + 1 && seen.at(-1).seq === head, JSON.stringify({ st: (await acpView(AP, id))?.st, seen, head }));
     await AP.evaluate(id => window.__canvas.live[id].revive.click(), id);
     const back = await until(async () => { const v = await acpView(AP, id); return v.alive && v.promptable ? v : null; }, 30000);
     const intact = !!back && before.length > 0 && before.every((x, i) => back.items[i] === x);
     if (back) await acpSay(AP, id, 'stream');
     const more = back && await until(async () => { const v = await acpView(AP, id); return v.asst > back.asst && v.promptable ? v : null; }, 20000);
-    check('N23: after a hub restart the card is detached or interrupted with ↻; ↻ revives it with its transcript, and a new prompt works', !!v && acpSent(AP, id, 'revive').length >= 1 && intact && !!more, JSON.stringify({ st: v?.st, revive: v?.revive, intact, before: before.length, after: back?.items.length, more: !!more }));
+    check('N23: ↻ revives it with its transcript, and a new prompt works', !!det && acpSent(AP, id, 'revive').length >= 1 && intact && !!more, JSON.stringify({ intact, before: before.length, after: back?.items.length, more: !!more }));
+    await AP.evaluate(nb => window.__canvas.removeNode(nb), nb);
   });
   await section('N25', async () => {
     const id = AID, epoch = (await acpIdle(AP, id))?.epoch;
@@ -1472,20 +1485,27 @@ else {
       r.status === 204 && /running without a card$/.test(item?.name || '') && item.attn === 'bad' && item.meta === ACWD && !!w && !('agent' in w.open) && w.hello.info?.createdAt === epoch && await AP.evaluate(id => window.__canvas.S.nodes[id]?.kind === 'acp', id), JSON.stringify({ put: r.status, item, open: w?.open, epoch, got: w?.hello?.info?.createdAt }));
     await acpIdle(AP, id);
   });
+  // N27 needs the request in the middle: `reconnect` = wb-fake-acp --scenario permission-reconnect, whose prompt streams 116
+  // chunks, asks a permission and streams 80 more. In a fresh session: spawn 1, session 2, prompt 3, the request at 120, head 200.
   await section('N27', async () => {
-    const id = AID;
-    for (let i = 0; i < 6; i++) { await acpSay(AP, id, 'stream'); await acpIdle(AP, id); }
-    await acpSay(AP, id, 'perm');
-    await until(async () => (await acpView(AP, id)).perm === 1, 15000); await sleep(500);
-    const head = (await acpView(AP, id)).seq, logOf = () => AP.evaluate(id => [...window.__canvas.live[id].body.querySelectorAll('.ag-log > *')].map(e => e.className + ':' + e.textContent), id), dom0 = await logOf();
-    await settled(AP); await AP.reload(); await until(() => AP.evaluate(() => window.__canvas?.BOOTED));
-    const after = await until(async () => { const v = await acpView(AP, id); return v?.perm === 1 && v.seq >= head ? v : null; }, 20000);
+    if (!RECONNECT) return skip('N27', 'no `reconnect` agent (wb-fake-acp --scenario permission-reconnect) in /api/info.agents');
+    const id = await AP.evaluate(cwd => window.__canvas.addNode({ kind: 'acp', name: 'n27', agent: 'reconnect', cwd, x: 3000, y: 2600, w: 560, h: 520 }).id, ACWD);
+    await acpSay(AP, id, 'go');
+    const pre = await until(async () => { const v = await acpView(AP, id); return v?.perm === 1 && v.seq >= 200 ? v : null; }, 20000);
     await sleep(500);
-    const dom1 = await logOf();
+    const logOf = () => AP.evaluate(id => [...window.__canvas.live[id].body.querySelectorAll('.ag-log > *')].map(e => e.className + ':' + e.textContent), id), dom0 = await logOf();
+    await settled(AP); await AP.reload(); await until(() => AP.evaluate(() => window.__canvas?.BOOTED));
+    const after = await until(async () => { const v = await acpView(AP, id); return v?.perm === 1 && v.seq >= 200 ? v : null; }, 20000);
+    await sleep(500);
+    const dom1 = await logOf(), items = after?.items || [], at = items.findIndex(x => x.startsWith('tool:')), perm = acpEvs(AP, id, 'permission')[0];
+    const inOrder = items.length === 200 && at === 119 && items[at] === 'tool:pending Run `make check`'
+      && items.slice(3, at).every((x, i) => x === 'asst:before ' + (i + 1)) && items.slice(at + 1).every((x, i) => x === 'asst:after ' + (i + 117));
     await acpClick(AP, id, '.ag-perm button[data-kind="allow_once"]');
-    const res = await until(() => acpEvs(AP, id, 'permission_resolved', head)[0], 10000);
-    check('N27: a reload with a pending permission renders every item in order, and the permission panel answers', !!after && dom1.length === dom0.length && dom1.every((t, i) => t === dom0[i]) && res?.by === 'user', JSON.stringify({ n0: dom0.length, n1: dom1.length, at: dom1.findIndex((t, i) => t !== dom0[i]), res }));
-    await acpIdle(AP, id);
+    const res = await until(() => acpEvs(AP, id, 'permission_resolved', 200)[0], 10000);
+    check('N27: a reload with a permission pending at seq 120 of 200 renders all 200 items in order with the request in its place, and the panel answers',
+      !!pre && !!after && perm?.seq === 120 && after.seq === 200 && inOrder && JSON.stringify(items) === JSON.stringify(pre.items) && dom1.length === dom0.length && dom1.every((t, i) => t === dom0[i]) && res?.by === 'user',
+      JSON.stringify({ seq: after?.seq, perm: perm?.seq, n: items.length, at, around: items.slice(at - 1, at + 2), same: JSON.stringify(items) === JSON.stringify(pre?.items), n0: dom0.length, n1: dom1.length, diff: dom1.findIndex((t, i) => t !== dom0[i]), res }));
+    await AP.evaluate(id => window.__canvas.removeNode(id), id); await settled(AP);
   });
   await section('N28', async () => {
     const id = AID, before = await acpIdle(AP, id);
@@ -1497,9 +1517,11 @@ else {
     const r = spawnSync('python3', ['-I', path.join(path.dirname(HARNESS), 'wbctl.py'), '--hub', H.hubSocket, 'raw', JSON.stringify({ t: 'acp.open', rid: 1, sid: id, since: 0, spawn: { agent: 'stub', cwd: ACWD } })], { encoding: 'utf8', timeout: 20000 });
     const t1 = Date.now(); netBack();
     const w = await until(() => acpWs(AP, id, t1).find(w => w.hello), 40000), after = await until(async () => { const v = await acpView(AP, id); return v?.promptable ? v : null; }, 20000);
-    const first = w?.recv.find(m => m.t === 'ev');
+    const first = w?.recv.find(m => m.t === 'ev'), now = await acpView(AP, id), last = Math.max(0, ...(w?.recv || []).filter(m => m.t === 'ev').map(m => m.ev.seq));
     check('N28: a hello with reset (stateDir wiped, the session recreated) clears the card and repopulates its transcript from seq 1',
-      r.status === 0 && w?.hello.reset === true && w.open.epoch === before?.epoch && first?.ev.seq === 1 && !!after && after.epoch !== before.epoch && after.asst === 0 && after.items.length < before.items.length, JSON.stringify({ wbctl: r.status, err: (r.stderr || '').slice(0, 200), reset: w?.hello?.reset, first: first?.ev, before: before?.items.length, after: after?.items }));
+      r.status === 0 && w?.hello.reset === true && w.open.epoch === before?.epoch && first?.ev.seq === 1 && !!after && after.epoch !== before.epoch && after.asst === 0 && after.items.length < before.items.length
+      && after.items.includes('note:agent started') && after.items.includes('note:session ready') && now?.seq === last,
+      JSON.stringify({ wbctl: r.status, err: (r.stderr || '').slice(0, 200), reset: w?.hello?.reset, first: first?.ev, before: before?.items.length, after: after?.items, seq: now?.seq, last }));
   });
   await section('N29', async () => {
     const id = AID; await acpIdle(AP, id); await settled(AP);

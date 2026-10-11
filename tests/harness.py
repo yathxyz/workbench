@@ -28,7 +28,9 @@ sh (/bin/sh) as a second shell for tests.
 Agents: `stub` runs wb-fake-acp (the scripted test agent, the package's `fake` output) from
 --bin-dir, else PATH, without --scenario, so it acts on prompt keywords. `stuck` runs it with
 --scenario kill-stubborn (it ignores stdin EOF and SIGTERM, and its prompts never end), for the
-ui check N39. Test mode refuses to start without it; --dogfood registers no agent.
+ui check N39. `reconnect` runs it with --scenario permission-reconnect (a prompt streams 116
+chunks, asks a permission and streams 80 more), for the ui check N27. Test mode refuses to start
+without it; --dogfood registers no agent.
 
 Test mode (the default) gives the hub a temporary HOME and environment canaries, and exits
 when stdin closes. The stdin lines "stop hub" and "start hub" stop wb-hub (SIGTERM) and start
@@ -151,6 +153,7 @@ class Harness:
             self.agents = {
                 "stub": {"label": "Stub", "argv": [fake], "env": {}},
                 "stuck": {"label": "Stuck", "argv": [fake, "--scenario", "kill-stubborn"], "env": {}},
+                "reconnect": {"label": "Reconnect", "argv": [fake, "--scenario", "permission-reconnect"], "env": {}},
             }
         self.root = Path(tempfile.mkdtemp(prefix="wb-"))
         self.secret = secrets.token_hex(32)
