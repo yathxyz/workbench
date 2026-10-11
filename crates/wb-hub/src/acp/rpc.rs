@@ -82,7 +82,6 @@ pub fn initialize(id: u64) -> Value {
         "clientCapabilities": {
             "fs": {"readTextFile": false, "writeTextFile": false},
             "terminal": false,
-            "auth": {"terminal": false},
             "elicitation": {"form": {}, "url": {}}
         }
     });
@@ -93,14 +92,9 @@ pub fn new_session(id: u64, cwd: &str) -> Value {
     request(id, "session/new", json!({"cwd": cwd, "mcpServers": []}))
 }
 
-/// `mcpServers` is left out: the schema makes it optional for resume and never writes
-/// it empty.
 pub fn resume_session(id: u64, session_id: &str, cwd: &str) -> Value {
-    request(
-        id,
-        "session/resume",
-        json!({"sessionId": session_id, "cwd": cwd}),
-    )
+    let params = json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []});
+    request(id, "session/resume", params)
 }
 
 pub fn load_session(id: u64, session_id: &str, cwd: &str) -> Value {
@@ -170,12 +164,61 @@ mod tests {
 
     use super::*;
 
-    /// H-18: `msg` deserializes into `T` and serializes back to exactly `msg`, so no
-    /// field is misnamed, missing or ignored.
+    /// H-18: `msg` deserializes into `T` and serializes back to the same JSON, so no
+    /// field is misnamed, missing or ignored. The only difference allowed is a default
+    /// the schema writes or leaves out: the schema adds `auth:{terminal:false}` to
+    /// `clientCapabilities` and drops an empty `mcpServers` from `session/resume`.
     fn round_trip<T: DeserializeOwned + Serialize>(msg: &Value) {
         let typed: T = serde_json::from_value(msg.clone())
             .unwrap_or_else(|e| panic!("{msg} does not deserialize: {e}"));
-        assert_eq!(&serde_json::to_value(&typed).unwrap(), msg);
+        let back = serde_json::to_value(&typed).unwrap();
+        assert!(same(msg, &back), "{msg}\n  came back as {back}");
+    }
+
+    /// Equal JSON, except that a key may be on one side only when its value is a
+    /// default.
+    fn same(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Object(a), Value::Object(b)) => {
+                let only = |x: &Map<String, Value>, y: &Map<String, Value>| {
+                    x.iter().all(|(k, v)| y.contains_key(k) || is_default(v))
+                };
+                only(a, b)
+                    && only(b, a)
+                    && a.iter().all(|(k, v)| b.get(k).is_none_or(|w| same(v, w)))
+            }
+            (Value::Array(a), Value::Array(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(v, w)| same(v, w))
+            }
+            _ => a == b,
+        }
+    }
+
+    /// Null, false, an empty array, or an object of only those. An empty object is not
+    /// a default: in ACP capabilities `{}` means supported.
+    fn is_default(v: &Value) -> bool {
+        match v {
+            Value::Null | Value::Bool(false) => true,
+            Value::Array(a) => a.is_empty(),
+            Value::Object(m) => !m.is_empty() && m.values().all(is_default),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn defaults_are_the_only_allowed_difference() {
+        let caps = json!({"terminal": false, "elicitation": {"form": {}}});
+        assert!(same(
+            &caps,
+            &json!({"elicitation": {"form": {}}, "auth": {"terminal": false}})
+        ));
+        assert!(!same(&caps, &json!({"terminal": false, "elicitation": {}})));
+        assert!(!same(
+            &caps,
+            &json!({"terminal": true, "elicitation": {"form": {}}})
+        ));
+        assert!(!same(&json!({"resume": {}}), &json!({})));
+        assert!(!same(&json!({"a": [1]}), &json!({"a": [1, 2]})));
     }
 
     type Req<T> = JsonRpcMessage<Request<T>>;
