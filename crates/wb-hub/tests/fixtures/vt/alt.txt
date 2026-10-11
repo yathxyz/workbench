@@ -1,0 +1,61 @@
+shell line 00 \e[30mcolour 0\e[m\r\n
+shell line 01 \e[31mcolour 1\e[m\r\n
+shell line 02 \e[32mcolour 2\e[m\r\n
+shell line 03 \e[33mcolour 3\e[m\r\n
+shell line 04 \e[34mcolour 4\e[m\r\n
+shell line 05 \e[35mcolour 5\e[m\r\n
+shell line 06 \e[36mcolour 6\e[m\r\n
+shell line 07 \e[37mcolour 7\e[m\r\n
+shell line 08 \e[30mcolour 0\e[m\r\n
+shell line 09 \e[31mcolour 1\e[m\r\n
+shell line 10 \e[32mcolour 2\e[m\r\n
+shell line 11 \e[33mcolour 3\e[m\r\n
+shell line 12 \e[34mcolour 4\e[m\r\n
+shell line 13 \e[35mcolour 5\e[m\r\n
+shell line 14 \e[36mcolour 6\e[m\r\n
+shell line 15 \e[37mcolour 7\e[m\r\n
+shell line 16 \e[30mcolour 0\e[m\r\n
+shell line 17 \e[31mcolour 1\e[m\r\n
+shell line 18 \e[32mcolour 2\e[m\r\n
+shell line 19 \e[33mcolour 3\e[m\r\n
+shell line 20 \e[34mcolour 4\e[m\r\n
+shell line 21 \e[35mcolour 5\e[m\r\n
+shell line 22 \e[36mcolour 6\e[m\r\n
+shell line 23 \e[37mcolour 7\e[m\r\n
+shell line 24 \e[30mcolour 0\e[m\r\n
+shell line 25 \e[31mcolour 1\e[m\r\n
+shell line 26 \e[32mcolour 2\e[m\r\n
+shell line 27 \e[33mcolour 3\e[m\r\n
+shell line 28 \e[34mcolour 4\e[m\r\n
+shell line 29 \e[35mcolour 5\e[m\r\n
+$ \e[1;34medit\e[m notes.txt\r\n
+\e[?1049h\e[22;0;0t\e[?1h\e=\e[?2004h\e[?1002h\e[?1006h\e[?1004h
+\e[H\e[2J\e[1;22r
+\e[1;1H\e[38;5;244m  1 \e[mtext of line 1
+\e[2;1H\e[38;5;244m  2 \e[mtext of line 2
+\e[3;1H\e[38;5;244m  3 \e[mtext of line 3
+\e[4;1H\e[38;5;244m  4 \e[mtext of line 4
+\e[5;1H\e[38;5;244m  5 \e[m\e[1;35mbold\e[m and plain
+\e[6;1H\e[38;5;244m  6 \e[mtext of line 6
+\e[7;1H\e[38;5;244m  7 \e[mtext of line 7
+\e[8;1H\e[38;5;244m  8 \e[mtext of line 8
+\e[9;1H\e[38;5;244m  9 \e[mtext of line 9
+\e[10;1H\e[38;5;244m 10 \e[m\e[1;35mbold\e[m and plain
+\e[11;1H\e[38;5;244m 11 \e[mtext of line 11
+\e[12;1H\e[38;5;244m 12 \e[mtext of line 12
+\e[13;1H\e[38;5;244m 13 \e[mtext of line 13
+\e[14;1H\e[38;5;244m 14 \e[mtext of line 14
+\e[15;1H\e[38;5;244m 15 \e[m\e[1;35mbold\e[m and plain
+\e[16;1H\e[38;5;244m 16 \e[mtext of line 16
+\e[17;1H\e[38;5;244m 17 \e[mtext of line 17
+\e[18;1H\e[38;5;244m 18 \e[mtext of line 18
+\e[19;1H\e[38;5;244m 19 \e[mtext of line 19
+\e[20;1H\e[38;5;244m 20 \e[m\e[1;35mbold\e[m and plain
+\e[21;1H\e[38;5;244m 21 \e[mtext of line 21
+\e[22;1H\e[38;5;244m 22 \e[mtext of line 22
+\e[22;1H\n\n
+\e[21;1H\e[38;5;244m 23 \e[mnew line A
+\e[22;1H\e[38;5;244m 24 \e[mnew line B 漢字
+\e[23;1H\e[7m notes.txt [+]\e[K\e[m
+\e[24;1H-- INSERT --
+\e[5;12H\e[38;5;81m
