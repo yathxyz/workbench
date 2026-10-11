@@ -1172,8 +1172,8 @@ await section('acp mocked', async () => {
     ws.onMessage(m => { let o; try { o = JSON.parse(m); } catch { return; } s.sent.push(o); if (o.t === 'open' && !s.open) { s.open = o; script(s, socks.filter(x => x.open?.id === o.id).length); } else s.on?.(o); });
   });
   const send = (s, ...ms) => { for (const m of ms) s.ws.send(JSON.stringify(m)); };
-  const info = (id, epoch, head, x = {}) => ({ sid: id, kind: 'acp', host: 'h', createdAt: epoch, updatedAt: epoch, alive: true, viewers: 1, cwd: ACWD, state: x.state || 'idle',
-    acp: { agent: 'stub', agentSessionId: 'a', revivable: true, activity: 'none', pending: [], headSeq: head, seenSeq: x.seen ?? head, title: null, modeId: null } });
+  const info = (id, epoch, head, x = {}) => ({ sid: id, kind: 'acp', host: 'h', createdAt: epoch, updatedAt: epoch, alive: x.alive ?? true, viewers: 1, cwd: ACWD, state: x.state || 'idle', ...(x.fault ? { fault: x.fault } : {}),
+    acp: { agent: 'stub', agentSessionId: 'a', revivable: x.revivable ?? true, activity: 'none', pending: x.pending || [], headSeq: head, seenSeq: x.seen ?? head, title: null, modeId: null } });
   const hello = (id, epoch, head, x = {}) => ({ t: 'hello', status: 'attached', info: info(id, epoch, head, x), head, from: x.from ?? 1, reset: !!x.reset });
   const ev = (seq, e, x = {}) => ({ t: 'ev', ev: { seq, ts: seq, e, ...x } });
   const opensOf = id => socks.filter(s => s.open?.id === id);
@@ -1232,6 +1232,62 @@ await section('acp mocked', async () => {
       kill?.forget === true && badges.some(t => /ending…$/.test(t)) && !badges.some(t => /· ended$/.test(t)) && !!fresh && o4?.agent === 'stub' && o4.since === 0 && fresh.items.length === 1, JSON.stringify({ kill, badges, o4, items: fresh?.items }));
     check('§3.4.6 (mocked): a done card that is active in a visible, focused page sends seen with the head seq', seen?.seq === 1, JSON.stringify(opensOf(m2)[3]?.sent));
     await P.evaluate(id => window.__canvas.removeNode(id), m2);
+
+    // ROB-2: a panel left from an ended incarnation never answers the new one's request, even one with the same req
+    const permEv = (seq, title) => ev(seq, 'permission', { toolCall: { toolCallId: 't' + seq, title, kind: 'execute' }, options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }] });
+    const mocked = name => P.evaluate(([name, cwd]) => window.__canvas.addNode({ kind: 'acp', name, agent: 'stub', cwd, x: 3000, y: 3400, w: 560, h: 420, _spawn: false }).id, [name, ACWD]);
+    script = (s, n) => {
+      if (n === 1) send(s, hello(s.open.id, 4000, 2), ev(1, 'spawn', { pid: 4, via: 'new' }), permEv(2, 'Old tool'), { t: 'replayed', head: 2, truncated: false });
+      else send(s, hello(s.open.id, 5000, 2, { reset: true }), ev(1, 'spawn', { pid: 5, via: 'new' }), permEv(2, 'New tool'), { t: 'replayed', head: 2, truncated: false });
+    };
+    const m3 = await mocked('m3');
+    await until(async () => (await acpView(P, m3))?.perm === 1, 5000);
+    await P.evaluate(id => { window.__oldAllow = window.__canvas.live[id].body.querySelector('.ag-perm button[data-kind="allow_once"]'); }, m3);
+    opensOf(m3)[0].ws.close({ code: 1011 });
+    const fresh3 = await until(async () => { const v = await acpView(P, m3); return v.epoch === 5000 && v.perm === 1 ? v : null; }, 10000);
+    const oldGone = await P.evaluate(() => { window.__oldAllow.click(); return !window.__oldAllow.isConnected; });
+    await sleep(300);
+    const leaked = opensOf(m3)[1]?.sent.filter(m => m.t === 'permission') || [];
+    await acpClick(P, m3, '.ag-perm button[data-kind="allow_once"]');
+    const own = await until(() => opensOf(m3)[1]?.sent.find(m => m.t === 'permission'), 5000);
+    check('ROB-2 (mocked): after a hello with reset, a click on the old incarnation\'s panel sends nothing; the new panel answers with the new epoch',
+      !!fresh3 && oldGone && !leaked.length && own?.req === 2 && own.epoch === 5000, JSON.stringify({ fresh: !!fresh3, oldGone, leaked, own }));
+    await P.evaluate(id => window.__canvas.removeNode(id), m3);
+
+    // §3.4.7: an answer lost with its socket can be given again after the reconnect; a request the hub no longer holds goes
+    script = (s, n) => {
+      if (n === 1) { send(s, hello(s.open.id, 6000, 3), ev(1, 'spawn', { pid: 6, via: 'new' }), permEv(2, 'First tool'), permEv(3, 'Second tool'), { t: 'replayed', head: 3, truncated: false }); s.on = o => { if (o.t === 'permission') s.ws.close({ code: 1011 }); }; }
+      else send(s, hello(s.open.id, 6000, 3, { state: 'waiting_permission', pending: [{ req: 2, kind: 'permission', title: 'First tool', ts: 2 }] }), { t: 'replayed', head: 3, truncated: false });
+    };
+    const m4 = await mocked('m4');
+    await until(async () => (await acpView(P, m4))?.perm === 2, 5000);
+    await acpClick(P, m4, '.ag-perm button[data-kind="allow_once"]');
+    const lost = await until(() => opensOf(m4)[0].sent.find(m => m.t === 'permission'), 5000);
+    const panelOf = () => P.evaluate(id => [...window.__canvas.live[id].body.querySelectorAll('.ag-perm')].map(p => p.querySelector('.tt').textContent + (p.classList.contains('sent') ? ' (sent)' : '')), m4);
+    const again = await until(async () => { const ps = await panelOf(); return opensOf(m4).length === 2 && ps.length === 1 && ps[0] === 'First tool' ? ps : null; }, 10000);
+    await acpClick(P, m4, '.ag-perm button[data-kind="allow_once"]');
+    const resent = await until(() => opensOf(m4)[1]?.sent.find(m => m.t === 'permission'), 5000);
+    check('§3.4.7 (mocked): an answer lost with its socket can be given again after the reconnect, and a request the hub no longer holds goes',
+      lost?.req === 2 && !!again && resent?.req === 2 && resent.epoch === 6000, JSON.stringify({ lost: lost?.req, panels: await panelOf(), opens: opensOf(m4).length, resent }));
+    await P.evaluate(id => window.__canvas.removeNode(id), m4);
+
+    // F-A16: a dead session that cannot be revived offers Start new session, also when it has a fault (a quarantined record)
+    script = s => send(s, hello(s.open.id, 7000, 2, { alive: false, revivable: false, state: 'error', fault: { code: 'load_failed', message: 'the record could not be read' } }),
+      ev(1, 'spawn', { pid: 7, via: 'new' }), ev(2, 'exit', { reason: 'hub_restart' }), { t: 'replayed', head: 2, truncated: false });
+    const m5 = await mocked('m5');
+    const v5 = await until(async () => { const v = await acpView(P, m5); return /Fault: the record could not be read/.test(v?.state || '') ? v : null; }, 5000);
+    const acts5 = await P.evaluate(id => [...window.__canvas.live[id].body.querySelectorAll('.ag-state .acts button')].map(b => b.textContent), m5);
+    check('F-A16 (mocked): a dead, faulted session that cannot be revived shows its fault, no ↻, and Start new session', !!v5 && !v5.revive && acts5.includes('Start new session'), JSON.stringify({ state: v5?.state, revive: v5?.revive, acts5 }));
+    await P.evaluate(id => window.__canvas.removeNode(id), m5);
+
+    // 30 §1.5: the docked terminal is never a board node, so its live session is no orphan; a session without a card is
+    const orphans = await P.evaluate(cwd => {
+      const C = window.__canvas, base = { kind: 'pty', host: 'h', createdAt: 1, updatedAt: 1, alive: true, viewers: 1, cwd, state: '', pty: { fg: { comm: 'bash' } } };
+      C.SESS.dock = { ...base, sid: 'dock' }; C.SESS['zz-orphan'] = { ...base, sid: 'zz-orphan' };
+      const keys = C.attnItems().map(i => i.key).filter(k => k.startsWith('orphan:'));
+      delete C.SESS.dock; delete C.SESS['zz-orphan']; return keys;
+    }, ACWD);
+    check('30 §1.5 (mocked): the docked terminal\'s session is not listed as running without a card; a session without a card is', orphans.includes('orphan:zz-orphan') && !orphans.includes('orphan:dock'), JSON.stringify(orphans));
   } finally { await P.close(); }
 });
 if (!STUB) for (const n of ['N17', 'N18', 'N19', 'N20', 'N21', 'N22', 'N23', 'N24', 'N25', 'N27', 'N28', 'N29', 'N39', 'N41', 'N42']) skip(n, 'no stub agent in /api/info.agents (wb-fake-acp registered as `stub` in the test hub)');
@@ -1261,6 +1317,9 @@ else {
     const infos = acpWs(AP, id).flatMap((w, i) => w.recv.slice(recv0[i] || 0)).filter(f => f.t === 'info').map(f => f.info?.state).filter((s, i, a) => s !== a[i - 1]);
     const states = await AP.evaluate(() => [...new Set(window.__n17)]), chunks = acpEvs(AP, id, 'update', v0.seq).filter(e => e.update?.sessionUpdate === 'agent_message_chunk').length, noSeen = acpSent(AP, id, 'seen').length === seen0;
     check('N17: "stream" renders its chunks in one .ag-asst item, and the turn goes running → done while the card is not looked at', !!done && done.asst === v0.asst + 1 && chunks >= 2 && infos.indexOf('running') >= 0 && infos.indexOf('running') < infos.lastIndexOf('done') && states.includes('badge st-done') && noSeen, JSON.stringify({ infos, states, asst: [v0.asst, done?.asst], chunks, noSeen }));
+    const treeOf = () => AP.evaluate(id => document.querySelector(`#tp-list .tp-row[data-id="${id}"] .tp-mt`)?.textContent ?? null, id);
+    const tree = await until(async () => { const t = await treeOf(); return /· done/.test(t || '') ? t : null; }, 3000);
+    check('N17: the Folders tree row shows the card\'s state as it changes (30 §1.6)', !!tree, JSON.stringify({ tree: await treeOf() }));
     await AP.evaluate(id => window.__canvas.jumpNode(window.__canvas.S.nodes[id]), id);
     const idle = await until(async () => { const v = await acpView(AP, id); return v.st === 'idle' ? v : null; }, 10000);
     const sent = acpSent(AP, id, 'seen');

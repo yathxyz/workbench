@@ -279,7 +279,16 @@ function barRender() {
 }
 // Session facts from /rpc: sessions replaces, session upserts, gone deletes and leaves a tombstone (§3.5.3).
 const SESS = {}, TOMBS = new Set();
-function sessChanged(sid) { if (S?.nodes[sid]) { updateTitle(S.nodes[sid]); live[sid]?.backend?.refresh?.(); } clearTimeout(sessChanged.t); sessChanged.t = setTimeout(statusRender, 250); }
+function sessChanged(sid) { if (S?.nodes[sid]) { updateTitle(S.nodes[sid]); live[sid]?.backend?.refresh?.(); } clearTimeout(sessChanged.t); sessChanged.t = setTimeout(sessShown, 250); }
+// The Folders tree, the outline and the navigator show each agent card's state (30 §1.6): redraw them only when one
+// changed, since a running card's info arrives every 500 ms and a redraw replaces the rows under the pointer.
+function sessShown() {
+  statusRender();
+  const shown = S ? nodeList().filter(n => n.kind === 'acp').map(n => n.id + ' ' + badgeOf(n) + ' ' + SESS[n.id]?.state).join('\n') : '';
+  if (shown === sessShown.last) return;
+  sessShown.last = shown; renderTree();
+  if (VIEW === 'outline') renderOutline(); else if (VIEW === 'ranger') renderRanger();
+}
 function sessPut(x) { if (x?.sid && !TOMBS.has(x.sid + ' ' + x.createdAt)) { SESS[x.sid] = x; sessChanged(x.sid); } }
 const RPC_EVENTS = {
   hub: m => hubStatus(m),
@@ -864,6 +873,9 @@ class AcpBackend {
       if (info.createdAt !== this.epoch) this.seenSent = 0;
       this.epoch = info.createdAt ?? null;   // F-A2: sent on reopen, permission and elicitation
       if (m.from > this.seq + 1) this.add({ k: 'note', text: '… earlier messages not shown (replay truncated)' });
+      // An answer may have been lost with the old socket: what the hub still holds can be answered again, the rest is gone
+      const held = new Set((Array.isArray(info.acp?.pending) ? info.acp.pending : []).map(x => x?.req));
+      for (const [req, p] of this.pending) if (held.has(req)) p.sent = false; else this.pending.delete(req);
       this.setInfo(info);
     } else if (m.t === 'ev') this.fold(m.ev);
     else if (m.t === 'replayed') { this.seq = Math.max(this.seq, m.head || 0); this.replayed = true; if (this.draft != null) this.draftBack(); this.schedule(); }
@@ -958,14 +970,14 @@ class AcpBackend {
   setMode(modeId) { if (this.send({ t: 'set_mode', modeId }, { t: 'set_mode' })) this.modeWanted = modeId; else toast(this.n.name + ': not connected'); this.schedule(); }
   revive() { if (!this.send({ t: 'revive' }, { t: 'revive' })) toast(this.n.name + ': not connected'); }
   authenticate(methodId) { if (!this.send({ t: 'authenticate', methodId }, { t: 'authenticate' })) toast(this.n.name + ': not connected'); }
-  answer(req, t, body) {
-    const p = this.pending.get(req); if (!p || p.sent) return;
+  answer(req, t, body, p, ep) {   // p, ep: the request and the incarnation its panel was rendered from (ROB-2)
+    if (this.pending.get(req) !== p || ep !== this.epoch || p.sent) return;
     if (this.gone || this.missing) { this.pending.delete(req); this.schedule(); return toast(this.n.name + ': this request belongs to an ended session'); }
-    if (!this.send({ t, req, epoch: this.epoch, ...body }, { t, req, epoch: this.epoch }, true)) return toast(this.n.name + ': not connected');
+    if (!this.send({ t, req, epoch: ep, ...body }, { t, req, epoch: ep }, true)) return toast(this.n.name + ': not connected');
     p.sent = true; this.schedule();
   }
-  answerPermission(req, optionId) { this.answer(req, 'permission', { outcome: optionId ? { outcome: 'selected', optionId } : { outcome: 'cancelled' } }); }
-  answerElicitation(req, response) { this.answer(req, 'elicitation', { response }); }
+  answerPermission(req, optionId, p, ep) { this.answer(req, 'permission', { outcome: optionId ? { outcome: 'selected', optionId } : { outcome: 'cancelled' } }, p, ep); }
+  answerElicitation(req, response, p, ep) { this.answer(req, 'elicitation', { response }, p, ep); }
   // Start new session (F-A3): forget this one, wait for the close 1000, then open a new one with the spawn fields
   restart() {
     if (this.restarting || this.disposed) return;
@@ -1008,8 +1020,10 @@ class AcpBackend {
     }
     return out.join('\n');
   }
-  clear() {
+  clear() {   // the panels go at once: no button of the old incarnation survives until the next frame
     this.items = []; this.changed.clear(); this.byMsg.clear(); this.byTool.clear(); this.pending.clear(); this.waiting.clear();
+    for (const P of this.panels.values()) P.remove();
+    this.panels.clear();
     this.seq = 0; this.cleared = true; this.authNeeded = false; this.modeSeen = undefined;
   }
   add(it) { this.items.push(it); this.changed.add(it); return it; }
@@ -1089,7 +1103,7 @@ class AcpBackend {
   render() {
     const L = this.L, log = L.logEl; if (this.disposed || !log) return;
     const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
-    if (this.cleared) { this.cleared = false; log.replaceChildren(); for (const P of this.panels.values()) P.remove(); this.panels.clear(); }
+    if (this.cleared) { this.cleared = false; log.replaceChildren(); }
     for (const it of this.changed) { if (!it.el) log.append(it.el = acpItemEl(it)); acpFill(it); }
     this.changed.clear();
     if (stick) log.scrollTop = log.scrollHeight;
@@ -1125,13 +1139,16 @@ class AcpBackend {
     if (this.missing) return { key: 'missing ' + this.failed, text: this.failed ? 'Could not open the session: ' + this.failed : 'No session for this card.', hint: runs, acts: [renew] };
     if (this.failed) return { key: 'failed ' + this.failed, text: this.failed[0].toUpperCase() + this.failed.slice(1) + '.', acts: [['Reconnect', () => this.reconnect(), 'go']] };
     if (!s) return null;
-    if (s.fault) return { key: 'fault ' + s.fault.message, text: 'Fault: ' + vtext(s.fault.message) };
+    if (s.fault) {
+      const ended = !s.alive && !a?.revivable;   // F-A16, e.g. a quarantined load_failed session
+      return { key: 'fault ' + ended + ' ' + s.fault.message, text: 'Fault: ' + vtext(s.fault.message), ...(ended ? { hint: runs, acts: [renew] } : {}) };
+    }
     if (!s.alive && !a?.revivable) return { key: 'ended', text: 'The session ended and cannot be revived.', hint: runs, acts: [renew] };   // F-A16
     if (this.authNeeded && s.alive && a?.activity === 'none') return { key: 'auth ' + JSON.stringify(this.session.authMethods), auth: true, text: agentLabel(this.n.agent) + ' needs a login.', acts: [renew] };
     return null;
   }
   permPanel(req, p) {
-    const tc = p.toolCall, d = el('div', 'ag-perm'), h = el('div', 'ph');
+    const tc = p.toolCall, d = el('div', 'ag-perm'), h = el('div', 'ph'), ep = this.epoch;
     h.append(el('b', '', 'Permission'), el('span', 'tt', vtext(tc.title) || 'tool call')); if (tc.kind) h.append(el('span', 'kind', vtext(tc.kind)));
     d.append(h);
     const diff = Array.isArray(tc.content) ? tc.content.find(c => c?.type === 'diff') : null;
@@ -1143,13 +1160,13 @@ class AcpBackend {
       const b = el('button', kind.startsWith('allow') ? 'go' : '', vtext(o?.name || o?.optionId) + (always ? ' · remembered by ' + agentLabel(this.n.agent) : ''));
       b.type = 'button'; b.dataset.kind = kind;
       if (always) b.title = 'The agent stores this rule and applies it to its future sessions on this server';
-      b.onclick = () => this.answerPermission(req, vtext(o?.optionId));
+      b.onclick = () => this.answerPermission(req, vtext(o?.optionId), p, ep);
       row.append(b);
     }
     d.append(row); return d;
   }
   elicitPanel(req, p) {
-    const q = p.request, answer = r => this.answerElicitation(req, r), btn = (label, cls, fn) => { const b = el('button', cls, label); b.type = 'button'; b.onclick = fn; return b; };
+    const q = p.request, ep = this.epoch, answer = r => this.answerElicitation(req, r, p, ep), btn = (label, cls, fn) => { const b = el('button', cls, label); b.type = 'button'; b.onclick = fn; return b; };
     const decline = btn('Decline', '', () => answer({ action: 'decline' })), cancel = btn('Cancel', '', () => answer({ action: 'cancel' })), row = el('div', 'acts');
     if (q.mode === 'url') {   // F-A19: the full origin, never auto-opened, only https:
       const d = el('div', 'ag-url'), code = el('code', 'u');
@@ -6745,7 +6762,7 @@ function attnItems() {
     else if (s.state === 'error') items.push({ ...it, name: n.name + ' failed', attn: 'bad', meta: s.fault?.message || a?.last?.error?.message || a?.last?.outcome || '' });
     else if (s.state === 'done') items.push({ ...it, name: n.name + ' finished', attn: '', meta: agentLabel(n.agent) });
   }
-  if (DAEMON && S) for (const s of Object.values(SESS)) if (s.alive && !S.nodes[s.sid])   // running invisibly otherwise
+  if (DAEMON && S) for (const s of Object.values(SESS)) if (s.alive && !S.nodes[s.sid] && s.sid !== 'dock')   // running invisibly otherwise; the dock is never a node
     items.push({ key: 'orphan:' + s.sid, name: (s.kind === 'acp' ? agentLabel(s.acp?.agent) : s.pty?.fg?.comm || 'shell') + ' running without a card', kind: 'iattn', attn: 'bad', dir: false, meta: s.cwd || '', go: () => adoptOrphan(s) });
   const due = RV.loaded ? rvQueue().dueNow.length : 0; if (due) items.push({ key: 'attn:review', name: due + ' card' + (due === 1 ? '' : 's') + ' due', kind: 'iattn', dir: false, meta: 'review', go: () => setView('review') });
   for (const t of allTasks()) { if (COL[t.kw] === 'DONE') continue; const due = taskDue(t); if (due && due <= TODAY) items.push({ key: 'attn:' + taskKey(t), name: (due < TODAY ? 'overdue ' : 'due today ') + plainTask(t.text).slice(0, 60), kind: 'iattn', attn: due < TODAY ? 'bad' : '', dir: false, meta: taskAddr(t), go: () => taskOpen(t) }); else if (COL[t.kw] === 'NEXT' && !t.session) items.push({ key: 'attn:' + taskKey(t), name: 'NEXT ' + plainTask(t.text).slice(0, 60), kind: 'iattn', dir: false, meta: taskAddr(t), go: () => taskOpen(t) }); }
