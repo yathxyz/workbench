@@ -258,8 +258,11 @@ fn load(dir: &Path, sid: &str) -> anyhow::Result<Option<Record>> {
             reason: ExitReason::HubRestart,
             at,
         });
+        // Best effort: the next save writes the exit, or the next startup computes it again.
         let json = serde_json::to_vec(&rec)?;
-        write_atomic(dir, &name, &json).context(name)?;
+        if let Err(e) = write_atomic(dir, &name, &json) {
+            warn!(%sid, "writing the hub_restart exit: {e}");
+        }
     }
     Ok(Some(rec))
 }
@@ -404,6 +407,25 @@ mod tests {
                 .await
                 .is_err()
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_record_loads_when_its_hub_restart_exit_cannot_be_written() {
+        let dir = fresh_dir("unwritable");
+        let rec = record("live");
+        write_atomic(&dir, "live.json", &serde_json::to_vec(&rec).unwrap()).unwrap();
+        write_atomic(&dir, "live.snap", b"screen").unwrap();
+        // The rewrite's temporary file cannot be created, as on a full or read-only disk.
+        fs::create_dir(dir.join("live.json.tmp")).unwrap();
+
+        let loaded = load_or_quarantine(dir.clone(), "live".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.exit.unwrap().reason, ExitReason::HubRestart);
+        assert_eq!(sids(&dir).unwrap(), ["live"]);
+        assert_eq!(fs::read(dir.join("live.snap")).unwrap(), b"screen");
         fs::remove_dir_all(dir).unwrap();
     }
 }

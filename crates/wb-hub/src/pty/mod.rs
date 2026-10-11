@@ -165,28 +165,41 @@ async fn supervise(
     loop {
         // The span names the session in the actor's logs, the parser's included.
         let actor = pty.run(rx, first).instrument(info_span!("pty", %sid));
-        let ended = tokio::spawn(actor).await;
+        let next = match tokio::spawn(actor).await {
+            Err(e) if e.is_panic() => {
+                error!(%sid, "the session actor panicked: {e}");
+                // The panic dropped the actor's queue. Commands sent during the reload
+                // wait in a new one for the reloaded actor.
+                ctx.registry.reopen(&sid, created_at)
+            }
+            _ => {
+                let _ = writes.await;
+                return;
+            }
+        };
         // Every write the actor queued lands before the session is read back.
         let _ = writes.await;
-        match ended {
-            Err(e) if e.is_panic() => error!(%sid, "the session actor panicked: {e}"),
-            _ => return,
-        }
         if let Some(pid) = ctx.registry.live_pid(&sid) {
             kill_session(pid);
         }
         let dropped = std::mem::take(&mut *lock(&viewers));
-        let back = match store::load_or_quarantine(ctx.pty_dir.clone(), sid.clone()).await {
-            Ok(Some(rec)) => Some(Start::Loaded(rec)),
+        let Some(next) = next else {
+            return tell_reloaded(&sid, dropped);
+        };
+        let from = match store::load_or_quarantine(ctx.pty_dir.clone(), sid.clone()).await {
+            Ok(Some(rec)) => Start::Loaded(rec),
             Ok(None) => {
                 ctx.registry.forget(&sid, created_at, &[]);
-                None
+                tell_reloaded(&sid, dropped);
+                // What queued during the reload goes wherever the sid leads now.
+                let mut rx = next;
+                rx.close();
+                while let Some(cmd) = rx.recv().await {
+                    redeliver(&ctx, &sid, cmd).await;
+                }
+                return;
             }
-            Err(fault) => Some(Start::Faulted(fault)),
-        }
-        .and_then(|from| Some((from, ctx.registry.reopen(&sid, created_at)?)));
-        let Some((from, next)) = back else {
-            return tell_reloaded(&sid, dropped);
+            Err(fault) => Start::Faulted(fault),
         };
         rx = next;
         (pty, writes) = Pty::new(ctx.clone(), sid.clone(), created_at, viewers.clone());
@@ -358,7 +371,17 @@ impl Pty {
                 self.size = winsize(rec.cols.into(), rec.rows.into());
                 self.rec = rec;
             }
-            Start::Faulted(reason) => self.fault = Some(reason),
+            Start::Faulted(reason) => {
+                // A corpse like any other: its attach carries the exit, so a client can
+                // offer the respawn that clears the fault.
+                self.fault = Some(reason);
+                self.rec.exit = Some(Exit {
+                    code: None,
+                    signal: None,
+                    reason: ExitReason::HubRestart,
+                    at: now_ms(),
+                });
+            }
         }
         self.publish();
         None

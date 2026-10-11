@@ -825,6 +825,31 @@ fn a_corrupt_record_is_quarantined_while_a_healthy_session_loads() {
         kept[1].starts_with("x.quarantine-") && kept[1].ends_with(".snap"),
         "{kept:?}"
     );
+
+    // The faulted session is a corpse like any other: its attach carries an exit, so the
+    // card offers Enter, and a respawn clears the fault.
+    assert_eq!(x["pty"]["exit"]["reason"], "hub_restart", "{x}");
+    let attached = c.attach("x");
+    assert_eq!(
+        (&attached["t"], &attached["new"]),
+        (&json!("ok"), &json!(false)),
+        "{attached}"
+    );
+    assert_eq!(attached["exit"]["reason"], "hub_restart", "{attached}");
+    let again = c.spawn("x", &["bash"]);
+    assert_eq!(again["new"], true, "{again}");
+    let list = c.ok(json!({"t": "list"}));
+    let x = list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sid"] == "x")
+        .unwrap();
+    assert_eq!(
+        (&x["alive"], &x["fault"]),
+        (&json!(true), &json!(null)),
+        "{x}"
+    );
 }
 
 /// Opens `sid` with `spawn` and returns the reply.
