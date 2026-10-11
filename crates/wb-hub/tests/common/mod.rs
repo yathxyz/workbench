@@ -22,7 +22,12 @@ pub struct Hub {
     child: Option<Child>,
     pub dir: PathBuf,
     pub socket: PathBuf,
+    /// The `bash` shell's path, which is also the default shell.
     pub shell: String,
+    /// The `sh` shell's path.
+    pub sh: String,
+    /// Extra variables in the hub's environment.
+    env: Vec<(String, String)>,
 }
 
 impl Hub {
@@ -32,6 +37,11 @@ impl Hub {
 
     /// A hub whose `hub.json` is changed by `edit` before it starts.
     pub fn start_with(edit: impl FnOnce(&mut Value)) -> Hub {
+        Hub::start_with_env(edit, &[])
+    }
+
+    /// A hub with `hub.json` changed by `edit` and `env` added to its environment.
+    pub fn start_with_env(edit: impl FnOnce(&mut Value), env: &[(&str, &str)]) -> Hub {
         static N: AtomicUsize = AtomicUsize::new(0);
         // A short name under `$TMPDIR`: `sun_path` holds 108 bytes.
         let dir = std::env::temp_dir().join(format!(
@@ -43,44 +53,105 @@ impl Hub {
         fs::create_dir_all(dir.join("home")).unwrap();
         let socket = dir.join("hub.sock");
         let shell = find_bash();
+        let sh = find_sh(&shell);
+        // `sh` lists a missing path first: the first existing one is the one that runs.
         let mut config = json!({
             "socket": socket,
             "stateDir": dir.join("state"),
             "host": "example",
-            "child": {"shell": shell, "passEnv": ["PATH"], "setEnv": {"WB_SET": "from-config"}},
+            "shells": [
+                {"name": "bash", "paths": [shell], "args": ["-i"]},
+                {"name": "sh", "paths": ["/nonexistent/sh", sh], "args": ["-i"]},
+            ],
+            "defaultShell": "bash",
+            "child": {"passEnv": ["PATH"], "setEnv": {"WB_SET": "from-config"}},
         });
         edit(&mut config);
-        let config_path = dir.join("hub.json");
-        fs::write(&config_path, config.to_string()).unwrap();
-        let log = fs::File::create(dir.join("hub.log")).unwrap();
+        fs::write(dir.join("hub.json"), config.to_string()).unwrap();
+        let mut hub = Hub {
+            child: None,
+            dir,
+            socket,
+            shell,
+            sh,
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        };
+        hub.launch();
+        hub
+    }
+
+    /// The hub command on this directory, logging to `hub.log`.
+    fn command(&self) -> Command {
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("hub.log"))
+            .unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_wb-hub"));
         cmd.arg("--config")
-            .arg(&config_path)
+            .arg(self.dir.join("hub.json"))
             .env_clear()
-            .env("HOME", dir.join("home"))
+            .env("HOME", self.dir.join("home"))
             .env("USER", "alice")
             .env("LOGNAME", "alice")
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("RUST_LOG", "debug")
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log);
         for name in CANARIES {
             cmd.env(name, "canary-value");
         }
-        let child = cmd.spawn().unwrap();
-        let hub = Hub {
-            child: Some(child),
-            dir,
-            socket,
-            shell,
-        };
+        cmd
+    }
+
+    /// Starts the hub process on this directory and waits for its socket.
+    fn launch(&mut self) {
+        assert!(self.child.is_none(), "the hub is running");
+        self.child = Some(self.command().spawn().unwrap());
         let deadline = Instant::now() + PATIENCE;
-        while UnixStream::connect(&hub.socket).is_err() {
+        while UnixStream::connect(&self.socket).is_err() {
             assert!(Instant::now() < deadline, "the hub did not start");
             std::thread::sleep(Duration::from_millis(20));
         }
-        hub
+    }
+
+    /// Runs a second hub on this directory while this one runs; its exit status.
+    pub fn run_second(&self) -> ExitStatus {
+        let mut second = self.command().spawn().unwrap();
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            if let Some(status) = second.try_wait().unwrap() {
+                return status;
+            }
+            if Instant::now() > deadline {
+                let _ = second.kill();
+                let _ = second.wait();
+                panic!("the second hub kept running");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Starts a new hub process on the same state directory after the last one exited.
+    pub fn restart(&mut self) {
+        self.launch();
+    }
+
+    /// Kills the hub with SIGKILL, as a crash would, and reaps it.
+    pub fn kill9(&mut self) {
+        let mut child = self.child.take().expect("the hub is running");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// `stateDir/pty/<name>`.
+    pub fn pty_file(&self, name: &str) -> PathBuf {
+        self.dir.join("state").join("pty").join(name)
     }
 
     pub fn connect(&self) -> Client {
@@ -142,6 +213,15 @@ pub fn running(pid: u32) -> bool {
     }
 }
 
+/// Waits up to `within` for `cond`.
+pub fn eventually(within: Duration, what: &str, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + within;
+    while !cond() {
+        assert!(Instant::now() < deadline, "{what} within {within:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Waits until `pid` is gone (or a zombie, which the next check treats as a failure).
 pub fn wait_gone(pid: u32, within: Duration) -> bool {
     let deadline = Instant::now() + within;
@@ -152,6 +232,18 @@ pub fn wait_gone(pid: u32, within: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(20));
     }
     true
+}
+
+/// A second shell for the shell-choice tests: the `sh` next to `bash` (bash's own sh
+/// mode in nixpkgs), else the first `sh` on `PATH`.
+fn find_sh(bash: &str) -> String {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::iter::once(Path::new(bash).with_file_name("sh"))
+        .chain(std::env::split_paths(&path).map(|dir| dir.join("sh")))
+        .find(|p| p.is_absolute() && p.is_file())
+        .expect("sh next to bash or on PATH")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// `$BASH` when it is exported (the design's choice for test configs), else the first
@@ -265,27 +357,47 @@ impl Client {
 
     /// Collects `pty.out` text of `sid` until it contains `needle`.
     pub fn output_until(&mut self, sid: &str, needle: &str) -> String {
+        self.output_until_at(sid, needle).0
+    }
+
+    /// Like [`output_until`](Self::output_until), also returning the stream offset after
+    /// the last chunk.
+    pub fn output_until_at(&mut self, sid: &str, needle: &str) -> (String, u64) {
         let mut text = String::new();
-        while !text.contains(needle) {
+        let mut out = 0;
+        // Where an occurrence can start that the last search did not see: searching only
+        // from there keeps a long stream linear.
+        let mut from = 0;
+        while !text[from..].contains(needle) {
+            from = text.len().saturating_sub(needle.len());
+            while !text.is_char_boundary(from) {
+                from -= 1;
+            }
             let m = self
                 .next()
                 .unwrap_or_else(|| panic!("closed before {needle:?} in {text:?}"));
             if m["t"] == "pty.out" && m["sid"] == sid {
                 text += m["d"].as_str().unwrap();
+                out = m["out"].as_u64().unwrap();
             }
         }
-        text
+        (text, out)
     }
 
     pub fn input(&mut self, sid: &str, d: &str) {
         self.send(&json!({"t": "pty.input", "sid": sid, "d": d}));
     }
 
-    /// Opens `sid`, spawning `argv` if needed; returns the `ok` result.
+    /// Opens `sid`, spawning `argv` in the default shell if needed; returns the `ok`
+    /// result.
     pub fn spawn(&mut self, sid: &str, argv: &[&str]) -> Value {
-        self.ok(
-            json!({"t": "pty.open", "sid": sid, "cols": 80, "rows": 24, "spawn": {"argv": argv}}),
-        )
+        self.ok(json!({"t": "pty.open", "sid": sid, "cols": 80, "rows": 24,
+                       "spawn": {"argv": argv}}))
+    }
+
+    /// Opens `sid` at 80x24 without spawn fields; returns the reply.
+    pub fn attach(&mut self, sid: &str) -> Value {
+        self.request(json!({"t": "pty.open", "sid": sid, "cols": 80, "rows": 24}))
     }
 
     /// Reads until the hub closes the connection; the number of bytes read.

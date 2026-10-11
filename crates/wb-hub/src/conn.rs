@@ -13,8 +13,10 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
-use wb_proto::hub::{Agent, ErrorCode, HubMessage, HubRequest, PROTO, SessionsReply, SpawnPty};
-use wb_proto::limits::{HELLO_TIMEOUT, MAX_LINE, PTY_INPUT_FRAME, REQS_IN_FLIGHT};
+use wb_proto::hub::{
+    Agent, ErrorCode, HubMessage, HubRequest, PROTO, Resume, SessionsReply, SpawnPty,
+};
+use wb_proto::limits::{CAPTURE_MAX, HELLO_TIMEOUT, MAX_LINE, PTY_INPUT_FRAME, REQS_IN_FLIGHT};
 use wb_proto::line::encode;
 
 use crate::Ctx;
@@ -29,6 +31,8 @@ const ARGV_BYTES_MAX: usize = 256 << 10;
 /// How long a connection whose client stopped sending may take to deliver the replies
 /// it still owes; a `pty.kill{forget:true}` waits for the exit, up to about 3 s.
 const LINGER: Duration = Duration::from_secs(10);
+/// `pty.capture` lines when the request names none.
+const CAPTURE_DEFAULT: u32 = 200;
 
 pub type ConnId = u64;
 
@@ -42,31 +46,44 @@ pub struct Viewer {
 }
 
 /// Where the one reply to a request goes. It holds one of the connection's in-flight
-/// permits until it is sent or dropped.
+/// permits until it is sent or dropped. Dropped unsent, which happens when a session
+/// actor panics with the request in hand, it answers `err{code:"internal"}`.
 pub struct Reply {
     rid: u64,
     outq: Arc<OutQ>,
+    sent: bool,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl Reply {
-    pub fn ok(self, result: &impl Serialize) {
-        self.outq
-            .push_reply(line(&HubMessage::ok(self.rid, result)));
+    pub fn ok(mut self, result: &impl Serialize) {
+        self.send(&HubMessage::ok(self.rid, result));
     }
 
     /// The empty `ok` reply, `{}`.
-    pub fn done(self) {
-        let msg = HubMessage::Ok {
+    pub fn done(mut self) {
+        self.send(&HubMessage::Ok {
             rid: self.rid,
             result: Map::new(),
-        };
-        self.outq.push_reply(line(&msg));
+        });
     }
 
-    pub fn err(self, code: ErrorCode, message: impl Into<String>) {
-        self.outq
-            .push_reply(line(&error(Some(self.rid), None, code, message.into())));
+    pub fn err(mut self, code: ErrorCode, message: impl Into<String>) {
+        self.send(&error(Some(self.rid), None, code, message.into()));
+    }
+
+    fn send(&mut self, msg: &HubMessage) {
+        self.sent = true;
+        self.outq.push_reply(line(msg));
+    }
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        if !self.sent {
+            let msg = "session reloaded".into();
+            self.send(&error(Some(self.rid), None, ErrorCode::Internal, msg));
+        }
     }
 }
 
@@ -154,8 +171,8 @@ fn hello(ctx: &Ctx) -> HubMessage {
                 label: a.label.clone(),
             })
             .collect(),
-        shells: Vec::new(),
-        default_shell: String::new(),
+        shells: ctx.cfg.available_shells(),
+        default_shell: ctx.cfg.default_shell.clone(),
     }
 }
 
@@ -270,8 +287,8 @@ impl Conn {
                 cols,
                 rows,
                 spawn,
-                resume: _,
-            } => self.open(rid, sid, cols, rows, spawn).await,
+                resume,
+            } => self.open(rid, sid, cols, rows, spawn, resume).await,
             HubRequest::PtyDetach { rid, sid } => {
                 let conn = self.id;
                 self.to_session(rid, sid, |reply| Cmd::Detach {
@@ -293,9 +310,10 @@ impl Conn {
                 self.to_session(rid, sid, |reply| Cmd::Kill { forget, reply })
                     .await;
             }
-            HubRequest::PtyCapture { rid, .. } => {
-                let msg = "pty.capture needs the VT state, which this hub version lacks".into();
-                self.error(Some(rid), None, ErrorCode::Internal, msg);
+            HubRequest::PtyCapture { rid, sid, lines } => {
+                let lines = lines.unwrap_or(CAPTURE_DEFAULT).min(CAPTURE_MAX as u32) as usize;
+                self.to_session(rid, sid, |reply| Cmd::Capture { lines, reply })
+                    .await;
             }
             HubRequest::Unknown => {
                 self.error(
@@ -308,7 +326,15 @@ impl Conn {
         }
     }
 
-    async fn open(&mut self, rid: u64, sid: String, cols: u32, rows: u32, spawn: Option<SpawnPty>) {
+    async fn open(
+        &mut self,
+        rid: u64,
+        sid: String,
+        cols: u32,
+        rows: u32,
+        spawn: Option<SpawnPty>,
+        resume: Option<Resume>,
+    ) {
         if !valid_sid(&sid) {
             return self.error(Some(rid), None, ErrorCode::BadRequest, "invalid sid".into());
         }
@@ -320,6 +346,7 @@ impl Conn {
             cols,
             rows,
             spawn,
+            resume,
             reply: self.reply(rid).await,
         };
         self.opened.insert(sid.clone());
@@ -369,6 +396,7 @@ impl Conn {
         Reply {
             rid,
             outq: self.outq.clone(),
+            sent: false,
             _permit: self.permits.clone().acquire_owned().await.ok(),
         }
     }

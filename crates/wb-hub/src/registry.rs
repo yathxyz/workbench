@@ -41,6 +41,12 @@ struct Entry {
     summary: Option<Summary>,
 }
 
+impl Entry {
+    fn pid(&self) -> Option<u32> {
+        self.summary.as_ref()?.pty.as_ref()?.pid
+    }
+}
+
 /// Where a `pty.open` goes.
 pub enum Route {
     /// To this existing session.
@@ -112,6 +118,36 @@ impl Registry {
         Route::Created { created_at, rx }
     }
 
+    /// Registers a session found in the state directory at startup, with its `createdAt`,
+    /// or with a new one when its record could not be read. The caller starts its actor
+    /// on the returned channel.
+    pub fn load(&self, sid: &str, created_at: Option<u64>) -> (u64, mpsc::Receiver<Cmd>) {
+        let mut inner = lock(&self.inner);
+        let created_at = created_at.unwrap_or_else(|| now_ms().max(inner.last_created + 1));
+        inner.last_created = inner.last_created.max(created_at);
+        let (tx, rx) = mpsc::channel(CMD_QUEUE);
+        let entry = Entry {
+            created_at,
+            tx,
+            summary: None,
+        };
+        inner.sessions.insert(sid.to_owned(), entry);
+        (created_at, rx)
+    }
+
+    /// A new command channel for a session whose actor panicked and is being reloaded;
+    /// the Summary stays. `None` if the session is no longer registered.
+    pub fn reopen(&self, sid: &str, created_at: u64) -> Option<mpsc::Receiver<Cmd>> {
+        let mut inner = lock(&self.inner);
+        let entry = inner
+            .sessions
+            .get_mut(sid)
+            .filter(|e| e.created_at == created_at)?;
+        let (tx, rx) = mpsc::channel(CMD_QUEUE);
+        entry.tx = tx;
+        Some(rx)
+    }
+
     /// Stores a session's new Summary and sends it to the watchers.
     pub fn publish(&self, summary: &Summary) {
         let mut inner = lock(&self.inner);
@@ -172,14 +208,16 @@ impl Registry {
 
     /// The child pid of a live session.
     pub fn live_pid(&self, sid: &str) -> Option<u32> {
+        lock(&self.inner).sessions.get(sid).and_then(Entry::pid)
+    }
+
+    /// The child pids of every live session.
+    pub fn live_pids(&self) -> Vec<u32> {
         lock(&self.inner)
             .sessions
-            .get(sid)?
-            .summary
-            .as_ref()?
-            .pty
-            .as_ref()?
-            .pid
+            .values()
+            .filter_map(Entry::pid)
+            .collect()
     }
 
     /// Stops creating sessions and returns every session's sender.
