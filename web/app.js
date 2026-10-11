@@ -143,10 +143,11 @@ const SAVE = { busy: false, again: false, paused: null, pending: false, err: 0, 
 function save() {
   if (!S || !BOOTED) return;
   if (!DAEMON) return store.set(LS_KEY, serialize());
-  if (SAVE.paused) { SAVE.pending = true; return; }
+  if (SAVE.paused) { SAVE.pending = true; if (NET.state === 'signed_out') authBar(); return; }
   if (SAVE.busy) { SAVE.again = true; return; }
-  SAVE.busy = true; SAVE.pending = true; clearTimeout(SAVE.retryT);
   const json = serialize();
+  if (json === SAVE.lastJson) { SAVE.pending = false; SAVE.err = 0; barClear('save'); return; }   // nothing to write: a pan, a re-layout that changed nothing, or an edit undone before its retry
+  SAVE.busy = true; SAVE.pending = true; clearTimeout(SAVE.retryT);
   fetch('/api/board', { method: 'PUT', redirect: 'manual', cache: 'no-store', headers: { 'Content-Type': 'application/json', 'If-Match': BOARD_ETAG }, body: json })
     .then(async r => {
       if (r.status === 204) { BOARD_ETAG = r.headers.get('ETag'); SAVE.lastJson = json; SAVE.err = 0; SAVE.pending = SAVE.again; barClear('save'); return; }
@@ -161,7 +162,9 @@ function save() {
       if (SAVE.recheck) { const e = SAVE.recheck; SAVE.recheck = null; boardChanged(e); }
     });
 }
-const unsaved = () => saveT !== null || SAVE.pending || !!SAVE.paused;
+// A change not yet on disk, including one still inside the 500 ms debounce (SAVE.pending misses those).
+const changed = () => (saveT !== null || SAVE.pending) && serialize() !== SAVE.lastJson;
+const unsaved = () => !!SAVE.paused || changed();
 function changeCount() {   // this tab's changes against the board it last loaded or saved
   const a = JSON.parse(serialize()), b = JSON.parse(SAVE.lastJson || '{}'), an = a.nodes || {}, bn = b.nodes || {};
   let c = 0;
@@ -173,7 +176,7 @@ function conflictBar() {
   const c = changeCount();
   bar('conflict', `The board changed in another tab or device. This tab: ${c} change${c === 1 ? '' : 's'}; server: newer.`, [
     ['Load it', () => { SAVE.leaving = true; location.reload(); }],
-    ['Overwrite with this tab', () => { BOARD_ETAG = SAVE.theirs; SAVE.paused = null; barClear('conflict'); save(); dbFlush(); }],
+    ['Overwrite with this tab', () => { BOARD_ETAG = SAVE.theirs; SAVE.paused = null; SAVE.lastJson = null; barClear('conflict'); save(); dbFlush(); }],
   ]);
 }
 // /rpc board{etag}: another tab or device saved (F-A7).
@@ -246,11 +249,14 @@ function netSet(s) {
   } else if (s === 'down' || s === 'offline') NET.timer = setTimeout(netKick, backoff(NET.tries++));
   else if (s === 'signed_out') {
     if (!SAVE.paused) SAVE.paused = 'auth';
-    const since = SAVE.pending ? 'changes since ' + hhmm(NET.since) + ' are not saved yet' : 'nothing is lost yet';
-    bar('auth', 'Signed out: ' + since + '.', [['Sign in', SIGN_IN], ['Reload (unsaved changes are lost)', () => { SAVE.leaving = true; location.reload(); }]]);
+    authBar();
     NET.timer = setTimeout(netKick, 5000);
   } else if (s === 'forbidden') { bar('forbidden', 'This account has no access to Workbench (403).', [['Retry', () => netKick()]]); NET.timer = setTimeout(netKick, 30000); }
   netChip();
+}
+function authBar() {
+  const since = changed() ? 'changes since ' + hhmm(NET.since) + ' are not saved yet' : 'nothing is lost yet';
+  bar('auth', 'Signed out: ' + since + '.', [['Sign in', SIGN_IN], ['Reload (unsaved changes are lost)', () => { SAVE.leaving = true; location.reload(); }]]);
 }
 function wakeAll() { for (const w of [...WAKE]) w.wake(); }
 addEventListener('online', () => { wakeAll(); netKick(); });
@@ -3584,7 +3590,7 @@ function graphDraw() {
     const showLabel = z > 0.7 || near.has(g.id) || g.deg >= 3 || (q && !d);
     if (showLabel) {
       ctx.globalAlpha = d ? 0.25 : 1;
-      ctx.font = `${g.id === focus || g.kind === 'folder' ? 600 : 400} ${12 / Math.sqrt(z)}px "Atkinson Hyperlegible Next", system-ui, sans-serif`;
+      ctx.font = `${g.id === focus || g.kind === 'folder' ? 600 : 400} ${12 / Math.sqrt(z)}px ${MONO}`;
       ctx.fillStyle = g.kind === 'ghost' ? C.muted : C.fg; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
       ctx.fillText(g.label, p.x, p.y + rad + 4 / z);
     }
@@ -4684,7 +4690,7 @@ async function boot() {
     const v = b.body?.v;
     if (!(b.body === null && b.etag === '"empty"') && v !== 0 && v !== 5) return bootScreen({ kind: 'format', v: b.body === null ? 'null' : v });
     if (v === 5) board = b.body;   // else a fresh install, or the reset's {"v":0}: seed
-    DAEMON = true; BOARD_ETAG = b.etag; INFO = info; HUB_STARTED = info.hub?.startedAt; bootTries = 0;
+    DAEMON = true; BOARD_ETAG = b.etag; INFO = info.body; HUB_STARTED = INFO.hub?.startedAt; bootTries = 0;
     RPC = new Rpc();
     if ('serviceWorker' in navigator && window.isSecureContext) navigator.serviceWorker.register('sw.js').catch(() => {});
   } else { const raw = store.get(LS_KEY); if (raw) try { board = JSON.parse(raw); } catch {} }
@@ -6163,6 +6169,6 @@ AGENT_TOOLS.push(
   { name: 'host_status', description: 'Health of a host: load, memory, disk, uptime, shells, tmux sessions, unit counts (failed names). host: a name from hosts.json (empty = the serving daemon).', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
     run: async ({ host } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j = await (await hFetch(h, '/api/status')).json(); const gb = b => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}` + (j.sessions?.tmux != null ? ', tmux sessions ' + j.sessions.tmux : ''), j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
-window.__canvas = { setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk };  // for tests and debugging
+window.__canvas = { setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk };  // for tests and debugging
 boot();
 })();
