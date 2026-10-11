@@ -43,6 +43,21 @@ let
     WB_SOCKET = "/run/workbench-web/web.sock";
   };
 
+  # wb-hub sets these in every PTY child itself (DESIGN 3.7.3 step 1) and refuses them in
+  # child.passEnv and child.setEnv.
+  fixedChildEnv = [
+    "HOME"
+    "USER"
+    "LOGNAME"
+    "SHELL"
+    "WB_SESSION"
+    "TERM"
+    "COLORTERM"
+  ];
+  # wb-hub's rules for shell and agent names and for variable names.
+  isName = n: builtins.match "[a-z0-9-]{1,32}" n != null;
+  isEnvName = n: builtins.match "[A-Za-z_][A-Za-z0-9_]{0,63}" n != null;
+
   # Set on the hub unit by value and copied into every child (child.passEnv).
   hubEnv = {
     LANG = config.i18n.defaultLocale;
@@ -308,8 +323,18 @@ in
         message = "services.workbench.firewall needs firewall.interface and an IPv4 trustedProxy.";
       }
       {
-        assertion = lib.all (n: builtins.match "[a-z0-9-]{1,32}" n != null) (lib.attrNames cfg.agents);
+        assertion = lib.all isName (lib.attrNames cfg.agents);
         message = "services.workbench.agents: names must match ^[a-z0-9-]{1,32}$.";
+      }
+      {
+        assertion = lib.all isName (lib.attrNames cfg.shells);
+        message = "services.workbench.shells: names must match ^[a-z0-9-]{1,32}$.";
+      }
+      {
+        assertion = lib.all isEnvName (
+          lib.attrNames cfg.environment ++ lib.concatMap (a: lib.attrNames a.env) (lib.attrValues cfg.agents)
+        );
+        message = "services.workbench.environment and agents.<name>.env: variable names must match ^[A-Za-z_][A-Za-z0-9_]{0,63}$.";
       }
       {
         assertion = lib.all (a: a.package != null || lib.hasPrefix "/" a.exe) (lib.attrValues cfg.agents);
@@ -330,8 +355,12 @@ in
         message = "services.workbench.shells: paths must be absolute and stable (never /nix/store), such as /run/current-system/sw/bin/bash.";
       }
       {
-        assertion = lib.intersectLists (lib.attrNames cfg.environment) (lib.attrNames childSetEnv) == [ ];
-        message = "services.workbench.environment must not set ${lib.concatStringsSep ", " (lib.attrNames childSetEnv)}; the module sets them.";
+        assertion =
+          lib.intersectLists (lib.attrNames cfg.environment) (lib.attrNames childSetEnv ++ fixedChildEnv)
+          == [ ];
+        message = "services.workbench.environment must not set ${
+          lib.concatStringsSep ", " (lib.attrNames childSetEnv ++ fixedChildEnv)
+        }; the module or the hub sets them.";
       }
     ];
 

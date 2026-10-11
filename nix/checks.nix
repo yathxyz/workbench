@@ -1,5 +1,5 @@
 # `nix flake check`: package (with cargo test), clippy, fmt, the black-box conformance suite, the
-# end-to-end security suite, the browser suite, the VM test.
+# end-to-end security suite, the browser suite, the VM test, the module's assertions.
 {
   pkgs,
   self,
@@ -114,4 +114,69 @@ in
       '';
 
   vm = pkgs.testers.runNixOSTest (import ./vm.nix { inherit self; });
+
+  # The module's assertions refuse what wb-hub would refuse at its next start, so a bad name
+  # fails the evaluation instead of the first hub restart after a deploy.
+  module =
+    let
+      failing =
+        extra:
+        let
+          sys = pkgs.nixos {
+            imports = [
+              self.nixosModules.workbench
+              extra
+            ];
+            system.stateVersion = lib.trivial.release;
+            users.users.alice.isNormalUser = true;
+            services.workbench = {
+              enable = true;
+              user = "alice";
+              listenAddress = "192.0.2.2";
+              trustedProxy = "192.0.2.1";
+              publicOrigin = "https://wb.example.org";
+              proxySecretFile = "/run/secrets/workbench-proxy-secret";
+              firewall.interface = "wg0";
+            };
+          };
+        in
+        map (a: a.message) (
+          lib.filter (a: !a.assertion && lib.hasPrefix "services.workbench" a.message) sys.config.assertions
+        );
+      expect = {
+        valid = [ ];
+        shellName = [ "services.workbench.shells: names" ];
+        environmentName = [ "services.workbench.environment and agents" ];
+        agentEnvName = [ "services.workbench.environment and agents" ];
+        fixedName = [ "services.workbench.environment must not set" ];
+      };
+      got = lib.mapAttrs (_: failing) {
+        valid = { };
+        shellName.services.workbench.shells = {
+          bash.paths = [ "/run/current-system/sw/bin/bash" ];
+          my_sh.paths = [ "/run/current-system/sw/bin/sh" ];
+        };
+        environmentName.services.workbench.environment."FOO-BAR" = "x";
+        agentEnvName.services.workbench.agents.x = {
+          label = "X";
+          exe = "/run/current-system/sw/bin/true";
+          env."1X" = "x";
+        };
+        fixedName.services.workbench.environment.SHELL = "/bin/sh";
+      };
+      matches = lib.mapAttrs (
+        case: prefixes:
+        lib.length got.${case} == lib.length prefixes
+        && lib.all (p: lib.any (lib.hasPrefix p) got.${case}) prefixes
+      ) expect;
+    in
+    pkgs.runCommand "workbench-module" { } (
+      if lib.all lib.id (lib.attrValues matches) then
+        "touch $out"
+      else
+        ''
+          echo ${lib.escapeShellArg (builtins.toJSON got)}
+          exit 1
+        ''
+    );
 }

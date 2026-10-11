@@ -12,6 +12,18 @@ use crate::env::valid_env_name;
 /// `sun_path` holds 108 bytes including the trailing NUL.
 const SUN_PATH: usize = 108;
 
+/// What the hub sets in every PTY child (DESIGN §3.7.3 step 1); the module's assertion
+/// lists the same names.
+const FIXED_CHILD_ENV: [&str; 7] = [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "WB_SESSION",
+    "TERM",
+    "COLORTERM",
+];
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
@@ -133,6 +145,10 @@ impl Config {
             if !valid_env_name(name) {
                 bail!("invalid environment variable name {name:?}");
             }
+        }
+        let mut child = self.child.pass_env.iter().chain(self.child.set_env.keys());
+        if let Some(name) = child.find(|n| FIXED_CHILD_ENV.contains(&n.as_str())) {
+            bail!("child.passEnv and child.setEnv must not name {name}: the hub sets it");
         }
         for (name, agent) in &self.agents {
             if !valid_name(name) {
@@ -290,5 +306,17 @@ mod tests {
         assert!(with(|v| v["agents"][long_name] = v["agents"]["claude"].clone()).is_err());
         assert!(with(|v| v["agents"]["omp"]["argv"][0] = "omp".into()).is_err());
         assert!(with(|v| v["agents"]["omp"]["argv"] = serde_json::json!([])).is_err());
+    }
+
+    #[test]
+    fn the_fixed_child_variables_cannot_be_configured() {
+        for name in FIXED_CHILD_ENV {
+            let pass = with(|v| v["child"]["passEnv"][0] = name.into());
+            assert!(pass.is_err_and(|e| e.to_string().contains(name)), "{name}");
+            assert!(
+                with(|v| v["child"]["setEnv"][name] = "x".into()).is_err(),
+                "{name}"
+            );
+        }
     }
 }
