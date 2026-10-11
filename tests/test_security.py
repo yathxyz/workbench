@@ -114,6 +114,8 @@ def main():
         t.check("harness Caddy: no TCP listener; caddy.sock 0600 in a 0700 directory",
                 not listeners and (mode(caddy), mode(os.path.dirname(caddy))) == (0o600, 0o700),
                 repr((listeners, oct(mode(caddy)), oct(mode(os.path.dirname(caddy))))))
+        t.check("harness JSON: stateDir is the hub's state directory",
+                h.info()["stateDir"] == str(h.root / "state" / "hub"), h.info()["stateDir"])
 
         def auth(origin=None, secret=good, host=HOST):
             hd = [("Host", host)]

@@ -232,7 +232,7 @@ class Harness:
             "hubSocket": self.hub_sock,
             "webSocket": self.web_sock,
             "caddyAdmin": self.caddy_admin,
-            "stateDir": str(self.root),
+            "stateDir": self.hub_config["stateDir"],
             "boardsDir": str(self.boards_dir),
             "notesDir": str(self.notes_dir),
         }
