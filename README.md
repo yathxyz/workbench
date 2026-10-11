@@ -2,8 +2,8 @@
 
 A browser canvas of terminal and agent cards for one user on one host.
 
-- **wb-hub** owns the PTYs (and, later, ACP agent processes). It runs as the user, holds no
-  secrets and is never restarted by a deploy, so sessions outlive the web front.
+- **wb-hub** owns the PTYs and the ACP agent processes. It runs as the user, holds no secrets
+  and is never restarted by a deploy, so sessions outlive the web front.
 - **wb-web** serves the single-page app and relays browser WebSockets to the hub. It accepts
   requests only from one trusted reverse proxy that adds a shared secret header, and it checks
   Host and Origin on every request. Restarting it never ends a session.
@@ -11,6 +11,8 @@ A browser canvas of terminal and agent cards for one user on one host.
 
 The proxy in front (for example Caddy with an OIDC gate) authenticates the human; wb-web
 authenticates the proxy.
+
+[docs/DESIGN.md](docs/DESIGN.md) is the full design: protocol, threat model, units and tests.
 
 ## Build
 
