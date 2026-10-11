@@ -6,12 +6,12 @@
 'use strict';
 const V = window.V;
 const HDR = 30, GRID = 200, LOD_Z = 0.45, LS_KEY = 'canvas-proto-board-v5';
-const MONO = '"Atkinson Hyperlegible Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+const MONO = '"JetBrainsMono Nerd Font Mono", "JetBrains Mono", ui-monospace, monospace';
 
 // ------------------------------------------------------------------ utilities
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
-function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }   // text only: markup goes through innerHTML at the few static sites
 function svgEl(tag, attrs) { const e = document.createElementNS('http://www.w3.org/2000/svg', tag); for (const k in attrs || {}) e.setAttribute(k, attrs[k]); return e; }
 const uid = p => p + Math.random().toString(36).slice(2, 9);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -21,16 +21,13 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch {} },
   del(k) { try { localStorage.removeItem(k); } catch {} },
 };
-const sstore = {
-  get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
-  set(k, v) { try { sessionStorage.setItem(k, v); } catch {} },
-};
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 // ------------------------------------------------------------------ state
 let S = null;                 // persisted board
 const live = {};              // id -> runtime objects (DOM, xterm, CodeMirror view, backend)
-let DAEMON = false, TOKEN = null;
+let DAEMON = false, BOOTED = false, BOARD_ETAG = null, HUB_STARTED = null, BOARD_CAM;   // BOARD_CAM: the board's stored camera, written back untouched (F-A7)
+const SERVED = /^https?:$/.test(location.protocol) && !window.CANVAS_HOSTED;   // served by wb-web: never the demo, never localStorage
 let tool = 'select', inkColor = 'ink', penSeen = false, activeId = null, topZ = 10, focusedBuf = null;
 const camBack = [], camFwd = [];
 
@@ -122,8 +119,12 @@ function fitAll(animate = true) {
 
 // ------------------------------------------------------------------ persistence
 let saveT = null, camT = null;
-function dirty() { if (!S) return; clearTimeout(saveT); saveT = setTimeout(save, 500); }
-function dirtyCam() { clearTimeout(camT); camT = setTimeout(dirty, 400); }
+let ADOPTING = false;   // applying another tab's board: nothing in it is this tab's edit
+function dirty() { if (!S || ADOPTING) return; clearTimeout(saveT); saveT = setTimeout(() => { saveT = null; save(); }, 500); }
+// The camera is per device (localStorage wb-cam-<host>), never saved in a served board, so a pan dirties nothing.
+const camKey = () => 'wb-cam-' + (INFO?.host || location.host);
+function camLoad() { try { const c = JSON.parse(store.get(camKey())); if ([c.x, c.y, c.z].every(Number.isFinite) && c.z > 0) return { x: c.x, y: c.y, z: c.z }; } catch {} return null; }
+function dirtyCam() { clearTimeout(camT); camT = setTimeout(() => DAEMON ? store.set(camKey(), JSON.stringify(S.cam)) : dirty(), 400); }
 function syncBuffers() {
   for (const n of nodeList()) {
     if (n.kind !== 'buffer' || !live[n.id]?.view) continue;
@@ -136,16 +137,217 @@ function syncBuffers() {
     }));
   }
 }
-function serialize() { syncBuffers(); return JSON.stringify(S, (k, v) => (k.startsWith('_') ? undefined : v)); }
+function serialize() { syncBuffers(); return JSON.stringify(S, function (k, v) { return k.startsWith('_') ? undefined : DAEMON && k === 'cam' && this === S ? BOARD_CAM : v; }); }
+// One PUT in flight: each 204 carries the ETag the next PUT's If-Match needs (30 §2.3).
+const SAVE = { busy: false, again: false, paused: null, pending: false, err: 0, theirs: null, lastJson: null, recheck: null, retryT: null, leaving: false, dbQueue: new Set() };
 function save() {
+  if (!S || !BOOTED) return;
+  if (!DAEMON) return store.set(LS_KEY, serialize());
+  if (SAVE.paused) { SAVE.pending = true; if (NET.state === 'signed_out') authBar(); return; }
+  if (SAVE.busy) { SAVE.again = true; return; }
   const json = serialize();
-  if (DAEMON) fetch('/api/board', { method: 'PUT', headers: { 'X-Token': TOKEN, 'Content-Type': 'application/json' }, body: json }).catch(() => {});
-  else store.set(LS_KEY, json);
+  if (json === SAVE.lastJson) { SAVE.pending = false; SAVE.err = 0; barClear('save'); return; }   // nothing to write: a pan, a re-layout that changed nothing, or an edit undone before its retry
+  SAVE.busy = true; SAVE.pending = true; clearTimeout(SAVE.retryT);
+  fetch('/api/board', { method: 'PUT', redirect: 'manual', cache: 'no-store', headers: { 'Content-Type': 'application/json', 'If-Match': BOARD_ETAG }, body: json })
+    .then(async r => {
+      if (r.status === 204) { BOARD_ETAG = r.headers.get('ETag'); SAVE.lastJson = json; SAVE.err = 0; SAVE.pending = SAVE.again; barClear('save'); return; }
+      if (r.type === 'opaqueredirect' || r.status === 401) { SAVE.paused = 'auth'; return netSet('signed_out'); }
+      if (r.status === 412) { SAVE.theirs = (await r.json().catch(() => ({}))).etag; SAVE.paused = 'conflict'; return conflictBar(); }
+      throw new Error((await r.json().catch(() => ({}))).error || 'HTTP ' + r.status);
+    })
+    .catch(e => { SAVE.err++; SAVE.again = false; bar('save', 'Board not saved: ' + e.message + '. Retrying…'); SAVE.retryT = setTimeout(save, backoff(SAVE.err)); netKick(); })
+    .finally(() => {
+      SAVE.busy = false;
+      if (SAVE.again && !SAVE.paused) { SAVE.again = false; save(); }
+      if (SAVE.recheck) { const e = SAVE.recheck; SAVE.recheck = null; boardChanged(e); }
+    });
+}
+// A change not yet on disk, including one still inside the 500 ms debounce (SAVE.pending misses those).
+const changed = () => (saveT !== null || SAVE.pending) && serialize() !== SAVE.lastJson;
+const unsaved = () => !!SAVE.paused || changed();
+function changeCount() {   // this tab's changes against the board it last loaded or saved
+  const a = JSON.parse(serialize()), b = JSON.parse(SAVE.lastJson || '{}'), an = a.nodes || {}, bn = b.nodes || {};
+  let c = 0;
+  for (const id of new Set([...Object.keys(an), ...Object.keys(bn)])) if (JSON.stringify(an[id]) !== JSON.stringify(bn[id])) c++;
+  for (const k of ['edges', 'strokes', 'shapes']) if (JSON.stringify(a[k] || []) !== JSON.stringify(b[k] || [])) c++;
+  return c;
+}
+function conflictBar() {
+  const c = changeCount();
+  bar('conflict', `The board changed in another tab or device. This tab: ${c} change${c === 1 ? '' : 's'}; server: newer.`, [
+    ['Load it', () => { SAVE.leaving = true; location.reload(); }],
+    ['Overwrite with this tab', () => { BOARD_ETAG = SAVE.theirs; SAVE.paused = null; SAVE.lastJson = null; barClear('conflict'); save(); dbFlush(); }],
+  ]);
+}
+// /rpc board{etag}: another tab or device saved (F-A7).
+async function boardChanged(etag) {
+  if (!DAEMON || !BOOTED || etag === BOARD_ETAG) return;   // our own save
+  if (SAVE.busy) { SAVE.recheck = etag; return; }          // our PUT's 204 may carry this very ETag
+  if (unsaved()) { if (SAVE.paused !== 'auth') { SAVE.theirs = etag; SAVE.paused = 'conflict'; conflictBar(); } return; }
+  let b; try { b = await bootFetch('/api/board'); } catch { return netKick(); }
+  if (b.etag === BOARD_ETAG || b.body?.v !== 5) return;
+  if (unsaved()) { SAVE.theirs = b.etag; SAVE.paused = 'conflict'; return conflictBar(); }
+  boardAdopt(b.body); BOARD_ETAG = b.etag;
+}
+// A clean tab takes another tab's board in place: nodes, links and ink. The camera stays this device's.
+function boardAdopt(b) {
+  ADOPTING = true;
+  try {
+    const cur = S.nodes;
+    for (const id of Object.keys(cur)) if (!b.nodes?.[id] || b.nodes[id].kind !== cur[id].kind) { unmountQuiet(id); delete cur[id]; }
+    for (const [id, nn] of Object.entries(b.nodes || {})) {
+      const o = cur[id];
+      if (!o) { cur[id] = nn; continue; }
+      for (const k of Object.keys(o)) if (!k.startsWith('_') && !(k in nn)) delete o[k];
+      Object.assign(o, nn);   // in place: the mounted card's closures hold this object
+      const v = live[id]?.view;
+      if (o.kind === 'buffer' && v && v.state.doc.toString() !== (o.text || '')) v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: o.text || '' } });
+    }
+    S.edges = b.edges || []; S.strokes = b.strokes || []; S.shapes = b.shapes || []; BOARD_CAM = b.cam;
+    frameList().filter(f => !live[f.id]).sort((x, y) => depthOf(x) - depthOf(y)).forEach(mount);
+    nodeList().filter(n => !live[n.id]).forEach(mount);
+    frameList().forEach(placeFrame); nodeList().forEach(place);
+    frameList().sort((x, y) => depthOf(y) - depthOf(x)).forEach(f => relayout(f));
+    restack(); updateAllTitles(); renderTree(); renderLinks(); renderInk(null);
+    SAVE.lastJson = serialize();
+  } finally { ADOPTING = false; }
+}
+function unmountQuiet(id) {   // the card went in another tab: drop it here without killing its session
+  const L = live[id]; if (!L) return;
+  L.backend?.dispose?.(); L.ro?.disconnect(); L.view?.destroy(); L.term?.dispose(); if (L.frame?.contentWindow) HOSTS.delete(L.frame.contentWindow);
+  L.el.remove(); delete live[id];
 }
 
 // ------------------------------------------------------------------ toast, ask, copy
 let toastT = null;
 function toast(msg, ms = 2600) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), ms); }
+
+// ------------------------------------------------------------------ connection state, alert bar, sessions (30 §0)
+const backoff = n => { const d = Math.min(30000, 500 * 2 ** Math.min(n, 6)); return d / 2 + Math.random() * d / 2; };   // equal jitter
+const NET = { state: 'up', hub: null, tries: 0, probing: null, since: 0, timer: null };
+const WAKE = new Set();   // parked until the network or the hub is back: PTY backends and the RPC socket, each with .wake()
+const SIGN_IN = '/oauth2/sign_in?rd=%2Ficon.svg';   // signs in in a new tab and lands on a harmless static file
+const hhmm = t => new Date(t).toTimeString().slice(0, 5);
+function netKick() { if (!DAEMON) return; return NET.probing || (NET.probing = netProbe().finally(() => { NET.probing = null; })); }
+async function netProbe() {
+  let r;
+  try { r = await fetch('/api/info', { redirect: 'manual', cache: 'no-store' }); } catch { return netSet(navigator.onLine === false ? 'offline' : 'down'); }
+  if (r.type === 'opaqueredirect' || r.status === 401) return netSet('signed_out');
+  if (r.status === 403) return netSet('forbidden');
+  let info = null; if (r.ok) try { info = await r.json(); } catch {}
+  if (!info) return netSet('down');
+  Object.assign(INFO, info); hubSeen(info.hub); netSet('up');
+}
+function netSet(s) {
+  const was = NET.state; NET.state = s; clearTimeout(NET.timer);
+  if (s !== was) NET.since = Date.now();
+  if (s === 'up') {
+    if (was !== 'up') {
+      NET.tries = 0; barClear('auth'); barClear('forbidden'); wakeAll();
+      if (SAVE.paused === 'auth') { SAVE.paused = null; save(); dbFlush(); }
+    }
+  } else if (s === 'down' || s === 'offline') NET.timer = setTimeout(netKick, backoff(NET.tries++));
+  else if (s === 'signed_out') {
+    if (!SAVE.paused) SAVE.paused = 'auth';
+    authBar();
+    NET.timer = setTimeout(netKick, 5000);
+  } else if (s === 'forbidden') { bar('forbidden', 'This account has no access to Workbench (403).', [['Retry', () => netKick()]]); NET.timer = setTimeout(netKick, 30000); }
+  netChip();
+}
+function authBar() {
+  const since = changed() ? 'changes since ' + hhmm(NET.since) + ' are not saved yet' : 'nothing is lost yet';
+  bar('auth', 'Signed out: ' + since + '.', [['Sign in', SIGN_IN], ['Reload (unsaved changes are lost)', () => { SAVE.leaving = true; location.reload(); }]]);
+}
+function wakeAll() { for (const w of [...WAKE]) w.wake(); }
+addEventListener('online', () => { wakeAll(); netKick(); });
+addEventListener('focus', () => { if (NET.state !== 'up') netKick(); const L = live[activeId]; if (L?.term) L.backend?.resize?.(L.term.cols, L.term.rows); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { wakeAll(); if (NET.state !== 'up') netKick(); } });
+addEventListener('beforeunload', e => { if (DAEMON && !SAVE.leaving && SAVE.pending && (SAVE.paused || SAVE.err)) { e.preventDefault(); e.returnValue = ''; } });
+// One persistent strip; only the highest-priority key shows. A string action starting with / is a link.
+const BARS = {}, BAR_ORDER = ['auth', 'forbidden', 'conflict', 'save', 'hub'];
+function bar(key, text, actions = []) { BARS[key] = { text, actions }; barRender(); }
+function barClear(key) { if (BARS[key]) { delete BARS[key]; barRender(); } }
+function barRender() {
+  const b = $('#bar'), k = BAR_ORDER.find(x => BARS[x]);
+  b.hidden = !k; if (!k) return;
+  b.dataset.key = k; b.classList.toggle('bad', k !== 'save');
+  $('.msg', b).textContent = BARS[k].text;
+  $('.acts', b).replaceChildren(...BARS[k].actions.map(([label, act]) => {
+    if (typeof act === 'string') { const a = el('a', '', label); a.href = act; a.target = '_blank'; a.rel = 'noopener'; return a; }
+    const btn = el('button', '', label); btn.onclick = act; return btn;
+  }));
+}
+// Session facts from /rpc: sessions replaces, session upserts, gone deletes and leaves a tombstone (§3.5.3).
+const SESS = {}, TOMBS = new Set();
+function sessChanged(sid) { if (S?.nodes[sid]) updateTitle(S.nodes[sid]); clearTimeout(sessChanged.t); sessChanged.t = setTimeout(statusRender, 250); }
+function sessPut(x) { if (x?.sid && !TOMBS.has(x.sid + ' ' + x.createdAt)) { SESS[x.sid] = x; sessChanged(x.sid); } }
+const RPC_EVENTS = {
+  hub: m => hubStatus(m),
+  sessions: m => { for (const k in SESS) delete SESS[k]; (m.sessions || []).forEach(sessPut); statusRender(); },
+  session: m => sessPut(m.session),
+  gone: m => {
+    TOMBS.add(m.sid + ' ' + m.epoch);
+    if (SESS[m.sid]?.createdAt === m.epoch) delete SESS[m.sid];
+    live[m.sid]?.backend?.goneElsewhere?.(m.epoch); sessChanged(m.sid);
+  },
+  board: m => boardChanged(m.etag),
+};
+// Hub status (30 §3.3).
+function hubStatus(m) {
+  const was = NET.hub?.status; NET.hub = m;
+  if (m.status === 'down') bar('hub', 'The Workbench hub is down: shells and agents are unavailable.');
+  else if (m.status === 'incompatible') bar('hub', 'The hub is older than this web version. Restart workbench-hub (this ends all shells and agents).');
+  else if (m.status === 'up' && (was === 'down' || was === 'incompatible')) { barClear('hub'); for (const w of [...WAKE]) if (w.waitHub) w.wake(); netKick(); }
+  netChip();
+}
+function hubSeen(hub) {
+  if (!hub?.startedAt) return;   // a probe while the hub is down must not forget the start time its return is compared with
+  if (HUB_STARTED && hub.startedAt !== HUB_STARTED) toast('The Workbench hub restarted at ' + hhmm(hub.startedAt) + ': shells and agents ended. Enter restarts a shell.', 8000);
+  HUB_STARTED = hub.startedAt;
+}
+function netChip() {
+  const c = $('#st-net'); if (!c) return;
+  const s = NET.state, h = NET.hub?.status;
+  const [text, cls, title] =
+    s === 'down' || s === 'offline' ? ['reconnecting…', 'warn', (s === 'offline' ? 'Offline' : 'Server unreachable') + ' since ' + hhmm(NET.since)] :
+    s === 'signed_out' ? ['signed out', 'bad', 'Click to sign in (opens a new tab)'] :
+    s === 'forbidden' ? ['no access', 'bad', 'This account has no access to Workbench (403)'] :
+    h === 'down' ? ['hub down', 'bad', 'The Workbench hub is down'] :
+    h === 'incompatible' ? ['hub needs restart', 'bad', 'The hub is older than this web version'] :
+    NET.hub?.stale ? ['⟳', 'dim', 'hub update pending; restart workbench-hub when convenient (ends all sessions)'] : [null];
+  c.hidden = !text; if (!text) return;
+  c.textContent = text; c.className = 'stc ' + cls; c.title = title;
+  c.onclick = s === 'signed_out' ? () => window.open(SIGN_IN, '_blank', 'noopener') : null;
+}
+// Boot fetches (30 §2.2): a manual redirect is how an expired sign-in shows up.
+async function bootFetch(path) {   // throws {kind, status?}
+  let r; try { r = await fetch(path, { redirect: 'manual', cache: 'no-store' }); } catch { throw { kind: 'net' }; }
+  if (r.type === 'opaqueredirect' || r.status === 401) throw { kind: 'signed_out' };
+  if (r.status === 403) throw { kind: 'forbidden' };
+  if (!r.ok) throw { kind: 'http', status: r.status };
+  if (!/^application\/json\b/i.test(r.headers.get('content-type') || '')) throw { kind: 'not_json' };
+  try { return { body: await r.json(), etag: r.headers.get('ETag') }; } catch { throw { kind: 'not_json' }; }
+}
+let bootTries = 0, bootTimer = null;
+function bootScreen(e) {
+  const m = $('#boot-msg'), retry = () => { clearInterval(bootTimer); m.hidden = true; boot(); };
+  const auto = e.kind === 'net' || (e.kind === 'http' && e.status >= 500);
+  const [title, text, acts] =
+    e.kind === 'signed_out' ? ['Signed out', 'Sign in again to open the board.', [['Sign in', () => location.reload()]]] :
+    e.kind === 'forbidden' ? ['No access', 'This account has no access to Workbench (403).', [['Retry', retry]]] :
+    e.kind === 'not_json' ? ['Not a board', 'The server answered with something that is not a board. Nothing was changed.', [['Retry', retry]]] :
+    e.kind === 'format' ? ['Unknown board', `Board format not recognised (v=${e.v}); nothing was changed.`, [['Retry', retry]]] :
+    auto ? ['Workbench server unreachable', '', [['Retry now', retry]]] :
+    ['Error ' + e.status, 'The server refused to load the board.', [['Retry', retry]]];
+  m.dataset.kind = e.kind; $('h2', m).textContent = title; $('p', m).textContent = text;
+  $('.acts', m).replaceChildren(...acts.map(([label, fn]) => { const b = el('button', '', label); b.onclick = fn; return b; }));
+  m.hidden = false; clearInterval(bootTimer);
+  if (auto) {
+    let left = Math.ceil(backoff(bootTries++) / 1000);
+    const tick = () => { if (left <= 0) return retry(); $('p', m).textContent = `Retrying in ${left--} s.`; };
+    tick(); bootTimer = setInterval(tick, 1000);
+  }
+}
 function copyText(text) {
   const ok = () => toast('Copied: ' + text);
   try { navigator.clipboard.writeText(text).then(ok, () => toast(text, 6000)); } catch { toast(text, 6000); }
@@ -203,7 +405,7 @@ const bufTheme = V.EditorView.theme({
   '.cm-activeLine': { backgroundColor: 'var(--active-line)' },
   '.cm-activeLineGutter': { backgroundColor: 'transparent', color: 'var(--fg)' },
   '&.cm-focused': { outline: 'none' },
-  '.cm-cursor': { borderLeftColor: 'var(--accent)', borderLeftWidth: '2px' },
+  '.cm-cursor': { borderLeftColor: 'var(--cursor)', borderLeftWidth: '2px' },
   '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': { backgroundColor: 'var(--sel) !important' },
   '.cm-foldGutter': { display: 'none' },
 });
@@ -216,6 +418,16 @@ const bufHighlight = V.HighlightStyle.define([
   { tag: [T.link, T.url], color: 'var(--link)' },
   { tag: T.monospace, color: 'var(--code)' },
   { tag: [T.processingInstruction, T.list, T.quote, T.meta, T.contentSeparator], color: 'var(--muted)' },
+  // code: Modus's mappings (keyword, string, comment, builtin, function name, variable, constant, type, docstring)
+  { tag: [T.keyword, T.controlKeyword, T.definitionKeyword, T.moduleKeyword], color: 'var(--syn-keyword)' },
+  { tag: [T.string, T.special(T.string), T.regexp], color: 'var(--syn-string)' },
+  { tag: [T.comment, T.lineComment, T.blockComment], color: 'var(--syn-comment)' },
+  { tag: [T.docString, T.docComment], color: 'var(--syn-docstring)' },
+  { tag: [T.standard(T.name), T.standard(T.variableName)], color: 'var(--syn-builtin)' },
+  { tag: [T.function(T.variableName), T.function(T.definition(T.variableName)), T.function(T.propertyName)], color: 'var(--syn-fnname)' },
+  { tag: T.definition(T.variableName), color: 'var(--syn-variable)' },
+  { tag: [T.constant(T.name), T.constant(T.variableName), T.bool, T.null, T.atom], color: 'var(--syn-constant)' },
+  { tag: [T.typeName, T.className, T.namespace], color: 'var(--syn-type)' },
 ]);
 
 // ------------------------------------------------------------------ addresses
@@ -464,49 +676,122 @@ class JsRepl {
 }
 
 // Real PTY through canvasd. The daemon keeps the session alive across reloads and replays recent output.
+// A real shell on the server (/pty, §3.5.1). Nothing auto-runs: `spawn` is true only on the first open of a card made in
+// this page and on Enter on an ended or not-found card; page loads and reconnects attach with `resume` (SEC-2, F-A6).
+const IN_CHUNK = 262144;   // characters per `in` message: worst-case JSON escaping stays under the web's message cap
+const EXIT_TEXT = {
+  hub_restart: 'the Workbench hub restarted: press Enter to start a new shell',
+  killed: 'process killed: press Enter to start a new one',
+  spawn_failed: 'could not start: press Enter to try again',
+};
 class PtyBackend {
-  constructor(n, term) { this.n = n; this.t = term; this.connect(); }
-  openMsg() { return JSON.stringify({ t: 'open', id: this.n.id, cmd: this.n.cmd || '', parent: this.n.spawnFrom || '', cwd: this.n.cwd || '', tmux: this.n.tmux || '', cols: this.t.cols, rows: this.t.rows, env: { CANVAS_NODE: pathOf(this.n.id), ...(this.n.env || {}) } }); }
+  constructor(n, term, L) { this.n = n; this.t = term; this.L = L; this.spawn = !!n._spawn; delete n._spawn; this.tries = 0; this.connect(); }
+  openMsg() {
+    const n = this.n, m = { t: 'open', id: n.id, cmd: n.cmd || '', parent: n.spawnFrom || '', cwd: n.cwd || '', tmux: n.tmux || '', cols: this.t.cols, rows: this.t.rows, env: { CANVAS_NODE: pathOf(n.id), ...(n.env || {}) }, spawn: this.spawn };
+    if (this.spawn && n.shell) m.shell = n.shell;
+    if (!this.spawn && this.resume) m.resume = this.resume;
+    return JSON.stringify(m);
+  }
   connect() {
     if (this.disposed) return;
+    clearTimeout(this.timer); WAKE.delete(this); this.waitHub = false;
     const h = this.host = this.n.hostUrl ? hostByUrl(this.n.hostUrl) : hostOf(this.n);   // a process stays on the host it started on
     if (h) { this.n.hostUrl = h.url; rpcFor(h); } else delete this.n.hostUrl;
-    this.parked = false;
+    this.parked = false; this.final = false; this.helloSeen = false;
     const ws = this.ws = new WebSocket(hWs(h, '/pty'));
-    ws.onopen = () => { ws.send(this.openMsg()); this.tries = 0; if (h) hostUp(h); };
+    ws.onopen = () => { ws.send(this.openMsg()); if (h) { this.tries = 0; hostUp(h); } };
     ws.onmessage = ev => {
-      const m = JSON.parse(ev.data);
+      let m; try { m = JSON.parse(ev.data); } catch { return; }
       if (m.t === 'hello') {
-        this.dead = false;
+        this.dead = false; this.exitReason = null; this.helloSeen = true; this.tries = 0; this.epoch = m.epoch;
+        this.spawn = false;   // only now: a socket that closes before hello (1013, a restart) retries the spawn
+        this.final = false;   // a respawn on the socket a failed open left open is live again
+        this.L?.el.classList.remove('net-wait');
+        if (m.stream != null) this.resume = { stream: m.stream, out: m.out };
         if (m.tmux) { if (this.n.tmuxSess !== m.tmux || !!this.n.tmuxAdopted !== !!m.adopted) { this.n.tmuxSess = m.tmux; this.n.tmuxAdopted = !!m.adopted; retag(this.n); } if (m.attached && m.cwd) this.n.cwdLive = m.cwd; }
-        if (!m.new) { this.t.reset(); this.t.write(m.replay || ''); }
-        else if (this.n.replay) {
-          const r = this.n.replay; delete this.n.replay; dirty();
-          setTimeout(() => { this.t.write('\x1b[38;5;179m↺ replaying the parent’s input\x1b[0m\r\n'); this.send(r); }, 800);
-        }
-      } else if (m.t === 'out') { this.t.write(m.d); activity(this.n.id); }
+        if (m.new) {
+          if (this.lost || (this.helloed && !this.respawning)) this.t.write('\r\n\x1b[33m[new shell: the server had no session for this card]\x1b[0m\r\n');
+          if (this.n.replay) {
+            const r = this.n.replay; delete this.n.replay; dirty();
+            setTimeout(() => { this.t.write('\x1b[38;5;179m↺ replaying the parent’s input\x1b[0m\r\n'); this.send(r); }, 800);
+          }
+        } else if (m.resumed) this.t.write(m.replay || '');   // the ring tail after our offset: the scrollback stays
+        else { this.t.reset(); this.t.write(m.replay || ''); }
+        this.helloed = true; this.respawning = false; this.lost = false;
+      } else if (m.t === 'out') { this.t.write(m.d); if (m.out != null && this.resume) this.resume.out = m.out; activity(this.n.id); }
       else if (m.t === 'fg') { if (this.n.fg !== m.comm) { this.n.fg = m.comm; retag(this.n); } if (m.cwd && this.n.cwdLive !== m.cwd) { this.n.cwdLive = m.cwd; cwdMoved(this.n); } }
-      else if (m.t === 'exit') { this.dead = true; this.t.write('\r\n\x1b[2m[process ended: press Enter to start a new one]\x1b[0m\r\n'); }
-      else if (m.t === 'error') { this.dead = true; this.t.write('\r\n\x1b[31m' + m.error + '\x1b[0m\r\n'); }
+      else if (m.t === 'exit') {
+        this.dead = true; this.exitReason = m.reason || null;
+        const how = m.code != null ? ` with code ${m.code}` : m.signal ? ` (signal ${m.signal})` : '';
+        this.t.write('\r\n\x1b[2m[' + (EXIT_TEXT[m.reason] || `process exited${how}: press Enter to start a new one`) + ']\x1b[0m\r\n');
+      } else if (m.t === 'gone') this.goneElsewhere(m.epoch);
+      else if (m.t === 'error') {
+        if (!this.helloSeen) this.final = true;   // a failed open: the server closes 1000, nothing to reconnect to (F-A4)
+        this.dead = true;
+        if (m.code === 'not_found') { this.lost = true; this.t.write(`\r\n\x1b[33m[No session: press Enter to start ${this.n.cmd || this.n.shell || 'a shell'}]\x1b[0m\r\n`); }
+        else if (m.code === 'bad_request' && this.n.shell && INFO?.defaultShell && /^shell .* not available/.test(m.error || '')) this.offerDefault();
+        else this.t.write('\r\n\x1b[31m' + m.error + '\x1b[0m\r\n');
+      }
     };
-    ws.onclose = () => {
-      if (this.disposed) return;
-      if (!h) return void setTimeout(() => this.connect(), 1200);
-      hostDown(h);
-      if (hostAuto(this.n)) { this.tries = (this.tries || 0) + 1; setTimeout(() => this.connect(), Math.min(15000, 1200 * 2 ** Math.min(this.tries, 4))); }
-      else { this.parked = true; this.t.write(`\r\n\x1b[2m[@${h.name} is unreachable. ↻ on the folder tab, or entering the workspace, reconnects.]\x1b[0m\r\n`); }
+    ws.onclose = ev => {
+      if (this.disposed || ws !== this.ws) return;
+      if (h) {
+        hostDown(h);
+        if (hostAuto(this.n)) { this.tries = (this.tries || 0) + 1; setTimeout(() => this.connect(), Math.min(15000, 1200 * 2 ** Math.min(this.tries, 4))); }
+        else { this.parked = true; this.t.write(`\r\n\x1b[2m[@${h.name} is unreachable. ↻ on the folder tab, or entering the workspace, reconnects.]\x1b[0m\r\n`); }
+        return;
+      }
+      // §3.5.4: 1000/1008/1009 are final and keep the card's state; 1013 waits for the hub; the rest back off.
+      if (this.final || [1000, 1008, 1009].includes(ev.code)) {
+        this.final = true;
+        if (ev.code === 1008 || ev.code === 1009) this.t.write(`\r\n\x1b[31m[connection closed: ${ev.code === 1009 ? 'message too big' : 'protocol error'} (${ev.code}): press Enter to reopen]\x1b[0m\r\n`);
+        else if (!this.dead) this.t.write('\r\n\x1b[2m[connection closed: press Enter to start a new shell]\x1b[0m\r\n');
+        this.dead = true; this.L?.el.classList.remove('net-wait');
+        return;
+      }
+      this.L?.el.classList.add('net-wait'); WAKE.add(this);
+      if (ev.code === 1013) { this.waitHub = true; this.timer = setTimeout(() => this.wake(), 30000); return; }
+      netKick();
+      if (NET.state !== 'signed_out' && NET.state !== 'forbidden') this.timer = setTimeout(() => this.connect(), backoff(this.tries++));
     };
   }
+  wake() { if (!this.disposed && !this.final && !this.host && this.ws?.readyState > 1) { this.tries = 0; this.connect(); } }
   reconnect() { if (this.parked && !this.disposed) { this.tries = 0; this.connect(); } }
-  send(d) { if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ t: 'in', d })); }
+  // /rpc or /pty `gone`: the session was ended in another tab or by wb; never reconnect or respawn on our own (ROB-19)
+  goneElsewhere(epoch) {
+    if (epoch != null && this.epoch != null && epoch !== this.epoch) return;
+    if (this.final) return;
+    this.final = true; this.dead = true; clearTimeout(this.timer); WAKE.delete(this); this.L?.el.classList.remove('net-wait');
+    this.t.write('\r\n\x1b[2m[this session was ended elsewhere: press Enter to start a new one]\x1b[0m\r\n');
+    try { this.ws?.close(); } catch {}
+  }
+  offerDefault() { this.shellOffer = true; this.t.write(`\r\n\x1b[33m[the shell ${this.n.shell} is not available here: press Enter to start ${INFO.defaultShell}]\x1b[0m\r\n`); }
+  // Enter on an ended or not-found card: an explicit spawn with the card's shell, or the default one the card offered
+  respawn() {
+    if (!this.shellOffer && this.n.shell && INFO?.shells && INFO.defaultShell && !INFO.shells.includes(this.n.shell)) return this.offerDefault();
+    if (this.shellOffer) { this.shellOffer = false; this.n.shell = INFO.defaultShell; updateTitle(this.n); dirty(); }
+    this.dead = false; this.respawning = true; this.spawn = true;
+    if (this.ws?.readyState === 1) this.ws.send(this.openMsg()); else this.connect();
+  }
+  send(d) {
+    if (this.ws?.readyState !== 1) return;
+    for (let i = 0; i < d.length;) {
+      let j = Math.min(d.length, i + IN_CHUNK);
+      if (j < d.length && /[\ud800-\udbff]/.test(d[j - 1])) j--;   // never split a surrogate pair
+      this.ws.send(JSON.stringify({ t: 'in', d: d.slice(i, j) })); i = j;
+    }
+  }
   input(d) {
-    if (this.dead) { if (d === '\r' && this.ws?.readyState === 1) { this.dead = false; this.ws.send(this.openMsg()); } return; }
+    if (this.dead) { if (d === '\r') this.respawn(); return; }
     if (this.n.kind === 'repl') { this.n.inputLog = ((this.n.inputLog || '') + d).slice(-20000); dirty(); }
     this.send(d);
   }
-  resize(cols, rows) { if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ t: 'resize', cols, rows })); }
+  // only the tab the user is looking at sizes the PTY (ROB-8)
+  resize(cols, rows) { if (this.ws?.readyState === 1 && document.visibilityState === 'visible' && document.hasFocus() && activeId === this.n.id) this.ws.send(JSON.stringify({ t: 'resize', cols, rows })); }
   // the card goes: a wb-* tmux session dies with it, an adopted one is only detached (the daemon decides); detachOnly forces a detach
-  kill() { this.disposed = true; try { this.ws.send(JSON.stringify({ t: 'kill', session: this.detachOnly ? false : undefined })); } catch {} setTimeout(() => this.ws?.close(), 50); }
+  kill() { this.disposed = true; clearTimeout(this.timer); WAKE.delete(this); if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ t: 'kill', session: this.detachOnly ? false : undefined })); setTimeout(() => this.ws?.close(), 50); }
+  // the card went in another tab: close here, the session is not ours to end
+  dispose() { this.disposed = true; clearTimeout(this.timer); WAKE.delete(this); try { this.ws?.close(); } catch {} }
   // end the process (session=true also kills a tmux session) but keep the card: it shows the exit and Enter starts anew
   end(session) { if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ t: 'kill', session })); }
 }
@@ -516,15 +801,10 @@ class Offline {
 }
 
 // ------------------------------------------------------------------ mounting
-function termTheme() {
-  const dark = getComputedStyle(document.documentElement).colorScheme === 'dark';
-  // Modus Operandi / Modus Vivendi ANSI colours
-  const ansi = dark
-    ? ['#000000', '#ff5f59', '#44bc44', '#d0bc00', '#2fafff', '#feacd0', '#00d3d0', '#a6a6a6', '#595959', '#ff6b55', '#00c06f', '#fec43f', '#79a8ff', '#b6a0ff', '#6ae4b9', '#ffffff']
-    : ['#000000', '#a60000', '#006800', '#6f5500', '#0031a9', '#721045', '#005e8b', '#a6a6a6', '#595959', '#972500', '#316500', '#884900', '#354fcf', '#531ab6', '#005a5f', '#ffffff'];
+function termTheme() {   // Modus tinted terminal colours, from the --ansi-* tokens in style.css
   const names = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
-  const t = { background: cssVar('--term-bg'), foreground: cssVar('--term-fg'), cursor: cssVar('--fg'), cursorAccent: cssVar('--term-bg'), selectionBackground: cssVar('--sel') };
-  names.forEach((nm, i) => { t[nm] = ansi[i]; t['bright' + nm[0].toUpperCase() + nm.slice(1)] = ansi[i + 8]; });
+  const t = { background: cssVar('--term-bg'), foreground: cssVar('--term-fg'), cursor: cssVar('--cursor'), cursorAccent: cssVar('--term-bg'), selectionBackground: cssVar('--sel') };
+  names.forEach((nm, i) => { t[nm] = cssVar('--ansi-' + i); t['bright' + nm[0].toUpperCase() + nm.slice(1)] = cssVar('--ansi-' + (i + 8)); });
   return t;
 }
 function mount(n) { if (n.kind === 'frame') mountFrame(n); else mountNode(n); }
@@ -1140,8 +1420,8 @@ $('#tp-new').onclick = () => $('#add-frame').click();
 
 function mountNode(n) {
   const e = el('div', 'node k-' + n.kind); e.dataset.id = n.id;
-  const hdr = el('div', 'hdr', '<i class="dot"></i><span class="path"><span class="anc"></span><b class="name"></b></span><span class="badge"></span><span class="tags"></span><span class="btns"></span>');
-  const body = el('div', 'body'), lod = el('div', 'lod', '<b></b><pre></pre>'), ink = svgEl('svg', { class: 'ink' });
+  const hdr = Object.assign(el('div', 'hdr'), { innerHTML: '<i class="dot"></i><span class="path"><span class="anc"></span><b class="name"></b></span><span class="badge"></span><span class="tags"></span><span class="btns"></span>' });
+  const body = el('div', 'body'), lod = Object.assign(el('div', 'lod'), { innerHTML: '<b></b><pre></pre>' }), ink = svgEl('svg', { class: 'ink' });
   const port = el('div', 'port'); port.title = 'Drag onto another node to add a pipe';
   const rs = el('div', 'rs'), rse = el('div', 'rse'), rsb = el('div', 'rsb'); rs.title = 'Drag to resize'; rse.title = 'Drag: width'; rsb.title = 'Drag: height';
   e.append(hdr, body, lod, ink, port, rse, rsb, rs); nodesEl.append(e);
@@ -1210,7 +1490,7 @@ function badgeOf(n) {
   if (n.kind === 'frame' && n.owner && S.nodes[n.owner]) return '✦ ' + S.nodes[n.owner].name;
   if (n.kind === 'artifact') return n.head ? 'v ' + String(n.head).slice(0, 6) : '';
   if (n.kind === 'ghost') return n.alias ? 'copy' : n.journalDay && !n.noteId ? 'journal' : n.noteId ? 'note' : n.linkTitle ? 'link' : n.tmuxTarget ? 'tmux' : n.procPid ? 'process' : n.unitName ? (n.unitState || 'unit') : n.hardlink ? 'hardlink' : n.link ? 'symlink' : n.mount ? 'mount' : n.dir ? 'directory' : 'file';
-  if (n.kind === 'term') return n.backend === 'pty' ? 'shell' : 'sim shell';
+  if (n.kind === 'term') return n.backend === 'pty' ? n.shell || 'shell' : 'sim shell';
   if (n.kind === 'repl') return n.lang === 'js' ? 'js' : (n.cmd || '').split(' ')[0].replace('python3', 'py');
   return { buffer: 'page', ref: 'ref', agent: 'agent' }[n.kind] || n.kind;
 }
@@ -1252,7 +1532,7 @@ function mountTerm(n, L) {
   L.ro.observe(L.body);
   L.fitNow();
   if (n.kind === 'repl' && n.lang === 'js') L.backend = new JsRepl(n, term);
-  else if (n.backend === 'pty') L.backend = DAEMON ? new PtyBackend(n, term) : new Offline(n, term);
+  else if (n.backend === 'pty') L.backend = DAEMON ? new PtyBackend(n, term, L) : new Offline(n, term);
   else L.backend = new FakeShell(n, term);
   term.onData(d => L.backend.input(d));
 }
@@ -1344,6 +1624,7 @@ function activate(id) {
   activeId = id;
   const L = live[id]; if (!L) return;
   L.el.classList.add('active');
+  if (L.term) L.backend?.resize?.(L.term.cols, L.term.rows);   // the card the user looks at sizes its PTY
   if (L.el.parentNode === nodesEl && +L.el.style.zIndex < topZ) L.el.style.zIndex = ++topZ;
   $$('#tp-list .tp-row').forEach(r => r.classList.toggle('on', r.dataset.id === id));
   updateSideCtx();
@@ -1395,6 +1676,7 @@ function addNode(n) {
   if (!('in' in n)) { const t = containerAt(n.x + Math.min(40, n.w / 2), n.y + 20, new Set([n.id])); if (t && t.mode !== 'stack') n.in = t.id; }
   if (!n.in || !S.nodes[n.in]) delete n.in;
   if (n.in && S.nodes[n.in].mode === 'pack') n.order = 1e9;
+  n._spawn = true;   // made in this page: its first open may spawn (SEC-2); `_` keys are never saved
   S.nodes[n.id] = n; mount(n);
   SEP.keep = n; if (n.in) relayout(S.nodes[n.in], true); else separate(null, n); SEP.keep = null;
   restack(); renderEdges(); activate(n.id); renderTree(); dirty(); return n;
@@ -1429,7 +1711,7 @@ function spawnChild(n, name) {
     child.cwd = n.cwd; child.env = { ...(n.env || {}) };
     child.spawnNote = `branched from ${pathOf(n.id)}: started in ${n.cwd}, inherited ${Object.keys(child.env).length} env var(s)`;
   }
-  if (n.kind === 'term' && n.backend === 'pty') child.env = { ...(n.env || {}) };
+  if (n.kind === 'term' && n.backend === 'pty') { child.env = { ...(n.env || {}) }; if (n.shell) child.shell = n.shell; }
   if (n.kind === 'repl' && n.lang === 'js') { child.history = [...(n.history || [])]; child.replayFrom = pathOf(n.id); }
   if (n.kind === 'repl' && n.lang !== 'js') child.replay = n.inputLog || '';
   if (n.kind === 'agent') { child.turns = (n.turns || []).map(t => ({ ...t })); child.log = [...(n.log || []).filter(m => !m.live).map(m => ({ ...m })), { t: 'note', text: `Forked from ${pathOf(n.id)} after ${child.turns.length} turn(s). This branch continues on its own.` }]; child.tier = n.tier; }
@@ -1819,7 +2101,16 @@ $('#add-web').onclick = () => askName('Address', 'https://', u => newWeb(u));
 $('#add-sketch').onclick = () => newSketch();
 if ($('#add-agent')) $('#add-agent').onclick = () => { const n = newAt('agent', { w: 520, h: 440, log: [{ t: 'note', text: 'Ask me about the board, or tell me what to change.' }], turns: [], tier: 'quick' }); setTimeout(() => live[n.id]?.ta?.focus(), 50); };
 $('#open-today').onclick = () => openToday();
-$('#add-shell').onclick = () => newAt('term', { backend: DAEMON ? 'pty' : 'fake', cwd: DAEMON ? undefined : '/home/me', env: {} });
+$('#add-shell').onclick = () => pickShell(shell => newAt('term', { backend: DAEMON ? 'pty' : 'fake', cwd: DAEMON ? undefined : '/home/me', env: {}, ...(shell ? { shell } : {}) }));
+// The server's shells (/api/info.shells); the default is the last one picked on this device, else the server's default.
+const SHELL_KEY = 'wb-shell';
+function shellDefault() { const sh = INFO?.shells || [], last = store.get(SHELL_KEY); return sh.includes(last) ? last : INFO?.defaultShell; }
+function pickShell(then) {
+  const sh = DAEMON && INFO?.shells || [];
+  if (sh.length < 2) return then(sh[0]);
+  const d = shellDefault(), order = sh.includes(d) ? [d, ...sh.filter(x => x !== d)] : sh;
+  openPicker('Shell', order.map(x => ({ k: 'shell', l: x, s: x === INFO.defaultShell ? 'default' : '', run: () => { store.set(SHELL_KEY, x); then(x); } })));
+}
 $('#add-buffer').onclick = () => { const n = newAt('buffer', { text: '# untitled\n\n- ' }); n.text = `# ${n.name}\n\n- `; live[n.id].view.dispatch({ changes: { from: 0, to: live[n.id].view.state.doc.length, insert: n.text } }); };
 $('#add-frame').onclick = () => {
   if (VIEW !== 'canvas') setView('canvas');
@@ -1848,7 +2139,8 @@ $('#help-close').onclick = () => { $('#help').hidden = true; };
 $('#reset-board').onclick = ev => confirmDel(ev.currentTarget, () => {
   for (const id in live) live[id].backend?.kill?.();
   S = null; clearTimeout(saveT);
-  if (DAEMON) fetch('/api/board', { method: 'PUT', headers: { 'X-Token': TOKEN, 'Content-Type': 'application/json' }, body: '{"v":0}' }).finally(() => location.reload());
+  SAVE.leaving = true;   // a deliberate wipe: a 412 reloads too
+  if (DAEMON) fetch('/api/board', { method: 'PUT', redirect: 'manual', headers: { 'Content-Type': 'application/json', 'If-Match': BOARD_ETAG }, body: '{"v":0}' }).finally(() => location.reload());
   else { store.del(LS_KEY); location.reload(); }
 });
 
@@ -1969,7 +2261,7 @@ function renderPalette() {
     d.onclick = () => runItem(it);
     list.append(d);
   });
-  if (!palItems.length) list.append(el('div', 'pal-hint', 'No match. Type <code>&gt;</code> for commands, or a path, <code>Folder/B3</code>, <code>page › heading ¶2</code>, <code>page#anchor</code>, <code>@x,y</code>.'));
+  if (!palItems.length) list.append(Object.assign(el('div', 'pal-hint'), { innerHTML: 'No match. Type <code>&gt;</code> for commands, or a path, <code>Folder/B3</code>, <code>page › heading ¶2</code>, <code>page#anchor</code>, <code>@x,y</code>.' }));
 }
 function runItem(it) {
   if (it.cmd) { const r = S.recentCmds = (S.recentCmds || []).filter(t => t !== it.l); r.unshift(it.l); r.length = Math.min(r.length, 5); dirty(); }
@@ -2968,7 +3260,7 @@ function sideTab(which) {
   $$('.side-tabs button').forEach(b => b.classList.toggle('on', b.dataset.side === which));
   { const sc = $('#side-chat'); if (sc) sc.hidden = true; } $('#side-term').hidden = false;
   if (which === 'term') {
-    if (!S.dockTerm) S.dockTerm = { id: 'dock', kind: 'term', name: 'dock', backend: DAEMON ? 'pty' : 'fake', cwd: DAEMON ? undefined : '/home/me', env: {} };
+    if (!S.dockTerm) { S.dockTerm = { id: 'dock', kind: 'term', name: 'dock', backend: DAEMON ? 'pty' : 'fake', cwd: DAEMON ? undefined : '/home/me', env: {}, _spawn: BOOTED }; if (shellDefault()) S.dockTerm.shell = shellDefault(); dirty(); }
     if (!live.dock) { live.dock = { el: $('#side-term'), body: $('#side-term-body'), hdr: null }; mountTerm(S.dockTerm, live.dock); }
     setTimeout(() => { live.dock.fitNow?.(); live.dock.term?.focus(); }, 60);
   }
@@ -3071,8 +3363,8 @@ function mirrorTo(target, u, src) {
   finally { mirroring = false; }
 }
 const edTheme = V.EditorView.theme({
-  '&': { fontSize: '15px' },
-  '.cm-scroller': { fontFamily: 'var(--ui)', lineHeight: '1.7' },
+  '&': { fontSize: '14px' },
+  '.cm-scroller': { fontFamily: MONO, lineHeight: '1.6' },
   '.cm-content': { maxWidth: '72ch', margin: '0 auto', padding: '28px 24px 40vh' },
   '.cm-gutters': { display: 'none' },
 });
@@ -3301,7 +3593,7 @@ function graphDraw() {
     const showLabel = z > 0.7 || near.has(g.id) || g.deg >= 3 || (q && !d);
     if (showLabel) {
       ctx.globalAlpha = d ? 0.25 : 1;
-      ctx.font = `${g.id === focus || g.kind === 'folder' ? 600 : 400} ${12 / Math.sqrt(z)}px "Atkinson Hyperlegible Next", system-ui, sans-serif`;
+      ctx.font = `${g.id === focus || g.kind === 'folder' ? 600 : 400} ${12 / Math.sqrt(z)}px ${MONO}`;
       ctx.fillStyle = g.kind === 'ghost' ? C.muted : C.fg; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
       ctx.fillText(g.label, p.x, p.y + rad + 4 / z);
     }
@@ -3714,13 +4006,26 @@ AGENT_TOOLS.push({
 // one WebSocket; the key lives in the daemon's environment. In the hosted artifact the outer page's own `sample` answers.
 let INFO = null;
 class Rpc {
-  constructor(h = null) { this.h = h; this.calls = new Map(); this.seq = 0; this.connect(); }
+  constructor(h = null) { this.h = h; this.calls = new Map(); this.seq = 0; this.tries = 0; this.connect(); }
   connect() {
+    clearTimeout(this.timer); WAKE.delete(this);
     const ws = this.ws = new WebSocket(hWs(this.h, '/rpc'));
-    ws.onopen = () => { this.tries = 0; };
-    ws.onmessage = ev => { const m = JSON.parse(ev.data); if (m.t === 'cmd') return this.runCmd(m); const c = this.calls.get(m.id); if (c) c.on(m); };
-    ws.onclose = () => { for (const c of this.calls.values()) c.on({ t: 'error', code: 'upstream_error', message: 'the daemon connection closed' }); this.calls.clear(); this.tries = (this.tries || 0) + 1; setTimeout(() => this.connect(), this.h ? Math.min(30000, 1500 * 2 ** Math.min(this.tries, 4)) : 1500); };
+    ws.onopen = () => { this.tries = 0; if (!this.h && this.opened) netKick(); this.opened = true; };   // a reopen re-reads /api/info: hubSeen spots a restart
+    ws.onmessage = ev => {
+      let m; try { m = JSON.parse(ev.data); } catch { return; }
+      if (!this.h && RPC_EVENTS[m.t] && m.id == null) return RPC_EVENTS[m.t](m);
+      if (m.t === 'cmd') return this.runCmd(m);
+      const c = this.calls.get(m.id); if (c) c.on(m);
+    };
+    ws.onclose = () => {
+      for (const c of this.calls.values()) c.on({ t: 'error', code: 'upstream_error', message: 'the server connection closed' }); this.calls.clear();
+      if (this.h) { this.tries++; return void setTimeout(() => this.connect(), Math.min(30000, 1500 * 2 ** Math.min(this.tries, 4))); }
+      WAKE.add(this);
+      if (NET.state === 'signed_out' || NET.state === 'forbidden') return;
+      netKick(); this.timer = setTimeout(() => this.connect(), backoff(this.tries++));
+    };
   }
+  wake() { if (this.ws?.readyState > 1) { this.tries = 0; this.connect(); } }
   ready() { return new Promise(res => { if (this.ws.readyState === 1) return res(true); this.ws.addEventListener('open', () => res(true), { once: true }); setTimeout(() => res(this.ws.readyState === 1), 4000); }); }
   send(m) { if (this.ws.readyState === 1) this.ws.send(JSON.stringify(m)); }
   async runCmd(m) {
@@ -3792,7 +4097,7 @@ const HOSTS = new Map();   // iframe contentWindow -> {n, port}
 // versions: in the local build the daemon keeps them; in demo mode the node keeps the last few in S
 async function artPublish(n, { html, files } = {}, capabilities) {
   if (DAEMON) {
-    const r = await fetch(`/api/artifact/${n.id}`, { method: 'PUT', headers: { 'X-Token': TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify({ html, files, capabilities, ifMatch: n.head ?? null }) });
+    const r = await fetch(`/api/artifact/${n.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ html, files, capabilities, ifMatch: n.head ?? null }) });
     const j = await r.json();
     if (!r.ok) throw { code: j.error?.code || 'upstream_error', message: j.error?.message || 'publish failed' };
     n.head = j.version; n.versions = j.meta.versions.slice(-30); n.url = j.url;
@@ -3808,7 +4113,7 @@ async function artPublish(n, { html, files } = {}, capabilities) {
 }
 async function artSource(n, sha) {
   if (!DAEMON) { const v = sha && (n.versions || []).find(v => v.sha === sha); return v ? v.html : (n.html || ''); }
-  const r = await fetch(`/api/artifact/${n.id}${sha ? '?v=' + sha : ''}`, { headers: { 'X-Token': TOKEN } }); const j = await r.json();
+  const r = await fetch(`/api/artifact/${n.id}${sha ? '?v=' + sha : ''}`); const j = await r.json();
   const c = j.content; if (!c) return n.html || '';
   return c.kind === 'page' ? c.html : (c.files['index.html']?.text || '');
 }
@@ -3932,7 +4237,18 @@ function artifactPermissions(n) {
 // db: slash paths; even segments are documents. Query evaluation in the host; persistence with the board (demo) or
 // in the daemon's per-artifact store (local build). Snapshots are pushed to watchers after every write.
 const DB_WATCH = new Map();  // node id -> Set of {kind, path, q, push}
-function dbSave(n) { dirty(); if (DAEMON) { clearTimeout(n._dbT); n._dbT = setTimeout(() => fetch(`/api/db/${n.id}`, { method: 'PUT', headers: { 'X-Token': TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify(n.db) }).catch(() => {}), 400); } }
+function dbSave(n) { dirty(); if (DAEMON) { clearTimeout(n._dbT); n._dbT = setTimeout(() => dbPut(n), 400); } }
+function dbPut(n) {   // deferred while saving is paused (signed out, conflict); errors show and retry
+  if (SAVE.paused) return void SAVE.dbQueue.add(n);
+  fetch(`/api/db/${n.id}`, { method: 'PUT', redirect: 'manual', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(n.db) })
+    .then(r => {
+      if (r.type === 'opaqueredirect' || r.status === 401) { SAVE.dbQueue.add(n); return netSet('signed_out'); }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      n._dbErr = 0; if (!SAVE.err) barClear('save');
+    })
+    .catch(e => { bar('save', 'Data for ' + n.name + ' not saved: ' + e.message + '. Retrying…'); clearTimeout(n._dbT); n._dbT = setTimeout(() => dbPut(n), backoff(n._dbErr = (n._dbErr || 0) + 1)); netKick(); });
+}
+function dbFlush() { const q = [...SAVE.dbQueue]; SAVE.dbQueue.clear(); q.forEach(dbPut); }
 const dbGetField = (d, f) => f.split('.').reduce((o, k) => (o == null ? undefined : o[k]), d);
 function dbQuery(n, path, q) {
   const prefix = path.replace(/\/+$/, '') + '/';
@@ -4026,7 +4342,7 @@ async function artifactVersions(n) {
 }
 async function openWorkbenchInside() {
   if (!DAEMON) return toast('Needs the local build: the demo page is 1.3 MB and cannot embed itself here.');
-  const r = await fetch(`/api/cat?path=${encodeURIComponent(INFO.dist)}&limit=6000000`, { headers: { 'X-Token': TOKEN } }); const j = await r.json();
+  const r = await fetch(`/api/cat?path=${encodeURIComponent(INFO.dist)}&limit=6000000`); const j = await r.json();
   if (!r.ok || j.text?.startsWith('(binary')) return toast('dist/canvas-workbench.html not found. Run python3 tools/build-artifact.py first.');
   const n = await newArtifact('workbench-inside', j.text, { sample: { images: true }, artifact: {}, db: {} }); n.w = 1100; n.h = 720; place(n); jumpNode(n);
 }
@@ -4104,7 +4420,7 @@ async function rvLoad(force) {
   RV.cards = SAMPLE_CARDS; RV.log = S.reviews || []; RV.source = 'sample deck (demo)';
   if (DAEMON) {
     try {
-      const [c, r] = await Promise.all([fetch('/api/cards', { headers: { 'X-Token': TOKEN } }).then(x => x.json()), fetch('/api/reviews', { headers: { 'X-Token': TOKEN } }).then(x => x.json())]);
+      const [c, r] = await Promise.all([fetch('/api/cards').then(x => x.json()), fetch('/api/reviews').then(x => x.json())]);
       if (c.cards?.length) { RV.cards = c.cards.filter(x => x.status !== 'retired').map(x => ({ ...x, src: x.src || `${x.title}\n${Object.entries(x.props || {}).map(([k, v]) => `${k.toLowerCase()}:: ${v}`).join('\n')}\n${x.body || ''}`.trim() })); RV.source = c.root; }
       else RV.source = `sample deck (no cards under ${c.root}${c.exists ? '' : ', which does not exist'})`;
       RV.log = r.reviews || [];
@@ -4184,7 +4500,7 @@ function rvDiff(typed, truth) {
   if (rvNorm(typed) === rvNorm(truth)) { const s = el('span', 'ok'); s.textContent = ' ✓ exact (accents ignored)'; d.append(s); }
 }
 async function rvAppend(lines) {
-  if (DAEMON) { try { await fetch('/api/reviews', { method: 'POST', headers: { 'X-Token': TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify({ reviews: lines }) }); } catch { toast('Could not write the review log; the daemon is unreachable.'); } }
+  if (DAEMON) { try { await fetch('/api/reviews', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reviews: lines }) }); } catch { toast('Could not write the review log; the daemon is unreachable.'); } }
   else { S.reviews = S.reviews || []; S.reviews.push(...lines); dirty(); }
   RV.log.push(...lines);
 }
@@ -4272,7 +4588,7 @@ AGENT_TOOLS.push(
     run: async ({ front, back, deck, kind, extra, source, path }) => {
       const anchor = Math.random().toString(36).slice(2, 8);
       const block = `## ${str(front)} ^${anchor}\ncard:: ${kind || 'basic'}${deck ? `\ndeck:: ${deck}` : ''}${back ? `\nback:: ${str(back)}` : ''}${extra ? `\n${str(extra)}` : ''}${source ? `\nSource: ${source}` : ''}\n`;
-      if (DAEMON) { const r = await fetch('/api/notes/append', { method: 'POST', headers: { 'X-Token': TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify({ path: path || 'roam/inbox/cards.md', text: block, by: 'assistant' }) }); const j = await r.json(); RV.loaded = false; return `written to ${j.path} as ^${anchor}`; }
+      if (DAEMON) { const r = await fetch('/api/notes/append', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: path || 'roam/inbox/cards.md', text: block, by: 'assistant' }) }); const j = await r.json(); RV.loaded = false; return `written to ${j.path} as ^${anchor}`; }
       const p = findPage('cards') || openPage('cards', null, true); const v = live[p.id].view; v.dispatch({ changes: { from: v.state.doc.length, insert: (v.state.doc.length ? '\n' : '# cards\n\n') + block } });
       SAMPLE_CARDS.push({ id: `${p.id}#^${anchor}`, file: 'cards', deck: deck || 'inbox', kind: kind || 'basic', front: str(front), back: str(back), extra: str(extra), src: block.trim() }); RV.loaded = false;
       return `added to page cards as ^${anchor}`;
@@ -4368,17 +4684,21 @@ function seedInk() {
 
 // ------------------------------------------------------------------ boot
 async function boot() {
-  try { await Promise.race([document.fonts.ready, new Promise(r => setTimeout(r, 1500))]); } catch {}
-  const hashTok = (location.hash.match(/token=([\w-]+)/) || [])[1];
-  if (hashTok) { sstore.set('canvas-token', hashTok); history.replaceState(null, '', location.pathname); }
-  TOKEN = hashTok || sstore.get('canvas-token') || '';  // empty behind an authenticating proxy (canvasd --origins)
+  // @font-face fonts load lazily: wait for the faces xterm and CodeMirror measure (at most 1.5 s)
+  try { await Promise.race([Promise.all([document.fonts.load('13px "JetBrainsMono Nerd Font Mono"'), document.fonts.load('13px "Noto Sans"')]), new Promise(r => setTimeout(r, 1500))]); } catch {}
   let board = null;
-  if (/^https?:$/.test(location.protocol) && !window.CANVAS_HOSTED) {
-    try { const r = await fetch('/api/board', { headers: { 'X-Token': TOKEN } }); if (r.ok) { DAEMON = true; board = await r.json(); } } catch {}
-    if (DAEMON) { try { INFO = await (await fetch('/api/info', { headers: { 'X-Token': TOKEN } })).json(); } catch { INFO = { sample: false, artifactOrigin: `http://127.0.0.1:${+location.port + 1}` }; } RPC = new Rpc(); if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {}); }
-  }
-  if (!DAEMON) { const raw = store.get(LS_KEY); if (raw) try { board = JSON.parse(raw); } catch {} }
+  if (SERVED) {   // served: the board comes from the server or not at all (30 §2.1)
+    let b, info;
+    try { b = await bootFetch('/api/board'); info = await bootFetch('/api/info'); } catch (e) { return bootScreen(e); }
+    const v = b.body?.v;
+    if (!(b.body === null && b.etag === '"empty"') && v !== 0 && v !== 5) return bootScreen({ kind: 'format', v: b.body === null ? 'null' : v });
+    if (v === 5) board = b.body;   // else a fresh install, or the reset's {"v":0}: seed
+    DAEMON = true; BOARD_ETAG = b.etag; INFO = info.body; HUB_STARTED = INFO.hub?.startedAt; bootTries = 0;
+    RPC = new Rpc();
+    if ('serviceWorker' in navigator && window.isSecureContext) navigator.serviceWorker.register('sw.js').catch(() => {});
+  } else { const raw = store.get(LS_KEY); if (raw) try { board = JSON.parse(raw); } catch {} }
   S = board && board.v === 5 ? board : seed();
+  if (DAEMON) { BOARD_CAM = S.cam; S.cam = camLoad() || { x: 0, y: 0, z: 1, ...S.cam }; }
   migrateV9();
   if (DAEMON) hostsLoad();
   perspChip(); { const ah = $('#add-host'); if (ah) ah.disabled = !DAEMON; }
@@ -4409,6 +4729,7 @@ async function boot() {
   placeInkChip();
   wireReview(); detectMode(); { const ae = $('#add-emacs'); if (ae) ae.disabled = !DAEMON; }
   wsRestore(); focusRestoreTabs();
+  BOOTED = true; SAVE.lastJson = serialize();
   if (DAEMON && INFO && !INFO.sample) setTimeout(() => toast('Claude is off: start canvasd with ANTHROPIC_API_KEY set to use the assistant, agents, handwriting and artifacts.', 8000), 1500);
 }
 // ================================================================ v8: node kinds around terminals, Emacs, browser, artifacts, sketch
@@ -4426,7 +4747,9 @@ function newEmacs(file) {
   return n;
 }
 // Browser window: a page in a frame. Sites that send X-Frame-Options or a frame-ancestors CSP stay blank; ↗ opens them outside.
-function normUrl(u) { u = String(u || '').trim(); if (!u) return ''; if (!/^[a-z]+:/i.test(u)) u = 'https://' + u; return u; }
+// Only http(s) pages: a javascript: or data: URL from a board or a tool would run script (SEC-1).
+const webUrlOk = u => { try { return /^https?:$/.test(new URL(u).protocol); } catch { return false; } };
+function normUrl(u) { u = String(u || '').trim(); if (!u) return ''; if (!/^[a-z][a-z0-9+.-]*:/i.test(u)) u = 'https://' + u; return webUrlOk(u) ? u : ''; }
 function newWeb(url) {
   const u = normUrl(url); const name = u ? u.replace(/^https?:\/\//, '').split('/')[0] : 'web';
   return newAt('web', { url: u, name, w: 720, h: 520 });
@@ -4436,18 +4759,20 @@ function mountWeb(n, L) {
   const go = el('button'); go.textContent = 'Go'; const out = el('button'); out.textContent = '↗'; out.title = 'Open in a browser tab';
   bar.append(inp, go, out);
   const f = el('iframe', 'web-frame'); f.title = n.name; f.setAttribute('referrerpolicy', 'no-referrer');
-  f.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-pointer-lock allow-modals');
+  f.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-pointer-lock allow-modals');
   const note = el('div', 'web-note'); note.textContent = 'Blank? That site refuses to be framed; ↗ opens it in a tab.';
-  L.body.append(bar, f, note); L.frame = f; L.urlInput = inp;
+  L.body.append(bar, f, note); L.frame = f; L.urlInput = inp; L.note = note;
   inp.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Enter') { n.url = normUrl(inp.value); inp.value = n.url; dirty(); webGo(n, L); updateTitle(n); } });
   inp.addEventListener('pointerdown', e => e.stopPropagation());
   go.onclick = e => { e.stopPropagation(); n.url = normUrl(inp.value); inp.value = n.url; dirty(); webGo(n, L); updateTitle(n); };
-  out.onclick = e => { e.stopPropagation(); window.open(n.url || 'about:blank', '_blank', 'noopener'); };
+  out.onclick = e => { e.stopPropagation(); if (webUrlOk(n.url)) window.open(n.url, '_blank', 'noopener'); };
   webGo(n, L);
 }
 function webGo(n, L) {
   const f = L.frame; if (!f) return;
-  if (!n.url) { f.removeAttribute('src'); return; }
+  const ok = webUrlOk(n.url);
+  L.note.textContent = n.url && !ok ? 'Refused: only http and https pages open in a web card.' : 'Blank? That site refuses to be framed; ↗ opens it in a tab.';
+  if (!ok) { f.removeAttribute('src'); return; }
   if (window.CANVAS_HOSTED) { toast('On claude.ai the viewer blocks nested frames; web nodes work in the local build. ↗ opens the page in a tab.', 5000); }
   f.src = n.url;
 }
@@ -4475,10 +4800,10 @@ async function sketchToPage(n) {
 }
 // File-backed artifact: the HTML file is the source of truth; any agent (claude code, oh-my-pi, a script) writes it and the node republishes and reloads.
 async function artFromFile(n, L) {
-  const st = await (await fetch(`/api/stat?path=${encodeURIComponent(n.file)}`, { headers: { 'X-Token': TOKEN || '' } })).json();
+  const st = await (await fetch(`/api/stat?path=${encodeURIComponent(n.file)}`)).json();
   if (!st.exists) throw new Error('no such file');
   if (st.mtime === n.fileMtime && n.head) return false;
-  const r = await fetch(`/api/cat?path=${encodeURIComponent(n.file)}&limit=6000000`, { headers: { 'X-Token': TOKEN || '' } });
+  const r = await fetch(`/api/cat?path=${encodeURIComponent(n.file)}&limit=6000000`);
   const html = await r.text();
   const sha = await shaShort(html);
   if (sha !== n.head) { await artPublish(n, { html }); }
@@ -4490,7 +4815,7 @@ function artWatch(n) {
   const tick = async () => {
     const L = live[n.id]; if (!L || S.nodes[n.id] !== n) { clearInterval(n._poll); n._poll = null; return; }
     try {
-      const st = await (await fetch(`/api/stat?path=${encodeURIComponent(n.file)}`, { headers: { 'X-Token': TOKEN || '' } })).json();
+      const st = await (await fetch(`/api/stat?path=${encodeURIComponent(n.file)}`)).json();
       if (st.exists && st.mtime !== n.fileMtime) { const before = n.head; await artFromFile(n, L); if (n.head !== before) { artMount(n, L); updateTitle(n); } else n.fileMtime = st.mtime; }
     } catch {}
   };
@@ -4506,7 +4831,7 @@ async function newArtifactFromFile(file) {
 }
 // start watching file-backed artifacts that were on the board at load, and new ones as they mount
 AGENT_TOOLS.push(
-  { name: 'open_web', description: 'Open a web page as a browser-window node on the canvas.', inputSchema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }, run: ({ url }) => { const n = newWeb(url); return `opened ${n.name}`; } },
+  { name: 'open_web', description: 'Open a web page as a browser-window node on the canvas.', inputSchema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }, run: ({ url }) => { if (!normUrl(url)) throw new Error('only http and https URLs open in a web node'); const n = newWeb(url); return `opened ${n.name}`; } },
   { name: 'open_in_emacs', description: 'Open a file in an Emacs buffer node (local build only).', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, run: ({ path }) => { const n = newEmacs(path); return n ? `opened ${n.name}` : 'needs the local build'; } },
   { name: 'artifact_from_file', description: 'Show an HTML file as an artifact node that reloads whenever the file changes (local build only).', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, run: async ({ path }) => { const n = await newArtifactFromFile(path); return n ? `showing ${path} as ${n.name}` : 'needs the local build'; } },
 );
@@ -4899,8 +5224,11 @@ function hostOf(n) { for (let cur = n, g = 0; cur && g++ < 40; cur = cur.in && S
 function hostByUrl(url) { return hostRes(HOSTLIST.find(h => h.url === url) || frameList().map(f => f.host).find(h => h && h.url === url) || { url }); }
 function hostByName(name) { const h = HOSTLIST.find(h => h.name === name) || frameList().map(f => f.host).find(h => h && h.name === name); return h ? hostRes(h) : null; }
 function allHosts() { const m = new Map(); for (const h of HOSTLIST) m.set(h.url, h); for (const f of frameList()) { const h = f.host && hostRes(f.host); if (h && !m.has(h.url)) m.set(h.url, h); } return [...m.values()]; }
-function hFetch(h, path, opts = {}) { return fetch((h ? h.url : '') + path, { ...opts, headers: { 'X-Token': h ? (h.token || '') : TOKEN, ...(opts.headers || {}) } }); }
-function hWs(h, path) { return h ? h.url.replace(/^http/, 'ws') + path + '?token=' + encodeURIComponent(h.token || '') : `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${path}?token=${encodeURIComponent(TOKEN)}`; }
+function hFetch(h, path, opts = {}) {
+  if (h) return fetch(h.url + path, { ...opts, headers: { 'X-Token': h.token || '', ...(opts.headers || {}) } });
+  return fetch(path, opts).catch(e => { netKick(); throw e; });   // same-origin cookies authenticate; a throw feeds the connection state
+}
+function hWs(h, path) { return h ? h.url.replace(/^http/, 'ws') + path + '?token=' + encodeURIComponent(h.token || '') : `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${path}`; }
 function rpcFor(h) { if (!h) return RPC; const c = HOSTCONN[h.url] || (HOSTCONN[h.url] = {}); return c.rpc || (c.rpc = new Rpc(h)); }
 function fsSplit(raw) { const m = String(raw).match(/^@([^:]+):([\s\S]*)$/); return m ? { h: hostByName(m[1]), p: m[2] || '~' } : { h: null, p: raw }; }
 function hostFrames(url) { return frameList().filter(f => f.host && hostRes(f.host)?.url === url); }
@@ -5787,7 +6115,7 @@ function attnItems() {
   if (DAEMON) for (const h of allHosts()) if (HOSTCONN[h.url]?.down) items.push({ key: FS_PREFIX + '@' + h.name + ':~', name: '@' + h.name + ' unreachable', kind: 'iattn', attn: 'bad', dir: false, meta: 'host down', go: () => { hostRetry(h.url, true); } });
   for (const [url, d] of Object.entries(UNITS.data)) { const h = url ? hostByUrl(url) : null; for (const u of d?.units || []) if (u.active === 'failed') items.push({ ...unitEntry(h, u), kind: 'iattn', attn: 'bad', name: u.unit + ' failed' + (h ? ' @' + h.name : '') });
   }
-  for (const n of nodeList()) if (n.kind === 'term' && live[n.id]?.backend?.dead) items.push({ key: n.id, name: n.name + ' ended', kind: 'iattn', attn: 'bad', n, dir: false, meta: 'shell exited' });
+  for (const n of nodeList()) if (n.kind === 'term' && live[n.id]?.backend?.dead && live[n.id].backend.exitReason !== 'hub_restart') items.push({ key: n.id, name: n.name + ' ended', kind: 'iattn', attn: 'bad', n, dir: false, meta: 'shell exited' });
   for (const n of nodeList()) if (n.kind === 'term' && live[n.id]?.backend?.parked) items.push({ key: n.id, name: n.name + ' parked', kind: 'iattn', attn: 'bad', n, dir: false, meta: 'host unreachable' });
   const due = RV.loaded ? rvQueue().dueNow.length : 0; if (due) items.push({ key: 'attn:review', name: due + ' card' + (due === 1 ? '' : 's') + ' due', kind: 'iattn', dir: false, meta: 'review', go: () => setView('review') });
   for (const t of allTasks()) { if (COL[t.kw] === 'DONE') continue; const due = taskDue(t); if (due && due <= TODAY) items.push({ key: 'attn:' + taskKey(t), name: (due < TODAY ? 'overdue ' : 'due today ') + plainTask(t.text).slice(0, 60), kind: 'iattn', attn: due < TODAY ? 'bad' : '', dir: false, meta: taskAddr(t), go: () => taskOpen(t) }); else if (COL[t.kw] === 'NEXT' && !t.session) items.push({ key: 'attn:' + taskKey(t), name: 'NEXT ' + plainTask(t.text).slice(0, 60), kind: 'iattn', dir: false, meta: taskAddr(t), go: () => taskOpen(t) }); }
@@ -5844,6 +6172,6 @@ AGENT_TOOLS.push(
   { name: 'host_status', description: 'Health of a host: load, memory, disk, uptime, shells, tmux sessions, unit counts (failed names). host: a name from hosts.json (empty = the serving daemon).', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
     run: async ({ host } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j = await (await hFetch(h, '/api/status')).json(); const gb = b => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}` + (j.sessions?.tmux != null ? ', tmux sessions ' + j.sessions.tmux : ''), j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
-window.__canvas = { setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode };  // for tests and debugging
+window.__canvas = { setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk };  // for tests and debugging
 boot();
 })();
