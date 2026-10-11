@@ -51,12 +51,19 @@ let
 
   agentArgv0 = name: a: if a.package != null then "/etc/workbench/agents/${name}/${a.exe}" else a.exe;
 
+  allShellPaths = lib.concatMap (s: s.paths) (lib.attrValues cfg.shells);
+
   hubJson = json.generate "workbench-hub.json" {
     socket = "/run/workbench-hub/hub.sock";
     stateDir = "${home}/.local/state/workbench/hub";
     host = cfg.host;
+    # Attribute set order, so alphabetical.
+    shells = lib.mapAttrsToList (name: s: {
+      inherit name;
+      inherit (s) paths args;
+    }) cfg.shells;
+    inherit (cfg) defaultShell;
     child = {
-      shell = cfg.shell;
       passEnv = lib.attrNames hubEnv;
       setEnv = childSetEnv;
     };
@@ -72,7 +79,6 @@ let
       publicOrigin
       trustedProxy
       host
-      shell
       boardsDir
       notesDir
       ;
@@ -177,10 +183,48 @@ in
       };
     };
 
-    shell = mkOption {
+    shells = mkOption {
+      type = types.attrsOf (
+        types.submodule {
+          options = {
+            paths = mkOption {
+              type = types.nonEmptyListOf types.str;
+              description = "Absolute, stable candidate paths (never /nix/store), tried in order at every spawn; the first that exists and is executable runs.";
+            };
+            args = mkOption {
+              type = types.listOf types.str;
+              default = [ "-i" ];
+              description = "Arguments that start the shell interactive when a card names no command.";
+            };
+          };
+        }
+      );
+      default = lib.genAttrs [ "bash" "fish" "nu" "zsh" ] (x: {
+        paths = [
+          "/etc/profiles/per-user/${cfg.user}/bin/${x}"
+          "/run/current-system/sw/bin/${x}"
+        ];
+      });
+      defaultText = lib.literalExpression ''
+        lib.genAttrs [ "bash" "fish" "nu" "zsh" ] (x: {
+          paths = [ "/etc/profiles/per-user/''${user}/bin/''${x}" "/run/current-system/sw/bin/''${x}" ];
+        })
+      '';
+      description = ''
+        The shells a card can start, by name; cards offer those with an existing path and never
+        use $SHELL. Each starts interactive and non-login, with the hub's scrubbed environment.
+        The shell's system-wide startup files still run in cards, so environment.shellInit,
+        environment.interactiveShellInit, programs.bash.* and their zsh and fish counterparts
+        apply. Only /etc/set-environment is skipped (through __NIXOS_SET_ENVIRONMENT_DONE=1),
+        because it may export secrets set in environment.variables or
+        environment.sessionVariables.
+      '';
+    };
+
+    defaultShell = mkOption {
       type = types.str;
-      default = "/run/current-system/sw/bin/bash";
-      description = "Absolute, stable path of the POSIX shell cards start.";
+      default = "bash";
+      description = "The shell, a name in shells, that a card gets when it names none.";
     };
 
     boardsDir = mkOption {
@@ -278,6 +322,14 @@ in
         message = "services.workbench: the child environment must hold literal stable paths only (no /nix/store paths, no $ expansions); check nix.nixPath.";
       }
       {
+        assertion = lib.hasAttr cfg.defaultShell cfg.shells;
+        message = "services.workbench.defaultShell (${cfg.defaultShell}) must be a name in services.workbench.shells.";
+      }
+      {
+        assertion = lib.all (p: lib.hasPrefix "/" p && !(lib.hasInfix "/nix/store" p)) allShellPaths;
+        message = "services.workbench.shells: paths must be absolute and stable (never /nix/store), such as /run/current-system/sw/bin/bash.";
+      }
+      {
         assertion = lib.intersectLists (lib.attrNames cfg.environment) (lib.attrNames childSetEnv) == [ ];
         message = "services.workbench.environment must not set ${lib.concatStringsSep ", " (lib.attrNames childSetEnv)}; the module sets them.";
       }
@@ -353,9 +405,17 @@ in
     systemd.services.workbench-web = {
       description = "Workbench web front";
       wantedBy = [ "multi-user.target" ];
-      # Never Requires/BindsTo/PartOf: a web restart must not touch the hub.
-      wants = [ "workbench-hub.service" ];
-      after = [ "workbench-hub.service" ];
+      # Never Requires/BindsTo/PartOf: a web restart must not touch the hub. network-online
+      # makes a first-boot failure on a missing listen address less likely; Restart=always is
+      # what guarantees wb-web comes up.
+      wants = [
+        "workbench-hub.service"
+        "network-online.target"
+      ];
+      after = [
+        "workbench-hub.service"
+        "network-online.target"
+      ];
       stopIfChanged = false;
       restartTriggers = [ webJson ];
       startLimitIntervalSec = 0;
