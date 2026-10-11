@@ -1184,10 +1184,11 @@ class AcpBackend {
     if (this.modeWanted != null && this.modeWanted === this.modeNow()) this.modeWanted = null;
     if (sel.value !== this.mode()) sel.value = this.mode();
     if (L.revive) L.revive.hidden = !(s && !s.alive && a?.revivable && !this.gone && !this.missing && !this.restarting);
-    const st = this.state(), tx = this.stateText();
+    const st = this.state(), badge = $('.badge', L.hdr);
     $('.dot', L.hdr).className = 'dot' + (st ? ' st-' + st : '');
-    if (tx !== this.badgeText) { this.badgeText = tx; updateTitle(this.n); }
-    $('.badge', L.hdr).className = 'badge' + (st ? ' st-' + st : '');
+    // Checked against the DOM: sessChanged writes the badge too, from a /rpc summary that may be older than this one.
+    if (badge.textContent !== badgeOf(this.n)) updateTitle(this.n);
+    badge.className = 'badge' + (st ? ' st-' + st : '');
   }
 }
 // The kill of a card removed while its socket was down (§3.5.1): attach without spawning once the server is back, then end

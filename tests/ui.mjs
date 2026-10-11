@@ -1253,7 +1253,8 @@ else {
     await AP.evaluate(id => { const b = window.__canvas.live[id].hdr.querySelector('.badge'); window.__n17 = []; new MutationObserver(() => window.__n17.push(b.className)).observe(b, { attributes: true }); }, id);
     const v0 = await acpView(AP, id), seen0 = acpSent(AP, id, 'seen').length, recv0 = acpWs(AP, id).map(w => w.recv.length);
     await AP.evaluate(id => window.__canvas.live[id].backend.input('stream\r'), id);
-    const done = await until(async () => { const v = await acpView(AP, id); return v.st === 'done' ? v : null; }, 20000, 50);
+    // /rpc may bring the done summary before /acp brings the turn's events, so done counts once turn_end is folded.
+    const done = await until(async () => { const v = await acpView(AP, id), end = acpEvs(AP, id, 'turn_end', v0.seq)[0]; return v.st === 'done' && end && v.seq >= end.seq ? v : null; }, 20000, 50);
     await sleep(500);
     // The three chunks come at once and the card paints once per frame (30 §1.3), so `running` is checked in the info
     // frames the card took (its state is info.state) and `done` in the painted badge.
