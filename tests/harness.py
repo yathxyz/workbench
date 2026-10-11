@@ -370,7 +370,9 @@ def main():
               f"logs in {h.root}; kill -HUP {os.getpid()} restarts wb-web", file=sys.stderr)
     else:
         def watch_stdin():
-            for line in sys.stdin.buffer:
+            # Unbuffered: a daemon thread blocked in sys.stdin.buffer holds its lock, and the
+            # interpreter then aborts at exit after a SIGTERM.
+            for line in open(sys.stdin.fileno(), "rb", buffering=0, closefd=False):
                 if line.strip() in (b"stop hub", b"start hub"):
                     events.append(line.strip().decode())
                     wake.set()
