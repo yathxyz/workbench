@@ -19,6 +19,7 @@ use wb_proto::hub::{
 };
 use wb_proto::journal::EventBody;
 use wb_proto::limits::{CARD_OPEN_DEADLINE, MAX_LINE, WS_MAX_ACP};
+use wb_proto::line;
 
 use crate::AppState;
 use crate::http::{Keepalive, Tick, close, send_json, upgrade_required, ws_close, ws_too_big};
@@ -26,11 +27,6 @@ use crate::hub::{HubConn, HubStatus, REPLY_TIMEOUT, with_state};
 use crate::util::sanitize_sid;
 
 const ROUTE: &str = "/acp";
-
-// A relayed browser message plus its envelope fits one hub line: re-serialising a
-// browser value never makes it larger than it arrived, and the envelope is far below
-// 1 MiB.
-const _: () = assert!(WS_MAX_ACP + (1 << 20) < MAX_LINE);
 
 pub fn routes() -> Router<AppState> {
     Router::new().route(ROUTE, get(upgrade))
@@ -326,7 +322,15 @@ impl Relay {
                 HubRequest::AcpKill { rid, sid, forget }
             }
         };
-        self.send(&req).await?;
+        // Re-serialising can grow a browser value (`1e15` comes out as
+        // `1000000000000000.0`), so the line is measured: one longer than the hub reads
+        // (MAX_LINE, its `\n` aside) is refused here rather than ending the connection.
+        let encoded = line::encode(&req);
+        if encoded.len() > MAX_LINE + 1 {
+            let e = error("message too large", ErrorCode::BadRequest, browser_rid);
+            return send_json(ws, &e).await.map_err(|_| End::Gone);
+        }
+        self.hub.send_line(&encoded).await.map_err(|_| HUB_LOST)?;
         self.replies.insert(rid, (pending, browser_rid));
         Ok(())
     }

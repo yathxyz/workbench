@@ -152,7 +152,12 @@ impl HubConn {
     }
 
     pub async fn send(&mut self, req: &HubRequest) -> std::io::Result<()> {
-        self.tx.write_all(&line::encode(req)).await
+        self.send_line(&line::encode(req)).await
+    }
+
+    /// Sends a line already encoded with [`line::encode`].
+    pub async fn send_line(&mut self, line: &[u8]) -> std::io::Result<()> {
+        self.tx.write_all(line).await
     }
 
     /// The next message, or `None` once the connection has ended. Lines that do not

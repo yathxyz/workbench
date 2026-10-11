@@ -798,6 +798,27 @@ async fn a_nine_mib_prompt_is_relayed_and_a_larger_message_closes_1009() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_that_grows_past_a_hub_line_gets_bad_request_and_the_socket_stays() {
+    let (hub, web) = up().await;
+    let (mut ws, _, conn) = attached(&hub, &web, "p2").await;
+    // `1e15` comes out as `1000000000000000.0`: 7 MiB in, about 27 MiB out.
+    let blocks = vec!["1e15"; (7 << 20) / 5].join(",");
+    let msg = format!(r#"{{"t":"prompt","rid":"big","blocks":[{blocks}]}}"#);
+    assert!(msg.len() < WS_MAX_ACP);
+    ws.send(Message::Text(msg.into())).await.unwrap();
+    assert_eq!(
+        next_json(&mut ws).await,
+        json!({"t": "error", "error": "message too large", "code": "bad_request", "rid": "big"})
+    );
+    send_json(&mut ws, json!({"t": "cancel"})).await;
+    let reqs = wait_on_conn(&hub, conn, 2).await;
+    assert!(
+        matches!(reqs[1], HubRequest::AcpCancel { .. }),
+        "only the cancel reached the hub: {reqs:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigterm_closes_1012() {
     let (hub, mut web) = up().await;
     let (mut ws, _, _) = attached(&hub, &web, "s1").await;
