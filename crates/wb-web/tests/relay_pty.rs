@@ -289,6 +289,41 @@ async fn a_second_open_detaches_first_and_maps_the_spawn_fields() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeated_open_before_the_first_reply_stays_attached() {
+    let (hub, web) = up().await;
+    // The first reply comes late, so the second open (a double Enter on a dead card)
+    // goes out before it.
+    hub.reply_next_open(OpenReply::Late(Duration::from_millis(300), spawned()));
+    let mut ws = web.ws("/pty").await;
+    send_json(&mut ws, open("x1")).await;
+    send_json(&mut ws, open("x1")).await;
+    assert_eq!(next_json(&mut ws).await["t"], "hello");
+    // Input follows whatever the relay sent on the two replies.
+    send_json(&mut ws, json!({"t": "in", "d": "probe"})).await;
+    let (conn, _) = hub.wait_for(is_input).await;
+    let reqs = on_conn(&hub, conn);
+    assert_eq!(reqs.iter().filter(|r| is_open(r)).count(), 2, "{reqs:?}");
+    assert!(
+        !reqs
+            .iter()
+            .any(|r| matches!(r, HubRequest::PtyDetach { .. })),
+        "the relay detached the sid it had just re-opened: {reqs:?}"
+    );
+    hub.send(
+        conn,
+        HubMessage::PtyOut {
+            sid: "x1".into(),
+            d: "live".into(),
+            out: 4,
+        },
+    );
+    assert_eq!(
+        next_json(&mut ws).await,
+        json!({"t": "out", "d": "live", "out": 4})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_attach_to_a_dead_session_sends_replay_then_exit() {
     let (hub, web) = up().await;
     hub.reply_next_open(OpenReply::Ok(PtyOpenReply {

@@ -391,6 +391,8 @@ where
 pub enum OpenReply {
     Ok(PtyOpenReply),
     Err(ErrorCode, &'static str),
+    /// The reply, after a pause in which the connection reads nothing.
+    Late(Duration, PtyOpenReply),
 }
 
 /// The reply to an open when nothing else was scripted: a fresh spawn.
@@ -570,16 +572,23 @@ async fn serve(
                     HubRequest::Watch { rid } | HubRequest::List { rid } => {
                         HubMessage::ok(rid, &SessionsReply { sessions: Vec::new() })
                     }
-                    HubRequest::PtyOpen { rid, .. } => match opens.lock().unwrap().pop_front() {
-                        Some(OpenReply::Err(code, message)) => HubMessage::Err {
-                            rid: Some(rid),
-                            sid: None,
-                            code,
-                            message: message.into(),
-                        },
-                        Some(OpenReply::Ok(reply)) => HubMessage::ok(rid, &reply),
-                        None => HubMessage::ok(rid, &spawned()),
-                    },
+                    HubRequest::PtyOpen { rid, .. } => {
+                        let scripted = opens.lock().unwrap().pop_front();
+                        match scripted {
+                            Some(OpenReply::Err(code, message)) => HubMessage::Err {
+                                rid: Some(rid),
+                                sid: None,
+                                code,
+                                message: message.into(),
+                            },
+                            Some(OpenReply::Ok(reply)) => HubMessage::ok(rid, &reply),
+                            Some(OpenReply::Late(pause, reply)) => {
+                                tokio::time::sleep(pause).await;
+                                HubMessage::ok(rid, &reply)
+                            }
+                            None => HubMessage::ok(rid, &spawned()),
+                        }
+                    }
                     HubRequest::PtyDetach { rid, .. } | HubRequest::PtyKill { rid, .. } => {
                         HubMessage::ok(rid, &json!({}))
                     }

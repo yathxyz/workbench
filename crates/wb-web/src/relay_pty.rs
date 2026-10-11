@@ -124,7 +124,7 @@ struct Relay {
     /// The latest open waiting for its reply: rid, sid, deadline.
     pending: Option<(u64, String, Instant)>,
     /// Opens replaced by a later open before their reply; each is detached once its
-    /// `ok` arrives.
+    /// `ok` arrives, unless a later open is for the same sid.
     superseded: HashMap<u64, String>,
 }
 
@@ -260,8 +260,12 @@ impl Relay {
                     return self.opened(ws, sid, reply).await;
                 }
                 if let Some(sid) = self.superseded.remove(&rid) {
-                    let rid = self.rid();
-                    self.send(&HubRequest::PtyDetach { rid, sid }).await?;
+                    // A later open of the same sid keeps it attached; detaching would undo it.
+                    let reopened = self.pending.as_ref().is_some_and(|p| p.1 == sid);
+                    if !reopened && !self.is_cur(&sid) {
+                        let rid = self.rid();
+                        self.send(&HubRequest::PtyDetach { rid, sid }).await?;
+                    }
                 }
                 return Ok(());
             }
