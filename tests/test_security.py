@@ -92,6 +92,21 @@ def tcp_listeners(pid):
     return found
 
 
+def hub_children(h):
+    """The pids of the hub's direct children: every agent and shell it started."""
+    found = set()
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                stat = f.read()
+        except OSError:
+            continue
+        # pid (comm) state ppid ...; comm may hold spaces and parentheses.
+        if int(stat[stat.rindex(")") + 2:].split()[1]) == h.hub.pid:
+            found.add(int(pid))
+    return found
+
+
 def pty_list(h):
     return [s for s in wbctl.hub_sessions(h.hub_sock) if s.get("kind") == "pty"]
 
@@ -359,6 +374,7 @@ def main():
         pwned2, bash_env = h.root / "pwned2", h.root / "bash-env"
         bash_env.write_text(f"touch {h.root}/pwned3\n")
         ghost = {}
+        kids = hub_children(h)
         for label, spawn in (("absent", None), ("false", False)):
             r = wbctl.pty_session(caddy_ep, "ghost", spawn=spawn, cmd=f"touch {pwned2}",
                                   env={"BASH_ENV": str(bash_env)}, timeout=10)
@@ -369,17 +385,19 @@ def main():
                 repr({k: (r["error"], r["hello"] is not None) for k, r in ghost.items()}))
         t.check("T-S17 the socket closes 1000 after that error",
                 all(r["close"] == 1000 for r in ghost.values()), repr({k: r["close"] for k, r in ghost.items()}))
-        t.check("T-S17 no file; hub list has no ghost",
-                not pwned2.exists() and not (h.root / "pwned3").exists() and "ghost" not in sids(h), repr(sids(h)))
+        t.check("T-S17 no file, no process; hub list has no ghost",
+                not pwned2.exists() and not (h.root / "pwned3").exists() and "ghost" not in sids(h)
+                and hub_children(h) <= kids, repr((sids(h), hub_children(h) - kids)))
         card = wbctl.AcpCard(caddy_ep, "ghost2", timeout=10)
         card.open(0)
         card.wait(lambda: False)
         card.close()
         r = card.result
         time.sleep(0.5)
-        t.check("T-S17 /acp open without agent and cwd: error not_found, no hello, close 1000; no session",
+        t.check("T-S17 /acp open without agent and cwd: error not_found, no hello, close 1000; no session, no process",
                 [e.get("code") for e in r["errors"]] == ["not_found"] and r["hello"] is None and r["close"] == 1000
-                and "ghost2" not in sids(h), repr({k: r[k] for k in ("status", "errors", "hello", "close")}))
+                and "ghost2" not in sids(h) and hub_children(h) <= kids,
+                repr(({k: r[k] for k in ("status", "errors", "hello", "close")}, hub_children(h) - kids)))
 
         # S21, server half (the browser half is ui N30): a board node carrying cmd and env is stored
         # as data and starts nothing, and opening its card without spawn finds no session.
@@ -421,8 +439,11 @@ def main():
         first = wbctl.acp_session(caddy_ep, "t-s22", agent="stub", cwd=home, kill=True)
         card = wbctl.AcpCard(caddy_ep, "t-s22")
         stale = pending = answered = perm = None
+        agent_kid = False
         try:
             if card.open(0, agent="stub", cwd=home) and card.wait(lambda: card.since(0, wbctl.SETUP_END)):
+                # The control for T-S17's process check: a running agent shows as a hub child.
+                agent_kid = any(e.get("pid") in hub_children(h) for e in card.since(0, {"spawn"}))
                 card.send("prompt", blocks=[{"type": "text", "text": "ask-permission"}])
                 if card.wait(card.pending_permissions):
                     perm = card.pending_permissions()[0]
@@ -441,6 +462,8 @@ def main():
                 first["ok"] and first["createdAt"] not in (None, card.epoch()) and perm is not None,
                 repr((first["ok"], first["createdAt"], card.epoch(), first["errors"], card.result["errors"])))
         t.check("T-S22 acp.permission with a stale epoch: error stale", (stale or {}).get("code") == "stale", repr(stale))
+        t.check("T-S22 its agent is a child of the hub (the control for T-S17's process check)", agent_kid,
+                repr((card.since(0, {"spawn"}), hub_children(h))))
         t.check("T-S22 the request is still pending after the stale answer: the agent got nothing",
                 perm is not None and pending == [perm["seq"]], repr(pending))
         t.check("T-S22 the answer with the current epoch resolves it once, by the user, and the turn ends with PONG",
