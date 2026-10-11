@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Workbench</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;600;700&family=Atkinson+Hyperlegible+Mono:wght@400;600;700&family=Shantell+Sans:wght@400;600&display=swap">
+<link rel="stylesheet" href="vendor/xterm.css">
+<link rel="stylesheet" href="style.css">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#ffffff">
+</head>
+<body>
+<!--APP-->
+<div id="viewport">
+  <div id="focus-tabs" hidden role="tablist" aria-label="Focused nodes"></div>
+  <div id="which-key" hidden></div>
+  <div id="world">
+    <div id="frames"></div>
+    <svg id="shapes" class="layer"></svg>
+    <svg id="ink-world" class="layer"></svg>
+    <svg id="edges" class="layer"></svg>
+    <div id="nodes"></div>
+    <svg id="ink-live" class="layer"></svg>
+  </div>
+</div>
+
+<div id="toolbar">
+  <div class="grp"><button class="tb" id="toggle-tree" title="Folder tree (Alt-B)">Folders</button><button class="tb" id="view-name" title="Switch view (Alt-1 to Alt-6)">Canvas</button></div>
+  <button class="search" id="open-palette" title="Search everything and run any command"><span>Search or run a command</span><kbd class="k-pal">Ctrl K</kbd></button>
+  <div class="grp c-only"><button class="tb" id="toggle-draw" title="Drawing tools. A stylus always writes.">✎ Draw</button><button class="tb" id="toggle-new" title="Add shells, REPLs, pages, agents, folders">+ New</button><button class="tb" id="open-help" title="Help (?)">?</button></div>
+  <div class="grp c-only dock" id="dock-draw" role="toolbar" aria-label="Drawing tools" hidden>
+    <button class="tb ico on" data-tool="select" title="Select and move (V or 1)">↖<sub>1</sub></button>
+    <button class="tb ico" data-tool="rect" title="Rectangle (R or 2)">▭<sub>2</sub></button>
+    <button class="tb ico" data-tool="diamond" title="Diamond (D or 3)">◇<sub>3</sub></button>
+    <button class="tb ico" data-tool="ellipse" title="Ellipse (O or 4)">◯<sub>4</sub></button>
+    <button class="tb ico" data-tool="arrow" title="Arrow (A or 5). Start or end on a node or shape to bind it.">→<sub>5</sub></button>
+    <button class="tb ico" data-tool="pen" title="Pen (P or 7). A stylus always draws.">✎<sub>7</sub></button>
+    <button class="tb ico" data-tool="text" title="Text (T or 8)">T<sub>8</sub></button>
+    <button class="tb ico" data-tool="erase" title="Eraser (E or 0)">⌫<sub>0</sub></button>
+    <button class="tb ico" data-tool="area" title="Select an area (S or 6): everything fully inside the rectangle — ink, drawn shapes, cards. Delete removes it; the chip turns handwriting into a sketch card or text. Shift adds.">⬚<sub>6</sub></button>
+    <span class="sw-row">
+      <button class="sw on" data-color="ink" title="Ink"></button>
+      <button class="sw" data-color="red" title="Red"></button>
+      <button class="sw" data-color="blue" title="Blue"></button>
+    </span>
+  </div>
+  <div class="grp c-only dock" id="dock-new" role="toolbar" aria-label="Add" hidden>
+    <button class="tb" id="add-shell" title="New shell">Shell</button>
+    <button class="tb needs-daemon" id="add-emacs" title="New Emacs buffer: emacsclient -t on a file, in a real PTY">Emacs</button>
+    <button class="tb" id="add-web" title="New browser window: a web page in a frame">Web</button>
+    <button class="tb" id="add-artifact" title="New artifact: an HTML page in a sandboxed frame, made by Claude or by any agent writing a file">Artifact</button>
+    <button class="tb" id="add-sketch" title="New sketch: a card to write or draw on with the pen">Sketch</button>
+    <span class="menu-wrap">
+      <button class="tb" id="add-repl" title="New REPL">REPL</button>
+      <div class="menu" id="repl-menu" hidden>
+        <button data-repl="js">JavaScript <small>in browser</small></button>
+        <button data-repl="python3 -q" class="needs-daemon">Python <small>via canvasd</small></button>
+        <button data-repl="node" class="needs-daemon">Node <small>via canvasd</small></button>
+      </div>
+    </span>
+    <button class="tb" id="add-buffer" title="New page (or double-click the canvas)">Page</button>
+    <button class="tb" id="add-frame" title="New folder">Folder</button>
+    <button class="tb needs-daemon" id="add-host" title="New host folder: shells, Emacs buffers and file listings inside it run on another machine's daemon (hosts.json)">Host</button>
+    <button class="tb" id="open-today" title="Today's journal page">Today</button>
+  </div>
+</div>
+
+<aside id="tree-pane" aria-label="Folders">
+  <div id="tree-grip" role="separator" aria-orientation="vertical" title="Drag to resize · double-click to reset"></div>
+  <div class="tp-head"><b>Folders</b><span class="muted"></span><button class="hb" id="tp-new" title="New folder">+</button><button class="hb" id="tp-close" title="Hide (Alt-B)">✕</button></div>
+  <div id="tp-list" role="tree"></div>
+</aside>
+
+<section id="v-ranger" class="view" hidden aria-label="Navigator">
+  <div class="rg-path" id="rg-path"></div>
+  <div class="rg-cols"><div class="rg-col rg-parent" id="rg-parent"></div><div class="rg-col rg-cur" id="rg-cur"></div><div class="rg-prev" id="rg-prev"></div></div>
+  <div class="rg-bar"><span id="rg-info"></span><span id="rg-keys">h j k l move · ⏎ open · o canvas · / filter · space mark · dd cut · pp paste · r rename · + folder · n page · S shell · ? keys</span></div>
+</section>
+
+<section id="v-graph" class="view" hidden aria-label="Graph">
+  <canvas id="g-canvas"></canvas>
+  <div class="g-bar grp">
+    <input id="g-q" placeholder="Highlight… (Enter selects)" autocomplete="off" spellcheck="false">
+    <label><input type="checkbox" id="g-all" checked> Shells, REPLs, agents</label>
+    <label><input type="checkbox" id="g-ghost" checked> Pages not written yet</label>
+    <button class="tb" id="g-fit">Fit</button>
+  </div>
+  <div class="g-legend">
+    <span><i class="lg-page"></i>page</span><span><i class="lg-term"></i>shell</span><span><i class="lg-repl"></i>REPL</span><span><i class="lg-agent"></i>agent</span>
+    <span><b class="ln-link"></b>[[link]]</span><span><b class="ln-spawn"></b>branch</span><span><b class="ln-pipe"></b>pipe</span><span><b class="ln-sketch"></b>drawn arrow</span>
+  </div>
+  <div id="g-card" class="g-card" hidden></div>
+</section>
+
+<section id="v-editor" class="view" hidden aria-label="Editor">
+  <nav class="ed-side">
+    <input id="ed-filter" placeholder="Filter pages" autocomplete="off" spellcheck="false">
+    <div class="ed-btns"><button class="tb" id="ed-new">+ Page</button><button class="tb" id="ed-today">Today</button></div>
+    <div id="ed-list"></div>
+  </nav>
+  <div class="ed-main">
+    <div class="ed-head"><span id="ed-crumb"></span><button class="tb" id="ed-mic" title="Dictate at the cursor (Alt-V)">🎙 Dictate</button><button class="tb" id="ed-canvas" title="Show this spot on the canvas">Show on canvas</button></div>
+    <div id="ed-host"></div>
+  </div>
+  <aside class="ed-info">
+    <h4>Outline</h4><div id="ed-toc"></div>
+    <h4 id="ed-bl-h">Linked references</h4><div id="ed-bl"></div>
+    <h4 id="ed-ul-h" hidden>Unlinked mentions</h4><div id="ed-ul"></div>
+  </aside>
+</section>
+
+<section id="v-outline" class="view" hidden aria-label="Outline">
+  <div class="ol-wrap">
+    <p class="muted">Every node, grouped by the folder it is in. Branches sit under the node they came from; pages list their headings. Click a name to open it.</p>
+    <div id="ol-list"></div>
+  </div>
+</section>
+
+<section id="v-review" class="view" hidden aria-label="Review">
+  <div class="rv-app">
+    <header class="rv-head">
+      <label>Deck <select id="rv-deck"></select></label>
+      <span class="rv-stat">due <b id="rv-due">0</b> · new <b id="rv-new">0</b> · learnt <b id="rv-learnt">0</b> · done <b id="rv-done">0</b></span>
+      <label>retention <input id="rv-ret" type="range" min="0.70" max="0.97" step="0.01" value="0.90"> <span id="rv-retv" class="rv-stat">0.90</span></label>
+      <span class="muted" id="rv-source"></span>
+      <button class="tb" id="rv-reload" title="Re-read cards and the log (r)">↻</button>
+    </header>
+    <main class="rv-main">
+      <div class="rv-modes" id="rv-modes"><span>Answer by</span>
+        <button data-mode="basic" aria-pressed="true">think</button><button data-mode="type">type</button><button data-mode="pen">pen</button><button data-mode="voice">voice</button>
+        <span id="rv-modenote" class="muted"></span></div>
+      <div class="rv-card">
+        <div class="rv-cdeck"><span id="rv-cdeck"></span><span id="rv-ckind"></span></div>
+        <div class="rv-face" id="rv-face"></div>
+        <div class="rv-typebox" id="rv-typebox" hidden><input id="rv-typein" type="text" autocomplete="off" spellcheck="false"><button class="mic" id="rv-mic" hidden title="Hold to say the answer">🎙</button></div>
+        <div class="rv-diff" id="rv-diff" hidden></div>
+        <div class="rv-inkwrap" id="rv-inkwrap" hidden><canvas id="rv-ink" aria-label="handwriting area"></canvas><div class="rv-ghost" id="rv-ghost" hidden></div><div class="rv-hint">pen, finger or mouse · <a id="rv-clearink" href="#">clear</a></div></div>
+        <div class="rv-answer" id="rv-answer" hidden></div>
+        <div class="rv-ai" id="rv-ai" hidden></div>
+        <div class="rv-done" id="rv-done-box" hidden><p>Nothing due in this deck.</p><p class="muted">Grade a few cards Again to see them return, add cards (the assistant has create_flashcard), or move the retention slider.</p></div>
+      </div>
+      <button class="rv-reveal tb" id="rv-reveal">Show answer <kbd>Space</kbd></button>
+      <div class="rv-grades" id="rv-grades" hidden>
+        <button class="g1" data-g="1"><b>Again</b><small id="rv-iv1"></small></button><button class="g2" data-g="2"><b>Hard</b><small id="rv-iv2"></small></button>
+        <button class="g3" data-g="3"><b>Good</b><small id="rv-iv3"></small></button><button class="g4" data-g="4"><b>Easy</b><small id="rv-iv4"></small></button>
+      </div>
+      <div class="rv-actions"><kbd>1</kbd>–<kbd>4</kbd> grade · <kbd>u</kbd> undo · <kbd>s</kbd> suspend · <kbd>b</kbd> bury · <kbd>o</kbd> source · <kbd>?</kbd> ask
+        <button class="tb" id="rv-undo">undo</button><button class="tb" id="rv-suspend">suspend</button><button class="tb" id="rv-bury">bury</button><button class="tb" id="rv-open">open source</button><button class="tb" id="rv-ask">ask the assistant</button><button class="tb" id="rv-gradeink" hidden>grade my ink</button></div>
+    </main>
+    <aside class="rv-side">
+      <section><h4>Source block · <span id="rv-srcfile"></span></h4><pre id="rv-src"></pre></section>
+      <section><h4>FSRS-6 state</h4><div class="rv-kv" id="rv-state"></div><p class="muted">Derived from the log with the FSRS-6 default parameters; the daemon can fit the 21 parameters to an Anki revlog later.</p></section>
+      <section><h4>Review log · <span id="rv-logfile"></span></h4><div class="rv-log" id="rv-log"></div><p class="muted">Append-only. Scheduling state is recomputed from these lines, never stored in the note.</p></section>
+    </aside>
+  </div>
+</section>
+
+<section id="v-tasks" class="view" hidden aria-label="Tasks">
+  <div id="tk-board">
+    <div class="tk-col" data-col="TODO"><h3>To do <span class="tk-n"></span></h3><div class="tk-cards"></div>
+      <form id="tk-add"><input id="tk-in" placeholder="Add a task to today’s journal" autocomplete="off"></form></div>
+    <div class="tk-col" data-col="NEXT"><h3>Next <span class="tk-n"></span></h3><div class="tk-cards"></div></div>
+    <div class="tk-col" data-col="WAITING"><h3>Waiting <span class="tk-n"></span></h3><div class="tk-cards"></div></div>
+    <div class="tk-col" data-col="DONE"><h3>Done <span class="tk-n"></span></h3><div class="tk-cards"></div></div>
+  </div>
+</section>
+
+<aside id="side" aria-label="Docked terminal">
+  <div id="side-grip" role="separator" aria-orientation="vertical" title="Drag to resize · double-click to reset"></div>
+  <div class="side-hd">
+    <span class="side-tabs" role="tablist"><button class="on" data-side="term" role="tab" title="Docked terminal (Ctrl-`)">Terminal</button></span><span id="side-ctx"></span>
+    <button class="hb" id="side-close" title="Hide">✕</button>
+  </div>
+  <div class="k-term side-wrap" id="side-term"><div class="body" id="side-term-body"></div></div>
+</aside>
+
+<div id="pick-chip" hidden><span id="pick-n"></span><button class="mini" data-act="delete" title="Remove the selection: ink, shapes and cards (Delete). Ctrl-Z brings ink and shapes back.">Delete</button><button class="mini" data-act="sketch" title="Turn the selected handwriting into a sketch card: it gets an address, tags, arrows and Aa → text">Sketch card</button><button class="mini" data-act="read" title="Read the selected handwriting into text">Aa → text</button><button class="mini" data-act="compact" title="Pack the selected items into tight rows (c)">Compact</button><button class="mini" data-act="clear" title="Clear the selection (Esc)">✕</button></div>
+
+<div id="ws-bar" hidden role="status"><span id="ws-name"></span><button class="mini" id="ws-up" title="Leave this workspace (Esc, Ctrl-Space u)">⇱ Leave</button><span class="ws-hint">Esc leaves · Ctrl-Space 1…9 switches · click a dimmed folder to go there</span></div>
+<div id="status">
+  <span id="st-ws" title="Workspace you are in (Esc steps out)"></span><span id="st-addr" title="Canvas address under the pointer">–</span>
+  <span id="st-buf"><span id="st-buf-text">Click in a buffer to see its cursor address</span><button id="st-copy" class="mini" hidden>Copy</button></span>
+  <span id="st-host" title="Host status: hosts up, failed units, agents, due cards, tasks, attention. Each is a click."></span>
+  <span id="st-zoom">100%</span>
+</div>
+
+<div id="palette" class="overlay" hidden>
+  <div class="pal" role="dialog" aria-label="Jump">
+    <input id="pal-in" autocomplete="off" spellcheck="false" placeholder="ops/build · Ops/B2 · plans › Rollout ¶2 · plans#freeze · >today · any text">
+    <div id="pal-list" role="listbox"></div>
+    <div class="pal-hint">↑↓ choose · Enter jump · Esc close · <code>&gt;save name</code> saves the view · <code>&gt;today</code> opens the journal</div>
+  </div>
+</div>
+
+<div id="grant" class="overlay" hidden>
+  <div class="pal grant" role="dialog" aria-label="Permission">
+    <p id="grant-text"></p>
+    <div class="ex-btns"><button class="tb" id="grant-allow">Allow</button><button class="tb" id="grant-deny">Deny</button></div>
+    <div class="pal-hint">Asked once per artifact and capability. Change it later with ⚙ on the node.</div>
+  </div>
+</div>
+
+<div id="ask" class="overlay" hidden>
+  <form class="pal" id="ask-form">
+    <label id="ask-label" for="ask-in"></label>
+    <input id="ask-in" autocomplete="off" spellcheck="false">
+    <div class="pal-hint">Enter to confirm · Esc to cancel</div>
+  </form>
+</div>
+
+<div id="export-box" class="overlay" hidden>
+  <div class="pal wide">
+    <div class="ex-head"><b>JSON Canvas</b> <span class="muted">Opens in Obsidian and other tools that read the jsoncanvas.org format.</span></div>
+    <textarea id="ex-text" readonly spellcheck="false"></textarea>
+    <div class="ex-btns"><button class="tb" id="ex-copy">Copy</button><button class="tb" id="ex-dl">Download .canvas</button><button class="tb" id="ex-close">Close</button></div>
+  </div>
+</div>
+
+<div id="help" class="overlay" hidden>
+  <div class="pal wide help">
+    <h2>Workbench</h2>
+    <p class="muted" id="help-mode"></p>
+    <div class="cols">
+      <section>
+        <h3>Find and run</h3>
+        <dl>
+          <dt><kbd data-modkey="Mod-K">Ctrl-K</kbd></dt><dd>Fuzzy search over pages, shells, agents, folders, anchors, saved views and every command. Type letters in order: <code>cwb</code> finds canvas-workbench.</dd>
+          <dt><kbd>:</kbd> · <kbd data-modkey="Mod-Shift-P">Ctrl-Shift-P</kbd> · <code>&gt;</code></dt><dd>Commands only</dd>
+          <dt>Ctrl-N / Ctrl-P, Ctrl-J / Ctrl-K</dt><dd>Move in the palette</dd>
+          <dt>Alt-1 … Alt-7</dt><dd>Canvas, Navigator, Graph, Editor, Outline, Tasks, Review</dd>
+          <dt>Alt-B · Ctrl-` (or Ctrl-J)</dt><dd>Folder tree · docked terminal</dd>
+          <dt>Middle-drag · Alt-drag</dt><dd>Pan from anywhere, also over a terminal or editor; the middle button never pastes here. Space-drag pans too when nothing is being typed.</dd>
+          <dt>Boundaries</dt><dd>Items on one level never overlap: after a drop, a resize, an unfold or a new item, the others on that level move aside, folder tabs included, and the folder grows to fit. The palette's "keep a boundary" command turns it off.</dd>
+          <dt>Tab · Shift-Tab</dt><dd>Tab folds the active folder into a package (just its tab) and unfolds it again; Shift-Tab packages every other folder on the same level so one stays in focus, and a second Shift-Tab unfolds them all. Ctrl-Z undoes.</dd>
+          <dt>Enter · Esc</dt><dd>Enter the active folder as a workspace (everything else dims; the status bar shows where you are) or open the active node as a focus tab; Esc steps out, or back to the canvas.</dd>
+          <dt>Ctrl-Space</dt><dd>Leader key, which-key style (press it twice to send Ctrl-Space itself to Emacs or tmux; the palette can move the leader to Ctrl-Alt-Space or F1): 1 to 9 switch top-level workspaces, ` last workspace, u up, f focus tab, q close tab, n/p next and previous tab, h j k l move focus between neighbours, H J K L swap with a neighbour, e/b/t/s folder modes free/pack/tile/stack, o optimise the board, O optimise this folder, c compact, F browser fullscreen, z fit all, # tag.</dd>
+          <dt>Shift-click a mode button · Ctrl-Space E B T S</dt><dd>Cascade: the folder mode (free, pack, tile, stack) is applied to every nested folder as well. Ctrl-Z undoes.</dd>
+          <dt>Note trees</dt><dd><code>note:</code> in the navigator lists a note's headings as a tree (a heading's parent is the nearest heading above it with a smaller level; list items hang under their heading); <code>h</code> goes up to the parent heading. <code>[[Title#Heading]]</code>, <code>[[Title#^anchor]]</code> and a bare <code>^anchor</code> resolve as addresses (<code>ga</code>, <code>wb go note:Title#Heading</code>). The outline pane shows the heading tree of the focused page; click a heading to jump to it. A note's preview lists its backlinks.</dd>
+          <dt>Journal</dt><dd><code>journal:</code> is year › month › day; <code>journal:today</code> is today's entry (created when missing: a board page in the demo, <code>journal/YYYY-MM-DD.md</code> under the notes in the local build). <code>]d</code> / <code>[d</code> in the navigator go to the next / previous day that has an entry; the palette has <i>Journal: today / next / previous</i>. <b>Journal perspective</b> (<code>Ctrl-Space v j</code>): one folder per year with a folder per month, the day pages inside (index-only days as ghosts that open in Emacs; today as a ghost when it has no entry yet).</dd>
+          <dt>Links</dt><dd><code>link:</code> lists every page and note with links, most linked-to first, with <code>→ out ← in</code> counts; descend to see what a page links to (titles with no page are ghosts: Enter creates the page). <b>Links perspective</b> (<code>Ctrl-Space v l</code>, palette <i>Perspective: links from a page…</i>): the MOC view from one root: a folder per page, the pages it links to inside, nested where they link further; a page linked from several parents sits under the one that links to it most and shows as a copy under the others. Local build: links come from the daemon's index (<code>/api/links</code>, <code>/api/backlinks</code>, tool <code>list_backlinks</code>).</dd>
+          <dt>Tasks (Alt-6)</dt><dd>A task is a block whose first word is a keyword: <code>TODO NEXT WAITING HOLD SOMEDAY DONE CANCELLED</code> (Org's set; DOING/NOW/LATER still read). Right under it, Logseq-style: <code>SCHEDULED: &lt;2026-10-11 Sat&gt;</code>, <code>DEADLINE: …</code>, <code>[#A]</code> priority on the line, <code>session::</code> and <code>dispatched::</code> once dispatched. The view shows the board's pages and, in the local build, every task in the notes index, in four columns sorted by date. Keys: <code>j</code>/<code>k</code> pick, <code>t</code>/<code>T</code> cycle the keyword (written back to the file), <code>Enter</code> opens the line, <code>d</code> dispatches, <code>r</code> reloads. Dispatch pastes title and body into the first shell tagged <code>#agent</code> (on the given host) and records the session. <code>wb tasks</code>, <code>wb task KW REF</code>, <code>wb dispatch REF [HOST] [SHELL]</code>.</dd>
+          <dt>/mcp</dt><dd>The daemon serves MCP (Streamable HTTP, JSON) at <code>/mcp</code> with the gateway's names: <code>list_agent_sessions</code>, <code>inspect_agent_session</code>, <code>send_agent_session</code>, <code>interrupt_agent_session</code>, <code>list_work_items</code>, <code>inspect_work_item</code>, <code>create_work_item</code> (writes a block into <code>roam/inbox/tasks.md</code>), <code>dispatch_work_item</code>, <code>set_work_item</code>, plus <code>search_nodes</code>, <code>get_node</code>, <code>list_nodes</code>, <code>list_agenda</code>, <code>list_flashcards</code>, <code>create_note</code>, <code>create_flashcard</code>, <code>tag_node</code>, <code>host_status</code>. Auth: <code>Authorization: Bearer &lt;token&gt;</code>.</dd>
+          <dt>proc: and unit:</dt><dd>The host's own trees in the navigator: <code>⚙ processes</code> (from <code>/proc</code>: parent tree, command, cwd, unit; a board shell's process shows its card) and <code>⊙ units</code> (systemd, failed first, each with its processes and <code>systemctl status</code> in the preview). Perspectives <b>processes</b> (Ctrl-Space v c: each shell card in a folder with the OS processes under it as ghosts, refreshed every 2 s inside the open workspace) and <b>units</b> (Ctrl-Space v u: one folder per host with a ghost per unit, tagged #active #failed #inactive; a unit that owns a board shell becomes its own folder). <code>wb ps</code>, <code>wb units</code>, <code>wb unit restart|stop|start NAME [HOST] yes</code> (the only mutating verbs; the palette asks first), <code>wb health</code>. The filesystem perspective marks hard links (⧉, a dashed edge to the other name) and mount points (⛁).</dd>
+          <dt>Status line</dt><dd>Bottom right: hosts up/all, ✗ failed units, ✦ agents running, ▦ cards due, ☐ open tasks, ! attention. Each count is a click to the matching place; <code>! attention</code> (also <code>wb ls attn:</code>) lists what needs a look, one address per item.</dd>
+          <dt>tmux</dt><dd>Local build with <code>canvasd --tmux-socket PATH</code>: every shell card is a tmux session <code>wb-&lt;id&gt;</code> on that socket, so it survives a daemon restart (the card re-attaches). Sessions other programs made there (an agent's <code>control-session</code>, a plain <code>tmux -S PATH new -s name</code>) are listed under <code>tmux:</code> in the navigator (Enter adopts one as a card tagged <code>#tmux</code>; ⇠ or ✕ detaches it, the session keeps running) and in the <b>tmux</b> perspective (Ctrl-Space v x: one folder per session, sessions with no card as ghosts). From a shell: <code>wb send tmux:@host/name 'text'</code>, <code>wb logs</code>, <code>wb interrupt</code>, <code>wb kill</code>, <code>wb tmux</code>, <code>wb adopt name</code>.</dd>
+          <dt>Ctrl-Space v, then m / p / f / t / x / c / u / j / l</dt><dd>Perspective: a folder is a view of one relation. <b>manual</b> shows the folders as you made them (the stored board); <b>process</b> derives one folder per shell that spawned others, nested as the spawn tree, with items outside the relation dimmed; <b>filesystem</b> (next version) groups by directory on each host. Switching back restores every manual folder and position exactly.</dd>
+          <dt>Host folders</dt><dd>New → Host (local build): a folder bound to another machine's daemon, shown as <code>@name</code> on its tab and <code>#host</code> in its tags. Shells and Emacs buffers opened inside run there; the navigator lists <code>@name files</code>; <code>wb</code> in those shells drives this board through that daemon. Hosts come from <code>~/.canvas-proto/hosts.json</code> on the serving daemon, or type <code>name=http://addr:port#token</code>. A host that drops shows a red <code>@name</code> and ↻: shells inside the open workspace reconnect by themselves, others wait for ↻ or Enter. A running shell cannot be moved to another host.</dd>
+          <dt>Shift-C</dt><dd>Optimise the board: groups what is linked, spawned, piped or tagged together, lays each group out in flow order, packs the groups, snaps to the grid. Ctrl-Z undoes.</dd>
+          <dt>#</dt><dd>Tag the active node. Tags filter and describe nodes: #agent is a terminal running an agent (set by itself from the foreground process), #aggregator makes a node a container (a tagged terminal gets its own folder, and what it spawns lands there), #emacs marks Emacs buffers. Click a tag to filter; Esc clears.</dd>
+          <dt>wb</dt><dd>Agents in a terminal drive the board with the <code>wb</code> command (on PATH in every shell): <code>wb tools</code>, <code>wb nodes</code>, <code>wb web URL</code>, <code>wb artifact-file page.html</code>, <code>wb card FRONT BACK</code>, <code>wb tag PATH agent</code>.</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>Navigator (ranger)</h3>
+        <dl>
+          <dt>h j k l · gg G · ⏎</dt><dd>Up a level, down, up, into · top, bottom · open (pages open in the Editor)</dd>
+          <dt>/ · space · v · Esc</dt><dd>Filter (fuzzy) · mark · invert marks · clear</dd>
+          <dt>dd · pp · DD</dt><dd>Cut · paste into this folder (moves items) · delete</dd>
+          <dt>r · + · n · S</dt><dd>Rename · new folder · new page · shell in this folder or directory</dd>
+          <dt>o · yp · 1 2 3</dt><dd>Show on canvas · copy path · folder free, pack, stack</dd>
+          <dt>gh · gw · m<i>x</i> · '<i>x</i></dt><dd>Files at home · workspace root · set bookmark · go to bookmark</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>Pages</h3>
+        <dl>
+          <dt>Vim keys</dt><dd>On by default. Esc for normal mode. Turn off in the palette: “vim”.</dd>
+          <dt><code>[[</code></dt><dd>Completes to any page, folder, shell, REPL or agent. Links show in the graph and in backlinks.</dd>
+          <dt><code>((plans#freeze))</code> · ⚓</dt><dd>Block reference · name a spot</dd>
+          <dt>Ink over a page</dt><dd>Sticks to its line. Aa → text writes it in at that line.</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>Artifacts and review</h3>
+        <dl>
+          <dt>Artifact node</dt><dd>A Claude artifact page in a sandboxed frame. It reaches the world only through <code>claude.use()</code>; you allow each capability once. ✎ edits the source as a page, "Artifact: publish from this page" ships it.</dd>
+          <dt>Node kinds</dt><dd>Shell (real PTY: run claude code, oh-my-pi or anything), Emacs buffer (emacsclient -t on a file), Web (a page in a frame; ↗ opens it outside when the site refuses frames), Artifact (sandboxed HTML page: published by Claude, or backed by a file any agent writes, reloaded on change), Sketch (write or draw with the pen; Aa turns the ink into a page), Page, Folder.</dd>
+          <dt>Review (Alt-7)</dt><dd>Space reveals, 1 to 4 grades, u undoes, s suspends, b buries, o opens the source, ? asks. Answer by thinking, typing, pen or voice.</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>Pen and voice</h3>
+        <dl>
+          <dt>Stylus · P</dt><dd>A stylus always writes; its eraser end erases. P selects the pen for mouse or touch.</dd>
+          <dt>Aa → text · ✎ → ask</dt><dd>Beside what you just wrote: Claude reads it into text, or answers it.</dd>
+          <dt>🎙 hold · tap · Alt-V</dt><dd>Hold to talk to the assistant, tap to dictate into the box, Alt-V dictates into a page.</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>Folders and canvas</h3>
+        <dl>
+          <dt>Drag a header into a folder</dt><dd>The pointer decides where it belongs. Folders nest; moving one carries its contents.</dd>
+          <dt>◻ free · ▦ pack · ⊞ tile · ❐ stack</dt><dd>No gravity · rows in drop order · panes that fill the folder in dwm's golden-ratio spiral (the first pane takes 0.618 of the width, the next 0.618 of what is left the other way, and so on inwards) · a deck of cards. (The PaperWM ribbon is gone: it grew the folder past the screen.)</dd>
+          <dt>Workspaces: ⌂ · Enter · Esc</dt><dd>A folder becomes the desktop: ⌂ on its tab, Enter with it active, Ctrl-Space 1…9, or a double-click on its icon. The other top-level folders dim. The way out: the <b>⇱ Leave</b> bar at the top, Esc, Ctrl-Space u, ⌂ on the tab again, or a click on any dimmed folder, which leaves and goes there.</dd>
+          <dt>⬚ Select an area (S or 6)</dt><dd>Drag a rectangle: every stroke, drawn shape and card fully inside it is selected (Shift-drag does the same from the select tool; Shift adds). <b>Delete</b> removes the lot; Ctrl-Z brings the ink and shapes back (a removed card is gone). The chip offers <b>Sketch card</b>, which turns the selected handwriting into a sketch card with an address, tags, arrows and Aa → text, and <b>Aa → text</b> directly.</dd>
+          <dt>Aspect ratio (⊞ again)</dt><dd>A folder tiles in the <b>screen's ratio</b> (its area kept), so Enter makes it the whole view: a workspace that is a desktop. ⊞ on a tiled folder (or <code>wb mode F tile</code> again, or the palette's "next tile aspect ratio") steps through 16:9, 3:2, 4:3, 1:1, 3:4, 9:16 and back to the screen's; the panes retile each time. Entering a screen-ratio folder that is smaller than the screen grows it to the screen's size at zoom 100%. A folder that is itself a pane of a tiled parent takes its size from the parent.</dd>
+          <dt>Tabs and headers</dt><dd>A folder's tab and a card's header keep their screen size at every zoom, but never run past their item: the name ellipsizes first, then the count, badge and tags go, then the mode buttons and all header buttons but ✕. Zoom in and they come back.</dd>
+          <dt>Resizing</dt><dd>Every card and folder has three handles: the corner (◢ on folders), the right edge (width) and the bottom edge (height). A <b>tiled</b> pane's edge changes its share of the split it sits in; the folder retiles live. A <b>packed</b> folder's size is what its items must fit: rows re-flow, and when they still do not fit the cards shrink together (down to a third); dragged below a deck's size the folder <b>stacks</b>, and a deck dragged open unstacks. Switching tile ↔ ribbon keeps the size the folder had before either, so nothing stretches.</dd>
+          <dt>Shift-drag empty canvas · Shift-click a header</dt><dd>Select items · add or remove one. Esc clears.</dd>
+          <dt>C · Ctrl-Z</dt><dd>Compact the selection, or everything when nothing is selected · undo the last compact or tile change</dd>
+          <dt>Drag a pane edge</dt><dd>Resize the folder tree or the side pane; double-click the edge resets it</dd>
+          <dt>Drag empty canvas · Ctrl + scroll</dt><dd>Pan · zoom. Shift-1 fits everything.</dd>
+          <dt>V R D O A P T E</dt><dd>Select, rectangle, diamond, ellipse, arrow, pen, text, eraser (✎ Draw shows the bar)</dd>
+        </dl>
+      </section>
+    </div>
+    <div class="ex-btns"><button class="tb" id="reset-board">Reset board</button><button class="tb" id="help-close">Close</button></div>
+  </div>
+</div>
+
+<div id="ink-chip" hidden role="toolbar" aria-label="Handwriting"><button id="ink-text" title="Turn this handwriting into text. On a page it goes in at that line; elsewhere it becomes a new page.">Aa → text</button><button id="ink-x" title="Dismiss">✕</button></div>
+
+<div id="toast" role="status" aria-live="polite"></div>
+<!--/APP-->
+<script src="vendor/vendor.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
