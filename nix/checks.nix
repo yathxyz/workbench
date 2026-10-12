@@ -1,5 +1,5 @@
-# `nix flake check`: package (with cargo test), clippy, fmt, the black-box conformance suite, the
-# end-to-end security suite, the browser suite, the adapter probe against the stub, the VM test,
+# `nix flake check`: package (with cargo test), clippy, fmt, Edwin's headless core, the black-box
+# conformance suite, the end-to-end security suite, the browser suite, the adapter probe against the stub, the VM test,
 # the module's assertions. The harness registers wb-fake-acp (the package's `fake` output) as
 # its `stub` agent, so every check that starts it has that output on PATH.
 {
@@ -13,6 +13,10 @@ let
   tests = lib.fileset.toSource {
     root = ../tests;
     fileset = ../tests;
+  };
+  edwin = lib.fileset.toSource {
+    root = ../edwin;
+    fileset = ../edwin;
   };
 in
 {
@@ -47,6 +51,12 @@ in
         HOME=$TMPDIR cargo fmt --all --check
         touch $out
       '';
+
+  # Edwin's editing core in Node with no browser (step E0 of the edwind plan).
+  edwin-headless = pkgs.runCommand "workbench-edwin-headless" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    node --test ${edwin}/test/headless.test.mjs
+    touch $out
+  '';
 
   # tests/test_daemon.py over the harness: real wb-hub, wb-web and Caddy, as in `security`.
   conformance =
