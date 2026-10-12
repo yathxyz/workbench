@@ -1435,4 +1435,6 @@ The test runs numbered steps. The steps this design pins down:
 | **M5-T** conformance | `tests/test_daemon.py`, `crates/wb-web/examples/dump-index.rs` | M5-W1/W2/W3 | `test_daemon.py` complete; `dump-index` | `conformance` green; a one-off parity run of `dump-index` against the Python prototype on a real notes directory (read-only), with any differences recorded |
 | **M5-N** nix | `nix/web.nix`, `nix/checks.nix`, `nix/module.nix` | M5-W2/F | `dist/canvas-workbench.html` built; `conformance` with `mock_api.py`; `anthropic-api-key` credential | at integration: `nix flake check` green; deploy without a hub restart |
 
+**Superseded (2026-10-12):** M5-W1 and M5-W2 are not built in Rust. Edwin, run headless as the text daemon edwind, owns the notes index and the `sample` backend instead, with provider-agnostic model backends and keys on the server; pages become files in `notesDir`. The plan is in `edwin/README.md`. M5-W3, M5-F and the parts of M5-T and M5-N that do not depend on W1 and W2 stand.
+
 **M5 exit:** all of §9.6 holds. The **two-week dogfood clock** starts, and it ends with the removal review: every feature untouched in two weeks is listed for deletion (§1).
