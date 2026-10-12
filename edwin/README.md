@@ -14,7 +14,7 @@ first, undo undoes your own edits, and the runtime is Node.
 | --- | --- |
 | `src/*.js` | the editor, in the order `index.html` loads it: `scheme` `runtime` `text` `editor-core` `editor-prims` `evil-core` `pool` `complete` `extras` `stack` `ai` `evil-ex` `org` |
 | `scm/*.scm` | the shipped Scheme configuration (`emacs`, `evil`, `org`, `ai`, `init`), also inlined in `index.html` |
-| `index.html` | the page: styles, the Scheme blocks and the script tags. It loads `src/*.js` from its own directory, so a published copy puts them next to it |
+| `index.html` | the page: styles, the Scheme blocks and the script tags. It loads `src/*.js` relative to itself, so serving this directory runs it, and a published copy keeps the `src/` paths |
 | `test/headless.mjs` | loads the editor in Node with no browser and drives it with keys |
 | `test/headless.test.mjs` | the headless suite: `node --test edwin/test/headless.test.mjs`, or `nix build .#checks.x86_64-linux.edwin-headless` |
 
