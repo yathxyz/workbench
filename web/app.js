@@ -573,7 +573,7 @@ class FakeShell {
   constructor(n, term) {
     this.n = n; this.t = term; n.cwd = n.cwd || '/home/me'; n.env = n.env || {};
     this.le = new LineEditor(term, () => this.promptStr(), line => this.run(line));
-    term.write('\x1b[2m' + (DAEMON ? 'Simulated shell (made before canvasd ran). ' : 'Simulated shell in your browser. Run canvasd for real ones. ') + 'Type help.\x1b[0m\r\n');
+    term.write('\x1b[2m' + (DAEMON ? 'Simulated shell (made in demo mode). ' : 'Simulated shell in your browser. Serve the page from wb-web for real ones. ') + 'Type help.\x1b[0m\r\n');
     if (n.spawnNote) term.write('\x1b[38;5;179m⑂ ' + n.spawnNote + '\x1b[0m\r\n');
     this.le.prompt();
   }
@@ -638,7 +638,7 @@ class FakeShell {
       case 'history': return this.le.hist.map((h, i) => `${String(i + 1).padStart(4)}  ${h}`).join('\n');
       case 'clear': this.t.clear(); return '';
       case 'date': return new Date().toString();
-      default: return `${cmd}: not available in the simulated shell (run canvasd for a real one)`;
+      default: return `${cmd}: not available in the simulated shell (wb-web serves real ones)`;
     }
   }
 }
@@ -1410,7 +1410,7 @@ function mountAcp(n, L) {
   $('.ag-mode', L.body).onchange = e => b.setMode(e.target.value);
 }
 class Offline {
-  constructor(n, term) { term.write('\x1b[33mThis node is a real shell. Start canvasd to run it:\x1b[0m\r\n  python3 daemon/canvasd.py --open\r\n'); }
+  constructor(n, term) { term.write('\x1b[33mThis node is a real shell: it runs when wb-web serves this page.\x1b[0m\r\n'); }
   input() {}
 }
 
@@ -2073,7 +2073,7 @@ function mountNode(n) {
     B('↻', 'Reload', () => webGo(n, live[n.id]));
     B('↗', 'Open in a browser tab', () => { if (webUrlOk(n.url)) window.open(n.url, '_blank', 'noopener'); else toast('Only http and https URLs open in a tab.'); });
   } else if (n.kind === 'sketch') {
-    B('Aa', 'Turn the ink on this card into a page (needs Claude with images)', () => sketchToPage(n));
+    B('Aa', 'Turn the ink on this card into a page (needs a model that reads images)', () => sketchToPage(n));
     B('⌫', 'Clear the ink on this card', () => sketchClear(n));
   } else if (n.kind === 'ghost') {
     B('↗', n.alias ? 'Jump to the real node' : n.tmuxTarget ? 'Adopt: a card attached to this tmux session' : n.dir ? 'Open: this directory becomes a folder' : 'Open: make it real (Emacs on the file; a page in demo mode)', () => ghostOpen(n));
@@ -2170,7 +2170,7 @@ function mountBuffer(n, L) {
       V.EditorView.updateListener.of(u => {
         if (u.docChanged && ED.node === n) mirrorTo(ED.view, u, u.view);
         if (u.docChanged) { n.text = u.state.doc.toString(); dirty(); scheduleCrossRefresh(); }
-        if ((u.docChanged || u.selectionSet) && focusedBuf === n.id) showBufAddr(n);
+        if ((u.docChanged || u.selectionSet) && focusedBuf === n.id) scheduleBufAddr(n);
         if (u.docChanged || u.geometryChanged || u.viewportChanged) scheduleLineInk(n.id);
       }),
       V.EditorView.domEventHandlers({
@@ -2368,6 +2368,7 @@ function pipeFrom(n) {
       L.backend.input(text.replace(/\r?\n/g, '\r').replace(/\r$/, '') + (n.kind === 'buffer' ? '\r' : ''));
     }
     L.el.classList.remove('pulse'); void L.el.offsetWidth; L.el.classList.add('pulse');
+    for (const e of S.edges) if (e.type === 'pipe' && e.from === n.id && e.to === t.id) flowPipe(e);
   }
   toast(`Sent ${text.split('\n').length} line(s) to ${targets.map(t => pathOf(t.id)).join(', ')}`);
 }
@@ -2431,6 +2432,12 @@ function edgeGeom(a, b) {
   return [p1, { x: p1.x + d, y: p1.y }, { x: p2.x - d, y: p2.y }, p2];
 }
 let rsEdges = null;
+const FLOWING = new Map();   // pipe edge id → until (ms): its dashes flow for a moment after a send
+function flowPipe(e) {
+  FLOWING.set(e.id, Date.now() + 2400);
+  edgesSvg.querySelector(`.redge[data-edge="${CSS.escape(e.id)}"]`)?.classList.add('flowing');
+  setTimeout(() => { if ((FLOWING.get(e.id) || 0) > Date.now()) return; FLOWING.delete(e.id); edgesSvg.querySelector(`.redge[data-edge="${CSS.escape(e.id)}"]`)?.classList.remove('flowing'); }, 2450);
+}
 const hashSeed = id => { let h = 7; for (const c of String(id)) h = (h * 31 + c.charCodeAt(0)) | 0; return (Math.abs(h) % 2147483646) + 1; };
 function renderEdges() {
   const rs = rsEdges || (rsEdges = V.rough.svg(edgesSvg));
@@ -2440,7 +2447,7 @@ function renderEdges() {
     a = visibleOf(a); b = visibleOf(b); if (a === b) continue;  // items in a stacked folder connect to its deck
     const [p1, c1, c2, p2] = edgeGeom(a, b);
     const o = { seed: hashSeed(e.id), roughness: 0.9, bowing: 0.8, stroke: 'currentColor', strokeWidth: 1.7 };
-    const g = svgEl('g', { class: 'redge e-' + e.type });
+    const g = svgEl('g', { class: 'redge e-' + e.type + ((FLOWING.get(e.id) || 0) > Date.now() ? ' flowing' : ''), 'data-edge': e.id });
     g.append(rs.path(`M${p1.x},${p1.y} C${c1.x},${c1.y} ${c2.x},${c2.y} ${p2.x},${p2.y}`, e.type === 'spawn' ? o : { ...o, strokeLineDash: e.type === 'pipe' ? [8, 6] : e.type === 'symlink' ? [6, 4] : [2, 5] }));
     const ang = Math.atan2(p2.y - c2.y, p2.x - c2.x), L = 13;
     g.append(rs.linearPath([[p2.x - L * Math.cos(ang - .5), p2.y - L * Math.sin(ang - .5)], [p2.x, p2.y], [p2.x - L * Math.cos(ang + .5), p2.y - L * Math.sin(ang + .5)]], o));
@@ -2612,6 +2619,8 @@ function snapshotText(n, max = 12) {
 function refreshSnapshots() { for (const n of nodeList()) { const L = live[n.id]; if (L?.lod) $('pre', L.lod).textContent = snapshotText(n); } }
 
 // ------------------------------------------------------------------ status bar
+let bufAddrT = 0;
+function scheduleBufAddr(n) { clearTimeout(bufAddrT); bufAddrT = setTimeout(() => { if (focusedBuf === n.id) showBufAddr(n); }, 120); }
 function showBufAddr(n) {
   const v = live[n.id]?.view; if (!v) return;
   const t = $('#st-buf-text'); t.textContent = fmtAddr(bufferAddress(n, v.state, v.state.selection.main.head)); t.classList.add('live');
@@ -2918,9 +2927,11 @@ cmd('Toggle docked terminal', () => toggleDockTerm(), 'Ctrl-`');
 cmd('Side pane: wider', () => { toggleSide(true, true); setPaneW((S.paneW || PANE_W) + 80, true); }, 'Ctrl-Alt-[');
 cmd('Side pane: narrower', () => { toggleSide(true, true); setPaneW((S.paneW || PANE_W) - 80, true); }, 'Ctrl-Alt-]');
 cmd('Side pane: reset width', () => setPaneW(PANE_W, true));
-cmd('Assistant: new conversation', () => { S.chat.turns = []; S.chat.log = [{ t: 'note', text: CHAT_HELLO }]; renderAgentLog(S.chat); dirty(); toggleSide(true); });
-cmd('Assistant: fork the conversation onto the canvas', () => $('#chat-fork').click());
-cmd('Assistant: talk (hold-to-talk mic)', () => { toggleSide(true, true); sideTab('chat'); $('.mic', live.chat.body).dispatchEvent(new PointerEvent('pointerdown', { button: 0 })); });
+// Listed only while the assistant pane exists (initChat mounts none since v9): run without it, they threw.
+const hasChat = () => !!(S.chat && live.chat);
+cmd('Assistant: new conversation', () => { S.chat.turns = []; S.chat.log = [{ t: 'note', text: CHAT_HELLO }]; renderAgentLog(S.chat); dirty(); toggleSide(true); }, '', hasChat);
+cmd('Assistant: fork the conversation onto the canvas', () => $('#chat-fork').click(), '', hasChat);
+cmd('Assistant: talk (hold-to-talk mic)', () => { toggleSide(true, true); sideTab('chat'); $('.mic', live.chat.body).dispatchEvent(new PointerEvent('pointerdown', { button: 0 })); }, '', hasChat);
 cmd('Dictate into the page', () => { if (VIEW === 'editor' && ED.view) dictateInto('editor'); else if (focusedBuf && S.nodes[focusedBuf]) dictateInto(S.nodes[focusedBuf]); else toast('Click into a page first.'); }, 'Alt-V');
 for (const [t, name, key] of [['select', 'select and move', 'V'], ['area', 'select an area (ink, shapes, cards)', 'S'], ['rect', 'rectangle', 'R'], ['diamond', 'diamond', 'D'], ['ellipse', 'ellipse', 'O'], ['arrow', 'arrow', 'A'], ['pen', 'pen', 'P'], ['text', 'text', 'T'], ['erase', 'eraser', 'E']])
   cmd(`Tool: ${name}`, onCanvas(() => setTool(t)), key);
@@ -3020,7 +3031,7 @@ window.addEventListener('keydown', e => {
   if (e.key === 'Escape' && PICKED.size) { pickClear(); return; }
   if (e.key === 'Escape' && TAG_FILTER) { tagFilter(''); return; }
   if (e.key === 'Tab' && !typing() && VIEW === 'canvas' && !FOCUS.cur) { e.preventDefault(); e.shiftKey ? foldCycle() : foldToggle(); return; }
-  if (e.key === 'Enter' && activeId && S.nodes[activeId]) { e.preventDefault(); const n = S.nodes[activeId]; n.kind === 'frame' ? wsEnter(n) : focusOpen(n); return; }
+  if (e.key === 'Enter' && activeId && S.nodes[activeId]) { e.preventDefault(); const n = S.nodes[activeId]; n.kind === 'frame' ? wsEnter(n) : e.shiftKey ? focusOpen(n) : typeInto(n); return; }
   if (e.key === 'C') { optimise(null); return; }
   const keyTools = { v: 'select', 1: 'select', r: 'rect', 2: 'rect', d: 'diamond', 3: 'diamond', o: 'ellipse', 4: 'ellipse', a: 'arrow', 5: 'arrow', s: 'area', 6: 'area', p: 'pen', 7: 'pen', t: 'text', 8: 'text', e: 'erase', 0: 'erase' };
   const t = keyTools[e.key.toLowerCase()]; if (t) setTool(t);
@@ -3069,9 +3080,12 @@ class RefWidget extends V.WidgetType {
   ignoreEvent() { return false; }
 }
 const refreshLinks = V.StateEffect.define();
+const REF_DOCS = new WeakMap();   // doc (immutable) → it holds a ((ref)), so its decorations depend on the cursor line and on other pages
+const curLine = (doc, sel) => doc.lineAt(Math.min(sel.main.head, doc.length)).number;
 // [[links]] render as links; ((refs)) render as the referenced text, except on the line being edited.
 function linkDecos(docObj, selection) {
   const out = [], doc = docObj.toString(), cur = docObj.lineAt(Math.min(selection.main.head, docObj.length));
+  REF_DOCS.set(docObj, doc.includes('(('));
   for (const m of doc.matchAll(/\[\[([^\[\]\n]+)\]\]/g)) {
     const a = m.index, b = a + 2 + m[1].length;
     out.push(V.Decoration.mark({ class: 'cm-brk' }).range(a, a + 2));
@@ -3094,7 +3108,13 @@ function linkDecos(docObj, selection) {
 const linkField = V.StateField.define({
   create: st => linkDecos(st.doc, st.selection),
   // tr.state must not be read here (it is the state being built), so use newDoc/newSelection
-  update(val, tr) { return tr.docChanged || tr.selection || tr.effects.some(e => e.is(refreshLinks)) ? linkDecos(tr.newDoc, tr.newSelection) : val; },
+  // A cursor move changes only which ((ref)) shows its source: nothing in a page without refs, nor while the cursor
+  // stays on its line. Rebuilding on every move made j/k and clicks cost a pass over the whole page.
+  update(val, tr) {
+    if (tr.docChanged || tr.effects.some(e => e.is(refreshLinks))) return linkDecos(tr.newDoc, tr.newSelection);
+    if (!tr.selection || !REF_DOCS.get(tr.newDoc) || curLine(tr.newDoc, tr.newSelection) === curLine(tr.startState.doc, tr.startState.selection)) return val;
+    return linkDecos(tr.newDoc, tr.newSelection);
+  },
   provide: f => V.EditorView.decorations.from(f),
 });
 function findPage(name) { name = String(name).trim().toLowerCase(); return nodeList().find(n => n.kind === 'buffer' && n.name.toLowerCase() === name) || null; }
@@ -3142,20 +3162,33 @@ function freeSpot(x, y, w, h) {
   }
   return { x: Math.round(x), y: Math.round(y) };
 }
+// One pass over every page: each line is lowercased once and its [[name]], ((name#…)) and ((name ›…)) targets are
+// collected, so the cost is the board's text, not pages × pages × lines. A box is rebuilt only when its hits changed.
 function updateBacklinks() {
   const pages = nodeList().filter(n => n.kind === 'buffer' && live[n.id]?.view);
-  for (const p of pages) {
-    const name = p.name.toLowerCase(), hits = [];
-    for (const q of pages) {
-      if (q === p) continue;
-      const st = live[q.id].view.state;
-      for (let i = 1; i <= st.doc.lines; i++) {
-        const t = st.doc.line(i).text, low = t.toLowerCase();
-        if (low.includes('[[' + name + ']]') || low.includes('((' + name + '#') || low.includes('((' + name + ' ›')) hits.push({ q, pos: st.doc.line(i).from, t, st });
+  const names = new Set(pages.map(p => p.name.toLowerCase())), hitsOf = new Map();
+  const RX = /\[\[([^\[\]\n]+)\]\]|\(\(([^()#›\n]+?)\s*(?:#|›)/g;
+  for (const q of pages) {
+    const st = live[q.id].view.state, doc = st.doc, text = doc.toString();
+    if (!text.includes('[[') && !text.includes('((')) continue;
+    for (let i = 1; i <= doc.lines; i++) {
+      const line = doc.line(i), low = line.text.toLowerCase(), seen = new Set();
+      if (!low.includes('[[') && !low.includes('((')) continue;
+      for (const m of low.matchAll(RX)) {
+        const name = m[1] !== undefined ? m[1] : m[2].trimEnd();
+        if (!names.has(name) || seen.has(name)) continue;
+        seen.add(name);
+        if (!hitsOf.has(name)) hitsOf.set(name, []);
+        hitsOf.get(name).push({ q, pos: line.from, t: line.text, st });
       }
     }
+  }
+  for (const p of pages) {
     const box = live[p.id].backlinks; if (!box) continue;
-    box.replaceChildren();
+    const hits = (hitsOf.get(p.name.toLowerCase()) || []).filter(h => h.q !== p);
+    const sig = hits.length + '\n' + hits.slice(0, 20).map(h => h.q.id + ':' + h.pos + ':' + h.t).join('\n');
+    if (box._sig === sig) continue;
+    box._sig = sig; box.replaceChildren();
     if (!hits.length) continue;
     box.append(el('h4', null, `Linked references · ${hits.length}`));
     for (const h of hits.slice(0, 20)) {
@@ -3172,8 +3205,9 @@ function scheduleCrossRefresh() {
   clearTimeout(crossT);
   crossT = setTimeout(() => {
     updateBacklinks();
-    for (const n of nodeList()) if (n.kind === 'buffer' && live[n.id]?.view) live[n.id].view.dispatch({ effects: refreshLinks.of(null) });
-    ED.view?.dispatch({ effects: refreshLinks.of(null) });
+    // Only ((refs)) show another page's text; [[links]] look the same whatever the other pages say.
+    for (const n of nodeList()) { const v = n.kind === 'buffer' && live[n.id]?.view; if (v && REF_DOCS.get(v.state.doc) !== false) v.dispatch({ effects: refreshLinks.of(null) }); }
+    if (ED.view && REF_DOCS.get(ED.view.state.doc) !== false) ED.view.dispatch({ effects: refreshLinks.of(null) });
     refreshViews();
   }, 250);
 }
@@ -3486,7 +3520,7 @@ async function agentSend(n, opt = {}) {
   n.log.push({ t: 'user', text }); n.turns.push({ role: 'user', content: opt.note ? `${opt.note}\n${text}` : text }); renderAgentLog(n);
   const sample = await getSample();
   if (!sample) {
-    n.log.push({ t: 'note', text: DAEMON ? SAMPLE_OFF : 'The agent runs on Claude inside the hosted Canvas Workbench artifact on claude.ai, or through canvasd with an API key. It is not available in this copy.' });
+    n.log.push({ t: 'note', text: DAEMON ? SAMPLE_OFF : 'The agent needs a language model: Claude inside the hosted artifact on claude.ai, or a Workbench server that serves one. It is not available in this copy.' });
     renderAgentLog(n); dirty(); return;
   }
   L.busy = true; $('.stop', L.body).hidden = false; $('.go', L.body).disabled = true; activity(n.id);
@@ -3559,9 +3593,9 @@ async function inkImage(ids) {
   return new Promise(res => cv.toBlob(res, 'image/png'));
 }
 async function canSeeImages() {
-  const sample = await getSample(); if (!sample) { toast(DAEMON ? SAMPLE_OFF : 'Reading handwriting runs on Claude, inside the hosted artifact on claude.ai or through canvasd.', 6000); return null; }
+  const sample = await getSample(); if (!sample) { toast(DAEMON ? SAMPLE_OFF : 'Reading handwriting needs a language model: Claude inside the hosted artifact on claude.ai, or a Workbench server that serves one.', 6000); return null; }
   const lim = await sample.limits?.().catch(() => null);
-  if (!lim?.images) { toast('This view cannot send images to Claude, so it cannot read handwriting here.', 6000); return null; }
+  if (!lim?.images) { toast('The model here cannot read images, so it cannot read handwriting.', 6000); return null; }
   return sample;
 }
 const INK_PROMPT = 'The image is a handwritten note from a personal workspace. Transcribe it to Markdown. Keep the writer\'s words and line breaks. Lines that look like list items become "- " bullets; a first line that looks like a title becomes "# Title". Write "- TODO " for items marked as to-do or with an empty checkbox. Use [[name]] only where the writer drew double brackets. If a word is unreadable, write [?]. Output only the Markdown, no commentary.';
@@ -3614,7 +3648,7 @@ $('#ink-x').onclick = () => { INK.ids = []; placeInkChip(); };
 // Hold 🎙 in an agent or the assistant to talk, release to send; tap it to dictate into the box without sending.
 // 🎙 on a page (or Alt-V) dictates at the cursor. Saying "new line" or "new bullet" breaks the line.
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-const VOICE_BLOCKED = 'The microphone is not available here. On claude.ai the artifact runs in a sandboxed frame without microphone access. Use the local build (canvasd) in Chrome, Edge or Safari, or your system dictation into any text box (macOS: press Fn twice; Windows: Win+H).';
+const VOICE_BLOCKED = 'The microphone is not available here. On claude.ai the artifact runs in a sandboxed frame without microphone access. Use the self-hosted Workbench in Chrome, Edge or Safari, or your system dictation into any text box (macOS: press Fn twice; Windows: Win+H).';
 const VOICE = { rec: null, target: null };
 function spoken(t) { return t.replace(/\s*\bnew bullet\b\s*/gi, '\n- ').replace(/\s*\bnew (line|paragraph)\b\s*/gi, '\n'); }
 function listen({ onUpdate, onEnd, label }) {
@@ -4706,7 +4740,9 @@ function daemonSample() {
   fn.json = async (input, o) => JSON.parse((await fn(input, o)).text.replace(/^[\s\S]*?([\[{])/, '$1').replace(/[^\]}]*$/, ''));
   return fn;
 }
-const SAMPLE_OFF = 'Claude is off in this build: start canvasd with ANTHROPIC_API_KEY set in its environment (never in a page). Models: CANVAS_MODEL_QUICK, CANVAS_MODEL_DEFAULT, CANVAS_MODEL_COMPLEX.';
+// Said where a model feature is used, never at startup: a server without a model is a normal setup, not a fault.
+// Provider-neutral: the server's `sample` backend is configured on the server, with its key there, never in a page.
+const SAMPLE_OFF = 'No language model on this server: the assistant, handwriting and artifacts that ask a model stay off until wb-web serves `sample` (configured in its web.json, with the key kept on the server). Shells, agent cards and pages work without it.';
 
 // ------------------------------------------------------------------ artifacts: Claude artifact pages as nodes
 // An artifact node is a versioned HTML page running in a sandboxed frame on its own origin (the daemon's second port;
@@ -4771,7 +4807,7 @@ async function artMount(n, L) {
   }
   clearTimeout(L.helloT);
   L.helloT = setTimeout(() => { if (!L.hello && live[n.id] === L) { L.notice.hidden = false; L.notice.textContent = window.CANVAS_HOSTED
-    ? 'The page did not start. On claude.ai the viewer blocks frames inside an artifact; artifact nodes run in the local build (python3 daemon/canvasd.py).'
+    ? 'The page did not start. On claude.ai the viewer blocks frames inside an artifact; artifact nodes run on the self-hosted Workbench.'
     : 'The page did not answer the bridge within 6 s. It still runs, but window.claude.use() resolves null for it.'; } }, 6000);
 }
 function mountArtifact(n, L) {
@@ -5003,7 +5039,7 @@ cmd('Artifact: publish from this page', () => publishFromPage(S.nodes[activeId])
 cmd('Artifact: reload', () => artMount(S.nodes[activeId], live[activeId]), '', () => S.nodes[activeId]?.kind === 'artifact');
 cmd('Artifact: versions…', () => artifactVersions(S.nodes[activeId]), '', () => S.nodes[activeId]?.kind === 'artifact');
 cmd('Artifact: permissions…', () => artifactPermissions(S.nodes[activeId]), '', () => S.nodes[activeId]?.kind === 'artifact');
-cmd('Artifact: open the Workbench demo inside itself', () => openWorkbenchInside(), '', () => DAEMON);
+cmd('Artifact: open the Workbench demo inside itself', () => openWorkbenchInside(), '', () => DAEMON && !!INFO?.dist);   // wb-web reports dist:null until M5
 cmd('Artifact: paste HTML from the clipboard as a new artifact', async () => { try { const t = await navigator.clipboard.readText(); if (!t.trim()) return toast('Clipboard is empty.'); askName('Artifact name', 'pasted', name => newArtifact(name, t)); } catch { toast('Clipboard read is not allowed here. Use "New artifact from HTML…" and paste into the page.'); } });
 
 // ------------------------------------------------------------------ flashcards: a review view over cards from notes
@@ -5113,7 +5149,7 @@ function rvSide(c) {
   }
   const lg = $('#rv-log'); lg.replaceChildren(...RV.log.slice(-12).reverse().map(l => { const p = el('pre'); p.textContent = JSON.stringify(l); return p; }));
   if (!RV.log.length) lg.innerHTML = '<pre class="muted">(empty: grade a card)</pre>';
-  $('#rv-logfile').textContent = DAEMON ? '.reviews/<host>.jsonl via canvasd' : 'board (demo mode)';
+  $('#rv-logfile').textContent = DAEMON ? '.reviews/<host>.jsonl via wb-web' : 'board (demo mode)';
 }
 function rvReveal() {
   const c = RV.cur; if (!c || RV.revealed) return; RV.revealed = true;
@@ -5193,14 +5229,14 @@ function rvOpenSource() {
 }
 async function rvAsk() {
   const c = RV.cur; if (!c) return; const box = $('#rv-ai'); box.hidden = false;
-  const sample = await getSample(); if (!sample) { box.textContent = DAEMON ? SAMPLE_OFF : 'The assistant runs on Claude in the hosted artifact or through canvasd.'; return; }
+  const sample = await getSample(); if (!sample) { box.textContent = DAEMON ? SAMPLE_OFF : 'The assistant needs a language model: Claude inside the hosted artifact on claude.ai, or a Workbench server that serves one.'; return; }
   box.textContent = 'Thinking…';
   try { await sample(`You are helping someone review a flashcard. Give context, one example and, if useful, a mnemonic, in at most 80 words. Plain text.\nFront: ${rvFront(c)}\nBack: ${rvAnswer(c)}\nExtra: ${c.extra || ''}\nSource: ${c.file}`, { modelTier: 'quick', onText: ({ text }) => { box.textContent = text; } }); }
   catch (e) { box.textContent = `Assistant unavailable (${e?.code || 'error'}).`; }
 }
 async function rvGradeInk() {
   const c = RV.cur; if (!c) return; const box = $('#rv-ai'); box.hidden = false;
-  const sample = await canSeeImages(); if (!sample) { box.textContent = 'Cannot send images to Claude here.'; return; }
+  const sample = await canSeeImages(); if (!sample) { box.textContent = 'The model here cannot read images.'; return; }
   box.textContent = 'Looking at the ink…';
   try {
     const blob = await new Promise(res => $('#rv-ink').toBlob(res, 'image/png'));
@@ -5337,15 +5373,16 @@ async function boot() {
   S = board && board.v === 5 ? board : seed();
   if (DAEMON) { BOARD_CAM = S.cam; S.cam = camLoad() || { x: 0, y: 0, z: 1, ...S.cam }; }
   migrateV9();
-  if (DAEMON) hostsLoad();
+  // No /api/hosts at boot: wb-web answers it 404 by design (multi-host is a v1 non-goal; DESIGN §3.5.5), so the call
+  // only put an error in the console of every load.
   perspChip(); { const ah = $('#add-host'); if (ah) ah.disabled = !DAEMON; } acpButton();
   if (perspCur() === 'fs') setTimeout(() => { perspEdgesRebuild(); renderLinks(); }, 300);
   hashInit();
   if (separateAll()) { restack(); renderLinks(); }
   S.views = S.views || {}; S.strokes = S.strokes || []; S.fs = S.fs || seedFs(); S.shapes = S.shapes || [];
   $('#help-mode').innerHTML = DAEMON
-    ? 'Connected to canvasd: shells are real processes on this machine and survive page reloads. Board and buffers are saved under <code>~/.canvas-proto</code>.'
-    : 'Demo mode: shells are simulated in the browser and the board is saved in this browser only. Run <code>python3 daemon/canvasd.py --open</code> for real shells.';
+    ? 'Connected to wb-web: shells and agents run in wb-hub on this machine and outlive page reloads and web restarts. The board is saved in wb-web’s boards directory.'
+    : 'Demo mode: shells are simulated in the browser and the board is saved in this browser only. Serve the page from wb-web (see the README) for real shells.';
   setTheme(S.theme || 'auto'); S.vim = S.vim ?? true; setPaneW(S.paneW || PANE_W, false); setTreeW(S.treeW || TREE_W, false); wirePaneGrip();
   RG.bm = S.rgBookmarks || {};
   $('.k-pal').textContent = keyLabel('Mod-K');
@@ -5367,7 +5404,6 @@ async function boot() {
   wireReview(); detectMode(); { const ae = $('#add-emacs'); if (ae) ae.disabled = !DAEMON; }
   wsRestore(); focusRestoreTabs();
   BOOTED = true; SAVE.lastJson = serialize();
-  if (DAEMON && INFO && !INFO.sample) setTimeout(() => toast('Claude is off: start canvasd with ANTHROPIC_API_KEY set to use the assistant, agents, handwriting and artifacts.', 8000), 1500);
 }
 // ================================================================ v8: node kinds around terminals, Emacs, browser, artifacts, sketch
 // Emacs buffer: a real PTY running emacsclient -t on one file (starts a daemon if none), falling back to emacs -nw.
@@ -5376,7 +5412,7 @@ function emacsCmd(file) {
   return `f=${q}; if command -v emacsclient >/dev/null 2>&1; then emacsclient -t -a '' "$f"; else emacs -nw "$f"; fi`;
 }
 function newEmacs(file) {
-  if (!DAEMON) { toast('Emacs buffers need the local build (python3 daemon/canvasd.py).'); return null; }
+  if (!DAEMON) { toast('Emacs buffers need the self-hosted Workbench (wb-web).'); return null; }
   file = String(file || '').trim(); if (!file) return null;
   const base = file.replace(/\/+$/, '').split('/').pop() || 'scratch';
   const n = newAt('term', { backend: 'pty', cmd: emacsCmd(file), emacs: file, name: base, w: 640, h: 440, env: { TERM: 'xterm-256color', COLORTERM: 'truecolor' } });
@@ -5645,6 +5681,17 @@ function focusRestoreNode() {
   FOCUS.cur = null; FOCUS.rect = null;
 }
 function focusOpen(n) { if (!n || n.kind === 'frame') return wsEnter(n); if (!FOCUS.tabs.includes(n.id)) FOCUS.tabs.push(n.id); focusShow(n.id); }
+// Enter on the active card puts the keyboard in it where it stands: a shell's cursor, an agent's composer, a page's
+// text, a web card's address. A card that is off screen, in a closed deck or drawn as a far-zoom snapshot is brought
+// into view at reading size first. A card with no text input opens as a focus tab, as Shift-Enter does for any card.
+function cardInput(n) { const L = live[n.id]; return L && (L.term || L.ta || L.view || (n.kind === 'web' && $('.web-bar input', L.body))) || null; }
+function typeInto(n) {
+  const t = cardInput(n); if (!t) return focusOpen(n);
+  const go = () => { activate(n.id); t.focus(); };
+  if (FOCUS.cur === n.id) return go();
+  const a = w2s(n.x, n.y), b = w2s(n.x + n.w, n.y + n.h);
+  if (lastLod || stashed(n) || a.x < 0 || a.y < 0 || b.x > VW() || b.y > VH()) jumpNode(n, 1, go); else go();
+}
 function focusHide() {
   if (!FOCUS.cur) { focusStrip(); return; }
   focusRestoreNode();
@@ -5770,7 +5817,7 @@ function isLeader(e) { const k = leaderName(); return k === 'F1' ? e.key === 'F1
 function setLeader(k) { if (!LEADERS[k]) return; S.leader = k; dirty(); toast('Leader key: ' + LEADERS[k].label + ' (press it twice to send it to the terminal or editor).'); }
 const LEADER_MAP = [
   ['Tab', 'fold / unfold (package)', () => foldToggle()], ['S-Tab', 'fold the others / unfold all', () => foldCycle()],
-  ['1…9', 'workspace n', null], ['`', 'last workspace', () => wsToggleLast()], ['u', 'up (close focus, leave ws)', () => FOCUS.cur ? focusHide() : wsLeave()], ['Enter', 'enter folder, focus node', () => { const n = activeId && S.nodes[activeId]; n && (n.kind === 'frame' ? wsEnter(n) : focusOpen(n)); }],
+  ['1…9', 'workspace n', null], ['`', 'last workspace', () => wsToggleLast()], ['u', 'up (close focus, leave ws)', () => FOCUS.cur ? focusHide() : wsLeave()], ['Enter', 'enter folder, type into node', () => { const n = activeId && S.nodes[activeId]; n && (n.kind === 'frame' ? wsEnter(n) : typeInto(n)); }],
   ['f', 'focus tab', () => { const n = activeId && S.nodes[activeId]; if (n) focusOpen(n); }], ['q', 'close tab', () => FOCUS.cur && focusClose(FOCUS.cur)], ['n', 'next tab', () => focusCycle(1)], ['p', 'previous tab', () => focusCycle(-1)],
   ['h j k l', 'focus neighbour', null], ['H J K L', 'swap neighbour', null], ['e', 'folder: free', () => folderMode('free')], ['b', 'folder: pack', () => folderMode('pack')],
   ['t', 'folder: tile', () => folderMode('tile')], ['s', 'folder: stack', () => folderMode('stack')], ['E B T S', 'same, nested folders too', null], ['v', 'perspective: m p f t x c u j l', () => perspMenu()], ['a', 'go to address', () => askName('Address (board:/path · fs:@host/dir · note:Title#Heading · tag:x · journal:2026/10/10 · link:Page)', currentAddr(), v => goAddr(v))], ['o', 'optimise board', () => optimise(null)],
@@ -5805,7 +5852,8 @@ cmd('Workspace: enter the active folder', () => { const n = activeId && S.nodes[
 cmd('Workspace: step out', () => wsLeave(), 'Esc', () => !!WS.cur);
 cmd('Workspace: switch…', () => { const list = wsTop(); askName('Workspace number: ' + list.map((f, i) => (i + 1) + ' ' + f.name).join('  ·  '), '', v => wsGo(+String(v).trim())); }, 'Ctrl-Space 1…9');
 cmd('Workspace: last', () => wsToggleLast(), 'Ctrl-Space `');
-cmd('Focus: open the active node as a tab', () => { const n = activeId && S.nodes[activeId]; if (n) focusOpen(n); else toast('Pick a node first.'); }, 'Enter');
+cmd('Focus: open the active node as a tab', () => { const n = activeId && S.nodes[activeId]; if (n) focusOpen(n); else toast('Pick a node first.'); }, 'Shift-Enter');
+cmd('Type into the active node', () => { const n = activeId && S.nodes[activeId]; if (n && n.kind !== 'frame') typeInto(n); else toast('Pick a node first.'); }, 'Enter');
 cmd('Focus: back to the canvas', () => focusHide(), 'Esc', () => !!FOCUS.cur);
 cmd('Focus: close this tab', () => focusClose(FOCUS.cur), 'Ctrl-Space q', () => !!FOCUS.cur);
 cmd('Focus: next tab', () => focusCycle(1), 'Ctrl-Space n', () => FOCUS.tabs.length > 1);
@@ -6043,7 +6091,7 @@ cmd('Perspective: manual (folders as you made them)', () => perspSet('manual'), 
 cmd('Perspective: process (a shell and what it spawned)', () => perspSet('process'), 'Ctrl-Space v p', () => perspCur() !== 'process');
 cmd('Perspective: filesystem (directories on each host)', () => perspSet('fs'), 'Ctrl-Space v f', () => perspCur() !== 'fs');
 cmd('Perspective: tags (one folder per tag, copies under the others)', () => perspSet('tag'), 'Ctrl-Space v t', () => perspCur() !== 'tag');
-cmd('Perspective: tmux (one folder per session on each host\'s socket)', () => perspSet('tmux'), 'Ctrl-Space v x', () => perspCur() !== 'tmux' && DAEMON);
+cmd('Perspective: tmux (one folder per session on each host\'s socket)', () => perspSet('tmux'), 'Ctrl-Space v x', () => perspCur() !== 'tmux' && DAEMON && !!INFO?.tmux);   // tmux:false: /api/tmux is 404 in wb-web
 cmd('Perspective: processes (each shell with the OS processes under it)', () => perspSet('proc'), 'Ctrl-Space v c', () => perspCur() !== 'proc');
 cmd('Perspective: units (systemd services on each host)', () => perspSet('unit'), 'Ctrl-Space v u', () => perspCur() !== 'unit');
 cmd('Perspective: journal (year › month › day)', () => perspSet('journal'), 'Ctrl-Space v j', () => perspCur() !== 'journal');
@@ -6825,6 +6873,6 @@ AGENT_TOOLS.push(
   { name: 'host_status', description: 'Health of a host: load, memory, disk, uptime, shells, tmux sessions, unit counts (failed names). host: a name from hosts.json (empty = the serving daemon).', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
     run: async ({ host } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j = await (await hFetch(h, '/api/status')).json(); const gb = b => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}` + (j.sessions?.tmux != null ? ', tmux sessions ' + j.sessions.tmux : ''), j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
-window.__canvas = { setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
+window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 boot();
 })();

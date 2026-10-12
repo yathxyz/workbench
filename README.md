@@ -38,6 +38,16 @@ prints their addresses as one JSON line:
 python3 -I tests/harness.py --bin-dir target/debug --web-root "$(nix build --no-link --print-out-paths .#workbench-web)"
 ```
 
+`tests/perf.mjs` walks the app end to end in headless Chromium against the same harness (load, pan and zoom,
+drag, type into a shell and a page, flood a shell, the palette, the views, a board of 140 cards) and prints, per
+scenario, the JavaScript and browser time, the slowest input events with their handler time, long animation frames
+with the scripts in them, and the functions with the most self time. It also checks the behaviour it walks through;
+timings never fail it. `--profiles DIR` keeps each scenario's CPU profile for DevTools:
+
+```sh
+WB_PLAYWRIGHT=<playwright>/index.mjs WB_HARNESS=tests/harness.py node tests/perf.mjs "$(nix build --no-link --print-out-paths .#workbench-web)"
+```
+
 The test Caddy adds the proxy secret to every request it forwards, so it listens only on a unix
 socket in the harness's private temporary directory (`caddySocket` in the JSON line), never on
 TCP. Add `--dogfood` to use your real home directory for shells, forward the socket from the
