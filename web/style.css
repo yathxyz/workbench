@@ -161,7 +161,7 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 /* ------------------------------------------------------------ edges and ink */
 .edge { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; }
 .e-spawn { stroke: var(--accent); }
-.e-pipe { stroke: var(--pipe); stroke-dasharray: 7 5; animation: flow 1.2s linear infinite; }
+.e-pipe { stroke: var(--pipe); stroke-dasharray: 7 5; }
 .e-ref { stroke: var(--ref); stroke-dasharray: 2 4; }
 .e-temp { stroke: var(--pipe); stroke-dasharray: 4 4; }
 @keyframes flow { to { stroke-dashoffset: -24; } }
@@ -257,7 +257,9 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 .redge { pointer-events: none; }
 .redge path { vector-effect: non-scaling-stroke; }
 .redge.e-spawn { color: var(--accent); } .redge.e-pipe { color: var(--pipe); } .redge.e-ref { color: var(--ref); }
-.redge.e-pipe path:first-child { animation: flow 1.2s linear infinite; }
+/* A pipe's dashes flow only while text goes along it: an endless dash animation restyles and repaints the edge layer
+   every frame, so an idle board kept the main thread busy. */
+.redge.e-pipe.flowing path:first-child { animation: flow 1.2s linear infinite; }
 .text-edit { position: fixed; z-index: 150; font-family: var(--hand); background: var(--panel); color: var(--fg); border: 1.5px dashed var(--accent); border-radius: var(--radius); padding: 4px 6px; resize: none; outline: none; }
 .cm-wikilink { color: var(--link); cursor: pointer; text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--link) 40%, transparent); text-underline-offset: 3px; }
 .cm-wikilink .cm-brk, .cm-brk { opacity: .45; }

@@ -1657,6 +1657,35 @@ await section('dock size', async () => {
   } finally { await P.close(); }
 });
 
+// N49: a server without a model says nothing about one at load, and no boot request is refused.
+await section('N49', async () => {
+  const since = Date.now(), P = await ctx.newPage(); watchErrors(P); record(P);
+  await P.addInitScript(() => { window.__toasts = []; new MutationObserver(() => { const t = document.querySelector('#toast'); if (t?.classList.contains('show') && window.__toasts.at(-1) !== t.textContent) window.__toasts.push(t.textContent); }).observe(document, { subtree: true, attributes: true, attributeFilter: ['class'], childList: true, characterData: true }); });
+  try {
+    await P.goto(ORIGIN + '/'); await until(() => P.evaluate(() => window.__canvas?.BOOTED)); await sleep(2500);
+    const toasts = await P.evaluate(() => window.__toasts), sample = await P.evaluate(() => window.__canvas.INFO.sample);
+    const refused = []; for (const e of REQ.filter(e => e.t >= since && e.url.startsWith(ORIGIN + '/api/'))) if (await status(e) >= 400) refused.push(e.url);
+    check('N49: with /api/info.sample false the load shows no toast about a model or an API key, and no /api request of the load is refused', sample === false && !toasts.some(t => /claude|anthropic|api.?key|model/i.test(t)) && !refused.length, JSON.stringify({ sample, toasts, refused }));
+  } finally { await P.close(); }
+});
+
+// N50: Enter on the active shell card puts the keyboard in that shell where the card stands; Shift-Enter opens it full screen.
+await section('N50', async () => {
+  const P = await dpage(); await P.bringToFront();
+  try {
+    const id = await newTerm(P, 'n50');
+    await P.evaluate(id => { const C = window.__canvas; C.jumpNode(C.S.nodes[id]); }, id); await sleep(600);
+    await P.evaluate(() => document.activeElement?.blur()); await P.keyboard.press('Enter'); await sleep(400);
+    const inTerm = await P.evaluate(id => ({ term: !!document.activeElement?.closest(`.node[data-id="${id}"]`) && document.activeElement.classList.contains('xterm-helper-textarea'), focus: window.__canvas.FOCUS.cur }), id);
+    await P.keyboard.type('echo n50-$((6*7))\r');
+    const typed = await until(async () => (await termText(P, id)).includes('n50-42'), 5000);
+    await P.evaluate(() => document.activeElement?.blur()); await P.keyboard.press('Shift+Enter'); await sleep(400);
+    const tab = await P.evaluate(() => window.__canvas.FOCUS.cur);
+    await P.evaluate(() => window.__canvas.focusHide());
+    check('N50: Enter on the active shell card puts the keyboard in its terminal on the canvas; Shift-Enter opens it as a focus tab', inTerm.term && !inTerm.focus && !!typed && tab === id, JSON.stringify({ inTerm, typed: !!typed, tab, id }));
+  } finally { await P.close(); }
+});
+
 // N11: over the whole daemon phase's request log
 await section('N11', async () => {
   st = { token: REQ.filter(e => /[?&#]token=/.test(e.url)).map(e => e.url), xtoken: REQ.filter(e => 'x-token' in e.h).map(e => e.url), ws: [...new Set(WSL.map(w => w.url))] };
