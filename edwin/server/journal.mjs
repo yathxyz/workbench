@@ -39,6 +39,7 @@ export class Journal {
      which case nothing of the line counts as written: the caller drops the batch. */
   append(obj) {
     this.open();
+    if (this.failed) return Promise.reject(this.failed);
     const line = JSON.stringify(obj) + '\n';
     return new Promise((resolve, reject) => {
       this.pending.push({ line, resolve, reject });
@@ -51,16 +52,26 @@ export class Journal {
     const batch = this.pending; this.pending = [];
     if (!batch.length) return Promise.resolve();
     const run = async () => {
-      let failed = null;
+      let failed = null, start = null;
       try {
         const data = Buffer.from(batch.map(b => b.line).join(''), 'utf8');
-        /* Test hook (R16.7): EDWIND_FAULT=enospc-journal makes every append fail as a full disk does. */
-        if (process.env.EDWIND_FAULT === 'enospc-journal') throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+        start = fs.fstatSync(this.fd).size;
+        /* Test hooks (R16.7): EDWIND_FAULT=enospc-journal fails every append as a full disk does;
+           enospc-journal-partial writes the lines and then fails, as a failing fdatasync does. */
+        const fault = process.env.EDWIND_FAULT;
+        if (fault === 'enospc-journal') throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
         let off = 0;
         while (off < data.length) off += fs.writeSync(this.fd, data, off, data.length - off);
+        if (fault === 'enospc-journal-partial') throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
         fs.fdatasyncSync(this.fd);
         this.lines += batch.length; this.bytes += data.length;
-      } catch (e) { failed = e; }
+      } catch (e) {
+        failed = e;
+        /* Whatever of the group reached the file is taken back, so a restart never replays a batch that was
+           refused; from here on every append fails until a save makes a new journal. */
+        if (start !== null) { try { fs.ftruncateSync(this.fd, start); fs.fdatasyncSync(this.fd); } catch (e2) { /* the disk is in trouble */ } }
+        this.failed = e;
+      }
       for (const b of batch) failed ? b.reject(failed) : b.resolve();
     };
     this.syncing = run();

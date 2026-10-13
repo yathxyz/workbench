@@ -124,7 +124,7 @@ export class EditClient {
     const seq = (this.seqs.get(buf) || 0) + 1; this.seqs.set(buf, seq);
     const msg = { t: 'edit', buf, base, seq, ops }; if (undo) msg.undo = undo;
     this.send(msg);
-    return this.next(m => (m.t === 'ack' || m.t === 'error') && m.seq === seq && (m.buf === buf || m.buf === undefined));
+    return this.next(m => (m.t === 'ack' || m.t === 'error') && m.seq === seq); // the ack carries the canonical id
   }
   call(cmd, args = [], ctx = {}, buf) { const m = { t: 'call', cmd, args, ctx }; if (buf) m.buf = buf; return this.request(m); }
   form(form) { return this.request({ t: 'call', form, ctx: {} }); }

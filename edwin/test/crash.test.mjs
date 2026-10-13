@@ -181,13 +181,15 @@ test('R16.7 a full disk during journal append: the edit is refused and rolled ba
   const b = new EditClient(dir.cfg.socket), c = new EditClient(dir.cfg.socket);
   await b.connect(); await b.hello(); await c.connect(); await c.hello();
   const o = await b.open('j.md'); assert.equal(o.text, 'ok text\n'); assert.equal(o.ver, 1); await c.open('j.md');
-  const e = await b.edit('j.md', 1, [[0, '', 'lost ']]);
-  assert.equal(e.t, 'error'); assert.equal(e.code, 'read_only'); assert.match(e.msg, /ENOSPC/); assert.equal(e.seq, 1);
+  // Two edits in one group commit: both are refused and both are rolled back, newest first.
+  const [e, e2] = await Promise.all([b.edit('j.md', 1, [[0, '', 'lost ']]), c.edit('j.md', 1, [[3, '', 'gone ']])]);
+  for (const x of [e, e2]) { assert.equal(x.t, 'error'); assert.equal(x.code, 'read_only'); assert.match(x.msg, /ENOSPC/); assert.equal(x.seq, 1); }
   const meta = await c.next(m => m.t === 'meta' && m.buf === 'j.md');
   assert.match(meta.readOnly, /journal write failed: ENOSPC/);
-  assert.equal((await c.open('j.md')).text, 'ok text\n', 'the refused batch is not applied');
+  assert.equal((await c.open('j.md')).text, 'ok text\n', 'the refused batches are not applied');
   assert.equal((await c.open('j.md')).ver, 1, 'the version did not move');
-  assert.equal(c.queue.filter(m => m.t === 'edits').length, 0, 'no edits went out for it');
+  assert.equal(c.queue.filter(m => m.t === 'edits').length, 0, 'no edits went out for them');
+  assert.equal(b.queue.filter(m => m.t === 'edits').length, 0);
   // The resend of the refused batch is refused the same way (nothing was recorded for its seq).
   b.send({ t: 'edit', buf: 'j.md', base: 1, seq: 1, ops: [[0, '', 'lost ']] });
   assert.equal((await b.next(m => m.t === 'error' || m.t === 'ack')).code, 'read_only');
@@ -205,5 +207,33 @@ test('R16.7 a full disk during journal append: the edit is refused and rolled ba
   const o2 = await d.open('j.md'); assert.equal(o2.text, 'ok text\n'); assert.equal(o2.meta.readOnly, false);
   assert.equal((await d.edit('j.md', o2.ver, [[0, '', 'again ']])).t, 'ack');
   d.close(); await stopEdwind(child);
+  fs.rmSync(dir.root, { recursive: true, force: true });
+});
+
+test('R16.7 a journal write that fails after its bytes landed is truncated, so a restart never replays a refused edit', async () => {
+  const dir = makeDir();
+  fs.writeFileSync(path.join(dir.dirs.notes, 'p.md'), 'text\n');
+  let child = await startEdwind(dir);
+  const a = new EditClient(dir.cfg.socket); await a.connect(); await a.hello();
+  await a.open('p.md');
+  assert.equal((await a.edit('p.md', 0, [[0, '', 'kept ']])).t, 'ack');
+  a.close(); await stopEdwind(child);
+  const jdir = path.join(dir.dirs.state, 'buffers');
+  const jfile = path.join(jdir, fs.readdirSync(jdir).find(f => f.endsWith('.jsonl')));
+  const before = fs.statSync(jfile).size;
+  child = await startEdwind(dir, { env: { EDWIND_FAULT: 'enospc-journal-partial' } });
+  const b = new EditClient(dir.cfg.socket); await b.connect(); await b.hello();
+  assert.equal((await b.open('p.md')).text, 'kept text\n');
+  const e = await b.edit('p.md', 1, [[0, '', 'refused ']]);
+  assert.equal(e.code, 'read_only');
+  b.close(); await stopEdwind(child);
+  assert.equal(fs.statSync(jfile).size, before, 'the journal is back to its length before the failed group');
+  const { ok, lines } = checkOk(dir.file);
+  assert.equal(ok, true, lines.join('\n')); assert.match(lines[0], /ok, 1 batches, version 1$/);
+  child = await startEdwind(dir);
+  const c = new EditClient(dir.cfg.socket); await c.connect(); await c.hello();
+  const o = await c.open('p.md');
+  assert.equal(o.text, 'kept text\n'); assert.equal(o.ver, 1); assert.equal(o.meta.readOnly, false);
+  c.close(); await stopEdwind(child);
   fs.rmSync(dir.root, { recursive: true, force: true });
 });

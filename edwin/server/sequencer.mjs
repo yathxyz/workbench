@@ -115,6 +115,14 @@ export class Sequencer {
     sb.touched();
   }
 
+  /* Roll back ENTRY and every newer batch of SB, newest first. The batches of one failed group commit reject
+     in order, so the first continuation undoes the whole group and the later ones find theirs gone (false).
+     Any batch newer than a failed one is unjournaled too: the journal refuses appends after a failure. */
+  rollbackThrough(sb, entry) {
+    if (!sb.hist.includes(entry)) return false;
+    for (;;) { const last = sb.hist[sb.hist.length - 1]; this.rollback(sb, last); if (last === entry) return true; }
+  }
+
   /* Journal ENTRY, wait for the sync, then ack SENDER (if any) and send edits to the others. */
   async commit(sb, entry, sender) {
     const h = this.hashIf(sb);
@@ -127,7 +135,7 @@ export class Sequencer {
            restart would lose and a resend is applied afresh; the buffer goes read-only with the reason until
            a save or restart (R16.7). */
         this.log.error('journal', { buf: sb.id, error: e.code || e.message });
-        this.rollback(sb, entry);
+        this.rollbackThrough(sb, entry);
         sb.setReadOnly(`journal write failed: ${e.code || e.message}`);
         throw new ProtoError('read_only', `journal write failed: ${e.code || e.message}`, { buf: sb.id, seq: entry.seq });
       }

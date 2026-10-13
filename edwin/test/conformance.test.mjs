@@ -20,6 +20,8 @@ after(async () => { await stopEdwind(child); fs.rmSync(dir.root, { recursive: tr
 
 const client = async (opts) => { const c = new EditClient(dir.cfg.socket, opts); await c.connect(); const w = await c.hello(); assert.equal(w.t, 'welcome'); c.welcome = w; return c; };
 const note = (name, text) => { fs.writeFileSync(path.join(dir.dirs.notes, name), text); return name; };
+/* Wait until edwind has dispatched everything C sent so far (one connection's messages are handled in order). */
+const sync = async c => { const rid = c.newRid(); c.send({ t: 'ping', rid }); await c.next(m => m.t === 'pong' && m.rid === rid); };
 
 test('R7.2 MAX_LINE equals wb_proto::limits::MAX_LINE', () => {
   const rs = fs.readFileSync(path.join(EDWIN, '../crates/wb-proto/src/limits.rs'), 'utf8');
@@ -183,7 +185,33 @@ test('R6.1 ids: notesDir-relative, ~/, absolute; a symlink and its target name o
   const o3 = await a.open('~/h.md');
   assert.equal(o3.error, null);
   assert.ok((await a.call('buffer-list')).value.some(b => b.id === '~/h.md'));
+  // Every message about the buffer carries the canonical id, whatever spelling the client used; edit, save
+  // and revert accept any spelling.
+  const ack = await a.edit(abs, o1.ver, [[0, '', 'I ']]);
+  assert.equal(ack.t, 'ack'); assert.equal(ack.buf, 'ids.md');
+  const saved = await a.request({ t: 'save', buf: path.join(dir.dirs.home, 'link.md') });
+  assert.deepEqual(saved.value, { buf: 'ids.md', ver: ack.ver, saved: true });
+  assert.equal(fs.readFileSync(abs, 'utf8'), 'I i\n');
   a.close();
+});
+
+test('R14.14 a client that stops reading is disconnected with slow_client; the others go on', async () => {
+  const id = note('slow.md', '');
+  const slow = await client(), fast = await client(), other = await client();
+  await slow.open(id); await fast.open(id); await other.open(id);
+  slow.sock.pause(); // the client stops reading: the kernel buffer fills, then edwind's queue for it
+  const closed = new Promise((resolve, reject) => { slow.sock.once('close', resolve); setTimeout(() => reject(new Error('the slow client was not disconnected')), 20000).unref(); });
+  const chunk = 'x'.repeat(256 * 1024);
+  let ver = 0;
+  const n = 24; // 6 MiB of edits, past the 4 MiB cap
+  for (let i = 0; i < n; i++) { const ack = await fast.edit(id, ver, [[0, '', chunk]]); assert.equal(ack.t, 'ack'); ver = ack.ver; }
+  for (let i = 0; i < 100 && !/slow_client/.test(child.logs); i++) await new Promise(r => setTimeout(r, 50));
+  assert.match(child.logs, /slow_client/, 'edwind dropped the slow client');
+  slow.sock.resume(); // a paused socket cannot see the close; reading again, it does
+  await closed;
+  for (let i = 0; i < n; i++) assert.equal((await other.next(m => m.t === 'edits' && m.buf === id, 30000)).ops[0][2].length, chunk.length);
+  assert.equal((await fast.open(id)).text.length, n * chunk.length);
+  fast.close(); other.close();
 });
 
 test('R7.2 a line over MAX_LINE is too_large and the connection stays', async () => {
@@ -321,6 +349,7 @@ test('§13.1 server-edit: --wait resolves on done (saved, 0) or abort (1); plain
   assert.deepEqual(quick.value, { buf: id, exit: null });
   const rid = a.newRid();
   a.send({ t: 'call', rid, cmd: 'server-edit', args: [id, null], ctx: { wait: true } });
+  await sync(a); // b's socket is independent of a's: the waiter must exist before b finishes the edit
   await b.open(id);
   await b.edit(id, 0, [[0, '', 'ok ']]);
   await b.call('server-edit-done', [id]);
@@ -329,6 +358,7 @@ test('§13.1 server-edit: --wait resolves on done (saved, 0) or abort (1); plain
   assert.equal(fs.readFileSync(path.join(dir.dirs.notes, 'se.md'), 'utf8'), 'ok edit me\n');
   const rid2 = a.newRid();
   a.send({ t: 'call', rid: rid2, cmd: 'server-edit', args: [id], ctx: { wait: true } });
+  await sync(a);
   await b.call('server-edit-abort', [id]);
   assert.deepEqual((await a.next(m => m.rid === rid2)).value, { buf: id, exit: 1 });
   a.close(); b.close();
