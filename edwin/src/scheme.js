@@ -1124,8 +1124,16 @@ function compSpecial(name, x, scope, tail) {
         try { return run(env); }
         catch (e) {
           if (e instanceof Unwind && e.tag === tag) { obj = e.a; c = e.b; }
-          else if (e instanceof Escape || e instanceof Unwind || e instanceof RangeError || ((e instanceof SchemeError || e instanceof Raise) && e.signalled)) throw e;
-          else if (e instanceof SchemeError) {
+          else if (e instanceof Escape || e instanceof Unwind || ((e instanceof SchemeError || e instanceof Raise) && e.signalled)) throw e;
+          else if (e instanceof RangeError) {
+            /* The JavaScript stack ran out before the shadow stack's cap (R4.34): the stack is unwound
+               already, so the clauses see a recursion-depth condition here, after unwinding. */
+            handlers = saved;
+            obj = new SchemeError('recursion-depth', `Recursion too deep: the JavaScript stack ran out at depth ${Math.max(0, sp - 1)}`, []);
+            sp = s;
+            c = choose(obj);
+            if (!c) throw e;
+          } else if (e instanceof SchemeError) {
             try { signal(e, false); } catch (e2) { if (e2 instanceof Unwind && e2.tag === tag) { obj = e2.a; c = e2.b; } else throw e2; }
           } else {
             /* Another JS exception: unwound already; the clauses see it as it is. */
