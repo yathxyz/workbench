@@ -71,7 +71,7 @@ buffer, sequences edits from any number of clients over `edit.sock`, journals th
 the files on disk. `crates/wb-cli` is `wb buf`, `wb eval`, `wb edit` and `wb repl` over the same socket.
 `nix/package.nix` installs `share/edwin/{src,scm,server}` and `bin/edwind`; `nix/module.nix` has
 `services.workbench.edit.*` and `workbench-edit.service`; `nix/checks.nix` has `edwin-ot`, `edit-conformance`,
-`edit-crash` (about eight minutes: 1,000 kills) and `edit-disk`; `nix/vm.nix` step 10 covers R16.18's E1 part.
+`edit-crash` (about thirteen minutes: 1,000 kills) and `edit-disk`; `nix/vm.nix` step 10 covers R16.18's E1 part.
 
 Layout of `edwin/server/`: `main.mjs` (config, start, listen, `--check`, `--export`, evaluation, the E1 server
 commands), `session.mjs` (one client: §7 messages), `sequencer.mjs` (rebase, apply, journal, ack, replay, undo),
