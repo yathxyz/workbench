@@ -10,5 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 wb-proto.workspace = true
-serde.workspace = true
+anyhow.workspace = true
+rustix = { workspace = true, features = ["fs", "process", "rand", "termios"] }
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

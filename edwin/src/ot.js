@@ -26,6 +26,13 @@ function splitsPair(text, pos) { return pos > 0 && pos < text.length && isLow(te
 
 /* Check one op against TEXT and give back the text after it. Throws OTError bad_edit. */
 function applyOp(text, op) {
+  checkOp(text, op);
+  const [pos, del, ins] = op;
+  if (!del && !ins) return String(text);
+  return text.slice(0, pos) + ins + text.slice(pos + del.length);
+}
+/* Check one op against TEXT (a string or a rope) without building the result (R7.7, R7.8). */
+function checkOp(text, op) {
   if (!Array.isArray(op) || op.length !== 3 || typeof op[0] !== 'number' || typeof op[1] !== 'string' || typeof op[2] !== 'string') throw new OTError('bad_edit', 'an op is [pos, del, ins]');
   const [pos, del, ins] = op;
   if (!Number.isInteger(pos) || pos < 0 || pos > text.length) throw new OTError('bad_edit', `position ${pos} is outside the text (length ${text.length})`);
@@ -33,8 +40,6 @@ function applyOp(text, op) {
   if (del && text.slice(pos, pos + del.length) !== del) throw new OTError('bad_edit', `the text at ${pos} is not the one the op deletes`);
   if (splitsPair(text, pos) || splitsPair(text, pos + del.length)) throw new OTError('bad_edit', `position ${pos} splits a surrogate pair`);
   if (ins && (isLow(ins.charCodeAt(0)) && pos > 0 && isHigh(text.charCodeAt(pos - 1)) || isHigh(ins.charCodeAt(ins.length - 1)) && pos + del.length < text.length && isLow(text.charCodeAt(pos + del.length)))) throw new OTError('bad_edit', `the insertion at ${pos} splits a surrogate pair`);
-  if (!del && !ins) return String(text);
-  return text.slice(0, pos) + ins + text.slice(pos + del.length);
 }
 /* Apply OPS in order to TEXT (a string), checking each (R7.7). */
 function apply(text, ops) {
@@ -266,7 +271,7 @@ function walk(items, T, skip) {
     /* An undo of a group whose batches all lie in out cancels with them: the real text after it is the
        reduced text without that group. Only the first pass (no skip, so pending is null) meets these. */
     if (!pending && b.undo && b.undo.of !== undefined) {
-      const g = { cid: b.cid, g: b.undo.of };
+      const g = { cid: b.undo.ofCid || b.cid, g: b.undo.of };
       const j = out.findIndex(x => inGroup(x, g));
       if (j >= 0) {
         const r = reduceSeq(out.slice(j), texts[j], g);
@@ -298,7 +303,7 @@ function undoOps(group, history, text) {
   return { op: r.pending, partial: r.partial };
 }
 
-const OT = { OTError, apply, applyOp, check, invert, delta, fromOps, toOps, applyOperation, compose, transform, transformOps, rebase, shiftMarker, killsMarker, hash, splitsPair, undoOps, textBefore, Op, retain, insert, del };
+const OT = { OTError, apply, applyOp, checkOp, check, invert, delta, fromOps, toOps, applyOperation, compose, transform, transformOps, rebase, shiftMarker, killsMarker, hash, splitsPair, undoOps, textBefore, Op, retain, insert, del };
 if (typeof module !== 'undefined' && module.exports) module.exports = OT;
 root.EdOT = OT;
 })(typeof globalThis !== 'undefined' ? globalThis : self);
