@@ -2399,8 +2399,10 @@ dependencies = [
 name = "wb-cli"
 version = "0.1.0"
 dependencies = [
- "serde",
+ "anyhow",
+ "rustix",
  "serde_json",
+ "tempfile",
  "wb-proto",
 ]
 

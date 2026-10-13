@@ -1,0 +1,130 @@
+// The sequencer (spec §7.6–§7.7): one authoritative order of batches per buffer. An incoming edit is
+// transformed against every batch sequenced after its base, checked, applied to the Edwin buffer through
+// editText (so markers and change hooks run, R6.8), journaled and fsynced, then acknowledged to its
+// sender and sent as `edits` to everyone else. Server-made batches (disk reverts, merges, undo) take
+// the same path from applyBatch.
+import { createRequire } from 'node:module';
+import { ProtoError } from './proto.mjs';
+
+const require = createRequire(import.meta.url);
+const OT = require('../src/ot.js');
+
+/* History retention (R7.17). */
+export const HIST_MIN_BATCHES = 10000;
+export const HIST_MIN_MS = 24 * 3600 * 1000;
+export const HIST_MAX_BYTES = 32 * 1024 * 1024;
+/* Every HASH_EVERY versions ack and edits carry the text hash (R7.14). */
+export const HASH_EVERY = 50;
+
+const originOf = by => (by.kind === 'disk' ? 'disk' : by.kind === 'server' ? 'server' : by.kind === 'agent' ? 'agent' : 'remote');
+
+export class Sequencer {
+  constructor(Ed, log) { this.Ed = Ed; this.log = log; }
+
+  /* The length of the text at version VER of SB, from its history. */
+  lenAt(sb, ver) {
+    const b = sb.hist.find(x => x.ver === ver + 1);
+    return b ? b.len : sb.ed.rope.length;
+  }
+  /* Is BASE still inside the retained history? */
+  inHistory(sb, base) { return base === sb.ver || (sb.hist.length > 0 && base >= sb.hist[0].ver - 1); }
+
+  /* Rebase OPS made against version BASE to the current text and check them: the ops as they apply now.
+     Throws ProtoError stale_base or bad_edit. */
+  rebase(sb, ops, base) {
+    if (base > sb.ver) throw new ProtoError('bad_request', `base ${base} is ahead of the buffer (version ${sb.ver})`);
+    if (!this.inHistory(sb, base)) throw new ProtoError('stale_base', `base ${base} is older than the retained history`);
+    const later = sb.hist.filter(b => b.ver > base);
+    let applied;
+    try {
+      const op = later.length ? OT.rebase(ops, this.lenAt(sb, base), later) : OT.fromOps(ops, sb.ed.rope.length);
+      applied = OT.toOps(op, sb.ed.rope);
+    } catch (e) { throw new ProtoError('bad_edit', e.message); }
+    return applied;
+  }
+
+  /* Check and apply OPS (already against the current text) to SB as one sequenced batch by BY.
+     Returns the history entry. Throws ProtoError bad_edit with nothing applied (every op is checked
+     against a string copy before the rope changes). */
+  applyBatch(sb, ops, by, { cid = null, seq = null, undo = null } = {}) {
+    const Ed = this.Ed;
+    const text = sb.ed.rope.toString();
+    try { OT.apply(text, ops); } catch (e) { throw new ProtoError('bad_edit', e.message); }
+    const len = sb.ed.rope.length;
+    Ed.withOrigin(originOf(by), () => {
+      const save = Ed.E.inhibitRO; Ed.E.inhibitRO = true;
+      try { for (const [pos, del, ins] of ops) Ed.editText(sb.ed, pos, del.length, ins); }
+      finally { Ed.E.inhibitRO = save; }
+    });
+    sb.ver++;
+    const entry = { ver: sb.ver, cid, seq, by, ops, undo: undo || undefined, at: Date.now(), len, bytes: JSON.stringify(ops).length };
+    sb.hist.push(entry); sb.histBytes += entry.bytes;
+    if (cid !== null && seq !== null) { let m = sb.seqIndex.get(cid); if (!m) { m = new Map(); sb.seqIndex.set(cid, m); } m.set(seq, sb.ver); }
+    this.trim(sb);
+    sb.touched();
+    return entry;
+  }
+
+  /* Drop history past the retention rule (R7.17). */
+  trim(sb) {
+    const now = Date.now();
+    while (sb.hist.length && (sb.histBytes > HIST_MAX_BYTES || (sb.hist.length > HIST_MIN_BATCHES && now - sb.hist[0].at > HIST_MIN_MS))) {
+      const b = sb.hist.shift(); sb.histBytes -= b.bytes;
+      if (b.cid !== null) { const m = sb.seqIndex.get(b.cid); if (m) { m.delete(b.seq); if (!m.size) sb.seqIndex.delete(b.cid); } }
+    }
+  }
+
+  hashIf(sb) { return sb.ver % HASH_EVERY === 0 ? OT.hash(sb.ed.rope) : undefined; }
+
+  /* One `edit` from CLIENT (R7.11, R7.15). Resolves after the ack is queued. */
+  async edit(client, sb, msg) {
+    const { base, seq, ops, undo } = msg;
+    const known = sb.seqIndex.get(client.cid);
+    if (known && known.has(seq)) { client.send({ t: 'ack', buf: sb.id, seq, ver: known.get(seq) }); return; } // a resend
+    if (sb.readOnly) throw new ProtoError('read_only', typeof sb.readOnly === 'string' ? sb.readOnly : 'the buffer is read-only', { buf: sb.id, seq });
+    const applied = this.rebase(sb, ops, base);
+    const entry = this.applyBatch(sb, applied, client.by(), { cid: client.cid, seq, undo });
+    await this.commit(sb, entry, client);
+  }
+
+  /* Journal ENTRY, wait for the sync, then ack SENDER (if any) and send edits to the others. */
+  async commit(sb, entry, sender) {
+    const h = this.hashIf(sb);
+    if (sb.journal) {
+      try { await sb.journal.append({ t: 'b', ver: entry.ver, cid: entry.cid, seq: entry.seq, by: entry.by, ops: entry.ops, undo: entry.undo, at: entry.at }); }
+      catch (e) {
+        /* The line did not reach the disk (ENOSPC): the batch stays applied in memory but is not acknowledged;
+           the buffer goes read-only with the reason until a save or restart (R16.7). */
+        this.log.error('journal', { buf: sb.id, error: e.code || e.message });
+        sb.setReadOnly(`journal write failed: ${e.code || e.message}`);
+        throw new ProtoError('read_only', `journal write failed: ${e.code || e.message}`, { buf: sb.id, seq: entry.seq });
+      }
+      if (sb.journal.needsCompaction()) sb.owner.compactSoon(sb);
+    }
+    if (sender) sender.send(h === undefined ? { t: 'ack', buf: sb.id, seq: entry.seq, ver: entry.ver } : { t: 'ack', buf: sb.id, seq: entry.seq, ver: entry.ver, h });
+    const edits = { t: 'edits', buf: sb.id, ver: entry.ver, ops: entry.ops, by: entry.by };
+    if (h !== undefined) edits.h = h;
+    for (const c of sb.clients) if (c !== sender) c.sendBulkish(edits);
+    sb.owner.afterBatch(sb, entry);
+  }
+
+  /* Replay for open{since}: own batches as ack, others as edits (R7.16). */
+  replay(client, sb, since) {
+    for (const b of sb.hist) {
+      if (b.ver <= since) continue;
+      const h = b.ver % HASH_EVERY === 0 && b.ver === sb.ver ? OT.hash(sb.ed.rope) : undefined;
+      if (b.cid === client.cid) client.send(h === undefined ? { t: 'ack', buf: sb.id, seq: b.seq, ver: b.ver } : { t: 'ack', buf: sb.id, seq: b.seq, ver: b.ver, h });
+      else client.sendBulkish(h === undefined ? { t: 'edits', buf: sb.id, ver: b.ver, ops: b.ops, by: b.by } : { t: 'edits', buf: sb.id, ver: b.ver, ops: b.ops, by: b.by, h });
+    }
+  }
+
+  /* The ops that undo GROUP ({cid, g}) of SB through its retained history (R6.19): {ops, partial}, or
+     null when the group is not in the retained history. */
+  undoOps(sb, group) {
+    const first = sb.hist.findIndex(b => b.cid === group.cid && b.undo && b.undo.g === group.g);
+    if (first < 0) return null;
+    const history = sb.hist.slice(first).map(b => ({ ver: b.ver, ops: b.ops, cid: b.cid, undo: b.undo || { g: 'v' + b.ver } }));
+    const r = OT.undoOps(group, history, sb.ed.rope.toString());
+    return { ops: OT.toOps(r.op, sb.ed.rope), partial: r.partial };
+  }
+}
