@@ -2,7 +2,7 @@
    Ex commands are looked up in the Lisp alist evil-ex-commands, so evil.el and init.el can add more. */
 (function () {
 'use strict';
-const L = window.L, Ed = window.Ed, E = Ed.E, H = Ed.hooks, EC = window.EvilCore;
+const L = globalThis.L, Ed = globalThis.Ed, E = Ed.E, H = Ed.hooks, EC = globalThis.EvilCore;
 const { intern, NIL, signal, pr, arr, listOf, truthy, Sym } = L;
 const bool = b => !!b, T = true;
 const { D, CMD, put, stateOf, setState, textToKeys, firstNonBlank } = EC;
@@ -505,7 +505,7 @@ function substituteText(seg, reSource, reFlags, rep, g, inner) {
   return { out, count, nl: changed.size, lastEnd };
 }
 /* The thread job: the replacement of one shard [from, to) of buffer ID, with OUT null when nothing changed. */
-if (window.EdPool && EdPool.define) EdPool.define('subst', (it, ctx) => {
+if (globalThis.EdPool && EdPool.define) EdPool.define('subst', (it, ctx) => {
   const seg = ctx.rope(it.id).slice(it.from, it.to);
   const r = substituteText(seg, ctx.args.source, ctx.args.flags, ctx.args.rep, ctx.args.g, !!it.inner);
   return { out: r.out === seg ? null : r.out, count: r.count, nl: r.nl, lastEnd: r.lastEnd };
@@ -519,7 +519,7 @@ function substitute(b, lines, pattern, rep, flags) {
   const t = b.rope, [l1, l2] = lines, [s, e] = linesSpan(t, l1, l2);
   /* A big range goes to the thread pool in line-aligned shards; the command then returns a promise
      that the command loop awaits, so keys wait while the page stays live. */
-  if (e - s > (1 << 20) && window.EdPool && EdPool.ok) return substituteAsync(b, lines, re, pattern, rep, flags);
+  if (e - s > (1 << 20) && globalThis.EdPool && EdPool.ok) return substituteAsync(b, lines, re, pattern, rep, flags);
   return substituteSync(b, lines, re, pattern, rep, flags);
 }
 function substituteSync(b, lines, re, pattern, rep, flags) {
@@ -901,6 +901,5 @@ H.mouseDrag = (b, from, p) => {
     b.pt = Math.min(p, Math.max(0, b.rope.length - 1));
   } else { b.mark = from; b.pt = p; b.markActive = p !== from; }
 };
-window.EvilEx = { vimRegex, findMatch, exExecute, parseRange, resolveEx, substituteText };
-Ed.boot();
+globalThis.EvilEx = { vimRegex, findMatch, exExecute, parseRange, resolveEx, substituteText };
 })();

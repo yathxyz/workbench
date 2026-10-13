@@ -2,7 +2,7 @@
    electric pairs, fill-paragraph, centered view, bookmarks, the save hook, face colours. */
 (function () {
 'use strict';
-const L = window.L, Ed = window.Ed, E = Ed.E, H = Ed.hooks, EC = window.EvilCore;
+const L = globalThis.L, Ed = globalThis.Ed, E = Ed.E, H = Ed.hooks, EC = globalThis.EvilCore;
 const { intern, signal, truthy, listOf, arr, NIL } = L;
 const { D, CMD } = L;
 const cur = () => E.current;
@@ -144,7 +144,7 @@ CMD('fill-paragraph', '*', '', 'Re-wrap the paragraph at point to fill-column (S
 L.defvar('centered-view-width', 100, 'Columns of text that centered-view-mode centres in the window (yath/centered-view-width).');
 CMD('centered-view-mode', '', '', 'Toggle centring this buffer’s text in a column of centered-view-width characters (SPC y c).', () => {
   const b = cur(); b.centered = !b.centered;
-  document.documentElement.style.setProperty('--center-cols', String(Math.max(20, Number(L.get('centered-view-width')) || 100)));
+  Ed.host.page.setVar('center-cols', String(Math.max(20, Number(L.get('centered-view-width')) || 100)));
   Ed.message('Centered view ' + (b.centered ? 'on' : 'off')); return false;
 });
 /* visual-line-mode is per buffer, as in Emacs: the buffer wraps whatever truncate-lines says, and j and k
@@ -196,8 +196,8 @@ H.postCommand = (def, b, failed) => {
   }
 };
 const BM = 'edwin:bookmarks';
-function bookmarks() { try { return JSON.parse(localStorage.getItem(BM) || '{}'); } catch (e) { return E.bookmarks || {}; } }
-function saveBookmarks(m) { E.bookmarks = m; try { localStorage.setItem(BM, JSON.stringify(m)); } catch (e) { /* in memory only */ } }
+function bookmarks() { try { return JSON.parse(Ed.host.storage.get(BM) || '{}'); } catch (e) { return E.bookmarks || {}; } }
+function saveBookmarks(m) { E.bookmarks = m; try { Ed.host.storage.set(BM, JSON.stringify(m)); } catch (e) { /* in memory only */ } }
 CMD('bookmark-set', async () => [await Ed.readMini('Bookmark name: ', '', () => Object.keys(bookmarks()), { kind: 'bookmark', def: cur().name })], 'name', 'Remember this place under NAME (SPC b m).', ([name]) => {
   const b = cur(), m = bookmarks(); m[name] = { buffer: b.name, file: b.file, pt: b.pt }; saveBookmarks(m); Ed.message(`Set bookmark ${name}`); return false;
 });
@@ -222,8 +222,8 @@ CMD('bookmark-delete', async () => [await Ed.readMini('Delete bookmark: ', '', (
 }
 
 /* ---------- faces: colours and fonts are CSS variables ---------- */
-D('set-face-color!', 'face color', 'Set the colour of FACE: bg fg dim cursor region kw fn st cm co pa or any CSS token name.', ([f, c]) => { document.documentElement.style.setProperty('--' + (f instanceof L.Sym ? f.name : str(f)), str(c)); return false; });
-D('set-font-size!', 'px', 'Set the text size in pixels.', ([n]) => { for (const v of document.querySelectorAll('.text')) v.style.fontSize = n + 'px'; document.documentElement.style.setProperty('--text-size', n + 'px'); E.metricsGen++; return false; });
-D('set-font-family!', 'family', 'Set the text font family.', ([f]) => { document.documentElement.style.setProperty('--font-mono', str(f) + ', ' + 'ui-monospace, monospace'); E.metricsGen++; return false; });
-D('theme-dark?', '', '#t when the page shows the dark theme.', () => document.documentElement.dataset.theme === 'dark' || (document.documentElement.dataset.theme !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches));
+D('set-face-color!', 'face color', 'Set the colour of FACE: bg fg dim cursor region kw fn st cm co pa or any CSS token name.', ([f, c]) => { Ed.host.page.setVar(f instanceof L.Sym ? f.name : str(f), str(c)); return false; });
+D('set-font-size!', 'px', 'Set the text size in pixels.', ([n]) => { for (const f of E.frames) for (const v of f.root.querySelectorAll('.text')) v.style.fontSize = n + 'px'; Ed.host.page.setVar('text-size', n + 'px'); E.metricsGen++; return false; });
+D('set-font-family!', 'family', 'Set the text font family.', ([f]) => { Ed.host.page.setVar('font-mono', str(f) + ', ' + 'ui-monospace, monospace'); E.metricsGen++; return false; });
+D('theme-dark?', '', '#t when the page shows the dark theme.', () => { const t = Ed.host.page.getAttr('theme'); return t === 'dark' || (t !== 'light' && Ed.host.page.prefersDark()); });
 })();

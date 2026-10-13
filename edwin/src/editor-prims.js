@@ -1,10 +1,10 @@
 /* Lmacs primitives: the editor as seen from Lisp, plus the built-in commands and startup. */
 (function () {
 'use strict';
-const L = window.L, Ed = window.Ed, E = Ed.E;
+const L = globalThis.L, Ed = globalThis.Ed, E = Ed.E;
 const { intern, NIL, signal, pr, arr, listOf, truthy, Sym } = L;
 const bool = b => !!b, T = true;
-const $ = id => document.getElementById(id);
+const host = Ed.host;
 
 const cur = () => E.current;
 const num = x => { if (typeof x !== 'number') signal('wrong-type-argument', 'expected an integer, got', x); return Math.trunc(x); };
@@ -288,7 +288,7 @@ CMD('exchange-point-and-mark', '', '', 'Put the mark where point is and point wh
   const b = cur(); if (b.mark === null) signal('user-error', 'No mark set in this buffer');
   [b.pt, b.mark] = [b.mark, b.pt]; b.markActive = true; E.keepMark = true; return false;
 });
-function toClipboard(s) { try { navigator.clipboard?.writeText(s).catch(() => {}); } catch (e) {} }
+function toClipboard(s) { host.setClipboard(s); }
 D('kill-new', 'STRING', 'Make STRING the latest kill.', ([s]) => { E.killRing.unshift(str(s)); if (E.killRing.length > 60) E.killRing.pop(); E.killIdx = 0; toClipboard(s); return false; });
 D('kill-append', 'STRING BEFORE-P', 'Append STRING to the latest kill (prepend if BEFORE-P).', ([s, before]) => {
   if (!E.killRing.length) E.killRing.unshift('');
@@ -581,11 +581,11 @@ CMD('indent-for-tab-command', '*', '', 'Expand a snippet key before point; else 
   if (b === E.minibuf) return L.call('minibuffer-complete', []);
   const complete = L.get('tab-always-indent') === intern('complete');
   /* yasnippet binds TAB itself, whatever tab-always-indent says. */
-  if (window.Yas && window.Yas.keyAt(b)) return window.Yas.expand(b);
+  if (globalThis.Yas && globalThis.Yas.keyAt(b)) return globalThis.Yas.expand(b);
   const ver = b.ver, pt = b.pt;
   if (Ed.isLisp(b)) Ed.indentLine(b);
   if (!Ed.changedSince(b, ver) && b.pt === pt) {
-    if (complete && window.Complete && window.Complete.prefixAt(b) && window.Complete.open(b, false)) { if (E.corfu.cands.length === 1) window.Complete.accept(); return false; }
+    if (complete && globalThis.Complete && globalThis.Complete.prefixAt(b) && globalThis.Complete.open(b, false)) { if (E.corfu.cands.length === 1) globalThis.Complete.accept(); return false; }
     if (!Ed.isLisp(b)) {
       /* tab-to-tab-stop: a tab, or with indent-tabs-mode #f spaces to the next tab-width column. */
       const tw = Math.max(1, Math.floor(Number(L.get('tab-width'))) || 8);
@@ -782,30 +782,57 @@ D('major-mode', '[buffer]', 'The major mode of BUFFER as a symbol.', ([b]) => in
 D('set-major-mode!', 'mode [buffer]', 'Set the major mode of BUFFER.', ([m, b]) => { Ed.toBuffer(b === undefined ? false : b).mode = m.name; return m; });
 D('mark-active?', '', '#t if the mark is active.', () => cur().markActive);
 
+/* ---------- frames (R9.2): headless runtimes have none, and (selected-frame) is then #f ---------- */
+const toFrame = f => (L.absent(f) || f === false ? E.frame : f instanceof Ed.Frame ? f : signal('wrong-type-argument', 'expected a frame, got', f));
+D('framep', 'x', '#t if X is a frame.', ([x]) => x instanceof Ed.Frame);
+alias('frame?', 'framep');
+D('frame-live-p', 'x', '#t if X is a frame that has not been deleted.', ([x]) => x instanceof Ed.Frame && E.frames.includes(x));
+D('selected-frame', '', 'The selected frame, or #f in a runtime with no frames.', () => E.frame || false);
+D('frame-list', '', 'All live frames.', () => listOf(E.frames.slice()));
+D('select-frame', 'frame', 'Make FRAME the selected frame.', ([f]) => { Ed.selectFrame(f); Ed.render(); return f; });
+D('delete-frame', '[frame]', 'Delete FRAME (the selected frame by default). Its page elements stay; it stops being drawn.', ([f]) => { const fr = toFrame(f); if (fr) Ed.deleteFrame(fr); return false; });
+CMD('other-frame', 'p', 'COUNT', 'Select the COUNTth next frame.', ([n]) => {
+  const fs = E.frames; if (fs.length < 2) return false;
+  const i = fs.indexOf(E.frame), k = ((i + (typeof n === 'number' ? n : 1)) % fs.length + fs.length) % fs.length;
+  Ed.selectFrame(fs[k]); return false;
+});
+D('make-frame', 'parent-element . opts', 'Make a frame drawing into PARENT-ELEMENT, a page element. Not available without a page.', ([el]) => {
+  if (!el || typeof el !== 'object' || !el.ownerDocument) signal('error', 'make-frame needs a page element', el);
+  return Ed.makeFrame(el, {});
+});
+
 /* ---------- configuration files: emacs.scm, evil.scm, org.scm, ai.scm and init.scm ---------- */
-/* A lazy config (org.scm) is evaluated at boot without a buffer; :e org.scm then shows the shipped text. */
-const CONFIG = [['emacs.scm', 'emacs-scm'], ['evil.scm', 'evil-scm'], ['org.scm', 'org-scm', 'lazy'], ['ai.scm', 'ai-scm', 'lazy'], ['init.scm', 'init-scm']];
-const defaultConfig = id => $(id).textContent.replace(/^\n/, '');
-function shippedConfig(name) { const c = CONFIG.find(x => x[0] === name && x[2]); return c && $(c[1]) ? defaultConfig(c[1]) : null; }
-function loadConfig(name, id, lazy) {
-  const saved = Ed.Store.get(name);
-  if (!$(id)) return null;
-  const text = saved ?? defaultConfig(id);
+/* A lazy config (org.scm) is evaluated at boot without a buffer; :e org.scm then shows the shipped text.
+   The host reads the shipped files (R4.1): the page's Scheme blocks in a browser, edwin/scm/ under Node. */
+const CONFIG = [['emacs.scm'], ['evil.scm'], ['org.scm', 'lazy'], ['ai.scm', 'lazy'], ['init.scm']];
+const shipped = name => host.config(name);
+function shippedConfig(name) { const c = CONFIG.find(x => x[0] === name && x[1]); return c ? shipped(name) : null; }
+function loadConfig(name, lazy) {
+  const saved = Ed.Store.get(name), orig = shipped(name);
+  if (orig === null) return null;
+  const text = saved ?? orig;
   if (!lazy) { const b = Ed.getBufferCreate(name); b.text = text; b.file = name; b.modified = false; b.pt = 0; }
   try { evalText(text); return null; }
   catch (e) {
     const why = Ed.errorText(e);
-    if (saved !== null) { try { evalText(defaultConfig(id)); } catch (e2) { /* keep going */ } }
+    if (saved !== null) { try { evalText(orig); } catch (e2) { /* keep going */ } }
     return `Error in ${name}: ${why}${saved !== null ? ' (loaded the shipped version instead; M-x reset-config discards your copies)' : ''}`;
   }
 }
+/* R4.11: after the shipped files, the user's own init.scm (~/.config/edwin/init.scm), when the host has one. */
+function loadUserInit() {
+  const text = host.userConfig('init.scm');
+  if (text === null || text === undefined) return null;
+  try { evalText(text); return null; } catch (e) { return `Error in ~/.config/edwin/init.scm: ${Ed.errorText(e)}`; }
+}
 CMD('reset-config', '', '', 'Restore the shipped emacs.scm, evil.scm and init.scm, forget saved copies, and evaluate them again.', () => {
-  for (const [name, id] of CONFIG) {
-    if (!$(id)) continue;
+  for (const [name] of CONFIG) {
+    const orig = shipped(name);
+    if (orig === null) continue;
     Ed.Store.del(name);
     const b = Ed.getBuffer(name);
-    if (b) { b.text = defaultConfig(id); b.pt = 0; b.modified = false; b.undo = []; b.redo = []; }
-    evalText(defaultConfig(id));
+    if (b) { b.text = orig; b.pt = 0; b.modified = false; b.undo = []; b.redo = []; }
+    evalText(orig);
   }
   Ed.message('Restored the shipped configuration'); return false;
 });
@@ -840,7 +867,13 @@ const SCRATCH = `;; Edwin: a small Emacs in the browser, scripted in Scheme, dri
 
 (evil-define-key 'normal 'global "SPC s" 'shout)
 `;
-function boot() {
+/* Ed.boot({host, frame}) starts the editor once all core files have loaded (R9.1). The host is the one
+   the core loaded with; FRAME, when given, is the frame to draw into and take keys from. */
+let booted = false;
+function boot(opts = {}) {
+  if (booted) throw new Error('Edwin has already booted');
+  if (opts.host && opts.host !== host) throw new Error('Ed.boot: a different host from the one Edwin loaded with');
+  booted = true;
   for (const n of ['global-map', 'minibuffer-local-map', 'scheme-mode-map', 'scheme-interaction-mode-map', 'special-mode-map', 'fundamental-mode-map', 'org-mode-map', 'text-mode-map'])
     L.set(n, new Ed.Keymap(n));
   L.get('scheme-interaction-mode-map').parent = L.get('scheme-mode-map');
@@ -849,21 +882,22 @@ function boot() {
   const msgs = Ed.getBufferCreate('*Messages*'); msgs.readOnly = true;
   const scratch = Ed.getBufferCreate('*scratch*'); scratch.text = SCRATCH; scratch.pt = 0;
   const errors = [];
-  for (const [name, id, lazy] of CONFIG) { const err = loadConfig(name, id, lazy); if (err) errors.push(err); }
-  E.buffers = [scratch, ...CONFIG.filter(c => !c[2]).map(([n]) => Ed.getBuffer(n)), msgs];
+  for (const [name, lazy] of CONFIG) { const err = loadConfig(name, lazy); if (err) errors.push(err); }
+  const userErr = loadUserInit(); if (userErr) errors.push(userErr);
+  E.buffers = [scratch, ...CONFIG.filter(c => !c[1]).map(([n]) => Ed.getBuffer(n)).filter(Boolean), msgs];
   E.root = new Ed.Window(scratch); Ed.selectWindow(E.root);
   if (errors.length) errors.forEach(e => Ed.message(e));
   else Ed.message(Ed.Store.get('init.scm') !== null ? 'Loaded your saved init.scm. :h shows the key reference.' : 'Welcome to Edwin. :h shows the key reference; C-z toggles Emacs keys.');
-  if (!E.headless) wire();
+  if (opts.frame) { Ed.selectFrame(opts.frame); wire(opts.frame); }
   Ed.render();
   Ed.commandLoop();
 }
 Ed.boot = boot;
 
-/* ---------- browser wiring ---------- */
-function wire() {
-  const ta = $('input'), frame = $('frame'), root = $('windows');
-  const focus = () => { if (document.activeElement !== ta) ta.focus({ preventScroll: true }); };
+/* ---------- browser wiring: one frame's input, mouse and menu bar ---------- */
+function wire(f) {
+  const ta = f.el('input'), frame = f.root, root = f.el('windows'), doc = frame.ownerDocument, win = doc.defaultView;
+  const focus = () => { if (doc.activeElement !== ta) ta.focus({ preventScroll: true }); };
   ta.addEventListener('focus', () => { E.focused = true; Ed.render(); });
   ta.addEventListener('blur', () => { E.focused = false; Ed.render(); });
   ta.addEventListener('keydown', e => {
@@ -903,7 +937,7 @@ function wire() {
     else { b.pt = p; b.markActive = false; }
     dragFrom = p; dragWin = w; Ed.render();
   });
-  window.addEventListener('mousemove', e => {
+  win.addEventListener('mousemove', e => {
     if (dragFrom === null || !(e.buttons & 1) || dragWin !== E.sel) return;
     const p = Ed.posFromPoint(e.clientX, e.clientY, dragWin);
     if (p === null) return;
@@ -912,14 +946,14 @@ function wire() {
     else { b.mark = dragFrom; b.pt = p; b.markActive = p !== dragFrom; }
     Ed.render();
   });
-  window.addEventListener('mouseup', () => { dragFrom = null; dragWin = null; });
+  win.addEventListener('mouseup', () => { dragFrom = null; dragWin = null; });
   frame.addEventListener('mousedown', e => { if (!root.contains(e.target) && !e.target.closest('button')) { e.preventDefault(); focus(); } });
   Ed.hooks.wireWindow = w => {
     let acc = 0, queued = false;
     w.view.addEventListener('wheel', e => {
       e.preventDefault();
       acc += e.deltaMode === 1 ? e.deltaY * 20 : e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY;
-      if (!queued) { queued = true; requestAnimationFrame(() => {
+      if (!queued) { queued = true; host.nextFrame(() => {
         queued = false; const lh = Ed.lineHeight(); const lines = Math.trunc(acc / lh); if (!lines) return; acc -= lines * lh;
         Ed.scrollWindow(w, lines);
         const b = w.buffer, l = Ed.lineNoB(b, w === E.sel ? b.pt : w.pt), l1 = Ed.lineNoB(b, w.start), l2 = l1 + (w.rows || 20) - 1;
@@ -928,7 +962,7 @@ function wire() {
       }); }
     }, { passive: false });
   };
-  for (const btn of document.querySelectorAll('[data-key], [data-cmd]')) {
+  for (const btn of frame.querySelectorAll('[data-key], [data-cmd]')) {
     btn.addEventListener('mousedown', e => e.preventDefault());
     btn.addEventListener('click', () => {
       focus();
@@ -936,7 +970,6 @@ function wire() {
       else Ed.feedKey('<cmd:' + btn.dataset.cmd + '>');
     });
   }
-  window.addEventListener('resize', () => Ed.render());
   focus();
 }
 })();

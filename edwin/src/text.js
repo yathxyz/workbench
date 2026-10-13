@@ -9,7 +9,7 @@
    it so the text is kept in memory once. The read methods have the names and the semantics of
    the String methods, so helpers written for strings accept a rope too. */
 (function () {
-/* The module is a function so a worker can be built from its source (window.ropeSource). */
+/* The module is a function so a worker can be built from its source (globalThis.ropeSource). */
 function ropeModule(g) {
 'use strict';
 const TARGET = 2048, MAX = 4096, MIN = 256;
@@ -238,6 +238,6 @@ class Rope {
 Rope.flattens = 0;
 g.Rope = Rope;
 }
-ropeModule(window);
-window.ropeSource = '(' + ropeModule.toString() + ')(self);';
+ropeModule(globalThis);
+globalThis.ropeSource = '(' + ropeModule.toString() + ')(self);';
 })();
