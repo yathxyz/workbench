@@ -107,7 +107,7 @@ export class Client {
     this.sverText = base; this.sver = msg.ver;
     if (this.inflight) {
       const [Rp, Ip] = OT.transform(R, OT.fromOps(this.inflight.ops, this.sverText.length - OT.delta(msg.ops)));
-      this.inflight.ops = OT.toOps(Ip, base); R = Rp; base = OT.applyOperation(base, Ip);
+      this.inflight.ops = OT.toOps(Ip, base); this.inflight.base = this.sver; R = Rp; base = OT.applyOperation(base, Ip); // a resend carries the rebased ops with their new base
     }
     for (let i = 0; i < this.queue.length; i++) {
       const [Rp, Qp] = OT.transform(R, OT.fromOps(this.queue[i].ops, R.baseLen));

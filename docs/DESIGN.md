@@ -416,6 +416,10 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
   - If the leader disconnects first, the call fails with `page_gone`. It is never re-sent to another tab.
 - **Authority, stated explicitly:** any process running as the service user that can reach web.sock gets the full board tool set (`run_in_shell`, `publish_artifact`, `create_node`, …) through the leader tab. That is the authority such a process already holds.
 
+### 3.3.1 `edit.sock` (the `wb` CLI and frames to edwind)
+- **Socket:** `/run/workbench-edit/edit.sock`, created by edwind (`edwin/server/main.mjs`) in the unit's `RuntimeDirectory`; directory 0700, socket 0600, no `SO_PEERCRED` (Node has none): the file permissions admit the same peers, `uid ∈ {geteuid(), 0}`, and edwind refuses to start unless the directory and socket are its own with those modes. NDJSON with the same `MAX_LINE` as hub.sock and web.sock; the messages are those of the edwind spec §7 (`hello`/`welcome`, `open`, `edit`/`ack`/`edits`, `save`, `call`, `image?`).
+- **Authority, stated explicitly:** any process running as the service user that can reach edit.sock runs arbitrary code as the service user: `call` with a `form` and `wb eval` evaluate Scheme on the server image, which can open, edit and save any file the unit can write. That is the authority such a process already holds.
+
 ### 3.4 Session model
 
 #### 3.4.1 Identity and the nothing-auto-runs rule

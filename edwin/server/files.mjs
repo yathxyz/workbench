@@ -53,6 +53,8 @@ export function saveAtomic(real, text, { eol = 'lf' } = {}) {
   try {
     let off = 0;
     const buf = Buffer.from(data, 'utf8');
+    /* Test hook (R16.7): EDWIND_FAULT=enospc-save makes the disk fill half way through the write. */
+    if (process.env.EDWIND_FAULT === 'enospc-save') { fs.writeSync(fd, buf, 0, buf.length >> 1); throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' }); }
     while (off < buf.length) off += fs.writeSync(fd, buf, off, buf.length - off);
     fs.fsyncSync(fd);
     if (existing) fs.fchmodSync(fd, existing.mode & 0o7777);

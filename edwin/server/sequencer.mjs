@@ -37,6 +37,9 @@ export class Sequencer {
     const later = sb.hist.filter(b => b.ver > base);
     let applied;
     try {
+      /* The ops are checked against the text the client saw (R7.7, R7.8); a rebase alone would silently
+         take the deleted text from the current buffer. */
+      OT.check(later.length ? OT.textBefore(sb.ed.rope.toString(), later) : sb.ed.rope, ops);
       const op = later.length ? OT.rebase(ops, this.lenAt(sb, base), later) : OT.fromOps(ops, sb.ed.rope.length);
       applied = OT.toOps(op, sb.ed.rope);
     } catch (e) { throw new ProtoError('bad_edit', e.message); }
@@ -58,6 +61,9 @@ export class Sequencer {
     });
     sb.ver++;
     const entry = { ver: sb.ver, cid, seq, by, ops, undo: undo || undefined, at: Date.now(), len, bytes: JSON.stringify(ops).length };
+    /* The clients attached now get this batch as edits once it is journaled; one that opens in between gets
+       it from the replay instead (open{since} reads the history), so nobody sees it twice. */
+    entry.recipients = [...sb.clients];
     sb.hist.push(entry); sb.histBytes += entry.bytes;
     if (cid !== null && seq !== null) { let m = sb.seqIndex.get(cid); if (!m) { m = new Map(); sb.seqIndex.set(cid, m); } m.set(seq, sb.ver); }
     this.trim(sb);
@@ -80,22 +86,48 @@ export class Sequencer {
   async edit(client, sb, msg) {
     const { base, seq, ops, undo } = msg;
     const known = sb.seqIndex.get(client.cid);
-    if (known && known.has(seq)) { client.send({ t: 'ack', buf: sb.id, seq, ver: known.get(seq) }); return; } // a resend
+    if (known && known.has(seq)) { // a resend: the original ack, once the batch is on disk (R7.15, R8.3)
+      const ver = known.get(seq);
+      const entry = sb.hist.find(b => b.ver === ver);
+      if (entry && entry.pending) { try { await entry.pending; } catch (e) { /* reported below */ } }
+      if (!sb.seqIndex.get(client.cid) || !sb.seqIndex.get(client.cid).has(seq)) throw new ProtoError('read_only', typeof sb.readOnly === 'string' ? sb.readOnly : 'the batch was not journaled', { buf: sb.id, seq });
+      client.send({ t: 'ack', buf: sb.id, seq, ver });
+      return;
+    }
     if (sb.readOnly) throw new ProtoError('read_only', typeof sb.readOnly === 'string' ? sb.readOnly : 'the buffer is read-only', { buf: sb.id, seq });
     const applied = this.rebase(sb, ops, base);
     const entry = this.applyBatch(sb, applied, client.by(), { cid: client.cid, seq, undo });
     await this.commit(sb, entry, client);
   }
 
+  /* Undo ENTRY, the newest batch of SB, in place: the inverse ops applied as the server, the history entry and
+     its (cid, seq) forgotten, the version stepped back. Nothing has been sent about it yet. */
+  rollback(sb, entry) {
+    const Ed = this.Ed;
+    if (sb.hist[sb.hist.length - 1] !== entry) throw new Error('rollback of a batch that is not the newest');
+    Ed.withOrigin('server', () => {
+      const save = Ed.E.inhibitRO; Ed.E.inhibitRO = true;
+      try { for (const [pos, del, ins] of OT.invert(entry.ops)) Ed.editText(sb.ed, pos, del.length, ins); }
+      finally { Ed.E.inhibitRO = save; }
+    });
+    sb.hist.pop(); sb.histBytes -= entry.bytes; sb.ver--;
+    if (entry.cid !== null && entry.seq !== null) { const m = sb.seqIndex.get(entry.cid); if (m) { m.delete(entry.seq); if (!m.size) sb.seqIndex.delete(entry.cid); } }
+    sb.touched();
+  }
+
   /* Journal ENTRY, wait for the sync, then ack SENDER (if any) and send edits to the others. */
   async commit(sb, entry, sender) {
     const h = this.hashIf(sb);
+    const recipients = entry.recipients; delete entry.recipients;
     if (sb.journal) {
-      try { await sb.journal.append({ t: 'b', ver: entry.ver, cid: entry.cid, seq: entry.seq, by: entry.by, ops: entry.ops, undo: entry.undo, at: entry.at }); }
+      try { entry.pending = sb.journal.append({ t: 'b', ver: entry.ver, cid: entry.cid, seq: entry.seq, by: entry.by, ops: entry.ops, undo: entry.undo, at: entry.at }); await entry.pending; delete entry.pending; }
       catch (e) {
-        /* The line did not reach the disk (ENOSPC): the batch stays applied in memory but is not acknowledged;
-           the buffer goes read-only with the reason until a save or restart (R16.7). */
+        delete entry.pending;
+        /* The line did not reach the disk (ENOSPC): the batch is rolled back, so nothing is applied that a
+           restart would lose and a resend is applied afresh; the buffer goes read-only with the reason until
+           a save or restart (R16.7). */
         this.log.error('journal', { buf: sb.id, error: e.code || e.message });
+        this.rollback(sb, entry);
         sb.setReadOnly(`journal write failed: ${e.code || e.message}`);
         throw new ProtoError('read_only', `journal write failed: ${e.code || e.message}`, { buf: sb.id, seq: entry.seq });
       }
@@ -104,7 +136,7 @@ export class Sequencer {
     if (sender) sender.send(h === undefined ? { t: 'ack', buf: sb.id, seq: entry.seq, ver: entry.ver } : { t: 'ack', buf: sb.id, seq: entry.seq, ver: entry.ver, h });
     const edits = { t: 'edits', buf: sb.id, ver: entry.ver, ops: entry.ops, by: entry.by };
     if (h !== undefined) edits.h = h;
-    for (const c of sb.clients) if (c !== sender) c.sendBulkish(edits);
+    for (const c of recipients) if (c !== sender) c.sendBulkish(edits);
     sb.owner.afterBatch(sb, entry);
   }
 

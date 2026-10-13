@@ -18,6 +18,41 @@ let
     root = ../edwin;
     fileset = ../edwin;
   };
+  # The edwind suites check MAX_LINE against wb-proto's (R7.2), so they see that one file of the crates.
+  edwind = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../edwin
+      ../crates/wb-proto/src/limits.rs
+    ];
+  };
+  # fast-check for the OT properties: a dev dependency pinned in tools/package-lock.json (R15.1), installed
+  # from the lock with no scripts, as nix/vendor.nix does.
+  edwinDevDeps = pkgs.stdenv.mkDerivation {
+    pname = "workbench-edwin-dev-deps";
+    version = (lib.importJSON ../tools/package.json).version;
+    src = lib.fileset.toSource {
+      root = ../tools;
+      fileset = lib.fileset.unions [
+        ../tools/package.json
+        ../tools/package-lock.json
+      ];
+    };
+    npmDeps = pkgs.importNpmLock {
+      package = lib.importJSON ../tools/package.json;
+      packageLock = lib.importJSON ../tools/package-lock.json;
+    };
+    npmFlags = [ "--ignore-scripts" ];
+    nativeBuildInputs = [
+      pkgs.nodejs
+      pkgs.importNpmLock.npmConfigHook
+    ];
+    dontBuild = true;
+    installPhase = ''
+      mkdir -p $out
+      cp -r node_modules $out/
+    '';
+  };
 in
 {
   package = workbench;
@@ -63,6 +98,37 @@ in
   edwin-scheme = pkgs.runCommand "workbench-edwin-scheme" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     node --test ${edwin}/test/scheme*.test.mjs
     node ${edwin}/test/scheme-bench.mjs
+    touch $out
+  '';
+
+  # The OT properties (R16.1–R16.4): fast-check over random sessions, plus the undo properties and the
+  # wire checks (R7.7, R7.8, R7.14, R6.16, R6.17). OT_RUNS raises the run count; the check uses the default.
+  edwin-ot = pkgs.runCommand "workbench-edwin-ot" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    export NODE_PATH=${edwinDevDeps}/node_modules
+    node --test ${edwin}/test/ot.test.mjs
+    touch $out
+  '';
+
+  # A real edwind in a temp directory, under bin/edwind's Node flags, over every §7 message and error code,
+  # the limits, chunking, resend, replay, the E1 server commands and the socket checks (R14.3, R16.12, R16.16, R16.17).
+  edit-conformance = pkgs.runCommand "workbench-edit-conformance" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    export HOME=$TMPDIR
+    node --test ${edwind}/edwin/test/conformance.test.mjs
+    touch $out
+  '';
+
+  # SIGKILL at 1,000 random points under a three-client load, a journal torn at every byte offset, and a
+  # full disk during save and journal append (R16.5–R16.7). About eight minutes.
+  edit-crash = pkgs.runCommand "workbench-edit-crash" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    export HOME=$TMPDIR
+    node --test ${edwind}/edwin/test/crash.test.mjs
+    touch $out
+  '';
+
+  # External writes, the three-way merge, the conflict and deleted marks, CRLF, atomic save (R8.12–R8.15).
+  edit-disk = pkgs.runCommand "workbench-edit-disk" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    export HOME=$TMPDIR
+    node --test ${edwind}/edwin/test/disk.test.mjs
     touch $out
   '';
 
@@ -184,6 +250,9 @@ in
         environmentName = [ "services.workbench.environment and agents" ];
         agentEnvName = [ "services.workbench.environment and agents" ];
         fixedName = [ "services.workbench.environment must not set" ];
+        editFrames = [ "services.workbench.edit.frames requires" ];
+        editWritable = [ "services.workbench.edit.writablePaths" ];
+        editUrl = [ "services.workbench.edit.models.*.baseUrl" ];
       };
       got = lib.mapAttrs (_: failing) {
         valid = { };
@@ -198,6 +267,12 @@ in
           env."1X" = "x";
         };
         fixedName.services.workbench.environment.SHELL = "/bin/sh";
+        editFrames.services.workbench.edit = {
+          enable = false;
+          frames = true;
+        };
+        editWritable.services.workbench.edit.writablePaths = [ "work/roam" ];
+        editUrl.services.workbench.edit.models.openai.baseUrl = "http://api.example.org/v1";
       };
       matches = lib.mapAttrs (
         case: prefixes:
