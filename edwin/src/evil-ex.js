@@ -831,12 +831,13 @@ D('revert-buffer', '', 'Reload the current buffer from its saved file, dropping 
   const v = Ed.Store.get(b.file); b.text = v ?? ''; b.pt = Math.min(b.pt, b.rope.length); b.modified = false; b.marks = {}; b.jumps = [];
   Ed.message(`"${b.file}" reloaded`); return false;
 });
-D('load', 'FILE', 'Evaluate the saved file FILE, or the buffer visiting it.', ([f]) => {
-  const vb = E.buffers.find(x => x.file === f), text = vb ? vb.text : Ed.Store.get(String(f));
-  if (text === null) signal('user-error', `Cannot open load file: ${f}`);
-  for (const form of L.readAll(text)) { L.resetOps(); L.ev(form); }
-  Ed.message(`Loaded ${f}`); return T;
-});
+{
+  const load = L.toFn(intern('load'));
+  D('load', 'FILE [env]', 'Evaluate the file FILE: the buffer visiting it, a saved file, or a file the host can read.', ([f, env]) => {
+    load([String(f), env]);
+    Ed.message(`Loaded ${f}`); return T;
+  });
+}
 D('evil--show-help-text', 'TEXT', 'Show TEXT in the *Help* buffer.', ([t]) => { showList('*Help*', String(t)); Ed.message('q returns to the previous buffer'); return false; });
 function cycleBuffer(d) {
   const list = E.buffers.filter(x => !x.name.startsWith(' ') && !/^\*(Messages|Help|Registers|Marks|Buffer List)\*$/.test(x.name)).sort((a, z) => a.id - z.id);

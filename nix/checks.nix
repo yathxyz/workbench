@@ -62,6 +62,7 @@ in
   # minor modes, buffer-locals, markers) and the shadow-stack cost bound (R4.34, at most 10%).
   edwin-scheme = pkgs.runCommand "workbench-edwin-scheme" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     node --test ${edwin}/test/scheme*.test.mjs
+    node ${edwin}/test/scheme-bench.mjs
     touch $out
   '';
 
