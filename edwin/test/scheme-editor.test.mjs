@@ -283,6 +283,13 @@ test('define-derived-mode: parent keymap, hooks parent first, derived-mode-p', a
   await ed.keys('C-c t');
   assert.equal(ed.text(), 'from-text');
   assert.equal(ed.Ed.MODE_NAMES['notes-mode'], 'Notes');
+  // A motion bound in the parent's Evil map works alone and after an operator.
+  ev(`(evil-define-key 'motion 'text-mode-map "Q" 'evil-end-of-line)`);
+  ev('(insert " tail") (goto-char 1)');
+  await ed.type('Q');
+  assert.equal(ed.point(), ed.text().length - 1);
+  await ed.type('0dQ');
+  assert.equal(ed.text(), '');
 });
 
 test('frames: a headless runtime has none', () => {
