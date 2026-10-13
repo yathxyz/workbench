@@ -92,7 +92,8 @@ H.stateMaps = b => {
 };
 function opMaps(b) {
   const out = [];
-  for (const s of ['operator', 'motion']) { const a = aux(b.mode, s, false); if (a) out.push(a); const g = KM(`evil-${s}-state-map`); if (g) out.push(g); }
+  const modes = Ed.modeParents.size ? Ed.modeChain(b.mode) : [b.mode];
+  for (const s of ['operator', 'motion']) { for (const m of modes) { const a = aux(m, s, false); if (a) out.push(a); } const g = KM(`evil-${s}-state-map`); if (g) out.push(g); }
   return out;
 }
 function modeNameOf(m) {

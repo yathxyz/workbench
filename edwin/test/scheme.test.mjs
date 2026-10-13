@@ -124,6 +124,8 @@ describe(`Edwin Scheme (${MODE})`, () => {
     assert.equal(ev('(with-output-to-string (lambda () (display "a") (write "b") (newline) (format #t "~a-~s" 1 "x") (write-line 3)))'), '"a\\"b\\"\\n1-\\"x\\"3\\n"');
     assert.equal(ev('(call-with-output-string (lambda (port) (format port "~a+~a" 1 2) (pp \'(a b) port)))'), '"1+2(a b)\\n"');
     assert.equal(ev('(list (port? (current-output-port)) (output-port? (current-output-port)) (input-port? (open-input-string "")) (textual-port? (open-output-string)) (port? 5))'), '(#t #t #t #t #f)');
+    // read-string counts characters: one outside the BMP is never split into surrogates.
+    assert.equal(ev('(let ((p (open-input-string "\u{1F600}a\u{1F600}"))) (list (read-string 1 p) (read-char p) (read-string 5 p)))'), '("\u{1F600}" #\\a "\u{1F600}")');
     assert.equal(ev('(let ((p (open-input-string "x"))) (list (char-ready? p) (input-port-open? p) (begin (close-port p) (input-port-open? p))))'), '(#t #t #f)');
     assert.equal(ev('(eof-object? (eof-object))'), '#t');
     assert.equal(ev('(format #f "~a" 5)'), '"5"');

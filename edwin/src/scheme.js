@@ -1932,7 +1932,10 @@ D('read-string', 'k [port]', 'The next K characters of PORT (fewer at its end), 
   if (k instanceof Port) [k, p] = [p, k];   // MIT's (read-string port k) order too
   p = openIn(inPort(p, 'read-string'), 'read-string'); int(k, 'read-string');
   if (p.pos >= p.text.length) return EOF;
-  const s = p.text.slice(p.pos, p.pos + k); p.pos += s.length; return s;
+  /* K characters, not UTF-16 units: a character outside the BMP is two units and is never split. */
+  const t = p.text; let j = p.pos;
+  for (let n = 0; n < k && j < t.length; n++) j += t.codePointAt(j) > 0xffff ? 2 : 1;
+  const s = t.slice(p.pos, j); p.pos = j; return s;
 });
 /* (read [port]) reads a datum from PORT; (read string) reads one from STRING, as before. */
 D('read', '[port-or-string]', 'Read one datum from PORT (the current input port), or from a string.', ([s]) => {
