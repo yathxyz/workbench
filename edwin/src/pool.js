@@ -33,7 +33,7 @@ function codecModule(g) {
   function encode(x, meta) {
     const active = new Set();
     const enc = x => {
-      if (x === true || x === false || typeof x === 'number' || typeof x === 'string') return x;
+      if (x === true || x === false || typeof x === 'number' || typeof x === 'string' || typeof x === 'bigint') return x;
       if (x === S.NIL) return { $: 'nil' };
       if (x === S.UNSPEC || x === undefined || x === null) return { $: 'u' };
       if (x === S.EOF) return { $: 'eof' };
@@ -219,7 +219,7 @@ function workerMain(self, limits) {
   const errMsg = e => S ? S.errorMessage(e) : (e && e.message) || String(e);
   function encodeSafe(x) { try { return codec.encode(x); } catch (e) { return S.write(x); } }
   function encodeError(e) {
-    if (S && e instanceof S.SchemeError) return { kind: e.kind === 'error' && /^Interrupted:/.test(e.message) ? 'thread-timeout' : e.kind, message: e.message, irritants: e.irritants.map(encodeSafe) };
+    if (S && e instanceof S.SchemeError) return { kind: e.kind === 'scheme-interrupt' ? 'thread-timeout' : e.kind, message: e.message, irritants: e.irritants.map(encodeSafe) };
     if (S && e instanceof S.Raise) return { kind: 'raise', message: S.errorMessage(e), obj: encodeSafe(e.obj) };
     if (e instanceof RangeError) return { kind: 'error', message: 'Stack overflow' };
     if (S && e instanceof S.Escape) return { kind: 'error', message: 'Escape procedure called outside its extent' };

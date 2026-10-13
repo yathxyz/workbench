@@ -1272,6 +1272,7 @@ async function runCommand(def, keys) {
   const b = E.current, before = snap(b), wasActive = b.markActive, pin = b.pin;
   if (before.ver < b.pin) b.pin = before.ver;
   E.keepPrefix = false; E.keepMark = false; E.noUndo = false;
+  if (E.depth === 0) L.S.resetStack();
   if (hooks.preCommand) hooks.preCommand(def, b);
   try { L.resetOps(); L.runHook('pre-command-hook'); } catch (e) { reportError(e); }
   const layout = windowLayout();

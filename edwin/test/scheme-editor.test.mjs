@@ -15,6 +15,7 @@ writeFileSync(join(configDir, 'init.scm'), `
 (define user-init-saw-org (command? 'org-todo))
 (defvar user-init-loaded #t "Set by the user's init.scm.")
 `);
+writeFileSync(join(configDir, 'lisp', 'greet.scm'), `(define (greet who) (string-append "hello " who)) (provide 'greet)`);
 const ed = await startEdwin({ configDir });
 const ev = src => ed.eval(src);
 const sym = v => (v && v.name !== undefined ? v.name : v);
@@ -287,4 +288,21 @@ test('define-derived-mode: parent keymap, hooks parent first, derived-mode-p', a
 test('frames: a headless runtime has none', () => {
   assert.equal(ev('(selected-frame)'), false);
   assert.equal(ev('(frame-list)'), ed.L.NIL);
+});
+
+test('require loads a feature from ~/.config/edwin/lisp; the shipped files are features (R4.10)', () => {
+  assert.equal(ev(`(featurep 'org)`), true);
+  assert.equal(ev(`(featurep 'greet)`), false);
+  assert.equal(sym(ev(`(require 'greet)`)), 'greet');
+  assert.equal(ev('(greet "edwin")'), 'hello edwin');
+  assert.throws(() => ev(`(require 'no-such-feature)`), /Cannot open load file/);
+});
+
+test('a buffer output port inserts at its marker as edits (R4.4)', async () => {
+  await fresh('[]');
+  ev('(define m (copy-marker 2)) (define p (open-buffer-output-port (current-buffer) m))');
+  // (newline) is the editor command in emacs.scm, as in Emacs; write-string writes the line break.
+  ev(`(display "one " p) (write 'two p) (write-string "\\n" p)`);
+  assert.equal(ed.text(), '[one two\n]');
+  assert.equal(ev('(marker-position m)'), 10);
 });

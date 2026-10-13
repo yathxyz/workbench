@@ -1040,6 +1040,30 @@ L.evalText(`
     \`(%define-derived-mode ',child ',parent ,name (lambda () #f ,@r))))
 `);
 
+/* ---------- files for load, include and require (R4.10) ----------
+   A path is read from the buffer visiting it, else from the host (the disk under Node), else from the
+   saved files. load-path starts as the host's: ~/.config/edwin/lisp, then the shipped scm/. */
+L.S.hooks.readFile = path => {
+  const vb = E.buffers.find(x => x.file === path);
+  if (vb) return vb.text;
+  const t = host.readFile(path);
+  return t !== null && t !== undefined ? t : Ed.Store.get(path);
+};
+L.set('load-path', listOf(host.loadPath.slice()));
+
+/* ---------- buffer ports (R4.4): output inserted at a marker, as edits ---------- */
+D('open-buffer-output-port', 'buffer [marker]', 'An output port that inserts what is written into BUFFER at MARKER (default: the end), as edits.', ([buf, m]) => {
+  const b = Ed.toBuffer(buf);
+  const at = m instanceof Ed.Marker ? m : b.marker(b.rope.length, 'after');
+  if (at.buffer !== b) signal('error', 'open-buffer-output-port: the marker is in another buffer', m);
+  return L.S.makeOutputPort(s => {
+    if (!s || at.pos === null) return;
+    const p = at.pos;
+    Ed.checkRO(b); Ed.editText(b, p, 0, s); b.modified = true;
+    at.pos = p + s.length;   // the next write goes after this one, whatever the marker's type
+  }, 'buffer ' + b.name);
+});
+
 /* ---------- frames (R9.2): headless runtimes have none, and (selected-frame) is then #f ---------- */
 const toFrame = f => (L.absent(f) || f === false ? E.frame : f instanceof Ed.Frame ? f : signal('wrong-type-argument', 'expected a frame, got', f));
 D('framep', 'x', '#t if X is a frame.', ([x]) => x instanceof Ed.Frame);
@@ -1070,6 +1094,7 @@ function loadConfig(name, lazy) {
   if (orig === null) return null;
   const text = saved ?? orig;
   if (!lazy) { const b = Ed.getBufferCreate(name); b.text = text; b.file = name; b.modified = false; b.pt = 0; }
+  L.call('provide', [intern(name.replace(/\.scm$/, ''))]);   // (require 'org) does not load the shipped file again
   try { evalText(text); return null; }
   catch (e) {
     const why = Ed.errorText(e);
