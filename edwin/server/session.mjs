@@ -27,7 +27,7 @@ export class Client {
     socket.on('data', chunk => { try { this.reader.push(chunk); } catch (e) { this.fail(e); } });
     socket.on('error', e => { if (e.code !== 'ECONNRESET' && e.code !== 'EPIPE') this.log.warn('client', { cid: this.cid, error: e.code || e.message }); });
     socket.on('close', () => this.onClose());
-    socket.on('drain', () => this.pump());
+    socket.on('drain', () => { this.writing = false; this.pump(); });
     this.helloTimer = setTimeout(() => { if (!this.hello) { this.log.info('client', { event: 'no hello', cid: null }); this.destroy(); } }, HELLO_TIMEOUT_MS);
     this.pinger = setInterval(() => { if (this.hello) this.send({ t: 'ping', rid: 'p' + Date.now() }); }, PING_EVERY_MS);
     this.pinger.unref();
@@ -48,7 +48,14 @@ export class Client {
     if (this.closed) return;
     const line = encode(obj);
     this.queued += line.length;
-    if (this.queued > CLIENT_QUEUE_CAP) { this.log.warn('client', { cid: this.cid, event: 'slow_client', queued: this.queued }); this.queue = [encode({ t: 'error', code: 'slow_client', msg: 'the client is not reading fast enough' })]; this.queued = 0; this.pump(); this.destroy(); return; }
+    /* Everything not yet on the wire counts: our queue and what Node holds for a socket that stopped draining. */
+    const held = this.queued + this.socket.writableLength;
+    if (held > CLIENT_QUEUE_CAP) {
+      this.log.warn('client', { cid: this.cid, event: 'slow_client', queued: held });
+      this.queue = []; this.queued = 0;
+      try { this.socket.write(encode({ t: 'error', code: 'slow_client', msg: 'the client is not reading fast enough' })); } catch (e) { /* closing */ }
+      this.destroy(); return;
+    }
     this.queue.push(line); this.pump();
   }
   /* Bulk frames (snap, chunk, image): written one at a time, each after the previous one drained. */
@@ -57,9 +64,8 @@ export class Client {
     if (this.closed || this.writing) return;
     while (this.queue.length && !this.closed) {
       const line = this.queue.shift();
-      const ok = this.socket.write(line);
       if (this.queued) this.queued = Math.max(0, this.queued - line.length);
-      if (!ok) return; // wait for drain
+      if (!this.socket.write(line)) { this.writing = true; return; } // the drain event resumes
     }
   }
   destroy() { if (this.closed) return; this.closed = true; try { this.socket.end(); } catch (e) { /* closing */ } setTimeout(() => this.socket.destroy(), 100).unref(); }

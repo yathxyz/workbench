@@ -50,6 +50,30 @@ fn append_reads_a_file_argument() {
 }
 
 #[test]
+fn write_by_another_spelling_of_the_id_is_acked() {
+    // The absolute path of a file under notesDir is an alias of its notesDir-relative id (R6.1): edwind
+    // answers with the canonical id, and `wb` must still see the ack.
+    let ed = Edwind::start();
+    let abs = ed.notes.join("alias.md");
+    let abs = abs.to_str().unwrap();
+    let run = ed.wb(
+        &["buf", "write", abs, "--append", "--create"],
+        Some("one\n"),
+    );
+    assert_eq!(run.code, 0, "{run:?}\n{}", ed.log());
+    let run = ed.wb(&["buf", "write", abs, "--append", "--json"], Some("two\n"));
+    assert_eq!(run.code, 0, "{run:?}");
+    let v: serde_json::Value = serde_json::from_str(run.stdout.trim()).unwrap();
+    assert_eq!(v["buf"], "alias.md");
+    assert_eq!(v["ver"], 2);
+    assert_eq!(
+        ed.wb(&["buf", "read", "alias.md"], None).stdout,
+        "one\ntwo\n"
+    );
+    assert_eq!(ed.wb(&["buf", "read", abs], None).stdout, "one\ntwo\n");
+}
+
+#[test]
 fn missing_buffer_without_create_is_exit_3() {
     let ed = Edwind::start();
     let id = ed.work_file("nope.txt");

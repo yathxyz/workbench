@@ -121,7 +121,7 @@ pub fn write(
     json: bool,
 ) -> Result<()> {
     let buf = id::normalize(name);
-    let (base, ops) = match how {
+    let (base, ops, canon) = match how {
         WriteHow::Append(input) => {
             let new = read_input(input)?;
             let opened = client.open(&buf, None, create)?;
@@ -131,13 +131,13 @@ pub fn write(
             } else {
                 vec![Op::new(len16(&live), "", new)]
             };
-            (opened.ver, ops)
+            (opened.ver, ops, opened.id)
         }
         WriteHow::Replace(input) => {
             let new = read_input(input)?;
             let opened = client.open(&buf, None, create)?;
             let live = opened.text.unwrap_or_default();
-            (opened.ver, diff::diff_ops(&live, &new))
+            (opened.ver, diff::diff_ops(&live, &new), opened.id)
         }
         WriteHow::Patch { input, base } => {
             let hunks = patch::parse(&read_input(input)?)?;
@@ -173,13 +173,13 @@ pub fn write(
                 .detail(rendered.iter().map(|h| h.trim_end().to_owned()).collect())
                 .extra("rejects", json!(rendered))
             })?;
-            (base_ver, diff::diff_ops(&base_text, &new))
+            (base_ver, diff::diff_ops(&base_text, &new), opened.id)
         }
     };
-    let ver = client.edit(&buf, base, &ops)?;
-    client.close(&buf)?;
+    let ver = client.edit(&canon, base, &ops)?;
+    client.close(&canon)?;
     if json {
-        print_json(&json!({"buf": buf, "ver": ver, "ops": ops.len()}));
+        print_json(&json!({"buf": canon, "ver": ver, "ops": ops.len()}));
     }
     Ok(())
 }

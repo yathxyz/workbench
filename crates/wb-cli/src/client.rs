@@ -26,6 +26,8 @@ const EDIT_OVERHEAD: usize = 512;
 /// at, the buffer's `meta` and the replayed `edits` batches (after `open{since}`).
 #[derive(Debug, Default)]
 pub struct Opened {
+    /// The buffer's canonical id (R6.1), which every later message carries.
+    pub id: String,
     pub ver: u64,
     pub text: Option<String>,
     pub meta: Value,
@@ -233,11 +235,18 @@ impl Client {
             msg["create"] = Value::Bool(true);
         }
         self.send(&msg)?;
-        let mut opened = Opened::default();
+        let mut opened = Opened {
+            id: buf.to_owned(),
+            ..Opened::default()
+        };
+        // One buffer is open at a time, and the server names it by its canonical id, which may differ
+        // from `buf` (an absolute path under notesDir, `~/…`): no message of this open is filtered by it.
         loop {
             let m = self.recv()?;
             let mine = m["rid"].as_str() == Some(rid.as_str());
-            let same_buf = m["buf"].as_str() == Some(buf);
+            if mine && let Some(id) = m["buf"].as_str() {
+                opened.id = id.to_owned();
+            }
             match m["t"].as_str() {
                 Some("snap") if mine => {
                     opened.text = Some(m["text"].as_str().unwrap_or_default().to_owned());
@@ -249,7 +258,7 @@ impl Client {
                         opened.text.get_or_insert_default().push_str(piece);
                     }
                 }
-                Some("edits") if same_buf => {
+                Some("edits") => {
                     let ops = m["ops"]
                         .as_array()
                         .map(|ops| ops.iter().map(Op::from_value).collect::<Result<Vec<_>>>())
@@ -260,12 +269,12 @@ impl Client {
                         ops,
                     });
                 }
-                Some("meta") if same_buf => opened.meta = m,
+                Some("meta") => opened.meta = m,
                 Some("opened") if mine => {
                     opened.ver = m["ver"].as_u64().unwrap_or(opened.ver);
                     return Ok(opened);
                 }
-                Some("error") if mine || (m.get("rid").is_none() && same_buf) => {
+                Some("error") if mine || m.get("rid").is_none() => {
                     return Err(error_fail(&m).into());
                 }
                 _ => {}
@@ -286,11 +295,11 @@ impl Client {
             self.next_seq += 1;
             let seq = self.next_seq;
             self.send(&json!({"t": "edit", "buf": buf, "base": ver, "seq": seq, "ops": batch}))?;
+            // The ack carries the canonical id, not necessarily `buf`; `seq` is ours alone.
             loop {
                 let m = self.recv()?;
-                let same_buf = m["buf"].as_str() == Some(buf);
                 match m["t"].as_str() {
-                    Some("ack") if same_buf && m["seq"].as_u64() == Some(seq) => {
+                    Some("ack") if m["seq"].as_u64() == Some(seq) => {
                         ver = m["ver"]
                             .as_u64()
                             .ok_or_else(|| anyhow!("ack without a version"))?;
@@ -298,9 +307,7 @@ impl Client {
                     }
                     Some("error")
                         if m["seq"].as_u64() == Some(seq)
-                            || (m.get("seq").is_none()
-                                && m.get("rid").is_none()
-                                && (same_buf || m.get("buf").is_none())) =>
+                            || (m.get("seq").is_none() && m.get("rid").is_none()) =>
                     {
                         return Err(error_fail(&m).into());
                     }
