@@ -96,7 +96,7 @@ g.L = {
   errorMessage: S.errorMessage, Escape: S.Escape, isList: S.isList, car: S.car, cdr: S.cdr, cons: S.cons, list: S.list, equal: S.equal,
 };
 }
-runtimeModule(window);
+runtimeModule(globalThis);
 /* The module is a function so a worker can be built from its source (pool.js). */
-window.runtimeSource = '(' + runtimeModule.toString() + ')(self);';
+globalThis.runtimeSource = '(' + runtimeModule.toString() + ')(self);';
 })();

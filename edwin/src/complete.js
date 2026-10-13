@@ -4,7 +4,7 @@
    of a word. */
 (function () {
 'use strict';
-const L = window.L, Ed = window.Ed, E = Ed.E, H = Ed.hooks, EC = window.EvilCore;
+const L = globalThis.L, Ed = globalThis.Ed, E = Ed.E, H = Ed.hooks, EC = globalThis.EvilCore;
 const { intern, signal, truthy } = L;
 const { D, CMD } = L;
 const cur = () => E.current;
@@ -84,7 +84,7 @@ function globalNames() {
 }
 /* The index of each buffer comes from the worker pool (pool.js): sorted, so a prefix is a binary
    search instead of a pass over every word of every buffer. */
-const P = window.EdPool;
+const P = globalThis.EdPool;
 function candidates(b, prefix) {
   const lower = prefix.toLowerCase(), out = [], re = symbolChar(b);
   const seen = new Map();
@@ -164,9 +164,9 @@ function esc(s) { return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;',
 let placing = false;
 function place() {
   placing = false;
-  const el = document.getElementById('corfu'), c = E.corfu;
+  const f = E.frame, el = f && f.el('corfu'), c = E.corfu;
   if (!el || el.hidden || !c || E.mini) return;
-  const curEl = E.sel.view.querySelector('.cur'), frame = document.getElementById('frame').getBoundingClientRect();
+  const curEl = E.sel.view.querySelector('.cur'), frame = f.root.getBoundingClientRect();
   if (!curEl) { el.hidden = true; return; }
   const r = curEl.getBoundingClientRect();
   const left = r.left - frame.left - c.prefix.length * (r.width || 8);
@@ -175,10 +175,11 @@ function place() {
   if (below + el.offsetHeight > frame.height - 40) el.style.top = (r.top - frame.top - el.offsetHeight - 2) + 'px'; else el.style.top = below + 'px';
 }
 H.renderOverlay = () => {
-  let el = document.getElementById('corfu');
+  const f = E.frame; if (!f) return;
+  let el = f.el('corfu');
   const c = E.corfu;
   if (!c || E.mini) { if (el && !el.hidden) el.hidden = true; return; }
-  if (!el) { el = document.createElement('div'); el.id = 'corfu'; document.getElementById('frame').appendChild(el); }
+  if (!el) { el = f.root.ownerDocument.createElement('div'); el.id = 'corfu'; f.root.appendChild(el); f.parts.corfu = el; }
   const N = Math.max(3, Number(L.get('corfu-count')) || 10);
   if (c.index < c.scroll) c.scroll = c.index; if (c.index >= c.scroll + N) c.scroll = c.index - N + 1;
   const key = c.scroll + ' ' + c.index + ' ' + N + ' ' + c.prefix;
@@ -191,7 +192,7 @@ H.renderOverlay = () => {
   /* Inside a frame callback (a wheel scroll, a resize) a new animation frame is the next one, and
      this frame would paint the popup where the text was: place it now, the layout is due anyway. */
   if (E.inFrame) place();
-  else if (!placing) { placing = true; requestAnimationFrame(place); }
+  else if (!placing) { placing = true; Ed.host.nextFrame(place); }
 };
-window.Complete = { open, close, accept, prefixAt, fileCandidates };
+globalThis.Complete = { open, close, accept, prefixAt, fileCandidates };
 })();

@@ -7,7 +7,7 @@
    that runs in the worker pool when it offers EdPool.run, else on the main thread. */
 (function () {
 'use strict';
-const L = window.L, Ed = window.Ed, E = Ed.E, H = Ed.hooks, EC = window.EvilCore;
+const L = globalThis.L, Ed = globalThis.Ed, E = Ed.E, H = Ed.hooks, EC = globalThis.EvilCore;
 const { intern, signal, truthy, listOf, arr, NIL, Sym } = L;
 const { D, CMD } = L;
 const cur = () => E.current;
@@ -141,7 +141,7 @@ D('org-read-date', '&optional PROMPT DEFAULT', 'Read a date in the minibuffer (t
 D('org-parse-date', 'STRING', 'The date STRING names, as YYYY-MM-DD, or #f.', ([s]) => { const r = parseDate(str(s)); return r ? ymd(r.date) : false; });
 D('org-time-stamp-string', '&optional ACTIVE WITH-TIME', 'The current time as an Org timestamp.', ([a, t]) => stamp(ORG.now(), L.absent(a) ? true : truthy(a), truthy(t)));
 function uuid() {
-  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  if (globalThis.crypto && crypto.randomUUID) return crypto.randomUUID();
   const h = '0123456789abcdef'; let s = '';
   for (let i = 0; i < 36; i++) s += i === 8 || i === 13 || i === 18 || i === 23 ? '-' : i === 14 ? '4' : i === 19 ? h[8 + Math.floor(Math.random() * 4)] : h[Math.floor(Math.random() * 16)];
   return s;
@@ -916,7 +916,7 @@ async function openLink(target) {
   let m;
   target = target.trim();
   if ((m = /^id:(.+)$/.exec(target))) { await ensureIndex(); const node = entryById(m[1].trim()); if (!node) signal('user-error', `Cannot find entry with ID "${m[1].trim()}"`); visitNode(node); return; }
-  if (/^https?:\/\//.test(target)) { let ok = false; try { ok = !!window.open(target, '_blank', 'noopener'); } catch (e) { /* blocked */ } Ed.message(ok ? `Opened ${target}` : `Could not open ${target} (popup blocked?)`); return; }
+  if (/^https?:\/\//.test(target)) { const ok = Ed.host.openUrl(target); Ed.message(ok ? `Opened ${target}` : `Could not open ${target} (popup blocked?)`); return; }
   if ((m = /^file:(.+)$/.exec(target)) || (m = /^(.+\.(?:org|md|txt|scm))(::.*)?$/.exec(target))) {
     let name = m[1], search = null;
     const k = name.indexOf('::'); if (k >= 0) { search = name.slice(k + 2); name = name.slice(0, k); }
@@ -1079,7 +1079,7 @@ function orgParseFile(item, ctx) {
   }
   return { file, title: title || category, id, tags, entries, links };
 }
-if (window.EdPool && EdPool.define) { try { EdPool.define('org-parse', orgParseFile, []); ORG.poolJob = true; } catch (e) { ORG.poolJob = false; } }
+if (globalThis.EdPool && EdPool.define) { try { EdPool.define('org-parse', orgParseFile, []); ORG.poolJob = true; } catch (e) { ORG.poolJob = false; } }
 function indexDirty() { if (ORG.ix) ORG.ix.dirty = true; }
 /* Every Org and Markdown file in the store, plus the open outline buffers (their text wins over the store). */
 function indexSources() {
@@ -1092,7 +1092,7 @@ function refreshIndex() {
   const ix = ORG.ix || (ORG.ix = { files: new Map(), dirty: true, built: 0 });
   if (ix.promise) return ix.promise;
   const kw = todoKeywords(), items = [], keep = new Map(), bufs = [];
-  const pool = !!(window.EdPool && EdPool.run && EdPool.map && ORG.poolJob);
+  const pool = !!(globalThis.EdPool && EdPool.run && EdPool.map && ORG.poolJob);
   for (const src of indexSources()) {
     const old = ix.files.get(src.file);
     if (src.b) {
@@ -1520,7 +1520,7 @@ CMD('org-agenda-todo', '', '', 'Cycle the TODO state of the entry at point, in i
   if (vb) { const pos = locateEntry(vb, e); withBuffer(vb, () => setTodo(vb, pos, next)); }
   else {
     const text = Ed.Store.get(e.file) ?? '';
-    const tb = { rope: new window.Rope(text), mode: 'org-mode' };
+    const tb = { rope: new globalThis.Rope(text), mode: 'org-mode' };
     const pos = locateEntry(tb, e), info = headingInfo(tb, pos);
     let a = pos + info.textStart, z = a; if (info.todo) { z = a + info.todo.length; while (text[z] === ' ') z++; }
     Ed.Store.set(e.file, text.slice(0, a) + (next ? next + ' ' : '') + text.slice(z));
@@ -1588,7 +1588,7 @@ function orgFile(name) { const dir = String(L.get('org-directory') || ''); retur
 function storeEntry(file, headline, entry, tpl) {
   const vb = E.buffers.find(x => x.file === file);
   const text = vb ? vb.text : (Ed.Store.get(file) ?? '');
-  const tb = { rope: new window.Rope(text), mode: 'org-mode' };
+  const tb = { rope: new globalThis.Rope(text), mode: 'org-mode' };
   const pad = '\n'.repeat(typeof tpl['empty-lines'] === 'number' ? tpl['empty-lines'] : 0);
   const ops = [];
   let pos = text.length;
@@ -1710,9 +1710,9 @@ const CSS = `
 .text .oaw { color: var(--co); }
 .text .oao { color: var(--rb1); font-weight: 600; }
 `;
-if (typeof document !== 'undefined') { const st = document.createElement('style'); st.id = 'org-css'; st.textContent = CSS; document.head.appendChild(st); }
+Ed.host.page.addStyle('org-css', CSS);
 
-window.Org = { ORG, parseFile: orgParseFile, refreshIndex, ensureIndex, index: () => ORG.ix, ON, OC, lexSeg: H.lexSeg, parseDate, stamp, strftime, slugOf, todoKeywords,
+globalThis.Org = { ORG, parseFile: orgParseFile, refreshIndex, ensureIndex, index: () => ORG.ix, ON, OC, lexSeg: H.lexSeg, parseDate, stamp, strftime, slugOf, todoKeywords,
   headlineBefore, nextHeadline, prevHeadline, subtreeEnd, entryEnd, children, headingInfo, levelAt, foldsOf, addFold, removeFolds, reveal, isHidden, groupItems, weekView, todoView, expandTemplate, nodeAtPoint, uuid,
   /* The class name of each character of the segment FROM..TO of B, for tests. */
   classesOf(b, from, to) { const seg = b.rope.slice(from, to); const r = H.lexSeg(b, from, to, seg); return r ? Array.from(r.cls, c => ON[c]) : null; } };

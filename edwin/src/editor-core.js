@@ -4,22 +4,20 @@
    so keyboard macros and repeat can push keys back in front of it. */
 (function () {
 'use strict';
-const L = window.L;
+const L = globalThis.L;
 const { intern, NIL, signal, pr, arr, listOf, truthy, SchemeError, Sym } = L;
-const $ = id => document.getElementById(id);
+/* The host (host-browser.js or host-node.js) is everything the core needs from where it runs. */
+const host = globalThis.EdHost;
+if (!host) throw new Error('Edwin needs a host: load host-browser.js or host-node.js first');
 const hooks = {};
 
-/* ---------- file store (localStorage with in-memory fallback) ---------- */
-const mem = new Map(), PFX = 'lmacs:file:';
+/* ---------- file store: the host's storage, under its own prefix ---------- */
+const PFX = 'lmacs:file:';
 const Store = {
-  get(n) { try { const v = localStorage.getItem(PFX + n); if (v !== null) return v; } catch (e) {} return mem.has(n) ? mem.get(n) : null; },
-  set(n, v) { mem.set(n, v); try { localStorage.setItem(PFX + n, v); return true; } catch (e) { return false; } },
-  del(n) { mem.delete(n); try { localStorage.removeItem(PFX + n); } catch (e) {} },
-  list() {
-    const s = new Set(mem.keys());
-    try { for (let k = 0; k < localStorage.length; k++) { const key = localStorage.key(k); if (key && key.startsWith(PFX)) s.add(key.slice(PFX.length)); } } catch (e) {}
-    return [...s].sort();
-  },
+  get(n) { return host.storage.get(PFX + n); },
+  set(n, v) { return host.storage.set(PFX + n, v) !== false; },
+  del(n) { host.storage.remove(PFX + n); },
+  list() { return host.storage.keys().filter(k => k.startsWith(PFX)).map(k => k.slice(PFX.length)).sort(); },
 };
 
 /* ---------- buffers ---------- */
@@ -28,7 +26,7 @@ class Buffer {
     this.id = Buffer.count = (Buffer.count || 0) + 1;
     /* The text lives in a rope; every change is logged as a delta (VER, POS, DEL, INS) so caches,
        undo and the worker mirrors can follow it without keeping copies of the whole text. */
-    this.rope = new window.Rope(''); this.ver = 0; this.log = []; this.pin = Infinity;
+    this.rope = new globalThis.Rope(''); this.ver = 0; this.log = []; this.pin = Infinity;
     this.name = name; this.pt = 0; this.mark = null; this.markActive = false;
     this.mode = modeFor(name); this.file = null; this.modified = false; this.readOnly = false;
     this.undo = []; this.redo = []; this.pendingUndo = null; this.typeRun = 0; this.scroll = 0;
@@ -51,10 +49,10 @@ function modeFor(name) {
 const MODE_NAMES = { 'scheme-interaction-mode': 'Scheme Interaction', 'scheme-mode': 'Scheme', 'fundamental-mode': 'Fundamental', 'special-mode': 'Special', 'minibuffer-mode': 'Minibuffer', 'org-mode': 'Org', 'text-mode': 'Text' };
 const isLisp = b => b.mode === 'scheme-mode' || b.mode === 'scheme-interaction-mode' || b.mode === 'minibuffer-mode';
 
-/* E.headless: no page to draw on (edwind, tests). The host sets window.EDWIN_HEADLESS before this file loads;
-   redisplay and the browser wiring are then skipped, and everything else runs as in the page. */
+/* E.headless: no page to draw on (edwind, tests), as the host says. Redisplay and the browser wiring are
+   then skipped, and everything else runs as in the page. */
 const E = {
-  headless: !!window.EDWIN_HEADLESS,
+  headless: !!host.headless, host, frames: [], frame: null,
   buffers: [], win: null, current: null, minibuf: new Buffer(' *Minibuf-1*'),
   mini: null, miniFlash: '', history: [], echo: '', pendingKeys: '', prompt: null,
   prefixArg: null, keepPrefix: false, uArg: false, uDigits: null, depth: 0,
@@ -176,6 +174,45 @@ function popToBuffer(b, select) {
   if (select) selectWindow(w);
   return w;
 }
+
+/* ---------- frames: the page areas Edwin draws into ----------
+   A frame is one view of the editor on a page (R9.2): a root element holding the window tree, the echo
+   area and the input, with the menubar, the completion popup and the snipe boxes. The core never looks
+   up page elements itself: it asks the selected frame for a part by name (frame.el), so a page can hold
+   several frames. With no frame (headless) nothing is drawn. */
+class Frame {
+  constructor(root, parts) {
+    this.id = Frame.count = (Frame.count || 0) + 1;
+    this.root = root; this.parts = Object.assign(Object.create(null), parts);
+  }
+  /* The part NAME (frame, menubar, windows, echo, input, corfu, snipe): given at creation, or the element
+     with that id inside the root, or the root itself. Parts made later (the popups) are found once made. */
+  el(name) {
+    const p = this.parts[name];
+    if (p) return p;
+    const r = this.root, el = r.id === name ? r : r.querySelector('#' + name);
+    if (el) this.parts[name] = el;
+    return el;
+  }
+  __print() { return '#<frame ' + this.id + '>'; }
+  get __type() { return 'frame'; }
+}
+function makeFrame(root, parts) {
+  const f = new Frame(root, parts);
+  E.frames.push(f); if (!E.frame) E.frame = f;
+  E.headless = false;
+  return f;
+}
+function selectFrame(f) { if (!(f instanceof Frame) || !E.frames.includes(f)) signal('wrong-type-argument', 'not a live frame', f); E.frame = f; return f; }
+function deleteFrame(f) {
+  const i = E.frames.indexOf(f); if (i < 0) return false;
+  E.frames.splice(i, 1);
+  if (E.frame === f) E.frame = E.frames[0] || null;
+  if (!E.frames.length) E.headless = true;
+  return true;
+}
+/* A part of the selected frame, or null with no frame. */
+const $ = name => (E.frame ? E.frame.el(name) : null);
 
 /* ---------- text primitives (0-based internally; Lisp sees 1-based) ---------- */
 function checkRO(b) { if (b.readOnly && !E.inhibitRO && !(L.get('inhibit-read-only') && L.get('inhibit-read-only').value)) signal('buffer-read-only', b); }
@@ -333,7 +370,7 @@ function lexOf(b, soft) {
   /* Redisplay (SOFT) does not wait for the lex of a big buffer when most of it must be lexed (the
      first time, or after a change of more than 1MB): the worker pool makes it and the text shows
      plain until then. A command that needs the classes lexes at once. */
-  if (soft && b.rope.length > (1 << 19) && window.EdPool && EdPool.ok) {
+  if (soft && b.rope.length > (1 << 19) && globalThis.EdPool && EdPool.ok) {
     if (b._lexBusy) return null;
     const sp = b._lc ? spanOf(b, b._lv) : null;
     if ((!sp || b.rope.length - sp.suf - sp.pre > (1 << 20)) && EdPool.lexAsync(b)) return null;
@@ -654,7 +691,7 @@ function message(s) {
     E.inhibitRO = was;
   }
 }
-function ding() { const f = $('frame'); if (!f) return; f.classList.remove('bell'); void f.offsetWidth; f.classList.add('bell'); }
+function ding() { const f = E.frame && E.frame.root; if (!f) return; f.classList.remove('bell'); void f.offsetWidth; f.classList.add('bell'); }
 function errorText(e) {
   if (e instanceof SchemeError) return L.errorMessage(e);
   if (e instanceof L.S.Raise) return L.errorMessage(e);
@@ -818,7 +855,7 @@ function miniCandidates(sync) {
   /* The base: the previous matches when this input narrows them (kept in list order), else all. */
   const base = m.matched && m.cacheAll === all && narrows(m.matchedKey, q) ? m.matched : all;
   const filter = list => { const out = []; for (const c of list) { let ok = true; for (const t of terms) if (!t.test(c)) { ok = false; break; } if (ok) out.push(c); } return out; };
-  if (!sync && base.length >= ASYNC_MIN && window.EdPool && EdPool.ok) {
+  if (!sync && base.length >= ASYNC_MIN && globalThis.EdPool && EdPool.ok) {
     if (m.asyncKey !== q) {
       m.asyncKey = q;
       const p = EdPool.filterAsync(base, terms);
@@ -1463,7 +1500,7 @@ function syncLines(view, lines) {
       if (byO === null) { byO = new Map(); for (let j = i; j < kids.length; j++) byO.set(kids[j]._o, kids[j]); }
       const m = byO.get(L0.o);
       if (m && m !== el && m._h === L0.html) { view.insertBefore(m, el || null); el = m; }
-      else if (!el) { el = document.createElement('div'); view.appendChild(el); }
+      else if (!el) { el = view.ownerDocument.createElement('div'); view.appendChild(el); }
     }
     if (byO !== null) byO.delete(el._o);
     if (el._h !== L0.html) { el.innerHTML = L0.html; el._h = L0.html; }
@@ -1501,21 +1538,16 @@ function lineHeight() { return metrics(E.sel).lh; }
    cost more than the rest of redisplay together. With long lines truncated the view can grow a
    scrollbar as its content changes, so the size is read every time then. */
 E.metricsGen = 0; E.sizeGen = 0;
-if (typeof document !== 'undefined' && document.fonts && document.fonts.addEventListener) document.fonts.addEventListener('loadingdone', () => { E.metricsGen++; render(); });
+host.page.onFontsLoaded(() => { E.metricsGen++; render(); });
 function sizeChanged() { E.sizeGen++; }
 /* A render from inside a frame callback (an animation frame, a resize observer, a media query
    change): the layout is computed in this frame anyway, so overlays place themselves at once
    instead of a frame late (E.inFrame). */
 function frameRender() { E.inFrame = true; try { render(); } finally { E.inFrame = false; } }
-if (typeof window !== 'undefined') {
-  window.addEventListener('resize', sizeChanged);
-  /* index.html's narrow-screen rule changes the text's font size and padding, which the style
-     cache holds: read it again when the rule starts or stops applying. */
-  const narrow = window.matchMedia ? window.matchMedia('(max-width: 560px)') : null;
-  const restyle = () => { E.metricsGen++; frameRender(); };
-  if (narrow && narrow.addEventListener) narrow.addEventListener('change', restyle);
-  else if (narrow && narrow.addListener) narrow.addListener(restyle);
-}
+host.page.onResize(sizeChanged);
+/* index.html's narrow-screen rule changes the text's font size and padding, which the style cache holds:
+   read it again when the rule starts or stops applying. */
+host.page.onMedia('(max-width: 560px)', () => { E.metricsGen++; frameRender(); });
 /* The observer watches each view's border box and compares it with the one the last render read,
    whatever the generation: the echo area changes after the windows are drawn, and that resize
    would otherwise wait for the next key. A scrollbar coming or going (long lines truncated) changes
@@ -1534,8 +1566,8 @@ function metrics(w) {
   const v = w.view, key = v.className + '|' + E.metricsGen;
   let m = w._m;
   if (!m || m.key !== key) {
-    const cs = getComputedStyle(v);
-    const probe = document.createElement('span');
+    const cs = v.ownerDocument.defaultView.getComputedStyle(v);
+    const probe = v.ownerDocument.createElement('span');
     probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;left:0;top:0';
     probe.textContent = '0'.repeat(64);
     v.appendChild(probe);
@@ -1569,13 +1601,13 @@ function fitsRows(seg, m, cols, nowrap) {
 }
 /* Build or update the DOM for the window tree, then draw each window. */
 function ensureWindowDom() {
-  const root = $('windows');
+  const root = $('windows'), doc = root.ownerDocument;
   const build = node => {
     if (node instanceof Window) {
       if (!node.el) {
-        node.el = document.createElement('div'); node.el.className = 'win'; node.el.dataset.wid = node.id;
-        node.view = document.createElement('div'); node.view.className = 'text'; node.view.setAttribute('role', 'textbox'); node.view.setAttribute('aria-multiline', 'true');
-        node.ml = document.createElement('div'); node.ml.className = 'modeline';
+        node.el = doc.createElement('div'); node.el.className = 'win'; node.el.dataset.wid = node.id;
+        node.view = doc.createElement('div'); node.view.className = 'text'; node.view.setAttribute('role', 'textbox'); node.view.setAttribute('aria-multiline', 'true');
+        node.ml = doc.createElement('div'); node.ml.className = 'modeline';
         node.ml.innerHTML = '<span class="ml-tag" hidden></span><span class="ml-state"></span><span class="ml-name"></span><span class="ml-pos"></span><span class="ml-mode"></span><span class="ml-extra"></span><span class="ml-cmd"></span>';
         node.el.appendChild(node.view); node.el.appendChild(node.ml);
         node.view._win = node; if (sizeWatch) sizeWatch.observe(node.view, { box: 'border-box' });
@@ -1583,7 +1615,7 @@ function ensureWindowDom() {
       }
       return node.el;
     }
-    if (!node.el) { node.el = document.createElement('div'); }
+    if (!node.el) { node.el = doc.createElement('div'); }
     node.el.className = 'split ' + node.dir;
     const kids = node.children.map(build);
     // Keep children in order; move or append as needed without rebuilding their contents.
@@ -1629,7 +1661,7 @@ function renderWindow(w) {
   let lines, fits = false;
   let cols = Math.floor((m.cw - (numbers ? (Math.max(2, String(total).length) + 2) * m.ch : 0)) / m.ch);
   /* centered-view-mode caps each line's text at --center-cols (index.html, set by extras.js). */
-  if (b.centered) cols = Math.min(cols, Number(document.documentElement.style.getPropertyValue('--center-cols')) || 100);
+  if (b.centered) cols = Math.min(cols, Number(host.page.getVar('center-cols')) || 100);
   // Wrapped lines take more than one row: render, measure, and move the start down until point fits.
   // When no shown line can wrap, every line is one row of m.lh and the geometry is known without layout.
   for (let tries = 0; tries < 4; tries++) {
@@ -1695,7 +1727,7 @@ function echoMoved(echo) {
   if (h !== echo._h) { echo._h = h; sizeChanged(); }
 }
 function render() {
-  if (!E.root || !E.sel || E.headless) return;
+  if (!E.root || !E.sel || !E.frame) return;
   ensureWindowDom();
   const echo = $('echo');
   echoMoved(echo);
@@ -1728,21 +1760,22 @@ function render() {
     if (look.prefixHelp && !E.isearch && (E.prompt === null || E.prompt === undefined)) setEcho(echo, `<span class="wkp">${esc(look.showcmd || '')}-</span>${look.prefixHelp}`, true);
     else setEcho(echo, text, false);
   }
-  $('frame').classList.toggle('unfocused', !E.focused);
+  E.frame.root.classList.toggle('unfocused', !E.focused);
   if (hooks.renderOverlay) hooks.renderOverlay();
 }
 
 /* ---------- pointer: map a screen point to a buffer position ---------- */
 function windowAt(x, y) {
-  const el = document.elementFromPoint(x, y);
+  const el = E.frame.root.ownerDocument.elementFromPoint(x, y);
   const we = el && el.closest ? el.closest('.win') : null;
   return we ? windowList().find(w => w.el === we) || null : null;
 }
 function posFromPoint(x, y, w) {
   w = w || windowAt(x, y) || E.sel;
   let node, off;
-  if (document.caretPositionFromPoint) { const r = document.caretPositionFromPoint(x, y); if (!r) return null; node = r.offsetNode; off = r.offset; }
-  else if (document.caretRangeFromPoint) { const r = document.caretRangeFromPoint(x, y); if (!r) return null; node = r.startContainer; off = r.startOffset; }
+  const doc = E.frame.root.ownerDocument;
+  if (doc.caretPositionFromPoint) { const r = doc.caretPositionFromPoint(x, y); if (!r) return null; node = r.offsetNode; off = r.offset; }
+  else if (doc.caretRangeFromPoint) { const r = doc.caretRangeFromPoint(x, y); if (!r) return null; node = r.startContainer; off = r.startOffset; }
   else return null;
   const view = w.view, t = w.buffer.text;
   if (node === view) {
@@ -1774,8 +1807,8 @@ ${lex}
 ${markDocstrings}
 ${forwardSexp}
 ${parenDepths}`;
-window.Ed = {
-  E, hooks, LEX_SOURCE, Store, Buffer, Keymap, PREFIX, C, SENTINEL, getBuffer, getBufferCreate, toBuffer, setWindowBuffer, otherBuffer, checkRO,
+globalThis.Ed = {
+  E, hooks, host, Frame, makeFrame, selectFrame, deleteFrame, LEX_SOURCE, Store, Buffer, Keymap, PREFIX, C, SENTINEL, getBuffer, getBufferCreate, toBuffer, setWindowBuffer, otherBuffer, checkRO,
   insertText, deleteText, replaceText, spanOf, changedSince, installLex, metrics, lastMatch, bol, eol, lineNo, column, posAtColumn, lastLineStart, lineStartOf, lex, lexOf, markDocstrings,
   forwardSexp, backwardSexp, upList, matchParen, indentLine, lispIndentFor, isLisp, modeFor, MODE_NAMES,
   normKey, kbd, defineKey, lookupIn, lookupKey, lookupWith, activeMaps, whereIs, keyName, keyChar, selfInsertable, message, ding,

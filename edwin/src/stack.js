@@ -5,19 +5,20 @@
    variables below), so hooks that evil-ex.js sets are wrapped once the page has loaded. */
 (function () {
 'use strict';
-const L = window.L, Ed = window.Ed, E = Ed.E, H = Ed.hooks, EC = window.EvilCore;
+const L = globalThis.L, Ed = globalThis.Ed, E = Ed.E, H = Ed.hooks, EC = globalThis.EvilCore;
 const { intern, signal, truthy, listOf, arr, NIL, Sym } = L;
 const { D, CMD } = L;
 const cur = () => E.current;
 const str = x => { if (typeof x !== 'string') signal('wrong-type-argument', 'expected a string, got', x); return x; };
 const nameOf = x => x instanceof Sym ? x.name : str(x);
-const whenLoaded = f => { if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', f); else f(); };
+const host = Ed.host, page = host.page;
+const whenLoaded = f => host.whenLoaded(f);
 
-/* ---------- small persistent tables beside the files (localStorage, in memory when it is unavailable) ---------- */
+/* ---------- small persistent tables beside the files (the host's storage, in memory when it is unavailable) ---------- */
 const mem = new Map();
 const Meta = {
-  get(k, dflt) { try { const v = localStorage.getItem('edwin:' + k); if (v !== null) return JSON.parse(v); } catch (e) { /* fall through */ } return mem.has(k) ? mem.get(k) : dflt; },
-  set(k, v) { mem.set(k, v); try { localStorage.setItem('edwin:' + k, JSON.stringify(v)); } catch (e) { /* in memory only */ } },
+  get(k, dflt) { try { const v = host.storage.get('edwin:' + k); if (v !== null) return JSON.parse(v); } catch (e) { /* fall through */ } return mem.has(k) ? mem.get(k) : dflt; },
+  set(k, v) { mem.set(k, v); try { host.storage.set('edwin:' + k, JSON.stringify(v)); } catch (e) { /* in memory only */ } },
 };
 /* A write that waits MS and runs once for a burst of calls. flush() runs a pending one now: the
    page flushes them all when it is hidden or closed, as Emacs saves from kill-emacs-hook. */
@@ -30,8 +31,7 @@ const later = (f, ms) => {
   return call;
 };
 const flushAll = () => { for (const run of [...pending]) { try { run(); } catch (e) { console.error(e); } } };
-addEventListener('pagehide', flushAll);
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushAll(); });
+host.onSuspend(flushAll);
 const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
 L.defvar('savehist-mode', true, 'Non-#f keeps the minibuffer histories (M-x, files, buffers, ex, search) across reloads.');
@@ -70,9 +70,8 @@ function extra(name) { try { return arr(L.get('savehist-additional-variables')).
   const save = later(write, 500);
   const prev = H.miniExit;
   H.miniExit = m => { if (prev) prev(m); save(); };
-  /* The kill ring changes without the minibuffer: it is written when the page goes away. */
-  addEventListener('pagehide', write);
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') write(); });
+  /* The kill ring changes without the minibuffer: it is written when the page (or the process) goes away. */
+  host.onSuspend(write);
 }
 
 /* ---------- prescient-persist-mode: the frequency table behind M-x, buffers and files ---------- */
@@ -249,19 +248,19 @@ CMD('yas-insert-snippet', async () => {
   if (!keys.length) signal('user-error', `No snippets for ${cur().mode}`);
   return [await Ed.readMini('Snippet: ', '', () => keys, { kind: 'snippet', require: true, annotate: k => { const s = lookupSnippet(cur().mode, k); return s ? s.doc || s.template.split('\n')[0] : ''; } })];
 }, 'KEY', 'Insert the snippet KEY at point, asking for its fields.', async ([key]) => { const b = cur(), s = lookupSnippet(b.mode, str(key)); if (!s) signal('user-error', `No snippet ${key}`); await expandTemplate(b, b.pt, b.pt, s.template); return false; });
-window.Yas = { keyAt, expand, snippets };
+globalThis.Yas = { keyAt, expand, snippets };
 
 /* ---------- themes: the two Modus tinted palettes of the CSS, by name ---------- */
 const THEMES = { 'modus-operandi-tinted': 'light', 'modus-vivendi-tinted': 'dark' };
 /* data-theme is shared with the host page: the value Edwin did not set itself is the host's, and
    auto (disable-theme) puts it back instead of removing the attribute. */
-let hostTheme = document.documentElement.dataset.theme, ownTheme;
+let hostTheme = page.getAttr('theme'), ownTheme;
 function setThemeAttr(v) {
-  const root = document.documentElement;
-  if (root.dataset.theme !== ownTheme) hostTheme = root.dataset.theme;
+  const now = page.getAttr('theme');
+  if (now !== ownTheme) hostTheme = now;
   ownTheme = v;
-  if (v === undefined) { if (hostTheme === undefined) delete root.dataset.theme; else root.dataset.theme = hostTheme; ownTheme = hostTheme; }
-  else root.dataset.theme = v;
+  if (v === undefined) { page.setAttr('theme', hostTheme); ownTheme = hostTheme; }
+  else page.setAttr('theme', v);
 }
 function applyTheme(name) {
   if (!name || name === 'auto') { setThemeAttr(undefined); Meta.set('theme', null); }
@@ -317,7 +316,7 @@ function grepLines(name, text, src, flags, max) {
   return out;
 }
 function projectGrepJob(args, ctx) { return grepLines(args.name, args.text != null ? args.text : ctx.buffer(args.id), args.src, args.flags, args.max); }
-const pooled = () => window.EdPool && typeof EdPool.define === 'function' && typeof EdPool.run === 'function' && typeof EdPool.map === 'function';
+const pooled = () => globalThis.EdPool && typeof EdPool.define === 'function' && typeof EdPool.run === 'function' && typeof EdPool.map === 'function';
 if (pooled()) { try { EdPool.define('project-grep', projectGrepJob, [grepLines]); } catch (e) { console.error(e); } }
 async function grepAll(items, buffers) {
   if (pooled() && EdPool.ok) {
@@ -369,7 +368,7 @@ CMD('project-find-regexp', async () => {
 });
 L.put(intern('project-find-regexp'), 'evil-jump', true);
 L.addHook('post-command-pulse', intern('project-find-regexp'));
-window.Stack = { grepLines, calcEval, Meta, places: () => places, recent: () => recent };
+globalThis.Stack = { grepLines, calcEval, Meta, places: () => places, recent: () => recent };
 
 /* ---------- the echo area: which-key waits, the root carries the Evil state, snipe matches are boxed ---------- */
 /* The bindings of a pending prefix are rendered at once (the echo text is what it always was) and
@@ -389,8 +388,7 @@ function wrapLook() {
         if (!wkTimer) wkTimer = setTimeout(() => { wkTimer = null; if (E.pendingKeys && E.pendingKeys === wkKeys) Ed.render(); }, left + 5);
       }
     } else wkKeys = '';
-    const root = document.documentElement;
-    if (wait) root.dataset.whichKey = 'wait'; else if (root.dataset.whichKey) delete root.dataset.whichKey;
+    page.setAttr('which-key', wait ? 'wait' : undefined);
     return o;
   };
 }
@@ -415,24 +413,25 @@ function rectAt(w, p, len) {
   const ln = view.querySelector(`.ln[data-o="${ls}"]`);
   if (!ln) return null;
   let off = p - ls, startNode = null, startOff = 0;
-  const walker = document.createTreeWalker(ln, NodeFilter.SHOW_TEXT);
+  const doc = ln.ownerDocument, walker = doc.createTreeWalker(ln, 4 /* NodeFilter.SHOW_TEXT */);
   for (let node = walker.nextNode(); node; node = walker.nextNode()) {
     const n = node.nodeValue.length;
     if (!startNode) { if (off < n) { startNode = node; startOff = off; off += len; } else { off -= n; continue; } }
-    if (startNode && off <= n) { const r = document.createRange(); r.setStart(startNode, startOff); r.setEnd(node, off); const rs = r.getClientRects(); return rs.length ? rs[0] : null; }
+    if (startNode && off <= n) { const r = doc.createRange(); r.setStart(startNode, startOff); r.setEnd(node, off); const rs = r.getClientRects(); return rs.length ? rs[0] : null; }
     if (startNode) off -= n;
   }
   return null;
 }
 function drawSnipe() {
-  let el = document.getElementById('snipe');
+  const f = E.frame; if (!f) return;
+  let el = f.el('snipe');
   const h = E.snipeHl, w = E.sel;
   if (!h || !w || w.buffer !== h.b || E.mini) { if (el) el.hidden = true; return; }
-  if (!el) { el = document.createElement('div'); el.id = 'snipe'; document.getElementById('frame').appendChild(el); }
+  if (!el) { el = f.root.ownerDocument.createElement('div'); el.id = 'snipe'; f.root.appendChild(el); f.parts.snipe = el; }
   const b = h.b, t = b.rope, fold = h.str === h.str.toLowerCase();
   const first = w.start, last = Ed.eol(t, Ed.lineStartB(b, Math.max(1, w.lastLine || Ed.lineNoB(b, w.start))));
   const hay = t.slice(first, Math.min(t.length, last + h.str.length)), nd = fold ? h.str.toLowerCase() : h.str, src = fold ? hay.toLowerCase() : hay;
-  const frame = document.getElementById('frame').getBoundingClientRect(), boxes = [];
+  const frame = f.root.getBoundingClientRect(), boxes = [];
   for (let k = src.indexOf(nd), n = 0; k >= 0 && n < 200; k = src.indexOf(nd, k + 1), n++) {
     if (!h.whole && (h.fwd ? first + k < h.pt : first + k > h.pt)) continue;
     const r = rectAt(w, first + k, h.str.length);
@@ -445,8 +444,7 @@ function drawSnipe() {
   H.renderOverlay = () => {
     if (prev) prev();
     const b = E.sel && E.sel.buffer, st = b && E.evil ? EC.stateOf(b) : null;
-    const val = E.mini ? 'minibuffer' : st || 'emacs', root = document.documentElement;
-    if (root.dataset.evilState !== val) root.dataset.evilState = val;
+    page.setAttr('evil-state', E.mini ? 'minibuffer' : st || 'emacs');
     drawSnipe();
   };
 }

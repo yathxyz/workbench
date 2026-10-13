@@ -9,11 +9,11 @@
    on the main thread, only without parallelism. */
 (function () {
 'use strict';
-const Ed = window.Ed, E = Ed.E, H = Ed.hooks, L = window.L, S = L.S;
+const Ed = globalThis.Ed, E = Ed.E, H = Ed.hooks, L = globalThis.L, S = L.S;
 const { intern, NIL, UNSPEC, listOf, arr, truthy, SchemeError, Sym, Pair } = L;
 const { D, CMD } = L;
 
-const SIZE = Math.min(6, Math.max(1, (navigator.hardwareConcurrency || 2) - 1));
+const SIZE = Math.min(6, Math.max(1, ((globalThis.navigator && navigator.hardwareConcurrency) || 2) - 1));
 const DELTA_CAP = 4096;          // a mirror more than this many versions behind is reset, not patched (trimLog's own cutoff)
 const MIRROR_BUDGET = 64 << 20;  // per worker: total mirror characters before LRU eviction
 const SCHEME_TIMEOUT = 30000;    // watchdog limit for Scheme jobs in a worker (the main thread uses 8000)
@@ -298,8 +298,8 @@ const codec = mainG.EdCodec;
 const bufferById = id => E.buffers.find(b => b.id === id) || (E.minibuf.id === id ? E.minibuf : null);
 codec.hooks.buffer = h => bufferById(h.id) || false;
 
-const canWorkers = typeof Worker === 'function' && typeof Blob === 'function' && !!window.ropeSource && !!Ed.LEX_SOURCE;
-const hasScheme = !!(window.schemeSource && window.runtimeSource);
+const canWorkers = typeof Worker === 'function' && typeof Blob === 'function' && !!globalThis.ropeSource && !!Ed.LEX_SOURCE;
+const hasScheme = !!(globalThis.schemeSource && globalThis.runtimeSource);
 const registry = new Map();         // job name -> { name, fn, src, depsSrc, localOnly }
 const urls = { true: null, false: null };
 const jobSource = j => 'JOBS[' + JSON.stringify(j.name) + '] = (function () { ' + j.depsSrc + '\nreturn (' + j.src + '); })();';
@@ -308,9 +308,9 @@ function buildUrl(withScheme) {
   if (urls[key]) return urls[key];
   const parts = [
     'self.window = self;',
-    window.ropeSource,
-    withScheme ? window.schemeSource : '',
-    withScheme ? window.runtimeSource : '',
+    globalThis.ropeSource,
+    withScheme ? globalThis.schemeSource : '',
+    withScheme ? globalThis.runtimeSource : '',
     Ed.LEX_SOURCE,
     '(' + codecModule.toString() + ')(self);',
     'self.JOBS = Object.create(null);',
@@ -339,7 +339,7 @@ const lastSlotFor = new Map();      // affinity key -> k
 const threadLocal = new Set();      // names never copied by shipping (define-thread-local)
 const mkErr = (kind, msg) => new SchemeError(kind, msg || kind, []);
 const jobsOf = b => b._jobs || (b._jobs = new Map());
-const idle = window.requestIdleCallback ? f => window.requestIdleCallback(f, { timeout: 1000 }) : f => setTimeout(f, 50);
+const idle = f => Ed.host.idle(f);
 
 function mkSlot(k) {
   return { k, w: null, url: null, ready: false, scheme: false, busy: null, gen: 0, mirrors: new Map(), meta: new Map(), have: new Map(), names: null, macros: null,
@@ -1512,7 +1512,7 @@ CMD('consult-grep', async () => [await Ed.readMini('Grep: ', '', null, { history
   return false;
 });
 
-window.EdPool = {
+globalThis.EdPool = {
   get ok() { return isOk(); },
   get scheme() { return schemeState === 'yes' && slots.some(s => s && s.ready && s.scheme); },
   get size() { return size; }, set size(n) { setSize(n); },

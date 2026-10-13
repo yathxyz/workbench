@@ -4,10 +4,9 @@
    and the ex command line. Motions, operators, text objects and key bindings live in evil.el. */
 (function () {
 'use strict';
-const L = window.L, Ed = window.Ed, E = Ed.E, H = Ed.hooks;
+const L = globalThis.L, Ed = globalThis.Ed, E = Ed.E, H = Ed.hooks;
 const { intern, NIL, signal, pr, arr, listOf, truthy, Sym } = L;
 const bool = b => !!b, T = true;
-const $ = id => document.getElementById(id);
 const cur = () => E.current;
 const num = x => { if (typeof x !== 'number') signal('wrong-type-argument', 'expected an integer, got', x); return Math.trunc(x); };
 const str = x => { if (typeof x !== 'string') signal('wrong-type-argument', 'expected a string, got', x); return x; };
@@ -119,7 +118,7 @@ D('evil-global-set-key', 'STATE KEY DEF', 'Bind KEY to DEF in the global keymap 
 D('evil-state-keymap', 'STATE', 'The global keymap of STATE.', ([s]) => stateTargets(s, false)[0]);
 
 /* ---------- registers ---------- */
-const clip = s => { try { navigator.clipboard?.writeText(s).catch(() => {}); } catch (e) {} };
+const clip = s => Ed.host.setClipboard(s);
 function regKey(r) { return r === null || L.absent(r) ? '"' : (chr(r) ?? String(r)); }
 function regGet(r) {
   const c = regKey(r), b = cur();
@@ -637,7 +636,7 @@ CMD('evil-execute-macro', async () => [E.prefixArg === null ? 1 : Ed.prefixNumer
   'Run the keys in REGISTER COUNT times. @@ repeats the last one, @: the last ex command.', async ([count, r]) => {
     let c = chr(r);
     if (c === '@') { if (!E.lastMacro) signal('user-error', 'No previously used register'); c = E.lastMacro; }
-    if (c === ':') { E.lastMacro = ':'; if (!E.lastEx) signal('user-error', 'No previous command line'); for (let k = 0; k < count; k++) await window.EvilCore.exExecute(E.lastEx); return false; }
+    if (c === ':') { E.lastMacro = ':'; if (!E.lastEx) signal('user-error', 'No previous command line'); for (let k = 0; k < count; k++) await globalThis.EvilCore.exExecute(E.lastEx); return false; }
     const e = regGet(c);
     if (!e) signal('user-error', `Register ${c} is empty`);
     E.lastMacro = c;
@@ -971,5 +970,5 @@ CMD('evil-scroll-line-to-top', '', '', 'Scroll so the line with point is at the 
 CMD('evil-scroll-line-to-bottom', '', '', 'Scroll so the line with point is at the bottom (zb).', () => { E.recenter = 'bottom'; return false; });
 
 for (const n of ['evil-repeat', 'evil-undo', 'evil-redo', 'evil-execute-macro', 'undo', 'undo-redo', 'evil-record-macro']) put(n, 'evil-repeat', intern('abort'));
-window.EvilCore = { stateOf, setState, visualBounds, visualRange, readRange, regGet, storeYank, keysToText, textToKeys, clampNormal, firstNonBlank, blockRanges, pushJump, exitVisual, enterInsert, defvar, D, CMD, put, get, aux, KM };
+globalThis.EvilCore = { stateOf, setState, visualBounds, visualRange, readRange, regGet, storeYank, keysToText, textToKeys, clampNormal, firstNonBlank, blockRanges, pushJump, exitVisual, enterInsert, defvar, D, CMD, put, get, aux, KM };
 })();

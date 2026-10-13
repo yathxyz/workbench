@@ -2616,6 +2616,7 @@ FILES    Files are kept in this browser's storage.  emacs.scm, evil.scm
 
 ;;; org.scm ends here
 </script>
+<script src="src/host-browser.js"></script>
 <script src="src/scheme.js"></script>
 <script src="src/runtime.js"></script>
 <script src="src/text.js"></script>
@@ -2629,5 +2630,9 @@ FILES    Files are kept in this browser's storage.  emacs.scm, evil.scm
 <script src="src/ai.js"></script>
 <script src="src/evil-ex.js"></script>
 <script src="src/org.js"></script>
+<script>
+/* R9.1: boot once all the core files have loaded, with this page as the host and #frame as the one frame. */
+Ed.boot({ host: EdHost, frame: Ed.makeFrame(document.getElementById('frame'), { input: document.getElementById('input') }) });
+</script>
 
 </body></html>

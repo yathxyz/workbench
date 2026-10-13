@@ -2,7 +2,7 @@
 // One Edwin per process (it keeps its state in globals), so the cases run in order on fresh buffers.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { startEdwin, touched } from './headless.mjs';
+import { startEdwin } from './headless.mjs';
 
 const ed = await startEdwin();
 let n = 0;
@@ -91,7 +91,32 @@ test('Org: a heading, a TODO state from the minibuffer and a demote', async () =
   assert.match(ed.text(), /^\*\* TODO task/);
 });
 
-test('the page objects the core still touches at load (E0 removes these)', () => {
-  // Not a behaviour check: it prints what is left for E0, so the list shrinks in the diff as the work goes on.
-  console.log('page objects touched:', JSON.stringify(Object.fromEntries(touched)));
+test('no page objects exist in this process: the core reached none to boot (R4.1)', () => {
+  assert.equal(typeof document, 'undefined');
+  assert.equal(typeof window, 'undefined');
+  assert.equal(typeof localStorage, 'undefined');
+  assert.equal(ed.E.headless, true);
+  assert.equal(ed.E.frame, null);
+  assert.equal(ed.eval('(selected-frame)'), false);
+});
+
+test('Org commands exist after boot (R9.1: boot runs after all 13 files)', () => {
+  for (const c of ['org-todo', 'org-agenda', 'org-capture', 'org-roam-node-find', 'org-cycle'])
+    assert.ok(ed.L.isCommand(ed.L.intern(c)), c);
+});
+
+test('the shipped Scheme in scm/ is what index.html carries', async () => {
+  const { readFileSync } = await import('node:fs');
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  for (const name of ['emacs', 'evil', 'org', 'ai', 'init']) {
+    const m = new RegExp(`<script type="text/x-scheme" id="${name}-scm">\\n([\\s\\S]*?)</script>`).exec(html);
+    assert.ok(m, name);
+    assert.equal(m[1], readFileSync(new URL(`../scm/${name}.scm`, import.meta.url), 'utf8'), name + '.scm');
+  }
+});
+
+test('persistent tables flush through the host when the process suspends', async () => {
+  await ed.type(':e flush.txt\n');
+  ed.host.suspend();
+  assert.ok(ed.host.storage.keys().some(k => k === 'edwin:savehist'));
 });

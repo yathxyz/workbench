@@ -6,14 +6,14 @@
    so the chat code never sees provider details. The Scheme API is documented at the top of ai.scm. */
 (function () {
 'use strict';
-const L = window.L, Ed = window.Ed, E = Ed.E, H = Ed.hooks, EC = window.EvilCore;
+const L = globalThis.L, Ed = globalThis.Ed, E = Ed.E, H = Ed.hooks, EC = globalThis.EvilCore;
 const { intern, signal, truthy, listOf, arr, NIL, Sym } = L;
 const { D, CMD } = L;
 const cur = () => E.current;
 const { bol, eol } = Ed;
 const str = x => { if (typeof x !== 'string') signal('wrong-type-argument', 'expected a string, got', x); return x; };
 const KEY_PFX = 'gptel/keys/';          // where older versions kept keys, as files (migrated at load)
-const SECRET_PFX = 'lmacs:secret:gptel/'; // localStorage prefix outside the file namespace
+const SECRET_PFX = 'lmacs:secret:gptel/'; // storage prefix outside the file namespace
 const SANDBOX = 'blocked by the artifact sandbox: run Edwin from your own host, or use an mcp backend';
 
 L.defvar('gptel-backend', 'Claude', 'Name of the backend gptel-send uses (see gptel-backends).');
@@ -57,19 +57,19 @@ function useCap(name) {
 }
 /* Hosts the page's CSP refused: the definitive sign of the sandbox. */
 const cspBlocked = new Set();
-try { document.addEventListener('securitypolicyviolation', e => { if (e.blockedURI) cspBlocked.add(hostOf(e.blockedURI)); }); } catch (e) { /* no document */ }
+Ed.host.onCspViolation(e => { if (e.blockedURI) cspBlocked.add(hostOf(e.blockedURI)); });
 
 /* ---------- API keys: never in init.scm, never files ---------- */
-/* Keys live under their own localStorage prefix, not in Ed.Store: the Store is the file namespace that
+/* Keys live under their own storage prefix, not in Ed.Store: the Store is the file namespace that
    grep, find-file, recent files and project search list, and the model's grep tool reads it. */
 const secretMem = new Map();
 function getKey(name) {
-  try { const v = localStorage.getItem(SECRET_PFX + name); if (v !== null) return v; } catch (e) { /* no storage */ }
+  try { const v = Ed.host.storage.get(SECRET_PFX + name); if (v !== null) return v; } catch (e) { /* no storage */ }
   return secretMem.has(name) ? secretMem.get(name) : null;
 }
 function setKey(name, key) {
-  if (key) { secretMem.set(name, key); try { localStorage.setItem(SECRET_PFX + name, key); } catch (e) { /* memory only */ } }
-  else { secretMem.delete(name); try { localStorage.removeItem(SECRET_PFX + name); } catch (e) { /* memory only */ } }
+  if (key) { secretMem.set(name, key); try { Ed.host.storage.set(SECRET_PFX + name, key); } catch (e) { /* memory only */ } }
+  else { secretMem.delete(name); try { Ed.host.storage.remove(SECRET_PFX + name); } catch (e) { /* memory only */ } }
 }
 /* Move keys saved as gptel/keys/<backend> files by older versions out of the file Store. */
 function migrateKeys() {
@@ -386,7 +386,7 @@ function defTool(name, description, inputSchema, execute) { TOOLS[name] = { name
    by that reader as its argument and the command would be lost. */
 function feedAtTopLevel(name) {
   const k = `<cmd:${name}>`;
-  if (window.EdPool && typeof EdPool.deliver === 'function') EdPool.deliver(() => Ed.feedKey(k));
+  if (globalThis.EdPool && typeof EdPool.deliver === 'function') EdPool.deliver(() => Ed.feedKey(k));
   else Ed.feedKey(k);
 }
 /* Confirmations run inside the command loop (the minibuffer is a recursive edit there): the tool
@@ -431,7 +431,7 @@ function grepFiles(a) {
   }
   return out.join('\n');
 }
-if (window.EdPool && typeof EdPool.define === 'function') { try { EdPool.define('gptel-grep', grepFiles); } catch (e) { /* main thread */ } }
+if (globalThis.EdPool && typeof EdPool.define === 'function') { try { EdPool.define('gptel-grep', grepFiles); } catch (e) { /* main thread */ } }
 defTool('grep', 'Search the saved files (and, optionally, only those whose name contains FILE) for a regular expression. Returns file:line: text, at most 200 matches.',
   { type: 'object', properties: { regex: { type: 'string' }, file: { type: 'string', description: 'Only files whose name contains this' } }, required: ['regex'] },
   async ({ regex, file }) => {
@@ -439,7 +439,7 @@ defTool('grep', 'Search the saved files (and, optionally, only those whose name 
     const names = Ed.Store.list().filter(n => !file || n.includes(String(file)));
     const files = names.map(n => [n, Ed.Store.get(n) || '']);
     const args = { regex: String(regex), files, max: 200 };
-    if (window.EdPool && EdPool.ok && typeof EdPool.run === 'function') { try { return await EdPool.run('gptel-grep', args); } catch (e) { /* fall through */ } }
+    if (globalThis.EdPool && EdPool.ok && typeof EdPool.run === 'function') { try { return await EdPool.run('gptel-grep', args); } catch (e) { /* fall through */ } }
     return grepFiles(args) || '(no matches)';
   });
 defTool('eval_scheme', 'Evaluate Scheme code in the editor and return the printed result. The user confirms first.',
@@ -946,5 +946,5 @@ D('gptel-backends', '', 'Names of the defined backends.', () => listOf(Object.ke
 D('gptel-presets', '', 'Names of the defined presets.', () => listOf(Object.keys(presets)));
 D('gptel-chat-buffer?', '&optional BUFFER', '#t when BUFFER is a gptel chat buffer.', ([b]) => isChat(b === undefined ? cur() : Ed.toBuffer(b)));
 
-window.EdAI = { backends, presets, tools: TOOLS, AIError, send, buildRequest, parseChat, isChat, mcpManifest, getKey, setKey, keyOf, migrateKeys, grepFiles, memoryText, remember, active, makeClaude, makeOpenAI, makeAnthropic, makeMcp, SANDBOX };
+globalThis.EdAI = { backends, presets, tools: TOOLS, AIError, send, buildRequest, parseChat, isChat, mcpManifest, getKey, setKey, keyOf, migrateKeys, grepFiles, memoryText, remember, active, makeClaude, makeOpenAI, makeAnthropic, makeMcp, SANDBOX };
 })();

@@ -1284,7 +1284,7 @@ const Scheme = {
 g.Scheme = Scheme;
 if (typeof module !== 'undefined') module.exports = Scheme;
 }
-schemeModule(window);
+schemeModule(globalThis);
 /* The module is a function so a worker can be built from its source (pool.js). */
-window.schemeSource = '(' + schemeModule.toString() + ')(self);';
+globalThis.schemeSource = '(' + schemeModule.toString() + ')(self);';
 })();
