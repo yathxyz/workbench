@@ -118,7 +118,7 @@ in
   '';
 
   # SIGKILL at 1,000 random points under a three-client load, a journal torn at every byte offset, and a
-  # full disk during save and journal append (R16.5–R16.7). About eight minutes.
+  # full disk during save and journal append (R16.5–R16.7). About thirteen minutes.
   edit-crash = pkgs.runCommand "workbench-edit-crash" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
     node --test ${edwind}/edwin/test/crash.test.mjs
