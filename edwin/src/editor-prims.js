@@ -7,7 +7,10 @@ const bool = b => !!b, T = true;
 const host = Ed.host;
 
 const cur = () => E.current;
-const num = x => { if (typeof x !== 'number') signal('wrong-type-argument', 'expected an integer, got', x); return Math.trunc(x); };
+const num = x => {
+  if (x instanceof Ed.Marker) { if (x.pos === null) signal('error', 'Marker does not point anywhere'); return x.pos + 1; }
+  if (typeof x !== 'number') signal('wrong-type-argument', 'expected an integer, got', x); return Math.trunc(x);
+};
 const str = x => { if (typeof x !== 'string') signal('wrong-type-argument', 'expected a string, got', x); return x; };
 const optNum = (x, d) => L.absent(x) ? d : num(x);
 const clampPos = (b, p) => Math.max(0, Math.min(b.rope.length, p));
@@ -339,6 +342,7 @@ CMD('switch-to-buffer', 'BSwitch to buffer: ', 'BUFFER-OR-NAME', 'Display BUFFER
 CMD('kill-buffer', 'bKill buffer: ', '&optional BUFFER-OR-NAME', 'Kill the buffer.', ([n]) => {
   const b = Ed.toBuffer(n === undefined ? false : n);
   if (b === E.minibuf) return false;
+  if (E.buffers.includes(b)) { const save = E.current; E.current = b; try { Ed.runHookSafely('kill-buffer-hook', []); } finally { E.current = save === b ? b : save; } }
   E.buffers = E.buffers.filter(x => x !== b);
   if (!E.buffers.length) Ed.getBufferCreate('*scratch*');
   for (const w of Ed.windowList()) {
@@ -349,6 +353,7 @@ CMD('kill-buffer', 'bKill buffer: ', '&optional BUFFER-OR-NAME', 'Kill the buffe
   }
   for (const w of Ed.windowList()) w.prev = w.prev.filter(x => x !== b);
   if (E.current === b) E.current = E.mini ? E.minibuf : E.win;
+  Ed.runHookSafely('buffer-list-update-hook', []);
   return T;
 });
 CMD('rename-buffer', 'sRename buffer (to new name): ', 'NEWNAME', 'Change the current buffer’s name.', ([n]) => {
@@ -362,7 +367,7 @@ CMD('quit-window', '', '', 'Stop showing this buffer: close its window if it was
   Ed.setWindowBuffer(prev); return false;
 });
 for (const mode of ['fundamental-mode', 'scheme-mode', 'scheme-interaction-mode', 'special-mode', 'text-mode', 'org-mode'])
-  CMD(mode, '', '', `Switch the current buffer to ${Ed.MODE_NAMES[mode]} mode.`, () => { cur().mode = mode; return false; });
+  CMD(mode, '', '', `Switch the current buffer to ${Ed.MODE_NAMES[mode]} mode.`, () => Ed.switchMajorMode(cur(), mode));
 D('%save-excursion', 'thunk', 'Call THUNK, then restore the current buffer and point.', ([f]) => {
   const b = cur(), p = b.pt, w = E.current;
   try { return L.apply(f, []); }
@@ -627,6 +632,8 @@ function describeFn(sym) {
   let out = `${name} is ${inter}.\n\n`;
   if (keys.length) out += `It is bound to ${keys.join(', ')}.\n\n`;
   out += signature(name, f) + '\n\n' + (f.doc || 'Not documented.') + '\n';
+  const ads = Ed.adviceOf(name);
+  if (ads.length) out += '\nThis procedure has advice:\n' + ads.map(a => `  ${a.how} ${a.name || a.fn.procName || pr(a.fn, true)}`).join('\n') + '\n';
   if (f.props && f.props.size) out += '\nProperties: ' + [...f.props].map(([k, v]) => `${k.name} = ${pr(v, true)}`).join(', ') + '\n';
   if (f.procName && f.procName !== name) out = `${name} is an alias for ‘${f.procName}’.\n\n` + out;
   return out;
@@ -689,6 +696,7 @@ function visit(name) {
   if (Ed.hooks.visited) Ed.hooks.visited(b, name, true);
   Ed.setWindowBuffer(b);
   if (content === null) Ed.message('(New file)');
+  { const save = E.current; E.current = b; try { L.resetOps(); L.runHook('find-file-hook'); } catch (e) { Ed.reportError(e); } finally { E.current = save; } }
   return b;
 }
 Ed.visit = visit;
@@ -782,6 +790,256 @@ D('major-mode', '[buffer]', 'The major mode of BUFFER as a symbol.', ([b]) => in
 D('set-major-mode!', 'mode [buffer]', 'Set the major mode of BUFFER.', ([m, b]) => { Ed.toBuffer(b === undefined ? false : b).mode = m.name; return m; });
 D('mark-active?', '', '#t if the mark is active.', () => cur().markActive);
 
+/* ---------- markers (R6.11, R6.14): positions that follow edits ---------- */
+const toMarker = (m, who) => (m instanceof Ed.Marker ? m : signal('wrong-type-argument', `${who}: expected a marker, got`, m));
+const markerType = t => (t === false || t === undefined || t === NIL ? 'before' : 'after');
+D('markerp', 'object', '#t if OBJECT is a marker.', ([x]) => x instanceof Ed.Marker);
+alias('marker?', 'markerp');
+D('make-marker', '', 'A new marker that points nowhere.', () => new Ed.Marker(null, null));
+D('point-marker', '', 'A new marker at point in the current buffer.', () => cur().marker(cur().pt));
+D('mark-marker', '', 'The marker of the mark in the current buffer (it moves with the mark).', () => cur()._mark);
+D('copy-marker', 'position [type]', 'A new marker at POSITION (a number or marker); TYPE non-#f makes it advance past text inserted at it.', ([p, t]) => {
+  const b = p instanceof Ed.Marker ? p.buffer || cur() : cur();
+  return b.marker(clampPos(b, num(p) - 1), markerType(t));
+});
+D('set-marker', 'marker position [buffer]', 'Point MARKER at POSITION in BUFFER (default current); POSITION #f makes it point nowhere.', ([m, p, buf]) => {
+  m = toMarker(m, 'set-marker');
+  if (p === false || p === NIL) { m.release(); return m; }
+  const b = L.absent(buf) ? (p instanceof Ed.Marker && p.buffer ? p.buffer : cur()) : Ed.toBuffer(buf);
+  return m.set(b, clampPos(b, num(p) - 1));
+});
+alias('move-marker', 'set-marker');
+D('marker-position', 'marker', 'The position MARKER points at, or #f.', ([m]) => { m = toMarker(m, 'marker-position'); return m.pos === null || !m.buffer ? false : m.pos + 1; });
+D('marker-buffer', 'marker', 'The buffer MARKER points into, or #f.', ([m]) => toMarker(m, 'marker-buffer').buffer || false);
+D('marker-insertion-type', 'marker', '#t if MARKER advances past text inserted at it.', ([m]) => toMarker(m, 'marker-insertion-type').type === 'after');
+D('set-marker-insertion-type', 'marker type', 'TYPE non-#f makes MARKER advance past text inserted at it; #f keeps it before.', ([m, t]) => { toMarker(m, 'set-marker-insertion-type').type = markerType(t); return t; });
+
+/* ---------- hooks (R4.22): every JS hook user code may want has a Scheme hook variable ---------- */
+for (const [name, doc] of [
+  ['pre-command-hook', 'Procedures called before each command.'],
+  ['before-change-functions', 'Procedures called with (beg end) before a change to the text of the current buffer.'],
+  ['after-change-functions', 'Procedures called with (beg end old-len) after a change to the text of the current buffer.'],
+  ['find-file-hook', 'Procedures called after a file is visited, with its buffer current.'],
+  ['before-save-hook', 'Procedures called before a buffer is saved.'],
+  ['after-save-hook', 'Procedures called after a buffer is saved.'],
+  ['kill-buffer-hook', 'Procedures called with the buffer current before it is killed.'],
+  ['buffer-list-update-hook', 'Procedures called when a buffer is made or killed.'],
+  ['window-configuration-change-hook', 'Procedures called after a command changes the windows or what they show.'],
+  ['focus-in-hook', 'Procedures called when a frame gets the keyboard.'],
+  ['focus-out-hook', 'Procedures called when a frame loses the keyboard.'],
+]) L.defvar(name, NIL, doc);
+L.magic('inhibit-modification-hooks', () => !!E.inhibitModHooks, v => { E.inhibitModHooks = truthy(v); }, 'Non-#f stops before- and after-change-functions from running.');
+D('edit-origin', '', 'Who made the change a change hook is running for: local, remote, server, disk or agent (R4.23).', () => intern(E.editOrigin));
+
+/* ---------- buffer-local variables (R4.26) ---------- */
+const symName = (x, who) => (x instanceof Sym ? x.name : signal('wrong-type-argument', `${who}: expected a symbol, got`, x));
+const bufArg = b => (L.absent(b) ? cur() : Ed.toBuffer(b));
+D('make-local-variable', 'variable', 'Give VARIABLE a value of its own in the current buffer, starting from the default value.', ([v]) => { Ed.makeLocal(cur(), symName(v, 'make-local-variable')); return v; });
+D('make-variable-buffer-local', 'variable', 'Make VARIABLE get a buffer-local value whenever it is set.', ([v]) => { Ed.localize(symName(v, 'make-variable-buffer-local')).auto = true; return v; });
+D('kill-local-variable', 'variable', 'Drop the current buffer’s own value of VARIABLE.', ([v]) => { const b = cur(); if (b.locals) b.locals.delete(symName(v, 'kill-local-variable')); return v; });
+D('local-variable-p', 'variable [buffer]', '#t if VARIABLE has a value of its own in BUFFER.', ([v, b]) => { b = bufArg(b); return !!(b.locals && b.locals.has(symName(v, 'local-variable-p'))); });
+D('buffer-local-value', 'variable buffer', 'The value of VARIABLE in BUFFER.', ([v, b]) => {
+  const n = symName(v, 'buffer-local-value'), x = Ed.localValue(Ed.toBuffer(b), n);
+  if (x === undefined) signal('void-variable', v); return x;
+});
+D('buffer-local-variables', '[buffer]', 'An alist of the buffer-local variables of BUFFER and their values.', ([b]) => { b = bufArg(b); return listOf(b.locals ? [...b.locals].map(([k, x]) => L.cons(intern(k), x)) : []); });
+D('kill-all-local-variables', '', 'Drop every buffer-local value of the current buffer except those whose permanent-local property is set.', () => {
+  const b = cur(); if (b.locals) for (const k of [...b.locals.keys()]) if (!truthy(symProp(k, 'permanent-local'))) b.locals.delete(k); return false;
+});
+D('default-value', 'variable', 'The default value of VARIABLE, the one buffers without their own see.', ([v]) => { const x = Ed.defaultValue(symName(v, 'default-value')); if (x === undefined) signal('void-variable', v); return x; });
+D('set-default', 'variable value', 'Set the default value of VARIABLE.', ([v, x]) => Ed.setDefault(symName(v, 'set-default'), x));
+D('%set-local!', 'variable value', 'Give VARIABLE the value VALUE in the current buffer only (setq-local).', ([v, x]) => { const n = symName(v, 'setq-local'), b = cur(); Ed.makeLocal(b, n); b.locals.set(n, x); return x; });
+D('%defvar', 'variable value-thunk doc local', 'defvar: give VARIABLE the value of VALUE-THUNK unless it is bound; LOCAL makes it buffer-local when set.', ([v, th, doc, local]) => {
+  const n = symName(v, 'defvar');
+  if (Ed.defaultValue(n) === undefined && L.get(n) === undefined) { const x = typeof th === 'function' ? L.apply(th, []) : false; if (Ed.localized.has(n)) Ed.setDefault(n, x); else L.set(n, x); }
+  if (typeof doc === 'string') L.S.gdoc.set(n, doc);
+  if (truthy(local)) Ed.localize(n).auto = true;
+  return v;
+});
+
+/* ---------- symbol properties: (put 'sym 'prop value), (get 'sym 'prop) ---------- */
+const plists = new Map();
+function symProp(name, prop) { const p = plists.get(name); const v = p ? p.get(prop) : undefined; return v === undefined ? false : v; }
+D('put', 'symbol property value', 'Set PROPERTY of SYMBOL to VALUE. (put \'var \'shared-local #t) makes a buffer-local travel with the buffer (E3).', ([s, p, v]) => {
+  const n = symName(s, 'put'), k = symName(p, 'put');
+  let pl = plists.get(n); if (!pl) plists.set(n, pl = new Map()); pl.set(k, v);
+  const f = L.fnOrNull(s); if (f) L.put(s, k, v);
+  return v;
+});
+D('get', 'symbol property', 'The value of PROPERTY of SYMBOL, or #f.', ([s, p]) => {
+  const n = symName(s, 'get'), k = symName(p, 'get'), v = symProp(n, k);
+  return v !== false ? v : L.prop(s, k);
+});
+D('symbol-plist', 'symbol', 'The property list of SYMBOL.', ([s]) => { const pl = plists.get(symName(s, 'symbol-plist')); return listOf(pl ? [...pl].flatMap(([k, v]) => [intern(k), v]) : []); });
+Ed.symProp = symProp;
+
+/* ---------- advice (R4.24): advice-add and advice-remove on any global procedure or command ----------
+   The global's box gets an accessor: reading it gives a wrapper that runs the advice around the
+   original, and defining the name again replaces the original underneath the advice. */
+const HOWS = new Set([':around', ':before', ':after', ':override', ':filter-args', ':filter-return']);
+const advised = new Map();
+const then = (r, f) => (r && typeof r.then === 'function' ? r.then(f) : f(r));
+function adviceCall(ent, args) {
+  let run = a => L.callProc(ent.orig, a);
+  for (const ad of ent.list.slice().reverse()) {
+    const inner = run, f = ad.fn;
+    switch (ad.how) {
+      case ':around': { const orig = Object.assign(a => inner(a), { procName: ent.name }); run = a => L.callProc(f, [orig, ...a]); break; }
+      case ':before': run = a => { L.callProc(f, a); return inner(a); }; break;
+      case ':after': run = a => then(inner(a), r => { L.callProc(f, a); return r; }); break;
+      case ':override': run = a => L.callProc(f, a); break;
+      case ':filter-args': run = a => inner(arr(L.callProc(f, [listOf(a)]))); break;
+      case ':filter-return': run = a => then(inner(a), r => L.callProc(f, [r])); break;
+    }
+  }
+  return run(args);
+}
+function rewrap(ent) {
+  const o = ent.orig, w = args => adviceCall(ent, args);
+  for (const k of ['procName', 'doc', 'params', 'interactive', 'arity', 'rest', 'props']) if (o[k] !== undefined) w[k] = o[k];
+  w.advised = ent;
+  ent.wrapper = w;
+}
+function adviceAdd(name, how, fn, props) {
+  if (!HOWS.has(how)) signal('error', `Unknown advice type ${how}; use one of ${[...HOWS].join(' ')}`);
+  let ent = advised.get(name);
+  if (!ent) {
+    const box = L.S.gbox(name), d = Object.getOwnPropertyDescriptor(box, 'value');
+    if (d && d.get) signal('error', `${name} cannot be advised`);
+    if (typeof box.value !== 'function') signal('void-function', intern(name));
+    ent = { name, orig: box.value, list: [], wrapper: null, box };
+    Object.defineProperty(box, 'value', {
+      get: () => ent.wrapper,
+      set: v => { if (typeof v === 'function' && !v.advised) { ent.orig = v; rewrap(ent); } else if (v === undefined) unadvise(ent, v); else if (typeof v !== 'function') unadvise(ent, v); },
+      configurable: true, enumerable: true,
+    });
+    advised.set(name, ent);
+  }
+  const pname = props && props.name;
+  ent.list = ent.list.filter(a => a.fn !== fn && !(pname && a.name === pname));
+  ent.list.unshift({ how, fn, name: pname });
+  rewrap(ent);
+}
+function unadvise(ent, value) {
+  advised.delete(ent.name);
+  Object.defineProperty(ent.box, 'value', { value: value === undefined ? undefined : value, writable: true, configurable: true, enumerable: true });
+}
+function adviceRemove(name, fn) {
+  const ent = advised.get(name); if (!ent) return;
+  ent.list = ent.list.filter(a => a.fn !== fn && !(typeof fn === 'string' && a.name === fn) && !(fn instanceof Sym && (a.fn === fn || a.name === fn.name)));
+  if (ent.list.length) rewrap(ent); else unadvise(ent, ent.orig);
+}
+D('advice-add', 'symbol how function [props]', 'Run FUNCTION as HOW advice of the global procedure SYMBOL: :around (FUNCTION gets the original first), :before, :after, :override, :filter-args (FUNCTION maps the argument list), :filter-return (FUNCTION maps the value). PROPS may name it: \'((name . my-advice)).', ([s, how, f, props]) => {
+  let pname = null;
+  if (!L.absent(props) && props !== NIL) for (const p of arr(props)) if (p instanceof L.Pair && p.car === intern('name')) pname = p.cdr instanceof Sym ? p.cdr.name : String(p.cdr);
+  adviceAdd(symName(s, 'advice-add'), symName(how, 'advice-add'), f, { name: pname });
+  return false;
+});
+D('advice-remove', 'symbol function', 'Remove FUNCTION (or the advice of that name) from the advice of SYMBOL.', ([s, f]) => { adviceRemove(symName(s, 'advice-remove'), f); return false; });
+D('advice-member-p', 'function symbol', '#t if FUNCTION advises SYMBOL.', ([f, s]) => { const ent = advised.get(symName(s, 'advice-member-p')); return !!ent && ent.list.some(a => a.fn === f || (f instanceof Sym && a.name === f.name)); });
+D('advice-original', 'symbol', 'The unadvised procedure of SYMBOL.', ([s]) => { const ent = advised.get(symName(s, 'advice-original')); return ent ? ent.orig : L.toFn(s); });
+Ed.adviceOf = name => { const ent = advised.get(name); return ent ? ent.list.map(a => ({ how: a.how, fn: a.fn, name: a.name })) : []; };
+
+/* ---------- minor and derived modes (R4.25) ---------- */
+/* As a mode command: called with no argument it toggles when run as a command and turns the mode on
+   from Lisp, as in Emacs; a positive prefix turns it on, zero or less off, 'toggle toggles. */
+function modeArgOn(arg, was) {
+  if (arg === intern('toggle')) return !was;
+  if (L.absent(arg) || arg === NIL) return true;
+  return Ed.prefixNumeric(arg) > 0;
+}
+const modeVariable = name => name.replace(/-mode$/, '') + '-enabled';
+function defineMinorMode(o) {
+  const name = o.name, v = o.variable || modeVariable(name);
+  if (v === name) signal('error', `${name}: the mode variable needs a name of its own`);
+  if (o.global) L.defvar(v, !!o.init, o.doc); else { const ent = Ed.localize(v); ent.auto = true; if (ent.def === undefined) ent.def = !!o.init; if (o.doc) L.S.gdoc.set(v, o.doc); }
+  L.defvar(name + '-hook', NIL, `Procedures called after ${name} is turned on or off.`);
+  if (o.keymap) L.set(name + '-map', o.keymap);
+  Ed.minorModes.delete(name);
+  Ed.minorModes.set(name, { name, variable: v, global: !!o.global, lighter: o.lighter || '' });
+  const spec = async () => [E.prefixArg === null || E.prefixArg === undefined ? intern('toggle') : E.prefixArg];
+  CMD(name, spec, '&optional ARG', o.doc || `Toggle ${name}.`, ([arg]) => {
+    const b = cur(), was = o.global ? truthy(L.get(v)) : truthy(Ed.localValue(b, v)), on = modeArgOn(arg, was);
+    if (o.global) Ed.setDefault(v, on); else { Ed.makeLocal(b, v); b.locals.set(v, on); }
+    if (o.body) o.body(on, b);
+    L.runHook(name + '-hook');
+    L.runHook(name + (on ? '-on-hook' : '-off-hook'));
+    if (arg === intern('toggle')) Ed.message(`${o.pretty || name} ${on ? 'enabled' : 'disabled'}${o.global ? '' : ' in current buffer'}`);
+    return on;
+  });
+  return intern(name);
+}
+Ed.defineMinorMode = defineMinorMode;
+D('%define-minor-mode', 'name doc plist body', 'define-minor-mode: NAME is the mode, PLIST holds :global :lighter :keymap :init-value :variable, BODY is a thunk run after each change. The state is in NAME-without-mode-enabled unless :variable names another.', ([s, doc, plist, body]) => {
+  const kw = new Map(); const a = arr(plist); for (let i = 0; i + 1 < a.length; i += 2) kw.set(symName(a[i], 'define-minor-mode'), a[i + 1]);
+  let km = kw.get(':keymap');
+  if (km !== undefined && !(km instanceof Ed.Keymap)) {
+    const m = new Ed.Keymap(s.name + '-map');
+    if (km !== false && km !== NIL) for (const p of arr(km)) Ed.defineKey(m, p.car, p.cdr);
+    km = m;
+  }
+  if (km === undefined && !(L.get(s.name + '-map') instanceof Ed.Keymap)) km = new Ed.Keymap(s.name + '-map');
+  const lighter = kw.get(':lighter');
+  const vr = kw.get(':variable');
+  return defineMinorMode({ name: symName(s, 'define-minor-mode'), variable: vr instanceof Sym ? vr.name : null, doc: typeof doc === 'string' ? doc : '', global: truthy(kw.get(':global')), init: truthy(kw.get(':init-value')),
+    lighter: typeof lighter === 'string' ? lighter : '', keymap: km, body: typeof body === 'function' ? () => L.apply(body, []) : null });
+});
+D('minor-mode-list', '', 'Names of the defined minor modes.', () => listOf([...Ed.minorModes.keys()].map(intern)));
+D('minor-mode-active-p', 'mode [buffer]', '#t if minor MODE is on in BUFFER.', ([m, b]) => { const mm = Ed.minorModes.get(symName(m, 'minor-mode-active-p')); return !!mm && Ed.minorOn(bufArg(b), mm); });
+/* Major modes: switching runs the mode's hooks, parents first, then after-change-major-mode-hook. */
+L.defvar('after-change-major-mode-hook', NIL, 'Procedures called after a major mode command switches the current buffer’s mode.');
+const majorBodies = new Map();
+function switchMajorMode(b, mode) {
+  const chain = Ed.modeChain(mode).reverse();
+  const save = E.current; E.current = b;
+  try {
+    L.call('kill-all-local-variables', []);
+    b.mode = mode;
+    for (const m of chain) { const body = majorBodies.get(m); if (body) L.apply(body, []); }
+    for (const m of chain) L.runHook(m + '-hook');
+    L.runHook('after-change-major-mode-hook');
+  } finally { E.current = save; }
+  return false;
+}
+Ed.switchMajorMode = switchMajorMode;
+D('%define-derived-mode', 'child parent name body', 'define-derived-mode: CHILD is a major mode built on PARENT (#f for none), shown as NAME; BODY is a thunk run when it is turned on.', ([c, p, nm, body]) => {
+  const child = symName(c, 'define-derived-mode'), parent = p instanceof Sym && p.name !== 'nil' ? p.name : null;
+  if (parent) Ed.modeParents.set(child, parent); else Ed.modeParents.delete(child);
+  if (typeof nm === 'string') Ed.MODE_NAMES[child] = nm;
+  if (typeof body === 'function') majorBodies.set(child, body); else majorBodies.delete(child);
+  let km = L.get(child + '-map'); if (!(km instanceof Ed.Keymap)) { km = new Ed.Keymap(child + '-map'); L.set(child + '-map', km); }
+  if (parent) { let pk = L.get(parent + '-map'); if (!(pk instanceof Ed.Keymap)) { pk = new Ed.Keymap(parent + '-map'); L.set(parent + '-map', pk); } if (pk !== km) km.parent = pk; }
+  L.defvar(child + '-hook', NIL, `Procedures called when ${child} is turned on.`);
+  CMD(child, '', '', `Switch the current buffer to ${typeof nm === 'string' ? nm : child} mode${parent ? `, derived from ${parent}` : ''}.`, () => switchMajorMode(cur(), child));
+  return c;
+});
+D('derived-mode-p', '. modes', 'The first of MODES the current major mode is or derives from, or #f.', ms => { const chain = Ed.modeChain(cur().mode); for (const m of ms) if (m instanceof Sym && chain.includes(m.name)) return m; return false; });
+
+/* The Scheme side of the forms above. */
+L.evalText(`
+(define-macro (defvar name . rest)
+  \`(%defvar ',name ,(if (pair? rest) \`(lambda () ,(car rest)) #f) ,(if (and (pair? rest) (pair? (cdr rest))) (cadr rest) #f) #f))
+(define-macro (defcustom name value . rest)
+  \`(%defvar ',name (lambda () ,value) ,(if (and (pair? rest) (string? (car rest))) (car rest) #f) #f))
+(define-macro (defvar-local name value . rest)
+  \`(%defvar ',name (lambda () ,value) ,(if (pair? rest) (car rest) #f) #t))
+(define-macro (setq-local . pairs)
+  (let loop ((p pairs) (out '()))
+    (if (and (pair? p) (pair? (cdr p))) (loop (cddr p) (cons \`(%set-local! ',(car p) ,(cadr p)) out)) \`(begin ,@(reverse out)))))
+(define-macro (setq-default . pairs)
+  (let loop ((p pairs) (out '()))
+    (if (and (pair? p) (pair? (cdr p))) (loop (cddr p) (cons \`(set-default ',(car p) ,(cadr p)) out)) \`(begin ,@(reverse out)))))
+(define-macro (define-minor-mode name doc . rest)
+  (let loop ((r rest) (kw '()))
+    (if (and (pair? r) (keyword? (car r)) (pair? (cdr r)))
+        (loop (cddr r) (cons (cadr r) (cons (car r) kw)))
+        \`(%define-minor-mode ',name ,doc (list ,@(reverse kw)) (lambda () #f ,@r)))))
+(define-macro (define-derived-mode child parent name . rest)
+  (let* ((r (if (and (pair? rest) (string? (car rest))) (cdr rest) rest))
+         (r (let skip ((r r)) (if (and (pair? r) (keyword? (car r)) (pair? (cdr r))) (skip (cddr r)) r))))
+    \`(%define-derived-mode ',child ',parent ,name (lambda () #f ,@r))))
+`);
+
 /* ---------- frames (R9.2): headless runtimes have none, and (selected-frame) is then #f ---------- */
 const toFrame = f => (L.absent(f) || f === false ? E.frame : f instanceof Ed.Frame ? f : signal('wrong-type-argument', 'expected a frame, got', f));
 D('framep', 'x', '#t if X is a frame.', ([x]) => x instanceof Ed.Frame);
@@ -873,7 +1131,7 @@ let booted = false;
 function boot(opts = {}) {
   if (booted) throw new Error('Edwin has already booted');
   if (opts.host && opts.host !== host) throw new Error('Ed.boot: a different host from the one Edwin loaded with');
-  booted = true;
+  booted = true; E.booted = true;
   for (const n of ['global-map', 'minibuffer-local-map', 'scheme-mode-map', 'scheme-interaction-mode-map', 'special-mode-map', 'fundamental-mode-map', 'org-mode-map', 'text-mode-map'])
     L.set(n, new Ed.Keymap(n));
   L.get('scheme-interaction-mode-map').parent = L.get('scheme-mode-map');
@@ -898,8 +1156,9 @@ Ed.boot = boot;
 function wire(f) {
   const ta = f.el('input'), frame = f.root, root = f.el('windows'), doc = frame.ownerDocument, win = doc.defaultView;
   const focus = () => { if (doc.activeElement !== ta) ta.focus({ preventScroll: true }); };
-  ta.addEventListener('focus', () => { E.focused = true; Ed.render(); });
-  ta.addEventListener('blur', () => { E.focused = false; Ed.render(); });
+  const focusHook = name => { try { L.resetOps(); L.runHook(name); } catch (e) { Ed.reportError(e); } };
+  ta.addEventListener('focus', () => { E.focused = true; Ed.selectFrame(f); focusHook('focus-in-hook'); Ed.render(); });
+  ta.addEventListener('blur', () => { E.focused = false; focusHook('focus-out-hook'); Ed.render(); });
   ta.addEventListener('keydown', e => {
     const k = Ed.keyName(e);
     if (!k) return;

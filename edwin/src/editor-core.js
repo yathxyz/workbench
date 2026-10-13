@@ -27,17 +27,62 @@ class Buffer {
     /* The text lives in a rope; every change is logged as a delta (VER, POS, DEL, INS) so caches,
        undo and the worker mirrors can follow it without keeping copies of the whole text. */
     this.rope = new globalThis.Rope(''); this.ver = 0; this.log = []; this.pin = Infinity;
-    this.name = name; this.pt = 0; this.mark = null; this.markActive = false;
+    /* Markers (R6.11): every position that must follow edits, in one set that shiftMarkers moves.
+       Plain { pos } objects in it (temps) are before markers. Point is an after marker, kept as a number. */
+    this.markers = new Set(); this.temps = this.markers;
+    this._mark = this.marker(null); this._marks = new Map(); this._jumps = []; this.locals = null;
+    this.name = name; this.pt = 0; this.markActive = false;
     this.mode = modeFor(name); this.file = null; this.modified = false; this.readOnly = false;
     this.undo = []; this.redo = []; this.pendingUndo = null; this.typeRun = 0; this.scroll = 0;
-    this.marks = {}; this.jumps = []; this.jumpIdx = 0; this.temps = new Set();
+    this.jumpIdx = 0;
     this.visual = null; this.evilState = undefined; this._lv = -1; this._lc = null;
+  }
+  marker(pos, type) { const m = new Marker(this, pos, type); this.markers.add(m); return m; }
+  /* The mark is a before marker; b.mark reads and sets its position (null when unset). */
+  get mark() { return this._mark.pos; }
+  set mark(v) { this._mark.pos = v === null || v === undefined ? null : v; }
+  /* Evil's marks: a table of before markers, read and written as positions (b.marks[k] = pos). */
+  get marks() { return this._marksView || (this._marksView = marksView(this)); }
+  set marks(o) { for (const m of this._marks.values()) this.markers.delete(m); this._marks.clear(); for (const k in o) this.marks[k] = o[k]; }
+  /* The jump list: an array of before markers. Assigning it drops the markers left out. */
+  get jumps() { return this._jumps; }
+  set jumps(a) {
+    const keep = new Set();
+    this._jumps = a.map(x => { const m = x instanceof Marker ? x : this.marker(x); keep.add(m); return m; });
+    for (const m of this.markers) if (m.jump && !keep.has(m)) this.markers.delete(m);
+    for (const m of keep) { m.jump = true; this.markers.add(m); }
   }
   /* The whole text as one string (built once per change, then cached). Hot paths read the rope. */
   get text() { return this.rope.toString(); }
   set text(v) { setText(this, String(v)); }
   __print() { return '#<buffer ' + this.name + '>'; }
   get __type() { return 'buffer'; }
+}
+/* A marker: a position in a buffer that follows its edits, with an insertion type (R6.11). A before
+   marker stays before text inserted at it; an after marker advances past it. A released marker
+   (set-marker m #f) points nowhere and is no longer moved. */
+class Marker {
+  constructor(buffer, pos, type) { this.buffer = buffer; this.pos = pos; this.type = type === 'after' ? 'after' : 'before'; }
+  set(buffer, pos) {
+    if (this.buffer && this.buffer !== buffer) this.buffer.markers.delete(this);
+    this.buffer = pos === null ? null : buffer; this.pos = pos;
+    if (this.buffer) this.buffer.markers.add(this);
+    return this;
+  }
+  release() { if (this.buffer) this.buffer.markers.delete(this); this.buffer = null; this.pos = null; }
+  __print() { return this.buffer && this.pos !== null ? `#<marker at ${this.pos + 1} in ${this.buffer.name}>` : '#<marker in no buffer>'; }
+  get __type() { return 'marker'; }
+}
+function marksView(b) {
+  const t = b._marks;
+  return new Proxy(Object.create(null), {
+    get: (_, k) => { const m = typeof k === 'string' ? t.get(k) : undefined; return m ? m.pos : undefined; },
+    set: (_, k, v) => { let m = t.get(k); if (!m) { m = b.marker(v); t.set(k, m); } else m.pos = v; return true; },
+    deleteProperty: (_, k) => { const m = t.get(k); if (m) { b.markers.delete(m); t.delete(k); } return true; },
+    has: (_, k) => t.has(k),
+    ownKeys: () => [...t.keys()],
+    getOwnPropertyDescriptor: (_, k) => (t.has(k) ? { value: t.get(k).pos, writable: true, enumerable: true, configurable: true } : undefined),
+  });
 }
 function modeFor(name) {
   if (hooks.modeFor) { const m = hooks.modeFor(name); if (m) return m; }
@@ -65,7 +110,7 @@ E.minibuf.mode = 'minibuffer-mode';
 function getBuffer(name) { return E.buffers.find(b => b.name === name) || null; }
 function getBufferCreate(name) {
   let b = getBuffer(name);
-  if (!b) { b = new Buffer(name); E.buffers.push(b); }
+  if (!b) { b = new Buffer(name); E.buffers.push(b); if (E.booted) runHookSafely('buffer-list-update-hook', []); }
   return b;
 }
 function toBuffer(x) {
@@ -239,23 +284,136 @@ function trimLog(b) {
   let k = 0; while (k < log.length && log[k].v <= min) k++;
   if (k) log.splice(0, k);
 }
-/* Low-level change: no read-only check and no marker adjustment. Returns the removed text. */
+/* Low-level change: no read-only check, no marker adjustment and no change hooks. Returns the removed text. */
 function ropeEdit(b, pos, n, ins) {
   const removed = b.rope.splice(pos, n, ins);
   if (removed || ins) logEdit(b, pos, removed, ins);
   return removed;
 }
-/* Move temp markers through a change at POS of DEL characters into INS: those after it shift, those
-   inside it stay inside. Edits that bypass insertText/deleteText (undo, assigning b.text) use it so
-   markers held across them (an answer streaming in) keep pointing at the same text. */
-function shiftTemps(b, pos, del, ins) {
-  if (!b.temps.size) return;
+/* The one marker-shift routine (R6.11, R6.12), for a change at POS of DEL characters into INS:
+   - markers after the changed text, and at its end when text was deleted, move by INS - DEL;
+   - a marker at POS, or inside the deleted text, goes to POS (before) or POS + INS (after);
+   - point and the points of the other windows on the buffer are after markers.
+   A marker whose character was deleted is flagged dead (the :g and :normal line markers skip it).
+   Markers a deletion moved are remembered by ENTRY, the log entry, so undo puts them back. */
+function shiftMarkers(b, pos, del, ins, entry) {
   const e = pos + del, d = ins - del;
-  for (const t of b.temps) if (t.pos > pos) t.pos = t.pos >= e ? t.pos + d : Math.min(t.pos, pos + ins);
+  const after = p => (p < pos ? p : p > e || (del && p === e) ? p + d : pos + ins);
+  b.pt = after(b.pt);
+  if (E.root) for (const w of windowList()) if (w.buffer === b && w !== E.sel) w.pt = after(w.pt);
+  if (!b.markers.size) return;
+  let moved = null;
+  for (const m of b.markers) {
+    const p = m.pos;
+    if (p === null || p < pos) continue;
+    if (p > e || (del && p === e)) {
+      if (p === e && del) (moved || (moved = [])).push([m, p, !!m.dead, p + d]);
+      m.pos = p + d; continue;
+    }
+    const q = m.type === 'after' ? pos + ins : pos;
+    if (del) { if (p > pos) (moved || (moved = [])).push([m, p, !!m.dead, q]); m.dead = true; }
+    m.pos = q;
+  }
+  if (moved && entry) markersMoved.set(entry, moved);
 }
-/* Temps a deletion moved to its start, by log entry, so undoing it puts them back where they were. */
-const tempsMoved = new WeakMap();
-/* Assigning b.text: log the changed middle only. */
+/* Markers a deletion moved, by log entry: [marker, old position, old dead flag, new position]. */
+const markersMoved = new WeakMap();
+/* Undoing ENTRY: markers follow the inverse change, and those the deletion moved go back where they
+   were, when nothing has moved them since. */
+function unshiftMarkers(b, entry) {
+  const moved = markersMoved.get(entry);
+  const back = moved ? moved.filter(([m, , , q]) => b.markers.has(m) && m.pos === q) : null;
+  shiftMarkers(b, entry.pos, entry.ins.length, entry.del.length, null);
+  if (back) for (const [m, p, dead] of back) { m.pos = p; m.dead = dead; }
+}
+
+/* ---------- change hooks (R4.22, R4.23) ----------
+   before-change-functions get (beg end) of the text about to change, after-change-functions get
+   (beg end old-len) of the new text, 1-based, with the changed buffer current. They do not run for
+   the changes they make themselves (inhibit-modification-hooks is #t inside them). A function that
+   signals is reported and removed from the hook, as Emacs does. (edit-origin) says who made the change. */
+E.editOrigin = 'local';
+let inChangeHook = false;
+function changeHooks() {
+  if (inChangeHook || E.inhibitModHooks) return false;
+  const bf = L.get('before-change-functions'), af = L.get('after-change-functions');
+  return (bf && bf !== NIL) || (af && af !== NIL) ? true : false;
+}
+function runChangeHook(b, name, args) {
+  const save = E.current;
+  inChangeHook = true; E.current = b;
+  try { runHookSafely(name, args); }
+  finally { inChangeHook = false; E.current = save; }
+}
+/* Run the hook NAME with ARGS; a function that signals is reported and taken off the hook, both its
+   buffer-local and its default value, so one broken function cannot break every later edit. */
+function runHookSafely(name, args) {
+  for (const f of L.hookFns(name)) {
+    try { L.apply(f, args); }
+    catch (e) {
+      if (L.isQuit(e)) throw e;
+      removeHookEverywhere(name, f);
+      message(`Error in ${name} (${f.procName || pr(f, true)}): ${errorText(e)}; removed it from the hook`);
+    }
+  }
+}
+function removeHookEverywhere(name, f) {
+  const drop = v => (v && v !== NIL && typeof v !== 'function' ? listOf(arr(v).filter(x => x !== f)) : v === f ? NIL : v);
+  const ent = localized.get(name);
+  if (ent) { ent.def = drop(ent.def); for (const b of E.buffers) if (b.locals && b.locals.has(name)) b.locals.set(name, drop(b.locals.get(name))); }
+  else L.set(name, drop(L.get(name)));
+}
+
+/* ---------- buffer-local variables (R4.26) ----------
+   A variable made local in some buffer gets an accessor on its global box: reads and writes go to the
+   current buffer's own value when it has one, else to the default value. An automatically local
+   variable (defvar-local, make-variable-buffer-local) gets a local value whenever it is set.
+   Buffer-locals live with the buffer in each runtime; (put 'var 'shared-local #t) marks the ones that
+   travel with the buffer's meta once frames share buffers (E3). */
+const localized = new Map();
+function localize(name) {
+  let ent = localized.get(name);
+  if (ent) return ent;
+  const box = L.S.gbox(name), d = Object.getOwnPropertyDescriptor(box, 'value');
+  if (d && d.get) signal('error', `${name} is computed from editor state and cannot be buffer-local`);
+  ent = { def: box.value, auto: false };
+  Object.defineProperty(box, 'value', {
+    get() { const l = E.current && E.current.locals; return l && l.has(name) ? l.get(name) : ent.def; },
+    set(v) {
+      const b = E.current;
+      if (b && ((b.locals && b.locals.has(name)) || (ent.auto && v !== undefined))) (b.locals || (b.locals = new Map())).set(name, v);
+      else ent.def = v;
+    },
+    configurable: true, enumerable: true,
+  });
+  localized.set(name, ent);
+  return ent;
+}
+function makeLocal(b, name) {
+  const ent = localize(name);
+  if (!b.locals) b.locals = new Map();
+  if (!b.locals.has(name)) b.locals.set(name, ent.def);
+}
+function localValue(b, name) {
+  const ent = localized.get(name);
+  if (!ent) return L.get(name);
+  return b && b.locals && b.locals.has(name) ? b.locals.get(name) : ent.def;
+}
+const defaultValue = name => { const ent = localized.get(name); return ent ? ent.def : L.get(name); };
+function setDefault(name, v) { const ent = localized.get(name); if (ent) ent.def = v; else L.set(name, v); return v; }
+L.hooking.defaultValue = defaultValue;
+/* Run F with (edit-origin) answering ORIGIN: remote, server, disk or agent (E1 applies edits with it). */
+function withOrigin(origin, f) { const save = E.editOrigin; E.editOrigin = origin; try { return f(); } finally { E.editOrigin = save; } }
+/* Every change to buffer text goes through here: hooks, the rope, the log, the markers. */
+function editText(b, pos, n, ins) {
+  const hk = changeHooks();
+  if (hk) runChangeHook(b, 'before-change-functions', [pos + 1, pos + n + 1]);
+  const removed = ropeEdit(b, pos, n, ins);
+  if (removed || ins) shiftMarkers(b, pos, removed.length, ins.length, b.log[b.log.length - 1]);
+  if (hk) runChangeHook(b, 'after-change-functions', [pos + 1, pos + ins.length + 1, removed.length]);
+  return removed;
+}
+/* Assigning b.text: change the differing middle only, as one edit. */
 function setText(b, v) {
   const r = b.rope;
   if (r.flat === v) return;
@@ -263,10 +421,13 @@ function setText(b, v) {
   if (old === v) return;
   const { pre, suf } = diffSpan(old, v);
   const del = old.slice(pre, old.length - suf), ins = v.slice(pre, v.length - suf);
+  const hk = changeHooks();
+  if (hk) runChangeHook(b, 'before-change-functions', [pre + 1, pre + del.length + 1]);
   if (del.length + ins.length > (v.length >> 1)) r.reset(v);
   else { r.splice(pre, del.length, ins); r.flat = v; }
   logEdit(b, pre, del, ins);
-  shiftTemps(b, pre, del.length, ins.length);
+  shiftMarkers(b, pre, del.length, ins.length, b.log[b.log.length - 1]);
+  if (hk) runChangeHook(b, 'after-change-functions', [pre + 1, pre + ins.length + 1, del.length]);
 }
 /* The span changed since version OLD: { pre, suf } lengths of the untouched prefix and suffix, or null
    when the log no longer reaches back that far. */
@@ -299,13 +460,7 @@ function changedSince(b, ver) {
 function insertText(b, s) {
   if (!s) return;
   checkRO(b);
-  const p = b.pt, n = s.length;
-  ropeEdit(b, p, 0, s);
-  b.pt = p + n;
-  if (b.mark !== null && b.mark > p) b.mark += n;
-  for (const k in b.marks) if (b.marks[k] > p) b.marks[k] += n;
-  for (let j = 0; j < b.jumps.length; j++) if (b.jumps[j] > p) b.jumps[j] += n;
-  for (const t of b.temps) if (t.pos > p) t.pos += n;
+  editText(b, b.pt, 0, s);
   b.modified = true;
 }
 function deleteText(b, s, e) {
@@ -313,21 +468,7 @@ function deleteText(b, s, e) {
   s = Math.max(0, s); e = Math.min(b.rope.length, e);
   if (s === e) return '';
   checkRO(b);
-  const n = e - s;
-  const gone = ropeEdit(b, s, n, '');
-  const adj = p => p >= e ? p - n : p > s ? s : p;
-  b.pt = adj(b.pt); if (b.mark !== null) b.mark = adj(b.mark);
-  for (const k in b.marks) b.marks[k] = adj(b.marks[k]);
-  for (let j = 0; j < b.jumps.length; j++) b.jumps[j] = adj(b.jumps[j]);
-  if (b.temps.size) {
-    let moved = null;
-    for (const t of b.temps) {
-      if (t.pos > s && t.pos <= e) (moved || (moved = [])).push([t, t.pos, !!t.dead]);
-      if (t.pos >= s && t.pos < e) t.dead = true;
-      t.pos = adj(t.pos);
-    }
-    if (moved) tempsMoved.set(b.log[b.log.length - 1], moved);
-  }
+  const gone = editText(b, s, e - s, '');
   b.modified = true;
   return gone;
 }
@@ -610,11 +751,31 @@ function lookupIn(km, parts) {
   return m;
 }
 const KM = name => { const v = L.get(name); return v instanceof Keymap ? v : null; };
+/* ---------- minor and derived modes (R4.25) ----------
+   A minor mode is a command and a variable that holds its state, buffer-local unless the mode is
+   global. Edwin Scheme has one binding per name, so the variable cannot share the command's name as in
+   Emacs: it is NAME without -mode plus -enabled (electric-pair-mode sets electric-pair-enabled),
+   unless define-minor-mode names one with :variable. Its keymap, the
+   variable NAME-map, is searched after the Evil state maps and before the major mode's map. A derived
+   major mode records its parent: its keymap inherits the parent's, and Evil's per-mode maps of the
+   parent apply to it too. */
+const minorModes = new Map();
+const minorOn = (b, m) => { const v = m.global ? L.get(m.variable) : localValue(b, m.variable); return v !== undefined && v !== false && v !== NIL; };
+function minorMaps(b) {
+  const out = [];
+  for (const m of minorModes.values()) if (minorOn(b, m)) { const km = KM(m.name + '-map'); if (km) out.push(km); }
+  return out;
+}
+function lighters(b) { let s = ''; for (const m of minorModes.values()) if (m.lighter && minorOn(b, m)) s += m.lighter; return s; }
+const modeParents = new Map();
+/* MODE and the modes it derives from, nearest first. */
+function modeChain(mode) { const out = [mode]; for (let m = modeParents.get(mode), n = 0; m && n < 32; m = modeParents.get(m), n++) out.push(m); return out; }
 function activeMaps(b) {
   b = b || E.current;
   const out = [];
   if (b === E.minibuf && E.mini) { const m = KM('minibuffer-local-map'); if (m) out.push(m); }
   if (hooks.stateMaps) out.push(...hooks.stateMaps(b));
+  if (minorModes.size) out.push(...minorMaps(b));
   const mm = KM(b.mode + '-map'); if (mm) out.push(mm);
   const g = KM('global-map'); if (g) out.push(g);
   return out;
@@ -1057,14 +1218,15 @@ function restoreSnap(b, s) {
   let mid = oldMid;
   for (const e of ops) {
     const q = e.pos - pre; mid = mid.slice(0, q) + e.del + mid.slice(q + e.ins.length);
-    /* Temps follow each inverse edit, and a deletion's moved temps go back to where they were. */
-    if (b.temps.size) {
-      shiftTemps(b, e.pos, e.ins.length, e.del.length);
-      const moved = tempsMoved.get(e);
-      if (moved) for (const [t, p, dead] of moved) if (b.temps.has(t) && t.pos === e.pos) { t.pos = p; t.dead = dead; }
-    }
+    /* Markers follow each inverse edit, and those a deletion moved go back to where they were. */
+    unshiftMarkers(b, e);
   }
-  if (mid !== oldMid) ropeEdit(b, pre, oldMid.length, mid);
+  if (mid !== oldMid) {
+    const hk = changeHooks();
+    if (hk) runChangeHook(b, 'before-change-functions', [pre + 1, pre + oldMid.length + 1]);
+    ropeEdit(b, pre, oldMid.length, mid);
+    if (hk) runChangeHook(b, 'after-change-functions', [pre + 1, pre + mid.length + 1, oldMid.length]);
+  }
   const newLen = r.length, m = Math.min(oldLen, newLen);
   let i = m;
   if (ops.length) {
@@ -1074,8 +1236,7 @@ function restoreSnap(b, s) {
   }
   b.modified = s.modified; b.pt = Math.min(i, newLen);
   b.mark = s.mark === null ? null : Math.min(s.mark, newLen);
-  for (const key in b.marks) b.marks[key] = Math.min(b.marks[key], newLen);
-  b.jumps = b.jumps.map(j => Math.min(j, newLen));
+  for (const m of b.markers) if (m.pos !== null && m.pos > newLen) m.pos = newLen;
 }
 function flushPendingUndo(b) {
   if (b.pendingUndo) { if (changedSince(b, b.pendingUndo.ver)) { b.undo.push(b.pendingUndo); b.redo = []; } b.pendingUndo = null; }
@@ -1112,6 +1273,8 @@ async function runCommand(def, keys) {
   if (before.ver < b.pin) b.pin = before.ver;
   E.keepPrefix = false; E.keepMark = false; E.noUndo = false;
   if (hooks.preCommand) hooks.preCommand(def, b);
+  try { L.resetOps(); L.runHook('pre-command-hook'); } catch (e) { reportError(e); }
+  const layout = windowLayout();
   let failed = false;
   try { await callInteractivelySafe(def); }
   catch (e) { failed = true; reportError(e); flushReplay(); }
@@ -1123,7 +1286,15 @@ async function runCommand(def, keys) {
     if (!E.keepPrefix) { E.prefixArg = null; E.uArg = false; E.uDigits = null; }
     try { if (hooks.postCommand) hooks.postCommand(def, b, failed); } catch (e) { reportError(e); }
     try { L.resetOps(); L.runHook('post-command-hook'); } catch (e) { reportError(e); }
+    if (windowLayout() !== layout) try { L.resetOps(); L.runHook('window-configuration-change-hook'); } catch (e) { reportError(e); }
   }
+}
+/* The window tree and what each window shows, as a string: a command that changes it runs
+   window-configuration-change-hook. */
+function windowLayout() {
+  if (!E.root) return '';
+  const walk = n => (n instanceof Split ? n.dir + '(' + n.children.map(walk).join(',') + ')' : n.id + ':' + (n.buffer ? n.buffer.id : 0));
+  return walk(E.root);
 }
 /* Run FN as a callback outside any command (a thread result): its edits become one undo step,
    the log is pinned while it runs, errors go to the echo area, and the screen is redrawn. */
@@ -1637,9 +1808,10 @@ function renderWindow(w) {
   /* Style and class writes only when they change: each one dirties style and layout. */
   const gw = String(Math.max(2, String(total).length));
   if (w._gw !== gw) { view.style.setProperty('--gw', gw); w._gw = gw; }
-  const nowrap = truthy(L.get('truncate-lines')) && !b.visualLine;
-  const vc = (numbers ? 'n' : '') + (nowrap ? 'w' : '') + (b.centered ? 'c' : '');
-  if (w._vc !== vc) { view.classList.toggle('numbers', !!numbers); view.classList.toggle('nowrap', nowrap); view.classList.toggle('centered', !!b.centered); w._vc = vc; }
+  const centered = truthy(localValue(b, 'centered-view-enabled'));
+  const nowrap = truthy(L.get('truncate-lines')) && !truthy(localValue(b, 'visual-line-enabled'));
+  const vc = (numbers ? 'n' : '') + (nowrap ? 'w' : '') + (centered ? 'c' : '');
+  if (w._vc !== vc) { view.classList.toggle('numbers', !!numbers); view.classList.toggle('nowrap', nowrap); view.classList.toggle('centered', centered); w._vc = vc; }
   if (w._selected !== selected) { w.el.classList.toggle('selected', selected); w._selected = selected; }
   const active = selected && !E.mini && E.focused;
   if (view._buf !== b) { view.textContent = ''; view._buf = b; }
@@ -1661,7 +1833,7 @@ function renderWindow(w) {
   let lines, fits = false;
   let cols = Math.floor((m.cw - (numbers ? (Math.max(2, String(total).length) + 2) * m.ch : 0)) / m.ch);
   /* centered-view-mode caps each line's text at --center-cols (index.html, set by extras.js). */
-  if (b.centered) cols = Math.min(cols, Number(host.page.getVar('center-cols')) || 100);
+  if (truthy(localValue(b, 'centered-view-enabled'))) cols = Math.min(cols, Number(host.page.getVar('center-cols')) || 100);
   // Wrapped lines take more than one row: render, measure, and move the start down until point fits.
   // When no shown line can wrap, every line is one row of m.lh and the geometry is known without layout.
   for (let tries = 0; tries < 4; tries++) {
@@ -1705,7 +1877,7 @@ function renderWindow(w) {
   putText(q('ml-state'), b.readOnly ? '%%' : b.modified ? '**' : '--');
   putText(q('ml-name'), b.name);
   putText(q('ml-pos'), `L${foldsOf(b) ? lineNoB(b, pt) : ptLine} C${column(t, pt)}  ${percent(w)}`);
-  putText(q('ml-mode'), `(${MODE_NAMES[b.mode] || b.mode}${selected && E.isearch ? ' Isearch' : ''})`);
+  putText(q('ml-mode'), `(${MODE_NAMES[b.mode] || b.mode}${lighters(b)}${selected && E.isearch ? ' Isearch' : ''})`);
   putText(q('ml-extra'), look.extra || '');
   putText(q('ml-cmd'), selected ? look.showcmd || '' : '');
   return look;
@@ -1808,7 +1980,8 @@ ${markDocstrings}
 ${forwardSexp}
 ${parenDepths}`;
 globalThis.Ed = {
-  E, hooks, host, Frame, makeFrame, selectFrame, deleteFrame, LEX_SOURCE, Store, Buffer, Keymap, PREFIX, C, SENTINEL, getBuffer, getBufferCreate, toBuffer, setWindowBuffer, otherBuffer, checkRO,
+  E, hooks, host, Frame, makeFrame, selectFrame, deleteFrame, Marker, shiftMarkers, editText, withOrigin, runHookSafely, removeHookEverywhere,
+  localized, localize, makeLocal, localValue, defaultValue, setDefault, minorModes, minorOn, modeParents, modeChain, lighters, LEX_SOURCE, Store, Buffer, Keymap, PREFIX, C, SENTINEL, getBuffer, getBufferCreate, toBuffer, setWindowBuffer, otherBuffer, checkRO,
   insertText, deleteText, replaceText, spanOf, changedSince, installLex, metrics, lastMatch, bol, eol, lineNo, column, posAtColumn, lastLineStart, lineStartOf, lex, lexOf, markDocstrings,
   forwardSexp, backwardSexp, upList, matchParen, indentLine, lispIndentFor, isLisp, modeFor, MODE_NAMES,
   normKey, kbd, defineKey, lookupIn, lookupKey, lookupWith, activeMaps, whereIs, keyName, keyChar, selfInsertable, message, ding,

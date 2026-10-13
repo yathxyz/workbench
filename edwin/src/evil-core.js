@@ -84,7 +84,8 @@ H.stateMaps = b => {
   const st = stateOf(b);
   if (!st) return [];
   const out = [];
-  const add = s => { const a = aux(b.mode, s, false); if (a) out.push(a); const g = KM(`evil-${s}-state-map`); if (g) out.push(g); };
+  const modes = Ed.modeParents.size ? Ed.modeChain(b.mode) : [b.mode];
+  const add = s => { for (const m of modes) { const a = aux(m, s, false); if (a) out.push(a); } const g = KM(`evil-${s}-state-map`); if (g) out.push(g); };
   ({ normal: ['normal', 'motion'], visual: ['visual', 'normal', 'motion'], motion: ['motion'], insert: ['insert'],
      replace: ['replace', 'insert'], emacs: ['emacs'], operator: ['operator', 'motion'] })[st].forEach(add);
   return out;
@@ -655,8 +656,8 @@ CMD('evil-undo', '<c>', '&optional COUNT', 'Undo COUNT changes.', ([n]) => { con
 CMD('evil-redo', '<c>', '&optional COUNT', 'Redo COUNT changes.', ([n]) => { const b = cur(); for (let k = 0; k < optNum(n, 1); k++) Ed.redoStep(b); clampNormal(b); return false; });
 function pushJump(b, pos) {
   const t = b.rope, ln = lineNo(t, pos);
-  b.jumps = b.jumps.filter(j => lineNo(t, j) !== ln);
-  b.jumps.push(pos); if (b.jumps.length > 100) b.jumps.shift();
+  const js = b.jumps.filter(j => lineNo(t, j.pos) !== ln);
+  js.push(pos); b.jumps = js.length > 100 ? js.slice(-100) : js;
   b.jumpIdx = b.jumps.length; b.marks['`'] = pos;
 }
 D('evil-set-jump', '&optional POS', 'Record POS (default point) in the jump list.', ([p]) => { const b = cur(); pushJump(b, L.absent(p) ? b.pt : num(p) - 1); return false; });
@@ -664,12 +665,12 @@ CMD('evil-jump-backward', '<c>', '&optional COUNT', 'Go to an older position in 
   const b = cur(), c = optNum(n, 1);
   if (b.jumpIdx >= b.jumps.length) { pushJump(b, b.pt); b.jumpIdx = b.jumps.length - 1; }
   const k = b.jumpIdx - c; if (k < 0) signal('user-error', 'At the start of the jump list');
-  b.jumpIdx = k; b.pt = Math.min(b.jumps[k], b.rope.length); return false;
+  b.jumpIdx = k; b.pt = Math.min(b.jumps[k].pos, b.rope.length); return false;
 });
 CMD('evil-jump-forward', '<c>', '&optional COUNT', 'Go to a newer position in the jump list (C-i or TAB).', ([n]) => {
   const b = cur(), k = b.jumpIdx + optNum(n, 1);
   if (k >= b.jumps.length) signal('user-error', 'At the end of the jump list');
-  b.jumpIdx = k; b.pt = Math.min(b.jumps[k], b.rope.length); return false;
+  b.jumpIdx = k; b.pt = Math.min(b.jumps[k].pos, b.rope.length); return false;
 });
 D('evil-set-marker', 'CHAR &optional POS', 'Set mark CHAR at POS (default point).', ([c, p]) => {
   const ch = chr(c), b = cur();

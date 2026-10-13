@@ -9,10 +9,6 @@ const cur = () => E.current;
 const { bol, eol, lineNo } = Ed;
 const str = x => { if (typeof x !== 'string') signal('wrong-type-argument', 'expected a string, got', x); return x; };
 
-/* The on/off state of these global modes has its own name: the mode's name is its command, and Edwin
-   Scheme has one binding per name, so storing the state there would replace the command. */
-L.defvar('rainbow-delimiters-enabled', true, 'Non-#f colours parentheses by depth in Scheme buffers (toggled by rainbow-delimiters-mode).');
-L.defvar('electric-pair-enabled', true, 'Non-#f inserts the closing bracket or quote when you type the opening one (toggled by electric-pair-mode).');
 L.defvar('fill-column', 70, 'Column at which fill-paragraph wraps.');
 L.defvar('avy-keys', 'asdfghjklqwertyuiopzxcvbnm', 'Letters used for avy labels, in order of preference.');
 L.defvar('before-save-hook', NIL, 'Procedures called before a buffer is saved.');
@@ -110,10 +106,9 @@ const PAIRS = { '(': ')', '[': ']', '{': '}', '"': '"' };
     return sic([n]);
   });
 }
-/* As a minor mode command: no ARG toggles, a positive one turns the mode on, zero or less off. */
-const modeArg = (arg, was) => (L.absent(arg) || arg === NIL ? !was : Ed.prefixNumeric(arg) > 0);
-CMD('rainbow-delimiters-mode', 'P', '&optional ARG', 'Toggle colouring parentheses by depth.', ([arg]) => { const on = modeArg(arg, truthy(L.get('rainbow-delimiters-enabled'))); L.set('rainbow-delimiters-enabled', on); Ed.message('Rainbow delimiters ' + (on ? 'on' : 'off')); return false; });
-CMD('electric-pair-mode', 'P', '&optional ARG', 'Toggle automatic closing brackets and quotes.', ([arg]) => { const on = modeArg(arg, truthy(L.get('electric-pair-enabled'))); L.set('electric-pair-enabled', on); Ed.message('Electric pairs ' + (on ? 'on' : 'off')); return false; });
+/* The ad hoc toggles are minor modes (R4.25). Each one's state is its -enabled variable. */
+Ed.defineMinorMode({ name: 'rainbow-delimiters-mode', global: true, init: true, pretty: 'Rainbow delimiters', doc: 'Toggle colouring parentheses by depth in Scheme buffers. The state is rainbow-delimiters-enabled.' });
+Ed.defineMinorMode({ name: 'electric-pair-mode', global: true, init: true, pretty: 'Electric pairs', doc: 'Toggle inserting the closing bracket or quote when you type the opening one. The state is electric-pair-enabled.' });
 D('electric-pair-delete', '', 'Delete the pair around point when it is empty, as DEL does with electric pairs. Return #t if it did.', () => {
   const b = cur(), prev = b.rope.at(b.pt - 1), next = b.rope.at(b.pt);
   if (truthy(L.get('electric-pair-enabled')) && prev in PAIRS && PAIRS[prev] === next && !b.readOnly && !b.markActive) { Ed.deleteText(b, b.pt - 1, b.pt + 1); return true; }
@@ -142,23 +137,17 @@ CMD('fill-paragraph', '*', '', 'Re-wrap the paragraph at point to fill-column (S
   return false;
 });
 L.defvar('centered-view-width', 100, 'Columns of text that centered-view-mode centres in the window (yath/centered-view-width).');
-CMD('centered-view-mode', '', '', 'Toggle centring this buffer’s text in a column of centered-view-width characters (SPC y c).', () => {
-  const b = cur(); b.centered = !b.centered;
-  Ed.host.page.setVar('center-cols', String(Math.max(20, Number(L.get('centered-view-width')) || 100)));
-  Ed.message('Centered view ' + (b.centered ? 'on' : 'off')); return false;
-});
+Ed.defineMinorMode({ name: 'centered-view-mode', pretty: 'Centered view', doc: 'Toggle centring this buffer’s text in a column of centered-view-width characters (SPC y c). The state is centered-view-enabled.',
+  body: () => Ed.host.page.setVar('center-cols', String(Math.max(20, Number(L.get('centered-view-width')) || 100))) });
 /* visual-line-mode is per buffer, as in Emacs: the buffer wraps whatever truncate-lines says, and j and k
    move by screen lines when evil-respect-visual-line-mode is on (init.scm binds them to the -visual-line motions). */
-CMD('visual-line-mode', '', '', 'Toggle Visual Line mode in this buffer: long lines wrap and j and k move by screen lines (SPC y v).', () => {
-  const b = cur(); b.visualLine = !b.visualLine;
-  Ed.message('Visual-Line mode ' + (b.visualLine ? 'enabled' : 'disabled') + ' in current buffer'); return false;
-});
+Ed.defineMinorMode({ name: 'visual-line-mode', lighter: ' Wrap', pretty: 'Visual-Line mode', doc: 'Toggle Visual Line mode in this buffer: long lines wrap and j and k move by screen lines (SPC y v). The state is visual-line-enabled.' });
 const VERT = ['evil-next-line', 'evil-previous-line', 'evil-next-visual-line', 'evil-previous-visual-line'];
 /* Move by screen rows using the rendered lines: the row below or above the cursor at the same x, kept
    as a goal across consecutive j and k. Rows that are not on screen fall back to buffer lines. */
 D('evil--visual-line-move', 'COUNT', 'Move COUNT screen lines down (up if COUNT is negative) in a visual-line-mode buffer, keeping the x position; #f when this buffer is not in visual-line-mode.', ([n]) => {
   const b = cur(), w = E.sel, c = Number(n) || 0;
-  if (!b.visualLine || !w || w.buffer !== b || !w.view) return false;
+  if (!truthy(Ed.localValue(b, 'visual-line-enabled')) || !w || w.buffer !== b || !w.view) return false;
   const last = E.lastCommand instanceof L.Sym ? E.lastCommand.name : '';
   if (!VERT.includes(last)) E.goalX = null;
   const st = EC.stateOf(b), dir = c > 0 ? 1 : -1, t = b.rope;
@@ -181,11 +170,11 @@ D('evil--visual-line-move', 'COUNT', 'Move COUNT screen lines down (up if COUNT 
   L.set('evil-this-type', intern('exclusive'));
   return true;
 });
-CMD('auto-fill-mode', '', '', 'Toggle wrapping as you type past fill-column (SPC y a).', () => { const b = cur(); b.autoFill = !b.autoFill; Ed.message('Auto fill ' + (b.autoFill ? 'on' : 'off')); return false; });
+Ed.defineMinorMode({ name: 'auto-fill-mode', lighter: ' Fill', pretty: 'Auto fill', doc: 'Toggle wrapping as you type past fill-column (SPC y a). The state is auto-fill-enabled.' });
 const prevPost2 = H.postCommand;
 H.postCommand = (def, b, failed) => {
   if (prevPost2) prevPost2(def, b, failed);
-  if (failed || E.depth > 0 || !E.current.autoFill) return;
+  if (failed || E.depth > 0 || !truthy(Ed.localValue(E.current, 'auto-fill-enabled'))) return;
   if (L.cmdSym(def) === intern('self-insert-command') && L.chr(L.get('last-command-event')) === ' ') {
     const buf = E.current, t = buf.rope, ls = bol(t, buf.pt);
     if (Ed.column(t, buf.pt) > (Number(L.get('fill-column')) || 70)) {

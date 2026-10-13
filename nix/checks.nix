@@ -1,4 +1,4 @@
-# `nix flake check`: package (with cargo test), clippy, fmt, Edwin's headless core, the black-box
+# `nix flake check`: package (with cargo test), clippy, fmt, Edwin's headless core and Scheme, the black-box
 # conformance suite, the end-to-end security suite, the browser suite, the adapter probe against the stub, the VM test,
 # the module's assertions. The harness registers wb-fake-acp (the package's `fake` output) as
 # its `stub` agent, so every check that starts it has that output on PATH.
@@ -52,9 +52,16 @@ in
         touch $out
       '';
 
-  # Edwin's editing core in Node with no browser (step E0 of the edwind plan).
+  # Edwin's editing core in Node with no browser and no page stand-ins (step E0 of the edwind plan).
   edwin-headless = pkgs.runCommand "workbench-edwin-headless" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     node --test ${edwin}/test/headless.test.mjs
+    touch $out
+  '';
+
+  # Edwin's Scheme: the language (R4.3-R4.10, R4.31-R4.34), the editor-level forms (hooks, advice,
+  # minor modes, buffer-locals, markers) and the shadow-stack cost bound (R4.34, at most 10%).
+  edwin-scheme = pkgs.runCommand "workbench-edwin-scheme" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    node --test ${edwin}/test/scheme*.test.mjs
     touch $out
   '';
 
