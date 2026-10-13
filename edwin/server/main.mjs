@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import os from 'node:os';
-import { createRequire } from 'node:module';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { Authority, expandHome } from './paths.mjs';
 import { Buffers } from './buffers.mjs';
@@ -130,8 +130,9 @@ export class Server {
     if (this.stopping) return;
     this.stopping = true;
     this.log.info('stop', {});
-    if (this.net) await new Promise(r => this.net.close(() => r()));
+    const closed = this.net ? new Promise(r => this.net.close(() => r())) : null;
     for (const c of [...this.clients]) { c.send({ t: 'error', code: 'shutting_down', msg: 'edwind is stopping' }); c.destroy(); }
+    if (closed) await closed;
     await this.buffers.shutdown();
     try { this.Ed.host.suspend(); } catch (e) { /* storage flush is best effort */ }
     try { fs.unlinkSync(this.cfg.socket); } catch (e) { /* gone */ }
@@ -289,7 +290,19 @@ export async function exportAll(cfg, dir, log) {
 
 /* ---------- main ---------- */
 function usage() { process.stderr.write('usage: edwind --config PATH [--check | --export DIR | --write-roots]\n'); return 2; }
+/* R4.45, R14.12: edwind never starts processes. Node's permission model would enforce this, but it also
+   disables fsync and fdatasync (Node 22 and 24), which the journal and atomic save need (R8.3, R8.7). So the
+   backstop is in-process: every function of child_process is replaced before anything else runs, for CJS
+   and ESM importers alike. The Authority (paths.mjs) is the real check on file writes. */
+export function guardProcesses() {
+  const cp = require('node:child_process');
+  const refuse = () => { throw new Error('edwind never starts processes (R4.45)'); };
+  for (const k of Object.keys(cp)) if (typeof cp[k] === 'function') { try { Object.defineProperty(cp, k, { value: refuse, writable: false, configurable: false }); } catch (e) { /* frozen */ } }
+  syncBuiltinESMExports();
+}
+
 export async function main(argv) {
+  guardProcesses();
   const args = [...argv];
   let config = null, mode = 'run', exportDir = null;
   while (args.length) {

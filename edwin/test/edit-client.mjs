@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
@@ -24,9 +24,28 @@ export function makeDir(extra = {}) {
 }
 
 /* Start edwind on DIR; resolves to the child once the socket accepts. */
-export function startEdwind(dir, { nodeArgs = [], env = {} } = {}) {
+/* The Node flags bin/edwind runs with (R14.11, R16.16): the same list nix/package.nix composes in the wrapper,
+   so the gate suites test edwind as the unit runs it. Node's permission model (`--permission`, R14.12) is not
+   among them: Node 22 and 24 disable fsync and fdatasync under it, which R8.3 and R8.7 need; edwind guards
+   child_process in-process instead (main.mjs guardProcesses). The stack is sized to the soft limit
+   (`ulimit -s`) minus headroom, at most 32000 KiB; the Scheme cap of 10,000 frames needs about 7 MiB. */
+export function nodeFlags({ stackKiB } = {}) {
+  if (stackKiB === undefined) {
+    const lim = spawnSync('sh', ['-c', 'ulimit -s'], { encoding: 'utf8' }).stdout.trim();
+    stackKiB = lim === 'unlimited' ? 32000 : Math.min(32000, Math.max(984, Number(lim) - 1200));
+  }
+  return ['--disallow-code-generation-from-strings', '--frozen-intrinsics', '--no-warnings=ExperimentalWarning', `--stack-size=${stackKiB}`];
+}
+
+/* Every edwind this process started dies with it, whatever the test did. */
+const children = new Set();
+process.once('exit', () => { for (const c of children) { try { c.kill('SIGKILL'); } catch (e) { /* gone */ } } });
+
+export function startEdwind(dir, { nodeArgs, env = {} } = {}) {
+  if (!nodeArgs) nodeArgs = nodeFlags();
   const child = spawn(process.execPath, [...nodeArgs, MAIN, '--config', dir.file], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, HOME: dir.dirs.home, ...env } });
   child.logs = '';
+  children.add(child); child.once('exit', () => children.delete(child));
   child.stderr.on('data', d => { child.logs += d; if (process.env.EDWIND_LOG) process.stderr.write(d); });
   child.stdout.on('data', d => { child.logs += d; });
   return new Promise((resolve, reject) => {
@@ -74,7 +93,7 @@ export class EditClient {
     return new Promise((resolve, reject) => {
       const w = { pred, resolve, reject };
       this.waiters.push(w);
-      const t = setTimeout(() => { const k = this.waiters.indexOf(w); if (k >= 0) { this.waiters.splice(k, 1); reject(new Error(`timeout waiting for ${pred.toString().slice(0, 80)}; queue: ${JSON.stringify(this.queue).slice(0, 400)}`)); } }, timeout);
+      const t = setTimeout(() => { const k = this.waiters.indexOf(w); if (k >= 0) { this.waiters.splice(k, 1); reject(new Error(`timeout waiting for ${pred.toString().slice(0, 80)}; queue: ${JSON.stringify(this.queue).slice(0, 400)}`)); } }, timeout).unref();
       w.resolve = m => { clearTimeout(t); resolve(m); };
     });
   }
@@ -109,5 +128,5 @@ export class EditClient {
   }
   call(cmd, args = [], ctx = {}, buf) { const m = { t: 'call', cmd, args, ctx }; if (buf) m.buf = buf; return this.request(m); }
   form(form) { return this.request({ t: 'call', form, ctx: {} }); }
-  close() { this.sock.end(); this.sock.destroy(); }
+  close() { this.closed = true; this.sock.end(); this.sock.destroy(); for (const w of this.waiters.splice(0)) w.reject(new Error('client closed')); }
 }

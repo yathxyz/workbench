@@ -54,6 +54,8 @@ export class Journal {
       let failed = null;
       try {
         const data = Buffer.from(batch.map(b => b.line).join(''), 'utf8');
+        /* Test hook (R16.7): EDWIND_FAULT=enospc-journal makes every append fail as a full disk does. */
+        if (process.env.EDWIND_FAULT === 'enospc-journal') throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
         let off = 0;
         while (off < data.length) off += fs.writeSync(this.fd, data, off, data.length - off);
         fs.fdatasyncSync(this.fd);

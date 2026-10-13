@@ -3,7 +3,9 @@
 # inside a card, nothing auto-running, kill-forget then reopen for both kinds, a nushell card, a
 # deploy-style switch, an OOM kill, hub.sock peer credentials, and a hub stop/start that leaves
 # a PTY corpse with the last screen, journals ending in the death invariant, and a revivable
-# agent. The agent is `stub`, wb-fake-acp acting on prompt keywords.
+# agent. The agent is `stub`, wb-fake-acp acting on prompt keywords. Step 10 is edwind (the edwind spec
+# R16.18, E1 part): the unit, `wb buf` and `wb eval` round trips, a restart that loses nothing, the web
+# restart leaving it alone, and edit.sock refused to another uid (R16.12).
 { self }:
 let
   secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -79,6 +81,8 @@ in
           pkgs.python3
           pkgs.socat
           (wbctlFor pkgs)
+          # `wb` for step 10; the units run their own copy from services.workbench.package.
+          config.services.workbench.package
         ];
       };
 
@@ -365,5 +369,55 @@ in
           assert states.get("a1") == "detached" and states.get("a3") == "error", states
           r = wbctl("acp-revive a1 --prompt ask-permission --permission allow_once --expect PONG")
           assert last_session(r)["via"] == "resume", last_session(r)
+
+      with subtest("10: edwind: the unit, wb buf and wb eval, a restart, the web restart, edit.sock peers"):
+          EDIT_SOCK = "/run/workbench-edit/edit.sock"
+          wb.wait_for_unit("workbench-edit.service")
+          wb.wait_until_succeeds(f"test -S {EDIT_SOCK}", timeout=30)
+          assert wb.succeed(f"stat -c %a /run/workbench-edit {EDIT_SOCK}").split() == ["700", "600"]
+          assert wb.succeed(f"stat -c %U /run/workbench-edit {EDIT_SOCK}").split() == ["alice", "alice"]
+          edit_pid = main_pid("workbench-edit")
+          wb.succeed(f"grep -qa -- --disallow-code-generation-from-strings /proc/{edit_pid}/cmdline")
+          wb.succeed(f"grep -qa -- --frozen-intrinsics /proc/{edit_pid}/cmdline")
+
+          def wb_cli(cmd, stdin=None):
+              pipe = f"printf %s {shlex.quote(stdin)} | " if stdin is not None else ""
+              return wb.succeed("set -o pipefail; " + pipe + as_user("alice", f"env HOME={HOME} wb {cmd}"))
+
+          # R16.18: a write and a read round trip; wb eval on the server image.
+          wb.succeed(f"mkdir -p {HOME}/work/roam && chown alice:users {HOME}/work {HOME}/work/roam")
+          wb_cli("buf write t.md --append --create -", "hello\n")
+          assert wb_cli("buf read t.md") == "hello\n"
+          assert wb_cli("eval '(+ 1 2)'").strip() == "3"
+          # The unit's stack carries the Scheme cap of 10,000 frames (R4.34, LimitSTACK).
+          assert wb_cli("eval '(define (f n) (if (= n 0) 0 (+ 1 (f (- n 1))))) (f 9900)'").strip() == "9900"
+          assert "t.md" in wb_cli("buf ls")
+
+          # A restart of edwind loses nothing: the lines before it are there, and writes continue.
+          for i in range(1, 6):
+              wb_cli("buf write t.md --append -", f"line {i}\n")
+          hub_pid_before = main_pid("workbench-hub")
+          wb.succeed("systemctl restart workbench-edit")
+          wb.wait_until_succeeds(f"test -S {EDIT_SOCK}", timeout=30)
+          assert main_pid("workbench-edit") != edit_pid, "edwind did not restart"
+          wb.wait_until_succeeds("set -o pipefail; " + as_user("alice", f"env HOME={HOME} wb buf read t.md | grep -q 'line 5'"), timeout=30)
+          wb_cli("buf write t.md --append -", "after\n")
+          text = wb_cli("buf read t.md")
+          assert text == "hello\n" + "".join(f"line {i}\n" for i in range(1, 6)) + "after\n", text
+          assert main_pid("workbench-hub") == hub_pid_before, "the edwind restart touched the hub"
+
+          # A web restart leaves edwind and the hub alone (R15.7, R15.8).
+          edit_pid = main_pid("workbench-edit")
+          wb.succeed("systemctl restart workbench-web")
+          wb.wait_for_open_port(8090, WB_IP)
+          assert main_pid("workbench-edit") == edit_pid, "the web restart touched edwind"
+          assert main_pid("workbench-hub") == hub_pid_before, "the web restart touched the hub"
+
+          # R16.12: another uid cannot reach edit.sock (the directory is 0700), and wb refuses a socket it
+          # does not own before sending anything.
+          rc, out = wb.execute(as_user("bob", f"socat -t2 - UNIX-CONNECT:{EDIT_SOCK} </dev/null 2>&1"))
+          assert rc != 0 and "ermission denied" in out, (rc, out)
+          rc, out = wb.execute(as_user("bob", f"env HOME=/tmp wb buf ls 2>&1"))
+          assert rc != 0, out
     '';
 }
