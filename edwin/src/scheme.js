@@ -3,10 +3,18 @@
    binding, define-syntax/syntax-rules (introduced identifiers are renamed, so temporaries
    never capture user variables), define-macro, escape continuations, dynamic-wind, guard,
    records, vectors, hash tables and chars. Expressions are compiled once into JS closures
-   with lexical addressing, then run. */
+   with lexical addressing, then run.
+   Numbers are JS doubles; an exact integer result outside ±2^53 becomes a BigInt (and comes back
+   to a double when it fits again). Textual ports (R7RS), first-class environments, source
+   locations on every pair read, a condition-type hierarchy with handlers that run before
+   unwinding (R7RS with-exception-handler), restarts, and a shadow stack of active procedure
+   calls for backtraces. Everything lives inside schemeModule so a worker can be built from
+   its source (pool.js). */
 (function () {
 function schemeModule(g) {
 'use strict';
+/* Read once at load: false compiles the shadow stack out (scheme-bench.mjs measures its cost). */
+const SHADOW = g.SCHEME_SHADOW_STACK !== false;
 
 /* ---------- data ---------- */
 class Sym { constructor(name) { this.name = name; } toString() { return this.name; } }
@@ -21,12 +29,94 @@ class Param {
   constructor(value, converter, name) { this.value = value; this.converter = converter || null; this.name = name || null; }
 }
 class Record { constructor(type, fields) { this.type = type; this.fields = fields; } }
-class RecordType { constructor(name, fieldNames) { this.name = name; this.fieldNames = fieldNames; } }
+class RecordType { constructor(name, fieldNames) { this.name = name; this.fieldNames = fieldNames; this.printer = null; } }
 class Box { constructor(name, value) { this.name = name; this.value = value; } }
-class TailCall { constructor(f, args) { this.f = f; this.args = args; } }
-class Env { constructor(name, parent) { this.name = name; this.parent = parent; } }
+/* LOC: where the tail call is (by default the call site in progress), for the shadow stack. */
+class TailCall { constructor(f, args, loc) { this.f = f; this.args = args; this.loc = loc === undefined ? site : loc; } }
+/* A first-class environment: a compile-time scope and the runtime frame that matches it.
+   The global environment has neither. */
+class Environment { constructor(scope, frame) { this.scope = scope; this.frame = frame; } }
+const GLOBAL_ENV = new Environment(null, null);
+/* A textual port. Output ports send text to SINK (a function) or collect it in CHUNKS; input
+   ports read TEXT from POS. */
+class Port {
+  constructor(name, input, output) { this.name = name || null; this.input = input; this.output = output; this.open = true; this.sink = null; this.chunks = null; this.text = ''; this.pos = 0; this.file = null; this.last = 10; }
+  put(s) {
+    if (!this.open) throw new SchemeError('wrong-type-argument', 'Port is closed: ' + write(this), [this]);
+    if (!s) return;
+    if (this.sink) this.sink(s); else this.chunks.push(s);
+    this.last = s.charCodeAt(s.length - 1);
+  }
+  string() { const s = this.chunks.join(''); this.chunks = s ? [s] : []; return s; }
+}
+function makeOutputPort(fn, name) { const p = new Port(name || 'output', false, true); p.sink = fn; return p; }
+function makeStringOutputPort() { const p = new Port('string', false, true); p.chunks = []; return p; }
+function makeStringInputPort(text, name) { const p = new Port(name || 'string', true, false); p.text = text; return p; }
+/* A restart: NAME (a symbol or #f), REPORT (string or procedure of a port), INTERACTIVE (a procedure
+   returning the argument list, or #f) and FN, called with the arguments after unwinding to the
+   point that established it (TAG). JS is true when FN is a JS function. */
+class Restart { constructor(name, report, interactive, fn, tag, js) { this.name = name || false; this.report = report || false; this.interactive = interactive || false; this.fn = fn; this.tag = tag; this.js = !!js; } }
+/* Unwinding to a guard or a restart: not an Error, so nothing but its target catches it. */
+class Unwind { constructor(tag, a, b) { this.tag = tag; this.a = a; this.b = b; } }
+/* A condition type: conditions are SchemeErrors whose KIND names one. */
+class ConditionType {
+  constructor(name, parent, reporter) { this.name = name; this.parent = parent || null; this.reporter = reporter || null; }
+  isa(name) { for (let t = this; t; t = t.parent) if (t.name === name) return true; return false; }
+}
+/* One entry of a backtrace. */
+class StackFrame { constructor(proc, frame, loc) { this.proc = proc; this.frame = frame; this.loc = loc; } }
+/* Where a pair was read: the text it came from and an offset; line (from 1) and column (from 0)
+   are computed when first asked for. */
+class SrcInfo { constructor(file, text) { this.file = file; this.text = text; this.starts = null; } }
+class SrcLoc {
+  constructor(info, off) { this.info = info; this.off = off; this.lc = null; }
+  get file() { return this.info.file; }
+  get line() { return this.where()[0]; }
+  get col() { return this.where()[1]; }
+  where() {
+    if (this.lc) return this.lc;
+    const info = this.info;
+    if (!info.starts) { const st = [0], t = info.text; for (let i = 0; i < t.length; i++) if (t.charCodeAt(i) === 10) st.push(i + 1); info.starts = st; }
+    const st = info.starts; let lo = 0, hi = st.length - 1;
+    while (lo < hi) { const m = (lo + hi + 1) >> 1; if (st[m] <= this.off) lo = m; else hi = m - 1; }
+    return (this.lc = [lo + 1, this.off - st[lo]]);
+  }
+  plain() { return { file: this.file, line: this.line, col: this.col }; }
+}
+const locs = new WeakMap();          // pair -> SrcLoc
+/* A hash table whose object keys are held weakly (a WeakMap); other keys (numbers, strings,
+   booleans) are held strongly in the Map itself. Iteration (keys, ->alist, walk, count) yields the
+   strong entries, then the weak entries whose keys are still alive, so an entry can vanish between
+   two walks once nothing else refers to its key. */
+const canWeak = typeof WeakRef === 'function';
+const isObjKey = k => (typeof k === 'object' && k !== null) || typeof k === 'function';
+class WeakTable extends Map {
+  constructor() { super(); this.wm = new WeakMap(); this.refs = new Set(); this.reg = typeof FinalizationRegistry === 'function' ? new FinalizationRegistry(r => this.refs.delete(r)) : null; }
+  get(k) { if (isObjKey(k)) { const e = this.wm.get(k); return e ? e.v : undefined; } return super.get(k); }
+  has(k) { return isObjKey(k) ? this.wm.has(k) : super.has(k); }
+  set(k, v) {
+    if (!isObjKey(k)) return super.set(k, v);
+    const e = this.wm.get(k);
+    if (e) e.v = v;
+    else { const ref = canWeak ? new WeakRef(k) : { deref: () => k }; this.wm.set(k, { v, ref }); this.refs.add(ref); if (this.reg) this.reg.register(k, ref, ref); }
+    return this;
+  }
+  delete(k) {
+    if (!isObjKey(k)) return super.delete(k);
+    const e = this.wm.get(k); if (!e) return false;
+    this.wm.delete(k); this.refs.delete(e.ref); if (this.reg) this.reg.unregister(e.ref); return true;
+  }
+  clear() { super.clear(); for (const r of this.refs) if (this.reg) this.reg.unregister(r); this.wm = new WeakMap(); this.refs.clear(); }
+  get size() { let n = super.size; for (const r of this.refs) { const k = r.deref(); if (k !== undefined && this.wm.has(k)) n++; } return n; }
+  *entries() { yield* super.entries(); for (const r of [...this.refs]) { const k = r.deref(); if (k === undefined) { this.refs.delete(r); continue; } const e = this.wm.get(k); if (e) yield [k, e.v]; } }
+  *keys() { for (const [k] of this.entries()) yield k; }
+  *values() { for (const [, v] of this.entries()) yield v; }
+  [Symbol.iterator]() { return this.entries(); }
+  forEach(f, self) { for (const [k, v] of this.entries()) f.call(self, v, k, this); }
+}
 
 const NIL = new Nil(), UNSPEC = new Unspecified(), EOF = new Eof();
+const MAXS = Number.MAX_SAFE_INTEGER;
 const obarray = new Map();
 function intern(name) { let s = obarray.get(name); if (!s) { s = new Sym(name); obarray.set(name, s); } return s; }
 let gensymCounter = 0;
@@ -60,17 +150,164 @@ class Escape { constructor(tag, vals) { this.tag = tag; this.vals = vals; } }
 function typeErr(expected, got, who) { return new SchemeError('wrong-type-argument', `${who ? who + ': ' : ''}expected ${expected}, got ${write(got)}`, [got]); }
 function err(msg, ...irritants) { return new SchemeError('error', msg, irritants); }
 function errorMessage(e) {
-  if (e instanceof SchemeError) return e.message + (e.kind === 'error' && e.irritants.length ? ' ' + e.irritants.map(x => write(x)).join(' ') : '');
+  if (e instanceof SchemeError) {
+    const t = ctypes.get(e.kind), r = t ? reporterOf(t) : null;
+    if (r) { try { return reportWith(r, e); } catch (x) { /* fall back to the plain report */ } }
+    return e.message + (e.kind === 'error' && e.irritants.length ? ' ' + e.irritants.map(x => write(x)).join(' ') : '');
+  }
   if (e instanceof Raise) return 'Uncaught exception: ' + write(e.obj);
   if (e instanceof RangeError) return 'Stack overflow';
   return e && e.message ? e.message : String(e);
 }
 
+/* ---------- condition types ---------- */
+/* Every SchemeError is a condition whose type is named by its kind. quit and scheme-interrupt are
+   not errors (as in Emacs); a kind nobody declared is a child of error. */
+const ctypes = new Map();
+function conditionType(kind) {
+  if (kind instanceof ConditionType) return kind;
+  const name = kind instanceof Sym ? kind.name : String(kind);
+  let t = ctypes.get(name);
+  if (!t) { t = new ConditionType(name, name === 'error' ? null : conditionType('error'), null); ctypes.set(name, t); }
+  return t;
+}
+function defineConditionType(name, parent, reporter) {
+  name = name instanceof Sym ? name.name : String(name);
+  const p = parent === null || parent === false || parent === undefined ? null : conditionType(parent);
+  for (let q = p; q; q = q.parent) if (q.name === name) throw new SchemeError('error', 'define-condition-type: ' + name + ' cannot be its own ancestor', []);
+  let t = ctypes.get(name);
+  if (t) { t.parent = p; t.reporter = reporter || null; } else { t = new ConditionType(name, p, reporter); ctypes.set(name, t); }
+  return t;
+}
+const reporterOf = t => { for (let c = t; c; c = c.parent) if (c.reporter) return c.reporter; return null; };
+function reportWith(r, c) { if (typeof r === 'string') return r; const p = makeStringOutputPort(); callProc(r, [c, p]); return p.string(); }
+function conditionIs(e, kind) { return e instanceof SchemeError && conditionType(e.kind).isa(kind instanceof Sym ? kind.name : kind); }
+const isErrorCondition = e => e instanceof SchemeError && conditionType(e.kind).isa('error');
+defineConditionType('error', null); defineConditionType('quit', null); defineConditionType('scheme-interrupt', null);
+for (const k of ['user-error', 'wrong-type-argument', 'unbound-variable', 'range-error', 'file-error', 'server-only', 'edit-conflict', 'timeout',
+  'http-error', 'wrong-number-of-arguments', 'divide-by-zero', 'syntax-error', 'read-error', 'assertion-failed', 'recursion-depth', 'control-error',
+  'buffer-read-only', 'search-failed', 'beginning-of-buffer', 'end-of-buffer', 'beginning-of-line', 'end-of-line', 'scan-error', 'void-function',
+  'invalid-regexp', 'setting-constant', 'ship-error', 'job-error', 'no-worker', 'thread-died', 'thread-cancelled']) defineConditionType(k, 'error');
+defineConditionType('args-out-of-range', 'range-error'); defineConditionType('end-of-file', 'read-error'); defineConditionType('thread-timeout', 'timeout');
+
+/* ---------- signalling: handlers run before unwinding ---------- */
+/* HANDLERS is the dynamic stack of exception handlers, innermost first: { h, js, next }. A Scheme
+   handler (js false) is called with the condition; a JS handler with (condition, continuable) and
+   may return DECLINE to pass it on. A handler runs where the condition was raised, with the outer
+   handlers installed; returning from one for raise is an error, for raise-continuable it resumes.
+   Errors a JS primitive throws are routed here by the innermost Scheme call site that sees them
+   while a handler is installed (the try/catch is only paid then); `signalled` marks a condition
+   every handler has seen, so outer call sites let it pass (the mark is cleared once it is past
+   every handler). Quit and scheme-interrupt conditions reach only JS handlers. */
+const DECLINE = { toString() { return '#<decline>'; } };
+let handlers = null;
+let restarts = null;                 // innermost first: { r: Restart, next }
+const isPassive = o => (hooks.isQuit && hooks.isQuit(o)) || (o instanceof SchemeError && (o.kind === 'scheme-interrupt' || o.kind === 'quit'));
+function signal(obj, continuable) {
+  const top = handlers;
+  if (obj instanceof SchemeError) { obj.signalled = true; if (top !== null && obj.shadow === undefined) obj.shadow = snapshot(); }
+  if (top !== null) {
+    const passive = isPassive(obj);
+    try {
+      for (let n = top; n !== null; n = n.next) {
+        if (passive && !n.js) continue;
+        handlers = n.next;
+        let v;
+        try { v = n.js ? n.h(obj, continuable) : callProc(n.h, [obj]); }
+        catch (e) { if (e instanceof SchemeError || e instanceof Raise) e.signalled = true; throw e; }
+        if (n.js && v === DECLINE) continue;
+        if (continuable) return v;
+        signal(new SchemeError('error', 'Exception handler returned from a non-continuable raise of ' + (obj instanceof SchemeError ? errorMessage(obj) : write(obj)), [obj]), false);
+      }
+    } finally { handlers = top; }
+  }
+  if (obj instanceof SchemeError) throw obj;
+  const r = new Raise(obj, continuable); r.signalled = true; r.shadow = top !== null ? snapshot() : undefined;
+  throw r;
+}
+/* Install the JS handler H(condition, continuable) -> value or DECLINE around THUNK (a JS function). */
+function withHandler(h, thunk) {
+  const saved = handlers;
+  handlers = { h, js: true, next: saved };
+  try { return thunk(); } finally { handlers = saved; }
+}
+
+/* ---------- restarts ---------- */
+/* Restarts are established for the dynamic extent of a thunk and invoked by throwing an Unwind to
+   the establishing point, which then calls the restart's procedure with the arguments. Handlers
+   run before unwinding, so they see every restart established between them and the raise. */
+function establish(rs, tag, run, tailOk) {
+  const saved = restarts, s = sp;
+  let chain = saved;
+  for (let i = rs.length - 1; i >= 0; i--) chain = { r: rs[i], next: chain };
+  restarts = chain;
+  try { return run(); }
+  catch (e) {
+    if (!(e instanceof Unwind) || e.tag !== tag) throw e;
+    sp = s; restarts = saved;
+    const r = e.a;
+    if (r.js) return r.fn(...e.b);
+    return tailOk ? new TailCall(r.fn, e.b) : callProc(r.fn, e.b);
+  } finally { restarts = saved; }
+}
+const restartName = x => x instanceof Sym ? x : typeof x === 'string' ? intern(x) : false;
+function withRestarts(specs, thunk) {
+  const tag = {};
+  return establish(specs.map(s => s instanceof Restart ? s : new Restart(restartName(s.name), s.report, s.interactive, s.fn, tag, true)), tag, thunk, false);
+}
+function computeRestarts() { const out = []; for (let n = restarts; n; n = n.next) out.push(n.r); return out; }
+function findRestart(x) {
+  if (x instanceof Restart) { for (let n = restarts; n; n = n.next) if (n.r === x) return x; return null; }
+  const name = restartName(x);
+  for (let n = restarts; n; n = n.next) if (n.r.name === name) return n.r;
+  return null;
+}
+function invokeRestart(x, args) {
+  const r = findRestart(x);
+  if (!r) throw new SchemeError('control-error', x instanceof Restart ? 'Restart is not active: ' + write(x) : 'No restart named ' + write(x) + ' is active', [x]);
+  throw new Unwind(r.tag, r, args || []);
+}
+function restartArgs(r) {
+  if (r.interactive) return r.js ? r.interactive(r) : arr(callProc(r.interactive, []));
+  if (hooks.restartArgs) return hooks.restartArgs(r) || [];
+  return [];
+}
+function restartReport(r) {
+  if (typeof r.report === 'string') return r.report;
+  if (typeof r.report === 'function') { if (r.js) return String(r.report(r)); const p = makeStringOutputPort(); callProc(r.report, [p]); return p.string(); }
+  return r.name ? r.name.name : 'anonymous restart';
+}
+const USE_VALUE = intern('use-value'), STORE_VALUE = intern('store-value');
+/* An unbound variable offers use-value (a value for this reference) and store-value (define the
+   variable and go on), here at the reference. */
+function unboundRef(box, name) {
+  const tag = {};
+  siteProc = null;
+  const need = v => { if (v === undefined) throw new SchemeError('wrong-number-of-arguments', name + ': the restart needs a value', []); return v; };
+  return establish([
+    new Restart(USE_VALUE, `Specify a value to use instead of ${name}.`, null, v => need(v), tag, true),
+    new Restart(STORE_VALUE, `Define ${name} to a given value.`, null, v => { box.value = need(v); return v; }, tag, true),
+  ], tag, () => signal(new SchemeError('unbound-variable', `Unbound variable: ${name}`, [intern(name)]), false), false);
+}
+function unboundSet(box, name, v) {
+  const tag = {};
+  siteProc = null;
+  const store = x => { box.value = x === undefined ? v : x; return UNSPEC; };
+  return establish([
+    new Restart(USE_VALUE, `Define ${name} to a given value (or the one being assigned) and go on.`, null, store, tag, true),
+    new Restart(STORE_VALUE, `Define ${name} to a given value (or the one being assigned) and go on.`, null, store, tag, true),
+  ], tag, () => signal(new SchemeError('unbound-variable', `Unbound variable: ${name}`, [intern(name)]), false), false);
+}
+
 /* ---------- reader ---------- */
 const DELIM = /[\s()\[\]"';`,]/;
 const NAMED_CHARS = { space: 32, newline: 10, tab: 9, nul: 0, null: 0, return: 13, escape: 27, esc: 27, delete: 127, del: 127, backspace: 8, alarm: 7, linefeed: 10, altmode: 27, rubout: 127 };
-function reader(src) {
+/* OPTS: { file } or a file name; every pair read gets a source location (locs). */
+function reader(src, opts) {
   let i = 0;
+  const file = typeof opts === 'string' ? opts : opts && opts.file !== undefined ? opts.file : null;
+  const info = new SrcInfo(file, src);
+  const mark = (p, off) => { locs.set(p, new SrcLoc(info, off)); return p; };
   const peek = () => src[i];
   function skip() {
     for (;;) {
@@ -108,21 +345,30 @@ function reader(src) {
     if (NAMED_CHARS[lc] !== undefined) { i = j; return mkchar(NAMED_CHARS[lc]); }
     const cp = src.codePointAt(i); i += cp > 0xffff ? 2 : 1; return mkchar(cp);
   }
+  function located(items, offs, start, tail) {
+    const l = listOf(items, tail);
+    let p = l;
+    for (let k = 0; p instanceof Pair && k < items.length; k++, p = p.cdr) mark(p, k === 0 ? start : offs[k]);
+    return l;
+  }
   function readList(close) {
-    i++; const items = [];
+    const start = i;
+    i++; const items = [], offs = [];
     for (;;) {
       skip();
       if (i >= src.length) eof();
-      if (src[i] === close) { i++; return listOf(items); }
+      if (src[i] === close) { i++; return located(items, offs, start, NIL); }
       if (src[i] === ')' || src[i] === ']') throw new SchemeError('read-error', `Unexpected ${src[i]}`);
       if (src[i] === '.' && (i + 1 >= src.length || DELIM.test(src[i + 1])) && items.length) {
         i++; const tail = form(); skip();
         if (src[i] !== close) throw new SchemeError('read-error', 'Bad dotted list');
-        i++; return listOf(items, tail);
+        i++; return located(items, offs, start, tail);
       }
+      offs.push(i);
       items.push(form());
     }
   }
+  function quoted(head, at) { skip(); const off = i, x = form(); const p = new Pair(head, new Pair(x, NIL)); mark(p.cdr, off); return mark(p, at); }
   function form() {
     skip();
     if (i >= src.length) eof();
@@ -130,9 +376,9 @@ function reader(src) {
     if (c === '(') return readList(')');
     if (c === '[') return readList(']');
     if (c === ')' || c === ']') { i++; throw new SchemeError('read-error', `Unexpected ${c}`); }
-    if (c === "'") { i++; return list(S.quote, form()); }
-    if (c === '`') { i++; return list(S.quasiquote, form()); }
-    if (c === ',') { i++; if (src[i] === '@') { i++; return list(S['unquote-splicing'], form()); } return list(S.unquote, form()); }
+    if (c === "'") { i++; return quoted(S.quote, i - 1); }
+    if (c === '`') { i++; return quoted(S.quasiquote, i - 1); }
+    if (c === ',') { i++; if (src[i] === '@') { i++; return quoted(S['unquote-splicing'], i - 2); } return quoted(S.unquote, i - 1); }
     if (c === '"') return readString();
     if (c === '#') {
       const d = src[i + 1];
@@ -143,9 +389,9 @@ function reader(src) {
       if (d === 'x' || d === 'b' || d === 'o' || d === 'd' || d === 'e' || d === 'i') {
         let j = i + 2; while (j < src.length && !DELIM.test(src[j])) j++;
         const tok = src.slice(i + 2, j); i = j;
-        const n = d === 'x' ? parseInt(tok, 16) : d === 'b' ? parseInt(tok, 2) : d === 'o' ? parseInt(tok, 8) : Number(tok);
-        if (isNaN(n)) throw new SchemeError('read-error', 'Bad number: #' + d + tok);
-        return n;
+        const n = d === 'x' || d === 'b' || d === 'o' ? parseRadix(tok, d === 'x' ? 16 : d === 'b' ? 2 : 8) : d === 'i' ? (v => v === false ? false : inexact(v))(parseNumber(tok)) : parseNumber(tok);
+        if (n === false) throw new SchemeError('read-error', 'Bad number: #' + d + tok);
+        return d === 'e' ? exactOf(n) : n;
       }
       if (d === '!') { let j = i; while (j < src.length && !DELIM.test(src[j])) j++; const tok = src.slice(i + 2, j); i = j; if (tok === 'eof') return EOF; if (tok === 'unspecific' || tok === 'void') return UNSPEC; if (tok === 'default' || tok === 'optional' || tok === 'rest' || tok === 'key') return intern('#!' + tok); return form(); }
       throw new SchemeError('read-error', 'Bad # syntax');
@@ -154,6 +400,7 @@ function reader(src) {
     if (src[i] === '|') { j = src.indexOf('|', i + 1); if (j < 0) eof(); const name = src.slice(i + 1, j); i = j + 1; return intern(name); }
     while (j < src.length && !DELIM.test(src[j])) j++;
     const tok = src.slice(i, j); i = j;
+    if (/^[+-]?\d+$/.test(tok)) { const n = Number(tok); return n <= MAXS && n >= -MAXS ? n : BigInt(tok); }
     if (/^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(tok)) return Number(tok);
     if (/^[+-]?\d+\/\d+$/.test(tok)) { const [a, b] = tok.split('/'); return Number(a) / Number(b); }
     if (tok === '+inf.0') return Infinity; if (tok === '-inf.0') return -Infinity; if (tok === '+nan.0') return NaN;
@@ -163,7 +410,12 @@ function reader(src) {
   return { form, get done() { skip(); return i >= src.length; }, get pos() { return i; }, set pos(v) { i = v; } };
 }
 function read(src) { return reader(src).form(); }
-function readAll(src) { const r = reader(src), out = []; while (!r.done) out.push(r.form()); return out; }
+function readAll(src, file) { const r = reader(src, file), out = []; while (!r.done) out.push(r.form()); return out; }
+/* The source location of a pair read or a procedure's lambda form: { file, line, col } or null. */
+function sourceLocation(x) {
+  const l = typeof x === 'function' ? x.loc : x instanceof SrcLoc ? x : x && typeof x === 'object' ? locs.get(x) : null;
+  return l ? l.plain() : null;
+}
 
 /* ---------- printer ---------- */
 const CHAR_NAMES = { 32: 'space', 10: 'newline', 9: 'tab', 0: 'nul', 13: 'return', 27: 'escape', 127: 'delete', 8: 'backspace', 7: 'alarm' };
@@ -175,7 +427,8 @@ function write(x, display) {
   if (x === null) return '#<null>';
   if (x instanceof Sym) return display || !/[\s()"';|]/.test(x.name) || x.name === '' ? (x.name === '' ? '||' : x.name) : '|' + x.name + '|';
   if (x instanceof Alias) return x.sym.name;
-  if (typeof x === 'number') return Number.isInteger(x) ? String(x) : Number.isFinite(x) ? (String(x).includes('.') || String(x).includes('e') ? String(x) : x + '.0') : x > 0 ? '+inf.0' : x < 0 ? '-inf.0' : '+nan.0';
+  if (typeof x === 'number') return writeNumber(x);
+  if (typeof x === 'bigint') return x.toString();
   if (typeof x === 'string') return display ? x : writeString(x);
   if (x instanceof Char) return display ? String.fromCodePoint(x.code) : '#\\' + (CHAR_NAMES[x.code] || (x.code < 32 ? 'x' + x.code.toString(16) : String.fromCodePoint(x.code)));
   if (x instanceof Pair) {
@@ -191,15 +444,40 @@ function write(x, display) {
   if (Array.isArray(x)) return '#(' + x.map(e => write(e, display)).join(' ') + ')';
   if (typeof x === 'function') return '#<procedure' + (x.procName ? ' ' + x.procName : '') + '>';
   if (x instanceof Param) return '#<parameter' + (x.name ? ' ' + x.name : '') + '>';
+  if (x instanceof WeakTable) return '#<weak-hash-table ' + x.size + '>';
   if (x instanceof Map) return '#<hash-table ' + x.size + '>';
-  if (x instanceof Record) return '#<' + x.type.name + (x.fields.length ? ' ' + x.fields.map(f => write(f, display)).join(' ') : '') + '>';
+  if (x instanceof Record) return writeRecord(x);
   if (x instanceof RecordType) return '#<record-type ' + x.name + '>';
   if (x instanceof Values) return x.vals.map(v => write(v, display)).join(' ');
   if (x instanceof Unspecified || x instanceof Eof || x instanceof Nil) return x.toString();
   if (x && typeof x.__print === 'function') return x.__print();
   if (x instanceof SchemeError) return '#<error ' + writeString(x.message) + '>';
+  if (x instanceof Port) return '#<' + (x.input ? 'input-' : '') + (x.output ? 'output-' : '') + 'port' + (x.name ? ' ' + x.name : '') + ' ' + objectHash(x) + '>';
+  if (x instanceof Environment) return x === GLOBAL_ENV ? '#<environment system-global-environment>' : '#<environment ' + objectHash(x) + '>';
+  if (x instanceof ConditionType) return '#<condition-type ' + x.name + '>';
+  if (x instanceof Restart) return '#<restart ' + (x.name ? x.name.name : 'anonymous') + ' ' + objectHash(x) + '>';
+  if (x instanceof StackFrame) { const l = x.loc; return '#<stack-frame ' + (x.proc && x.proc.procName || 'anonymous') + (l ? ' ' + (l.file || '') + ':' + l.line + ':' + l.col : '') + '>'; }
+  if (x instanceof Error) return '#<js-error ' + writeString(String(x.message)) + '>';
+  if (typeof x === 'object') { const c = x.constructor && x.constructor.name; return '#<' + (c && c !== 'Object' ? c : 'object') + ' ' + objectHash(x) + '>'; }
   return String(x);
 }
+function writeNumber(x) {
+  if (Number.isInteger(x)) return x <= MAXS && x >= -MAXS ? String(x) : (s => s.includes('e') ? s : s + '.')(String(x));
+  if (Number.isFinite(x)) { const s = String(x); return s.includes('.') || s.includes('e') ? s : s + '.0'; }
+  return x > 0 ? '+inf.0' : x < 0 ? '-inf.0' : '+nan.0';
+}
+/* Records print as #<type N> handles (N is the object's hash number) unless the type has a printer,
+   which is called as (printer record port). */
+function writeRecord(x) {
+  const pr = x.type.printer;
+  if (pr) {
+    const p = makeStringOutputPort();
+    try { callProc(pr, [x, p]); return p.string(); } catch (e) { if (e instanceof Escape || e instanceof Unwind) throw e; }
+  }
+  return '#<' + x.type.name + ' ' + objectHash(x) + '>';
+}
+const hashes = new WeakMap(); let hashN = 0;
+function objectHash(x) { if (!isObjKey(x)) return false; let h = hashes.get(x); if (!h) { h = ++hashN; hashes.set(x, h); } return h; }
 const display = x => write(x, true);
 
 /* ---------- equality ---------- */
@@ -234,17 +512,110 @@ function tick() {
   if ((++tickN & 0x3FFFF) !== 0) return;
   const now = performance.now();
   if (!stepT0) { stepT0 = now; return; }
-  if (now - stepT0 > watchdog.limitMs) { stepT0 = 0; throw new SchemeError('error', `Interrupted: evaluation ran for more than ${Math.round(watchdog.limitMs / 1000)} s`, []); }
+  if (now - stepT0 > watchdog.limitMs) { stepT0 = 0; throw new SchemeError('scheme-interrupt', `Interrupted: evaluation ran for more than ${Math.round(watchdog.limitMs / 1000)} s`, []); }
 }
+
+/* ---------- the shadow stack ---------- */
+/* ST holds the active applications of compound procedures, three slots per entry (the procedure,
+   the location of the call that entered it, its lexical frame), entry k at 3k; entry 0 is a
+   sentinel so SP (the next free entry) is never 0. A compound procedure pushes itself on entry and
+   pops itself when its body returns, so a tail call it makes (run by its caller's trampoline after
+   the pop) replaces it. Call sites only note the callee and their location in SITEPROC and SITE,
+   so a call to a primitive costs two stores; a backtrace's innermost entry is the primitive (or the
+   procedure not yet entered) the innermost frame last called, if any. Points that raise an error
+   outside any call clear SITEPROC so that entry is not shown. Catch sites (callProc, evalForm, guard,
+   call/ec, restarts) restore SP after a throw, once a snapshot is attached to the condition. Going
+   past MAX_DEPTH signals recursion-depth, with DEPTH_SLACK more entries for its handlers. */
+let MAX_DEPTH = 10000;
+const DEPTH_SLACK = 2000;
+let depthLimit = MAX_DEPTH, sp = 1, site = null, siteProc = null;
+const ST = new Array((MAX_DEPTH + 2 * DEPTH_SLACK) * 3).fill(null);
+function setMaxDepth(n) {
+  MAX_DEPTH = n; depthLimit = n;
+  for (let need = (n + 2 * DEPTH_SLACK) * 3; ST.length < need;) ST.push(null);
+}
+function resetStack() { sp = 1; depthLimit = MAX_DEPTH; site = null; siteProc = null; }
+function snapshot() { return { raw: ST.slice(3, sp * 3), site, proc: siteProc }; }
+/* The entries of a snapshot, innermost first: { proc, frame, loc }. */
+function frames(snap) {
+  const out = [], raw = snap.raw;
+  const n = raw.length / 3, p = snap.proc;
+  if (p && (!p.scope || n === 0 || raw[(n - 1) * 3] !== p)) out.push({ proc: p, frame: null, loc: snap.site ? snap.site.plain() : null });
+  for (let k = n - 1; k >= 0; k--) { const l = raw[k * 3 + 1]; out.push({ proc: raw[k * 3], frame: raw[k * 3 + 2], loc: l ? l.plain() : null }); }
+  return out;
+}
+function backtrace() { return frames(snapshot()); }
+function conditionBacktrace(e) { const s = e && e.shadow; return s ? frames(s) : null; }
+function depthExceeded() {
+  const e = new SchemeError('recursion-depth', 'Recursion too deep', []);
+  if (depthLimit > MAX_DEPTH) throw e;
+  depthLimit = MAX_DEPTH + DEPTH_SLACK;
+  try { return signal(e, false); } finally { depthLimit = MAX_DEPTH; }
+}
+/* What every catch site does with an exception passing through: a condition no handler has seen yet
+   goes to the handlers now (before anything unwinds further), the stack is snapshotted onto it, and
+   the stack pointer goes back to S. */
+function unwound(e, s) {
+  if (e instanceof SchemeError) {
+    if (handlers === null) e.signalled = false;   // past every handler: if it is thrown again, they see it afresh
+    else if (!e.signalled) signal(e, false);
+    if (e.shadow === undefined) e.shadow = snapshot();
+  } else if (e instanceof Raise && e.shadow === undefined) e.shadow = snapshot();
+  sp = s;
+  throw e;
+}
+/* Apply F to ARGS from JS (or from a primitive): the callee is noted as called from the current
+   site (a procedure map applies shows the (map ...) call as its caller). */
 function callProc(f, args) {
   if (typeof f !== 'function') {
     if (f instanceof Param) { if (args.length) { f.value = f.converter ? callProc(f.converter, [args[0]]) : args[0]; return UNSPEC; } return f.value; }
     if (f instanceof Sym && isBound(f.name) && typeof gref(f.name) === 'function') return callProc(gref(f.name), args);
     throw new SchemeError('wrong-type-argument', `Not a procedure: ${write(f)}`, [f]);
   }
-  let r = f(args);
-  while (r instanceof TailCall) { tick(); r = typeof r.f === 'function' ? r.f(r.args) : callProc(r.f, r.args); }
-  return r;
+  const s = sp, l = s === 1 ? null : site, lp = siteProc;   // from the top level, no call site
+  try {
+    if (SHADOW) { site = l; siteProc = f; }
+    let r = f(args);
+    while (r instanceof TailCall) {
+      tick(); const h = r.f;
+      if (SHADOW) { site = r.loc || l; siteProc = h; }
+      r = typeof h === 'function' ? h(r.args) : callProc(h, r.args);
+    }
+    if (SHADOW) { site = l; siteProc = lp; }
+    return r;
+  } catch (e) { return unwound(e, s); }
+}
+/* A call site's application of F, compiled per site with its source location LOC. */
+function makeCall(loc) {
+  if (!SHADOW) return (f, args) => {
+    if (typeof f !== 'function') return callProc(f, args);
+    if (handlers !== null) return callGuarded(f, args, loc);
+    let r = f(args);
+    while (r instanceof TailCall) { tick(); r = typeof r.f === 'function' ? r.f(r.args) : callProc(r.f, r.args); }
+    return r;
+  };
+  return (f, args) => {
+    if (typeof f !== 'function') return callProc(f, args);
+    if (handlers !== null) return callGuarded(f, args, loc);
+    site = loc; siteProc = f;
+    let r = f(args);
+    while (r instanceof TailCall) { tick(); const h = r.f; site = r.loc; siteProc = h; r = typeof h === 'function' ? h(r.args) : callProc(h, r.args); }
+    return r;
+  };
+}
+/* The same while a handler is installed: errors thrown below reach the handlers here. */
+function callGuarded(f, args, loc) {
+  const s = sp;
+  try {
+    if (SHADOW) { site = loc; siteProc = f; }
+    let r = f(args);
+    while (r instanceof TailCall) {
+      tick(); const h = r.f;
+      if (SHADOW) { site = r.loc; siteProc = h; }
+      r = typeof h === 'function' ? h(r.args) : callProc(h, r.args);
+    }
+    return r;
+  } catch (e) { return unwound(e, s); }
 }
 function arity(f, n, rest) { f.arity = n; f.rest = !!rest; return f; }
 function named(f, name) { if (!f.procName) f.procName = name; return f; }
@@ -390,7 +761,7 @@ function parseRules(spec, scope) {
 
 const SPECIAL = new Set([S.quote, S.quasiquote, S.lambda, S.define, S['set!'], S.if, S.begin, S.let, S['let*'], S.letrec, S['letrec*'], S.cond, S.case,
   S.and, S.or, S.when, S.unless, S.do, S['define-syntax'], S['define-macro'], S.parameterize, S.guard, S['define-record-type'], S['let-values'],
-  S.receive, S.assert, S.delay, S['case-lambda'], S['named-lambda'], S['define-values'], S['let-syntax'], S['letrec-syntax'], S['the-environment']]);
+  S.receive, S.assert, S.delay, S['case-lambda'], S['named-lambda'], S['define-values'], S['let-syntax'], S['letrec-syntax'], S['the-environment'], S.include]);
 
 const K = v => () => v;
 function body(forms, scope, tail) {
@@ -429,7 +800,7 @@ function parseParams(params) {
   if (p !== NIL) rest = p;
   return { names, optional, rest };
 }
-function makeLambda(params, bodyForms, scope, name) {
+function makeLambda(params, bodyForms, scope, name, loc) {
   const { names, optional, rest } = parseParams(params);
   const all = [...names, ...optional]; if (rest) all.push(rest);
   const inner = new Scope(scope, all);
@@ -440,6 +811,7 @@ function makeLambda(params, bodyForms, scope, name) {
   const run = body(bodyForms, inner, true);
   const nReq = names.length, nOpt = optional.length, hasRest = !!rest;
   const slotRest = nReq + nOpt + 1;
+  const lambdaLoc = loc || null;
   return env => {
     const f = function (args) {
       const n = args.length;
@@ -448,10 +820,15 @@ function makeLambda(params, bodyForms, scope, name) {
       frame[0] = env;
       for (let i = 0; i < nReq + nOpt; i++) frame[i + 1] = i < n ? args[i] : false;
       if (hasRest) frame[slotRest] = n > nReq + nOpt ? listOf(args.slice(nReq + nOpt)) : NIL;
+      if (SHADOW) {
+        const t = sp; if (t > depthLimit) depthExceeded();
+        const b = t * 3; ST[b] = f; ST[b + 1] = site; ST[b + 2] = frame; sp = t + 1;
+        const r = run(frame); sp = t; return r;
+      }
       return run(frame);
     };
     f.procName = name || null; f.doc = doc; f.arity = nReq; f.rest = hasRest; f.optional = nOpt; f.params = params;
-    f.src = srcForm; f.scope = inner; f.env = env;
+    f.src = srcForm; f.scope = inner; f.env = env; f.loc = lambdaLoc;
     return f;
   };
 }
@@ -468,7 +845,7 @@ function compRef(id, scope) {
   }
   const name = baseName(id).name;
   const box = gbox(name);
-  return () => { const v = box.value; if (v === undefined) throw new SchemeError('unbound-variable', `Unbound variable: ${name}`); return v; };
+  return () => { const v = box.value; if (v === undefined) return unboundRef(box, name); return v; };
 }
 function compSet(id, valc, scope, define) {
   const r = lookup(scope, id);
@@ -480,24 +857,20 @@ function compSet(id, valc, scope, define) {
   }
   const name = baseName(id).name, box = gbox(name);
   if (define) return env => { const v = valc(env); if (typeof v === 'function' && !v.procName) v.procName = name; box.value = v; return baseName(id); };
-  return env => { if (box.value === undefined) throw new SchemeError('unbound-variable', `Unbound variable: ${name}`); box.value = valc(env); return UNSPEC; };
+  return env => { const v = valc(env); if (box.value === undefined) return unboundSet(box, name, v); box.value = v; return UNSPEC; };
 }
 function compCall(form, scope, tail) {
   const fc = comp(form.car, scope, false);
   const argcs = arr(form.cdr).map(a => comp(a, scope, false));
   const n = argcs.length;
+  const loc = locs.get(form) || null;
   if (tail) {
-    if (n === 0) return env => new TailCall(fc(env), []);
-    if (n === 1) return env => new TailCall(fc(env), [argcs[0](env)]);
-    if (n === 2) return env => new TailCall(fc(env), [argcs[0](env), argcs[1](env)]);
-    return env => { const f = fc(env), args = new Array(n); for (let i = 0; i < n; i++) args[i] = argcs[i](env); return new TailCall(f, args); };
+    if (n === 0) return env => new TailCall(fc(env), [], loc);
+    if (n === 1) return env => new TailCall(fc(env), [argcs[0](env)], loc);
+    if (n === 2) return env => new TailCall(fc(env), [argcs[0](env), argcs[1](env)], loc);
+    return env => { const f = fc(env), args = new Array(n); for (let i = 0; i < n; i++) args[i] = argcs[i](env); return new TailCall(f, args, loc); };
   }
-  const call = (f, args) => {
-    if (typeof f !== 'function') return callProc(f, args);
-    let r = f(args);
-    while (r instanceof TailCall) { tick(); r = typeof r.f === 'function' ? r.f(r.args) : callProc(r.f, r.args); }
-    return r;
-  };
+  const call = makeCall(loc);
   if (n === 0) return env => call(fc(env), []);
   if (n === 1) return env => call(fc(env), [argcs[0](env)]);
   if (n === 2) return env => call(fc(env), [argcs[0](env), argcs[1](env)]);
@@ -540,7 +913,11 @@ function comp(x, scope, tail) {
   const head = x.car;
   const m = macroFor(scope, head);
   if (m && scan) scan.macros.push([head, lookup(scope, head)]);
-  if (m) return comp(expandMacro(m, x, scope), scope, tail);
+  if (m) {
+    const exp = expandMacro(m, x, scope);
+    if (exp instanceof Pair && !locs.has(exp)) { const l = locs.get(x); if (l) locs.set(exp, l); }
+    return comp(exp, scope, tail);
+  }
   const sf = special(scope, head);
   if (sf) return compSpecial(sf, x, scope, tail);
   return compCall(x, scope, tail);
@@ -563,7 +940,7 @@ function compSpecial(name, x, scope, tail) {
         // (define (name . params) body...) and curried (define ((name a) b) ...)
         let nameSpec = target.car, params = target.cdr, bodyForms = x.cdr.cdr;
         while (nameSpec instanceof Pair) { bodyForms = list(new Pair(S.lambda, new Pair(params, bodyForms))); params = nameSpec.cdr; nameSpec = nameSpec.car; }
-        const lam = makeLambda(params, bodyForms, scope, baseName(nameSpec).name);
+        const lam = makeLambda(params, bodyForms, scope, baseName(nameSpec).name, locs.get(x));
         return compSet(nameSpec, lam, scope, true);
       }
       if (!isId(target)) throw new SchemeError('syntax-error', 'define: bad target ' + write(strip(target)));
@@ -576,8 +953,8 @@ function compSpecial(name, x, scope, tail) {
       return setter;
     }
     case 'set!': need(2); return compSet(a[0], comp(a[1], scope, false), scope, false);
-    case 'lambda': need(1); return makeLambda(a[0], x.cdr.cdr, scope, null);
-    case 'named-lambda': { need(1); const spec = a[0]; return makeLambda(spec.cdr, x.cdr.cdr, scope, baseName(spec.car).name); }
+    case 'lambda': need(1); return makeLambda(a[0], x.cdr.cdr, scope, null, locs.get(x));
+    case 'named-lambda': { need(1); const spec = a[0]; return makeLambda(spec.cdr, x.cdr.cdr, scope, baseName(spec.car).name, locs.get(x)); }
     case 'begin': return body(x.cdr, scope, tail);
     case 'let': {
       need(1);
@@ -585,7 +962,7 @@ function compSpecial(name, x, scope, tail) {
         // named let
         const nm = a[0], bindings = arr(a[1]).map(b => b instanceof Pair ? [b.car, b.cdr === NIL ? UNSPEC : b.cdr.car] : [b, UNSPEC]);
         const loopScope = new Scope(scope, [nm]);
-        const lam = makeLambda(listOf(bindings.map(b => b[0])), x.cdr.cdr.cdr, loopScope, baseName(nm).name);
+        const lam = makeLambda(listOf(bindings.map(b => b[0])), x.cdr.cdr.cdr, loopScope, baseName(nm).name, locs.get(x));
         const inits = bindings.map(b => comp(b[1] === UNSPEC ? false : b[1], scope, false));
         return env => { const frame = [env, null]; const f = lam(frame); frame[1] = f; const args = inits.map(i => i(env)); return tail ? new TailCall(f, args) : callProc(f, args); };
       }
@@ -701,7 +1078,7 @@ function compSpecial(name, x, scope, tail) {
       need(2);
       const target = a[0];
       const nameId = target instanceof Pair ? target.car : target;
-      const lam = target instanceof Pair ? makeLambda(target.cdr, x.cdr.cdr, scope, baseName(nameId).name) : comp(a[1], scope, false);
+      const lam = target instanceof Pair ? makeLambda(target.cdr, x.cdr.cdr, scope, baseName(nameId).name, locs.get(x)) : comp(a[1], scope, false);
       const proc = lam(null);
       const m = { kind: 'proc', proc };
       if (scope) { if (!scope.macros) scope.macros = new Map(); scope.macros.set(nameId, m); } else { m.src = strip(x); macros.set(baseName(nameId).name, m); }
@@ -719,32 +1096,57 @@ function compSpecial(name, x, scope, tail) {
       };
     }
     case 'guard': {
-      // (guard (var clause...) body...)
+      /* (guard (var clause...) body...). The guard is a handler: the clause tests run where the
+         condition was raised, before unwinding, so a guard with no matching clause lets the outer
+         handlers see the condition in place; the chosen clause's body runs after unwinding to the
+         guard. Quit and scheme-interrupt conditions pass through. */
       need(2);
       const spec = a[0], v = spec.car;
       const inner = new Scope(scope, [v]);
-      const clauses = spec.cdr;
-      const handler = comp(new Pair(S.cond, clauses), inner, false);
-      const hasElse = arr(clauses).some(cl => cl instanceof Pair && isId(cl.car) && baseName(cl.car) === S.else);
+      const cls = arr(spec.cdr).map(cl => {
+        const c = arr(cl);
+        if (isId(c[0]) && baseName(c[0]) === S.else) return { test: null, run: body(cl.cdr, inner, false) };
+        if (c.length > 2 && isId(c[1]) && baseName(c[1]) === S['=>']) return { test: comp(c[0], inner, false), arrow: comp(c[2], inner, false) };
+        return { test: comp(c[0], inner, false), run: c.length > 1 ? body(cl.cdr, inner, false) : null };
+      });
       const run = body(x.cdr.cdr, scope, false);
       return env => {
+        const tag = {};
+        const choose = obj => {
+          if (isPassive(obj)) return null;
+          const frame = [env, obj];
+          for (let i = 0; i < cls.length; i++) { const t = cls[i].test; if (!t) return [i, true]; const tv = t(frame); if (tv !== false) return [i, tv]; }
+          return null;
+        };
+        const saved = handlers, s = sp;
+        handlers = { h: obj => { const c = choose(obj); if (!c) return DECLINE; throw new Unwind(tag, obj, c); }, js: true, next: saved };
+        let obj, c;
         try { return run(env); }
         catch (e) {
-          if (e instanceof Escape || e instanceof RangeError) throw e;
-          const obj = e instanceof Raise ? e.obj : e;
-          if (hooks.isQuit && hooks.isQuit(obj)) throw e;
-          const frame = [env, obj];
-          if (hasElse) return handler(frame);
-          // Without else, a cond that falls through re-raises.
-          const r = handler(frame);
-          if (r === UNSPEC && !clauseMatched(clauses, frame, inner)) throw e;
-          return r;
-        }
+          if (e instanceof Unwind && e.tag === tag) { obj = e.a; c = e.b; }
+          else if (e instanceof Escape || e instanceof Unwind || e instanceof RangeError || ((e instanceof SchemeError || e instanceof Raise) && e.signalled)) throw e;
+          else if (e instanceof SchemeError) {
+            try { signal(e, false); } catch (e2) { if (e2 instanceof Unwind && e2.tag === tag) { obj = e2.a; c = e2.b; } else throw e2; }
+          } else {
+            /* Another JS exception: unwound already; the clauses see it as it is. */
+            handlers = saved; sp = s;
+            obj = e instanceof Raise ? e.obj : e;
+            c = choose(obj);
+            if (!c) throw e;
+          }
+        } finally { handlers = saved; }
+        sp = s;
+        const frame = [env, obj], cl = cls[c[0]];
+        if (cl.arrow) return callProc(cl.arrow(frame), [c[1]]);
+        return cl.run ? cl.run(frame) : c[1];
       };
     }
     case 'define-record-type': {
       need(3);
       const typeName = a[0] instanceof Pair ? a[0].car : a[0];
+      /* (define-record-type (name :printer proc) ...): PROC is called as (proc record port). */
+      let printerc = null;
+      if (a[0] instanceof Pair) { const o = arr(a[0].cdr); for (let i = 0; i + 1 < o.length; i += 2) if (isId(o[i]) && baseName(o[i]).name === ':printer') printerc = comp(o[i + 1], scope, false); }
       const ctorSpec = a[1], predName = a[2], fields = a.slice(3).map(f => arr(f));
       const fieldNames = fields.map(f => baseName(f[0]));
       const rt = new RecordType(baseName(typeName).name, fieldNames.map(s => s.name));
@@ -764,7 +1166,7 @@ function compSpecial(name, x, scope, tail) {
         if (f[2]) defs.push([f[2], K(tag(named(arity(args => { if (!(args[0] instanceof Record) || args[0].type !== rt) throw typeErr(rt.name, args[0], baseName(f[2]).name); args[0].fields[k] = args[1]; return UNSPEC; }, 2), baseName(f[2]).name)))]);
       });
       const setters = defs.map(([id, vc]) => compSet(id, vc, scope, true));
-      return env => { for (const s of setters) s(env); return baseName(typeName); };
+      return env => { if (printerc) rt.printer = printerc(env); for (const s of setters) s(env); return baseName(typeName); };
     }
     case 'let-values': case 'receive': case 'define-values': {
       if (name === 'receive') {
@@ -793,19 +1195,21 @@ function compSpecial(name, x, scope, tail) {
         return run(frame);
       };
     }
-    case 'assert': { need(1); const c = comp(a[0], scope, false); const src = write(strip(a[0])); return env => { if (c(env) === false) throw new SchemeError('assertion-failed', 'Assertion failed: ' + src); return true; }; }
+    case 'assert': { need(1); const c = comp(a[0], scope, false); const src = write(strip(a[0])); return env => { if (c(env) === false) { siteProc = null; signal(new SchemeError('assertion-failed', 'Assertion failed: ' + src), false); } return true; }; }
     case 'delay': { need(1); const c = comp(a[0], scope, false); return env => { let done = false, v; const p = () => { if (!done) { v = c(env); done = true; } return v; }; p.isPromise = true; return p; }; }
     case 'case-lambda': {
-      const clauses = a.map(cl => makeLambda(cl.car, cl.cdr, scope, null));
+      const clauses = a.map(cl => makeLambda(cl.car, cl.cdr, scope, null, locs.get(cl) || locs.get(x)));
       return env => { const fs = clauses.map(c => c(env)); const f = args => { for (const g of fs) if (args.length === g.arity || (g.rest && args.length >= g.arity) || (args.length >= g.arity && args.length <= g.arity + (g.optional || 0))) return g(args); throw new SchemeError('wrong-number-of-arguments', 'case-lambda: no clause for ' + args.length + ' arguments'); }; return f; };
     }
-    case 'the-environment': return () => scope;
+    case 'the-environment': return scope ? env => new Environment(scope, env) : K(GLOBAL_ENV);
+    case 'include': {
+      /* (include file...): the files' forms, read through hooks.readFile at compile time, as a body. */
+      const forms = [];
+      for (const f of a) { const file = str(strip(f), 'include'); forms.push(...readAll(readFileText(file), file)); }
+      return body(listOf(forms), scope, tail);
+    }
   }
   throw new SchemeError('syntax-error', 'Unknown special form ' + name);
-}
-function clauseMatched(clauses, frame, scope) {
-  for (const cl of arr(clauses)) { const c = comp(cl.car, scope, false); if (c(frame) !== false) return true; }
-  return false;
 }
 function lookupValue(id, scope, env) {
   const r = lookup(scope, id);
@@ -813,11 +1217,24 @@ function lookupValue(id, scope, env) {
   return globals.get(baseName(id).name)?.value;
 }
 const gdoc = new Map();
-const hooks = { isQuit: null };
+/* Host hooks: output(string) for the console port, errorOutput(string) for current-error-port,
+   isQuit(condition), readFile(path) -> string or null for load/include/require, and
+   restartArgs(restart) -> array for invoke-restart-interactively. */
+const hooks = { isQuit: null, output: null, errorOutput: null, readFile: null, restartArgs: null };
 
 /* ---------- evaluation entry points ---------- */
 let steps = 0;
-function evalForm(form) { const c = comp(form, null, false); return c(null); }
+function evalForm(form) {
+  const s = sp;
+  try { const c = comp(form, null, false); return c(null); } catch (e) { return unwound(e, s); }
+}
+/* Evaluate FORM in ENV (an Environment): definitions bind in ENV's own frame. */
+function evalIn(form, env) {
+  if (env === undefined || env === null || env === GLOBAL_ENV) return evalForm(form);
+  if (!(env instanceof Environment)) throw typeErr('environment', env, 'eval');
+  const s = sp;
+  try { const c = body(new Pair(form, NIL), env.scope, false); return c(env.frame); } catch (e) { return unwound(e, s); }
+}
 /* Compile FORM in SCOPE only to see what it uses: { scopes, refs: [[id, lookup result or null]],
    macros: [[keyword, lookup result or null]] }. The scopes are the ones FORM binds itself. */
 function scanClosure(form, scope) {
@@ -826,7 +1243,18 @@ function scanClosure(form, scope) {
   try { comp(form, scope, false); } finally { scan = prev; }
   return out;
 }
-function evalString(src) { let v = UNSPEC; for (const f of readAll(src)) v = evalForm(f); return v; }
+function evalString(src, file) { let v = UNSPEC; for (const f of readAll(src, file)) v = evalForm(f); return v; }
+function readFileText(path) {
+  if (!hooks.readFile) throw new SchemeError('file-error', 'Cannot read ' + path + ': no file reader is installed', [path]);
+  const t = hooks.readFile(path);
+  if (t === null || t === undefined || t === false) throw new SchemeError('file-error', 'Cannot open file: ' + path, [path]);
+  return String(t);
+}
+/* Read PATH through hooks.readFile and evaluate its forms in ENV; the forms carry PATH. */
+function loadFile(path, env) {
+  for (const f of readAll(readFileText(path), path)) evalIn(f, env);
+  return true;
+}
 
 /* ---------- builtins ---------- */
 function def(name, fn, opts) {
@@ -835,8 +1263,9 @@ function def(name, fn, opts) {
   gdef(name, fn); return fn;
 }
 const D = (name, args, doc, fn) => def(name, fn, { args, doc });
-const num = (x, who) => { if (typeof x !== 'number') throw typeErr('number', x, who); return x; };
-const int = (x, who) => { if (!Number.isInteger(x)) throw typeErr('integer', x, who); return x; };
+/* NUM gives a double (a BigInt converts); INT an integer double (a BigInt is out of range there). */
+const num = (x, who) => { if (typeof x === 'number') return x; if (typeof x === 'bigint') return Number(x); throw typeErr('number', x, who); };
+const int = (x, who) => { if (Number.isInteger(x)) return x; if (typeof x === 'bigint') throw new SchemeError('range-error', `${who ? who + ': ' : ''}${x} is out of range`, [x]); throw typeErr('integer', x, who); };
 const str = (x, who) => { if (typeof x !== 'string') throw typeErr('string', x, who); return x; };
 const sym = (x, who) => { if (!(x instanceof Sym)) throw typeErr('symbol', x, who); return x; };
 const chr = (x, who) => { if (!(x instanceof Char)) throw typeErr('char', x, who); return x; };
@@ -845,46 +1274,208 @@ const proc = (x, who) => { if (typeof x !== 'function' && !(x instanceof Param))
 const ht = (x, who) => { if (!(x instanceof Map)) throw typeErr('hash table', x, who); return x; };
 const opt = (x, d) => x === undefined ? d : x;
 
-/* numbers */
-D('+', '. numbers', 'Sum of the numbers.', a => { let s = 0; for (const v of a) s += num(v, '+'); return s; });
-D('*', '. numbers', 'Product of the numbers.', a => { let s = 1; for (const v of a) s *= num(v, '*'); return s; });
-D('-', 'n . numbers', 'Negation of one number, or the first minus the rest.', a => { if (!a.length) throw err('-: expected at least 1 argument'); if (a.length === 1) return -num(a[0], '-'); let s = num(a[0], '-'); for (let i = 1; i < a.length; i++) s -= num(a[i], '-'); return s; });
-D('/', 'n . numbers', 'Reciprocal of one number, or the first divided by the rest.', a => { if (!a.length) throw err('/: expected at least 1 argument'); if (a.length === 1) return 1 / num(a[0], '/'); let s = num(a[0], '/'); for (let i = 1; i < a.length; i++) { const d = num(a[i], '/'); if (d === 0) throw new SchemeError('divide-by-zero', 'Division by zero'); s /= d; } return s; });
-D('quotient', 'a b', 'Integer quotient, truncating toward zero.', ([a, b]) => { if (int(b, 'quotient') === 0) throw new SchemeError('divide-by-zero', 'Division by zero'); return Math.trunc(int(a, 'quotient') / b); });
-D('remainder', 'a b', 'Remainder with the sign of A.', ([a, b]) => { if (int(b, 'remainder') === 0) throw new SchemeError('divide-by-zero', 'Division by zero'); return int(a, 'remainder') % b; });
-D('modulo', 'a b', 'Modulo with the sign of B.', ([a, b]) => { if (int(b, 'modulo') === 0) throw new SchemeError('divide-by-zero', 'Division by zero'); return ((int(a, 'modulo') % b) + b) % b; });
-D('abs', 'x', 'Absolute value.', ([x]) => Math.abs(num(x, 'abs')));
-D('min', 'x . xs', 'Smallest argument.', a => Math.min(...a.map(v => num(v, 'min'))));
-D('max', 'x . xs', 'Largest argument.', a => Math.max(...a.map(v => num(v, 'max'))));
-D('gcd', '. ns', 'Greatest common divisor.', a => a.reduce((g, v) => { v = Math.abs(int(v, 'gcd')); while (v) [g, v] = [v, g % v]; return g; }, 0));
-D('lcm', '. ns', 'Least common multiple.', a => a.reduce((l, v) => { v = Math.abs(int(v, 'lcm')); if (!l || !v) return 0; let g = l, w = v; while (w) [g, w] = [w, g % w]; return l / g * v; }, 1));
-for (const [n, f] of [['floor', Math.floor], ['ceiling', Math.ceil], ['round', x => { const r = Math.round(x); return Math.abs(x % 1) === 0.5 && r % 2 !== 0 ? r - 1 : r; }], ['truncate', Math.trunc], ['sqrt', Math.sqrt], ['exp', Math.exp], ['sin', Math.sin], ['cos', Math.cos], ['tan', Math.tan], ['asin', Math.asin], ['acos', Math.acos]])
+/* numbers: doubles, with BigInt for exact integers beyond ±2^53 (see norm) */
+const BMAX = 9007199254740991n, BMIN = -9007199254740991n;
+const isExactInt = x => typeof x === 'bigint' || Number.isSafeInteger(x);
+/* A BigInt result back in the safe range becomes a double, so 5 and 5n never meet. */
+const norm = b => b <= BMAX && b >= BMIN ? Number(b) : b;
+const big = x => typeof x === 'bigint' ? x : BigInt(x);
+const numx = (x, who) => { if (typeof x === 'number' || typeof x === 'bigint') return x; throw typeErr('number', x, who); };
+const intx = (x, who) => { if (typeof x === 'bigint' || Number.isInteger(x)) return x; throw typeErr('integer', x, who); };
+const divz = () => new SchemeError('divide-by-zero', 'Division by zero');
+function add(a, b, who) {
+  if (typeof a === 'number' && typeof b === 'number') { const r = a + b; if (r <= MAXS && r >= -MAXS) return r; return Number.isSafeInteger(a) && Number.isSafeInteger(b) ? norm(BigInt(a) + BigInt(b)) : r; }
+  numx(a, who); numx(b, who);
+  return isExactInt(a) && isExactInt(b) ? norm(big(a) + big(b)) : Number(a) + Number(b);
+}
+function sub(a, b, who) {
+  if (typeof a === 'number' && typeof b === 'number') { const r = a - b; if (r <= MAXS && r >= -MAXS) return r; return Number.isSafeInteger(a) && Number.isSafeInteger(b) ? norm(BigInt(a) - BigInt(b)) : r; }
+  numx(a, who); numx(b, who);
+  return isExactInt(a) && isExactInt(b) ? norm(big(a) - big(b)) : Number(a) - Number(b);
+}
+function mul(a, b, who) {
+  if (typeof a === 'number' && typeof b === 'number') { const r = a * b; if (r <= MAXS && r >= -MAXS) return r; return Number.isSafeInteger(a) && Number.isSafeInteger(b) ? norm(BigInt(a) * BigInt(b)) : r; }
+  numx(a, who); numx(b, who);
+  return isExactInt(a) && isExactInt(b) ? norm(big(a) * big(b)) : Number(a) * Number(b);
+}
+function div(a, b) {
+  if (typeof a === 'number' && typeof b === 'number') { if (b === 0) throw divz(); return a / b; }
+  numx(a, '/'); numx(b, '/');
+  if (b === 0) throw divz();
+  if (isExactInt(a) && isExactInt(b)) { const A = big(a), B = big(b); if (A % B === 0n) return norm(A / B); }
+  return Number(a) / Number(b);
+}
+const neg = x => typeof x === 'number' ? -x : norm(-numx(x, '-'));
+function quotient(a, b, who) {
+  if (typeof a === 'number' && typeof b === 'number' && Number.isSafeInteger(a) && Number.isSafeInteger(b)) { if (b === 0) throw divz(); return ((a - a % b) / b) || 0; }
+  intx(a, who); intx(b, who);
+  if (isExactInt(a) && isExactInt(b)) { const B = big(b); if (B === 0n) throw divz(); return norm(big(a) / B); }
+  const y = Number(b); if (y === 0) throw divz(); return Math.trunc(Number(a) / y);
+}
+function remainder(a, b, who) {
+  if (typeof a === 'number' && typeof b === 'number' && Number.isInteger(a) && Number.isInteger(b)) { if (b === 0) throw divz(); return (a % b) || 0; }
+  intx(a, who); intx(b, who);
+  if (isExactInt(a) && isExactInt(b)) { const B = big(b); if (B === 0n) throw divz(); return norm(big(a) % B); }
+  const y = Number(b); if (y === 0) throw divz(); return Number(a) % y;
+}
+function modulo(a, b, who) {
+  if (typeof a === 'number' && typeof b === 'number' && Number.isInteger(a) && Number.isInteger(b)) { if (b === 0) throw divz(); const r = a % b; return r !== 0 && (r < 0) !== (b < 0) ? r + b : r || 0; }
+  intx(a, who); intx(b, who);
+  if (isExactInt(a) && isExactInt(b)) { const B = big(b); if (B === 0n) throw divz(); const r = big(a) % B; return norm(r !== 0n && (r < 0n) !== (B < 0n) ? r + B : r); }
+  const x = Number(a), y = Number(b); if (y === 0) throw divz(); const r = x % y; return r !== 0 && (r < 0) !== (y < 0) ? r + y : r;
+}
+function gcd2(a, b) {
+  if (typeof a === 'number' && typeof b === 'number') { a = Math.abs(a); b = Math.abs(b); while (b) [a, b] = [b, a % b]; return a; }
+  let A = big(a), B = big(b); if (A < 0n) A = -A; if (B < 0n) B = -B;
+  while (B) [A, B] = [B, A % B];
+  return norm(A);
+}
+const absx = x => typeof x === 'number' ? Math.abs(x) : x < 0n ? -x : x;
+function expt(b, e) {
+  numx(b, 'expt'); numx(e, 'expt');
+  if (isExactInt(b) && isExactInt(e) && e >= 0) {
+    if (typeof b === 'number' && typeof e === 'number' && Math.abs(Math.pow(b, e)) < 2 ** 52) {
+      let r = 1, x = b, k = e;
+      while (k > 0) { if (k % 2 === 1) r *= x; k = Math.floor(k / 2); if (k) x *= x; }
+      return r;
+    }
+    if (b === 0 || b === 1) return b;
+    if (b === -1) return big(e) % 2n === 0n ? 1 : -1;
+    const bits = Number(e) * Math.log2(Math.abs(Number(b)));
+    if (!(bits < 2 ** 24)) throw new SchemeError('range-error', 'expt: the result would be too large', [b, e]);
+    return norm(big(b) ** big(e));
+  }
+  return Math.pow(Number(b), Number(e));
+}
+function exactOf(x) {
+  if (typeof x === 'bigint') return x;
+  numx(x, 'exact');
+  if (Number.isInteger(x)) return Number.isSafeInteger(x) ? x : BigInt(x);
+  return x;   // no rationals: a non-integer stays as it is
+}
+const inexact = x => typeof x === 'bigint' ? Number(x) : numx(x, 'inexact');
+const isNumber = x => typeof x === 'number' || typeof x === 'bigint';
+function parseNumber(t) {
+  if (/^[+-]?\d+$/.test(t)) { const n = Number(t); return n <= MAXS && n >= -MAXS ? n : BigInt(t[0] === '+' ? t.slice(1) : t); }
+  if (/^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(t)) return Number(t);
+  if (/^[+-]?\d+\/\d+$/.test(t)) { const [p, q] = t.split('/'); return div(parseNumber(p), parseNumber(q)); }
+  if (t === '+inf.0') return Infinity; if (t === '-inf.0') return -Infinity; if (t === '+nan.0' || t === '-nan.0') return NaN;
+  return false;
+}
+function parseRadix(t, r) {
+  if (r === 10) return parseNumber(t);
+  const m = /^([+-]?)([0-9a-z]+)$/i.exec(t);
+  if (!m) return false;
+  let b = 0n; const R = BigInt(r);
+  for (const ch of m[2].toLowerCase()) { const d = parseInt(ch, 36); if (d >= r) return false; b = b * R + BigInt(d); }
+  return norm(m[1] === '-' ? -b : b);
+}
+const roundEven = x => { const r = Math.round(x); return Math.abs(x % 1) === 0.5 && r % 2 !== 0 ? r - 1 : r; };
+D('+', '. numbers', 'Sum of the numbers.', a => { if (a.length === 2) return add(a[0], a[1], '+'); let s = 0; for (let i = 0; i < a.length; i++) s = add(s, a[i], '+'); return s; });
+D('*', '. numbers', 'Product of the numbers.', a => { if (a.length === 2) return mul(a[0], a[1], '*'); let s = 1; for (let i = 0; i < a.length; i++) s = mul(s, a[i], '*'); return s; });
+D('-', 'n . numbers', 'Negation of one number, or the first minus the rest.', a => { if (a.length === 2) return sub(a[0], a[1], '-'); if (!a.length) throw err('-: expected at least 1 argument'); if (a.length === 1) return neg(a[0]); let s = numx(a[0], '-'); for (let i = 1; i < a.length; i++) s = sub(s, a[i], '-'); return s; });
+D('/', 'n . numbers', 'Reciprocal of one number, or the first divided by the rest.', a => { if (!a.length) throw err('/: expected at least 1 argument'); if (a.length === 1) return div(1, a[0]); let s = a[0]; for (let i = 1; i < a.length; i++) s = div(s, a[i]); return s; });
+D('quotient', 'a b', 'Integer quotient, truncating toward zero.', ([a, b]) => quotient(a, b, 'quotient'));
+D('remainder', 'a b', 'Remainder with the sign of A.', ([a, b]) => remainder(a, b, 'remainder'));
+D('modulo', 'a b', 'Modulo with the sign of B.', ([a, b]) => modulo(a, b, 'modulo'));
+D('truncate-quotient', 'a b', 'Integer quotient, truncating toward zero.', ([a, b]) => quotient(a, b, 'truncate-quotient'));
+D('truncate-remainder', 'a b', 'Remainder with the sign of A.', ([a, b]) => remainder(a, b, 'truncate-remainder'));
+D('floor-remainder', 'a b', 'Modulo with the sign of B.', ([a, b]) => modulo(a, b, 'floor-remainder'));
+D('floor-quotient', 'a b', 'Integer quotient, rounding toward minus infinity.', ([a, b]) => quotient(sub(a, modulo(a, b, 'floor-quotient'), 'floor-quotient'), b, 'floor-quotient'));
+D('abs', 'x', 'Absolute value.', ([x]) => absx(numx(x, 'abs')));
+D('magnitude', 'x', 'Absolute value.', ([x]) => absx(numx(x, 'magnitude')));
+function minmax(a, who, isMax) {
+  if (!a.length) throw err(who + ': expected at least 1 argument');
+  let m = numx(a[0], who), inexactSeen = typeof m === 'number' && !Number.isSafeInteger(m);
+  for (let i = 1; i < a.length; i++) {
+    const v = numx(a[i], who);
+    if (typeof v === 'number' && !Number.isSafeInteger(v)) inexactSeen = true;
+    if (v !== v) return NaN;
+    if (isMax ? v > m : v < m) m = v;
+  }
+  return inexactSeen && typeof m === 'bigint' ? Number(m) : m;
+}
+const allNumbers = a => { for (let i = 0; i < a.length; i++) if (typeof a[i] !== 'number') return false; return true; };
+D('min', 'x . xs', 'Smallest argument.', a => allNumbers(a) && a.length ? Math.min(...a) : minmax(a, 'min', false));
+D('max', 'x . xs', 'Largest argument.', a => allNumbers(a) && a.length ? Math.max(...a) : minmax(a, 'max', true));
+D('gcd', '. ns', 'Greatest common divisor.', a => a.reduce((g, v) => gcd2(g, intx(v, 'gcd')), 0));
+D('lcm', '. ns', 'Least common multiple.', a => a.reduce((l, v) => { intx(v, 'lcm'); if (l === 0 || v === 0) return 0; return absx(mul(quotient(l, gcd2(l, v), 'lcm'), v, 'lcm')); }, 1));
+for (const [n, f] of [['floor', Math.floor], ['ceiling', Math.ceil], ['round', roundEven], ['truncate', Math.trunc]])
+  D(n, 'x', `${n[0].toUpperCase() + n.slice(1)} of X.`, ([x]) => typeof x === 'bigint' ? x : f(numx(x, n)));
+for (const [n, f] of [['sqrt', Math.sqrt], ['exp', Math.exp], ['sin', Math.sin], ['cos', Math.cos], ['tan', Math.tan], ['asin', Math.asin], ['acos', Math.acos]])
   D(n, 'x', `${n[0].toUpperCase() + n.slice(1)} of X.`, ([x]) => f(num(x, n)));
+D('exact-integer-sqrt', 'n', 'Two values: the integer square root S of N and N - S^2.', ([n]) => {
+  intx(n, 'exact-integer-sqrt'); if (n < 0) throw typeErr('non-negative integer', n, 'exact-integer-sqrt');
+  let s = BigInt(Math.floor(Math.sqrt(Number(n))));
+  const N = big(n);
+  while (s * s > N) s--;
+  while ((s + 1n) * (s + 1n) <= N) s++;
+  return new Values([norm(s), norm(N - s * s)]);
+});
 D('log', 'x [base]', 'Natural logarithm, or the logarithm in BASE.', ([x, b]) => b === undefined ? Math.log(num(x, 'log')) : Math.log(num(x, 'log')) / Math.log(num(b, 'log')));
 D('atan', 'y [x]', 'Arc tangent.', ([y, x]) => x === undefined ? Math.atan(num(y, 'atan')) : Math.atan2(num(y, 'atan'), num(x, 'atan')));
-D('expt', 'x y', 'X raised to the power Y.', ([x, y]) => Math.pow(num(x, 'expt'), num(y, 'expt')));
-D('exact->inexact', 'x', 'X as a float.', ([x]) => num(x, 'exact->inexact'));
-D('inexact->exact', 'x', 'X as an integer when it is one.', ([x]) => num(x, 'inexact->exact'));
-D('exact', 'x', 'X as an integer when it is one.', ([x]) => num(x, 'exact'));
-D('inexact', 'x', 'X as a float.', ([x]) => num(x, 'inexact'));
-D('number->string', 'n [radix]', 'Printed form of N.', ([n, r]) => r === undefined || r === 10 ? write(num(n, 'number->string')) : num(n).toString(r));
-D('string->number', 's [radix]', 'The number S names, or #f.', ([s, r]) => { const t = str(s, 'string->number').trim(); if (r !== undefined && r !== 10) { const v = parseInt(t, r); return isNaN(v) ? false : v; } if (!/^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(t)) return false; return Number(t); });
-D('random', '[n]', 'Random integer below N, or a float in [0,1).', ([n]) => n === undefined ? Math.random() : Number.isInteger(n) ? Math.floor(Math.random() * n) : Math.random() * num(n, 'random'));
-D('1+', 'n', 'N plus one.', ([n]) => num(n, '1+') + 1);
-D('1-', 'n', 'N minus one.', ([n]) => num(n, '1-') - 1);
-D('square', 'n', 'N squared.', ([n]) => num(n, 'square') ** 2);
-D('exact-integer?', 'x', 'Non-#f if X is an integer.', ([x]) => Number.isInteger(x));
-D('bitwise-and', '. ns', 'Bitwise and.', a => a.reduce((s, v) => s & int(v, 'bitwise-and'), -1));
-D('bitwise-or', '. ns', 'Bitwise or.', a => a.reduce((s, v) => s | int(v, 'bitwise-or'), 0));
-D('bitwise-xor', '. ns', 'Bitwise xor.', a => a.reduce((s, v) => s ^ int(v, 'bitwise-xor'), 0));
-D('arithmetic-shift', 'n count', 'Shift N left by COUNT bits (right if negative).', ([n, c]) => c >= 0 ? int(n, 'arithmetic-shift') * 2 ** c : Math.floor(int(n, 'arithmetic-shift') / 2 ** -c));
-function cmp(name, f) { D(name, 'a b . rest', 'Numeric comparison over all arguments.', a => { for (let i = 0; i + 1 < a.length; i++) if (!f(num(a[i], name), num(a[i + 1], name))) return false; return true; }); }
-cmp('=', (x, y) => x === y); cmp('<', (x, y) => x < y); cmp('>', (x, y) => x > y); cmp('<=', (x, y) => x <= y); cmp('>=', (x, y) => x >= y);
+D('expt', 'x y', 'X raised to the power Y (exact for exact integers).', ([x, y]) => expt(x, y));
+D('exact->inexact', 'x', 'X as a float.', ([x]) => inexact(x));
+D('inexact->exact', 'x', 'X as an exact integer when it is an integer.', ([x]) => exactOf(x));
+D('exact', 'x', 'X as an exact integer when it is an integer.', ([x]) => exactOf(x));
+D('inexact', 'x', 'X as a float.', ([x]) => inexact(x));
+D('number->string', 'n [radix]', 'Printed form of N.', ([n, r]) => r === undefined || r === 10 ? write(numx(n, 'number->string')) : numx(n, 'number->string').toString(int(r, 'number->string')));
+D('string->number', 's [radix]', 'The number S names, or #f.', ([s, r]) => { const t = str(s, 'string->number').trim(); return r !== undefined && r !== 10 ? parseRadix(t, int(r, 'string->number')) : parseNumber(t); });
+D('random', '[n]', 'Random integer below N, or a float in [0,1).', ([n]) => {
+  if (n === undefined) return Math.random();
+  if (typeof n === 'bigint') { let b = 0n; const words = n.toString(16).length / 8 + 2; for (let i = 0; i < words; i++) b = (b << 32n) | BigInt(Math.floor(Math.random() * 2 ** 32)); return norm(b % n); }
+  return Number.isInteger(n) ? Math.floor(Math.random() * n) : Math.random() * num(n, 'random');
+});
+D('1+', 'n', 'N plus one.', ([n]) => add(n, 1, '1+'));
+D('1-', 'n', 'N minus one.', ([n]) => sub(n, 1, '1-'));
+D('-1+', 'n', 'N minus one.', ([n]) => sub(n, 1, '-1+'));
+D('square', 'n', 'N squared.', ([n]) => mul(n, n, 'square'));
+D('exact-integer?', 'x', '#t if X is an exact integer.', ([x]) => isExactInt(x));
+D('exact-rational?', 'x', '#t if X is an exact integer (there are no other exact rationals).', ([x]) => isExactInt(x));
+const I32 = x => typeof x === 'number' && (x | 0) === x;
+function bitop(name, a, init, f32, fbig) {
+  let small = true;
+  for (const v of a) { intx(v, name); if (!I32(v)) small = false; }
+  if (small) { let s = init; for (const v of a) s = f32(s, v); return s; }
+  for (const v of a) if (!isExactInt(v)) throw typeErr('exact integer', v, name);
+  let s = BigInt(init); for (const v of a) s = fbig(s, BigInt(v)); return norm(s);
+}
+D('bitwise-and', '. ns', 'Bitwise and.', a => bitop('bitwise-and', a, -1, (x, y) => x & y, (x, y) => x & y));
+D('bitwise-or', '. ns', 'Bitwise or.', a => bitop('bitwise-or', a, 0, (x, y) => x | y, (x, y) => x | y));
+D('bitwise-xor', '. ns', 'Bitwise xor.', a => bitop('bitwise-xor', a, 0, (x, y) => x ^ y, (x, y) => x ^ y));
+D('bitwise-not', 'n', 'Bitwise complement: -N - 1.', ([n]) => sub(neg(intx(n, 'bitwise-not')), 1, 'bitwise-not'));
+function ashift(n, c, who) {
+  intx(n, who); int(c, who);
+  if (typeof n === 'number' && Number.isSafeInteger(n)) {
+    if (c < 0) return Math.floor(n / 2 ** -c);
+    const r = n * 2 ** c; if (r <= MAXS && r >= -MAXS) return r;
+  }
+  if (!isExactInt(n)) throw typeErr('exact integer', n, who);
+  if (c > 2 ** 24) throw new SchemeError('range-error', who + ': shift count too large', [c]);
+  return norm(c >= 0 ? big(n) << BigInt(c) : big(n) >> BigInt(-c));
+}
+D('arithmetic-shift', 'n count', 'Shift N left by COUNT bits (right if negative).', ([n, c]) => ashift(n, c, 'arithmetic-shift'));
+D('shift-left', 'n count', 'Shift N left by COUNT bits.', ([n, c]) => ashift(n, c, 'shift-left'));
+D('shift-right', 'n count', 'Shift N right by COUNT bits.', ([n, c]) => ashift(n, -int(c, 'shift-right'), 'shift-right'));
+D('bit-count', 'n', 'Number of 1 bits in N (in its complement if negative).', ([n]) => { let b = big(intx(n, 'bit-count')); if (b < 0n) b = -b - 1n; let k = 0; for (const ch of b.toString(2)) if (ch === '1') k++; return k; });
+D('integer-length', 'n', 'Bits needed to represent N.', ([n]) => { let b = big(intx(n, 'integer-length')); if (b < 0n) b = -b - 1n; return b === 0n ? 0 : b.toString(2).length; });
+/* = across a double and a BigInt compares values (only a big double can equal a BigInt). */
+const numEq = (x, y) => x === y || (typeof x !== typeof y && x == y);   // eslint-disable-line eqeqeq
+function cmp(name, f) {
+  D(name, 'a b . rest', 'Numeric comparison over all arguments.', a => {
+    if (a.length === 2) { const x = a[0], y = a[1]; if (typeof x === 'number' && typeof y === 'number') return f(x, y); return f(numx(x, name), numx(y, name)); }
+    for (let i = 0; i < a.length; i++) numx(a[i], name);
+    for (let i = 0; i + 1 < a.length; i++) if (!f(a[i], a[i + 1])) return false;
+    return true;
+  });
+}
+cmp('=', numEq); cmp('<', (x, y) => x < y); cmp('>', (x, y) => x > y); cmp('<=', (x, y) => x <= y); cmp('>=', (x, y) => x >= y);
 const pred = (n, f, doc) => D(n, 'x', doc || 'Type predicate.', ([x]) => f(x));
-pred('number?', x => typeof x === 'number'); pred('integer?', x => Number.isInteger(x)); pred('real?', x => typeof x === 'number');
-pred('rational?', x => typeof x === 'number' && Number.isFinite(x)); pred('exact?', x => Number.isInteger(x)); pred('inexact?', x => typeof x === 'number' && !Number.isInteger(x));
-pred('zero?', x => num(x, 'zero?') === 0); pred('positive?', x => num(x, 'positive?') > 0); pred('negative?', x => num(x, 'negative?') < 0);
-pred('even?', x => int(x, 'even?') % 2 === 0); pred('odd?', x => int(x, 'odd?') % 2 !== 0); pred('nan?', x => Number.isNaN(x)); pred('infinite?', x => x === Infinity || x === -Infinity); pred('finite?', x => Number.isFinite(x));
+pred('number?', isNumber); pred('integer?', x => typeof x === 'bigint' || Number.isInteger(x)); pred('real?', isNumber); pred('complex?', isNumber);
+pred('rational?', x => typeof x === 'bigint' || Number.isFinite(x)); pred('exact?', x => isExactInt(x)); pred('inexact?', x => typeof x === 'number' && !Number.isSafeInteger(x));
+pred('zero?', x => numx(x, 'zero?') == 0); pred('positive?', x => numx(x, 'positive?') > 0); pred('negative?', x => numx(x, 'negative?') < 0);   // eslint-disable-line eqeqeq
+pred('even?', x => typeof x === 'bigint' ? x % 2n === 0n : int(x, 'even?') % 2 === 0); pred('odd?', x => typeof x === 'bigint' ? x % 2n !== 0n : int(x, 'odd?') % 2 !== 0);
+pred('nan?', x => Number.isNaN(x)); pred('infinite?', x => x === Infinity || x === -Infinity); pred('finite?', x => typeof x === 'bigint' || Number.isFinite(x));
 
 /* booleans and equivalence */
 D('not', 'x', '#t if X is #f.', ([x]) => x === false);
@@ -1051,33 +1642,37 @@ D('subvector', 'v start end', 'Part of V.', ([v, a, b]) => vec(v).slice(a, b));
 D('vector-binary-search', 'v key compare', 'Element matching KEY by COMPARE, or #f.', ([v, k, c]) => { let lo = 0, hi = vec(v).length - 1; while (lo <= hi) { const m = (lo + hi) >> 1, r = callProc(c, [k, v[m]]); if (r === 0) return v[m]; if (r < 0) hi = m - 1; else lo = m + 1; } return false; });
 
 /* hash tables */
-function hkey(k) { return k instanceof Char ? 'c' + k.code : k; }
+/* Keys are compared as a JS Map does: by identity, strings and numbers (BigInts too) by value. Chars
+   are interned by mkchar, so a char is its own key. */
 D('make-hash-table', '. args', 'A new hash table (keys compared with eqv?, strings by value).', () => new Map());
+D('make-weak-hash-table', '. args', 'A new hash table that holds its object keys weakly: an entry goes away once nothing else refers to its key. Walking it shows the entries whose keys are still alive.', () => new WeakTable());
+D('make-key-weak-eqv-hash-table', '. args', 'A new hash table that holds its object keys weakly.', () => new WeakTable());
+pred('weak-hash-table?', x => x instanceof WeakTable);
 D('make-equal-hash-table', '', 'A new hash table.', () => new Map());
 D('make-strong-eqv-hash-table', '', 'A new hash table.', () => new Map());
 D('make-string-hash-table', '', 'A new hash table.', () => new Map());
 pred('hash-table?', x => x instanceof Map);
-D('hash-table-ref', 'table key [fail]', 'Value for KEY, or the result of FAIL.', ([t, k, f]) => { const v = ht(t).get(hkey(k)); if (v !== undefined) return v; if (f === undefined) throw err('hash-table-ref: no value for key', k); return callProc(f, []); });
-D('hash-table-ref/default', 'table key default', 'Value for KEY, or DEFAULT.', ([t, k, d]) => { const v = ht(t).get(hkey(k)); return v === undefined ? d : v; });
-D('hash-ref', 'table key [default]', 'Value for KEY, or DEFAULT (#f).', ([t, k, d]) => { const v = ht(t).get(hkey(k)); return v === undefined ? opt(d, false) : v; });
-D('hash-table-set!', 'table key value', 'Store VALUE under KEY.', ([t, k, v]) => { ht(t).set(hkey(k), v); return UNSPEC; });
-D('hash-set!', 'table key value', 'Store VALUE under KEY.', ([t, k, v]) => { ht(t).set(hkey(k), v); return UNSPEC; });
-D('hash-table-delete!', 'table key', 'Remove KEY.', ([t, k]) => { ht(t).delete(hkey(k)); return UNSPEC; });
-D('hash-remove!', 'table key', 'Remove KEY.', ([t, k]) => { ht(t).delete(hkey(k)); return UNSPEC; });
-D('hash-table-contains?', 'table key', '#t if KEY is present.', ([t, k]) => ht(t).has(hkey(k)));
-D('hash-table-exists?', 'table key', '#t if KEY is present.', ([t, k]) => ht(t).has(hkey(k)));
+D('hash-table-ref', 'table key [fail]', 'Value for KEY, or the result of FAIL.', ([t, k, f]) => { const v = ht(t).get(k); if (v !== undefined) return v; if (f === undefined) throw err('hash-table-ref: no value for key', k); return callProc(f, []); });
+D('hash-table-ref/default', 'table key default', 'Value for KEY, or DEFAULT.', ([t, k, d]) => { const v = ht(t).get(k); return v === undefined ? d : v; });
+D('hash-ref', 'table key [default]', 'Value for KEY, or DEFAULT (#f).', ([t, k, d]) => { const v = ht(t).get(k); return v === undefined ? opt(d, false) : v; });
+D('hash-table-set!', 'table key value', 'Store VALUE under KEY.', ([t, k, v]) => { ht(t).set(k, v); return UNSPEC; });
+D('hash-set!', 'table key value', 'Store VALUE under KEY.', ([t, k, v]) => { ht(t).set(k, v); return UNSPEC; });
+D('hash-table-delete!', 'table key', 'Remove KEY.', ([t, k]) => { ht(t).delete(k); return UNSPEC; });
+D('hash-remove!', 'table key', 'Remove KEY.', ([t, k]) => { ht(t).delete(k); return UNSPEC; });
+D('hash-table-contains?', 'table key', '#t if KEY is present.', ([t, k]) => ht(t).has(k));
+D('hash-table-exists?', 'table key', '#t if KEY is present.', ([t, k]) => ht(t).has(k));
 D('hash-table-count', 'table', 'Number of entries.', ([t]) => ht(t).size);
 D('hash-table-size', 'table', 'Number of entries.', ([t]) => ht(t).size);
-D('hash-table-keys', 'table', 'List of the keys.', ([t]) => listOf([...ht(t).keys()].map(k => typeof k === 'string' && /^c\d+$/.test(k) && false ? k : k)));
+D('hash-table-keys', 'table', 'List of the keys.', ([t]) => listOf([...ht(t).keys()]));
 D('hash-table-values', 'table', 'List of the values.', ([t]) => listOf([...ht(t).values()]));
 D('hash-table->alist', 'table', 'The entries as an alist.', ([t]) => listOf([...ht(t)].map(([k, v]) => new Pair(k, v))));
 D('hash-table-walk', 'table f', 'Call F with each key and value.', ([t, f]) => { for (const [k, v] of ht(t)) callProc(f, [k, v]); return UNSPEC; });
 D('hash-for-each', 'f table', 'Call F with each key and value.', ([f, t]) => { for (const [k, v] of ht(t)) callProc(f, [k, v]); return UNSPEC; });
 D('hash-map->list', 'f table', 'List of F applied to each key and value.', ([f, t]) => listOf([...ht(t)].map(([k, v]) => callProc(f, [k, v]))));
-D('hash-table-update!', 'table key f [default]', 'Replace the value under KEY with (f value).', ([t, k, f, d]) => { const cur = ht(t).get(hkey(k)); const base = cur === undefined ? (d === undefined ? (() => { throw err('hash-table-update!: no value for key', k); })() : callProc(d, [])) : cur; t.set(hkey(k), callProc(f, [base])); return UNSPEC; });
-D('hash-table-update!/default', 'table key f default', 'Replace the value under KEY with (f value), starting from DEFAULT.', ([t, k, f, d]) => { const cur = ht(t).get(hkey(k)); t.set(hkey(k), callProc(f, [cur === undefined ? d : cur])); return UNSPEC; });
+D('hash-table-update!', 'table key f [default]', 'Replace the value under KEY with (f value).', ([t, k, f, d]) => { const cur = ht(t).get(k); const base = cur === undefined ? (d === undefined ? (() => { throw err('hash-table-update!: no value for key', k); })() : callProc(d, [])) : cur; t.set(k, callProc(f, [base])); return UNSPEC; });
+D('hash-table-update!/default', 'table key f default', 'Replace the value under KEY with (f value), starting from DEFAULT.', ([t, k, f, d]) => { const cur = ht(t).get(k); t.set(k, callProc(f, [cur === undefined ? d : cur])); return UNSPEC; });
 D('hash-table-clear!', 'table', 'Remove every entry.', ([t]) => { ht(t).clear(); return UNSPEC; });
-D('hash-table-copy', 'table', 'A copy.', ([t]) => new Map(ht(t)));
+D('hash-table-copy', 'table', 'A copy.', ([t]) => { const c = ht(t) instanceof WeakTable ? new WeakTable() : new Map(); for (const [k, v] of t) c.set(k, v); return c; });
 
 /* control */
 pred('procedure?', x => typeof x === 'function' || x instanceof Param);
@@ -1085,7 +1680,8 @@ D('values', '. xs', 'Return several values.', a => a.length === 1 ? a[0] : new V
 D('call-with-values', 'producer consumer', 'Call CONSUMER with the values PRODUCER returns.', ([p, c]) => { const v = callProc(p, []); return new TailCall(c, v instanceof Values ? v.vals : [v]); });
 D('call/ec', 'f', 'Call F with an escape procedure that returns from this call.', ([f]) => {
   const tag = {}; const k = named(args => { throw new Escape(tag, args); }, 'escape');
-  try { return callProc(f, [k]); } catch (e) { if (e instanceof Escape && e.tag === tag) return e.vals.length === 1 ? e.vals[0] : new Values(e.vals); throw e; }
+  const s = sp;
+  try { return callProc(f, [k]); } catch (e) { if (e instanceof Escape && e.tag === tag) { sp = s; return e.vals.length === 1 ? e.vals[0] : new Values(e.vals); } throw e; }
 });
 gdef('call-with-escape-continuation', gref('call/ec'));
 gdef('call-with-current-continuation', gref('call/ec'));
@@ -1095,19 +1691,177 @@ D('force', 'promise', 'Value of a delayed expression.', ([p]) => typeof p === 'f
 D('make-promise', 'x', 'A promise already forced to X.', ([x]) => { const p = () => x; p.isPromise = true; return p; });
 D('make-parameter', 'value [converter]', 'A parameter object; call it to read, parameterize to bind.', ([v, c]) => new Param(c ? callProc(c, [v]) : v, c || null));
 D('parameter?', 'x', '#t if X is a parameter.', ([x]) => x instanceof Param);
-D('error', 'message . irritants', 'Signal an error.', ([m, ...irr]) => { throw new SchemeError('error', typeof m === 'string' ? m : write(m), irr); });
-D('user-error', 'format . args', 'Signal an error meant for the user.', ([m, ...a]) => { throw new SchemeError('user-error', fmt(str(m), a), []); });
-D('raise', 'obj', 'Raise OBJ as an exception.', ([o]) => { throw new Raise(o, false); });
-D('raise-continuable', 'obj', 'Raise OBJ; a handler may return a value.', ([o]) => { throw new Raise(o, true); });
-D('with-exception-handler', 'handler thunk', 'Call THUNK; if it raises, call HANDLER with the condition.', ([h, t]) => { try { return callProc(t, []); } catch (e) { if (e instanceof Escape || e instanceof RangeError) throw e; const obj = e instanceof Raise ? e.obj : e; if (hooks.isQuit && hooks.isQuit(obj)) throw e; return callProc(h, [obj]); } });
-pred('error?', x => x instanceof SchemeError); pred('error-object?', x => x instanceof SchemeError);
+
+/* conditions: raise, handlers and condition types */
+D('error', 'message . irritants', 'Signal an error. A condition as MESSAGE is raised as it is.', ([m, ...irr]) => signal(m instanceof SchemeError ? m : new SchemeError('error', typeof m === 'string' ? m : write(m), irr), false));
+D('user-error', 'format . args', 'Signal an error meant for the user.', ([m, ...a]) => signal(new SchemeError('user-error', fmt(str(m, 'user-error'), a), []), false));
+D('warn', 'message . irritants', 'Print a warning on the current error port.', ([m, ...irr]) => { errPort().put(';Warning: ' + (typeof m === 'string' ? m : write(m)) + (irr.length ? ' ' + irr.map(x => write(x)).join(' ') : '') + '\n'); return UNSPEC; });
+D('raise', 'obj', 'Raise OBJ: the current handler is called with it where it was raised; returning from that handler is an error.', ([o]) => signal(o, false));
+D('raise-continuable', 'obj', 'Raise OBJ; the value of the current handler is the value of this call.', ([o]) => signal(o, true));
+D('with-exception-handler', 'handler thunk', 'Call THUNK with HANDLER installed: anything raised in it calls HANDLER there, before unwinding, with the outer handlers installed.', ([h, t]) => {
+  proc(h, 'with-exception-handler');
+  const saved = handlers;
+  handlers = { h, js: false, next: saved };
+  try { return callProc(t, []); } finally { handlers = saved; }
+});
+pred('error?', x => isErrorCondition(x), '#t if X is a condition whose type is error or one of its descendants (quit is not an error).');
+pred('error-object?', x => x instanceof SchemeError, '#t if X is a condition.');
+pred('condition?', x => x instanceof SchemeError, '#t if X is a condition.');
 D('error-object-message', 'e', 'Message of the error.', ([e]) => e instanceof SchemeError ? e.message : write(e));
 D('error-object-irritants', 'e', 'Irritants of the error.', ([e]) => e instanceof SchemeError ? listOf(e.irritants) : NIL);
 D('error-message', 'e', 'Message of the error.', ([e]) => e instanceof SchemeError ? e.message : write(e));
+D('error-irritants', 'e', 'Irritants of the error.', ([e]) => e instanceof SchemeError ? listOf(e.irritants) : NIL);
 D('error-kind', 'e', 'Kind of the error, a symbol.', ([e]) => e instanceof SchemeError ? intern(e.kind) : intern('unknown'));
 D('error-message-string', 'e', 'Message of the error with its irritants.', ([e]) => errorMessage(e));
-D('condition/report-string', 'e', 'Message of the error with its irritants.', ([e]) => errorMessage(e));
-D('eval', 'expr [env]', 'Evaluate EXPR.', ([x]) => evalForm(x));
+D('condition/report-string', 'c', 'The report of condition C: its type reporter\'s output, or the message with the irritants.', ([e]) => errorMessage(e));
+D('condition/type', 'c', 'The condition type of C.', ([c]) => { if (!(c instanceof SchemeError)) throw typeErr('condition', c, 'condition/type'); return conditionType(c.kind); });
+pred('condition-type?', x => x instanceof ConditionType);
+const ctype = (x, who) => { if (x instanceof ConditionType) return x; if (x instanceof Sym || typeof x === 'string') return conditionType(x); throw typeErr('condition type', x, who); };
+D('condition-type/error?', 'type', '#t if TYPE is error or one of its descendants.', ([t]) => ctype(t, 'condition-type/error?').isa('error'));
+D('condition-type/name', 'type', 'The name of TYPE, a symbol.', ([t]) => intern(ctype(t, 'condition-type/name').name));
+D('condition-type/parent', 'type', 'The parent of TYPE, or #f.', ([t]) => ctype(t, 'condition-type/parent').parent || false);
+D('condition-type/generalizations', 'type', 'TYPE and its ancestors, nearest first.', ([t]) => { const out = []; for (let c = ctype(t, 'condition-type/generalizations'); c; c = c.parent) out.push(c); return listOf(out); });
+D('condition-type', 'name', 'The condition type named NAME (a child of error is made for an unknown name).', ([n]) => ctype(n, 'condition-type'));
+D('make-condition-type', 'name parent [reporter]', 'Define the condition type NAME under PARENT (a type or a name, #f for a root). REPORTER, a string or a procedure (condition port), writes its report.', ([n, p, r]) => defineConditionType(sym(n, 'make-condition-type'), p === false || p === undefined ? null : ctype(p, 'make-condition-type'), r || null));
+D('make-condition', 'type message . irritants', 'A new condition of TYPE (a type or a name).', ([t, m, ...irr]) => new SchemeError(ctype(t, 'make-condition').name, typeof m === 'string' ? m : write(m), irr));
+D('condition-is?', 'condition type', '#t if CONDITION is of TYPE (a type or a name) or one of its descendants.', ([c, t]) => conditionIs(c, ctype(t, 'condition-is?').name));
+D('condition-predicate', 'type', 'A predicate for conditions of TYPE or its descendants.', ([t]) => { const name = ctype(t, 'condition-predicate').name; return named(([c]) => conditionIs(c, name), name + '?'); });
+D('access-condition', 'condition field', 'Field FIELD of CONDITION: message, irritants, type, kind, payload or backtrace.', ([c, f]) => {
+  if (!(c instanceof SchemeError)) throw typeErr('condition', c, 'access-condition');
+  switch (sym(f, 'access-condition').name) {
+    case 'message': return c.message;
+    case 'irritants': return listOf(c.irritants);
+    case 'type': return conditionType(c.kind);
+    case 'kind': return intern(c.kind);
+    case 'payload': return c.payload === undefined ? false : c.payload;
+    case 'backtrace': return stackFrames(conditionBacktrace(c));
+  }
+  throw new SchemeError('wrong-type-argument', 'access-condition: no field ' + f.name, [f]);
+});
+D('condition/backtrace', 'condition', 'The stack when CONDITION was signalled (before unwinding), innermost first, as stack frames.', ([c]) => stackFrames(conditionBacktrace(c)));
+for (const k of ['user-error', 'wrong-type-argument', 'unbound-variable', 'range-error', 'file-error', 'quit', 'server-only', 'edit-conflict', 'timeout',
+  'http-error', 'scheme-interrupt', 'read-error', 'syntax-error', 'divide-by-zero', 'wrong-number-of-arguments', 'assertion-failed', 'recursion-depth', 'control-error'])
+  pred(k + '?', x => conditionIs(x, k), `#t if X is a ${k} condition (or of a type descended from ${k}).`);
+for (const t of ctypes.values()) gdef('condition-type:' + t.name, t);
+/* (define-condition-type name parent [reporter]): NAME and PARENT are names, not evaluated. Defines
+   condition-type:NAME and the predicate NAME?. */
+macros.set('define-condition-type', { kind: 'proc', proc: named(args => {
+  const [n, p, r] = args;
+  if (!isId(n)) throw new SchemeError('syntax-error', 'define-condition-type: expected a name', [strip(n)]);
+  const name = baseName(n), parent = p === undefined || p === false ? false : list(S.quote, strip(p));
+  const q = intern('quote');
+  return list(S.begin,
+    list(S.define, intern('condition-type:' + name.name), list(intern('make-condition-type'), list(q, name), parent, r === undefined ? false : r)),
+    list(S.define, intern(name.name + '?'), list(intern('condition-predicate'), list(q, name))),
+    list(q, name));
+}, 'define-condition-type') });
+
+/* restarts */
+pred('restart?', x => x instanceof Restart);
+D('restart/name', 'restart', 'Name of RESTART, a symbol, or #f.', ([r]) => { if (!(r instanceof Restart)) throw typeErr('restart', r, 'restart/name'); return r.name; });
+D('restart/report-string', 'restart', 'What RESTART does, for people.', ([r]) => { if (!(r instanceof Restart)) throw typeErr('restart', r, 'restart/report-string'); return restartReport(r); });
+D('compute-restarts', '[condition]', 'The active restarts, innermost first.', () => listOf(computeRestarts()));
+D('find-restart', 'name [condition]', 'The innermost active restart named NAME (or RESTART itself if active), or #f.', ([n]) => findRestart(n) || false);
+D('invoke-restart', 'restart . args', 'Unwind to RESTART (a restart or a name) and call it with ARGS.', ([r, ...a]) => invokeRestart(r, a));
+D('invoke-restart-interactively', 'restart', 'Invoke RESTART with arguments from its interactive procedure (or hooks.restartArgs).', ([r]) => { const rr = findRestart(r); if (!rr) return invokeRestart(r, []); return invokeRestart(rr, restartArgs(rr)); });
+for (const [n, doc] of [['abort', 'Invoke the innermost abort restart (back to the command loop).'], ['continue', 'Invoke the innermost continue restart, if any; else return #f.'],
+  ['retry', 'Invoke the innermost retry restart, if any; else return #f.'], ['use-value', 'Invoke the innermost use-value restart with VALUE, if any; else return #f.'],
+  ['store-value', 'Invoke the innermost store-value restart with VALUE, if any; else return #f.']])
+  D(n, n === 'use-value' || n === 'store-value' ? 'value' : '', doc, args => {
+    const r = findRestart(intern(n));
+    if (r) return invokeRestart(r, args);
+    if (n === 'abort') throw new SchemeError('control-error', 'No abort restart is active', []);
+    return false;
+  });
+/* (%restart-case thunk name report interactive procedure ...): call THUNK with the restarts. */
+D('%restart-case', 'thunk . specs', 'Call THUNK with restarts established (restart-case expands into this).', ([thunk, ...specs]) => {
+  const tag = {}, rs = [];
+  for (let i = 0; i + 3 < specs.length; i += 4) rs.push(new Restart(specs[i], specs[i + 1], specs[i + 2], specs[i + 3], tag, false));
+  return establish(rs, tag, () => callProc(thunk, []), true);
+});
+D('%with-simple-restart', 'name thunk format . args', 'Call THUNK with a restart NAME that makes this return #f and #t.', ([n, thunk, f, ...a]) => {
+  const tag = {};
+  return establish([new Restart(n, typeof f === 'string' ? fmt(f, a) : false, null, () => new Values([false, true]), tag, true)], tag, () => callProc(thunk, []), true);
+});
+/* (restart-case expr (name (arg...) [:report r] [:interactive i] body...) ...) */
+macros.set('restart-case', { kind: 'proc', proc: named(([expr, ...clauses]) => {
+  const out = [intern('%restart-case'), list(S.lambda, NIL, expr)];
+  for (const cl of clauses) {
+    const c = arr(cl);
+    if (c.length < 2 || !isId(c[0])) throw new SchemeError('syntax-error', 'restart-case: bad clause ' + write(strip(cl)), [strip(cl)]);
+    let k = 2, report = false, interactive = false;
+    while (k + 1 < c.length && isId(c[k]) && isKeyword(baseName(c[k]))) {
+      const kw = baseName(c[k]).name;
+      if (kw === ':report') report = c[k + 1]; else if (kw === ':interactive') interactive = c[k + 1];
+      k += 2;
+    }
+    out.push(list(S.quote, baseName(c[0])), report, interactive, new Pair(S.lambda, new Pair(c[1], listOf(c.slice(k)))));
+  }
+  return listOf(out);
+}, 'restart-case') });
+/* (with-simple-restart (name format arg...) body...): #f and #t if the restart is invoked. */
+macros.set('with-simple-restart', { kind: 'proc', proc: named(([spec, ...forms]) => {
+  const s = arr(spec);
+  return listOf([intern('%with-simple-restart'), list(S.quote, baseName(s[0])), new Pair(S.lambda, new Pair(NIL, listOf(forms))), ...s.slice(1)]);
+}, 'with-simple-restart') });
+
+/* the shadow stack, from Scheme */
+const stackFrames = fs => fs ? listOf(fs.map(f => new StackFrame(f.proc, f.frame, f.loc))) : NIL;
+D('stack-backtrace', '', 'The active procedure applications, innermost first, as stack frames.', function sbt() { const fs = backtrace(); return stackFrames(fs.length && fs[0].proc === sbt ? fs.slice(1) : fs); });
+pred('stack-frame?', x => x instanceof StackFrame);
+D('stack-frame/procedure', 'frame', 'The procedure applied.', ([f]) => f.proc);
+D('stack-frame/location', 'frame', 'Where it was called from: (file line column), or #f.', ([f]) => f.loc ? list(f.loc.file === null ? false : f.loc.file, f.loc.line, f.loc.col) : false);
+D('stack-frame/environment', 'frame', 'The environment of the application (for eval), or #f for a primitive.', ([f]) => f.proc && f.proc.scope && f.frame ? new Environment(f.proc.scope, f.frame) : false);
+D('source-location', 'obj', 'Where OBJ (a pair read or a compound procedure) comes from: (file line column), or #f.', ([x]) => { const l = sourceLocation(x); return l ? list(l.file === null ? false : l.file, l.line, l.col) : false; });
+
+/* environments */
+pred('environment?', x => x instanceof Environment);
+gdef('system-global-environment', GLOBAL_ENV);
+gdef('user-initial-environment', GLOBAL_ENV);
+D('interaction-environment', '', 'The global environment.', () => GLOBAL_ENV);
+D('nearest-repl/environment', '', 'The global environment.', () => GLOBAL_ENV);
+D('make-environment', '[parent]', 'A new empty environment inside PARENT (default the global one); eval\'s definitions in it stay in it.', ([p]) => {
+  const parent = p === undefined || p === false ? GLOBAL_ENV : p;
+  if (!(parent instanceof Environment)) throw typeErr('environment', parent, 'make-environment');
+  return new Environment(new Scope(parent.scope, []), [parent.frame]);
+});
+D('eval', 'expr [env]', 'Evaluate EXPR in ENV (default the global environment).', ([x, env]) => evalIn(x, env));
+/* The slot of SYM in ENV: [frame, index], or null when it is not bound locally. */
+function envSlot(env, s) {
+  if (!(env instanceof Environment)) throw typeErr('environment', env, 'environment');
+  const r = env.scope ? lookup(env.scope, s) : null;
+  if (!r || r.macro) return null;
+  let e = env.frame; for (let d = 0; d < r.depth; d++) e = e[0];
+  return [e, r.index];
+}
+D('environment-bound?', 'env symbol', '#t if SYMBOL is bound in ENV.', ([e, s]) => { sym(s, 'environment-bound?'); const sl = envSlot(e, s); return sl ? true : isBound(s.name); });
+D('symbol-bound?', 'env symbol', '#t if SYMBOL is bound in ENV.', ([e, s]) => { sym(s, 'symbol-bound?'); const sl = e instanceof Environment ? envSlot(e, s) : null; return sl ? true : isBound(s.name); });
+D('environment-lookup', 'env symbol', 'The value of SYMBOL in ENV.', ([e, s]) => { sym(s, 'environment-lookup'); const sl = envSlot(e, s); if (sl) { const v = sl[0][sl[1]]; if (v === undefined) throw new SchemeError('unbound-variable', 'Unassigned variable: ' + s.name, [s]); return v; } return gref(s.name); });
+D('environment-assign!', 'env symbol value', 'Set SYMBOL in ENV.', ([e, s, v]) => { sym(s, 'environment-assign!'); const sl = envSlot(e, s); if (sl) sl[0][sl[1]] = v; else gset(s.name, v); return UNSPEC; });
+D('environment-define', 'env symbol value', 'Bind SYMBOL in ENV itself.', ([e, s, v]) => { sym(s, 'environment-define'); if (!(e instanceof Environment)) throw typeErr('environment', e, 'environment-define'); if (!e.scope) { gdef(s.name, v); return s; } let k = e.scope.names.get(s); if (k === undefined) k = e.scope.add(s); e.frame[k] = v; return s; });
+
+/* features, load and require (files are read through hooks.readFile) */
+const featureList = [];
+D('provide', 'feature', 'Record that FEATURE is present.', ([f]) => { sym(f, 'provide'); if (!featureList.includes(f)) featureList.unshift(f); return f; });
+D('featurep', 'feature', '#t if FEATURE has been provided.', ([f]) => featureList.includes(f));
+D('features', '', 'The features provided, the latest first.', () => listOf(featureList));
+gdef('load-path', NIL);
+gdoc.set('load-path', 'Directories (strings) require searches for FEATURE.scm.');
+const joinPath = (d, f) => d === '' || d === '.' ? f : d.endsWith('/') ? d + f : d + '/' + f;
+D('load', 'filename [env]', 'Read FILENAME (through the host) and evaluate its forms in ENV.', ([f, env]) => loadFile(str(f, 'load'), env));
+D('require', 'feature [filename]', 'Load FEATURE unless it is provided: FILENAME, or FEATURE.scm in a directory of load-path. The file must provide FEATURE.', ([f, file]) => {
+  sym(f, 'require');
+  if (featureList.includes(f)) return f;
+  const name = file === undefined || file === false ? f.name + '.scm' : str(file, 'require');
+  const dirs = arr(gbox('load-path').value || NIL);
+  const tries = name.startsWith('/') ? [name] : dirs.map(d => joinPath(str(d, 'require'), name));
+  let path = null, text = null;
+  if (hooks.readFile) for (const p of tries) { const t = hooks.readFile(p); if (t !== null && t !== undefined && t !== false) { path = p; text = String(t); break; } }
+  if (text === null) throw new SchemeError('file-error', `Cannot open load file: ${name}` + (hooks.readFile ? '' : ' (no file reader is installed)'), [f]);
+  for (const x of readAll(text, path)) evalForm(x);
+  if (!featureList.includes(f)) throw new SchemeError('error', `Loading file ${path} did not provide feature ${f.name}`, [f]);
+  return f;
+});
 D('procedure-name', 'f', 'Name of the procedure, or #f.', ([f]) => proc(f, 'procedure-name').procName || false);
 D('procedure-documentation', 'f', 'Docstring of the procedure, or #f.', ([f]) => proc(f, 'procedure-documentation').doc || false);
 D('procedure-arity', 'f', 'Required argument count.', ([f]) => proc(f).arity === undefined ? false : f.arity);
@@ -1128,8 +1882,6 @@ D('current-seconds', '', 'Seconds since the epoch.', () => Date.now() / 1000);
 D('performance-now', '', 'High-resolution milliseconds.', () => (typeof performance !== 'undefined' ? performance.now() : Date.now()));
 D('exit', '[code]', 'Not available in the editor.', () => { throw err('exit: the editor cannot exit'); });
 D('bound?', 'symbol', '#t if the global variable is bound.', ([s]) => isBound(sym(s, 'bound?').name));
-D('symbol-bound?', 'env symbol', '#t if the global variable is bound.', ([e, s]) => isBound(sym(s).name));
-D('environment-bound?', 'env symbol', '#t if the global variable is bound.', ([e, s]) => isBound(sym(s).name));
 D('global-ref', 'symbol', 'Value of the global variable.', ([s]) => gref(sym(s, 'global-ref').name));
 D('global-set!', 'symbol value', 'Set the global variable.', ([s, v]) => { gset(sym(s, 'global-set!').name, v); return UNSPEC; });
 D('global-define!', 'symbol value', 'Define the global variable.', ([s, v]) => { gdef(sym(s).name, v); return s; });
@@ -1141,8 +1893,60 @@ D('macro?', 'symbol', '#t if the symbol names a macro.', ([s]) => macros.has(sym
 D('macroexpand-1', 'form', 'Expand the outermost macro of FORM once.', ([f]) => { if (f instanceof Pair) { const m = macroFor(null, f.car); if (m) return strip(expandMacro(m, f, null)); } return f; });
 D('macroexpand', 'form', 'Expand macros at the head of FORM until none apply.', ([f]) => { for (let n = 0; n < 1000; n++) { if (!(f instanceof Pair)) return f; const m = macroFor(null, f.car); if (!m) return strip(f); f = expandMacro(m, f, null); } return strip(f); });
 
-/* input and output: strings and the message area */
-D('write-string', 'obj . rest', 'Printed form of OBJ, like display.', ([x]) => display(x));
+/* input and output: textual ports (R7RS), strings and the message area */
+/* The console ports write through hooks.output (and hooks.errorOutput), read when written to. */
+const consolePort = makeOutputPort(s => { if (hooks.output) hooks.output(s); }, 'console');
+const consoleErrorPort = makeOutputPort(s => { const f = hooks.errorOutput || hooks.output; if (f) f(s); }, 'console-error');
+const emptyInput = makeStringInputPort('', 'console-input');
+const curOut = new Param(consolePort, null, 'current-output-port');
+const curErr = new Param(consoleErrorPort, null, 'current-error-port');
+const curIn = new Param(emptyInput, null, 'current-input-port');
+gdef('current-output-port', curOut); gdef('current-error-port', curErr); gdef('current-input-port', curIn);
+const outPort = (p, who) => { if (p === undefined || p === true) return curOut.value; if (p instanceof Port && p.output) return p; throw typeErr('output port', p, who); };
+const inPort = (p, who) => { if (p === undefined) return curIn.value; if (p instanceof Port && p.input) return p; throw typeErr('input port', p, who); };
+const errPort = () => curErr.value instanceof Port ? curErr.value : consolePort;
+const openIn = (p, who) => { if (!p.open) throw new SchemeError('wrong-type-argument', who + ': the port is closed', [p]); return p; };
+/* Call THUNK with the current output port bound to PORT. */
+function withOutputTo(port, thunk) { const old = curOut.value; curOut.value = port; try { return thunk(); } finally { curOut.value = old; } }
+pred('port?', x => x instanceof Port); pred('input-port?', x => x instanceof Port && x.input); pred('output-port?', x => x instanceof Port && x.output);
+pred('textual-port?', x => x instanceof Port); pred('binary-port?', () => false);
+D('input-port-open?', 'port', '#t if PORT is open.', ([p]) => inPort(p, 'input-port-open?').open);
+D('output-port-open?', 'port', '#t if PORT is open.', ([p]) => outPort(p, 'output-port-open?').open);
+for (const n of ['close-port', 'close-input-port', 'close-output-port']) D(n, 'port', 'Close PORT.', ([p]) => { if (!(p instanceof Port)) throw typeErr('port', p, n); p.open = false; return UNSPEC; });
+D('open-input-string', 'string', 'An input port reading STRING.', ([s]) => makeStringInputPort(str(s, 'open-input-string')));
+D('open-output-string', '', 'An output port collecting what is written to it; see get-output-string.', () => makeStringOutputPort());
+D('get-output-string', 'port', 'What has been written to a string output PORT.', ([p]) => { if (!(p instanceof Port) || !p.chunks) throw typeErr('string output port', p, 'get-output-string'); return p.string(); });
+D('with-output-to-string', '[thunk]', 'What THUNK writes to the current output port, as a string.', ([t]) => { const p = makeStringOutputPort(); if (t !== undefined) withOutputTo(p, () => callProc(t, [])); return p.string(); });
+D('call-with-output-string', 'proc', 'What PROC writes to the port it is called with, as a string.', ([f]) => { const p = makeStringOutputPort(); callProc(f, [p]); return p.string(); });
+D('with-input-from-string', 'string thunk', 'Call THUNK with the current input port reading STRING.', ([s, t]) => { const old = curIn.value; curIn.value = makeStringInputPort(str(s, 'with-input-from-string')); try { return callProc(t, []); } finally { curIn.value = old; } });
+D('read-char', '[port]', 'The next character of PORT, or the eof object.', ([p]) => { p = openIn(inPort(p, 'read-char'), 'read-char'); if (p.pos >= p.text.length) return EOF; const c = p.text.codePointAt(p.pos); p.pos += c > 0xffff ? 2 : 1; return mkchar(c); });
+D('peek-char', '[port]', 'The next character of PORT without reading it, or the eof object.', ([p]) => { p = openIn(inPort(p, 'peek-char'), 'peek-char'); return p.pos >= p.text.length ? EOF : mkchar(p.text.codePointAt(p.pos)); });
+D('char-ready?', '[port]', '#t if a character can be read from PORT without waiting.', ([p]) => { inPort(p, 'char-ready?'); return true; });
+D('read-line', '[port]', 'The next line of PORT without its newline, or the eof object.', ([p]) => {
+  p = openIn(inPort(p, 'read-line'), 'read-line');
+  if (p.pos >= p.text.length) return EOF;
+  let j = p.text.indexOf('\n', p.pos); if (j < 0) j = p.text.length;
+  const line = p.text.slice(p.pos, j); p.pos = Math.min(j + 1, p.text.length); return line;
+});
+D('read-string', 'k [port]', 'The next K characters of PORT (fewer at its end), or the eof object.', ([k, p]) => {
+  if (k instanceof Port) [k, p] = [p, k];   // MIT's (read-string port k) order too
+  p = openIn(inPort(p, 'read-string'), 'read-string'); int(k, 'read-string');
+  if (p.pos >= p.text.length) return EOF;
+  const s = p.text.slice(p.pos, p.pos + k); p.pos += s.length; return s;
+});
+/* (read [port]) reads a datum from PORT; (read string) reads one from STRING, as before. */
+D('read', '[port-or-string]', 'Read one datum from PORT (the current input port), or from a string.', ([s]) => {
+  if (typeof s === 'string') return read(s);
+  const p = openIn(inPort(s, 'read'), 'read');
+  const r = reader(p.text, p.file || null); r.pos = p.pos;
+  if (r.done) { p.pos = p.text.length; return EOF; }
+  const v = r.form(); p.pos = r.pos; return v;
+});
+D('write-string', 'string [port start end]', 'Write the characters of STRING (from START to END) to PORT.', ([s, p, a, b]) => { str(s, 'write-string'); outPort(p, 'write-string').put(a === undefined ? s : s.slice(a, opt(b, s.length))); return UNSPEC; });
+D('write-char', 'char [port]', 'Write CHAR to PORT.', ([c, p]) => { outPort(p, 'write-char').put(String.fromCodePoint(chr(c, 'write-char').code)); return UNSPEC; });
+D('write-u8', 'byte [port]', 'Not supported: ports are textual.', () => { throw new SchemeError('wrong-type-argument', 'write-u8: ports are textual', []); });
+D('flush-output', '[port]', 'Nothing to do: ports are not buffered.', ([p]) => { outPort(p, 'flush-output'); return UNSPEC; });
+D('fresh-line', '[port]', 'Start a new line on PORT unless it is at the start of one.', ([p]) => { p = outPort(p, 'fresh-line'); if (p.last !== 10) p.put('\n'); return UNSPEC; });
 D('object->string', 'obj', 'Printed form of OBJ, like write.', ([x]) => write(x));
 D('display->string', 'obj', 'Printed form of OBJ, like display.', ([x]) => display(x));
 D('string-pad', 's n', 'S padded on the right to N characters.', ([s, n]) => str(s).padEnd(n));
@@ -1155,8 +1959,8 @@ function fmt(f, args) {
     const a = args[k++]; let out;
     switch (c) {
       case 's': out = display(a); break; case 'S': out = write(a); break;
-      case 'd': out = String(Math.trunc(num(a, 'format'))); break; case 'c': out = a instanceof Char ? cs(a) : String.fromCodePoint(num(a)); break;
-      case 'x': out = num(a).toString(16); break; case 'X': out = num(a).toString(16).toUpperCase(); break; case 'o': out = num(a).toString(8); break;
+      case 'd': out = typeof a === 'bigint' ? a.toString() : String(Math.trunc(num(a, 'format'))); break; case 'c': out = a instanceof Char ? cs(a) : String.fromCodePoint(num(a)); break;
+      case 'x': out = numx(a, 'format').toString(16); break; case 'X': out = numx(a, 'format').toString(16).toUpperCase(); break; case 'o': out = numx(a, 'format').toString(8); break;
       case 'f': out = num(a).toFixed(prec ? +prec : 6); break;
     }
     if (prec && c === 's') out = out.slice(0, +prec);
@@ -1164,24 +1968,30 @@ function fmt(f, args) {
     return out;
   });
 }
-D('format', 'destination-or-string . args', 'Format ARGS into the string: ~a ~s ~% or %s %S %d %c %x %f.', ([d, ...a]) => {
+D('format', 'destination format . args', 'Format ARGS: ~a ~s ~% or %s %S %d %c %x %f. DESTINATION #f returns the string, #t writes to the current output port, a port writes to it; a format string first returns the string.', ([d, ...a]) => {
   if (typeof d === 'string') return fmt(d, a);
   const s = fmt(str(a[0], 'format'), a.slice(1));
   if (d === false) return s;
-  if (hooks.output) hooks.output(s);
+  outPort(d, 'format').put(s);
   return UNSPEC;
 });
 D('string-format', 'format . args', 'Format ARGS into the string.', ([f, ...a]) => fmt(str(f), a));
-D('display', 'obj [port]', 'Print OBJ for people.', ([x]) => { if (hooks.output) hooks.output(display(x)); return UNSPEC; });
-D('write', 'obj [port]', 'Print OBJ so it can be read back.', ([x]) => { if (hooks.output) hooks.output(write(x)); return UNSPEC; });
-D('newline', '[port]', 'Print a newline.', () => { if (hooks.output) hooks.output('\n'); return UNSPEC; });
-D('write-line', 'obj', 'Print OBJ and a newline.', ([x]) => { if (hooks.output) hooks.output(write(x) + '\n'); return UNSPEC; });
-D('pp', 'obj', 'Print OBJ.', ([x]) => { if (hooks.output) hooks.output(write(x) + '\n'); return UNSPEC; });
-D('read', '[string]', 'Read one datum from the string.', ([s]) => s === undefined ? EOF : read(str(s)));
+D('display', 'obj [port]', 'Print OBJ for people.', ([x, p]) => { outPort(p, 'display').put(display(x)); return UNSPEC; });
+D('write', 'obj [port]', 'Print OBJ so it can be read back.', ([x, p]) => { outPort(p, 'write').put(write(x)); return UNSPEC; });
+D('write-shared', 'obj [port]', 'Print OBJ so it can be read back.', ([x, p]) => { outPort(p, 'write-shared').put(write(x)); return UNSPEC; });
+D('write-simple', 'obj [port]', 'Print OBJ so it can be read back.', ([x, p]) => { outPort(p, 'write-simple').put(write(x)); return UNSPEC; });
+D('newline', '[port]', 'Print a newline.', ([p]) => { outPort(p, 'newline').put('\n'); return UNSPEC; });
+D('write-line', 'obj [port]', 'Print OBJ and a newline.', ([x, p]) => { outPort(p, 'write-line').put(write(x) + '\n'); return UNSPEC; });
+D('pp', 'obj [port]', 'Print OBJ.', ([x, p]) => { outPort(p, 'pp').put(write(x) + '\n'); return UNSPEC; });
 D('read-from-string', 'string [start]', 'Read one datum from STRING; return it and the end index as two values.', ([s, st]) => { const r = reader(str(s)); r.pos = opt(st, 0); const v = r.form(); return new Values([v, r.pos]); });
-D('read-all', 'string', 'Read every datum from STRING as a list.', ([s]) => listOf(readAll(str(s))));
+D('read-all', 'string [file]', 'Read every datum from STRING as a list.', ([s, f]) => listOf(readAll(str(s), f === undefined || f === false ? null : str(f, 'read-all'))));
 pred('eof-object?', x => x === EOF);
 D('eof-object', '', 'The end-of-file object.', () => EOF);
+D('set-record-type-printer!', 'type printer', 'Print records of TYPE by calling (PRINTER record port); #f restores the default.', ([t, p]) => { if (!(t instanceof RecordType)) throw typeErr('record type', t, 'set-record-type-printer!'); t.printer = p || null; return UNSPEC; });
+pred('record?', x => x instanceof Record);
+D('record-type-descriptor', 'record', 'The type of RECORD.', ([r]) => { if (!(r instanceof Record)) throw typeErr('record', r, 'record-type-descriptor'); return r.type; });
+D('record-type-name', 'type', 'The name of record TYPE, a symbol.', ([t]) => { if (!(t instanceof RecordType)) throw typeErr('record type', t, 'record-type-name'); return intern(t.name); });
+D('object-hash', 'obj', 'A number for OBJ (the one it prints with), or #f for an immediate value.', ([x]) => objectHash(x));
 
 /* regular expressions over JS syntax, used by the editor's search code and string utilities */
 D('regexp', 'pattern [flags]', 'A compiled JavaScript regular expression.', ([p, f]) => { try { return new RegExp(str(p, 'regexp'), opt(f, 'u')); } catch (e) { throw err('regexp: ' + e.message); } });
@@ -1280,6 +2090,21 @@ const Scheme = {
   read, readAll, reader, write, display, writeString, eqv, equal, globals, macros, gbox, gref, gset, gdef, isBound, gdoc,
   callProc, def, D, named, arity, comp, evalForm, evalString, errorMessage, fmt, hooks, strip, typeErr, err,
   num, int, str, sym, chr, vec, proc, opt, watchdog, lookup, Scope, baseName, scanClosure,
+  // numbers (R4.3)
+  numx, isNumber, isExactInt, add, sub, mul, div, quotient, remainder, modulo, expt, exact: exactOf, inexact, parseNumber,
+  // ports (R4.4)
+  Port, makeOutputPort, makeStringOutputPort, makeStringInputPort, consolePort, currentOutputPort: curOut, currentErrorPort: curErr, currentInputPort: curIn, withOutputTo,
+  // environments and loading (R4.5, R4.10)
+  Environment, globalEnvironment: GLOBAL_ENV, evalIn, loadFile, readFileText, features: featureList,
+  // source locations (R4.6)
+  sourceLocation, SrcLoc,
+  // hash tables and printing (R4.7, R4.8)
+  WeakTable, objectHash,
+  // conditions, handlers, restarts (R4.31-R4.33)
+  ConditionType, conditionType, defineConditionType, conditionIs, isErrorCondition, conditionReportString: errorMessage,
+  signal, withHandler, DECLINE, Restart, withRestarts, computeRestarts, findRestart, invokeRestart, restartArgs, restartReport, Unwind,
+  // the shadow stack (R4.34)
+  backtrace: () => backtrace(), conditionBacktrace, resetStack, stackDepth: () => sp - 1, setMaxDepth, get maxDepth() { return MAX_DEPTH; }, shadowStack: SHADOW,
 };
 g.Scheme = Scheme;
 if (typeof module !== 'undefined') module.exports = Scheme;
