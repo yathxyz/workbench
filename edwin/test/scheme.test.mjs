@@ -406,6 +406,27 @@ describe(`Edwin Scheme (${MODE})`, () => {
     assert.equal(S.stackDepth(), 0);
   });
 
+  test('R4.34 on a stack too small for the cap, guard still catches a recursion-depth condition', async () => {
+    // Node's default stack holds about 1,500 Scheme calls. The JavaScript RangeError is turned into a
+    // recursion-depth condition at the guard, after unwinding; edwind runs with a stack sized for the cap.
+    const src = `
+const { parentPort, workerData } = require('node:worker_threads');
+require('node:vm').runInThisContext(require('node:fs').readFileSync(workerData, 'utf8'));
+const S = globalThis.Scheme;
+S.evalString('(define (f n) (if (= n 0) 0 (+ 1 (f (- n 1)))))');
+const caught = S.write(S.evalString('(guard (e ((recursion-depth? e) (list (quote caught) (condition/report-string e)))) (f 100000))'));
+let plain = 'no error'; try { S.evalString('(f 100000)'); } catch (e) { plain = e.constructor.name; }
+parentPort.postMessage([caught, plain, S.stackDepth(), S.write(S.evalString('(f 100)'))]);`;
+    const res = await new Promise((resolve, reject) => {
+      const w = new Worker(src, { eval: true, workerData: SCHEME_FILE, resourceLimits: { stackSizeMb: 1 } });
+      w.once('message', resolve); w.once('error', reject);
+    });
+    assert.match(res[0], /^\(caught "Recursion too deep: the JavaScript stack ran out at depth \d+"\)$/);
+    assert.equal(res[1], 'RangeError', 'without a guard the overflow surfaces as it did');
+    assert.equal(res[2], 0);
+    assert.equal(res[3], '100', 'the evaluator works after the overflow');
+  });
+
   test('R4.34 the default cap of 10,000 frames (in a thread with a big stack)', async () => {
     const src = `
 const { parentPort, workerData } = require('node:worker_threads');
