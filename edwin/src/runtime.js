@@ -58,12 +58,23 @@ const apply = (f, args) => callProc(typeof f === 'function' ? f : toFn(f), args 
 let budget = 0;
 function resetOps() { budget = 0; S.watchdog.reset(); }
 
-function runHook(name, ...args) {
+/* A hook's value is a procedure or a list of them. In a buffer-local hook value, #t stands for the
+   hook's default value, as t does in Emacs (add-hook! with LOCAL puts it there). */
+const hooking = { defaultValue: get };
+function hookFns(name) {
   const h = get(name);
-  if (h === undefined || h === false || h === NIL) return;
-  const fs = typeof h === 'function' ? [h] : arr(h);
-  for (const f of fs) apply(f, args);
+  if (h === undefined || h === false || h === NIL) return [];
+  if (typeof h === 'function') return [h];
+  const out = [];
+  for (const f of arr(h)) {
+    if (f !== true) { out.push(f); continue; }
+    const g = hooking.defaultValue(name);
+    if (g === h || g === undefined || g === false || g === NIL) continue;
+    for (const x of typeof g === 'function' ? [g] : arr(g)) if (x !== true) out.push(x);
+  }
+  return out;
 }
+function runHook(name, ...args) { for (const f of hookFns(name)) apply(f, args); }
 function addHook(name, f, append) {
   const cur = arr(get(name) ?? NIL);
   if (cur.some(x => x === f)) return;
@@ -91,7 +102,7 @@ function evalText(text) { let v = UNSPEC; for (const f of S.readAll(text)) v = S
 
 g.L = {
   S, Sym, Pair, Char, SchemeError, NIL, UNSPEC, intern, listOf, arr, callProc, write, display, pr, signal, quit, isQuit, isQuietQuit, QUIET,
-  truthy, absent, get, set, magic, defvar, toFn, fnOrNull, cmdSym, cmdName, isCommand, prop, put, call, apply, resetOps, runHook, addHook, removeHook,
+  truthy, absent, get, set, magic, defvar, toFn, fnOrNull, cmdSym, cmdName, isCommand, prop, put, call, apply, resetOps, runHook, hookFns, hooking, addHook, removeHook,
   chr, code, mkchar, commandNames, functionNames, variableNames, D, CMD, alias, evalText, read: S.read, readAll: S.readAll, ev: S.evalForm,
   errorMessage: S.errorMessage, Escape: S.Escape, isList: S.isList, car: S.car, cdr: S.cdr, cons: S.cons, list: S.list, equal: S.equal,
 };

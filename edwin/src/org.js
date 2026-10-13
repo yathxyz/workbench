@@ -41,7 +41,7 @@ L.defvar('org-capture-after-finalize-hook', NIL, 'Procedures called after a capt
 L.defvar('after-save-hook', NIL, 'Procedures called after a buffer is saved.');
 Ed.MODE_NAMES['markdown-mode'] = 'Markdown'; Ed.MODE_NAMES['org-agenda-mode'] = 'Org Agenda'; Ed.MODE_NAMES['org-roam-mode'] = 'Org Roam';
 for (const mode of ['markdown-mode', 'org-agenda-mode', 'org-roam-mode'])
-  CMD(mode, '', '', `Switch the current buffer to ${Ed.MODE_NAMES[mode]} mode.`, () => { cur().mode = mode; return false; });
+  CMD(mode, '', '', `Switch the current buffer to ${Ed.MODE_NAMES[mode]} mode.`, () => Ed.switchMajorMode(cur(), mode));
 H.modeFor = name => /\.org$/i.test(name) ? 'org-mode' : /\.(md|markdown)$/i.test(name) ? 'markdown-mode' : null;
 H.ellipsis = () => String(L.get('org-ellipsis') ?? '...');
 const isOrg = b => b.mode === 'org-mode' || b.mode === 'org-roam-mode';
