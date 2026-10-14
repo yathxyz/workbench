@@ -111,3 +111,22 @@ test('desks (§10.8): Alt-Shift digits from the board and from a page, leader di
   assert.equal(K.whereIs('desk.delete'), 'Ctrl-Space d k');
   assert.ok(![...K.commands()].some(c => c.startsWith('ws.') && c !== 'ws.last'), 'no workspace digit rows remain');
 });
+
+test('desks D2 (§10.8): overview, ring, overlay, attention and the new desk keys; the overview and the ring keep the keyboard', () => {
+  assert.equal(K.leaderResolve('g').cmd, 'overview');
+  assert.equal(K.leaderResolve('w').cmd, 'ring');
+  assert.equal(K.leaderResolve('x').cmd, 'overlay');
+  assert.equal(K.leaderResolve('!').cmd, 'attn.next');
+  assert.equal(K.leaderResolve('9').cmd, 'desk.9');
+  assert.equal(K.leaderResolve('x', 'leader-m').cmd, 'overlay.send');
+  for (const [k, c] of [['b', 'desk.promote'], ['s', 'desk.sticky'], ['t', 'desk.layout'], ['o', 'desk.open']]) assert.equal(K.leaderResolve(k, 'leader-d').cmd, c);
+  assert.equal(outcome(ctx({ transient: 'overview' }), 'a'), 'overview.letter');
+  assert.equal(outcome(ctx({ transient: 'overview' }), '3'), 'overview.3');
+  assert.equal(outcome(ctx({ transient: 'overview' }), '<right>'), 'overview.right');
+  assert.equal(outcome(ctx({ transient: 'overview' }), 'C-k'), 'swallow');
+  assert.equal(outcome(ctx({ transient: 'ring' }), 'w'), 'ring.next');
+  assert.equal(outcome(ctx({ transient: 'ring' }), 'S-TAB'), 'ring.prev');
+  assert.equal(outcome(ctx({ transient: 'ring' }), 'h'), 'swallow');
+  assert.equal(K.whereIs('desk.sticky'), 'Ctrl-Space d s');
+  assert.equal(K.whereIs('overlay.send'), 'Ctrl-Space m x');
+});

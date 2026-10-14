@@ -107,7 +107,9 @@
     leader: [
       ['TAB', 'fold.toggle', 'fold / unfold (package)'], ['S-TAB', 'fold.cycle', 'fold the others / unfold all'],
       ...range(0, 9).map(i => [String(i), 'desk.' + i, 'desk n (0 is the Board)', '0…9']), ['`', 'desk.prev', 'previous desk'],
-      ['m', '>leader-m', 'send the selection to desk n'], ['M', '>leader-M', 'send it and go there'], ['d', '>leader-d', 'desk: new rename pin off also which delete'],
+      ['m', '>leader-m', 'send the selection to desk n (x: the scratch overlay)'], ['M', '>leader-M', 'send it and go there'], ['d', '>leader-d', 'desk: new rename pin off also which delete promote sticky tile'],
+      ['g', 'overview', 'overview of every desk'], ['w', 'ring', 'recent places: desks, tabs, views'], ['x', 'overlay', 'scratch overlay: show / hide'],
+      ['!', 'attn.next', 'next item that needs a look (any desk)'],
       ['u', 'up', 'up (close focus, leave ws)'], ['RET', 'card.enter', 'enter folder, type into node'],
       ['f', 'card.tab', 'focus tab'], ['q', 'tab.close', 'close tab'], ['n', 'tab.next', 'next tab'], ['p', 'tab.prev', 'previous tab'],
       ['h', 'card.left', 'select neighbour', 'h j k l'], ['j', 'card.down', 'select neighbour', 'h j k l'], ['k', 'card.up', 'select neighbour', 'h j k l'], ['l', 'card.right', 'select neighbour', 'h j k l'],
@@ -121,18 +123,26 @@
       ['ESC', 'leave', 'leave the card (on the board: cancel)'], ['C-g', 'cancel', 'cancel'],
     ],
     // desks (DESIGN §10.8): m and M take a desk number; d is the desk's own map, and d a takes a number too
-    'leader-m': range(0, 9).map(i => [String(i), 'desk.send.' + i, 'desk n (0 takes it off this desk)', '0…9']),
+    'leader-m': [...range(0, 9).map(i => [String(i), 'desk.send.' + i, 'desk n (0 takes it off this desk)', '0…9']), ['x', 'overlay.send', 'the scratch overlay (again: out of it)']],
     'leader-M': range(0, 9).map(i => [String(i), 'desk.follow.' + i, 'desk n (0: off this desk, to the Board)', '0…9']),
     'leader-da': range(1, 9).map(i => [String(i), 'desk.also.' + i, 'desk n (it stays here too)', '1…9']),
     'leader-d': [['n', 'desk.new', 'new desk with the selection'], ['r', 'desk.rename', 'rename this desk'], ['p', 'desk.pin', 'pin / unpin: in the board or this device only'],
       ['x', 'desk.off', 'take the selection off this desk'], ['a', '>leader-da', 'also on desk n (keep it here)'], ['i', 'desk.which', 'which desks hold the selected item'],
-      ['k', 'desk.delete', 'delete this desk (the cards stay)']],
+      ['k', 'desk.delete', 'delete this desk (the cards stay)'], ['b', 'desk.promote', 'promote: the Board takes their place here'],
+      ['s', 'desk.sticky', 'sticky: the selected cards on every desk'], ['t', 'desk.layout', 'tile / free this desk'], ['o', 'desk.open', 'open the folder as a desk']],
     'leader-v': [['m', 'persp.manual', 'manual'], ['p', 'persp.process', 'process'], ['f', 'persp.fs', 'filesystem'], ['t', 'persp.tag', 'tags'], ['x', 'persp.tmux', 'tmux'],
       ['c', 'persp.proc', 'processes'], ['u', 'persp.unit', 'units'], ['j', 'persp.journal', 'journal'], ['l', 'persp.link', 'links']],
     // transients: the palette and the dialogs keep every key for their own inputs, except Esc
     palette: [['ESC', 'overlay.close', 'close']],
     dialog: [['ESC', 'overlay.close', 'close']],
     hints: [['ESC', 'hints.cancel', 'cancel'], ['DEL', 'hints.back', 'delete a letter']],
+    // desks D2: the overview (letters search, so moving is on the arrows) and the recent-places ring
+    overview: [['<left>', 'overview.left', 'move', 'arrows'], ['<right>', 'overview.right', 'move', 'arrows'], ['<up>', 'overview.up', 'move', 'arrows'], ['<down>', 'overview.down', 'move', 'arrows'],
+      ['RET', 'overview.go', 'go there'], ['ESC', 'overview.close', 'stay'], ['DEL', 'overview.back', 'delete a letter'],
+      ...range(0, 9).map(i => [String(i), 'overview.' + i, 'go to desk n', '0…9'])],
+    ring: [['w', 'ring.next', 'next', 'w Tab ↓ →'], ['TAB', 'ring.next', 'next', 'w Tab ↓ →'], ['<down>', 'ring.next', 'next', 'w Tab ↓ →'], ['<right>', 'ring.next', 'next', 'w Tab ↓ →'],
+      ['W', 'ring.prev', 'back', 'W S-Tab ↑ ←'], ['S-TAB', 'ring.prev', 'back', 'W S-Tab ↑ ←'], ['<up>', 'ring.prev', 'back', 'W S-Tab ↑ ←'], ['<left>', 'ring.prev', 'back', 'W S-Tab ↑ ←'],
+      ['RET', 'ring.go', 'go'], ['SPC', 'ring.go', 'go'], ['ESC', 'ring.close', 'stay'], ...range(1, 9).map(i => [String(i), 'ring.' + i, 'go to entry n', '1…9'])],
     arrange: [
       ['h', 'arrange.left', 'move', 'h j k l'], ['j', 'arrange.down', 'move', 'h j k l'], ['k', 'arrange.up', 'move', 'h j k l'], ['l', 'arrange.right', 'move', 'h j k l'],
       ['H', 'arrange.narrower', 'resize', 'H J K L'], ['J', 'arrange.taller', 'resize', 'H J K L'], ['K', 'arrange.shorter', 'resize', 'H J K L'], ['L', 'arrange.wider', 'resize', 'H J K L'],
@@ -164,6 +174,8 @@
     palette: { map: 'palette', needs: ALL },
     dialog: { map: 'dialog', needs: ALL },
     hints: { map: 'hints', rest: 'hints.letter', swallow: true },
+    overview: { map: 'overview', rest: 'overview.letter', swallow: true },
+    ring: { map: 'ring', swallow: true },
     arrange: { map: 'arrange', swallow: true },
   };
   // views whose keys are a function (sequences such as gg, dd, m x): they claim these unmodified keys and decline the rest
