@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Start wb-hub, edwind, wb-web and a test Caddy on loopback with temporary configs.
 
-  python3 -I tests/harness.py --web-root DIR [--bin-dir DIR] [--dogfood] [--frames]
+  python3 -I tests/harness.py --web-root DIR [--bin-dir DIR] [--dogfood] [--frames] [--board FILE]
 
 Prints one JSON line on stdout once everything listens:
-  {web, caddy, caddySocket, hubSocket, webSocket, editSocket, caddyAdmin, stateDir, boardsDir, notesDir}
+  {web, caddy, caddySocket, hubSocket, webSocket, editSocket, caddyAdmin, stateDir, boardsDir, notesDir, host, boardFile}
 
 wb-web listens on 127.0.0.1:18090 and trusts 127.0.0.1. Caddy injects the proxy secret and
 listens only on caddySocket, a 0600 unix socket in the 0700 temporary directory, for the site
@@ -33,9 +33,21 @@ chunks, asks a permission and streams 80 more), for the ui check N27. Test mode 
 without it; --dogfood registers no agent.
 
 Test mode (the default) gives the hub a temporary HOME and environment canaries, and exits
-when stdin closes. The stdin lines "stop hub" and "start hub" stop wb-hub (SIGTERM) and start
-it again, acknowledged on stderr with "harness: wb-hub stopped" / "harness: wb-hub started". --dogfood uses the real HOME, no canaries, ignores stdin, and still uses a
-temporary state directory and a fresh, empty boards directory.
+when stdin closes. Control lines on stdin, one per line, each acknowledged with one JSON line on
+stdout once done, {"event": ..., "what": ...}:
+  "stop hub" / "start hub"          SIGTERM wb-hub and wait for it; start it again
+                                    (events "stopped"/"started", what "hub"; the stderr lines
+                                    "harness: wb-hub stopped" / "harness: wb-hub started" stay)
+  "stop edit" / "start edit"        the same for edwind (what "edit"); while it is stopped the
+                                    harness does not treat its exit as a failure
+  "restart edit"                    stop edit then start edit, one event "restarted"
+  "board FILE"                      copy FILE over <boardsDir>/<host>.json and delete
+                                    <boardsDir>/<host>.pre-edwind.json (event "board", what the
+                                    board file's path): a board prepared outside the browser, as a
+                                    deploy would find it (R8.17 migration checks)
+An unknown line is answered with {"event": "error", "what": <the line>}. --dogfood uses the real
+HOME, no canaries, ignores stdin, and still uses a temporary state directory and a fresh, empty
+boards directory. --board FILE seeds <boardsDir>/<host>.json from FILE before anything starts.
 
 Binaries come from --bin-dir, else from PATH. The web root comes from --web-root or
 $WB_WEB_ROOT (for example the output of `nix build .#workbench-web`).
@@ -149,7 +161,7 @@ def can_connect_unix(path):
 
 
 class Harness:
-    def __init__(self, web_root, bin_dir=None, dogfood=False, tcp=False, frames=False):
+    def __init__(self, web_root, bin_dir=None, dogfood=False, tcp=False, frames=False, board=None):
         self.web_root = str(Path(web_root).resolve())
         self.bin_dir = bin_dir
         self.dogfood = dogfood
@@ -185,7 +197,10 @@ class Harness:
         with os.fdopen(fd, "w") as f:
             f.write(self.secret + "\n")
 
-        host = os.uname().nodename
+        host = self.host = os.uname().nodename
+        self.board_file = self.boards_dir / f"{host}.json"
+        if board:
+            self.seed_board(board)
         self.hub_config = {
             "socket": self.hub_sock,
             "stateDir": str(self.root / "state" / "hub"),
@@ -299,6 +314,25 @@ class Harness:
         self.edit = self.spawn("edit", self.edwind_argv(), self.base_env())
         wait_until(lambda: can_connect_unix(self.edit_sock), "edwind", self.edit)
 
+    def stop_edit(self):
+        """SIGTERM edwind and wait for it: the browser's /edit sockets close (wb-web answers 1011/1013 until
+        start_edit), queued edits stay in the tabs (R6.10) and are resent after the reconnect (R7.15, R7.16)."""
+        self.stop_proc(self.edit)
+
+    def seed_board(self, src):
+        """Install SRC as the served board, as a deploy finds a board written by an older app.js: wb-web reads
+        the file on every GET, so no restart is needed. The R8.19 copy of an earlier migration is removed, so
+        the next first migration makes it again."""
+        data = Path(src).read_bytes()
+        json.loads(data)   # a board that does not parse would only fail later, in the browser
+        tmp = self.board_file.with_suffix(".json.tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, self.board_file)
+        pre = self.boards_dir / f"{self.host}.pre-edwind.json"
+        if pre.exists():
+            pre.unlink()
+        return str(self.board_file)
+
     def start_web(self):
         self.web = self.spawn("web", [self.bin("wb-web"), "--config", self.web_json], self.base_env())
         wait_until(lambda: can_connect_tcp(WEB_ADDR), "wb-web", self.web)
@@ -392,6 +426,8 @@ class Harness:
             "stateDir": self.hub_config["stateDir"],
             "boardsDir": str(self.boards_dir),
             "notesDir": str(self.notes_dir),
+            "host": self.host,
+            "boardFile": str(self.board_file),
         }
 
     def __enter__(self):
@@ -411,6 +447,7 @@ def main():
     p.add_argument("--bin-dir", help="directory holding wb-hub and wb-web (default: PATH)")
     p.add_argument("--dogfood", action="store_true", help="real HOME, no canaries, ignore stdin")
     p.add_argument("--frames", action="store_true", help="web.json frames: true (pages as Edwin frames)")
+    p.add_argument("--board", help="a board JSON file to install as <boardsDir>/<host>.json before the start")
     a = p.parse_args()
     if not a.web_root:
         p.error("--web-root or $WB_WEB_ROOT is required")
@@ -426,8 +463,9 @@ def main():
         signal.signal(s, on_signal)
 
     try:
-        h = Harness(a.web_root, a.bin_dir, a.dogfood, tcp=os.environ.get("WB_HARNESS_TCP") == "1", frames=a.frames)
-    except RuntimeError as e:
+        h = Harness(a.web_root, a.bin_dir, a.dogfood, tcp=os.environ.get("WB_HARNESS_TCP") == "1", frames=a.frames,
+                    board=a.board)
+    except (RuntimeError, OSError, ValueError) as e:
         print(f"harness: {e}", file=sys.stderr)
         return 1
     try:
@@ -445,8 +483,9 @@ def main():
             # Unbuffered: a daemon thread blocked in sys.stdin.buffer holds its lock, and the
             # interpreter then aborts at exit after a SIGTERM.
             for line in open(sys.stdin.fileno(), "rb", buffering=0, closefd=False):
-                if line.strip() in (b"stop hub", b"start hub"):
-                    events.append(line.strip().decode())
+                text = line.strip().decode(errors="replace")
+                if text:
+                    events.append(text)
                     wake.set()
             events.append(signal.SIGTERM)
             wake.set()
@@ -454,29 +493,58 @@ def main():
         threading.Thread(target=watch_stdin, daemon=True).start()
 
     status = 0
-    hub_stopped = False
+    stopped = {"hub": False, "edit": False}
+
+    def event(kind, what):
+        print(json.dumps({"event": kind, "what": what}), flush=True)
+
+    def control(line):
+        """One stdin control line; returns False when the harness must exit with status 1."""
+        nonlocal status
+        words = line.split(None, 1)
+        verb, rest = words[0], (words[1] if len(words) > 1 else "")
+        procs = {"hub": (lambda: h.stop_proc(h.hub), h.start_hub), "edit": (h.stop_edit, h.start_edit)}
+        if verb in ("stop", "start", "restart") and rest in procs:
+            stop, start = procs[rest]
+            try:
+                if verb != "start":
+                    stop()
+                    stopped[rest] = True
+                    if verb == "stop":
+                        if rest == "hub":
+                            print("harness: wb-hub stopped", file=sys.stderr, flush=True)
+                        event("stopped", rest)
+                        return True
+                start()
+                stopped[rest] = False
+                if rest == "hub":
+                    print("harness: wb-hub started", file=sys.stderr, flush=True)
+                event("started" if verb == "start" else "restarted", rest)
+            except RuntimeError as e:
+                print(f"harness: {e}\n{h.log_tail(rest)}", file=sys.stderr, flush=True)
+                status = 1
+                return False
+            return True
+        if verb == "board" and rest:
+            try:
+                event("board", h.seed_board(rest))
+            except (OSError, ValueError) as e:
+                event("error", f"board {rest}: {e}")
+            return True
+        event("error", line)
+        return True
+
     try:
         while True:
             wake.wait(0.5)
             wake.clear()
             while events:
-                event = events.pop(0)
-                if event == "stop hub":
-                    h.stop_proc(h.hub)
-                    hub_stopped = True
-                    print("harness: wb-hub stopped", file=sys.stderr, flush=True)
-                    continue
-                if event == "start hub":
-                    try:
-                        h.start_hub()
-                    except RuntimeError as e:
-                        print(f"harness: {e}\n{h.log_tail('hub')}", file=sys.stderr)
-                        status = 1
+                ev = events.pop(0)
+                if isinstance(ev, str):
+                    if not control(ev):
                         return status
-                    hub_stopped = False
-                    print("harness: wb-hub started", file=sys.stderr, flush=True)
                     continue
-                if event != signal.SIGHUP:
+                if ev != signal.SIGHUP:
                     return status
                 try:
                     h.restart_web()
@@ -485,8 +553,8 @@ def main():
                     print(f"harness: {e}\n{h.log_tail('web')}", file=sys.stderr)
                     status = 1
                     return status
-            for name, proc in (("wb-hub", h.hub), ("edwind", h.edit), ("wb-web", h.web), ("caddy", h.caddy)):
-                if name == "wb-hub" and hub_stopped:
+            for name, key, proc in (("wb-hub", "hub", h.hub), ("edwind", "edit", h.edit), ("wb-web", "web", h.web), ("caddy", "caddy", h.caddy)):
+                if stopped.get(key):
                     continue
                 if proc.poll() is not None:
                     print(f"harness: {name} exited with {proc.returncode}", file=sys.stderr)
