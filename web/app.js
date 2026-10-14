@@ -2922,13 +2922,13 @@ $('#reset-board').onclick = ev => confirmDel(ev.currentTarget, () => {
 });
 
 // ------------------------------------------------------------------ export (JSON Canvas 1.0)
-function toJsonCanvas() {
+async function toJsonCanvas() {
   const nodes = [], edges = [];
   const all = [...frameList(), ...nodeList()];
   for (const n of all) {
     const base = { id: n.id, x: Math.round(n.x), y: Math.round(n.y), width: Math.round(n.w), height: Math.round(n.h) };
     if (n.kind === 'frame') nodes.push({ ...base, type: 'group', label: n.name });
-    else if (n.kind === 'buffer') nodes.push({ ...base, type: 'text', text: n.text || '' });
+    else if (n.kind === 'buffer') nodes.push({ ...base, type: 'text', text: await pageTextFull(n) });
     else if (n.kind === 'ref') nodes.push({ ...base, type: 'text', text: `> from ${n.srcLabel}\n\n\`\`\`\n${n.text}\n\`\`\``, color: '6' });
     else nodes.push({ ...base, type: 'text', text: `**${pathOf(n.id)}** · ${badgeOf(n)}\n\n\`\`\`\n${snapshotText(n, 30)}\n\`\`\``, color: '4' });
   }
@@ -3118,7 +3118,7 @@ cmd('Folder: change shape', () => { const f = activeFolder(); f.shape = FSHAPES[
 cmd('Fit everything', onCanvas(() => fitAll()), '@fit');
 cmd('Save this view as…', () => setTimeout(() => openPalette('>save '), 0));
 cmd('Back to the previous view', onCanvas(() => { const t = camBack.pop(); if (t) { camFwd.push({ ...cam() }); animateTo(t); } }), '@camera.back');
-cmd('Export as JSON Canvas', () => { syncBuffers(); $('#ex-text').value = toJsonCanvas(); $('#export-box').hidden = false; });
+cmd('Export as JSON Canvas', async () => { syncBuffers(); $('#ex-text').value = await toJsonCanvas(); $('#export-box').hidden = false; });
 cmd('Theme: Modus Operandi (light)', () => setTheme('light'));
 cmd('Theme: Modus Vivendi (dark)', () => setTheme('dark'));
 cmd('Theme: follow the system', () => setTheme('auto'));
@@ -4281,8 +4281,8 @@ function headingsOf(text) {
 function backlinksOf(p) {
   const name = p.name.toLowerCase(), hits = [];
   for (const q of pages()) {
-    if (q === p || !live[q.id]?.view) continue;
-    const st = live[q.id].view.state;
+    if (q === p) continue;
+    const st = pageState(q); if (!st) continue;   // a CodeMirror state, or the replica's text (frames mode)
     for (let i = 1; i <= st.doc.lines; i++) {
       const t = st.doc.line(i).text, low = t.toLowerCase();
       if (low.includes('[[' + name + ']]') || low.includes('((' + name + '#') || low.includes('((' + name + ' ›')) hits.push({ q, pos: st.doc.line(i).from, t, st });
@@ -5186,7 +5186,7 @@ function artifactSourcePage(n) {
 async function publishFromPage(p) {
   const n = S.nodes[p.artifactOf] || nodeList().find(x => x.kind === 'artifact' && x.name + '.html' === p.name); if (!n) return toast('This page is not the source of an artifact.');
   syncBuffers();
-  try { const r = await artPublish(n, { html: p.text || '' }); toast(`${n.name}: version ${r.version.slice(0, 8)} published`); updateTitle(n); artMount(n, live[n.id]); }
+  try { const r = await artPublish(n, { html: await pageTextFull(p) }); toast(`${n.name}: version ${r.version.slice(0, 8)} published`); updateTitle(n); artMount(n, live[n.id]); }
   catch (e) { toast('Publish failed: ' + (e.message || e)); }
 }
 async function artifactVersions(n) {
@@ -5746,6 +5746,14 @@ function frUnmount(id) {
   // Only an Edwin frame: an artifact or web card keeps its iframe in the same field.
   if (L.frame && FR.byFrame.has(L.frame)) { FR.byFrame.delete(L.frame); L.frame.destroy(); L.frame = null; }
   FR.lastSeen.delete(id); FR.offAt.delete(id);
+  // The card is going away (deleted, or adopted by another tab): its replica is closed too, unless the Editor
+  // view or another card still shows the buffer, so edwind stops sending its edits and the runtime drops it.
+  const b = L.buf;
+  if (b) {
+    L.buf = null;
+    const used = (ED.frame && ED.frame.buffer === b) || Object.entries(live).some(([k, M]) => k !== id && M.buf === b);
+    if (!used) { if (b.meta?.anchors) FR.anchorCache[id] = b.meta.anchors.map(a => ({ ...a })); try { if (b.shared) FR.L.call('kill-buffer', [b]); } catch (e) { console.warn('edwin close', e); } }
+  }
 }
 const frBufOf = n => { const b = live[n.id]?.buf; return b && b.shared && b.sver >= 0 ? b : null; };
 // The replica of N, opened if needed (create: the page's file is recreated when it went missing on disk).
@@ -6020,6 +6028,13 @@ async function pageSetText(n, text) {
 }
 // Exposed for the UI suite and debugging: the page's text in either mode, and the live frames count and timing.
 function pageTextById(id) { const n = S?.nodes[id]; return n ? pageText(n) : ''; }
+// The whole text of a page for an export or a publish: the replica is opened when it is closed (pageText would
+// give the snapshot's first lines then); CodeMirror pages and unmigrated pages answer at once.
+async function pageTextFull(n) {
+  if (live[n.id]?.view) return live[n.id].view.state.doc.toString();
+  if (FR.on && n.buf) { const b = await frWhenBuf(n); if (b) return b.text; }
+  return pageText(n);
+}
 window.__perf = Object.assign(window.__perf || {}, {
   frame: {
     get samples() { return FR.perf.slice(); }, get count() { return FR.perf.length; },
