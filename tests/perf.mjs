@@ -1,10 +1,13 @@
 // End-to-end walk with event timing (the frontend's profile, next to ui.mjs's correctness checks).
 //
-//   WB_PLAYWRIGHT=<playwright>/index.mjs WB_HARNESS=tests/harness.py node tests/perf.mjs <web-root> [--json FILE] [--profiles DIR] [--cards N]
+//   WB_PLAYWRIGHT=<playwright>/index.mjs WB_HARNESS=tests/harness.py node tests/perf.mjs <web-root> [--json FILE] [--profiles DIR] [--cards N] [--pages M]
 //
 // --profiles DIR writes each scenario's CPU profile as DIR/<n>-<scenario>.cpuprofile (open it in DevTools' Performance panel).
+// --cards N adds N cards to the board (default 120); --pages M makes M of them pages and the rest cheap cards (scripted
+// terminals and sketches), so `--cards 133 --pages 33` with the seed's 6 pages and perf-page is the 140-card, 40-page
+// board of the budgets (spec §16.5). Without --pages every added card is a page, as before.
 //
-// It starts the harness (wb-hub, wb-web, Caddy), joins the browser to Caddy's unix socket through a forwarder on
+// It starts the harness (wb-hub, edwind, wb-web, Caddy), joins the browser to Caddy's unix socket through a forwarder on
 // 127.0.0.1:18443 that only this uid may use (as ui.mjs does), and walks the scenarios a working day has: load the
 // board, pan and zoom, drag a card, type into a shell, flood a shell with output, type into a page, search the
 // palette, switch views, and the same pan and zoom again on a board with many cards. Each scenario records:
@@ -24,9 +27,9 @@ import path from 'node:path';
 const { chromium } = await import(process.env.WB_PLAYWRIGHT || 'playwright');
 const args = process.argv.slice(2);
 const opt = (k, d) => { const i = args.indexOf(k); if (i < 0) return d; const v = args[i + 1]; args.splice(i, 2); return v; };
-const JSON_OUT = opt('--json', null), PROFILES = opt('--profiles', null), CARDS = +opt('--cards', 120);
+const JSON_OUT = opt('--json', null), PROFILES = opt('--profiles', null), CARDS = +opt('--cards', 120), PAGES = Math.min(CARDS, +opt('--pages', CARDS));
 const ROOT = args[0] || process.env.WB_WEB_ROOT, HARNESS = process.env.WB_HARNESS;
-if (!ROOT || !HARNESS) { console.error('usage: WB_PLAYWRIGHT=… WB_HARNESS=tests/harness.py node tests/perf.mjs <web-root> [--json FILE] [--profiles DIR] [--cards N]'); process.exit(2); }
+if (!ROOT || !HARNESS) { console.error('usage: WB_PLAYWRIGHT=… WB_HARNESS=tests/harness.py node tests/perf.mjs <web-root> [--json FILE] [--profiles DIR] [--cards N] [--pages M]'); process.exit(2); }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const until = async (f, ms = 10000, step = 100) => { const end = Date.now() + ms; for (;;) { let v; try { v = await f(); } catch {} if (v || Date.now() > end) return v; await sleep(step); } };
 const fails = [];
@@ -35,7 +38,8 @@ const check = (name, ok, info = '') => { console.log((ok ? 'ok   ' : 'FAIL ') + 
 // ---------------- the harness and the forwarder (ui.mjs's daemon phase)
 const PORT = 18443, ORIGIN = `http://127.0.0.1:${PORT}`;
 const { WB_HARNESS_TCP, ...harnessEnv } = process.env;
-const harness = spawn('python3', ['-I', HARNESS, '--web-root', ROOT], { stdio: ['pipe', 'pipe', 'pipe'], env: harnessEnv });
+const FRAMES = process.env.WB_FRAMES === '1';   // pages as Edwin frames (web.json frames: true)
+const harness = spawn('python3', ['-I', HARNESS, '--web-root', ROOT, ...(FRAMES ? ['--frames'] : [])], { stdio: ['pipe', 'pipe', 'pipe'], env: harnessEnv });
 let hlog = ''; harness.stderr.on('data', d => { hlog += d; });
 const H = await new Promise((res, rej) => {
   let out = ''; harness.stdout.on('data', d => { out += d; const i = out.indexOf('\n'); if (i >= 0) try { res(JSON.parse(out.slice(0, i))); } catch (e) { rej(e); } });
@@ -203,8 +207,16 @@ try {
   });
 
   // ---- many cards
-  await scenario(`add ${CARDS} pages`, async () => {
-    await C(N => { const C_ = window.__canvas; for (let i = 0; i < N; i++) C_.addNode({ kind: 'buffer', name: 'bulk' + i, x: 2000 + (i % 12) * 440, y: 200 + Math.floor(i / 12) * 340, w: 400, h: 300, text: `# bulk ${i}\n- see [[bulk${(i + 1) % N}]]\n` + 'filler text '.repeat(40) }); }, CARDS);
+  await scenario(PAGES === CARDS ? `add ${CARDS} pages` : `add ${CARDS} cards (${PAGES} pages)`, async () => {
+    await C(([N, M]) => {
+      const C_ = window.__canvas;
+      for (let i = 0; i < N; i++) {
+        const at = { name: 'bulk' + i, x: 2000 + (i % 12) * 440, y: 200 + Math.floor(i / 12) * 340, w: 400, h: 300 };
+        if (i < M) C_.addNode({ kind: 'buffer', ...at, text: `# bulk ${i}\n- see [[bulk${(i + 1) % M}]]\n` + 'filler text '.repeat(40) });
+        else if (i % 2) C_.addNode({ kind: 'sketch', ...at });
+        else C_.addNode({ kind: 'term', backend: 'fake', env: {}, ...at });
+      }
+    }, [CARDS, PAGES]);
   });
   await C(() => window.__canvas.fitAll()); await sleep(800);
   await scenario(`pan and zoom with ${CARDS} more cards`, async () => {
@@ -233,7 +245,7 @@ try {
   check('the reload keeps every card', await C(N => Object.values(window.__canvas.S.nodes).filter(n => /^bulk\d+$/.test(n.name)).length === N, CARDS));
   check('no page error during the walk', !errors.length, JSON.stringify(errors.slice(0, 5)));
 } finally {
-  if (JSON_OUT) fs.writeFileSync(JSON_OUT, JSON.stringify({ when: new Date().toISOString(), cards: CARDS, results, errors, http }, null, 1));
+  if (JSON_OUT) fs.writeFileSync(JSON_OUT, JSON.stringify({ when: new Date().toISOString(), cards: CARDS, pages: PAGES, results, errors, http }, null, 1));
   await browser.close(); harness.stdin.end(); fwd.close();
 }
 console.log(`\nFAILS: ${JSON.stringify(fails)}`);

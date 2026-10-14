@@ -11,8 +11,8 @@ use axum::response::Response;
 
 use crate::http::{ApiError, no_store, not_found};
 use crate::{
-    AppState, artifacts, auth, board, fsapi, host, info, notes, relay_acp, relay_pty, rpc,
-    static_files,
+    AppState, artifacts, auth, board, fsapi, host, info, notes, relay_acp, relay_edit, relay_pty,
+    rpc, static_files,
 };
 
 /// Request bodies outside the routes that set their own limit.
@@ -33,6 +33,7 @@ pub fn app(state: AppState) -> Router {
         .nest("/api", api)
         .merge(relay_pty::routes())
         .merge(relay_acp::routes())
+        .merge(relay_edit::routes())
         .merge(rpc::routes())
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(static_files::serve)

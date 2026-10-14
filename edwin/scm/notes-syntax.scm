@@ -8,11 +8,49 @@
 ;;; Both formats share the grammar. A Markdown heading is `# text`, an Org heading `* text`; the parser picks
 ;;; the heading regexp by the file's extension and applies everything else to both.
 
-;; Task keywords. The first seven are the user's Org set (org.scm); DOING, NOW and LATER are read as aliases
-;; (DOING and NOW act as NEXT, LATER as TODO) so pages written in the Logseq style index as tasks too.
-(define notes-task-keywords
-  '("TODO" "NEXT" "WAITING" "HOLD" "SOMEDAY" "DONE" "CANCELLED" "DOING" "NOW" "LATER"))
-(define notes-done-keywords '("DONE" "CANCELLED"))
+;; Task keywords: the one table shared by Org (org.scm reads org-todo-keywords from it), markdown-mode
+;; (edwin/src/markdown.js reads notes-task-keywords and notes-done-keywords) and the notes index. An entry is
+;; (KEYWORD SELECTION DONE? ALIAS-OF): SELECTION is the Org fast-selection key with its logging flags
+;; ("w@/!"), or #f for a keyword Org does not offer; DONE? marks a done state; ALIAS-OF names the keyword an
+;; alias stands for. The first seven are the user's Org set; DOING, NOW and LATER are read as aliases (DOING
+;; and NOW act as NEXT, LATER as TODO) so pages written in the Logseq style index as tasks too.
+;; Change the table with notes-set-task-keywords!, which updates every derived list and Org's keywords at once.
+(define notes-task-keyword-table
+  '(("TODO" "t" #f #f) ("NEXT" "n" #f #f) ("WAITING" "w@/!" #f #f) ("HOLD" "h@/!" #f #f) ("SOMEDAY" "s" #f #f)
+    ("DONE" "d!" #t #f) ("CANCELLED" "c@/!" #t #f)
+    ("DOING" #f #f "NEXT") ("NOW" #f #f "NEXT") ("LATER" #f #f "TODO")))
+(define (notes-task-entry-keyword e) (car e))
+(define (notes-task-entry-done? e) (and (pair? (cddr e)) (caddr e)))
+(define (notes-task-entry-alias e) (and (pair? (cddr e)) (pair? (cdddr e)) (cadddr e)))
+(define (notes-task-entry-selection e) (and (pair? (cdr e)) (cadr e)))
+(define (notes-table-keywords table) (map notes-task-entry-keyword table))
+(define (notes-table-done table)
+  (map notes-task-entry-keyword (filter notes-task-entry-done? table)))
+;; The flat lists the parsers read: every keyword in table order, and the done ones.
+(define notes-task-keywords (notes-table-keywords notes-task-keyword-table))
+(define notes-done-keywords (notes-table-done notes-task-keyword-table))
+;; The keyword an alias stands for (DOING -> NEXT), or the keyword itself.
+(define (notes-task-keyword-base kw)
+  (let ((e (assoc kw notes-task-keyword-table)))
+    (or (and e (notes-task-entry-alias e)) kw)))
+;; Org's org-todo-keywords value built from TABLE (the shared table by default): the entries that carry a
+;; selection key, open states first, then "|", then the done states, each as "KEYWORD(selection)".
+(define (notes-org-todo-keywords . table)
+  (let* ((table (if (pair? table) (car table) notes-task-keyword-table))
+         (own (filter (lambda (e) (and (notes-task-entry-selection e) (not (notes-task-entry-alias e)))) table))
+         (name (lambda (e) (string-append (notes-task-entry-keyword e) "(" (notes-task-entry-selection e) ")"))))
+    (list (cons 'sequence
+                (append (map name (filter (lambda (e) (not (notes-task-entry-done? e))) own))
+                        (list "|")
+                        (map name (filter notes-task-entry-done? own)))))))
+;; Replace the shared table: the flat lists change for markdown-mode and the index, and org-todo-keywords
+;; (when Org is loaded) for Org, so one change reaches both modes.
+(define (notes-set-task-keywords! table)
+  (set! notes-task-keyword-table table)
+  (set! notes-task-keywords (notes-table-keywords table))
+  (set! notes-done-keywords (notes-table-done table))
+  (when (bound? 'org-todo-keywords) (set! org-todo-keywords (notes-org-todo-keywords table)))
+  table)
 
 ;; [[target]], [[target|label]] (Markdown) and [[target][label]] (Org). Group 1 is the target, group 2 or 3
 ;; the label. A target may carry `#Heading` or `#^anchor`; `id:`, `file:` and URL schemes name other kinds.
@@ -78,6 +116,8 @@
 
 (define (notes-grammar)
   "The notes grammar as an alist of name -> regexp source string or keyword list."
+  ;; The flat keyword lists are what the index serialises (its golden test fixes these keys); the table they
+  ;; come from is notes-task-keyword-table.
   (list (cons 'task-keywords notes-task-keywords)
         (cons 'done-keywords notes-done-keywords)
         (cons 'wiki-link notes-wiki-link-regexp)

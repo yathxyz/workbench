@@ -1,6 +1,8 @@
 //! `GET /api/info`, `/api/sessions`, `/api/status` and `/api/pty/{id}/capture` (design
 //! §3.5.5, 20 §5.6). `sample`, `models` and `notesExists` in `/api/info` and the `edit`
-//! block of `/api/status` come from edwind's `status` command (edwind spec R15.11).
+//! block of `/api/status` come from edwind's `status` command (edwind spec R15.11);
+//! `edit` and `editUp` in `/api/info` say whether frames are on and edwind is reachable
+//! (R9.20).
 //! Paths are relative to `/api`.
 
 use std::collections::BTreeMap;
@@ -17,6 +19,7 @@ use wb_proto::limits::CAPTURE_MAX;
 use wb_proto::state::derive;
 
 use crate::AppState;
+use crate::edit_client::EditHandle;
 use crate::http::{ApiError, ApiQuery, Param};
 use crate::hub::{CallError, HubStatus, with_state};
 use crate::util::sanitize_sid;
@@ -66,6 +69,8 @@ async fn info(State(app): State<AppState>) -> Json<Value> {
     Json(json!({
         "host": app.cfg.host,
         "home": std::env::var("HOME").ok(),
+        "edit": frames_on(&app),
+        "editUp": app.edit.as_ref().is_some_and(EditHandle::is_up),
         "sample": sample::enabled(&app).await,
         "models": edit.as_ref().map_or(json!({}), |s| match &s["models"] {
             Value::Object(models) => Value::Object(models.clone()),
@@ -82,6 +87,13 @@ async fn info(State(app): State<AppState>) -> Json<Value> {
         "defaultShell": default_shell,
         "hub": hub,
     }))
+}
+
+/// Frames are on (R9.20): `frames` in `web.json` and an `editSocket` to serve them
+/// over. Without the socket `/edit` could only close with 1013, so the flag alone does
+/// not switch the board editor.
+fn frames_on(app: &AppState) -> bool {
+    app.cfg.frames.unwrap_or(false) && app.cfg.edit_socket.is_some()
 }
 
 /// 503 unless the hub is up.

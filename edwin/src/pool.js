@@ -304,7 +304,7 @@ function workerMain(self, limits) {
 const mainG = { Scheme: S };
 codecModule(mainG);
 const codec = mainG.EdCodec;
-const bufferById = id => E.buffers.find(b => b.id === id) || (E.minibuf.id === id ? E.minibuf : null);
+const bufferById = id => E.buffers.find(b => b.id === id) || Ed.allMinibufs().find(m => m.id === id) || null;
 codec.hooks.buffer = h => bufferById(h.id) || false;
 
 const canWorkers = nodeHost ? nodeHost.workers !== false && !!nodeHost.jobs && !!Ed.LEX_SOURCE
@@ -536,7 +536,7 @@ function runLocally(job, fn) {
 let scheduled = false;
 function schedule() { if (scheduled) return; scheduled = true; queueMicrotask(() => { scheduled = false; runSchedule(); }); }
 function sweepKilled() {
-  const live = new Set(E.buffers.map(b => b.id)); live.add(E.minibuf.id);
+  const live = new Set(E.buffers.map(b => b.id)); for (const m of Ed.allMinibufs()) live.add(m.id);
   for (const s of slots) { if (!s || !s.w) continue; for (const id of [...s.mirrors.keys()]) if (!live.has(id)) { s.mirrors.delete(id); try { s.w.postMessage({ t: 'drop', id }); } catch (e) { /* dying */ } } }
   return live;
 }

@@ -6,6 +6,7 @@
 import { createRequire } from 'node:module';
 import { ProtoError } from './proto.mjs';
 import { randomId } from './journal.mjs';
+import { afterOps as anchorsAfterOps, snapshot as anchorsSnapshot } from './anchors.mjs';
 
 const require = createRequire(import.meta.url);
 const OT = require('../src/ot.js');
@@ -57,6 +58,7 @@ export class Sequencer {
     const text = sb.ed.rope.toString();
     try { OT.apply(text, ops); } catch (e) { throw new ProtoError('bad_edit', e.message); }
     const len = sb.ed.rope.length;
+    const anchorsBefore = anchorsSnapshot(sb);
     Ed.withOrigin(originOf(by), () => {
       const save = Ed.E.inhibitRO; Ed.E.inhibitRO = true;
       try { for (const [pos, del, ins] of ops) Ed.editText(sb.ed, pos, del.length, ins); }
@@ -64,6 +66,8 @@ export class Sequencer {
     });
     sb.ver++;
     const entry = { ver: sb.ver, cid, seq, by, ops, undo: undo || undefined, at: Date.now(), len, bytes: JSON.stringify(ops).length };
+    /* The shared anchors follow the batch (R9.12); the copy lets a failed journal line roll them back. */
+    if (anchorsBefore) { entry.anchorsBefore = anchorsBefore; anchorsAfterOps(sb, ops, by); }
     /* The clients attached now get this batch as edits once it is journaled; one that opens in between gets
        it from the replay instead (open{since} reads the history), so nobody sees it twice. */
     entry.recipients = [...sb.clients];
@@ -83,9 +87,11 @@ export class Sequencer {
     const before = OT.apply(after, OT.invert(ops));
     ops = OT.toOps(OT.fromOps(ops, before.length), before);
     const len = before.length;
+    const anchorsBefore = anchorsSnapshot(sb);
     sb.ver++;
     /* One undo group per flush, so undo, undo-global and undo-writer can take a thread's batch back (R6.19). */
     const entry = { ver: sb.ver, cid: by.cid || null, seq: null, by, ops, undo: { g: 'thread-' + sb.ver + '-' + randomId(4) }, at: Date.now(), len, bytes: JSON.stringify(ops).length };
+    if (anchorsBefore) { entry.anchorsBefore = anchorsBefore; anchorsAfterOps(sb, ops, by); }
     entry.recipients = [...sb.clients];
     sb.hist.push(entry); sb.histBytes += entry.bytes;
     this.trim(sb);
@@ -138,6 +144,7 @@ export class Sequencer {
     });
     sb.hist.pop(); sb.histBytes -= entry.bytes; sb.ver--;
     if (entry.cid !== null && entry.seq !== null) { const m = sb.seqIndex.get(entry.cid); if (m) { m.delete(entry.seq); if (!m.size) sb.seqIndex.delete(entry.cid); } }
+    if (entry.anchorsBefore) { sb.anchors = entry.anchorsBefore; sb.anchorsDirty = false; delete entry.anchorsBefore; }
     sb.touched();
   }
 
@@ -167,6 +174,7 @@ export class Sequencer {
       }
       if (sb.journal.needsCompaction()) sb.owner.compactSoon(sb);
     }
+    delete entry.anchorsBefore;
     if (sender) sender.send(h === undefined ? { t: 'ack', buf: sb.id, seq: entry.seq, ver: entry.ver } : { t: 'ack', buf: sb.id, seq: entry.seq, ver: entry.ver, h });
     const edits = { t: 'edits', buf: sb.id, ver: entry.ver, ops: entry.ops, by: entry.by };
     if (h !== undefined) edits.h = h;

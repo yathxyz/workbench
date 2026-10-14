@@ -98,14 +98,15 @@ const isLisp = b => b.mode === 'scheme-mode' || b.mode === 'scheme-interaction-m
    then skipped, and everything else runs as in the page. */
 const E = {
   headless: !!host.headless, host, frames: [], frame: null,
-  buffers: [], win: null, current: null, minibuf: new Buffer(' *Minibuf-1*'),
-  mini: null, miniFlash: '', history: [], echo: '', pendingKeys: '', prompt: null,
+  buffers: [], win: null, current: null,
+  history: [], pendingKeys: '',
   prefixArg: null, keepPrefix: false, uArg: false, uDigits: null, depth: 0,
   lastCommand: false, thisCommand: false, thisKeys: '', killRing: [], killIdx: 0,
-  isearch: null, lastSearch: '', goalCol: null, recenter: null,
-  inhibitRO: false, pasteText: '', timers: new Map(), focused: false, suppressUndo: false, noUndo: false,
+  isearch: null, lastSearch: '', goalCol: null, cmdSeq: 0,
+  inhibitRO: false, pasteText: '', timers: new Map(), suppressUndo: false, noUndo: false,
 };
-E.minibuf.mode = 'minibuffer-mode';
+/* The minibuffer, the echo area and the window tree are per frame (R9.2): E.minibuf, E.mini, E.echo,
+   E.root, E.sel and the rest are accessors onto the selected frame (below, after Window). */
 
 function getBuffer(name) { return E.buffers.find(b => b.name === name) || null; }
 function getBufferCreate(name) {
@@ -130,10 +131,37 @@ class Window {
   get __type() { return 'window'; }
 }
 class Split { constructor(dir, children) { this.dir = dir; this.children = children; this.parent = null; this.el = null; for (const c of children) c.parent = this; } }
-E.root = null; E.sel = null; E.winHistory = []; E.winFuture = [];
+/* The per-frame state (R9.2): a window tree (wroot, sel, the winner history), a minibuffer with its
+   echo area, prompt and flash, and whether the frame has the keyboard. A Frame (below) adds the page
+   parts. With no frame (headless: edwind, the tests, a served runtime before its first card) the
+   implicit state E.implicit holds one window tree, so the core works unchanged. */
+class FrameState {
+  constructor() {
+    this.wroot = null; this.sel = null; this.winHistory = []; this.winFuture = [];
+    this.minibuf = new Buffer(' *Minibuf-1*'); this.minibuf.mode = 'minibuffer-mode'; this.minibuf.minibuf = true;
+    this.mini = null; this.miniFlash = ''; this.echo = ''; this.prompt = null; this.focused = false;
+    this.restoreScroll = false; this.recenter = null;
+  }
+}
+E.implicit = new FrameState();
+/* The frame the core is working on: the one being drawn (render swaps it in), else the selected one,
+   else the implicit state. E.root, E.sel, E.mini, E.minibuf, E.echo and the rest read and write it. */
+let rendering = null;
+const FS = () => rendering || E.frame || E.implicit;
+for (const [k, f] of [['root', 'wroot'], ['sel', 'sel'], ['winHistory', 'winHistory'], ['winFuture', 'winFuture'], ['mini', 'mini'], ['minibuf', 'minibuf'],
+  ['miniFlash', 'miniFlash'], ['echo', 'echo'], ['prompt', 'prompt'], ['focused', 'focused'], ['restoreScroll', 'restoreScroll'], ['recenter', 'recenter']])
+  Object.defineProperty(E, k, { get() { return FS()[f]; }, set(v) { FS()[f] = v; }, enumerable: true, configurable: true });
 Object.defineProperty(E, 'win', { get() { return E.sel ? E.sel.buffer : null; }, set(b) { if (E.sel) E.sel.buffer = b; } });
 function leaves(node, out) { out = out || []; if (!node) return out; if (node instanceof Window) out.push(node); else for (const c of node.children) leaves(c, out); return out; }
 function windowList() { return leaves(E.root); }
+/* Every window of every frame, the implicit tree included. */
+function allWindows() { const out = leaves(E.implicit.wroot); for (const f of E.frames) leaves(f.wroot, out); return out; }
+/* The selected window of the selected frame, whatever frame is being drawn. */
+const selWin = () => (E.frame || E.implicit).sel;
+/* Every minibuffer (one per frame, plus the implicit one). */
+function allMinibufs() { return [E.implicit.minibuf, ...E.frames.map(f => f.minibuf)]; }
+/* Run FN with frame F as the one the accessors read (redisplay of a frame that is not selected). */
+function withFrame(f, fn) { const save = rendering; rendering = f; try { return fn(); } finally { rendering = save; } }
 function selectWindow(w, keepPoint) {
   if (!w || w === E.sel) { if (w) E.current = E.mini ? E.minibuf : w.buffer; return; }
   if (E.sel && E.sel.buffer) { E.sel.pt = E.sel.buffer.pt; }
@@ -225,13 +253,15 @@ function popToBuffer(b, select) {
    area and the input, with the menubar, the completion popup and the snipe boxes. The core never looks
    up page elements itself: it asks the selected frame for a part by name (frame.el), so a page can hold
    several frames. With no frame (headless) nothing is drawn. */
-class Frame {
+class Frame extends FrameState {
   constructor(root, parts) {
+    super();
     this.id = Frame.count = (Frame.count || 0) + 1;
     this.root = root; this.parts = Object.assign(Object.create(null), parts);
+    this.kind = 'console'; this.fontSize = null; this.legacy = true; this.listeners = [];
   }
-  /* The part NAME (frame, menubar, windows, echo, input, corfu, snipe): given at creation, or the element
-     with that id inside the root, or the root itself. Parts made later (the popups) are found once made. */
+  /* The part NAME (frame, menubar, windows, echo, input, corfu, snipe, presence): given at creation, or the
+     element with that id inside the root, or the root itself. Parts made later (the popups) are found once made. */
   el(name) {
     const p = this.parts[name];
     if (p) return p;
@@ -239,25 +269,232 @@ class Frame {
     if (el) this.parts[name] = el;
     return el;
   }
+  /* The buffer of the frame's selected window. */
+  get buffer() { return this.sel ? this.sel.buffer : null; }
+  focus() { const ta = this.el('input'); if (ta && ta.focus) ta.focus({ preventScroll: true }); else { selectFrame(this); this.focused = true; } }
+  blur() { const ta = this.el('input'); if (ta && ta.blur && ta.ownerDocument.activeElement === ta) ta.blur(); else { this.focused = false; frameEvent('blur', this); } }
+  /* Show B in the frame's selected window. */
+  showBuffer(b) { withFrame(this, () => setWindowBuffer(toBuffer(b), this.sel)); if (E.frame === this) E.current = this.mini ? this.minibuf : this.sel.buffer; scheduleRender(); return b; }
+  point() { return E.frame === this ? this.sel.buffer.pt : this.sel.pt; }
+  setPoint(p) { const b = this.sel.buffer; p = Math.max(0, Math.min(b.rope.length, p)); if (E.frame === this) b.pt = p; this.sel.pt = p; scheduleRender(); return p; }
+  /* Pixels from the top of the frame's element to the top of the drawn line holding POS, or null (R9.12). */
+  lineTop(pos) {
+    const w = this.sel; if (!w || !w.view) return null;
+    const ls = bol(w.buffer.rope, Math.max(0, Math.min(w.buffer.rope.length, pos)));
+    const ln = w.view.querySelector(`.ln[data-o="${ls}"]`); if (!ln) return null;
+    const sc = frameScale(this), rr = this.root.getBoundingClientRect(), lr = ln.getBoundingClientRect();
+    return (lr.top - rr.top) / sc;
+  }
+  /* The buffer position under the client point, in this frame (works under a CSS transform, R9.9). */
+  posFromPoint(x, y) { return withFrame(this, () => { const w = windowAt(x, y); return w ? posFromPoint(x, y, w) : null; }); }
+  /* True while the frame's buffer has edits the server has not acknowledged (R9.15). */
+  unacked() { const b = this.buffer; return !!(b && (b.inflight || (b.queue && b.queue.length))); }
+  setFontSize(px) { this.fontSize = px; this.root.style.setProperty('--text-size', px + 'px'); E.metricsGen++; scheduleRender(); }
+  destroy() { deleteFrame(this); }
   __print() { return '#<frame ' + this.id + '>'; }
   get __type() { return 'frame'; }
 }
-function makeFrame(root, parts) {
-  const f = new Frame(root, parts);
-  E.frames.push(f); if (!E.frame) E.frame = f;
+/* Ed.makeFrame(el, {buffer, kind: 'card' | 'console', fontSize}) builds a frame's parts inside EL: the
+   windows, the echo area, the hidden input textarea and the presence layer, with a menubar for a console
+   (R9.2, R9.3). The older form makeFrame(root, parts) takes a page that already holds the parts
+   (edwin/index.html). The window tree starts with one window on BUFFER (else the current buffer). */
+function makeFrame(root, opts) {
+  opts = opts || {};
+  const built = 'kind' in opts || 'buffer' in opts || 'fontSize' in opts;
+  const f = new Frame(root, built ? {} : opts);
+  if (built) buildFrame(f, root, opts);
+  const b = (opts.buffer && toBuffer(opts.buffer)) || E.current || E.buffers[0];
+  f.wroot = f.sel = new Window(b); f.sel.pt = b.pt;
+  E.frames.push(f);
   E.headless = false;
+  if (!E.frame) selectFrame(f);
+  if (built && hooks.wireFrame) hooks.wireFrame(f);
+  if (built) { watchTheme(root); scheduleRender(); }
   return f;
 }
-function selectFrame(f) { if (!(f instanceof Frame) || !E.frames.includes(f)) signal('wrong-type-argument', 'not a live frame', f); E.frame = f; return f; }
+function buildFrame(f, root, opts) {
+  const doc = root.ownerDocument;
+  host.page.addStyle('edwin-frame-style', FRAME_CSS);
+  root.classList.add('edwin-frame', 'unfocused');
+  f.kind = opts.kind === 'card' ? 'card' : 'console'; f.legacy = false;
+  root.dataset.kind = f.kind;
+  const mk = (tag, cls) => { const el = doc.createElement(tag); el.className = cls; root.appendChild(el); return el; };
+  if (f.kind === 'console') {
+    const nav = mk('nav', 'ed-menubar'); nav.setAttribute('aria-label', 'Commands');
+    nav.innerHTML = '<span class="name">Edwin</span><button type="button" data-key="ESC">Esc</button><button type="button" data-cmd="evil-ex">Ex <kbd>:</kbd></button>' +
+      '<button type="button" data-cmd="list-buffers">Buffers <kbd>:ls</kbd></button><button type="button" data-cmd="save-buffer">Save <kbd>:w</kbd></button>' +
+      '<button type="button" data-cmd="evil-undo">Undo <kbd>u</kbd></button><button type="button" data-cmd="evil-help">Keys <kbd>:h</kbd></button>' +
+      '<button type="button" data-cmd="evil-toggle-emacs-state">Vim ⇄ Emacs <kbd>C-z</kbd></button><span class="spacer"></span>';
+    f.parts.menubar = nav;
+  }
+  f.parts.windows = mk('div', 'ed-windows');
+  const echo = mk('div', 'ed-echo'); echo.setAttribute('aria-live', 'polite'); f.parts.echo = echo;
+  const pres = mk('div', 'ed-presence'); f.parts.presence = pres;
+  const ta = mk('textarea', 'ed-input');
+  for (const [k, v] of [['autocapitalize', 'off'], ['autocomplete', 'off'], ['autocorrect', 'off'], ['spellcheck', 'false'], ['aria-label', 'Keyboard input']]) ta.setAttribute(k, v);
+  f.parts.input = ta;
+  f.parts.frame = root;
+  if (opts.fontSize) { f.fontSize = opts.fontSize; root.style.setProperty('--text-size', opts.fontSize + 'px'); }
+}
+/* A change of data-theme on <html> redraws every frame (R9.10); the colours themselves are CSS variables. */
+let themeWatched = false;
+function watchTheme(root) {
+  if (themeWatched) return;
+  const doc = root.ownerDocument, win = doc.defaultView;
+  if (!win || typeof win.MutationObserver !== 'function') return;
+  themeWatched = true;
+  new win.MutationObserver(() => { E.metricsGen++; frameRender(); }).observe(doc.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+}
+/* The CSS scale an ancestor's transform applies to frame F (1 without one): layout pixels are divided by it
+   to place overlays, and measured rectangles are divided by it to get layout pixels (R9.9). */
+function frameScale(f) { const r = f.root; if (!r || !r.offsetWidth) return 1; const w = r.getBoundingClientRect().width; return w > 0 ? w / r.offsetWidth : 1; }
+function selectFrame(f) {
+  if (!(f instanceof Frame) || !E.frames.includes(f)) signal('wrong-type-argument', 'not a live frame', f);
+  if (E.frame === f) return f;
+  const old = E.frame || E.implicit;
+  if (old.sel && old.sel.buffer) old.sel.pt = old.sel.buffer.pt;
+  E.frame = f;
+  if (f.sel && f.sel.buffer) { const b = f.sel.buffer; b.pt = Math.min(f.sel.pt, b.rope.length); E.current = f.mini ? f.minibuf : b; }
+  return f;
+}
 function deleteFrame(f) {
   const i = E.frames.indexOf(f); if (i < 0) return false;
   E.frames.splice(i, 1);
-  if (E.frame === f) E.frame = E.frames[0] || null;
+  for (const w of leaves(f.wroot)) if (w.view && sizeWatch) sizeWatch.unobserve(w.view);
+  for (const [el, type, fn, o] of f.listeners) el.removeEventListener(type, fn, o);
+  f.listeners = [];
+  if (!f.legacy && f.root) { for (const p of Object.values(f.parts)) if (p !== f.root && p.parentNode) p.parentNode.removeChild(p); f.root.classList.remove('edwin-frame', 'unfocused'); delete f.root.dataset.kind; }
+  if (E.frame === f) {
+    E.frame = null;
+    const next = E.frames[0] || null;
+    if (next) selectFrame(next);
+    else { const s = E.implicit.sel; if (s && s.buffer) E.current = E.implicit.mini ? E.implicit.minibuf : s.buffer; }
+  }
   if (!E.frames.length) E.headless = true;
+  frameEvent('blur', f);
   return true;
 }
-/* A part of the selected frame, or null with no frame. */
-const $ = name => (E.frame ? E.frame.el(name) : null);
+/* Ed.onFrameEvent(fn): fn({type, frame, buffer}) for edited, point, focus, blur and status (the page's title,
+   snapshot and status refresh). */
+const frameListeners = [];
+function onFrameEvent(fn) { frameListeners.push(fn); return () => { const i = frameListeners.indexOf(fn); if (i >= 0) frameListeners.splice(i, 1); }; }
+function frameEvent(type, frame, buffer) {
+  if (!frameListeners.length) return;
+  const ev = { type, frame, buffer: buffer || (frame && frame.sel ? frame.sel.buffer : null) };
+  for (const fn of frameListeners.slice()) { try { fn(ev); } catch (e) { console.error(e); } }
+}
+/* A part of the frame being drawn or selected, or null with no frame. */
+const $ = name => { const f = FS(); return f instanceof Frame ? f.el(name) : null; };
+
+/* The stylesheet a built frame needs, injected once per page. Faces are the board's tokens with Edwin's
+   modus values as fallbacks (R9.10); fonts are the page's (R9.11). */
+const FRAME_CSS = `
+.edwin-frame { --ed-bg: var(--panel, #fbf7f0); --ed-fg: var(--fg, #000000); --ed-dim: var(--muted, #595959); --ed-rule: var(--dot, #c4b8ab);
+  --ed-menu-bg: var(--panel-2, #efe9dd); --ed-ml-bg: var(--panel-2, #cab9b2); --ed-ml-inactive: var(--bg, #dfd9cf);
+  --ed-cursor: var(--fg, #000000); --ed-cursor-fg: var(--panel, #fbf7f0); --ed-region: var(--accent-soft, #c2bcb5); --ed-match: var(--accent, #79a8ff); --ed-lazy: var(--accent-soft, #c0efff);
+  --ed-paren: var(--accent-soft, #7fdfcf); --ed-mismatch: #ffa0a0; --ed-hl: color-mix(in srgb, var(--fg, #000) 7%, transparent); --ed-pulse: var(--accent-soft, #ffdfa0);
+  --ed-kw: var(--syn-keyword, #531ab6); --ed-fn: var(--syn-fnname, #721045); --ed-st: var(--syn-string, #3548cf); --ed-dc: var(--syn-docstring, #2a5045); --ed-cm: var(--syn-comment, #7f0000); --ed-co: var(--syn-constant, #0000b0); --ed-pa: var(--muted, #7f7f7f);
+  --ed-rb0: var(--syn-keyword, #0000b0); --ed-rb1: var(--syn-comment, #a60000); --ed-rb2: var(--syn-type, #006800); --ed-rb3: var(--syn-variable, #884900); --ed-rb4: var(--syn-builtin, #721045); --ed-rb5: var(--syn-string, #005e8b);
+  --ed-font: var(--mono, var(--font-mono, "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace)); --ed-font-ui: var(--sans, var(--font-ui, system-ui, sans-serif));
+  display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; background: var(--ed-bg); color: var(--ed-fg); font-family: var(--ed-font); box-sizing: border-box; }
+.edwin-frame[data-kind="console"] { height: 100%; border: 1px solid var(--ed-rule); border-radius: 6px; overflow: hidden; }
+.edwin-frame[data-kind="card"] { background: transparent; }
+.edwin-frame { --md-heading: var(--syn-keyword, var(--ed-kw)); --md-code: var(--syn-string, var(--ed-st)); --md-link: var(--syn-fnname, var(--ed-fn)); --md-ref: var(--syn-constant, var(--ed-co)); --md-field: var(--syn-variable, var(--ed-rb3)); --md-table: var(--syn-type, var(--ed-rb2));
+  --md-task-todo: var(--syn-keyword, var(--ed-kw)); --md-task-next: var(--syn-fnname, var(--ed-fn)); --md-task-waiting: var(--syn-type, var(--ed-rb2)); --md-task-done: var(--muted, var(--ed-dim)); --md-priority: var(--syn-constant, var(--ed-co));
+  --md-markup: var(--muted, var(--ed-dim)); --md-quote: var(--muted, var(--ed-dim)); --md-list: var(--syn-keyword, var(--ed-kw)); --md-tag: var(--syn-constant, var(--ed-co)); --md-date: var(--syn-constant, var(--ed-co)); --md-checkbox: var(--syn-constant, var(--ed-co)); --md-image: var(--syn-docstring, var(--ed-dc)); --md-anchor: var(--muted, var(--ed-dim)); }
+.edwin-frame .ed-menubar { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; padding: 4px 8px; background: var(--ed-menu-bg); border-bottom: 1px solid var(--ed-rule); font-family: var(--ed-font-ui); font-size: 13px; color: var(--ed-dim); }
+.edwin-frame .ed-menubar .name { font-weight: 600; letter-spacing: 0.04em; color: var(--ed-fg); margin-right: 6px; }
+.edwin-frame .ed-menubar button { font: inherit; color: inherit; background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 2px 8px; cursor: pointer; display: inline-flex; gap: 6px; align-items: baseline; }
+.edwin-frame .ed-menubar button:hover { background: var(--ed-bg); border-color: var(--ed-rule); }
+.edwin-frame .ed-menubar kbd { font-family: var(--ed-font); font-size: 11px; color: var(--ed-dim); }
+.edwin-frame .ed-menubar .spacer { flex: 1; }
+.edwin-frame .ed-windows { flex: 1; min-height: 0; display: flex; flex-direction: column; min-width: 0; }
+.edwin-frame .ed-windows > * { flex: 1; min-height: 0; min-width: 0; }
+.edwin-frame .split { display: flex; min-height: 0; min-width: 0; }
+.edwin-frame .split.v { flex-direction: column; }
+.edwin-frame .split.h { flex-direction: row; }
+.edwin-frame .split > * { flex: 1; min-height: 0; min-width: 0; }
+.edwin-frame .split.h > * + * { border-left: 1px solid var(--ed-rule); }
+.edwin-frame .win { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.edwin-frame .text { flex: 1; min-height: 0; overflow: hidden; position: relative; margin: 0; padding: 6px 10px 6px 12px; font-size: var(--text-size, 14px); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 8; cursor: text; user-select: none; -webkit-user-select: none; }
+.edwin-frame .text.nowrap { white-space: pre; overflow-x: auto; overflow-wrap: normal; }
+.edwin-frame .text.nowrap .ln { width: max-content; min-width: 100%; }
+.edwin-frame .ln { min-height: 1.5em; }
+.edwin-frame .win.selected .ln.cl { background: var(--ed-hl); }
+.edwin-frame .text.numbers .ln { position: relative; padding-left: calc(var(--gw, 2) * 1ch + 2ch); }
+.edwin-frame .text.numbers .ln::before { content: attr(data-n); position: absolute; left: 0; width: calc(var(--gw, 2) * 1ch); text-align: right; color: var(--ed-dim); font-variant-numeric: tabular-nums; }
+.edwin-frame .text.numbers .ln.cl::before { color: var(--ed-fg); font-weight: 500; }
+.edwin-frame .rg { background: var(--ed-region); }
+.edwin-frame .lz { background: var(--ed-lazy); }
+.edwin-frame .im { background: var(--ed-match); }
+.edwin-frame .pm { background: var(--ed-paren); }
+.edwin-frame .px { background: var(--ed-mismatch); }
+.edwin-frame .cur { background: var(--ed-cursor); color: var(--ed-cursor-fg) !important; border-radius: 1px; }
+.edwin-frame .cur.bar { background: transparent; color: inherit !important; box-shadow: inset 2px 0 0 var(--ed-cursor); border-radius: 0; }
+.edwin-frame .cur.hbar { background: transparent; color: inherit !important; box-shadow: inset 0 -3px 0 var(--ed-cursor); border-radius: 0; }
+.edwin-frame .cur.half { background: linear-gradient(transparent 55%, var(--ed-cursor) 55%); color: inherit !important; }
+.edwin-frame .cur.ghost, .edwin-frame.unfocused .text .cur { background: transparent; color: inherit !important; box-shadow: inset 0 0 0 1.5px var(--ed-cursor); }
+:root[data-evil-state="insert"] .edwin-frame:not(.unfocused) .win.selected .cur { --ed-cursor: var(--syn-type, #006800); }
+:root[data-evil-state="emacs"] .edwin-frame:not(.unfocused) .win.selected .cur { --ed-cursor: var(--accent, #005e8b); --ed-cursor-fg: #ffffff; }
+:root[data-evil-state="visual"] .edwin-frame:not(.unfocused) .win.selected .cur { --ed-cursor: var(--syn-variable, #884900); background: transparent; color: inherit !important; box-shadow: inset 0 0 0 1.5px var(--ed-cursor); }
+:root[data-evil-state="replace"] .edwin-frame:not(.unfocused) .win.selected .cur { --ed-cursor: var(--syn-comment, #a60000); }
+.edwin-frame .kw { color: var(--ed-kw); font-weight: 500; }
+.edwin-frame .fn { color: var(--ed-fn); font-weight: 500; }
+.edwin-frame .st { color: var(--ed-st); }
+.edwin-frame .dc { color: var(--ed-dc); font-style: italic; }
+.edwin-frame .cm { color: var(--ed-cm); font-style: italic; }
+.edwin-frame .co, .edwin-frame .nu, .edwin-frame .qu { color: var(--ed-co); }
+.edwin-frame .pa { color: var(--ed-pa); }
+.edwin-frame .pa.d0 { color: var(--ed-rb0); } .edwin-frame .pa.d1 { color: var(--ed-rb1); } .edwin-frame .pa.d2 { color: var(--ed-rb2); } .edwin-frame .pa.d3 { color: var(--ed-rb3); } .edwin-frame .pa.d4 { color: var(--ed-rb4); } .edwin-frame .pa.d5 { color: var(--ed-rb5); }
+.edwin-frame .avy { background: var(--syn-variable, #ffc000); color: var(--panel, #000000); font-weight: 700; border-radius: 2px; }
+.edwin-frame .ln.pulse { animation: edwin-pulse 0.45s ease-out; }
+@keyframes edwin-pulse { from { background: var(--ed-pulse); } to { background: transparent; } }
+.edwin-frame .text.centered .ln { max-width: calc(var(--center-cols, 100) * 1ch); margin-inline: auto; }
+.edwin-frame .modeline { display: flex; gap: 0 2ch; flex-wrap: wrap; align-items: center; padding: 2px 10px 2px 2px; background: var(--ed-ml-bg); color: var(--ed-fg); font-size: 13px; line-height: 1.5; white-space: pre; font-variant-numeric: tabular-nums; border-top: 1px solid var(--ed-rule); }
+.edwin-frame .ml-tag { font-family: var(--ed-font-ui); font-weight: 600; font-size: 12px; letter-spacing: 0.08em; padding: 0 8px; border-radius: 3px; background: var(--accent, #3548cf); color: var(--panel, #ffffff); margin-left: 2px; }
+.edwin-frame .ml-tag[data-state="insert"] { background: var(--syn-type, #006800); }
+.edwin-frame .ml-tag[data-state="visual"] { background: var(--syn-variable, #884900); }
+.edwin-frame .ml-tag[data-state="replace"] { background: var(--syn-comment, #a60000); }
+.edwin-frame .ml-tag[data-state="operator"] { background: var(--muted, #595959); }
+.edwin-frame .ml-tag[data-state="motion"] { background: var(--syn-string, #005e8b); }
+.edwin-frame .ml-tag[data-state="emacs"] { background: var(--syn-constant, #531ab6); }
+.edwin-frame .ml-state { color: var(--ed-dim); margin-left: 8px; }
+.edwin-frame .ml-name { font-weight: 600; }
+.edwin-frame .ml-pos, .edwin-frame .ml-mode { color: var(--ed-dim); }
+.edwin-frame .ml-extra { color: var(--syn-comment, #a60000); font-weight: 500; }
+.edwin-frame .ml-sync { color: var(--syn-comment, #a60000); font-weight: 600; }
+.edwin-frame .ml-cmd { margin-left: auto; color: var(--ed-fg); font-weight: 500; min-width: 6ch; text-align: right; }
+.edwin-frame .win:not(.selected) .modeline { background: var(--ed-ml-inactive); color: var(--ed-dim); }
+.edwin-frame .win:not(.selected) .ml-tag { opacity: 0.55; }
+.edwin-frame.unfocused .modeline { opacity: 0.85; }
+.edwin-frame.bell .win.selected .modeline { animation: edwin-bell 0.18s ease-out; }
+@keyframes edwin-bell { from { background: var(--syn-comment, #a60000); color: #fff; } }
+.edwin-frame .ed-echo { min-height: 1.5em; padding: 3px 10px 5px; font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ed-fg); max-height: 50%; overflow-y: auto; flex-shrink: 0; }
+.edwin-frame .ed-echo .prompt { color: var(--ed-fn); font-weight: 500; }
+.edwin-frame .ed-echo .miniline { display: flex; align-items: baseline; gap: 0; }
+.edwin-frame .ed-echo .mb { flex: 1; min-width: 0; }
+.edwin-frame .ed-echo .cc { color: var(--ed-dim); min-width: 7ch; font-variant-numeric: tabular-nums; }
+.edwin-frame .ed-echo .flash { color: var(--ed-co); margin-left: 1ch; }
+.edwin-frame .ed-echo .cands { display: flex; flex-direction: column; margin-top: 3px; border-top: 1px solid var(--ed-rule); padding-top: 3px; }
+.edwin-frame .ed-echo .cand, .edwin-frame .corfu .cand { display: flex; gap: 2ch; padding: 0 6px; border-radius: 3px; white-space: pre; overflow: hidden; }
+.edwin-frame .ed-echo .cand .cl { flex: 0 0 auto; min-width: 24ch; }
+.edwin-frame .ed-echo .cand .cl b, .edwin-frame .corfu .cand .cl b { color: var(--ed-co); font-weight: 600; }
+.edwin-frame .ed-echo .cand .ca, .edwin-frame .corfu .cand .ca { color: var(--ed-dim); overflow: hidden; text-overflow: ellipsis; }
+.edwin-frame .corfu .cand .ca { margin-left: auto; }
+.edwin-frame .ed-echo .cand.sel, .edwin-frame .corfu .cand.sel { background: var(--ed-region); }
+.edwin-frame .ed-echo .wkp { color: var(--ed-dim); margin-right: 2ch; }
+.edwin-frame .ed-echo .wk { display: inline-flex; gap: 0.75ch; margin-right: 2.5ch; white-space: nowrap; }
+.edwin-frame .ed-echo .wk kbd { font-family: var(--ed-font); color: var(--ed-kw); font-weight: 600; }
+.edwin-frame .corfu { position: absolute; z-index: 5; background: var(--ed-bg); border: 1px solid var(--ed-rule); border-radius: 4px; box-shadow: 0 8px 24px -12px rgb(20 24 36 / 0.5); font-size: 13px; line-height: 1.5; padding: 3px; max-width: min(60ch, 90%); min-width: 20ch; }
+.edwin-frame .snipe { position: absolute; inset: 0; pointer-events: none; z-index: 4; }
+.edwin-frame .snipe div { position: absolute; background: var(--syn-variable, #ffc000); opacity: 0.45; border-radius: 2px; }
+.edwin-frame .ed-presence { position: absolute; inset: 0; pointer-events: none; z-index: 3; overflow: hidden; }
+.edwin-frame .ed-presence .pc { position: absolute; width: 2px; border-radius: 1px; }
+.edwin-frame .ed-presence .pc span { position: absolute; left: 0; bottom: 100%; font: 10px var(--ed-font-ui); line-height: 1.3; padding: 0 4px; border-radius: 3px 3px 3px 0; color: #fff; white-space: nowrap; }
+.edwin-frame .ed-presence .pr { position: absolute; opacity: 0.3; border-radius: 2px; }
+.edwin-frame .ed-presence .faded { transition: opacity 0.6s; opacity: 0; }
+.edwin-frame .ed-input { position: absolute; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; font-size: 16px; resize: none; pointer-events: none; }
+`;
 
 /* ---------- text primitives (0-based internally; Lisp sees 1-based) ---------- */
 function checkRO(b) { if (b.readOnly && !E.inhibitRO && !(L.get('inhibit-read-only') && L.get('inhibit-read-only').value)) signal('buffer-read-only', b); }
@@ -300,7 +537,8 @@ function shiftMarkers(b, pos, del, ins, entry) {
   const e = pos + del, d = ins - del;
   const after = p => (p < pos ? p : p > e || (del && p === e) ? p + d : pos + ins);
   b.pt = after(b.pt);
-  if (E.root) for (const w of windowList()) if (w.buffer === b && w !== E.sel) w.pt = after(w.pt);
+  const sw = selWin();
+  for (const w of allWindows()) if (w.buffer === b && w !== sw) w.pt = after(w.pt);
   if (!b.markers.size) return;
   let moved = null;
   for (const m of b.markers) {
@@ -404,14 +642,45 @@ function setDefault(name, v) { const ent = localized.get(name); if (ent) ent.def
 L.hooking.defaultValue = defaultValue;
 /* Run F with (edit-origin) answering ORIGIN: remote, server, disk or agent (E1 applies edits with it). */
 function withOrigin(origin, f) { const save = E.editOrigin; E.editOrigin = origin; try { return f(); } finally { E.editOrigin = save; } }
-/* Every change to buffer text goes through here: hooks, the rope, the log, the markers. */
-function editText(b, pos, n, ins) {
+/* One change: hooks, the rope, the log, the markers. WHOLE is the whole new text when the caller has it
+   (assigning b.text), so a large replacement resets the rope instead of splicing it. */
+function editOne(b, pos, n, ins, whole) {
   const hk = changeHooks();
   if (hk) runChangeHook(b, 'before-change-functions', [pos + 1, pos + n + 1]);
-  const removed = ropeEdit(b, pos, n, ins);
+  let removed;
+  if (whole !== undefined && n + ins.length > (whole.length >> 1)) { removed = b.rope.slice(pos, pos + n); b.rope.reset(whole); if (removed || ins) logEdit(b, pos, removed, ins); }
+  else removed = ropeEdit(b, pos, n, ins);
   if (removed || ins) shiftMarkers(b, pos, removed.length, ins.length, b.log[b.log.length - 1]);
   if (hk) runChangeHook(b, 'after-change-functions', [pos + 1, pos + ins.length + 1, removed.length]);
   return removed;
+}
+/* The one way text changes (R6.8): OPS, an array of [pos, del, ins] applied in order, change the rope,
+   shift every marker, append to the log, run the change hooks with (edit-origin) = ORIGIN (local when
+   absent: a command), bump b.ver (logEdit) and schedule redisplay. Local commands, remote batches,
+   reverts and undo all come through here; hooks.applied tells the protocol client (sync.js). Returns
+   the ops as applied, with the removed text read from the buffer. */
+function applyOps(b, ops, origin, whole) {
+  const out = [], eff = origin || E.editOrigin;
+  withOrigin(eff, () => {
+    for (const op of ops) {
+      const pos = op[0], n = typeof op[1] === 'string' ? op[1].length : op[1], ins = op[2];
+      const removed = editOne(b, pos, n, ins, whole);
+      if (removed || ins) out.push([pos, removed, ins]);
+    }
+  });
+  if (whole !== undefined && b.rope.length === whole.length) b.rope.flat = whole;
+  if (out.length) {
+    if (hooks.applied) hooks.applied(b, out, eff);
+    for (const f of E.frames) if (f.sel && leaves(f.wroot).some(w => w.buffer === b)) frameEvent('edited', f, b);
+    scheduleRender();
+  }
+  return out;
+}
+/* The per-op entry the server and the editing primitives use: one change at POS of N characters into INS;
+   the origin is the current one (Ed.withOrigin). Returns the removed text. */
+function editText(b, pos, n, ins) {
+  const r = applyOps(b, [[pos, n, ins]]);
+  return r.length ? r[0][1] : '';
 }
 /* Assigning b.text: change the differing middle only, as one edit. */
 function setText(b, v) {
@@ -420,14 +689,14 @@ function setText(b, v) {
   const old = r.toString();
   if (old === v) return;
   const { pre, suf } = diffSpan(old, v);
-  const del = old.slice(pre, old.length - suf), ins = v.slice(pre, v.length - suf);
-  const hk = changeHooks();
-  if (hk) runChangeHook(b, 'before-change-functions', [pre + 1, pre + del.length + 1]);
-  if (del.length + ins.length > (v.length >> 1)) r.reset(v);
-  else { r.splice(pre, del.length, ins); r.flat = v; }
-  logEdit(b, pre, del, ins);
-  shiftMarkers(b, pre, del.length, ins.length, b.log[b.log.length - 1]);
-  if (hk) runChangeHook(b, 'after-change-functions', [pre + 1, pre + ins.length + 1, del.length]);
+  applyOps(b, [[pre, old.length - suf - pre, v.slice(pre, v.length - suf)]], undefined, v);
+}
+/* Redisplay in the next frame, once for any number of changes. */
+let renderQueued = false;
+function scheduleRender() {
+  if (renderQueued || !E.frames.length) return;
+  renderQueued = true;
+  host.nextFrame(() => { renderQueued = false; frameRender(); });
 }
 /* The span changed since version OLD: { pre, suf } lengths of the untouched prefix and suffix, or null
    when the log no longer reaches back that far. */
@@ -773,7 +1042,7 @@ function modeChain(mode) { const out = [mode]; for (let m = modeParents.get(mode
 function activeMaps(b) {
   b = b || E.current;
   const out = [];
-  if (b === E.minibuf && E.mini) { const m = KM('minibuffer-local-map'); if (m) out.push(m); }
+  if (b.minibuf && E.mini) { const m = KM('minibuffer-local-map'); if (m) out.push(m); }
   if (hooks.stateMaps) out.push(...hooks.stateMaps(b));
   if (minorModes.size) out.push(...minorMaps(b));
   const mm = KM(b.mode + '-map'); if (mm) out.push(mm);
@@ -1177,6 +1446,9 @@ async function callInteractively(cmd) {
   const f = L.toFn(cmd);
   let spec = f.interactive;
   if (spec === undefined) signal('wrong-type-argument', `${L.cmdName(cmd)} is not a command`);
+  /* A command declared (:where 'server) runs in edwind (R4.27): the protocol client sends call{cmd, ctx}
+     and the command loop goes on without waiting. */
+  if (f.where === 'server' && hooks.serverCommand) return hooks.serverCommand(L.cmdName(cmd), f);
   let args;
   if (typeof spec === 'function' && spec.jsSpec) args = await spec();
   else {
@@ -1242,12 +1514,15 @@ function flushPendingUndo(b) {
   if (b.pendingUndo) { if (changedSince(b, b.pendingUndo.ver)) { b.undo.push(b.pendingUndo); b.redo = []; } b.pendingUndo = null; }
 }
 function undoStep(b) {
+  /* A replica undoes by groups through everyone else's edits (R6.15–R6.19, sync.js). */
+  if (b.shared && hooks.undoShared) { E.noUndo = true; return hooks.undoShared(b); }
   flushPendingUndo(b);
   if (!b.undo.length) signal('user-error', 'Already at oldest change');
   const cur = snap(b), s = b.undo.pop();
   b.redo.push(cur); restoreSnap(b, s); E.noUndo = true;
 }
 function redoStep(b) {
+  if (b.shared && hooks.redoShared) { E.noUndo = true; return hooks.redoShared(b); }
   if (!b.redo.length) signal('user-error', 'Already at newest change');
   const cur = snap(b), s = b.redo.pop();
   b.undo.push(cur); restoreSnap(b, s); E.noUndo = true;
@@ -1267,6 +1542,7 @@ async function runCommand(def, keys) {
   L.set('last-command-event', ch ? L.mkchar(ch) : (keys ? intern(keys) : false));
   E.thisCommand = L.cmdSym(def);
   E.thisKeys = keys || '';
+  E.cmdSeq++;
   if (!E.mini && E.depth === 0) E.echo = '';
   E.miniFlash = '';
   const b = E.current, before = snap(b), wasActive = b.markActive, pin = b.pin;
@@ -1581,7 +1857,7 @@ function renderBuffer(b, o) {
   const seg = r.slice(from, to);
   const t = { charAt: k => seg.charAt(k - from), slice: (a, z) => seg.slice(a - from, z - from) };
   const eolS = p => { const q = seg.indexOf('\n', p - from); return q < 0 ? to : q + from; };
-  const cls = isLisp(b) && b !== E.minibuf ? lexOf(b, true) : null;
+  const cls = isLisp(b) && !b.minibuf ? lexOf(b, true) : null;
   /* A mode's own lexer (hooks.lexSeg, org.js) classifies the shown segment: ECLS is indexed from FROM
      and named by its own table. */
   const ext = !cls && lines && hooks.lexSeg ? hooks.lexSeg(b, from, to, seg) : null;
@@ -1743,17 +2019,22 @@ function metrics(w) {
     probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;left:0;top:0';
     probe.textContent = '0'.repeat(64);
     v.appendChild(probe);
-    const ch = probe.getBoundingClientRect().width / 64;
+    /* Measured rectangles are scaled by an ancestor's transform (a card at zoom z, R9.9); the layout
+       sizes (clientWidth) are not, so the measurements are divided by the scale. */
+    const sc = viewScale(v);
+    const ch = probe.getBoundingClientRect().width / 64 / sc;
     probe.textContent = 'iW'.repeat(32);
-    const mono = Math.abs(probe.getBoundingClientRect().width / 64 - ch) < 0.01;
+    const mono = Math.abs(probe.getBoundingClientRect().width / 64 / sc - ch) < 0.01;
     v.removeChild(probe);
     m = w._m = { key, sgen: -1, lh: parseFloat(cs.lineHeight) || 21, ch, mono, padT: parseFloat(cs.paddingTop) || 0, padX: (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0), nowrap: v.classList.contains('nowrap') };
   }
   if (m.sgen !== E.sizeGen || m.nowrap) {
-    m.ch0 = v.clientHeight; m.cw0 = v.clientWidth; m.oh0 = v.offsetHeight; m.ow0 = v.offsetWidth; m.cw = m.cw0 - m.padX; m.top = v.clientTop + m.padT; m.oh = v.getBoundingClientRect().height; m.sgen = E.sizeGen;
+    m.ch0 = v.clientHeight; m.cw0 = v.clientWidth; m.oh0 = v.offsetHeight; m.ow0 = v.offsetWidth; m.cw = m.cw0 - m.padX; m.top = v.clientTop + m.padT; m.oh = v.getBoundingClientRect().height / viewScale(v); m.sgen = E.sizeGen;
   }
   return m;
 }
+/* The scale an ancestor's CSS transform applies to element V (1 without one). */
+function viewScale(v) { const ow = v.offsetWidth; if (!ow) return 1; const w = v.getBoundingClientRect().width; return w > 0 ? w / ow : 1; }
 /* Whether every shown line fits on one row, judged without layout: printable ASCII and tabs only
    in a monospace font, with three columns to spare (the cursor at the line end, the end-of-line
    region mark, rounding). Anything else is measured in the DOM. */
@@ -1780,7 +2061,7 @@ function ensureWindowDom() {
         node.el = doc.createElement('div'); node.el.className = 'win'; node.el.dataset.wid = node.id;
         node.view = doc.createElement('div'); node.view.className = 'text'; node.view.setAttribute('role', 'textbox'); node.view.setAttribute('aria-multiline', 'true');
         node.ml = doc.createElement('div'); node.ml.className = 'modeline';
-        node.ml.innerHTML = '<span class="ml-tag" hidden></span><span class="ml-state"></span><span class="ml-name"></span><span class="ml-pos"></span><span class="ml-mode"></span><span class="ml-extra"></span><span class="ml-cmd"></span>';
+        node.ml.innerHTML = '<span class="ml-tag" hidden></span><span class="ml-state"></span><span class="ml-name"></span><span class="ml-pos"></span><span class="ml-mode"></span><span class="ml-extra"></span><span class="ml-sync"></span><span class="ml-cmd"></span>';
         node.el.appendChild(node.view); node.el.appendChild(node.ml);
         node.view._win = node; if (sizeWatch) sizeWatch.observe(node.view, { box: 'border-box' });
         if (hooks.wireWindow) hooks.wireWindow(node);
@@ -1801,7 +2082,8 @@ function ensureWindowDom() {
 }
 function windowRows(w) { const m = metrics(w); return Math.max(1, Math.floor(m.ch0 / m.lh)); }
 function renderWindow(w) {
-  const b = w.buffer, view = w.view, selected = w === E.sel;
+  /* The selected window of a frame that is not the selected frame shows its own point (w.pt) with a ghost cursor. */
+  const b = w.buffer, view = w.view, selected = w === E.sel && FS() === (E.frame || E.implicit);
   const look = hooks.look ? hooks.look(b, w) : {};
   const nums = L.get('display-line-numbers');
   const numbers = nums === intern('relative') ? 'relative' : truthy(nums) && nums !== NIL ? 'absolute' : null;
@@ -1880,6 +2162,7 @@ function renderWindow(w) {
   putText(q('ml-pos'), `L${foldsOf(b) ? lineNoB(b, pt) : ptLine} C${column(t, pt)}  ${percent(w)}`);
   putText(q('ml-mode'), `(${MODE_NAMES[b.mode] || b.mode}${lighters(b)}${selected && E.isearch ? ' Isearch' : ''})`);
   putText(q('ml-extra'), look.extra || '');
+  putText(q('ml-sync'), hooks.modeStatus ? hooks.modeStatus(b, FS()) : '');
   putText(q('ml-cmd'), selected ? look.showcmd || '' : '');
   return look;
 }
@@ -1899,8 +2182,21 @@ function echoMoved(echo) {
   const h = echo.offsetHeight;
   if (h !== echo._h) { echo._h = h; sizeChanged(); }
 }
+/* Redisplay: every frame with page parts is drawn; a frame that is not selected is drawn only when
+   what it shows changed since its last drawing. */
 function render() {
-  if (!E.root || !E.sel || !E.frame) return;
+  for (const f of E.frames) if (f.root && f.wroot && f.sel) renderFrame(f);
+}
+function frameKey(f) {
+  let k = (f.mini ? 'm' : '') + f.echo + '|' + f.miniFlash + '|' + E.metricsGen + '|' + E.sizeGen + '|' + (hooks.statusKey ? hooks.statusKey() : '');
+  for (const w of leaves(f.wroot)) { const b = w.buffer; k += `|${w.id}:${b.id}:${b.ver}:${w.pt}:${w.start}:${b.presence ? b.presence.length + ':' + (b._presTick || 0) : ''}`; }
+  return k;
+}
+function renderFrame(f) {
+  if (f !== E.frame) { const k = frameKey(f); if (k === f._rkey) return; f._rkey = k; }
+  withFrame(f, () => renderOne(f));
+}
+function renderOne(f) {
   ensureWindowDom();
   const echo = $('echo');
   echoMoved(echo);
@@ -1933,20 +2229,39 @@ function render() {
     if (look.prefixHelp && !E.isearch && (E.prompt === null || E.prompt === undefined)) setEcho(echo, `<span class="wkp">${esc(look.showcmd || '')}-</span>${look.prefixHelp}`, true);
     else setEcho(echo, text, false);
   }
-  E.frame.root.classList.toggle('unfocused', !E.focused);
-  if (hooks.renderOverlay) hooks.renderOverlay();
+  f.root.classList.toggle('unfocused', !f.focused);
+  if (f === E.frame && hooks.renderOverlay) hooks.renderOverlay();
+  if (hooks.renderPresence) hooks.renderPresence(f);
+}
+/* The client rect of LEN characters at buffer position P in window W, from the drawn lines (null when
+   the line is not drawn). Overlays (snipe, presence) place themselves with it. */
+function rectAt(w, p, len) {
+  const view = w.view, t = w.buffer.rope, ls = bol(t, p);
+  const ln = view.querySelector(`.ln[data-o="${ls}"]`);
+  if (!ln) return null;
+  let off = p - ls, startNode = null, startOff = 0;
+  const doc = ln.ownerDocument, walker = doc.createTreeWalker(ln, 4 /* NodeFilter.SHOW_TEXT */);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const n = node.nodeValue.length;
+    if (!startNode) { if (off < n || (off === n && len === 0)) { startNode = node; startOff = off; off += len; } else { off -= n; continue; } }
+    if (startNode && off <= n) { const r = doc.createRange(); r.setStart(startNode, startOff); r.setEnd(node, off); const rs = r.getClientRects(); return rs.length ? rs[0] : r.getBoundingClientRect(); }
+    if (startNode) off -= n;
+  }
+  return null;
 }
 
 /* ---------- pointer: map a screen point to a buffer position ---------- */
 function windowAt(x, y) {
-  const el = E.frame.root.ownerDocument.elementFromPoint(x, y);
+  const f = FS(); if (!f.root) return null;
+  const el = f.root.ownerDocument.elementFromPoint(x, y);
   const we = el && el.closest ? el.closest('.win') : null;
   return we ? windowList().find(w => w.el === we) || null : null;
 }
 function posFromPoint(x, y, w) {
   w = w || windowAt(x, y) || E.sel;
+  if (!w || !w.view) return null;
   let node, off;
-  const doc = E.frame.root.ownerDocument;
+  const doc = FS().root.ownerDocument;
   if (doc.caretPositionFromPoint) { const r = doc.caretPositionFromPoint(x, y); if (!r) return null; node = r.offsetNode; off = r.offset; }
   else if (doc.caretRangeFromPoint) { const r = doc.caretRangeFromPoint(x, y); if (!r) return null; node = r.startContainer; off = r.startOffset; }
   else return null;
@@ -1981,7 +2296,8 @@ ${markDocstrings}
 ${forwardSexp}
 ${parenDepths}`;
 globalThis.Ed = {
-  E, hooks, host, Frame, makeFrame, selectFrame, deleteFrame, Marker, shiftMarkers, editText, withOrigin, runHookSafely, removeHookEverywhere,
+  E, hooks, host, Frame, FrameState, makeFrame, selectFrame, deleteFrame, onFrameEvent, frameEvent, frameScale, withFrame, allWindows, allMinibufs, renderFrame, rectAt, scheduleRender, FRAME_CSS,
+  Marker, shiftMarkers, editText, applyOps, withOrigin, runHookSafely, removeHookEverywhere,
   localized, localize, makeLocal, localValue, defaultValue, setDefault, minorModes, minorOn, modeParents, modeChain, lighters, LEX_SOURCE, Store, Buffer, Keymap, PREFIX, C, SENTINEL, getBuffer, getBufferCreate, toBuffer, setWindowBuffer, otherBuffer, checkRO,
   insertText, deleteText, replaceText, spanOf, changedSince, installLex, metrics, lastMatch, bol, eol, lineNo, column, posAtColumn, lastLineStart, lineStartOf, lex, lexOf, markDocstrings,
   forwardSexp, backwardSexp, upList, matchParen, indentLine, lispIndentFor, isLisp, modeFor, MODE_NAMES,

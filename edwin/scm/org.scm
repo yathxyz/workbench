@@ -2,9 +2,11 @@
 ;;; templates, the agenda groups, and the evil-org keys.  The commands live in org.js, which
 ;;; loads after this file, so the variables are defined here and leader keys go in init.scm.
 
-(define org-todo-keywords
-      '((sequence "TODO(t)" "NEXT(n)" "WAITING(w@/!)" "HOLD(h@/!)" "SOMEDAY(s)"
-                  "|" "DONE(d!)" "CANCELLED(c@/!)")))
+;; The task keywords come from the one table of notes-syntax.scm (R10.2), shared with markdown-mode and the
+;; notes index: ((sequence "TODO(t)" "NEXT(n)" "WAITING(w@/!)" "HOLD(h@/!)" "SOMEDAY(s)" "|" "DONE(d!)"
+;; "CANCELLED(c@/!)")) from the shipped table. notes-set-task-keywords! changes it for both modes.
+(require 'notes-syntax)
+(define org-todo-keywords (notes-org-todo-keywords))
 (define org-ellipsis " [...]")
 (define org-modern-star "◉○◈◇✳")
 (define org-hide-emphasis-markers #t)
@@ -148,5 +150,9 @@
 (evil-define-key 'motion 'org-roam-mode
   "RET" 'org-open-at-point
   "q" 'quit-window)
+
+;; markdown-mode (markdown.scm, R10.1-R10.5) builds on these outline keys: it loads here, after Org and
+;; before init.scm, so the user's init can change both.
+(require 'markdown)
 
 ;;; org.scm ends here

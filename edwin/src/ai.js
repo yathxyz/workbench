@@ -412,7 +412,7 @@ CMD('gptel-confirm', async () => {
 }, '', 'Answer a pending tool confirmation (used by gptel tools; not for M-x).', () => false);
 const bufNamed = name => E.buffers.find(b => b.name === name) || E.buffers.find(b => b.file === name);
 defTool('list_buffers', 'List the open buffers: name, mode, size and file. Returns one line per buffer.', { type: 'object', properties: {} },
-  () => E.buffers.filter(b => b !== E.minibuf).map(b => `${b.name}\t${b.mode}\t${b.rope.length} chars${b.file ? '\t' + b.file : ''}`).join('\n'));
+  () => E.buffers.filter(b => !b.minibuf).map(b => `${b.name}\t${b.mode}\t${b.rope.length} chars${b.file ? '\t' + b.file : ''}`).join('\n'));
 defTool('read_buffer', 'Return the text of an open buffer by name (the first 30000 characters). Use list_buffers for the names.',
   { type: 'object', properties: { name: { type: 'string', description: 'Buffer name' } }, required: ['name'] },
   ({ name }) => { const b = bufNamed(String(name)); if (!b) throw new Error('no buffer named ' + name); const t = b.rope.slice(0, 30000); return b.rope.length > 30000 ? t + '\n[truncated]' : t; });

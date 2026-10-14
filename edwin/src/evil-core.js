@@ -48,7 +48,7 @@ function initialState(b) {
 }
 function stateOf(b) {
   b = b || E.current;
-  if (!E.evil || !b || b === E.minibuf) return null;
+  if (!E.evil || !b || b.minibuf) return null;
   if (b.evilState === undefined) b.evilState = initialState(b);
   return b.evilState;
 }

@@ -1578,7 +1578,7 @@ async function expandTemplate(tpl, ctx, now) {
   return { text: out, cursor: cursor < 0 ? out.length : cursor };
 }
 function captureAnnotation(b) {
-  if (!b || b === E.minibuf || b.capture) return '';
+  if (!b || b.minibuf || b.capture) return '';
   if (isOrg(b) && b.file) { const hs = headlineBefore(b, b.pt); if (hs !== null) { const t = headingInfo(b, hs).title; return `[[file:${b.file}::*${t}][${t}]]`; } return `[[file:${b.file}][${b.file}]]`; }
   if (b.file) return `[[file:${b.file}::${lineNoB(b, b.pt)}][${b.file}]]`;
   return '';

@@ -151,6 +151,14 @@ in
     touch $out
   '';
 
+  # Shared anchors (R9.12) and the frame's small server commands (E3): the after-marker rule through every writer,
+  # relocation after a disk revert, survival across restart and compaction, user-init, capf-candidates, sel.
+  edit-anchors = pkgs.runCommand "workbench-edit-anchors" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    export HOME=$TMPDIR
+    node --test ${edwind}/edwin/test/anchors.test.mjs
+    touch $out
+  '';
+
   # The E2 gates of the edwind spec (§17.1): the image log and its replication (edit-image), the notes index,
   # its grammar and the /api shapes (edit-notes), the block addresses against the golden file (edit-address).
   edit-image = pkgs.runCommand "workbench-edit-image" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
@@ -166,6 +174,23 @@ in
   edit-address = pkgs.runCommand "workbench-edit-address" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export NODE_PATH=${edwinDevDeps}/node_modules
     node --test ${edwin}/test/address.test.mjs
+    touch $out
+  '';
+
+  # markdown-mode (E3, §10.1, R10.1-R10.5): the parity table's commands, faces, overlays, folding, the keyword
+  # table shared with Org, journal-today, and the incremental font-lock budget (a keystroke in 10,000 lines
+  # re-fontifies in 2 ms), in the headless runtime.
+  edwin-markdown = pkgs.runCommand "workbench-edwin-markdown" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    node --test ${edwin}/test/markdown.test.mjs
+    touch $out
+  '';
+
+  # The frame runtime (E3 H1, §6.3, §7, §9.5): Edwin's core as a protocol client against a real edwind:
+  # open and snap, batches and acks, transform against pending edits, undo by group, reconnect and resend,
+  # image replication, server commands and ask, anchors, server-only stubs.
+  edit-frame = pkgs.runCommand "workbench-edit-frame" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    export HOME=$TMPDIR
+    node --test ${edwind}/edwin/test/frame.test.mjs
     touch $out
   '';
 

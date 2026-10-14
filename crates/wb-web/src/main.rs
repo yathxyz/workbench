@@ -14,6 +14,7 @@ mod hub;
 mod info;
 mod notes;
 mod relay_acp;
+mod relay_edit;
 mod relay_pty;
 mod routes;
 mod rpc;

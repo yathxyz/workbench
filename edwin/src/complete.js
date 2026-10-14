@@ -168,18 +168,20 @@ function place() {
   if (!el || el.hidden || !c || E.mini) return;
   const curEl = E.sel.view.querySelector('.cur'), frame = f.root.getBoundingClientRect();
   if (!curEl) { el.hidden = true; return; }
-  const r = curEl.getBoundingClientRect();
-  const left = r.left - frame.left - c.prefix.length * (r.width || 8);
-  el.style.left = Math.max(8, Math.min(left, frame.width - el.offsetWidth - 8)) + 'px';
-  const below = r.bottom - frame.top + 2;
-  if (below + el.offsetHeight > frame.height - 40) el.style.top = (r.top - frame.top - el.offsetHeight - 2) + 'px'; else el.style.top = below + 'px';
+  /* Measured rectangles are divided by the frame's CSS scale to get layout pixels (R9.9). */
+  const sc = Ed.frameScale(f), r = curEl.getBoundingClientRect();
+  const fw = frame.width / sc, fh = frame.height / sc;
+  const left = (r.left - frame.left) / sc - c.prefix.length * (r.width / sc || 8);
+  el.style.left = Math.max(8, Math.min(left, fw - el.offsetWidth - 8)) + 'px';
+  const below = (r.bottom - frame.top) / sc + 2;
+  if (below + el.offsetHeight > fh - 40) el.style.top = ((r.top - frame.top) / sc - el.offsetHeight - 2) + 'px'; else el.style.top = below + 'px';
 }
 H.renderOverlay = () => {
   const f = E.frame; if (!f) return;
   let el = f.el('corfu');
   const c = E.corfu;
   if (!c || E.mini) { if (el && !el.hidden) el.hidden = true; return; }
-  if (!el) { el = f.root.ownerDocument.createElement('div'); el.id = 'corfu'; f.root.appendChild(el); f.parts.corfu = el; }
+  if (!el) { el = f.root.ownerDocument.createElement('div'); el.className = 'corfu'; if (f.legacy) el.id = 'corfu'; f.root.appendChild(el); f.parts.corfu = el; }
   const N = Math.max(3, Number(L.get('corfu-count')) || 10);
   if (c.index < c.scroll) c.scroll = c.index; if (c.index >= c.scroll + N) c.scroll = c.index - N + 1;
   const key = c.scroll + ' ' + c.index + ' ' + N + ' ' + c.prefix;
