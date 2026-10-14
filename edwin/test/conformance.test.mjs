@@ -461,7 +461,13 @@ test('R16.17 limits: 500 open buffers, a flood of edits and a deep recursion lea
 test('R16.16 the Node flags of bin/edwind are in effect: no eval, frozen intrinsics, a sized stack, no child processes', async () => {
   const cmd = fs.readFileSync(`/proc/${child.pid}/cmdline`, 'utf8').split('\0');
   for (const f of ['--disallow-code-generation-from-strings', '--frozen-intrinsics']) assert.ok(cmd.includes(f), f);
-  assert.ok(cmd.some(f => f.startsWith('--stack-size=')));
+  /* The stack is the server thread's own (main.mjs runInThread), not a flag that depends on `ulimit -s`: the
+     Scheme cap of 10,000 frames (R4.34) holds whatever the soft limit is. */
+  assert.ok(!cmd.some(f => f.startsWith('--stack-size=')), 'no --stack-size flag');
+  const c = await client();
+  assert.equal((await c.form('(define (deep n) (if (= n 0) 0 (+ 1 (deep (- n 1))))) (deep 9990)')).value, '9990');
+  assert.equal((await c.form('(deep 10100)')).error.condition, 'recursion-depth', 'the cap, not the JS stack, ends the recursion');
+  c.close();
   assert.ok(!cmd.includes('--permission'), 'the permission model would disable fsync (R8.3)');
   // The child_process guard (R4.45, R14.12): every function of the module throws once edwind has started.
   const probe = `import { guardProcesses } from ${JSON.stringify(MAIN)}; import cp from 'node:child_process'; import { spawnSync } from 'node:child_process';

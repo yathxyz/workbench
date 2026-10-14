@@ -35,6 +35,13 @@ D('set-interactive!', 'name spec', 'Make the procedure named NAME a command. SPE
   const f = L.toFn(n); f.interactive = spec === '' || spec === false ? '' : spec; return n;
 });
 D('interactive-spec', 'command', 'The interactive spec of COMMAND, or #f.', ([c]) => { const f = L.fnOrNull(c); return f && f.interactive !== undefined ? f.interactive : false; });
+/* (define-command ... (:where 'server) ...) records where a command runs (R4.27); the default is the frame (R4.30). */
+D('set-command-where!', 'name where', 'Record that the command NAME runs WHERE: server, frame or both.', ([n, w]) => {
+  const f = L.toFn(n); const s = w instanceof Sym ? w.name : String(w);
+  if (s !== 'server' && s !== 'frame' && s !== 'both') signal('error', 'set-command-where!: where is server, frame or both', w);
+  f.where = s; return n;
+});
+D('command-where', 'name', 'Where the command NAME runs: server, frame or both.', ([n]) => { const f = L.fnOrNull(n); return intern(f && f.where ? f.where : 'frame'); });
 D('command?', 'x', '#t if X names or is a command.', ([x]) => L.isCommand(x));
 D('%add-hook', 'hook f append', 'Add F to the hook variable named HOOK.', ([h, f, ap]) => { L.addHook(h instanceof Sym ? h.name : str(h), f, truthy(ap)); return false; });
 D('%remove-hook', 'hook f', 'Remove F from the hook variable named HOOK.', ([h, f]) => { L.removeHook(h instanceof Sym ? h.name : str(h), f); return false; });

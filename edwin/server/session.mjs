@@ -12,7 +12,7 @@ const require = createRequire(import.meta.url);
 export const DEADLINE_FRAME_MS = 2000;
 export const DEADLINE_CLI_MS = 30000;
 
-/* R4.14 definitional heads, for the image log (log only in E1). */
+/* R4.14 definitional heads, for the image log (image.mjs extends the set). */
 export const DEFINITIONAL = new Set(['define', 'define-command', 'define-record-type', 'define-syntax', 'define-macro', 'define-minor-mode', 'define-derived-mode', 'defvar', 'defvar-local', 'defcustom', 'defface', 'set!', 'setq', 'setq-default', 'add-hook!', 'remove-hook!', 'advice-add', 'advice-remove', 'define-key', 'keymap-set', 'global-set-key', 'evil-define-key', 'evil-ex-define-cmd', 'define-snippet', 'put', 'provide', 'require']);
 
 export class Client {
@@ -80,6 +80,7 @@ export class Client {
   /* ---------- receiving ---------- */
   onLine(line) {
     if (!line.trim()) return;
+    if (this.server.onInput) this.server.onInput(this);
     let msg;
     try { msg = JSON.parse(line); } catch (e) { this.send({ t: 'error', code: 'bad_request', msg: 'not JSON' }); return; }
     if (!isObj(msg) || typeof msg.t !== 'string') { this.send({ t: 'error', code: 'bad_request', msg: 'a message is an object with t' }); return; }
@@ -171,10 +172,10 @@ export class Client {
   async onCall(msg) {
     const rid = ridOf(msg);
     if (rid === undefined) throw new ProtoError('bad_request', 'call needs a rid');
-    const ctx = isObj(msg.ctx) ? msg.ctx : {};
+    const ctx = isObj(msg.ctx) ? { ...msg.ctx, rid } : { rid };
     const args = Array.isArray(msg.args) ? msg.args : [];
     let out;
-    if (typeof msg.form === 'string') out = this.server.evalForm(this, msg.form);
+    if (typeof msg.form === 'string') out = await this.server.evalForm(this, msg.form, ctx, msg.buf);
     else if (typeof msg.cmd === 'string') out = await this.server.command(this, msg.cmd, args, ctx, msg.buf);
     else throw new ProtoError('bad_request', 'call needs cmd or form');
     if (out === undefined) return; // a delayed result (server-edit --wait, D20)

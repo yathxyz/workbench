@@ -256,7 +256,19 @@ body {
 ;;;; The prelude
 
 (define-syntax define-command
-  (syntax-rules (interactive)
+  (syntax-rules (interactive :where)
+    ((_ (name . args) (interactive spec) (:where w) body ...)
+     (begin (define (name . args) body ...) (set-interactive! 'name (lambda () spec)) (set-command-where! 'name w) 'name))
+    ((_ (name . args) (interactive) (:where w) body ...)
+     (begin (define (name . args) body ...) (set-interactive! 'name "") (set-command-where! 'name w) 'name))
+    ((_ (name . args) doc (interactive spec) (:where w) body ...)
+     (begin (define (name . args) doc body ...) (set-interactive! 'name (lambda () spec)) (set-command-where! 'name w) 'name))
+    ((_ (name . args) doc (interactive) (:where w) body ...)
+     (begin (define (name . args) doc body ...) (set-interactive! 'name "") (set-command-where! 'name w) 'name))
+    ((_ (name . args) (:where w) body ...)
+     (begin (define (name . args) body ...) (set-interactive! 'name "") (set-command-where! 'name w) 'name))
+    ((_ (name . args) doc (:where w) body ...)
+     (begin (define (name . args) doc body ...) (set-interactive! 'name "") (set-command-where! 'name w) 'name))
     ((_ (name . args) (interactive spec) body ...)
      (begin (define (name . args) body ...) (set-interactive! 'name (lambda () spec)) 'name))
     ((_ (name . args) (interactive) body ...)
