@@ -138,7 +138,7 @@ in generator mode so threads can block, be preempted, time out and stop in a deb
 every `(:where 'server)` command is a thread; the image log replicates definitions to frames; the notes index,
 the model layer and processes through the hub are server modules with Scheme primitives. `nix/checks.nix` has
 the gates `edit-image`, `edit-notes`, `edit-address`, `edwin-bench` (the evaluator budgets), `edit-lisp`,
-`edwin-pool` and `edit-security`; wb-web forwards the notes endpoints and `sample` over `edit.sock`.
+`edit-process`, `edwin-pool` and `edit-security`; wb-web forwards the notes endpoints and `sample` over `edit.sock`.
 
 Layout added in E2 (`edwin/server/` unless said): `threads.mjs` (the scheduler, held buffers, ask, timers,
 blocking primitives; `scm/threads.scm`), `debug.mjs` (the debugger, the inspector, apropos, find-definition,
@@ -217,9 +217,34 @@ Choices E2 made where the spec left one open, and where it had to deviate:
   `unlinked-mentions` block the calling thread while it searches (the sync channel remains for callers outside
   a thread). The pool's Node host compiles the lexer from a source string inside the worker and duplicates the
   built-in jobs (deviations recorded in `jobs.mjs`).
-- **Processes (R4.43–R4.45) and the §5 session API:** see `process.mjs`, `hub.mjs` and `wb.mjs` (their headers
-  carry the choices); the primitives live in `edwin/server`, not `edwin/src/wb.js` as the spec names, because
-  server-only code lives in `edwin/server`. The board family waits for EW-M4.
+- **The hub client (`hub.mjs`, `server.hub`)** connects to `hubSocket` (default `/run/workbench-hub/hub.sock`,
+  DESIGN §3.2.1), answers the hello as `edwind/<build>`, sends one `watch` (R5.7) and keeps the session
+  summaries current; it reconnects with the backoff of wb-web (250 ms to 5 s, jitter) and re-attaches live
+  processes with `pty.open {resume}` (no spawn). An unreachable hub is logged at debug level only. Conditions
+  `hub-error`, `process-error`, `stale-object`, `no-leader` sit under `error`; status gains `hub`, `hubVersion`,
+  `hubSessions`.
+- **Processes (R4.43–R4.45, `process.mjs`, `scm/process.scm`)** are hub PTY sessions with ids `ed-` + 16 base32
+  chars; `make-process` takes `:name :command :shell :cwd :env :size :buffer :filter :sentinel :card :noquery`
+  (default shell bash if the hub offers it, size 120x40). Output and exit run filters and sentinels on background
+  threads, queued per process so chunks stay ordered; insertion at the process mark ignores read-only (as Emacs
+  binds `inhibit-read-only`), with `by {kind: "server", thread: "process NAME"}`. `call-process` and
+  `shell-command-to-string` use a card-less PTY with `TERM=dumb NO_COLOR=1` (bash, sh, zsh only), strip ANSI and
+  CR, and forget the corpse (`pty.kill forget:true`); `:timeout` signals `timeout`. `accept-process-output`
+  returns at once when output arrived since the last call (Emacs). `M-x list-processes` is a server command
+  rendering `name:*Process List*`. `:card t` is only recorded until EW-M4 (such sessions stay hidden `ed-`
+  sessions, R9.22; `server.processes.onCard` is the hook for the board module). `pty.resize` is not sent.
+- **The §5 session API (`wb.mjs`, `scm/wb.scm`, feature `wb-hub`)**: interned session handles (`eq?`),
+  `session-list`, `session-get` (one argument gives the handle, two a field), `card-session` (session or
+  process), `card-send`, `card-read` (`pty.capture`, or the Org transcript of an `acp.open` replay),
+  `card-interrupt`, `card-kill` (`:force` or `y-or-n-p`), `acp-prompt` and `acp-prompt-async` (mailbox),
+  `shell-run` (done when `fg.leader` is seen true after the send, `:timeout` 600 s, returns the output since
+  the send). Hooks: `wb-session-exit-functions`, `wb-session-output-functions` (attached only while non-empty
+  and viewed, coalesced per 100 ms), `wb-acp-turn-end-functions`, `wb-page-saved-functions`,
+  `wb-card-created/deleted/moved-functions` from diffing saves of `<boardsDir>/<host>.json`; card hooks pass
+  `(id node-alist)` since card handles need the board family (EW-M4). The primitives live in `edwin/server`,
+  not `edwin/src/wb.js` as the spec names, because server-only code lives there. R13.2 (classifying `wb`'s
+  session from the hub summary) is not done; `server.hub.sessions` is ready for it. Both suites run against the
+  fake hub `test/fake-hub.mjs`.
 - **The model layer (§12, R14.4–R14.7)** is `models.mjs` with `scm/models.scm`. Backends are objects of two
   kinds, the ones the spec names (`anthropic`: Messages API, `x-api-key`; `openai`: chat completions, bearer);
   the default backend `workbench` is `models.anthropic` of `edit.json`, its models the tier values; a backend

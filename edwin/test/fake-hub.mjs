@@ -76,7 +76,8 @@ export class FakeHub {
   /* Run COMMAND for SESS: the scripted program, or the built-in echo/exit/sleep/false/not-found behaviour. */
   async run(sess, command, { interactive = false } = {}) {
     const sid = sess.summary.sid;
-    const io = { write: d => this.emitOut(sid, d), input: fn => { sess.inputFn = fn; }, delay: ms => sleep(ms), sess };
+    /* A program that reads input gets what arrived before it asked, as a real child reads the PTY's queue. */
+    const io = { write: d => this.emitOut(sid, d), input: fn => { sess.inputFn = fn; for (const d of (sess.pendingInputs || []).splice(0)) fn(d); }, delay: ms => sleep(ms), sess };
     let code = 0;
     const prog = this.programs.get(command) || this.programs.get(command.replace(/^export TERM=dumb NO_COLOR=1; /, ''));
     try {
@@ -165,7 +166,7 @@ export class FakeHub {
           ok({ new: true, pid, cwd: s.summary.cwd, epoch: s.summary.createdAt, stream: s.stream, out: s.out, resumed: false });
           this.publish(s);
           this.line(conn, { t: 'pty.fg', sid, comm: shell, cwd: s.summary.cwd });
-          if (sp.argv.length === 1) { this.startShell(s); setTimeout(() => this.emitOut(sid, '$ '), 5); }
+          if (sp.argv.length === 1) { this.startShell(s); this.emitOut(sid, '$ '); }
           else setTimeout(() => this.run(s, sp.argv[2] || ''), 5);
           return;
         }
@@ -182,7 +183,7 @@ export class FakeHub {
         if (Buffer.byteLength(req.d) > (1 << 20)) return this.err(conn, null, 'bad_request', 'pty.input is limited to 1048576 bytes', sid);
         if (!sess || !sess.summary.alive) return;
         sess.inputs.push(req.d);
-        if (sess.inputFn) sess.inputFn(req.d);
+        if (sess.inputFn) sess.inputFn(req.d); else (sess.pendingInputs || (sess.pendingInputs = [])).push(req.d);
         return;
       }
       case 'pty.resize': return;
