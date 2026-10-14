@@ -315,6 +315,39 @@ fn timeout_is_sent_when_given() {
 }
 
 #[test]
+fn desk_commands_send_the_desk_tools() {
+    let (run, seen) = exchange(
+        &["desk", "ls"],
+        None,
+        Script::ok("0 Board: every card at its place"),
+    );
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.stdout, "0 Board: every card at its place\n");
+    assert_eq!(
+        *seen.cmd(),
+        json!({"t": "cmd", "rid": 1, "tool": "list_desks", "input": {}})
+    );
+    let (run, seen) = exchange(
+        &["desk", "send", "3", "notes/plan", "--follow"],
+        None,
+        Script::ok("1 item(s) now also on desk 3."),
+    );
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(
+        seen.cmd()["input"],
+        json!({"desk": 3, "items": ["notes/plan"], "follow": true})
+    );
+    assert_eq!(seen.cmd()["tool"], "send_to_desk");
+    let (run, _) = exchange(
+        &["desk", "go", "9"],
+        None,
+        Script::err("tool", "nothing needs a look: desk 9 is empty"),
+    );
+    assert_eq!(run.code, 1, "{run:?}");
+    assert!(run.stderr.contains("desk 9 is empty"), "{run:?}");
+}
+
+#[test]
 fn fields_merge_over_inline_input() {
     let (run, seen) = exchange(
         &[

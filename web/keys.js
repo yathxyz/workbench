@@ -107,7 +107,7 @@
     leader: [
       ['TAB', 'fold.toggle', 'fold / unfold (package)'], ['S-TAB', 'fold.cycle', 'fold the others / unfold all'],
       ...range(0, 9).map(i => [String(i), 'desk.' + i, 'desk n (0 is the Board)', '0…9']), ['`', 'desk.prev', 'previous desk'],
-      ['m', '>leader-m', 'send the selection to desk n (x: the scratch overlay)'], ['M', '>leader-M', 'send it and go there'], ['d', '>leader-d', 'desk: new rename pin off also which delete promote sticky tile'],
+      ['m', '>leader-m', 'send the selection to desk n (x: the scratch overlay)'], ['M', '>leader-M', 'send it and go there'], ['d', '>leader-d', 'desk: new rename pin off also which delete promote sticky layout revert'],
       ['g', 'overview', 'overview of every desk'], ['w', 'ring', 'recent places: desks, tabs, views'], ['x', 'overlay', 'scratch overlay: show / hide'],
       ['!', 'attn.next', 'next item that needs a look (any desk)'],
       ['u', 'up', 'up (close focus, leave ws)'], ['RET', 'card.enter', 'enter folder, type into node'],
@@ -129,7 +129,8 @@
     'leader-d': [['n', 'desk.new', 'new desk with the selection'], ['r', 'desk.rename', 'rename this desk'], ['p', 'desk.pin', 'pin / unpin: in the board or this device only'],
       ['x', 'desk.off', 'take the selection off this desk'], ['a', '>leader-da', 'also on desk n (keep it here)'], ['i', 'desk.which', 'which desks hold the selected item'],
       ['k', 'desk.delete', 'delete this desk (the cards stay)'], ['b', 'desk.promote', 'promote: the Board takes their place here'],
-      ['s', 'desk.sticky', 'sticky: the selected cards on every desk'], ['t', 'desk.layout', 'tile / free this desk'], ['o', 'desk.open', 'open the folder as a desk']],
+      ['s', 'desk.sticky', 'sticky: the selected cards on every desk'], ['t', 'desk.layout', 'layout: free, tile, columns'], ['o', 'desk.open', 'open the folder as a desk'],
+      ['u', 'desk.revert', 'revert to its saved state (pinned)'], ['w', 'desk.keep', 'make this its saved state (pinned)']],
     'leader-v': [['m', 'persp.manual', 'manual'], ['p', 'persp.process', 'process'], ['f', 'persp.fs', 'filesystem'], ['t', 'persp.tag', 'tags'], ['x', 'persp.tmux', 'tmux'],
       ['c', 'persp.proc', 'processes'], ['u', 'persp.unit', 'units'], ['j', 'persp.journal', 'journal'], ['l', 'persp.link', 'links']],
     // transients: the palette and the dialogs keep every key for their own inputs, except Esc

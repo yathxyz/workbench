@@ -16,6 +16,7 @@ pub const USAGE: &str = "usage: wb buf ls [--json]
        wb repl [--json]
        wb tools [--socket PATH]
        wb TOOL [--json INPUT] [KEY=VALUE]... [KEY:=JSON]... [--timeout SECS] [--socket PATH]
+       wb desk ls | go N | send N [PATH]... [--keep] [--follow] [--timeout SECS] [--socket PATH]
 ";
 
 /// Board tools that `wb` does not run (W-14): hosts, units and tmux.
@@ -29,7 +30,7 @@ pub const DROPPED_TOOLS: &[&str] = &[
 ];
 
 /// Command words, which are never tool names.
-const COMMANDS: &[&str] = &["buf", "eval", "edit", "repl", "tools"];
+const COMMANDS: &[&str] = &["buf", "eval", "edit", "repl", "tools", "desk"];
 
 /// True when `name` matches `^[a-z][a-z0-9_]*$`.
 pub fn is_tool_name(name: &str) -> bool {
@@ -409,6 +410,7 @@ pub fn parse(argv: &[String]) -> Result<Args, Usage> {
                 json: false,
             })
         }
+        "desk" => parse_desk(rest),
         "-h" | "--help" | "help" => Err(usage("")),
         other if is_tool_name(other) && !COMMANDS.contains(&other) => parse_tool(other, rest),
         other => Err(usage(format!("unknown command {other:?}"))),
@@ -438,24 +440,94 @@ fn parse_tool(tool: &str, rest: &[String]) -> Result<Args, Usage> {
         Some(text) => Some(JsonInput::Object(object(text, "INPUT")?)),
     };
     let fields = s.pos.iter().map(|p| field(p)).collect::<Result<_, _>>()?;
-    let timeout = match s.value("--timeout") {
-        None => None,
-        Some(v) => match parse_u64("--timeout", v)? {
-            0 => return Err(usage("--timeout needs 1 second or more")),
-            secs => Some(secs),
-        },
-    };
     let call = ToolCall {
         tool: tool.to_owned(),
         json,
         fields,
-        timeout,
+        timeout: timeout(&s)?,
         socket: socket(&s)?,
     };
     // Check what is known now; `--json -` is checked again once stdin is read.
     call.input(None)?;
     Ok(Args {
         cmd: Command::Tool(call),
+        json: false,
+    })
+}
+
+/// `--timeout SECS`, at least 1.
+fn timeout(s: &Split) -> Result<Option<u64>, Usage> {
+    match s.value("--timeout") {
+        None => Ok(None),
+        Some(v) => match parse_u64("--timeout", v)? {
+            0 => Err(usage("--timeout needs 1 second or more")),
+            secs => Ok(Some(secs)),
+        },
+    }
+}
+
+/// A desk number: one digit, 0 (the Board) to 9 (the attention desk).
+fn desk_number(arg: &str) -> Result<Value, Usage> {
+    match arg.parse::<u8>() {
+        Ok(n) if n <= 9 && arg.len() == 1 => Ok(Value::from(n)),
+        _ => Err(usage(format!("a desk is a digit 0-9, got {arg:?}"))),
+    }
+}
+
+/// `wb desk ls`, `wb desk go N` and `wb desk send N [PATH]... [--keep] [--follow]`: the
+/// board tools `list_desks`, `go_to_desk` and `send_to_desk` (DESIGN §10.8, D3), run as
+/// `wb TOOL` runs them.
+fn parse_desk(argv: &[String]) -> Result<Args, Usage> {
+    let (sub, rest) = argv
+        .split_first()
+        .ok_or_else(|| usage("desk needs ls, go or send"))?;
+    refuse_url_token(rest)?;
+    let s = Split::new(rest, &["--timeout", "--socket"])?;
+    let mut fields = Vec::new();
+    let tool = match sub.as_str() {
+        "ls" => {
+            s.check(&["--timeout", "--socket"])?;
+            s.exactly(0, "no arguments after desk ls")?;
+            "list_desks"
+        }
+        "go" => {
+            s.check(&["--timeout", "--socket"])?;
+            s.exactly(1, "one desk number 0-9 after desk go")?;
+            fields.push(("desk".to_owned(), desk_number(&s.pos[0])?));
+            "go_to_desk"
+        }
+        "send" => {
+            s.check(&["--keep", "--follow", "--timeout", "--socket"])?;
+            let (n, paths) = s
+                .pos
+                .split_first()
+                .ok_or_else(|| usage("desk send needs a desk number 0-9"))?;
+            fields.push(("desk".to_owned(), desk_number(n)?));
+            if !paths.is_empty() {
+                let items = paths.iter().cloned().map(Value::String).collect();
+                fields.push(("items".to_owned(), Value::Array(items)));
+            }
+            for flag in ["keep", "follow"] {
+                if s.has(&format!("--{flag}")) {
+                    fields.push((flag.to_owned(), Value::Bool(true)));
+                }
+            }
+            "send_to_desk"
+        }
+        other => {
+            return Err(usage(format!(
+                "unknown desk command {other:?}: ls, go or send"
+            )));
+        }
+    };
+    Ok(Args {
+        cmd: Command::Tool(ToolCall {
+            tool: tool.to_owned(),
+            json: None,
+            fields,
+            timeout: timeout(&s)?,
+            socket: socket(&s)?,
+        }),
         json: false,
     })
 }
@@ -983,8 +1055,65 @@ mod tests {
     }
 
     #[test]
+    fn desk_commands_are_the_desk_tools() {
+        let c = call(&["desk", "ls"]);
+        assert_eq!(
+            (c.tool.as_str(), c.input(None).unwrap()),
+            ("list_desks", Map::new())
+        );
+        let c = call(&["desk", "go", "3", "--socket", "/s.sock"]);
+        assert_eq!(c.tool, "go_to_desk");
+        assert_eq!(c.input(None).unwrap(), obj(serde_json::json!({"desk": 3})));
+        assert_eq!(c.socket, Some("/s.sock".into()));
+        let c = call(&[
+            "desk",
+            "send",
+            "4",
+            "notes/plan",
+            "work/",
+            "--follow",
+            "--timeout=9",
+        ]);
+        assert_eq!(c.tool, "send_to_desk");
+        assert_eq!(
+            c.input(None).unwrap(),
+            obj(serde_json::json!({"desk": 4, "items": ["notes/plan", "work/"], "follow": true}))
+        );
+        assert_eq!(c.timeout, Some(9));
+        let c = call(&["desk", "send", "0", "--keep"]);
+        assert_eq!(
+            c.input(None).unwrap(),
+            obj(serde_json::json!({"desk": 0, "keep": true}))
+        );
+        // `--` lets a path start with a dash
+        assert_eq!(
+            call(&["desk", "send", "2", "--", "--odd"]).fields[1].1,
+            serde_json::json!(["--odd"])
+        );
+        for argv in [
+            &["desk"][..],
+            &["desk", "ls", "x"][..],
+            &["desk", "go"][..],
+            &["desk", "go", "10"][..],
+            &["desk", "go", "-1"][..],
+            &["desk", "go", "03"][..],
+            &["desk", "go", "1", "2"][..],
+            &["desk", "go", "1", "--keep"][..],
+            &["desk", "send"][..],
+            &["desk", "send", "x", "a"][..],
+            &["desk", "send", "1", "--json", "{}"][..],
+            &["desk", "send", "1", "--timeout", "0"][..],
+            &["desk", "move", "1"][..],
+            &["desk", "ls", "--url", "http://h"][..],
+        ] {
+            assert!(pv(argv).is_err(), "{argv:?} should be a usage error");
+        }
+    }
+
+    #[test]
     fn usage_lists_the_tool_commands() {
         assert!(USAGE.contains("wb tools [--socket PATH]"));
+        assert!(USAGE.contains("wb desk ls | go N | send N [PATH]..."));
         assert!(USAGE.contains(
             "wb TOOL [--json INPUT] [KEY=VALUE]... [KEY:=JSON]... [--timeout SECS] [--socket PATH]"
         ));
