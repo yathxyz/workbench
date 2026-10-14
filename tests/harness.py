@@ -203,7 +203,6 @@ class Harness:
             "boardsDir": str(self.boards_dir),
             "notesDir": str(self.notes_dir),
             "host": host,
-            "sample": None,
         }
         self.hub_json = self.write_json("hub.json", self.hub_config)
         self.web_json = self.write_json("web.json", self.web_config)
