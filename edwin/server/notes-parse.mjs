@@ -376,31 +376,36 @@ function parseItem(item, G) {
 if (!isMainThread && workerData && workerData.notesWorker) {
   let G = compileGrammar(workerData.grammar);
   const { syncPort, signal } = workerData;
+  /* A grep job over MSG.files (live text or a file to read): the hits, at most MSG.max. */
+  const grepJob = msg => {
+    const re = new RegExp(msg.source, msg.flags.includes('g') ? msg.flags : msg.flags + 'g');
+    const out = [];
+    for (const f of msg.files) {
+      if (out.length >= msg.max) break;
+      const text = typeof f.text === 'string' ? f.text : (() => { const r = readNote(f.file); return r.skipped ? null : r.text; })();
+      if (text === null) continue;
+      grepText(f.id, text, re, { excludeLinks: msg.excludeLinks, wiki: G.wiki, ref: G.ref, max: msg.max }, out);
+    }
+    return out;
+  };
   parentPort.on('message', msg => {
     try {
       switch (msg.t) {
         case 'grammar': G = compileGrammar(msg.grammar); parentPort.postMessage({ t: 'grammar', ok: true }); break;
         case 'parse': parentPort.postMessage({ t: 'parsed', jobId: msg.jobId, results: msg.items.map(it => parseItem(it, G)) }); break;
         case 'scan': parentPort.postMessage({ t: 'scanned', jobId: msg.jobId, files: scanTree(msg.root, msg.ignore) }); break;
+        case 'grep': parentPort.postMessage({ t: 'grepped', jobId: msg.jobId, hits: grepJob(msg) }); break; // a thread waits (R4.42)
         default: parentPort.postMessage({ t: 'error', jobId: msg.jobId, error: `unknown job ${msg.t}` });
       }
     } catch (e) { parentPort.postMessage({ t: 'error', jobId: msg.jobId, error: e.message }); }
   });
-  /* The synchronous channel: the main thread posts a job, waits on SIGNAL and reads the one reply. */
+  /* The synchronous channel (callers outside a thread): the main thread posts a job, waits on SIGNAL and
+     reads the one reply. */
   if (syncPort) syncPort.on('message', msg => {
     let reply;
     try {
-      if (msg.t === 'grep') {
-        const re = new RegExp(msg.source, msg.flags.includes('g') ? msg.flags : msg.flags + 'g');
-        const out = [];
-        for (const f of msg.files) {
-          if (out.length >= msg.max) break;
-          const text = typeof f.text === 'string' ? f.text : (() => { const r = readNote(f.file); return r.skipped ? null : r.text; })();
-          if (text === null) continue;
-          grepText(f.id, text, re, { excludeLinks: msg.excludeLinks, wiki: G.wiki, ref: G.ref, max: msg.max }, out);
-        }
-        reply = { jobId: msg.jobId, hits: out };
-      } else reply = { jobId: msg.jobId, error: `unknown sync job ${msg.t}` };
+      if (msg.t === 'grep') reply = { jobId: msg.jobId, hits: grepJob(msg) };
+      else reply = { jobId: msg.jobId, error: `unknown sync job ${msg.t}` };
     } catch (e) { reply = { jobId: msg.jobId, error: e.message }; }
     syncPort.postMessage(reply);
     Atomics.store(signal, 0, 1); Atomics.notify(signal, 0);
