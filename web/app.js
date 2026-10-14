@@ -125,6 +125,13 @@ function dirty() { if (!S || ADOPTING) return; clearTimeout(saveT); saveT = setT
 const camKey = () => 'wb-cam-' + (INFO?.host || location.host);
 function camLoad() { try { const c = JSON.parse(store.get(camKey())); if ([c.x, c.y, c.z].every(Number.isFinite) && c.z > 0) return { x: c.x, y: c.y, z: c.z }; } catch {} return null; }
 function dirtyCam() { clearTimeout(camT); camT = setTimeout(() => DAEMON ? store.set(camKey(), JSON.stringify(S.cam)) : dirty(), 400); }
+// The view is per device too (localStorage wb-view-<host>, F-A22): the entered workspace, the focus tabs and the
+// perspective. The board keeps none of them, and inside a perspective it keeps the manual layout, so another device
+// opens the board as it was made.
+const VIEW_KEYS = ['ws', 'focusTabs', 'persp', 'manual'];
+const viewKey = () => 'wb-view-' + (INFO?.host || location.host);
+function viewLoad() { try { const v = JSON.parse(store.get(viewKey())); if (v && typeof v === 'object') return v; } catch {} return null; }
+function viewSave() { if (S && BOOTED) store.set(viewKey(), JSON.stringify({ ws: S.ws || null, focusTabs: S.focusTabs || [], persp: perspCur() })); }
 function syncBuffers() {
   for (const n of nodeList()) {
     if (n.kind !== 'buffer' || !live[n.id]?.view) continue;
@@ -137,7 +144,13 @@ function syncBuffers() {
     }));
   }
 }
-function serialize() { syncBuffers(); return JSON.stringify(S, function (k, v) { return k.startsWith('_') ? undefined : DAEMON && k === 'cam' && this === S ? BOARD_CAM : v; }); }
+function serialize() {
+  syncBuffers(); const nodes = manualNodes();
+  return JSON.stringify(S, function (k, v) {
+    if (this === S) { if (VIEW_KEYS.includes(k)) return undefined; if (k === 'nodes') return nodes; if (DAEMON && k === 'cam') return BOARD_CAM; }
+    return k.startsWith('_') ? undefined : v;
+  });
+}
 // One PUT in flight: each 204 carries the ETag the next PUT's If-Match needs (30 §2.3).
 const SAVE = { busy: false, again: false, paused: null, pending: false, err: 0, theirs: null, lastJson: null, recheck: null, retryT: null, leaving: false, dbQueue: new Set() };
 function save() {
@@ -189,10 +202,13 @@ async function boardChanged(etag) {
   if (unsaved()) { SAVE.theirs = b.etag; SAVE.paused = 'conflict'; return conflictBar(); }
   boardAdopt(b.body); BOARD_ETAG = b.etag;
 }
-// A clean tab takes another tab's board in place: nodes, links and ink. The camera stays this device's.
+// A clean tab takes another tab's board in place: nodes, links and ink. The camera and the view stay this device's: a tab
+// inside a perspective goes back to the manual layout, takes the board, and builds its perspective again over it.
 function boardAdopt(b) {
   ADOPTING = true;
   try {
+    if (b.manual && b.persp && b.persp !== 'manual') b = { ...b, nodes: manualNodesOf(b.nodes || {}, b.manual) };   // saved inside a perspective by a page from before F-A22
+    const p = perspCur(); if (p !== 'manual') { perspClear(); S.persp = 'manual'; }
     const cur = S.nodes;
     for (const id of Object.keys(cur)) if (!b.nodes?.[id] || b.nodes[id].kind !== cur[id].kind) { unmountQuiet(id); delete cur[id]; }
     for (const [id, nn] of Object.entries(b.nodes || {})) {
@@ -208,6 +224,7 @@ function boardAdopt(b) {
     nodeList().filter(n => !live[n.id]).forEach(mount);
     frameList().forEach(placeFrame); nodeList().forEach(place);
     frameList().sort((x, y) => depthOf(y) - depthOf(x)).forEach(f => relayout(f));
+    if (p !== 'manual') { perspBuild(p); S.persp = p; perspChip(); wsApply(false); }
     restack(); updateAllTitles(); renderTree(); renderLinks(); renderInk(null);
     SAVE.lastJson = serialize();
   } finally { ADOPTING = false; }
@@ -5372,11 +5389,15 @@ async function boot() {
   } else { const raw = store.get(LS_KEY); if (raw) try { board = JSON.parse(raw); } catch {} }
   S = board && board.v === 5 ? board : seed();
   if (DAEMON) { BOARD_CAM = S.cam; S.cam = camLoad() || { x: 0, y: 0, z: 1, ...S.cam }; }
+  // F-A22: the view comes from this device; a board from before it lends its own view once, and one saved inside a
+  // perspective is turned back into the manual layout here.
+  if (S.manual && S.persp && S.persp !== 'manual') S.nodes = manualNodesOf(S.nodes, S.manual);
+  const view = viewLoad() || { ws: S.ws, focusTabs: S.focusTabs, persp: S.persp };
+  delete S.manual; S.persp = 'manual'; S.ws = view.ws || null; S.focusTabs = Array.isArray(view.focusTabs) ? view.focusTabs : [];
   migrateV9();
   // No /api/hosts at boot: wb-web answers it 404 by design (multi-host is a v1 non-goal; DESIGN §3.5.5), so the call
   // only put an error in the console of every load.
   perspChip(); { const ah = $('#add-host'); if (ah) ah.disabled = !DAEMON; } acpButton();
-  if (perspCur() === 'fs') setTimeout(() => { perspEdgesRebuild(); renderLinks(); }, 300);
   hashInit();
   if (separateAll()) { restack(); renderLinks(); }
   S.views = S.views || {}; S.strokes = S.strokes || []; S.fs = S.fs || seedFs(); S.shapes = S.shapes || [];
@@ -5402,8 +5423,9 @@ async function boot() {
   sideTab(S.sideTab || 'chat');
   placeInkChip();
   wireReview(); detectMode(); { const ae = $('#add-emacs'); if (ae) ae.disabled = !DAEMON; }
+  if (view.persp && view.persp !== 'manual' && PERSP_NAMES[view.persp]) { perspSet(view.persp, true); if (perspCur() === 'fs') setTimeout(() => { perspEdgesRebuild(); renderLinks(); }, 300); }
   wsRestore(); focusRestoreTabs();
-  BOOTED = true; SAVE.lastJson = serialize();
+  BOOTED = true; SAVE.lastJson = serialize(); viewSave();
 }
 // ================================================================ v8: node kinds around terminals, Emacs, browser, artifacts, sketch
 // Emacs buffer: a real PTY running emacsclient -t on one file (starts a daemon if none), falling back to emacs -nw.
@@ -5607,7 +5629,7 @@ function wsApply(animateCam = true) {
   const st = $('#st-ws'); if (st) st.textContent = label;
   const bar = $('#ws-bar'); if (bar) { bar.hidden = !f; if (f) $('#ws-name', bar).textContent = label; }   // v19.1: the way out stays on screen (user, 18:15)
   for (const n of Object.values(S.nodes)) if (n.kind === 'frame') live[n.id]?.el.classList.toggle('ws-cur', !!f && n.id === f.id);
-  S.ws = f ? f.id : null;
+  S.ws = f ? f.id : null; viewSave();
 }
 function wsEnter(f, quiet) {
   if (!f || f.kind !== 'frame') return;
@@ -5648,6 +5670,7 @@ function focusStrip() {
   const strip = $('#focus-tabs'); if (!strip) return;
   FOCUS.tabs = FOCUS.tabs.filter(id => S.nodes[id]);
   strip.hidden = !FOCUS.tabs.length; strip.replaceChildren();
+  S.focusTabs = [...FOCUS.tabs]; viewSave();
   if (!FOCUS.tabs.length) return;
   const home = el('button', 'ft' + (FOCUS.cur ? '' : ' on')); home.innerHTML = '<span class="g">◻</span>canvas'; home.onclick = () => focusHide(); strip.append(home);
   for (const id of FOCUS.tabs) {
@@ -5656,7 +5679,6 @@ function focusStrip() {
     b.append(g, nm, x); b.onclick = ev => { if (ev.target === x) { ev.stopPropagation(); focusClose(id); } else focusShow(id); };
     strip.append(b);
   }
-  S.focusTabs = [...FOCUS.tabs];
 }
 function focusGeometry(n) {
   const w = Math.max(200, VW() - 2), h = Math.max(120, VH() - FT_TOP - FT_H - FT_BOTTOM - 2);
@@ -5996,6 +6018,30 @@ function perspSnapshot() {
   for (const f of frameList()) snap.frames[f.id] = f;
   S.manual = snap;
 }
+// The board as the manual perspective holds it, built without touching the page: the stashed folders, each node's
+// manual folder and rectangle, no derived folders or ghosts. A node made inside a derived folder goes home as in perspClear.
+function manualNodesOf(nodes, snap) {
+  const out = {};
+  for (const [id, f] of Object.entries(snap.frames || {})) out[id] = f;
+  for (const n of Object.values(nodes)) {
+    if (n.kind === 'ghost' || (n.kind === 'frame' && n.derived) || out[n.id]) continue;
+    const c = { ...n };
+    if (snap.in && n.id in snap.in) { const p = snap.in[n.id]; if (p && (out[p] || (nodes[p] && !nodes[p].derived))) c.in = p; else delete c.in; [c.x, c.y, c.w, c.h] = snap.pos[n.id]; }
+    else if (c.in && !out[c.in]) {
+      const hf = c.hostUrl && Object.values(out).find(f => f.kind === 'frame' && !f.derived && f.host && hostRes(f.host)?.url === c.hostUrl);
+      if (hf) { c.in = hf.id; c.x = hf.x + PAD; c.y = hf.y + PAD + LABEL_H; } else delete c.in;
+    }
+    out[n.id] = c;
+  }
+  return out;
+}
+// What a save writes as nodes: a card shown in a focus tab keeps its place on the canvas, and a perspective's layout
+// gives way to the manual one.
+function manualNodes() {
+  let nodes = S.nodes; const f = FOCUS.cur && FOCUS.rect && nodes[FOCUS.cur];
+  if (f) nodes = { ...nodes, [f.id]: { ...f, ...FOCUS.rect } };
+  return perspCur() !== 'manual' && S.manual ? manualNodesOf(nodes, S.manual) : nodes;
+}
 function perspClear() {
   const snap = S.manual; if (!snap) return;
   for (const f of frameList()) if (f.derived) { const L = live[f.id]; if (L) { L.el.remove(); delete live[f.id]; } delete S.nodes[f.id]; }
@@ -6071,7 +6117,7 @@ function perspSet(p, quiet) {
   LAYOUT_UNDO = null;
   if (cur !== 'manual') perspClear();
   if (p !== 'manual') perspBuild(p);
-  S.persp = p; perspChip(); restack(); renderTree(); renderLinks(); updateAllTitles(); if (VIEW === 'ranger') renderRanger(); dirty();
+  S.persp = p; viewSave(); perspChip(); restack(); renderTree(); renderLinks(); updateAllTitles(); if (VIEW === 'ranger') renderRanger(); dirty();
   if (!quiet) toast('Perspective ' + PERSP_NAMES[p] + (p === 'manual' ? '' : '. Dimmed items have no place in this relation.') + (p === 'fs' ? ' ☰ on a directory lists it.' : '') + (p === 'link' ? ' Root: ' + PERSP.linkRoot + ' (palette: Perspective: links from…).' : ''));
 }
 function perspRebuild() { const p = perspCur(); if (p === 'manual') return toast('The manual perspective is the stored one; nothing to rebuild.'); perspClear(); perspBuild(p); restack(); renderTree(); renderLinks(); dirty(); toast('Rebuilt the ' + p + ' perspective.'); }
