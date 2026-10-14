@@ -4880,7 +4880,7 @@ class Rpc {
     if (!Rpc.ALL.size) addEventListener('blur', () => setTimeout(() => Rpc.look(true)));   // after the event: focus may only have moved into a frame
     Rpc.ALL.add(this); this.connect();
   }
-  static ago() { const s = Rpc.SEEN; return Math.max(0, Math.round(Math.max(Date.now() - s.wall, performance.now() - s.mono))); }
+  static ago() { const s = Rpc.SEEN; return Rpc.ON ? 0 : Math.max(0, Math.round(Math.max(Date.now() - s.wall, performance.now() - s.mono))); }
   active() { Rpc.look(); if (Rpc.SEEN != null) this.send({ t: 'active', ago: Rpc.ago() }); }
   connect() {
     clearTimeout(this.timer); WAKE.delete(this);
