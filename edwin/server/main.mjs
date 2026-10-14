@@ -18,11 +18,13 @@ import { Client, DEFINITIONAL } from './session.mjs';
 import { ImageLog, randomId, readJournal, jidPath } from './journal.mjs';
 import { ProtoError } from './proto.mjs';
 import { sha256 } from './files.mjs';
+import * as imageModule from './image.mjs';
+import * as notesModule from './notes.mjs';
 
 const require = createRequire(import.meta.url);
 /* The E2 modules, installed in this order after the buffers are loaded; each exports install(server) and
    may export shutdown(server) and name. */
-const MODULES = [];
+const MODULES = [imageModule, notesModule];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EDWIN = path.join(HERE, '..');
 export const BUILD = process.env.WB_EDIT_BUILD || 'dev';
@@ -97,9 +99,7 @@ export class Server {
     this.L = globalThis.L;
     this.Ed.boot({ host });
     await this.Ed.whenIdle();
-    for (const e of this.image.entries) {
-      try { this.L.resetOps(); this.L.evalText(e.form); } catch (err) { this.log.warn('image', { gen: e.gen, error: this.Ed.errorText(err) }); }
-    }
+    this.image.replay(this);
     this.buffers = new Buffers({ Ed: this.Ed, auth: this.auth, stateDir: this.cfg.stateDir, log: this.log });
     this.buffers.reload();
     for (const m of MODULES) { await m.install(this); this.modules.push(m); }
@@ -178,8 +178,8 @@ export class Server {
       L.resetOps();
       const forms = L.readAll(form);
       value = S.withOutputTo(port, () => { let v; for (const f of forms) v = L.ev(f); return v; });
-      /* Definitional forms enter the image log (R4.14, R4.15; replication is E2). */
-      for (const f of forms) if (isDefinitional(f, S)) { const gen = this.image.append(S.write(f), client.by()); this.log.info('image', { gen, by: client.kind }); }
+      /* Definitional forms enter the image log and reach every frame (R4.14, R4.15; image.mjs). */
+      const note = this.image.record(client, forms); if (note) Ed.E.echo = Ed.E.echo ? Ed.E.echo + '\n' + note : note;
     } catch (e) {
       error = this.conditionOf(e);
     } finally { S.watchdog.limitMs = limit; L.resetOps(); S.resetStack(); }

@@ -1,0 +1,68 @@
+[
+ {
+  "src": "alpha.md#5",
+  "srcFile": "alpha.md",
+  "dst": "Alpha",
+  "line": 11,
+  "candidates": [
+   "alpha.md",
+   "sub/alpha.md"
+  ],
+  "chosen": "alpha.md"
+ },
+ {
+  "src": "beta.md",
+  "srcFile": "beta.md",
+  "dst": "Alpha",
+  "line": 8,
+  "candidates": [
+   "alpha.md",
+   "sub/alpha.md"
+  ],
+  "chosen": "alpha.md"
+ },
+ {
+  "src": "beta.md#14",
+  "srcFile": "beta.md",
+  "dst": "alpha",
+  "line": 16,
+  "candidates": [
+   "alpha.md",
+   "sub/alpha.md"
+  ],
+  "chosen": "alpha.md"
+ },
+ {
+  "src": "gamma/delta.org",
+  "srcFile": "gamma/delta.org",
+  "dst": "Alpha",
+  "line": 8,
+  "candidates": [
+   "alpha.md",
+   "sub/alpha.md"
+  ],
+  "chosen": "alpha.md"
+ },
+ {
+  "src": "gamma/delta.org#11",
+  "srcFile": "gamma/delta.org",
+  "dst": "Alpha#^links",
+  "line": 16,
+  "candidates": [
+   "alpha.md",
+   "sub/alpha.md"
+  ],
+  "chosen": "alpha.md"
+ },
+ {
+  "src": "journal/2026-10-01.md#1",
+  "srcFile": "journal/2026-10-01.md",
+  "dst": "Alpha",
+  "line": 4,
+  "candidates": [
+   "alpha.md",
+   "sub/alpha.md"
+  ],
+  "chosen": "alpha.md"
+ }
+]

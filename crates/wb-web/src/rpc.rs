@@ -1,6 +1,8 @@
 //! `/rpc` (design §3.5.3), the feed so far: `hub{…}` and `sessions{…}` on connect and
-//! whenever the hub comes up, then `session`, `gone` and `board{etag}` as they happen.
-//! Client messages are read for the cap and the keepalive, and otherwise ignored.
+//! whenever the hub comes up, then `session`, `gone`, `board{etag}` and `notes{gen}` as
+//! they happen. Client messages are read for the cap and the keepalive; `sample`,
+//! `tool_result`, `tool_error`, `cancel` and `limits` go through [`crate::sample`], and
+//! the rest are ignored.
 
 use axum::Router;
 use axum::body::Bytes;
@@ -11,10 +13,13 @@ use axum::response::Response;
 use axum::routing::get;
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::mpsc;
 use wb_proto::limits::WS_MAX_RPC;
 
+use crate::edit_client::Delivery;
 use crate::http::{Keepalive, Tick, close, send_json, upgrade_required, ws_close, ws_too_big};
 use crate::hub::{HubStatus, with_state};
+use crate::sample::Tab;
 use crate::{AppState, FeedMsg};
 
 const ROUTE: &str = "/rpc";
@@ -73,6 +78,9 @@ async fn run(app: AppState, mut ws: WebSocket) {
             return;
         }
     }
+    let (to_tab, mut deliveries) = mpsc::unbounded_channel();
+    // Dropped on every return below, which cancels the tab's open streams (R12.8).
+    let mut tab = Tab::new(app.clone(), to_tab);
     let stop = app.stopped();
     tokio::pin!(stop);
     let mut keepalive = Keepalive::new();
@@ -81,10 +89,24 @@ async fn run(app: AppState, mut ws: WebSocket) {
             msg = ws.recv() => match msg {
                 None | Some(Ok(Message::Close(_))) => return,
                 Some(Err(_)) => return ws_too_big(ws, ROUTE).await,
+                Some(Ok(Message::Text(text))) => {
+                    keepalive.seen();
+                    match serde_json::from_str::<Value>(text.as_str()) {
+                        Ok(msg) if msg.is_object() => tab.client_msg(&msg).await,
+                        _ => continue,
+                    }
+                }
                 Some(Ok(_)) => {
                     keepalive.seen();
                     continue;
                 }
+            },
+            Some(delivery) = deliveries.recv() => match delivery {
+                Delivery::Stream { sid, msg } => {
+                    tab.stream_msg(&sid, &msg);
+                    vec![msg]
+                }
+                Delivery::Plain(msg) => vec![msg],
             },
             msg = feed.recv() => match msg {
                 // The control task fills the session map before it reports up.
@@ -95,6 +117,7 @@ async fn run(app: AppState, mut ws: WebSocket) {
                 }
                 Ok(FeedMsg::Gone { sid, epoch }) => vec![json!({"t": "gone", "sid": sid, "epoch": epoch})],
                 Ok(FeedMsg::Board { etag }) => vec![json!({"t": "board", "etag": etag})],
+                Ok(FeedMsg::Notes { generation }) => vec![json!({"t": "notes", "gen": generation})],
                 // Missed messages: resend what can be resent.
                 Err(RecvError::Lagged(_)) => snapshot(&app),
                 Err(RecvError::Closed) => return,

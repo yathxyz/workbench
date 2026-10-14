@@ -1,0 +1,17 @@
+{
+ "id": "tasks.md:3",
+ "node": "tasks.md#^t1",
+ "kw": "TODO",
+ "title": "Ship it",
+ "priority": "B",
+ "scheduled": null,
+ "deadline": null,
+ "closed": null,
+ "tags": [],
+ "session": "tmux:agent-x",
+ "dispatched": "2026-10-01T10:00",
+ "target": "@devbox",
+ "prompt": "Ship the thing, then tell [[Beta]].",
+ "path": "tasks.md",
+ "line": 3
+}

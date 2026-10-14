@@ -1,0 +1,377 @@
+{
+ "root": "<notesDir>",
+ "nodes": [
+  {
+   "id": "alpha.md",
+   "path": "alpha.md",
+   "title": "Alpha",
+   "kind": "file",
+   "tags": [
+    "intro",
+    "proj/edwind"
+   ],
+   "aliases": [],
+   "props": {},
+   "body": "# Alpha\n\nThe first note, tagged #intro and #proj/edwind. It links to [[Beta]] and to [[Beta|the b]] by label.\n\n## Links ^links\n\n- A link by path: [[gamma/delta]] and by alias [[Big Delta]].\n- A dangling link: [[Missing note]].\n- A block reference: ((Beta#^b1)) and a bare anchor ((^b2)).\n- A URL [docs](https://example.org/docs) and a file link [second alpha](sub/alpha.md).\n- Another note with the same title: [[Alpha]] resolves to the shortest path."
+  },
+  {
+   "id": "alpha.md#1",
+   "title": "Alpha",
+   "level": 1,
+   "kind": "heading",
+   "tags": [],
+   "body": "The first note, tagged #intro and #proj/edwind. It links to [[Beta]] and to [[Beta|the b]] by label.\n\n## Links ^links",
+   "line": 1,
+   "path": "alpha.md"
+  },
+  {
+   "id": "alpha.md#5",
+   "title": "Links",
+   "level": 2,
+   "kind": "heading",
+   "tags": [],
+   "body": "- A link by path: [[gamma/delta]] and by alias [[Big Delta]].\n- A dangling link: [[Missing note]].\n- A block reference: ((Beta#^b1)) and a bare anchor ((^b2)).\n- A URL [docs](https://example.org/docs) and a file link [second alpha](sub/alpha.md).",
+   "line": 5,
+   "path": "alpha.md"
+  },
+  {
+   "id": "alpha.md#^links",
+   "title": "Links",
+   "kind": "block",
+   "line": 5,
+   "path": "alpha.md"
+  },
+  {
+   "id": "alpha.md#13",
+   "title": "Tasks",
+   "level": 2,
+   "kind": "heading",
+   "tags": [],
+   "body": "- TODO Write the alpha section [#B] ^a-task\n  session:: tmux:agent-1\n  target:: @devbox\n  A body line for the task.",
+   "line": 13,
+   "path": "alpha.md"
+  },
+  {
+   "id": "alpha.md#^a-task",
+   "title": "TODO Write the alpha section [#B]",
+   "kind": "block",
+   "line": 15,
+   "path": "alpha.md"
+  },
+  {
+   "id": "alpha.md#^b-alpha",
+   "title": "Plain text with a block anchor at the end.",
+   "kind": "block",
+   "line": 26,
+   "path": "alpha.md"
+  },
+  {
+   "id": "beta.md",
+   "path": "beta.md",
+   "title": "Beta",
+   "kind": "file",
+   "tags": [
+    "proj",
+    "notes",
+    "setext"
+   ],
+   "aliases": [
+    "B",
+    "Second B"
+   ],
+   "props": {
+    "title": "Beta",
+    "aliases": "[B, \"Second B\"]",
+    "tags": "[proj, notes]",
+    "id": "7d3e5c10-0000-4000-8000-000000000002"
+   },
+   "body": "---\ntitle: Beta\naliases: [B, \"Second B\"]\ntags: [proj, notes]\nid: 7d3e5c10-0000-4000-8000-000000000002\n---\n\nBeta is linked from [[Alpha]] and from Delta. Its id is in the front matter.\n\n## First block ^b1\n\nThe first block's text, with a mention of Alpha."
+  },
+  {
+   "id": "beta.md#10",
+   "title": "First block",
+   "level": 2,
+   "kind": "heading",
+   "tags": [],
+   "body": "The first block's text, with a mention of Alpha.\n\n## Second block ^b2",
+   "line": 10,
+   "path": "beta.md"
+  },
+  {
+   "id": "beta.md#^b1",
+   "title": "First block",
+   "kind": "block",
+   "line": 10,
+   "path": "beta.md"
+  },
+  {
+   "id": "beta.md#14",
+   "title": "Second block",
+   "level": 2,
+   "kind": "heading",
+   "tags": [],
+   "body": "The second block. A link back: [[alpha]] (lower case, resolves by title).\n\nSetext heading\n--------------",
+   "line": 14,
+   "path": "beta.md"
+  },
+  {
+   "id": "beta.md#^b2",
+   "title": "Second block",
+   "kind": "block",
+   "line": 14,
+   "path": "beta.md"
+  },
+  {
+   "id": "beta.md#18",
+   "title": "Setext heading",
+   "level": 2,
+   "kind": "heading",
+   "tags": [],
+   "body": "Under a setext heading. #setext",
+   "line": 18,
+   "path": "beta.md"
+  },
+  {
+   "id": "cards/vocab.md",
+   "path": "cards/vocab.md",
+   "title": "Vocabulary",
+   "kind": "file",
+   "tags": [],
+   "aliases": [],
+   "props": {},
+   "body": "# Vocabulary\n\n## ἀρετή ^k3m9x2\ncard:: reverse\ndeck:: grc/vocab\nback:: excellence, virtue\nAristotle, EN 1103a. See [[Beta#^b1]].\n\n## λόγος ^p01x7\ncard:: basic\ndeck:: grc/vocab\nback:: word, reason, account"
+  },
+  {
+   "id": "cards/vocab.md#1",
+   "title": "Vocabulary",
+   "level": 1,
+   "kind": "heading",
+   "tags": [],
+   "body": "## ἀρετή ^k3m9x2\ncard:: reverse\ndeck:: grc/vocab\nback:: excellence, virtue",
+   "line": 1,
+   "path": "cards/vocab.md"
+  },
+  {
+   "id": "cards/vocab.md#3",
+   "title": "ἀρετή",
+   "level": 2,
+   "kind": "heading",
+   "tags": [],
+   "body": "card:: reverse\ndeck:: grc/vocab\nback:: excellence, virtue\nAristotle, EN 1103a. See [[Beta#^b1]].",
+   "line": 3,
+   "path": "cards/vocab.md"
+  },
+  {
+   "id": "cards/vocab.md#^k3m9x2",
+   "title": "ἀρετή",
+   "kind": "block",
+   "line": 3,
+   "path": "cards/vocab.md"
+  },
+  {
+   "id": "cards/vocab.md#9",
+   "title": "λόγος",
+   "level": 2,
+   "kind": "heading",
+   "tags": [],
+   "body": "card:: basic\ndeck:: grc/vocab\nback:: word, reason, account\n\n- aorist of λύω, 1 sg. active indicative ^a0r1s",
+   "line": 9,
+   "path": "cards/vocab.md"
+  },
+  {
+   "id": "cards/vocab.md#^p01x7",
+   "title": "λόγος",
+   "kind": "block",
+   "line": 9,
+   "path": "cards/vocab.md"
+  },
+  {
+   "id": "cards/vocab.md#^a0r1s",
+   "title": "aorist of λύω, 1 sg. active indicative",
+   "kind": "block",
+   "line": 14,
+   "path": "cards/vocab.md"
+  },
+  {
+   "id": "cards/vocab.md#20",
+   "title": "NixOS module helpers",
+   "level": 2,
+   "kind": "heading",
+   "tags": [],
+   "body": "card:: cloze\ndeck:: nixos\nIn a NixOS module, {{c1::mkIf}} guards a config block on a\ncondition, and {{c2::mkEnableOption}} declares a boolean option.",
+   "line": 20,
+   "path": "cards/vocab.md"
+  },
+  {
+   "id": "cards/vocab.md#^nx0m1",
+   "title": "NixOS module helpers",
+   "kind": "block",
+   "line": 20,
+   "path": "cards/vocab.md"
+  },
+  {
+   "id": "cards/vocab.md#26",
+   "title": "An old card",
+   "level": 2,
+   "kind": "heading",
+   "tags": [],
+   "body": "card:: basic\ndeck:: grc/vocab\nback:: gone\nstatus:: retired",
+   "line": 26,
+   "path": "cards/vocab.md"
+  },
+  {
+   "id": "cards/vocab.md#^old01",
+   "title": "An old card",
+   "kind": "block",
+   "line": 26,
+   "path": "cards/vocab.md"
+  },
+  {
+   "id": "gamma/delta.org",
+   "path": "gamma/delta.org",
+   "title": "Delta",
+   "kind": "file",
+   "tags": [
+    "org",
+    "x"
+   ],
+   "aliases": [
+    "Big Delta",
+    "dd"
+   ],
+   "props": {
+    "id": "11111111-2222-4333-8444-555555555555",
+    "roam_aliases": "\"Big Delta\" dd"
+   },
+   "body": ":PROPERTIES:\n:ID: 11111111-2222-4333-8444-555555555555\n:ROAM_ALIASES: \"Big Delta\" dd\n:END:\n#+title: Delta\n#+filetags: :org:x:\n\nDelta is an Org note. It links to [[Alpha]] and to [[id:7d3e5c10-0000-4000-8000-000000000002][see beta]],\nto [[file:../beta.md]] and to [[https://example.org][a site]].\n\n* TODO [#A] Write the Org section                                  :work:\nSCHEDULED: <2026-10-20 Tue> DEADLINE: <2026-10-25 Sat>"
+  },
+  {
+   "id": "gamma/delta.org#11",
+   "title": "TODO [#A] Write the Org section",
+   "level": 1,
+   "kind": "heading",
+   "tags": [
+    "work"
+   ],
+   "body": "SCHEDULED: <2026-10-20 Tue> DEADLINE: <2026-10-25 Sat>\n:PROPERTIES:\n:ID: 22222222-2222-4333-8444-555555555555\n:END:\nBody of the Org task, which refers to ((Alpha#^links)).",
+   "line": 11,
+   "path": "gamma/delta.org"
+  },
+  {
+   "id": "gamma/delta.org#17",
+   "title": "DONE A finished subtask",
+   "level": 2,
+   "kind": "heading",
+   "tags": [],
+   "body": "CLOSED: [2026-10-02 Thu]\n* Notes\nNothing to do here.",
+   "line": 17,
+   "path": "gamma/delta.org"
+  },
+  {
+   "id": "gamma/delta.org#19",
+   "title": "Notes",
+   "level": 1,
+   "kind": "heading",
+   "tags": [],
+   "body": "Nothing to do here.",
+   "line": 19,
+   "path": "gamma/delta.org"
+  },
+  {
+   "id": "journal/2026-10-01.md",
+   "path": "journal/2026-10-01.md",
+   "title": "2026-10-01",
+   "kind": "file",
+   "tags": [],
+   "aliases": [],
+   "props": {},
+   "body": "# 2026-10-01\n\n- TODO A journal task\n- Met about [[Alpha]] and ((^b-alpha))."
+  },
+  {
+   "id": "journal/2026-10-01.md#1",
+   "title": "2026-10-01",
+   "level": 1,
+   "kind": "heading",
+   "tags": [],
+   "body": "- TODO A journal task\n- Met about [[Alpha]] and ((^b-alpha)).",
+   "line": 1,
+   "path": "journal/2026-10-01.md"
+  },
+  {
+   "id": "sub/alpha.md",
+   "path": "sub/alpha.md",
+   "title": "Alpha",
+   "kind": "file",
+   "tags": [],
+   "aliases": [],
+   "props": {},
+   "body": "# Alpha\n\nA second note titled Alpha, deeper in the tree. Mentions Beta without a link."
+  },
+  {
+   "id": "sub/alpha.md#1",
+   "title": "Alpha",
+   "level": 1,
+   "kind": "heading",
+   "tags": [],
+   "body": "A second note titled Alpha, deeper in the tree. Mentions Beta without a link.",
+   "line": 1,
+   "path": "sub/alpha.md"
+  },
+  {
+   "id": "tasks.md",
+   "path": "tasks.md",
+   "title": "Tasks",
+   "kind": "file",
+   "tags": [
+    "urgent"
+   ],
+   "aliases": [],
+   "props": {},
+   "body": "# Tasks\n\n- TODO Ship it [#B] ^t1\n  session:: tmux:agent-x\n  dispatched:: 2026-10-01T10:00\n  target:: @devbox\n  Ship the thing, then tell [[Beta]].\n- NEXT Follow up with the team #urgent\n  SCHEDULED: <2026-10-20 Tue>\n  DEADLINE: <2026-10-25 Sun>\n- DOING Something happening now\n  - a child bullet with detail"
+  },
+  {
+   "id": "tasks.md#1",
+   "title": "Tasks",
+   "level": 1,
+   "kind": "heading",
+   "tags": [],
+   "body": "- TODO Ship it [#B] ^t1\n  session:: tmux:agent-x\n  dispatched:: 2026-10-01T10:00\n  target:: @devbox",
+   "line": 1,
+   "path": "tasks.md"
+  },
+  {
+   "id": "tasks.md#^t1",
+   "title": "TODO Ship it [#B]",
+   "kind": "block",
+   "line": 3,
+   "path": "tasks.md"
+  },
+  {
+   "id": "tasks.md#17",
+   "title": "LATER A heading task",
+   "level": 2,
+   "kind": "heading",
+   "tags": [],
+   "body": "Text under the heading task.\n\n## HOLD Another heading task ^hold-1",
+   "line": 17,
+   "path": "tasks.md"
+  },
+  {
+   "id": "tasks.md#21",
+   "title": "HOLD Another heading task",
+   "level": 2,
+   "kind": "heading",
+   "tags": [],
+   "body": "",
+   "line": 21,
+   "path": "tasks.md"
+  },
+  {
+   "id": "tasks.md#^hold-1",
+   "title": "HOLD Another heading task",
+   "kind": "block",
+   "line": 21,
+   "path": "tasks.md"
+  }
+ ]
+}

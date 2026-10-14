@@ -632,6 +632,95 @@ of a line, swap the two characters before point."
 (define-key minibuffer-local-map "C-w" 'backward-kill-word)
 (define-key minibuffer-local-map "C-u" 'kill-whole-input)
 
+
+;;; --- image log (E2) ---
+
+;; The image log (spec 4.4): a definitional form evaluated in the server image is logged with a
+;; generation and evaluated by every frame runtime in order, so one image spans many runtimes and
+;; survives restarts.  The primitives %image-server?, %declare-definitional, %share-variable and
+;; %image-command exist in the server image only (server/image.mjs); a frame has none of them, which
+;; is how a form learns where it runs.  The commands below run in the server image.
+
+(define (image-server?)
+  "#t in the server image (edwind), #f in a frame runtime."
+  (if (bound? '%image-server?) (%image-server?) (not (selected-frame))))
+
+(define (declare-definitional head)
+  "Make forms whose head is the symbol HEAD definitional (R4.14): logged and replicated like define."
+  (when (image-server?) (%declare-definitional head))
+  head)
+
+(define-syntax on-server
+  (syntax-rules ()
+    ((_ body ...) (if (image-server?) (begin body ...) #f))))
+
+(define-syntax on-frames
+  (syntax-rules ()
+    ((_ body ...) (if (image-server?) #f (begin body ...)))))
+
+(define-syntax defvar-shared
+  (syntax-rules ()
+    ((_ name init) (defvar-shared name init #f))
+    ((_ name init doc)
+     (begin (define name init)
+            (when (image-server?) (%share-variable 'name doc))
+            'name))))
+
+(define (image-result-field r key)
+  "The value under the symbol KEY in the alist R an image command returned, or #f."
+  (let ((p (and (pair? r) (assq key r)))) (and p (cdr p))))
+
+(define-command (image-log)
+  "Show the image log in the read-only buffer *image-log*: every entry with its
+generation, time and origin, newest last."
+  (interactive)
+  (%image-command "image-log")
+  (message "Image log: see the buffer *image-log*"))
+
+(define-command (image-compact)
+  "Drop image-log entries superseded by a later definition of the same name.
+The image epoch changes, so every frame restarts its runtime."
+  (interactive)
+  (let ((r (%image-command "image-compact")))
+    (message "Image compacted: ~a dropped, ~a kept" (image-result-field r 'dropped) (image-result-field r 'kept))))
+
+(define-command (image-reset confirm)
+  "Move the image log aside as image.<time>.jsonl and start fresh at generation 0.
+Every frame restarts its runtime.  CONFIRM must be the string yes."
+  (interactive "sReset the image log (the old log is kept aside)? Type yes: ")
+  (if (equal? confirm "yes")
+      (let ((r (%image-command "image-reset" #t)))
+        (message "Image reset; the old log is ~a" (image-result-field r 'archived)))
+      (message "Image reset cancelled")))
+
+(define-command (image-save-to-init confirm)
+  "Append the live image-log entries to init.scm in the config directory, then
+reset the log.  CONFIRM must be the string yes."
+  (interactive "sSave the image log to init.scm and reset it? Type yes: ")
+  (if (equal? confirm "yes")
+      (let ((r (%image-command "image-save-to-init" #t)))
+        (message "~a entries saved to ~a; image reset" (image-result-field r 'saved) (image-result-field r 'file)))
+      (message "Image save cancelled")))
+
+(define-command (image-problems)
+  "List the image-log entries that failed at replay (R4.19) with their errors."
+  (interactive)
+  (let ((problems (%image-command "image-problems")))
+    (if (null? problems)
+        (message "Every image entry replayed")
+        (begin
+          (for-each (lambda (p)
+                      (message "#~a ~a: ~a" (image-result-field p 'gen) (image-result-field p 'origin) (image-result-field p 'error)))
+                    problems)
+          (message "~a image entries failed at replay; see *Messages*" (length problems))))))
+
+(define-command (image-revert-entry gen)
+  "Remove the image-log entry with generation GEN; every frame rebuilds its runtime
+without it.  The server image keeps the definition until its next start."
+  (interactive "nRevert image entry (generation): ")
+  (let ((r (%image-command "image-revert-entry" gen)))
+    (message "Image entry ~a reverted: ~a" gen (image-result-field r 'form))))
+
 ;;; emacs.scm ends here
 </script>
 <script type="text/x-scheme" id="evil-scm">

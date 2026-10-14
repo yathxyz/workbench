@@ -1,5 +1,7 @@
 //! `GET /api/info`, `/api/sessions`, `/api/status` and `/api/pty/{id}/capture` (design
-//! §3.5.5, 20 §5.6). Paths are relative to `/api`.
+//! §3.5.5, 20 §5.6). `sample`, `models` and `notesExists` in `/api/info` and the `edit`
+//! block of `/api/status` come from edwind's `status` command (edwind spec R15.11).
+//! Paths are relative to `/api`.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,6 +34,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn info(State(app): State<AppState>) -> Json<Value> {
+    let edit = app.edit_status().await;
     let status = app.hub.status.borrow().clone();
     let (agents, shells, default_shell, hub) = match &status {
         HubStatus::Up(h) => (
@@ -63,11 +66,13 @@ async fn info(State(app): State<AppState>) -> Json<Value> {
     Json(json!({
         "host": app.cfg.host,
         "home": std::env::var("HOME").ok(),
-        "sample": sample::enabled(),
-        // The sample tiers arrive with `sample` in M5.
-        "models": {},
+        "sample": sample::enabled(&app).await,
+        "models": edit.as_ref().map_or(json!({}), |s| match &s["models"] {
+            Value::Object(models) => Value::Object(models.clone()),
+            _ => json!({}),
+        }),
         "notes": app.cfg.notes_dir,
-        "notesExists": notes::exists(),
+        "notesExists": notes::exists(&app).await,
         "state": app.cfg.state_dir,
         "dist": null,
         "tmux": false,
@@ -100,7 +105,30 @@ async fn sessions(State(app): State<AppState>) -> Result<Json<Value>, ApiError> 
     Ok(Json(json!({"host": app.cfg.host, "sessions": sessions})))
 }
 
+/// R15.11: `{up, version, build, clients, buffers, journalBytes, imageGen,
+/// loopLagP95Ms, ackP95Ms}` from edwind's `status`, or `null` while it is down.
+fn edit_block(status: Option<Value>) -> Value {
+    let Some(status) = status else {
+        return Value::Null;
+    };
+    let mut block = json!({"up": true});
+    for key in [
+        "version",
+        "build",
+        "clients",
+        "buffers",
+        "journalBytes",
+        "imageGen",
+        "loopLagP95Ms",
+        "ackP95Ms",
+    ] {
+        block[key] = status.get(key).cloned().unwrap_or(Value::Null);
+    }
+    block
+}
+
 async fn status(State(app): State<AppState>) -> Json<Value> {
+    let edit = edit_block(app.edit_status().await);
     let host = tokio::task::spawn_blocking(host_status)
         .await
         .unwrap_or_default();
@@ -132,6 +160,7 @@ async fn status(State(app): State<AppState>) -> Json<Value> {
         "sessions": sessions,
         // The units cache arrives with the host endpoints in M5.
         "units": {"total": 0, "active": 0, "failed": 0, "failedNames": []},
+        "edit": edit,
     }))
 }
 
@@ -236,5 +265,18 @@ mod tests {
         assert_eq!(parse_meminfo("MemTotal: 5 kB\n"), None);
         assert_eq!(parse_uptime("12345.67 54321.00\n"), Some(12345));
         assert_eq!(parse_uptime(""), None);
+    }
+
+    #[test]
+    fn the_edit_block_picks_the_status_fields_or_is_null() {
+        assert_eq!(edit_block(None), Value::Null);
+        let status = json!({"version": "1.2", "build": "1.2", "clients": 3, "buffers": 7,
+            "journalBytes": 100, "imageGen": 4, "loopLagP95Ms": 1.5, "ackP95Ms": null,
+            "notesExists": true, "sample": false});
+        assert_eq!(
+            edit_block(Some(status)),
+            json!({"up": true, "version": "1.2", "build": "1.2", "clients": 3, "buffers": 7,
+                "journalBytes": 100, "imageGen": 4, "loopLagP95Ms": 1.5, "ackP95Ms": null})
+        );
     }
 }

@@ -6,6 +6,7 @@ mod artifacts;
 mod auth;
 mod board;
 mod config;
+mod edit_client;
 mod fsapi;
 mod host;
 mod http;
@@ -27,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, broadcast, watch};
@@ -34,6 +36,7 @@ use wb_proto::hub::Summary;
 
 use crate::auth::Floor;
 use crate::config::Config;
+use crate::edit_client::EditHandle;
 use crate::hub::{HubHandle, HubStatus};
 use crate::static_files::Assets;
 
@@ -51,6 +54,10 @@ pub enum FeedMsg {
     Board {
         etag: String,
     },
+    /// The notes index changed (edwind spec R11.7).
+    Notes {
+        generation: u64,
+    },
 }
 
 pub struct App {
@@ -58,6 +65,8 @@ pub struct App {
     pub floor: Floor,
     pub assets: Assets,
     pub hub: HubHandle,
+    /// The edwind connection; `None` when `editSocket` is not configured (R15.5).
+    pub edit: Option<EditHandle>,
     pub feed: broadcast::Sender<FeedMsg>,
     /// Serialises board writes.
     pub board_lock: Mutex<()>,
@@ -74,6 +83,15 @@ impl App {
     pub async fn stopped(&self) {
         let mut shutdown = self.shutdown.clone();
         let _ = shutdown.wait_for(|stopping| *stopping).await;
+    }
+
+    /// edwind's `status`, cached briefly; `None` when edwind is not configured, down
+    /// or silent.
+    pub async fn edit_status(&self) -> Option<Value> {
+        match &self.edit {
+            Some(edit) => edit.status_value().await,
+            None => None,
+        }
     }
 
     /// Counts a socket as running until the returned guard drops.
@@ -138,12 +156,17 @@ async fn run(config: &Path) -> Result<()> {
     let mut int = signal(SignalKind::interrupt())?;
     let (feed, _) = broadcast::channel(FEED_CAPACITY);
     let hub = hub::spawn_control(cfg.hub_socket.clone(), feed.clone());
+    let edit = cfg
+        .edit_socket
+        .clone()
+        .map(|path| edit_client::spawn(path, &cfg.host, feed.clone()));
     let (stop, shutdown) = watch::channel(false);
     let app = Arc::new(App {
         cfg,
         floor,
         assets,
         hub,
+        edit,
         feed,
         board_lock: Mutex::new(()),
         shutdown,

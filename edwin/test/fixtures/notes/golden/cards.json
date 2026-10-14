@@ -1,0 +1,145 @@
+{
+ "root": "<notesDir>",
+ "exists": true,
+ "cards": [
+  {
+   "deck": "grc/vocab",
+   "title": "ἀρετή",
+   "props": {
+    "card": "reverse",
+    "deck": "grc/vocab",
+    "back": "excellence, virtue"
+   },
+   "body": "Aristotle, EN 1103a. See [[Beta#^b1]].",
+   "status": "active",
+   "src": "## ἀρετή ^k3m9x2\ncard:: reverse\ndeck:: grc/vocab\nback:: excellence, virtue\nAristotle, EN 1103a. See [[Beta#^b1]].",
+   "file": "cards/vocab.md",
+   "path": "cards/vocab.md",
+   "line": 3,
+   "id": "cards/vocab.md#^k3m9x2#fwd",
+   "kind": "basic",
+   "front": "ἀρετή",
+   "back": "excellence, virtue",
+   "extra": "Aristotle, EN 1103a. See [[Beta#^b1]]."
+  },
+  {
+   "deck": "grc/vocab",
+   "title": "ἀρετή",
+   "props": {
+    "card": "reverse",
+    "deck": "grc/vocab",
+    "back": "excellence, virtue"
+   },
+   "body": "Aristotle, EN 1103a. See [[Beta#^b1]].",
+   "status": "active",
+   "src": "## ἀρετή ^k3m9x2\ncard:: reverse\ndeck:: grc/vocab\nback:: excellence, virtue\nAristotle, EN 1103a. See [[Beta#^b1]].",
+   "file": "cards/vocab.md",
+   "path": "cards/vocab.md",
+   "line": 3,
+   "id": "cards/vocab.md#^k3m9x2#rev",
+   "kind": "reverse",
+   "front": "excellence, virtue",
+   "back": "ἀρετή",
+   "extra": "Aristotle, EN 1103a. See [[Beta#^b1]]."
+  },
+  {
+   "deck": "grc/vocab",
+   "title": "λόγος",
+   "props": {
+    "card": "basic",
+    "deck": "grc/vocab",
+    "back": "word, reason, account"
+   },
+   "body": "",
+   "status": "active",
+   "src": "## λόγος ^p01x7\ncard:: basic\ndeck:: grc/vocab\nback:: word, reason, account",
+   "file": "cards/vocab.md",
+   "path": "cards/vocab.md",
+   "line": 9,
+   "id": "cards/vocab.md#^p01x7",
+   "kind": "basic",
+   "front": "λόγος",
+   "back": "word, reason, account",
+   "extra": ""
+  },
+  {
+   "deck": "grc/grammar",
+   "title": "aorist of λύω, 1 sg. active indicative",
+   "props": {
+    "card": "type",
+    "deck": "grc/grammar",
+    "back": "ἔλυσα"
+   },
+   "body": "Augment ε + stem λυ + σ + α.",
+   "status": "active",
+   "src": "- aorist of λύω, 1 sg. active indicative ^a0r1s\n  card:: type\n  deck:: grc/grammar\n  back:: ἔλυσα\n  Augment ε + stem λυ + σ + α.",
+   "file": "cards/vocab.md",
+   "path": "cards/vocab.md",
+   "line": 14,
+   "id": "cards/vocab.md#^a0r1s",
+   "kind": "type",
+   "front": "aorist of λύω, 1 sg. active indicative",
+   "back": "ἔλυσα",
+   "extra": "Augment ε + stem λυ + σ + α."
+  },
+  {
+   "deck": "nixos",
+   "title": "NixOS module helpers",
+   "props": {
+    "card": "cloze",
+    "deck": "nixos"
+   },
+   "body": "In a NixOS module, {{c1::mkIf}} guards a config block on a\ncondition, and {{c2::mkEnableOption}} declares a boolean option.",
+   "status": "active",
+   "src": "## NixOS module helpers ^nx0m1\ncard:: cloze\ndeck:: nixos\nIn a NixOS module, {{c1::mkIf}} guards a config block on a\ncondition, and {{c2::mkEnableOption}} declares a boolean option.",
+   "file": "cards/vocab.md",
+   "path": "cards/vocab.md",
+   "line": 20,
+   "id": "cards/vocab.md#^nx0m1#c1",
+   "kind": "cloze",
+   "text": "In a NixOS module, {{c1::mkIf}} guards a config block on a condition, and {{c2::mkEnableOption}} declares a boolean option.",
+   "cloze": 1,
+   "extra": ""
+  },
+  {
+   "deck": "nixos",
+   "title": "NixOS module helpers",
+   "props": {
+    "card": "cloze",
+    "deck": "nixos"
+   },
+   "body": "In a NixOS module, {{c1::mkIf}} guards a config block on a\ncondition, and {{c2::mkEnableOption}} declares a boolean option.",
+   "status": "active",
+   "src": "## NixOS module helpers ^nx0m1\ncard:: cloze\ndeck:: nixos\nIn a NixOS module, {{c1::mkIf}} guards a config block on a\ncondition, and {{c2::mkEnableOption}} declares a boolean option.",
+   "file": "cards/vocab.md",
+   "path": "cards/vocab.md",
+   "line": 20,
+   "id": "cards/vocab.md#^nx0m1#c2",
+   "kind": "cloze",
+   "text": "In a NixOS module, {{c1::mkIf}} guards a config block on a condition, and {{c2::mkEnableOption}} declares a boolean option.",
+   "cloze": 2,
+   "extra": ""
+  },
+  {
+   "deck": "grc/vocab",
+   "title": "An old card",
+   "props": {
+    "card": "basic",
+    "deck": "grc/vocab",
+    "back": "gone",
+    "status": "retired"
+   },
+   "body": "",
+   "status": "retired",
+   "src": "## An old card ^old01\ncard:: basic\ndeck:: grc/vocab\nback:: gone\nstatus:: retired",
+   "file": "cards/vocab.md",
+   "path": "cards/vocab.md",
+   "line": 26,
+   "id": "cards/vocab.md#^old01",
+   "kind": "basic",
+   "front": "An old card",
+   "back": "gone",
+   "extra": ""
+  }
+ ]
+}

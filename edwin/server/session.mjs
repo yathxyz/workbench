@@ -163,9 +163,8 @@ export class Client {
   }
   onImageQuery(msg) {
     const rid = ridOf(msg), from = int(msg, 'from');
-    const entries = this.server.image.after(from);
-    for (let i = 0; i < entries.length; i += 100) { const slice = entries.slice(i, i + 100); this.sendBulk({ t: 'image', gen: slice[slice.length - 1].gen, forms: slice.map(e => e.form) }); }
-    this.send({ t: 'result', rid, value: { gen: this.server.image.gen } });
+    const value = this.server.image.sendAfter(this, from);
+    this.send({ t: 'result', rid, value });
   }
 
   /* ---------- call (§7.4) ---------- */

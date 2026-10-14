@@ -774,7 +774,7 @@ Server to client:
 - **Node fields persisted:** only `{agent, cwd}`.
 
 #### 3.5.3 `/rpc`
-**Kept:** `sample`, `limits`, `tool_result`, `tool_error`, `cancel`, `cmd_result`, and on the server side `text`, `tool`, `done`, `error`, `ok`, `cmd`.
+**Kept:** `sample`, `limits`, `tool_result`, `tool_error`, `cancel`, `cmd_result`, and on the server side `text`, `tool`, `done`, `error`, `ok`, `cmd`. wb-web does not run `sample` itself: it forwards `sample`, `tool_result`, `tool_error` and `cancel` to edwind over its `edit.sock` connection as `sample{sid, tab, …}` and the like, with `sid` a stream id unique in the web process and `tab` the socket's id, and maps edwind's `sample.text`, `sample.tool`, `sample.done` and `sample.error` back to the tab's `id` (edwind spec §12.2). `limits` is `call sample-limits`. A `sample` while edwind is down or reports no model backend is answered `error{id, code: "sampling_disabled"}`, and `limits` with `value: null`. When a socket closes with streams open, wb-web sends `cancel{sid}` for each (R12.8).
 
 **Changed:** `cmd` goes to the leader only (§3.3).
 
@@ -785,7 +785,8 @@ Server to client:
 - `sessions{sessions}` on connect while the hub is up, and again each time the hub comes up;
 - `session{session}`;
 - `gone{sid, epoch}`;
-- `board{etag}` after every successful board PUT, to all clients.
+- `board{etag}` after every successful board PUT, to all clients;
+- `notes{gen}` whenever edwind reports an index change (edwind spec R11.7), to all clients.
 
 **Frontend rules:**
 - `SESS[sid]` is upserted from `/rpc` and `/acp`.
@@ -815,23 +816,24 @@ Server to client:
 
 | Endpoint | Contract |
 |---|---|
-| `GET /api/info` | `{host, home, sample, models, notes, notesExists, state, dist, tmux:false, artifactOrigin:null, agents:[{name,label}], shells:[name], defaultShell, hub:{status, version, build, proto, startedAt, stale}}`. `shells` and `defaultShell` come from the hub's `hello`. While the hub is not up, `agents` and `shells` are `[]`, `defaultShell` is `null` (as it is when the hub reports an empty one), and `hub` carries `status` alone, plus `proto` for an incompatible hub (`version`, `build`, `startedAt` and `stale` are `null`). `models` is `{}` and `dist` is `null` until `sample` and the build artefact arrive (M5). Drops `port`, `artifactPort`, `bind`. |
+| `GET /api/info` | `{host, home, sample, models, notes, notesExists, state, dist, tmux:false, artifactOrigin:null, agents:[{name,label}], shells:[name], defaultShell, hub:{status, version, build, proto, startedAt, stale}}`. `shells` and `defaultShell` come from the hub's `hello`. While the hub is not up, `agents` and `shells` are `[]`, `defaultShell` is `null` (as it is when the hub reports an empty one), and `hub` carries `status` alone, plus `proto` for an incompatible hub (`version`, `build`, `startedAt` and `stale` are `null`). `sample`, `models` and `notesExists` come from edwind's `status` command (cached for 5 s); while edwind is not configured or not up they are `false`, `{}` and `false`. `dist` is `null` until the build artefact arrives. Drops `port`, `artifactPort`, `bind`. |
 | `GET /api/sessions` | `{host, sessions: Summary+state}`; 503 when the hub is down or incompatible |
-| `GET /api/status` | `{host, time, load, mem:{total, available}, uptime, disk:{total, free}, sessions:{alive, tmux:0, byState}, units}`. Each host figure is `null` if it cannot be read, and `sessions` is all `null` while the hub is not up. `units` is all zeros until M5. |
+| `GET /api/status` | `{host, time, load, mem:{total, available}, uptime, disk:{total, free}, sessions:{alive, tmux:0, byState}, units, edit}`. Each host figure is `null` if it cannot be read, and `sessions` is all `null` while the hub is not up. `units` is all zeros until M5. `edit` is `{up:true, version, build, clients, buffers, journalBytes, imageGen, loopLagP95Ms, ackP95Ms}` from edwind's `status` command, and `null` while edwind is not configured or not up (edwind spec R15.11). |
 | `GET /api/pty/{id}/capture?lines=` | `{id, tmux:false, text}`. `lines` defaults to 200 and is clamped to 1..=1000; a non-integer gives 400 "bad query", and an id that sanitises to empty gives 400 "bad id". Hub `not_found` or `kind_mismatch` → 404; hub down → 503; no hub reply within 10 s → 504; any other hub error → 502. |
 | `GET /api/board` | body is the board or `null`. `ETag: "<size>-<mtime_ns>-<ino>"`, or `"empty"` when no file exists. |
 | `PUT /api/board` | A body that is not valid JSON → 400 `{error:"invalid JSON: …"}`, before any `If-Match` check. `If-Match` required:<br>- missing → 428 `{error:"If-Match required"}`;<br>- anything but exactly one value equal to the current tag → 412 `{error:"board changed elsewhere", etag}`, with the current tag in the body only. Weak tags, `*`, comma lists and repeated headers are compared as plain strings and never match;<br>- `"empty"` with no file → 204;<br>- `"empty"` with a file → 412.<br>On success: 204 with the new ETag, an atomic write, and `board{etag}` on `/rpc`. Check and write happen under one mutex. |
 | `GET /api/ls`, `GET /api/stat` | same shapes. A path is `~`, `~/…` or absolute (anything else is 400), with `.` and `..` resolved lexically. `ls` lists directories first, then by lowercased name, at most 2000 entries: `{path, host, entries:[{name, dir, size, mtime, dev, ino, nlink?, mount?, link?}]}`. |
 | `GET /api/cat` | `{path, text, size}`. `limit` default 64000, clamped to 1..=8 MiB. Regular files only, opened non-blocking (a FIFO is refused); a NUL in the first 4000 bytes gives `"(binary file)"` as the text. |
-| `POST /api/mv` | `{src, dst}`, both absolute or `~/…`. No-clobber via `renameat2(NOREPLACE)`; `src` is not resolved, and a `dst` that is an existing directory receives the source's base name. **Refuses** with 400 a `dst` in, on or above `~/.ssh`, `~/.config/systemd` or `~/.local/share/systemd`, as written and with symlinks resolved. The check runs on the path and again on the real path of an `O_PATH` descriptor of the destination's parent, and the rename is made relative to that descriptor, so swapping a path component for a symlink cannot redirect it. Success: `{ok:true, src, dst}`. An existing `dst` → 400 "destination exists"; any other failure (`EROFS`, `EXDEV`, …) → 400 with the OS message. |
-| `GET/PUT /api/db/{node}`, `GET /api/nodes`, `/api/links`, `/api/cards`, `GET/POST /api/reviews`, `GET /api/tasks`, `GET/POST /api/task/{id}`, `POST /api/journal` (`day` required), `POST /api/notes/append` | prototype shapes |
+| `POST /api/mv` | `{src, dst}`, both absolute or `~/…`. No-clobber via `renameat2(NOREPLACE)`; `src` is not resolved, and a `dst` that is an existing directory receives the source's base name. **Refuses** with 400 a `dst` in, on or above each entry of `web.json`'s `refusePaths` (the list Nix also writes into `edit.json`, edwind spec R14.8), or without that key `~/.ssh`, `~/.config/systemd` and `~/.local/share/systemd`, as written and with symlinks resolved. The check runs on the path and again on the real path of an `O_PATH` descriptor of the destination's parent, and the rename is made relative to that descriptor, so swapping a path component for a symlink cannot redirect it. Success: `{ok:true, src, dst}`. An existing `dst` → 400 "destination exists"; any other failure (`EROFS`, `EXDEV`, …) → 400 with the OS message. |
+| `GET /api/nodes?limit=`, `/api/links`, `/api/cards`, `GET/POST /api/reviews`, `GET /api/tasks`, `GET/POST /api/task/{id}`, `POST /api/journal` (`day` required), `POST /api/notes/append` (`path` and `text` required; `by` defaults to `{kind:"web"}`) | prototype shapes, produced by edwind: each is a `call` over `edit.sock` (`notes-nodes [{limit}]`, `notes-links []`, `notes-cards []`, `notes-reviews []`, `notes-reviews-append [{reviews}]`, `notes-tasks []`, `notes-task [{id}]`, `notes-task-set [{id, kw, set, by:{kind:"frame"}}]`, `notes-journal [{day}]`, `notes-append [{path, text, by}]`) whose `value` is the body. A `result.error` or `error` from edwind maps by code: `bad_request` 400, `no_buffer` 404, `refused_path` 403, anything else 502, with edwind's message; no answer in 10 s is 504. Every one of them is 503 `{error:"workbench-edit is not running"}` while edwind is unreachable (edwind spec R11.8). Without `editSocket` in `web.json` the GET routes keep the empty-`notesDir` stubs and the POST routes are 503. |
+| `GET/PUT /api/db/{node}` | prototype shapes |
 | `GET /api/proc`, `GET /api/units`, `GET /api/unit/{n}` | read-only |
 | `GET/PUT /api/artifact/{node}` | srcdoc versions; `url` always `null`; 409 `{error:{code:'conflict', message, head}}` |
 | `POST /api/unit/{n}/{start,stop,restart}` | 403 "unit control is disabled in Workbench; use ssh" |
 | `/api/tmux*`, `/api/hosts`, `POST /api/cmd`, `/api/backlinks`, `POST /api/index/rescan`, `POST /api/tasks`, `POST /api/task/{id}/dispatch`, `DELETE /api/artifact/{n}`, `GET /api/journal`, `/mcp` | 404 |
 | `OPTIONS`, wrong methods | 405, no CORS headers |
 
-**Stubs before M5:** the notes, task, review, artifact, db, proc and unit endpoints return the shapes of an empty `notesDir` and no artifacts, and `/api/info` reports `notesExists:false, sample:false`.
+**Stubs before M5:** the artifact, db, proc and unit endpoints return the shapes of no artifacts and an idle host; the notes, task and review endpoints do the same for an empty `notesDir` only while `web.json` has no `editSocket`, and `/api/info` then reports `notesExists:false, sample:false`.
 
 **Static files:** `/`, `index.html`, `app.js`, `style.css`, `bridge.js`, `sw.js`, `manifest.webmanifest`, `icon.svg`, `vendor/*`, `fonts/*`.
 - They sit behind the same floor and are served from memory with sha256 ETags and `Cache-Control: no-cache`.
@@ -874,7 +876,8 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
   "boardsDir": "/home/alice/work/boards",
   "notesDir": "/home/alice/work/notes",
   "host": "devbox",
-  "sample": {"apiKeyFile": "/run/credentials/workbench-web.service/anthropic-api-key", "baseUrl": "https://api.anthropic.com"}
+  "editSocket": "/run/workbench-edit/edit.sock",
+  "refusePaths": ["/home/alice/.ssh", "/home/alice/.config/systemd", "/home/alice/.local/share/systemd"]
 }
 ```
 - `listen`, `publicOrigin`, `trustedProxy`, `proxySecretFile`, `stateDir`, `webRoot`, `boardsDir`, `notesDir` and `host` are required. `socket` and `hubSocket` default to the values shown.
@@ -882,8 +885,11 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
   - any path is not absolute, or `socket` or `hubSocket` is 108 bytes or longer;
   - `host` does not match `[A-Za-z0-9][A-Za-z0-9._-]*` (it names the board file);
   - `publicOrigin` is not `scheme://host[:port]` with an http or https scheme, no path, query or user, and no default port (browsers never send it);
-  - `sample.apiKeyFile` is not absolute, or `sample.baseUrl` is neither https nor http to a loopback host.
-- `sample` absent or `null`, or an unreadable key file, disables `sample` and keeps the web up.
+  - `editSocket` is present and not absolute, or 108 bytes or longer;
+  - a `refusePaths` entry is neither absolute nor `~` or `~/…`.
+- `editSocket` absent or `null` means no edwind: the notes endpoints stay stubs and `sample` stays off (edwind spec R15.5). With it, wb-web keeps one connection to edwind open (`kind: "web"`, reconnecting with backoff) for the notes endpoints, `sample` and `/api/status`'s `edit` block.
+- `refusePaths` is the destination list `POST /api/mv` refuses, written by Nix from the same list as `edit.json` (edwind spec R14.8); absent means the built-in three.
+- There is no `sample` key: the model backend and its key file are edwind's (`services.workbench.edit.models`, edwind spec R15.6). A config that still carries `sample` fails to load, as any unknown key does.
 - Subprocesses the web runs (`systemctl show`) get `env_clear()` plus `PATH`, `HOME` and `LANG`.
 - The web never spawns long-lived children.
 - There is **no `tmuxSocket`**.

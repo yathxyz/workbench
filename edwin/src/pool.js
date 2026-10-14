@@ -6,14 +6,23 @@
    grep) or Scheme code shipped by closure conversion (thread-run, future, parallel-map). Results
    come back as promises for JS callers and as futures for Scheme, whose handlers run on the main
    thread at a safe point of the command loop. When workers are not available every job still runs
-   on the main thread, only without parallelism. */
+   on the main thread, only without parallelism. In edwind (R4.47, R15.3) the Node host makes each
+   thread from the file server/worker.mjs, which loads the same modules from their files and the named
+   jobs from server/jobs.mjs; the pool's own code is the same on both hosts. */
 (function () {
 'use strict';
+/* A thread of edwind (server/worker.mjs) runs this file in a realm with no editor to take the codec, the
+   thread primitives and the message loop below from the file, since it may not build them from source
+   text as the browser's blob does: the file stops here for it. */
+if (!globalThis.Ed) { globalThis.EdPoolWorker = { codecModule, workerPrims, workerMain }; return; }
 const Ed = globalThis.Ed, E = Ed.E, H = Ed.hooks, L = globalThis.L, S = L.S;
 const { intern, NIL, UNSPEC, listOf, arr, truthy, SchemeError, Sym, Pair } = L;
 const { D, CMD } = L;
 
-const SIZE = Math.min(6, Math.max(1, ((globalThis.navigator && navigator.hardwareConcurrency) || 2) - 1));
+/* The Node host (host-node.js) makes the threads itself, from a file (R4.47, R15.3): makeWorker, workerCount,
+   jobs and the workers switch; the browser host has none of these and the pool builds blob workers. */
+const nodeHost = Ed.host && typeof Ed.host.makeWorker === 'function' ? Ed.host : null;
+const SIZE = nodeHost && nodeHost.workerCount ? Math.max(1, Math.min(16, nodeHost.workerCount)) : Math.min(6, Math.max(1, ((globalThis.navigator && navigator.hardwareConcurrency) || 2) - 1));
 const DELTA_CAP = 4096;          // a mirror more than this many versions behind is reset, not patched (trimLog's own cutoff)
 const MIRROR_BUDGET = 64 << 20;  // per worker: total mirror characters before LRU eviction
 const SCHEME_TIMEOUT = 30000;    // watchdog limit for Scheme jobs in a worker (the main thread uses 8000)
@@ -298,9 +307,25 @@ const codec = mainG.EdCodec;
 const bufferById = id => E.buffers.find(b => b.id === id) || (E.minibuf.id === id ? E.minibuf : null);
 codec.hooks.buffer = h => bufferById(h.id) || false;
 
-const canWorkers = typeof Worker === 'function' && typeof Blob === 'function' && !!globalThis.ropeSource && !!Ed.LEX_SOURCE;
-const hasScheme = !!(globalThis.schemeSource && globalThis.runtimeSource);
+const canWorkers = nodeHost ? nodeHost.workers !== false && !!nodeHost.jobs && !!Ed.LEX_SOURCE
+  : typeof Worker === 'function' && typeof Blob === 'function' && !!globalThis.ropeSource && !!Ed.LEX_SOURCE;
+const hasScheme = nodeHost ? true : !!(globalThis.schemeSource && globalThis.runtimeSource);
 const registry = new Map();         // job name -> { name, fn, src, depsSrc, localOnly }
+/* Every job of server/jobs.mjs is known from the start: a server module runs its own without a define call. */
+if (nodeHost && nodeHost.jobs) for (const [name, fn] of nodeHost.jobs.fns) registry.set(name, { name, fn, src: null, depsSrc: null, localOnly: false });
+/* The thread of slot S: the host's (a file) or a blob built from the module sources. */
+function makeWorker(s) {
+  if (nodeHost) return nodeHost.makeWorker({ k: s.k, withScheme: s.withScheme, lexSource: Ed.LEX_SOURCE, limits: { SCHEME_TIMEOUT, MIRROR_BUDGET } });
+  s.url = buildUrl(s.withScheme);
+  return new Worker(s.url);
+}
+/* edwind's threads hold the process only while work is outstanding (a job, a broadcast, a boot), so a
+   process whose main thread is done ends without terminating them; a Web Worker has no ref or unref. */
+function updateRefs() {
+  if (!nodeHost) return;
+  const live = pending.size > 0 || bWaiters.size > 0 || spawning > 0 || ui.length > 0 || batch.length > 0;
+  for (const s of slots) if (s && s.w) { if (live) s.w.ref(); else s.w.unref(); }
+}
 const urls = { true: null, false: null };
 const jobSource = j => 'JOBS[' + JSON.stringify(j.name) + '] = (function () { ' + j.depsSrc + '\nreturn (' + j.src + '); })();';
 function buildUrl(withScheme) {
@@ -353,13 +378,14 @@ function spawn(k) {
   if (s.w || s.dead || gaveUp) return s;
   s.retired = false;
   let w;
-  try { s.url = buildUrl(s.withScheme); w = new Worker(s.url); }
+  try { w = makeWorker(s); }
   catch (e) { s.dead = true; checkDead(); return s; }
   spawning++;
   s.w = w; s.ready = false; s.scheme = false; s.mirrors = new Map(); s.have = new Map(); s.busy = null;
   w.onmessage = ev => { if (s.w === w) onMessage(s, ev.data); };
   w.onerror = ev => { if (ev && ev.preventDefault) ev.preventDefault(); if (s.w === w) onError(s, ev); };
   try { w.postMessage({ t: 'init', k, size, broadcast: broadcastLog.map(x => x.enc) }); } catch (e) { /* reported by onerror */ }
+  updateRefs();
   return s;
 }
 function ensure(k) { if (!gaveUp && canWorkers && (!slots[k] || !slots[k].w) && !(slots[k] && slots[k].dead)) spawn(k); }
@@ -446,6 +472,7 @@ function onMessage(s, m) {
     /* The thread could not load a job defined after it booted: it is replaced by one whose blob has the job. */
     case 'define-failed': lateUrlDone(m.url); retire(s); schedule(); warm(); break;
   }
+  updateRefs();
 }
 /* Output of display/write in a thread: appended to *Messages*, each line prefixed with the thread. */
 function appendMessages(k, s) {
@@ -477,6 +504,7 @@ function finishJob(job) {
   pending.delete(job.req);
   if (job.slot && job.slot.busy === job) job.slot.busy = null;
   for (const b of job.buffers) if (b._jobs) b._jobs.delete(job.req);
+  updateRefs();
 }
 function resolveJob(job, val, versions) {
   if (job.status === 'done' || job.status === 'failed') return;
@@ -614,6 +642,7 @@ function dispatch(s, job) {
   if (job.future) job.future.status = 'running';
   try { s.w.postMessage(msg, job.transfer || []); }
   catch (e) { rejectJob(job, mkErr('job-error', 'cannot send the job to a thread: ' + e.message)); return; }
+  updateRefs();
   const ms = job.timeout ? (job.kind === 'eval' ? job.timeout + 1000 : job.timeout) : 0;
   if (ms) job.timer = setTimeout(() => { if (pending.get(job.req) === job) terminateSlot(s, 'thread-timeout', 'the job ran for more than ' + Math.round(ms / 1000) + ' s', false); }, ms);
 }
@@ -661,7 +690,19 @@ function progress(job, x) {
 }
 
 /* ---------- JS API ---------- */
+/* edwind (R15.3): a thread is the file server/worker.mjs, which imports server/jobs.mjs, so a job runs on a
+   thread only under a name exported there; FN is then the main-thread version (what runs when the pool
+   is off). A name jobs.mjs lists in LOCAL_ONLY (jobs the core's browser files define by source) runs on
+   the main thread. Any other name would need FN's source shipped to a thread: refused. */
+function defineNode(name, fn) {
+  if (typeof fn !== 'function') throw new Error('EdPool.define(' + name + '): expected a function');
+  const jobs = nodeHost.jobs;
+  if (!jobs || jobs.localOnly.has(name)) { registry.set(name, { name, fn, src: null, depsSrc: null, localOnly: true }); return; }
+  if (jobs.fns.has(name)) { registry.set(name, { name, fn, src: null, depsSrc: null, localOnly: false }); return; }
+  throw new Error('EdPool.define(' + name + '): a function is not shipped to a thread in edwind; export the job as ' + JSON.stringify(name) + ' from edwin/server/jobs.mjs');
+}
 function define(name, fn, deps) {
+  if (nodeHost) return defineNode(name, fn);
   if (typeof fn !== 'function') throw new Error('EdPool.define(' + name + '): expected a function');
   const src = fn.toString();
   if (/\[native code\]/.test(src) || /^async\b/.test(src) || /^function\s*\*/.test(src) || (/^\s*[\w$]+\s*\(/.test(src) && !/^function\b/.test(src))) throw new Error('EdPool.define(' + name + '): the job must be a plain function or arrow');
@@ -1205,6 +1246,7 @@ function broadcastForm(form) {
   const req = ++reqN;
   bWaiters.set(req, { left: live.length, resolve: () => settleFuture(f, 'done', true, null, new Map()) });
   for (const s of live) { try { s.w.postMessage({ t: 'broadcast', form: enc, req }); } catch (e) { /* dying: terminateSlot settles the waiter */ } }
+  updateRefs();
   return f;
 }
 function evalForm(form, opts) { const f = startFuture(form, [], opts || {}, true); return new Promise((res, rej) => f.then(res, rej)); }

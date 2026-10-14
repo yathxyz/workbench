@@ -716,3 +716,217 @@ async fn serve(
         }
     }
 }
+
+/// What the fake edwind's `status` command answers unless a test scripts another.
+pub fn edit_status() -> Value {
+    json!({
+        "version": "0.1.0", "build": "0.1.0", "boot": "boot1", "uptimeMs": 1000,
+        "clients": 1, "buffers": 2, "journalBytes": 4096, "imageGen": 3, "imageEpoch": "epoch1",
+        "loopLagP95Ms": 1.5, "ackP95Ms": 0.5,
+        "notesExists": true, "notesGen": 7,
+        "sample": true, "models": {"default": "tier-default", "quick": "tier-quick"},
+    })
+}
+
+enum EditInject {
+    Line(Value),
+    Close,
+}
+
+type EditRequests = watch::Sender<Vec<(usize, Value)>>;
+
+/// An edwind on a unix socket speaking the edit protocol's framing: `welcome` to
+/// `hello`, `pong` to `ping`, and to `call{cmd}` the scripted answer for `cmd`.
+/// Connections are numbered from 0 in accept order; every message after `hello` is
+/// recorded with its connection number.
+pub struct FakeEdit {
+    pub path: PathBuf,
+    _dir: tempfile::TempDir,
+    requests: watch::Receiver<Vec<(usize, Value)>>,
+    hellos: Arc<Mutex<Vec<Value>>>,
+    conns: Arc<Mutex<Vec<mpsc::UnboundedSender<EditInject>>>>,
+    answers: Arc<Mutex<std::collections::HashMap<String, Value>>>,
+    accept: tokio::task::JoinHandle<()>,
+}
+
+impl FakeEdit {
+    pub fn start() -> FakeEdit {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.sock");
+        FakeEdit::start_at(dir, path)
+    }
+
+    /// An edwind on a path chosen before it starts, for a web that is already running.
+    pub fn start_at(dir: tempfile::TempDir, path: PathBuf) -> FakeEdit {
+        let listener = UnixListener::bind(&path).unwrap();
+        let (record, requests) = watch::channel(Vec::new());
+        let record = Arc::new(record);
+        let hellos = Arc::new(Mutex::new(Vec::new()));
+        let conns = Arc::new(Mutex::new(Vec::new()));
+        let answers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        answers
+            .lock()
+            .unwrap()
+            .insert("status".to_owned(), json!({"value": edit_status()}));
+        let accept = tokio::spawn({
+            let conns = conns.clone();
+            let answers = answers.clone();
+            let hellos = hellos.clone();
+            async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    let id = {
+                        let mut conns = conns.lock().unwrap();
+                        conns.push(tx);
+                        conns.len() - 1
+                    };
+                    tokio::spawn(serve_edit(
+                        id,
+                        stream,
+                        record.clone(),
+                        hellos.clone(),
+                        rx,
+                        answers.clone(),
+                    ));
+                }
+            }
+        });
+        FakeEdit {
+            path,
+            _dir: dir,
+            requests,
+            hellos,
+            conns,
+            answers,
+            accept,
+        }
+    }
+
+    /// Scripts the answer to `call{cmd}`: the fields merged into `result{rid}`, such as
+    /// `{"value": …}` or `{"error": {"condition", "report"}}`, or a whole
+    /// `{"t": "error", "code", "msg"}` for a protocol refusal.
+    pub fn answer(&self, cmd: &str, reply: Value) {
+        self.answers.lock().unwrap().insert(cmd.to_owned(), reply);
+    }
+
+    /// Every `hello` received so far.
+    pub fn hellos(&self) -> Vec<Value> {
+        self.hellos.lock().unwrap().clone()
+    }
+
+    /// Every message after `hello` so far.
+    pub fn requests(&self) -> Vec<(usize, Value)> {
+        self.requests.borrow().clone()
+    }
+
+    /// Waits until `n` recorded messages match `pred`; returns all that match.
+    pub async fn wait_count(&self, n: usize, pred: impl Fn(&Value) -> bool) -> Vec<(usize, Value)> {
+        let mut rx = self.requests.clone();
+        let matching = |all: &Vec<(usize, Value)>| -> Vec<(usize, Value)> {
+            all.iter().filter(|(_, r)| pred(r)).cloned().collect()
+        };
+        let all = timeout(WAIT, rx.wait_for(|all| matching(all).len() >= n))
+            .await
+            .unwrap_or_else(|_| panic!("edwind messages did not arrive:\n{:#?}", self.requests()))
+            .unwrap()
+            .clone();
+        matching(&all)
+    }
+
+    /// Waits for the first message matching `pred`.
+    pub async fn wait_for(&self, pred: impl Fn(&Value) -> bool) -> (usize, Value) {
+        self.wait_count(1, pred).await.remove(0)
+    }
+
+    /// Waits for the first `call` of `cmd`, returning its `args`.
+    pub async fn wait_call(&self, cmd: &str) -> Value {
+        let (_, call) = self.wait_for(|m| m["t"] == "call" && m["cmd"] == cmd).await;
+        call["args"].clone()
+    }
+
+    /// Pushes a line to connection `conn`.
+    pub fn send(&self, conn: usize, msg: Value) {
+        self.conns.lock().unwrap()[conn]
+            .send(EditInject::Line(msg))
+            .unwrap();
+    }
+
+    /// Closes connection `conn` from the edwind side.
+    pub fn close(&self, conn: usize) {
+        let _ = self.conns.lock().unwrap()[conn].send(EditInject::Close);
+    }
+
+    /// Stops accepting and closes every connection; the socket file is removed.
+    pub fn stop(&self) {
+        self.accept.abort();
+        for conn in self.conns.lock().unwrap().iter() {
+            let _ = conn.send(EditInject::Close);
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl Drop for FakeEdit {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+async fn serve_edit(
+    id: usize,
+    stream: UnixStream,
+    record: Arc<EditRequests>,
+    hellos: Arc<Mutex<Vec<Value>>>,
+    mut inject: mpsc::UnboundedReceiver<EditInject>,
+    answers: Arc<Mutex<std::collections::HashMap<String, Value>>>,
+) {
+    let (rx, mut tx) = stream.into_split();
+    let mut lines = FramedRead::new(rx, LinesCodec::new_with_max_length(MAX_LINE));
+    loop {
+        let reply = tokio::select! {
+            line = lines.next() => {
+                let Some(Ok(line)) = line else { return };
+                let msg: Value = serde_json::from_str(&line).unwrap();
+                match msg["t"].as_str().unwrap() {
+                    "hello" => {
+                        hellos.lock().unwrap().push(msg);
+                        json!({"t": "welcome", "proto": 1, "build": "0.1.0", "boot": "boot1",
+                               "imageEpoch": "epoch1", "gen": 3, "caps": {}})
+                    }
+                    "ping" => json!({"t": "pong", "rid": msg["rid"]}),
+                    "call" => {
+                        record.send_modify(|all| all.push((id, msg.clone())));
+                        let cmd = msg["cmd"].as_str().unwrap_or_default();
+                        let scripted = answers.lock().unwrap().get(cmd).cloned();
+                        let mut reply = match scripted {
+                            Some(reply) => reply,
+                            None => json!({"t": "error", "code": "bad_request",
+                                           "msg": format!("unknown command {cmd}")}),
+                        };
+                        if reply["t"] != "error" {
+                            reply["t"] = "result".into();
+                        }
+                        reply["rid"] = msg["rid"].clone();
+                        reply
+                    }
+                    _ => {
+                        record.send_modify(|all| all.push((id, msg)));
+                        continue;
+                    }
+                }
+            }
+            msg = inject.recv() => match msg {
+                Some(EditInject::Line(msg)) => msg,
+                Some(EditInject::Close) | None => return,
+            },
+        };
+        let mut line = reply.to_string().into_bytes();
+        line.push(b'\n');
+        if tx.write_all(&line).await.is_err() {
+            return;
+        }
+    }
+}
