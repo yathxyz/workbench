@@ -64,7 +64,7 @@ Choices E0 made where the spec left one open:
 - Retiring the localStorage stores and the importer (R4.12) wait for served mode (E3); the core already reaches
   storage only through the host.
 
-## Step E1: edwind, the text daemon (in review)
+## Step E1: edwind, the text daemon (done)
 
 `edwin/server/` is edwind: a Node process that loads the core headless, keeps every shared buffer as an Edwin
 buffer, sequences edits from any number of clients over `edit.sock`, journals them, saves atomically and watches
@@ -90,10 +90,12 @@ Choices E1 made where the spec left one open, and where it had to deviate:
   `child_process` before anything else runs (`guardProcesses`, R4.45), and the Authority in `paths.mjs` is the
   one check on file writes, with the unit's `ProtectSystem=strict` and `ReadWritePaths` behind it. The
   conformance suite checks the flags in effect and the guard (R16.16).
-- **Stack size.** The Scheme cap of 10,000 frames (R4.34) needs about 7 MiB of JS stack; Node's default reaches
-  about 1,500. `bin/edwind` sizes `--stack-size` from `ulimit -s` minus headroom (at most 32000 KiB) and the unit
-  sets `LimitSTACK=64M`. `guard` catches the JS stack running out as the `recursion-depth` condition when the
-  stack is smaller than the cap. Browser frames keep the browser's depth.
+- **Stack size.** The Scheme cap of 10,000 frames (R4.34) needs about 7 MiB of JS stack in direct mode (about
+  8.4 MiB in E2's generator mode); Node's default reaches about 1,500. E1 sized `--stack-size` from `ulimit -s`;
+  since E2 `main.mjs` runs the server on a worker thread whose stack it sizes itself (`runInThread`, 32 MiB,
+  `EDWIND_STACK_MIB`), so neither `bin/edwind` nor the unit depends on the soft limit. `guard` catches the JS
+  stack running out as the `recursion-depth` condition when the stack is smaller than the cap. Browser frames
+  keep the browser's depth.
 - **Resend acks wait for the disk.** A batch's `(cid, seq)` is recorded when it is applied, but a resend arriving
   before its `fdatasync` returns gets the ack only after it (R7.15 with R8.3). Edits for a batch go to the clients
   attached when it was applied; a client that opens in between gets it from the `open{since}` replay, never twice.
@@ -120,10 +122,103 @@ Choices E1 made where the spec left one open, and where it had to deviate:
   different order. `ot.test.mjs` states the property that holds; the frames' point stays where the user expects.
 - **Edwin's key-value store** (`storage`) lives in `stateDir/storage.json`; compaction snapshots the text at the
   start of the retained history; journals compact at 4 MiB or 20,000 lines and after a save.
-- **`web.json`** is untouched in E1 (`editSocket`, `refusePaths`, `/edit` and the notes forwarding are E2, R15.5);
-  the module writes `refusePaths` into `edit.json` only. `/api/status`'s `edit` block (R15.11) is E2 as well.
+- **`web.json`** is untouched in E1 (`editSocket`, `refusePaths` and the notes forwarding came with E2, R15.5; the
+  `/edit` relay is E3); the module writes `refusePaths` into `edit.json` only. `/api/status`'s `edit` block
+  (R15.11) came with E2 as well.
 - **VM steps left for later phases:** `wb edit --wait` finished from a frame (E3) and the A7 migration dry run
   (E4). The other R16.18 steps run in `nix/vm.nix` step 10. The security suite's socket cases of R16.12 are in
   `edit-conformance` (start refusal) and the VM (another uid).
 - **`CRASH_ROUNDS`** sets the kill count of the crash suite (default 1,000); `OT_RUNS` the fast-check runs
   (default 10,000); `EDWIND_LOG=1` streams edwind's log in the test harness.
+
+## Step E2: the Lisp machine (in review)
+
+E2 makes the server image a Lisp machine (spec §4 after E0, §5 sessions, §11, §12, R15.6): the evaluator runs
+in generator mode so threads can block, be preempted, time out and stop in a debugger; every `call{form}` and
+every `(:where 'server)` command is a thread; the image log replicates definitions to frames; the notes index,
+the model layer and processes through the hub are server modules with Scheme primitives. `nix/checks.nix` has
+the gates `edit-image`, `edit-notes`, `edit-address`, `edwin-bench` (the evaluator budgets), `edit-lisp`,
+`edwin-pool` and `edit-security`; wb-web forwards the notes endpoints and `sample` over `edit.sock`.
+
+Layout added in E2 (`edwin/server/` unless said): `threads.mjs` (the scheduler, held buffers, ask, timers,
+blocking primitives; `scm/threads.scm`), `debug.mjs` (the debugger, the inspector, apropos, find-definition,
+room, list-threads, list-clients, the primitive registry; `scm/debug.scm`), `image.mjs` (the image log and its
+replication, `*image-log*`), `notes.mjs` and `notes-parse.mjs` (the notes index on a worker thread;
+`scm/notes-syntax.scm` is the grammar), `worker.mjs` and `jobs.mjs` (the worker pool's Node host, with
+`src/pool.js`), `scm/address.scm` (block addresses, R6.14), `process.mjs` and `hub.mjs` (processes through the
+hub; `scm/process.scm`), `wb.mjs` (§5 sessions and events; `scm/wb.scm`), `models.mjs` (backends,
+`http-request`, credentials, `sample`, usage; `scm/models.scm`). Modules install through the extension points
+of `main.mjs` (`MODULES`, `defineCommand`, `onMessage`, `statusProviders`, `buffers.on`).
+
+The evaluator in generator mode (R4.38, `src/scheme.js`): the same compiler produces generator closures, run
+with `yield*`, except for nodes that can call no compound procedure (constants, variable references, lambda,
+calls to primitives with such arguments), which stay plain closures marked `.d`; a compound procedure keeps a
+`gbody` for the generator path and a plain entry that drives it (`driveSync`), so JS callers (hooks, sort
+predicates) still call procedures as functions. A thread yields `Block(promise)` (sleep, ask, join, I/O),
+`PREEMPT` (its slice is over) or `Suspend(condition)` (the debugger); `ThreadState` and `switchTo` swap the
+shadow stack, the handlers, the restarts and the parameter bindings. `loadEdwin(host, {mode: 'gen'})` selects
+it; frames and workers stay in direct mode. Budget: the gen/direct geomean of `scheme-bench.mjs` is 1.2x
+(limit 3x); the shadow stack costs 8.4% (limit 10%). Both suites of `scheme.test.mjs` run in both modes.
+
+Choices E2 made where the spec left one open, and where it had to deviate:
+- **Command threads are not preempted but do break.** A command thread (one `call{form}`, one server command)
+  runs until it finishes, blocks or passes its deadline (R4.39), letting the event loop run every 20 ms so
+  messages are read (interrupt, answer, edits to buffers it does not hold); nothing else runs in those breaks,
+  since the thread is queued first again. Background threads get 5 ms slices round robin (R4.40). Deadlines
+  count runnable time only: a blocked thread does not spend its 2 s (frames) or 30 s (cli).
+- **Held buffers (R4.41).** A thread holds a shared buffer from the moment it edits it or makes it current
+  (`set-buffer`, `with-current-buffer`, the call's `buf`) until its next blocking point or its end. Its edits
+  (Edwin's edit log entries with origin `local`) are then sequenced as one batch in normal form, attributed to
+  the caller (`by` with `via: "server"`, the frame's `cid`, R4.28); client edits to a held buffer wait in the
+  sequencer and are rebased after it. A hold longer than 250 ms of runnable time ends the thread with the
+  `timeout` condition; what it edited is still sequenced. A server batch (`replaceText`, undo, a second
+  thread) on a held buffer first flushes the holder's pending edits, so history stays in rope order; the
+  holder may then find its positions moved (recorded choice: holds do not block the server itself).
+- **Handlers in direct nodes run in place and cannot block.** A primitive error raised from a `.d` node with
+  handlers installed runs the handlers synchronously (R4.31 holds), but a handler that blocks there gets
+  `cannot-block`; the generator path has no such limit.
+- **The server runs on a worker thread** (`runInThread` in `main.mjs`) with `resourceLimits.stackSizeMb` 32, so
+  the 10,000-frame cap holds whatever `ulimit -s` is; the main thread relays SIGTERM and SIGINT. Logs are
+  written synchronously (`fs.writeSync(2, …)`) because a worker's `process.stderr` is an asynchronous relay.
+  `--stack-size` left `bin/edwind` and the test flags; `EDWIND_NO_THREAD=1` runs on the main thread.
+- **`timeout` and `thread-cancelled` never enter the debugger**; `quit` and `scheme-interrupt` are passive
+  as before. `debug-on-error` defaults to true but applies to commands run for frames only: cli calls
+  (R13.10) and background threads report. A thread suspended in the debugger is resumed by `interrupt`
+  (`quit`) or `thread-kill` as any other; the debugger drops its session.
+- **The abort restart ends a thread with the `aborted` condition** in the call's result (R4.37); `thread-join`
+  sees `thread-cancelled`. A mutex a finished thread still holds is released.
+- **Tail calls shape the backtrace.** `(define (f x) (car x))` shows only `car` at the signal: `f`'s frame is
+  gone, as proper tail calls require. Locals by parameter name are those of live frames.
+- **`define-command` accepts `(:where w)` after the interactive clause** (`set-command-where!`, both runtimes).
+  `Server.command()` tries the JS server commands, then Scheme commands declared `server` or `both`; an
+  interactive spec reads its arguments through `ask` when the call carries none. The image's six `image-*`
+  commands are declared `server`. Frames send `call{cmd}` for them in E3 (R4.27); until then a frame that
+  invokes one locally gets the E1 behaviour.
+- **`ask` kinds** are `string`, `completing` (with `table`), `y-or-n`, `yes-or-no`, `number`, `char`; a cli
+  caller gets `user-error` from `read-string` and friends (no minibuffer to ask).
+- **Timers (R4.46)** accept seconds, `"N sec|min|hour"` and `"HH:MM"`; idle means no input from any client
+  (`server.onInput`); each firing is a background thread named after the function.
+- **`make-thread` from a thread run for a frame keeps that frame's `by`,** so a background thread's edits count
+  as the frame's; timers' threads are the server's.
+- **The primitive registry (R4.48)** is built at runtime: `def` captures each primitive's definer in the server
+  image (frames skip it), and the registry reports name, arity, documentation, `where` (`server` for module
+  primitives and marked ones, else `both`; no primitive is marked `frame` yet, a deviation to fill as frames
+  grow), whether it blocks and its source line. `edwind --config … --primitives` prints it; `describe-function`
+  says where a procedure runs. Named server commands and the Scheme commands of `debug.scm` are kept apart
+  (`thread-list`/`list-threads`, `apropos-list`/`apropos`, `definition-of`/`find-definition`, `room-info`/`room`).
+- **The debugger's keys are server commands** (`debug.scm`: `backtrace-mode`, `inspector-mode`); a frame that
+  shows `*Backtrace*` runs them through `call{cmd}` with its point (E3 loads `debug.scm` in frames for the
+  modes). `wb` reaches the same through `debugger-state`, `debugger-frames`, `debugger-eval`, `debugger-restart`,
+  `debugger-continue`, `debugger-abort`, `inspect`.
+- **R4.15 amendment (decided 2026-10-14 in the hypernotes thread, for E3 and later):** forms evaluated in a
+  note's environment are not definitional for the image log (not appended, not broadcast). `image.record`
+  inspects only the heads of top-level `call{form}` forms, so nothing in E2 conflicts; H1 implements it.
+- **The notes index parser runs on a dedicated `worker_threads` worker** (not the pool): `notes-grep` and
+  `unlinked-mentions` block the calling thread while it searches (the sync channel remains for callers outside
+  a thread). The pool's Node host compiles the lexer from a source string inside the worker and duplicates the
+  built-in jobs (deviations recorded in `jobs.mjs`).
+- **Processes (R4.43–R4.45) and the §5 session API:** see `process.mjs`, `hub.mjs` and `wb.mjs` (their headers
+  carry the choices); the primitives live in `edwin/server`, not `edwin/src/wb.js` as the spec names, because
+  server-only code lives in `edwin/server`. The board family waits for EW-M4.
+- **The model layer (§12, R14.4–R14.7):** see `models.mjs` (backends, `http-request`, `credential`, `sample`,
+  the usage log). Keys arrive through `LoadCredential` only; handles print as `#<credential NAME>`.

@@ -716,7 +716,8 @@ in
         TimeoutStopSec = 10;
         OOMScoreAdjust = 100;
         MemoryMax = "${toString (edit.memoryMiB * 5 / 4)}M";
-        # The Scheme cap of 10,000 frames needs about 8 MiB of stack; bin/edwind sizes --stack-size from this.
+        # The server runs on a worker thread whose stack main.mjs sizes itself (32 MiB, the Scheme cap of
+        # 10,000 frames needs about 8 MiB); the limit only has to admit that thread's stack.
         LimitSTACK = "64M";
 
         NoNewPrivileges = true;
