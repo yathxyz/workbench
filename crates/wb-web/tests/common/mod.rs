@@ -42,6 +42,7 @@ pub const WAIT: Duration = Duration::from_secs(10);
 pub type Ws = WebSocketStream<TcpStream>;
 
 /// A config for a wb-web under `dir`, with the secret file and web root written.
+/// `web.sock` is `dir/web.sock`.
 pub fn fixture(dir: &Path, hub_socket: &Path) -> Value {
     std::fs::write(dir.join("secret"), format!("{SECRET}\n")).unwrap();
     std::fs::create_dir(dir.join("web")).unwrap();
@@ -58,6 +59,7 @@ pub fn fixture(dir: &Path, hub_socket: &Path) -> Value {
         "publicOrigin": ORIGIN,
         "trustedProxy": "127.0.0.1",
         "proxySecretFile": dir.join("secret"),
+        "socket": dir.join("web.sock"),
         "hubSocket": hub_socket,
         "stateDir": dir.join("state"),
         "webRoot": dir.join("web"),
@@ -136,6 +138,11 @@ impl Web {
             dir,
             log,
         }
+    }
+
+    /// The fixture's `web.sock`.
+    pub fn socket(&self) -> PathBuf {
+        self.dir.path().join("web.sock")
     }
 
     /// Everything wb-web wrote to stderr so far.

@@ -1,5 +1,6 @@
 //! wb-web: the browser front of Workbench (design §5). It serves the SPA and `/api`,
-//! and relays terminal sockets to wb-hub, all behind the auth floor.
+//! and relays terminal sockets to wb-hub, all behind the auth floor. On `web.sock` it
+//! runs the `wb` CLI's board tools in the leader page.
 #![forbid(unsafe_code)]
 
 mod artifacts;
@@ -21,6 +22,7 @@ mod rpc;
 mod sample;
 mod static_files;
 mod util;
+mod websock;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -39,6 +41,7 @@ use crate::auth::Floor;
 use crate::config::Config;
 use crate::edit_client::EditHandle;
 use crate::hub::{HubHandle, HubStatus};
+use crate::rpc::Pages;
 use crate::static_files::Assets;
 
 /// What any module may publish to every `/rpc` client (W-1).
@@ -71,6 +74,8 @@ pub struct App {
     pub feed: broadcast::Sender<FeedMsg>,
     /// Serialises board writes.
     pub board_lock: Mutex<()>,
+    /// The `/rpc` clients, for `wb` commands (W-4).
+    pub pages: Pages,
     shutdown: watch::Receiver<bool>,
     /// Upgraded sockets still running. axum stops tracking a connection once it is
     /// upgraded, so shutdown waits on this count for their close frames.
@@ -153,6 +158,7 @@ async fn run(config: &Path) -> Result<()> {
     let listener = TcpListener::bind(cfg.listen)
         .await
         .with_context(|| format!("cannot listen on {}", cfg.listen))?;
+    let web_sock = websock::bind(&cfg.socket)?;
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let (feed, _) = broadcast::channel(FEED_CAPACITY);
@@ -170,6 +176,7 @@ async fn run(config: &Path) -> Result<()> {
         edit,
         feed,
         board_lock: Mutex::new(()),
+        pages: Pages::default(),
         shutdown,
         sockets: watch::channel(0).0,
     });
@@ -182,6 +189,7 @@ async fn run(config: &Path) -> Result<()> {
         let _ = stop.send(true);
     });
     tracing::info!("listening on {}", listener.local_addr()?);
+    let wb = tokio::spawn(websock::serve(app.clone(), web_sock));
     let service = routes::app(app.clone()).into_make_service_with_connect_info::<SocketAddr>();
     let graceful = app.clone();
     let server = axum::serve(listener, service)
@@ -192,12 +200,17 @@ async fn run(config: &Path) -> Result<()> {
         let _ = sockets.wait_for(|n| *n == 0).await;
         Ok::<_, std::io::Error>(())
     };
-    tokio::select! {
-        served = served => served.context("server failed")?,
+    let outcome = tokio::select! {
+        served = served => served.context("server failed"),
         () = async {
             app.stopped().await;
             tokio::time::sleep(SHUTDOWN_GRACE).await;
-        } => tracing::warn!("connections still open after the shutdown grace"),
-    }
-    Ok(())
+        } => {
+            tracing::warn!("connections still open after the shutdown grace");
+            Ok(())
+        }
+    };
+    wb.abort();
+    let _ = std::fs::remove_file(&app.cfg.socket);
+    outcome
 }
