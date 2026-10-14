@@ -2278,6 +2278,28 @@ await section('frames', async () => {
   const toolB = await until(async () => (await pageText(B2, two)).endsWith('- written by a tool'), 5000);
   check('frames: read_node returns the page frame\'s text and write_page appends to it; the frame shows the new line in both tabs', tools.read1 === merged && /^ok, .* lines$/.test(tools.wrote) && tools.read2 === merged + '\n- written by a tool' && tools.read2 === tools.text && !!toolDom && !!toolB, JSON.stringify({ read1: tools.read1.slice(-30), wrote: tools.wrote, read2: tools.read2.slice(-40), toolDom: !!toolDom, toolB: !!toolB }));
 
+  // (i) block cards on frames (F-A25): the fence line of a page frame carries the tear-out chip, tear_out_block reads
+  // the page through the replica, and an edit to the block in the other tab reloads the card here
+  const blk = await mk(A2, 'fr-blocks', '# fr-blocks\n\n```html {#frv card=300x200}\n<p id=frv>one</p>\n```\n\n~~~html\n<b>two</b>\n~~~\n', 12000, 13000);
+  await bufOf(A2, blk); await settled(A2);
+  await show(A2, blk); await until(() => frLive(A2, blk), 10000);
+  const tearChips = id => A2.evaluate(id => document.querySelectorAll(`.node[data-id="${id}"] .fr-anchors .cm-tear`).length, id);
+  const chips = await until(async () => (await tearChips(blk)) === 2 ? 2 : null, 5000);
+  await A2.evaluate(id => document.querySelectorAll(`.node[data-id="${id}"] .fr-anchors .cm-tear`)[1]?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true })), blk);
+  const torn = await until(() => A2.evaluate(id => { const C = window.__canvas, n = Object.values(C.S.nodes).find(m => m.block?.page === id); return n ? { block: n.block.id, info: C.pageText(id).includes('~~~html {#block1}'), edge: C.S.edges.some(e => e.from === id && e.to === n.id && e.type === 'ref') } : null; }, blk), 5000);
+  const tornOut = await A2.evaluate(() => window.__canvas.AGENT_TOOLS.find(t => t.name === 'tear_out_block').run({ page: 'fr-blocks', block: 'frv' }).catch(e => 'error: ' + e.message));
+  const blockFrameA = async () => { for (const f of A2.frames()) { try { if (await f.$('#frv')) return f; } catch {} } return null; };
+  let bfA = await until(blockFrameA, 8000);
+  const bfText = bfA ? await bfA.textContent('#frv') : null;
+  check('frames: the fence lines of a page frame carry the tear-out chip; the chip and tear_out_block make block cards bound to the page (an id is written for the block without one) and the card renders the block', chips === 2 && torn?.block === 'block1' && torn.info && torn.edge && /^created/.test(tornOut) && bfText === 'one', JSON.stringify({ chips, torn, tornOut, bfText }));
+  await until(() => B2.evaluate(id => !!window.__canvas.S.nodes[id], blk), 15000);   // the board reaches tab B
+  await show(B2, blk); await until(() => frLive(B2, blk), 10000);
+  const edited = await B2.evaluate(id => { const C = window.__canvas, n = C.S.nodes[id], t = C.pageText(id), i = t.indexOf('>one<'); return i >= 0 && C.pageEdit(n, i + 1, i + 4, 'uno'); }, blk);
+  bfA = await until(async () => { const f = await blockFrameA(); return f && (await f.textContent('#frv')) === 'uno' ? f : null; }, 8000);
+  check('frames: an edit to the block in tab B reaches tab A\'s replica and reloads the block card there', edited === true && !!bfA, JSON.stringify({ edited, reloaded: !!bfA }));
+  await A2.evaluate(id => { const C = window.__canvas; for (const n of Object.values(C.S.nodes)) if (n.block?.page === id) C.removeNode(n.id); C.removeNode(id); }, blk);
+  await settled(A2); await settled(B2);
+
   // (d) edwind down: the card shows the R9.18 notice, the mode line says offline, typing still works locally
   await enterPage(A2, two); await appendAt(A2);
   const stopped = await harnessCtl('stop edit');
