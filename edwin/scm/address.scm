@@ -194,3 +194,5 @@
                                    (i (string-search-forward needle (string-downcase (address-doc-slice doc s e)) 0)))
                               (if i (set! pos (+ s i)) (try (cdr scopes))))))))
                     (cons (car hit) pos))))))))
+
+(provide 'address)

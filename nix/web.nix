@@ -1,5 +1,6 @@
-# The web root: web/ as committed, the vendored xterm bundle, and the fonts, converted to woff2
-# from nixpkgs at build time with a generated fonts/fonts.css. No font file lives in the repo.
+# The web root: web/ as committed, the vendored xterm bundle, the Edwin console and frame runtime
+# under edwin/, and the fonts, converted to woff2 from nixpkgs at build time with a generated
+# fonts/fonts.css. No font file lives in the repo.
 {
   lib,
   runCommand,
@@ -13,6 +14,23 @@ let
     root = ../web;
     fileset = lib.fileset.difference ../web (lib.fileset.maybeMissing ../web/vendor);
   };
+  # Served at /edwin/ (edwind spec R9.19): the console page as /edwin/ (wb-web aliases a directory to
+  # its index.html), the 13 core files under src/ and the Scheme sources under scm/, which the frame
+  # runtime fetches as text/plain. The console page is edwin/console/index.html; until that file
+  # exists the standalone edwin/index.html stands in for it.
+  console =
+    if builtins.pathExists ../edwin/console/index.html then
+      ../edwin/console/index.html
+    else
+      ../edwin/index.html;
+  edwinSrc = lib.fileset.toSource {
+    root = ../edwin/src;
+    fileset = lib.fileset.fileFilter (f: f.hasExt "js") ../edwin/src;
+  };
+  edwinScm = lib.fileset.toSource {
+    root = ../edwin/scm;
+    fileset = lib.fileset.fileFilter (f: f.hasExt "scm") ../edwin/scm;
+  };
   mono = "${nerd-fonts.jetbrains-mono}/share/fonts/truetype/NerdFonts/JetBrainsMono";
   noto = "${noto-fonts}/share/fonts/noto";
 in
@@ -20,6 +38,9 @@ runCommand "workbench-web" { nativeBuildInputs = [ woff2 ]; } ''
   cp -r ${web} $out
   chmod -R u+w $out
   install -Dm444 -t $out/vendor ${vendor}/vendor.js ${vendor}/xterm.css
+  install -Dm444 ${console} $out/edwin/index.html
+  install -Dm444 -t $out/edwin/src ${edwinSrc}/*.js
+  install -Dm444 -t $out/edwin/scm ${edwinScm}/*.scm
 
   mkdir fonts
   cp ${mono}/JetBrainsMonoNerdFontMono-{Regular,Bold}.ttf ${noto}/NotoSans{,-Italic}.ttf fonts/

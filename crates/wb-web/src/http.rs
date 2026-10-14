@@ -110,6 +110,9 @@ pub mod close {
     pub const FINAL: u16 = 1000;
     /// The browser stopped answering pings.
     pub const GOING_AWAY: u16 = 1001;
+    /// A frame the route does not accept: binary, or text holding a newline, on
+    /// `/edit` (edwind spec R9.17).
+    pub const UNSUPPORTED: u16 = 1003;
     /// Protocol violation or open deadline.
     pub const POLICY: u16 = 1008;
     /// Message larger than the route's cap.

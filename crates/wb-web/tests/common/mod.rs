@@ -35,6 +35,8 @@ pub const ORIGIN: &str = "http://wb.example.org";
 /// The fake hub's default shell; never run, the fake hub only records the argv.
 pub const DEFAULT_SHELL: &str = "bash";
 pub const INDEX: &str = "<!doctype html><title>t</title>";
+pub const CONSOLE: &str = "<!doctype html><title>Edwin</title>";
+pub const SCM: &str = "(define (f x) x)\n";
 pub const WAIT: Duration = Duration::from_secs(10);
 
 pub type Ws = WebSocketStream<TcpStream>;
@@ -45,6 +47,12 @@ pub fn fixture(dir: &Path, hub_socket: &Path) -> Value {
     std::fs::create_dir(dir.join("web")).unwrap();
     std::fs::write(dir.join("web/index.html"), INDEX).unwrap();
     std::fs::write(dir.join("web/app.js"), "let x = 1;\n").unwrap();
+    // The Edwin console as nix/web.nix lays it out (edwind spec R9.19).
+    std::fs::create_dir_all(dir.join("web/edwin/scm")).unwrap();
+    std::fs::create_dir_all(dir.join("web/edwin/src")).unwrap();
+    std::fs::write(dir.join("web/edwin/index.html"), CONSOLE).unwrap();
+    std::fs::write(dir.join("web/edwin/src/scheme.js"), "let s = 2;\n").unwrap();
+    std::fs::write(dir.join("web/edwin/scm/emacs.scm"), SCM).unwrap();
     json!({
         "listen": "127.0.0.1:0",
         "publicOrigin": ORIGIN,

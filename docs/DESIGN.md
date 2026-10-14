@@ -419,6 +419,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 ### 3.3.1 `edit.sock` (the `wb` CLI and frames to edwind)
 - **Socket:** `/run/workbench-edit/edit.sock`, created by edwind (`edwin/server/main.mjs`) in the unit's `RuntimeDirectory`; directory 0700, socket 0600, no `SO_PEERCRED` (Node has none): the file permissions admit the same peers, `uid ∈ {geteuid(), 0}`, and edwind refuses to start unless the directory and socket are its own with those modes. NDJSON with the same `MAX_LINE` as hub.sock and web.sock; the messages are those of the edwind spec §7 (`hello`/`welcome`, `open`, `edit`/`ack`/`edits`, `save`, `call`/`result`, `image?`/`image`/`var`, and since E2 `ask`/`answer`, `interrupt`, `display`, `notes`, and the `sample` family wb-web forwards). Every `call` runs on a thread of the server image (edwind spec §4.8): a `call{form}` or a `(:where 'server)` command may block, ask its frame for input, time out (2 s for frames, 30 s for `wb`) or stop in the debugger; `edwin/README.md` Step E2 has the scheduler's rules.
 - **Authority, stated explicitly:** any process running as the service user that can reach edit.sock runs arbitrary code as the service user: `call` with a `form` and `wb eval` evaluate Scheme on the server image, which can open, edit and save any file the unit can write. That is the authority such a process already holds.
+- **Frames (`/edit`, edwind spec R9.16, R9.17):** each browser tab opens one WebSocket to `/edit`, behind the same floor as `/pty`, and wb-web (`relay_edit.rs`) opens one `edit.sock` connection for it. The relay parses nothing: a text frame is a line and a line is a text frame, so the browser sends `hello` with `kind: "frame"` itself. A binary frame or a text frame holding a newline closes 1003; a frame or line over `MAX_LINE` closes 1009; no `editSocket` or a failed connect closes 1013; edwind closing its end closes 1011; wb-web stopping closes 1012. The frame runtime is served under `/edwin/` (§3.5.5).
 
 ### 3.4 Session model
 
@@ -799,11 +800,12 @@ Server to client:
 |---|---|---|
 | 1000 | Final: failed open (`error` sent), kill-forget done, or `gone` | no reconnect; keep the card's state |
 | 1001 | No frame from the browser for `WS_DEAD` (the web pings every `WS_PING`) | reconnect with backoff |
+| 1003 | `/edit` only: a binary frame, or a text frame holding a newline (edwind spec R9.17) | no reconnect; show the error |
 | 1008 | Protocol violation (a bad first message or id) or open deadline | no reconnect; show the error |
 | 1009 | Message too big | no reconnect; show the error |
-| 1011 | Hub connection lost, no hub reply to `open` within 10 s, or "session reloaded" | reconnect with backoff |
+| 1011 | Hub connection lost, no hub reply to `open` within 10 s, or "session reloaded"; on `/edit`, edwind closed its end | reconnect with backoff |
 | 1012 | wb-web restarting | reconnect with backoff |
-| 1013 | Hub unavailable | wait for `/rpc` `hub{up}`, then reconnect |
+| 1013 | Hub unavailable; on `/edit`, no `editSocket` configured or edwind not accepting | wait for `/rpc` `hub{up}`, then reconnect; on `/edit`, the frame runtime's own backoff (edwind spec R7.16) |
 | other / abnormal | network | reconnect with backoff: 500 ms doubling to 30 s, equal jitter |
 
 #### 3.5.5 `/api` endpoints (v1)
@@ -816,12 +818,12 @@ Server to client:
 
 | Endpoint | Contract |
 |---|---|
-| `GET /api/info` | `{host, home, sample, models, notes, notesExists, state, dist, tmux:false, artifactOrigin:null, agents:[{name,label}], shells:[name], defaultShell, hub:{status, version, build, proto, startedAt, stale}}`. `shells` and `defaultShell` come from the hub's `hello`. While the hub is not up, `agents` and `shells` are `[]`, `defaultShell` is `null` (as it is when the hub reports an empty one), and `hub` carries `status` alone, plus `proto` for an incompatible hub (`version`, `build`, `startedAt` and `stale` are `null`). `sample`, `models` and `notesExists` come from edwind's `status` command (cached for 5 s); while edwind is not configured or not up they are `false`, `{}` and `false`. `dist` is `null` until the build artefact arrives. Drops `port`, `artifactPort`, `bind`. |
+| `GET /api/info` | `{host, home, edit, editUp, sample, models, notes, notesExists, state, dist, tmux:false, artifactOrigin:null, agents:[{name,label}], shells:[name], defaultShell, hub:{status, version, build, proto, startedAt, stale}}`. `edit` is `true` when `web.json` has `frames: true` and an `editSocket` (frames on, edwind spec R9.20: app.js then renders pages through Edwin frames over `/edit`); `editUp` is whether wb-web's own edwind connection is up right now (not cached). `shells` and `defaultShell` come from the hub's `hello`. While the hub is not up, `agents` and `shells` are `[]`, `defaultShell` is `null` (as it is when the hub reports an empty one), and `hub` carries `status` alone, plus `proto` for an incompatible hub (`version`, `build`, `startedAt` and `stale` are `null`). `sample`, `models` and `notesExists` come from edwind's `status` command (cached for 5 s); while edwind is not configured or not up they are `false`, `{}` and `false`. `dist` is `null` until the build artefact arrives. Drops `port`, `artifactPort`, `bind`. |
 | `GET /api/sessions` | `{host, sessions: Summary+state}`; 503 when the hub is down or incompatible |
 | `GET /api/status` | `{host, time, load, mem:{total, available}, uptime, disk:{total, free}, sessions:{alive, tmux:0, byState}, units, edit}`. Each host figure is `null` if it cannot be read, and `sessions` is all `null` while the hub is not up. `units` is all zeros until M5. `edit` is `{up:true, version, build, clients, buffers, journalBytes, imageGen, loopLagP95Ms, ackP95Ms}` from edwind's `status` command, and `null` while edwind is not configured or not up (edwind spec R15.11). |
 | `GET /api/pty/{id}/capture?lines=` | `{id, tmux:false, text}`. `lines` defaults to 200 and is clamped to 1..=1000; a non-integer gives 400 "bad query", and an id that sanitises to empty gives 400 "bad id". Hub `not_found` or `kind_mismatch` → 404; hub down → 503; no hub reply within 10 s → 504; any other hub error → 502. |
 | `GET /api/board` | body is the board or `null`. `ETag: "<size>-<mtime_ns>-<ino>"`, or `"empty"` when no file exists. |
-| `PUT /api/board` | A body that is not valid JSON → 400 `{error:"invalid JSON: …"}`, before any `If-Match` check. `If-Match` required:<br>- missing → 428 `{error:"If-Match required"}`;<br>- anything but exactly one value equal to the current tag → 412 `{error:"board changed elsewhere", etag}`, with the current tag in the body only. Weak tags, `*`, comma lists and repeated headers are compared as plain strings and never match;<br>- `"empty"` with no file → 204;<br>- `"empty"` with a file → 412.<br>On success: 204 with the new ETag, an atomic write, and `board{etag}` on `/rpc`. Check and write happen under one mutex. |
+| `PUT /api/board` | A body that is not valid JSON → 400 `{error:"invalid JSON: …"}`, before any `If-Match` check. `If-Match` required:<br>- missing → 428 `{error:"If-Match required"}`;<br>- anything but exactly one value equal to the current tag → 412 `{error:"board changed elsewhere", etag}`, with the current tag in the body only. Weak tags, `*`, comma lists and repeated headers are compared as plain strings and never match;<br>- `"empty"` with no file → 204;<br>- `"empty"` with a file → 412.<br>On success: 204 with the new ETag, an atomic write, and `board{etag}` on `/rpc`. Check and write happen under one mutex.<br>**Migration guard (edwind spec R8.20), under the same mutex, whatever the flags say:** when the body is an object whose `nodes` is an object keyed by id, every incoming node whose stored version has `buf` keeps that `buf`, and `text` and `anchors` are stripped from every node that ends up with `buf`; the amended body is what is written and what GET returns. Any other body shape (`{"v":0}`, `null`, an array `nodes`) is written as sent. **First `buf` (R8.19):** when a PUT brings `buf` to a node whose stored version had none and `<boardsDir>/<host>.pre-edwind.json` does not exist, the stored board is copied there (0600) before the write; the copy is never overwritten. |
 | `GET /api/ls`, `GET /api/stat` | same shapes. A path is `~`, `~/…` or absolute (anything else is 400), with `.` and `..` resolved lexically. `ls` lists directories first, then by lowercased name, at most 2000 entries: `{path, host, entries:[{name, dir, size, mtime, dev, ino, nlink?, mount?, link?}]}`. |
 | `GET /api/cat` | `{path, text, size}`. `limit` default 64000, clamped to 1..=8 MiB. Regular files only, opened non-blocking (a FIFO is refused); a NUL in the first 4000 bytes gives `"(binary file)"` as the text. |
 | `POST /api/mv` | `{src, dst}`, both absolute or `~/…`. No-clobber via `renameat2(NOREPLACE)`; `src` is not resolved, and a `dst` that is an existing directory receives the source's base name. **Refuses** with 400 a `dst` in, on or above each entry of `web.json`'s `refusePaths` (the list Nix also writes into `edit.json`, edwind spec R14.8), or without that key `~/.ssh`, `~/.config/systemd` and `~/.local/share/systemd`, as written and with symlinks resolved. The check runs on the path and again on the real path of an `O_PATH` descriptor of the destination's parent, and the rename is made relative to that descriptor, so swapping a path component for a symlink cannot redirect it. Success: `{ok:true, src, dst}`. An existing `dst` → 400 "destination exists"; any other failure (`EROFS`, `EXDEV`, …) → 400 with the OS message. |
@@ -835,9 +837,10 @@ Server to client:
 
 **Stubs before M5:** the artifact, db, proc and unit endpoints return the shapes of no artifacts and an idle host; the notes, task and review endpoints do the same for an empty `notesDir` only while `web.json` has no `editSocket`, and `/api/info` then reports `notesExists:false, sample:false`.
 
-**Static files:** `/`, `index.html`, `app.js`, `style.css`, `bridge.js`, `sw.js`, `manifest.webmanifest`, `icon.svg`, `vendor/*`, `fonts/*`.
+**Static files:** `/`, `index.html`, `app.js`, `style.css`, `bridge.js`, `sw.js`, `manifest.webmanifest`, `icon.svg`, `vendor/*`, `fonts/*`, and the Edwin console and frame runtime under `edwin/` (`edwin/index.html`, `edwin/src/*.js`, `edwin/scm/*.scm`, copied by `nix/web.nix`; edwind spec R9.19).
 - They sit behind the same floor and are served from memory with sha256 ETags and `Cache-Control: no-cache`.
-- MIME types include `woff2 → font/woff2`, `woff → font/woff`, `ttf → font/ttf` and `otf → font/otf`.
+- Every directory that holds an `index.html` is served at `<dir>/` as well (`/` and `/edwin/`); `<dir>` without the slash and a directory without an index are 404.
+- MIME types include `woff2 → font/woff2`, `woff → font/woff`, `ttf → font/ttf`, `otf → font/otf` and `scm → text/plain` (the frame runtime fetches the Scheme sources).
 
 **Security headers on every response:** `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, and on HTML `Content-Security-Policy: object-src 'none'; base-uri 'none'`.
 
@@ -852,7 +855,7 @@ The middleware is added last, so it wraps every route and the fallback. Checks r
    - required on any request with an `Upgrade` header and on every method other than GET/HEAD, and must equal `publicOrigin`;
    - optional on GET/HEAD, but must match when present.
 
-Only after the floor passes can a request get 404 (unknown upgrade path; only `/pty`, `/acp` and `/rpc` upgrade) or 405.
+Only after the floor passes can a request get 404 (unknown upgrade path; only `/pty`, `/acp`, `/rpc` and `/edit` upgrade) or 405.
 
 **Secret file:** `proxySecretFile`, 0400, delivered through `LoadCredential`, read once at startup. A missing file or bad format, or a missing `trustedProxy`/`publicOrigin`/`listen`, makes the web exit non-zero before listening.
 
@@ -877,6 +880,7 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
   "notesDir": "/home/alice/work/notes",
   "host": "devbox",
   "editSocket": "/run/workbench-edit/edit.sock",
+  "frames": false,
   "refusePaths": ["/home/alice/.ssh", "/home/alice/.config/systemd", "/home/alice/.local/share/systemd"]
 }
 ```
@@ -887,7 +891,8 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
   - `publicOrigin` is not `scheme://host[:port]` with an http or https scheme, no path, query or user, and no default port (browsers never send it);
   - `editSocket` is present and not absolute, or 108 bytes or longer;
   - a `refusePaths` entry is neither absolute nor `~` or `~/…`.
-- `editSocket` absent or `null` means no edwind: the notes endpoints stay stubs and `sample` stays off (edwind spec R15.5). With it, wb-web keeps one connection to edwind open (`kind: "web"`, reconnecting with backoff) for the notes endpoints, `sample` and `/api/status`'s `edit` block.
+- `editSocket` absent or `null` means no edwind: the notes endpoints stay stubs, `sample` stays off and `/edit` closes with 1013 (edwind spec R15.5). With it, wb-web keeps one connection to edwind open (`kind: "web"`, reconnecting with backoff) for the notes endpoints, `sample`, `/api/status`'s `edit` block and `/api/info`'s `editUp`, and opens one more per `/edit` WebSocket (§3.3.1).
+- `frames` (optional, default `false`; Nix writes `services.workbench.edit.frames`) switches the board's page editor to Edwin frames (edwind spec R9.20). `/api/info` reports `edit: true` only when it is `true` and `editSocket` is set; `/edit` itself relays whenever `editSocket` is set.
 - `refusePaths` is the destination list `POST /api/mv` refuses, written by Nix from the same list as `edit.json` (edwind spec R14.8); absent means the built-in three.
 - There is no `sample` key: the model backend and its key file are edwind's (`services.workbench.edit.models`, edwind spec R15.6). A config that still carries `sample` fails to load, as any unknown key does.
 - Subprocesses the web runs (`systemctl show`) get `env_clear()` plus `PATH`, `HOME` and `LANG`.

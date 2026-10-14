@@ -11,6 +11,7 @@ import { readText, saveAtomic, writeAtomic, sha256, diskState, FileError, BIG } 
 import { Journal, readJournal, header as journalHeader, Index, randomId, jidPath } from './journal.mjs';
 import { Sequencer } from './sequencer.mjs';
 import { Watcher, diffOps, merge3 } from './watch.mjs';
+import { restore as restoreAnchors, record as anchorsRecord, publicAnchors } from './anchors.mjs';
 
 const require = createRequire(import.meta.url);
 const OT = require('../src/ot.js');
@@ -30,6 +31,8 @@ export class SBuf {
     this.eol = 'lf'; this.readOnly = false; this.diskChanged = null; this.disk = null; this.big = false;
     this.clients = new Set(); this.journal = null; this.autosave = null; this.lastOpen = Date.now();
     this.special = false; this.writers = []; this.serverEdit = null;
+    /* Shared anchors (R9.12, anchors.mjs): [{id, pos, label?, quote, prefix}], moved by the sequencer. */
+    this.anchors = []; this.anchorsDirty = false;
   }
   get text() { return this.ed.rope.toString(); }
   get modified() { return this.ed.rope.length !== this.savedText.length || this.text !== this.savedText; }
@@ -50,7 +53,7 @@ export class SBuf {
   meta() {
     return {
       file: this.file, mode: this.ed.mode, modified: this.modified, readOnly: this.readOnly, saved: this.savedVer,
-      diskChanged: this.diskChanged, eol: this.eol, anchors: [], locals: {},
+      diskChanged: this.diskChanged, eol: this.eol, anchors: publicAnchors(this), locals: {}, ver: this.ver,
     };
   }
 }
@@ -99,7 +102,7 @@ export class Buffers {
     const jfile = jidPath(this.stateDir, e.jid, '.jsonl');
     if (!fs.existsSync(jfile)) { this.index.delete(e.jid); return; }
     /* Unload stale saved buffers: a header-only journal and no open for 7 days (R8.6). */
-    const { header, batches, mv, torn } = readJournal(jfile);
+    const { header, batches, mv, anchors, torn } = readJournal(jfile);
     const id = mv.length ? mv[mv.length - 1].id : header.id;
     let base = null, baseWhy = '';
     const saved = jidPath(this.stateDir, e.jid, '.saved'), snap = jidPath(this.stateDir, e.jid, '.snap');
@@ -125,13 +128,14 @@ export class Buffers {
       return sb;
     }
     sb.ver = header.base.ver;
-    let bad = null;
+    let bad = null, applied = 0;
     for (const b of batches) {
       if (b.ver !== sb.ver + 1) { bad = `version ${b.ver} after ${sb.ver}`; break; }
       try { this.seq.applyBatch(sb, b.ops, b.by || SERVER_BY, { cid: b.cid ?? null, seq: b.seq ?? null, undo: b.undo || null }); }
       catch (err) { bad = `batch ${b.ver}: ${err.message}`; break; }
-      sb.hist[sb.hist.length - 1].at = b.at || Date.now();
+      sb.hist[sb.hist.length - 1].at = b.at || Date.now(); applied++;
     }
+    restoreAnchors(sb, anchors, batches.slice(0, applied));
     if (torn) this.log.warn('reload', { buf: id, truncated: 'a torn last journal line was dropped' });
     sb.journal = new Journal(jfile).open();
     sb.journal.lines = 1 + batches.length + mv.length;
@@ -338,7 +342,7 @@ export class Buffers {
     writeAtomic(jidPath(this.stateDir, sb.jid, '.snap'), baseText);
     sb.journal.close();
     sb.journal = Journal.create(sb.journal.file, journalHeader({ jid: sb.jid, id: sb.id, name: sb.name, file: sb.file, mode: sb.ed.mode, baseVer, baseText }),
-      sb.hist.map(b => ({ t: 'b', ver: b.ver, cid: b.cid, seq: b.seq, by: b.by, ops: b.ops, undo: b.undo, at: b.at })));
+      [...sb.hist.map(b => ({ t: 'b', ver: b.ver, cid: b.cid, seq: b.seq, by: b.by, ops: b.ops, undo: b.undo, at: b.at })), ...(sb.anchors.length ? [anchorsRecord(sb)] : [])]);
     this.index.set(sb.indexEntry());
   }
 

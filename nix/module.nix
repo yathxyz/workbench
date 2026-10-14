@@ -106,8 +106,12 @@ let
       # The same list edit.json carries (R14.8); wb-web's /api/mv reads it instead of its built-in copy.
       refusePaths = readOnlyUserPaths;
     }
-    # With edwind, wb-web forwards the notes endpoints and `sample` over edit.sock (R15.5).
-    // lib.optionalAttrs edit.enable { inherit editSocket; }
+    # With edwind, wb-web forwards the notes endpoints and `sample` over edit.sock (R15.5) and relays
+    # /edit to it; `frames` switches the board's page editor (R9.20), reported as /api/info `edit`.
+    // lib.optionalAttrs edit.enable {
+      inherit editSocket;
+      frames = edit.frames;
+    }
   );
 
   # edwind (edwin/server, the edwind spec §15). `~` in writablePaths is the service user's home.
@@ -384,7 +388,7 @@ in
       frames = mkOption {
         type = types.bool;
         default = false;
-        description = "Page cards become Edwin frames (E4). Requires edit.enable. Not yet served.";
+        description = "Page cards become Edwin frames over /edit, and the board migrates pages to edwind buffers (edwind spec R8.16, R9.20). Written to web.json as `frames`; /api/info reports it as `edit`. Requires edit.enable. Off by default until E4.";
       };
       memoryMiB = mkOption {
         type = types.ints.positive;

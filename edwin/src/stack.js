@@ -427,15 +427,15 @@ function drawSnipe() {
   let el = f.el('snipe');
   const h = E.snipeHl, w = E.sel;
   if (!h || !w || w.buffer !== h.b || E.mini) { if (el) el.hidden = true; return; }
-  if (!el) { el = f.root.ownerDocument.createElement('div'); el.id = 'snipe'; f.root.appendChild(el); f.parts.snipe = el; }
+  if (!el) { el = f.root.ownerDocument.createElement('div'); el.className = 'snipe'; if (f.legacy) el.id = 'snipe'; f.root.appendChild(el); f.parts.snipe = el; }
   const b = h.b, t = b.rope, fold = h.str === h.str.toLowerCase();
   const first = w.start, last = Ed.eol(t, Ed.lineStartB(b, Math.max(1, w.lastLine || Ed.lineNoB(b, w.start))));
   const hay = t.slice(first, Math.min(t.length, last + h.str.length)), nd = fold ? h.str.toLowerCase() : h.str, src = fold ? hay.toLowerCase() : hay;
-  const frame = f.root.getBoundingClientRect(), boxes = [];
+  const frame = f.root.getBoundingClientRect(), boxes = [], sc = Ed.frameScale(f);
   for (let k = src.indexOf(nd), n = 0; k >= 0 && n < 200; k = src.indexOf(nd, k + 1), n++) {
     if (!h.whole && (h.fwd ? first + k < h.pt : first + k > h.pt)) continue;
     const r = rectAt(w, first + k, h.str.length);
-    if (r && r.width) boxes.push(`<div style="left:${r.left - frame.left}px;top:${r.top - frame.top}px;width:${r.width}px;height:${r.height}px"></div>`);
+    if (r && r.width) boxes.push(`<div style="left:${(r.left - frame.left) / sc}px;top:${(r.top - frame.top) / sc}px;width:${r.width / sc}px;height:${r.height / sc}px"></div>`);
   }
   el.innerHTML = boxes.join(''); el.hidden = !boxes.length;
 }

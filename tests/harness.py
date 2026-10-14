@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Start wb-hub, wb-web and a test Caddy on loopback with temporary configs.
+"""Start wb-hub, edwind, wb-web and a test Caddy on loopback with temporary configs.
 
-  python3 -I tests/harness.py --web-root DIR [--bin-dir DIR] [--dogfood]
+  python3 -I tests/harness.py --web-root DIR [--bin-dir DIR] [--dogfood] [--frames]
 
 Prints one JSON line on stdout once everything listens:
-  {web, caddy, caddySocket, hubSocket, webSocket, caddyAdmin, stateDir, boardsDir, notesDir}
+  {web, caddy, caddySocket, hubSocket, webSocket, editSocket, caddyAdmin, stateDir, boardsDir, notesDir}
 
 wb-web listens on 127.0.0.1:18090 and trusts 127.0.0.1. Caddy injects the proxy secret and
 listens only on caddySocket, a 0600 unix socket in the 0700 temporary directory, for the site
@@ -39,6 +39,14 @@ temporary state directory and a fresh, empty boards directory.
 
 Binaries come from --bin-dir, else from PATH. The web root comes from --web-root or
 $WB_WEB_ROOT (for example the output of `nix build .#workbench-web`).
+
+edwind (the editing server, edwin/server/main.mjs) runs beside wb-web with an edit.json: its socket
+in a 0700 directory under the temporary root, the harness's notesDir and boardsDir, the hub and web
+sockets, and the same host as web.json, whose editSocket points at it. `edwind` comes from --bin-dir
+or PATH when present; otherwise the harness runs edwin/server/main.mjs from this checkout with node
+and the flags of the package wrapper ($EDWIND_MAIN names another main.mjs). --frames writes
+`frames: true` into web.json (ui.mjs and perf.mjs pass it when WB_FRAMES=1); without it the key is
+absent, so a wb-web that does not know it still starts.
 """
 
 import argparse
@@ -141,11 +149,12 @@ def can_connect_unix(path):
 
 
 class Harness:
-    def __init__(self, web_root, bin_dir=None, dogfood=False, tcp=False):
+    def __init__(self, web_root, bin_dir=None, dogfood=False, tcp=False, frames=False):
         self.web_root = str(Path(web_root).resolve())
         self.bin_dir = bin_dir
         self.dogfood = dogfood
         self.tcp = tcp
+        self.frames = frames
         self.bash = resolve_bash()
         self.agents = {}
         if not dogfood:
@@ -160,14 +169,15 @@ class Harness:
         self.secret_file = self.root / "proxy-secret"
         self.hub_sock = str(self.root / "run" / "hub" / "hub.sock")
         self.web_sock = str(self.root / "run" / "web" / "web.sock")
+        self.edit_sock = str(self.root / "run" / "edit" / "edit.sock")
         self.caddy_admin = str(self.root / "caddy-admin.sock")
         self.caddy_sock = str(self.root / "caddy.sock")
         self.boards_dir = self.root / "boards"
         self.notes_dir = self.root / "notes"
         self.home = Path(pwd.getpwuid(os.getuid()).pw_dir) if dogfood else self.root / "home"
-        self.hub = self.web = self.caddy = self.tcp_server = None
+        self.hub = self.edit = self.web = self.caddy = self.tcp_server = None
 
-        for d in ("run/hub", "run/web", "state", "caddy"):
+        for d in ("run/hub", "run/web", "run/edit", "state", "caddy", "config/edwin"):
             (self.root / d).mkdir(mode=0o700, parents=True)
         for d in (self.boards_dir, self.notes_dir) + (() if dogfood else (self.home,)):
             d.mkdir(mode=0o700)
@@ -203,9 +213,27 @@ class Harness:
             "boardsDir": str(self.boards_dir),
             "notesDir": str(self.notes_dir),
             "host": host,
+            "editSocket": self.edit_sock,
+        }
+        if frames:
+            self.web_config["frames"] = True
+        # edwin/server/main.mjs loadConfig: unknown fields are refused, notesDir is required, the socket's
+        # directory must be 0700 and owned by this user. configDir is private to the run: the user's own
+        # init.scm never reaches a test.
+        self.edit_config = {
+            "socket": self.edit_sock,
+            "hubSocket": self.hub_sock,
+            "webSocket": self.web_sock,
+            "stateDir": str(self.root / "state" / "edit"),
+            "notesDir": str(self.notes_dir),
+            "boardsDir": str(self.boards_dir),
+            "configDir": str(self.root / "config" / "edwin"),
+            "host": host,
+            "logLevel": "info",
         }
         self.hub_json = self.write_json("hub.json", self.hub_config)
         self.web_json = self.write_json("web.json", self.web_config)
+        self.edit_json = self.write_json("edit.json", self.edit_config)
 
     def write_json(self, name, obj):
         path = self.root / name
@@ -213,10 +241,10 @@ class Harness:
         return str(path)
 
     def bin(self, name):
-        """wb-* from --bin-dir when given, everything else from PATH. wb-fake-acp falls back to PATH:
-        the package installs it in its `fake` output, apart from wb-hub and wb-web."""
+        """wb-* and edwind from --bin-dir when given, everything else from PATH. wb-fake-acp falls back
+        to PATH: the package installs it in its `fake` output, apart from wb-hub, wb-web and edwind."""
         path = None
-        if self.bin_dir and name.startswith("wb-"):
+        if self.bin_dir and (name.startswith("wb-") or name == "edwind"):
             path = os.path.join(self.bin_dir, name)
             if name == "wb-fake-acp" and not os.access(path, os.X_OK):
                 path = None
@@ -252,6 +280,24 @@ class Harness:
             env.update(CANARIES)
         self.hub = self.spawn("hub", [self.bin("wb-hub"), "--config", self.hub_json], env)
         wait_until(lambda: can_connect_unix(self.hub_sock), "wb-hub", self.hub)
+
+    def edwind_argv(self):
+        """`edwind --config edit.json` from --bin-dir or PATH; else node on this checkout's main.mjs (or
+        $EDWIND_MAIN) with the flags the package wrapper uses (nix/package.nix, edwin/test/edit-client.mjs)."""
+        try:
+            return [self.bin("edwind"), "--config", self.edit_json]
+        except RuntimeError:
+            pass
+        main = os.environ.get("EDWIND_MAIN") or str(Path(__file__).resolve().parent.parent / "edwin" / "server" / "main.mjs")
+        node = shutil.which("node")
+        if not node or not os.path.exists(main):
+            raise RuntimeError(f"edwind not found (use --bin-dir or PATH), and no node for {main}")
+        return [node, "--disallow-code-generation-from-strings", "--frozen-intrinsics",
+                "--no-warnings=ExperimentalWarning", main, "--config", self.edit_json]
+
+    def start_edit(self):
+        self.edit = self.spawn("edit", self.edwind_argv(), self.base_env())
+        wait_until(lambda: can_connect_unix(self.edit_sock), "edwind", self.edit)
 
     def start_web(self):
         self.web = self.spawn("web", [self.bin("wb-web"), "--config", self.web_json], self.base_env())
@@ -299,7 +345,7 @@ class Harness:
         # A stale listener would pass the readiness check and answer for the new wb-web.
         if can_connect_tcp(WEB_ADDR):
             raise RuntimeError(f"{WEB_ADDR[0]}:{WEB_ADDR[1]} is already in use")
-        for name, step in (("hub", self.start_hub), ("web", self.start_web), ("caddy", self.start_caddy)):
+        for name, step in (("hub", self.start_hub), ("edit", self.start_edit), ("web", self.start_web), ("caddy", self.start_caddy)):
             try:
                 step()
             except RuntimeError as e:
@@ -330,7 +376,7 @@ class Harness:
             except OSError:
                 pass
             self.tcp_server.close()
-        for proc in (self.caddy, self.web, self.hub):
+        for proc in (self.caddy, self.web, self.edit, self.hub):
             self.stop_proc(proc)
         shutil.rmtree(self.root, ignore_errors=True)
 
@@ -341,6 +387,7 @@ class Harness:
             "caddySocket": self.caddy_sock,
             "hubSocket": self.hub_sock,
             "webSocket": self.web_sock,
+            "editSocket": self.edit_sock,
             "caddyAdmin": self.caddy_admin,
             "stateDir": self.hub_config["stateDir"],
             "boardsDir": str(self.boards_dir),
@@ -363,6 +410,7 @@ def main():
     p.add_argument("--web-root", default=os.environ.get("WB_WEB_ROOT"))
     p.add_argument("--bin-dir", help="directory holding wb-hub and wb-web (default: PATH)")
     p.add_argument("--dogfood", action="store_true", help="real HOME, no canaries, ignore stdin")
+    p.add_argument("--frames", action="store_true", help="web.json frames: true (pages as Edwin frames)")
     a = p.parse_args()
     if not a.web_root:
         p.error("--web-root or $WB_WEB_ROOT is required")
@@ -378,7 +426,7 @@ def main():
         signal.signal(s, on_signal)
 
     try:
-        h = Harness(a.web_root, a.bin_dir, a.dogfood, tcp=os.environ.get("WB_HARNESS_TCP") == "1")
+        h = Harness(a.web_root, a.bin_dir, a.dogfood, tcp=os.environ.get("WB_HARNESS_TCP") == "1", frames=a.frames)
     except RuntimeError as e:
         print(f"harness: {e}", file=sys.stderr)
         return 1
@@ -437,7 +485,7 @@ def main():
                     print(f"harness: {e}\n{h.log_tail('web')}", file=sys.stderr)
                     status = 1
                     return status
-            for name, proc in (("wb-hub", h.hub), ("wb-web", h.web), ("caddy", h.caddy)):
+            for name, proc in (("wb-hub", h.hub), ("edwind", h.edit), ("wb-web", h.web), ("caddy", h.caddy)):
                 if name == "wb-hub" and hub_stopped:
                     continue
                 if proc.poll() is not None:

@@ -28,11 +28,12 @@ import * as modelsModule from './models.mjs';
 import * as hubModule from './hub.mjs';
 import * as processModule from './process.mjs';
 import * as wbModule from './wb.mjs';
+import * as anchorsModule from './anchors.mjs';
 
 const require = createRequire(import.meta.url);
 /* The E2 modules, installed in this order after the buffers are loaded; each exports install(server) and
    may export shutdown(server) and name. */
-const MODULES = [imageModule, notesModule, threadsModule, debugModule, modelsModule, hubModule, processModule, wbModule];
+const MODULES = [imageModule, notesModule, threadsModule, debugModule, modelsModule, hubModule, processModule, wbModule, anchorsModule];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EDWIN = path.join(HERE, '..');
 export const BUILD = process.env.WB_EDIT_BUILD || 'dev';

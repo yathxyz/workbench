@@ -32,20 +32,32 @@ struct Asset {
     ctype: &'static str,
 }
 
-/// URL path → asset; `/` is `index.html`.
+/// URL path → asset; every `<dir>/` with an `index.html` is that file, `/` included.
 pub struct Assets(HashMap<String, Asset>);
 
 impl Assets {
-    /// Reads every file under `root`, symlinks followed, dot files skipped.
+    /// Reads every file under `root`, symlinks followed, dot files skipped. The root
+    /// must hold an `index.html`; `/edwin/` and any other directory that has one gets
+    /// the same alias (edwind spec R9.19, the console page).
     pub fn load(root: &Path) -> Result<Self> {
         let mut assets = HashMap::new();
         let mut total = 0;
         walk(root, "", 0, &mut assets, &mut total)?;
-        let index = assets
-            .get("/index.html")
-            .cloned()
-            .ok_or_else(|| anyhow!("webRoot {} has no index.html", root.display()))?;
-        assets.insert("/".into(), index);
+        ensure!(
+            assets.contains_key("/index.html"),
+            "webRoot {} has no index.html",
+            root.display()
+        );
+        let indexes: Vec<(String, Asset)> = assets
+            .iter()
+            .filter_map(|(key, asset)| {
+                let dir = key.strip_suffix("index.html")?;
+                Some((dir.to_owned(), asset.clone()))
+            })
+            .collect();
+        for (dir, asset) in indexes {
+            assets.insert(dir, asset);
+        }
         Ok(Assets(assets))
     }
 }
@@ -133,7 +145,8 @@ pub fn mime(name: &str) -> &'static str {
         Some("woff") => "font/woff",
         Some("ttf") => "font/ttf",
         Some("otf") => "font/otf",
-        Some("txt") => "text/plain; charset=utf-8",
+        // Scheme sources the frame runtime fetches from `/edwin/scm/` (R9.19).
+        Some("txt" | "scm") => "text/plain; charset=utf-8",
         Some("md") => "text/markdown; charset=utf-8",
         Some("wasm") => "application/wasm",
         _ => "application/octet-stream",
@@ -225,6 +238,41 @@ mod tests {
     }
 
     #[test]
+    fn every_directory_with_an_index_gets_the_slash_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("index.html"), "root").unwrap();
+        fs::create_dir_all(dir.path().join("edwin/src")).unwrap();
+        fs::create_dir_all(dir.path().join("edwin/scm")).unwrap();
+        fs::write(dir.path().join("edwin/index.html"), "console").unwrap();
+        fs::write(dir.path().join("edwin/src/scheme.js"), "1").unwrap();
+        fs::write(dir.path().join("edwin/scm/emacs.scm"), "(define x 1)").unwrap();
+        let assets = Assets::load(dir.path()).unwrap();
+        let mut keys: Vec<_> = assets.0.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "/",
+                "/edwin/",
+                "/edwin/index.html",
+                "/edwin/scm/emacs.scm",
+                "/edwin/src/scheme.js",
+                "/index.html",
+            ]
+        );
+        assert_eq!(assets.0["/edwin/"].body, "console");
+        assert_eq!(assets.0["/edwin/"].etag, assets.0["/edwin/index.html"].etag);
+        assert_eq!(assets.0["/"].body, "root");
+        assert_eq!(
+            assets.0["/edwin/scm/emacs.scm"].ctype,
+            "text/plain; charset=utf-8"
+        );
+        // No alias for a directory without an index, and none for a plain file.
+        assert!(!assets.0.contains_key("/edwin/src/"));
+        assert!(!assets.0.contains_key("/edwin/src/scheme.js/"));
+    }
+
+    #[test]
     fn a_missing_index_is_fatal() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("app.js"), "1").unwrap();
@@ -247,5 +295,6 @@ mod tests {
         assert_eq!(mime("vendor.js"), "text/javascript; charset=utf-8");
         assert_eq!(mime("manifest.webmanifest"), "application/manifest+json");
         assert_eq!(mime("noext"), "application/octet-stream");
+        assert_eq!(mime("emacs.scm"), "text/plain; charset=utf-8");
     }
 }

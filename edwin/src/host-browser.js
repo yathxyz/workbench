@@ -22,8 +22,16 @@ const storage = {
     return [...s];
   },
 };
-/* The Scheme blocks are named after their files: emacs.scm is <script id="emacs-scm">. */
-function config(name) { const el = doc.getElementById(name.replace(/\.scm$/, '-scm')); return el ? el.textContent.replace(/^\n/, '') : null; }
+/* The shipped Scheme: in served mode the texts the page fetched (EdHost.sources = {name: text}, set by
+   Ed.bootServed, R9.1); on the standalone page the Scheme blocks named after their files, emacs.scm is
+   <script id="emacs-scm">. */
+function config(name) {
+  const src = globalThis.EdHost && globalThis.EdHost.sources;
+  if (src) return Object.hasOwn(src, name) ? src[name] : null;
+  const el = doc.getElementById(name.replace(/\.scm$/, '-scm')); return el ? el.textContent.replace(/^\n/, '') : null;
+}
+/* (require 'feature) and (load "file") read through the load path: the shipped files answer by basename. */
+function readFile(p) { const base = String(p).replace(/^.*\//, ''); return config(base); }
 const camel = name => name.replace(/-([a-z])/g, (m, c) => c.toUpperCase());
 const page = {
   getAttr(name) { return root.dataset[camel(name)]; },
@@ -42,8 +50,8 @@ const page = {
 globalThis.EdHost = {
   kind: 'browser', headless: false, storage, config, page,
   userConfig: () => null,
-  readFile: () => null,
-  loadPath: [],
+  readFile,
+  loadPath: ['scm'],
   onSuspend(f) { addEventListener('pagehide', f); doc.addEventListener('visibilitychange', () => { if (doc.visibilityState === 'hidden') f(); }); },
   whenLoaded(f) { if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', f); else f(); },
   setClipboard(s) { try { navigator.clipboard?.writeText(s).catch(() => {}); } catch (e) { /* not allowed here */ } },

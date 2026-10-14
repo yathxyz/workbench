@@ -234,3 +234,184 @@ async fn bad_board_writes_change_nothing() {
     assert_eq!(res.body, b"null");
     assert!(!web.dir.path().join("boards").exists());
 }
+
+// ---------------------------------------------------------------- edwind migration
+
+/// `<boardsDir>/<host>.pre-edwind.json`, the one-time copy of R8.19.
+fn backup_file(web: &Web) -> PathBuf {
+    web.dir.path().join("boards/testhost.pre-edwind.json")
+}
+
+/// A board whose pages have been migrated to edwind buffers (R8.16).
+fn migrated() -> Value {
+    json!({
+        "v": 1,
+        "nodes": {
+            "p1": {"id": "p1", "kind": "buffer", "buf": "notes/alpha.md", "x": 10, "y": 20},
+            "p2": {"id": "p2", "kind": "buffer", "buf": "notes/beta.md", "x": 30, "y": 40},
+            "t1": {"id": "t1", "kind": "terminal", "sid": "s1"},
+        },
+        "edges": [],
+    })
+}
+
+/// The same board as an app.js that knows no `buf` would save it: `text` and
+/// `anchors` on every page, a page of its own added.
+fn pre_buf() -> Value {
+    json!({
+        "v": 1,
+        "nodes": {
+            "p1": {"id": "p1", "kind": "buffer", "text": "stale alpha", "anchors": [{"id": "a1", "pos": 3}], "x": 11, "y": 20},
+            "p2": {"id": "p2", "kind": "buffer", "text": "stale beta", "x": 30, "y": 40},
+            "p3": {"id": "p3", "kind": "buffer", "text": "a new page", "anchors": []},
+            "t1": {"id": "t1", "kind": "terminal", "sid": "s1"},
+        },
+        "edges": [],
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pre_buf_put_over_a_migrated_board_keeps_every_buf_and_brings_back_no_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = Web::start(&dir.path().join("hub.sock"));
+    let mut rpc = web.ws("/rpc").await;
+
+    let res = put(&web, Some(EMPTY), migrated().to_string().as_bytes()).await;
+    assert_eq!(res.status, 204);
+    let tag1 = res.header("etag").unwrap().to_owned();
+    assert_eq!(next_board(&mut rpc).await["etag"], tag1.as_str());
+    // A first board that already carries buf has nothing to copy.
+    assert!(!backup_file(&web).exists());
+
+    let res = put(&web, Some(&tag1), pre_buf().to_string().as_bytes()).await;
+    assert_eq!(res.status, 204);
+    let tag2 = res.header("etag").unwrap().to_owned();
+    assert_ne!(tag2, tag1);
+    assert_eq!(next_board(&mut rpc).await["etag"], tag2.as_str());
+
+    let res = web.req("GET", "/api/board").send().await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.header("etag"), Some(tag2.as_str()));
+    let board = res.json();
+    let nodes = board["nodes"].as_object().unwrap();
+    // R8.20: every buf survives and no text comes back on a node that has one.
+    for (id, buf) in [("p1", "notes/alpha.md"), ("p2", "notes/beta.md")] {
+        assert_eq!(nodes[id]["buf"], buf, "{id}");
+        assert!(nodes[id].get("text").is_none(), "{id}: {}", nodes[id]);
+        assert!(nodes[id].get("anchors").is_none(), "{id}: {}", nodes[id]);
+    }
+    // The rest of the PUT is honoured: moved card, new page, terminal, version.
+    assert_eq!(nodes["p1"]["x"], 11);
+    assert_eq!(nodes["p3"], pre_buf()["nodes"]["p3"]);
+    assert_eq!(nodes["t1"], migrated()["nodes"]["t1"]);
+    assert_eq!(nodes.len(), 4);
+    assert_eq!(board["v"], 1);
+    assert_eq!(board["edges"], json!([]));
+    // What GET returns is what was written.
+    let on_disk: Value = serde_json::from_slice(&std::fs::read(board_file(&web)).unwrap()).unwrap();
+    assert_eq!(on_disk, board);
+    assert!(is_board_etag(
+        &tag2,
+        std::fs::metadata(board_file(&web)).unwrap().len() as usize
+    ));
+    assert!(!backup_file(&web).exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pre_edwind_copy_is_made_once_when_buf_first_arrives() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = Web::start(&dir.path().join("hub.sock"));
+
+    // The board before edwind: pages with text, no buf anywhere.
+    let before = pre_buf().to_string();
+    let res = put(&web, Some(EMPTY), before.as_bytes()).await;
+    assert_eq!(res.status, 204);
+    let tag1 = res.header("etag").unwrap().to_owned();
+    assert!(!backup_file(&web).exists());
+    // A PUT without buf changes nothing about the copy.
+    let mut moved = pre_buf();
+    moved["nodes"]["p1"]["x"] = json!(99);
+    let res = put(&web, Some(&tag1), moved.to_string().as_bytes()).await;
+    assert_eq!(res.status, 204);
+    let tag2 = res.header("etag").unwrap().to_owned();
+    assert!(!backup_file(&web).exists());
+
+    // The migration (R8.17) brings the first buf: the stored board is copied first.
+    let mut step1 = moved.clone();
+    step1["nodes"]["p1"] = json!({"id": "p1", "kind": "buffer", "buf": "notes/alpha.md", "x": 99});
+    let res = put(&web, Some(&tag2), step1.to_string().as_bytes()).await;
+    assert_eq!(res.status, 204);
+    let tag3 = res.header("etag").unwrap().to_owned();
+    let backup = backup_file(&web);
+    assert_eq!(
+        std::fs::read(&backup).unwrap(),
+        moved.to_string().as_bytes()
+    );
+    assert_eq!(
+        std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::read(board_file(&web)).unwrap(),
+        step1.to_string().as_bytes()
+    );
+
+    // More pages migrate, and a new page arrives with buf: the copy is never touched.
+    let mut step2 = step1.clone();
+    step2["nodes"]["p2"] = json!({"id": "p2", "kind": "buffer", "buf": "notes/beta.md"});
+    step2["nodes"]["p4"] = json!({"id": "p4", "kind": "buffer", "buf": "notes/delta.md"});
+    let res = put(&web, Some(&tag3), step2.to_string().as_bytes()).await;
+    assert_eq!(res.status, 204);
+    let tag4 = res.header("etag").unwrap().to_owned();
+    assert_eq!(
+        std::fs::read(&backup).unwrap(),
+        moved.to_string().as_bytes()
+    );
+
+    // A pre-buf tab saving over it afterwards: bufs kept, copy still the original.
+    let res = put(&web, Some(&tag4), pre_buf().to_string().as_bytes()).await;
+    assert_eq!(res.status, 204);
+    let board = web.req("GET", "/api/board").send().await.json();
+    assert_eq!(board["nodes"]["p1"]["buf"], "notes/alpha.md");
+    assert_eq!(board["nodes"]["p2"]["buf"], "notes/beta.md");
+    // A node the PUT does not carry is deleted, as any delete is: the guard protects
+    // only the nodes the PUT names.
+    assert!(board["nodes"].get("p4").is_none());
+    assert!(board["nodes"]["p3"]["buf"].is_null());
+    assert_eq!(board["nodes"]["p3"]["text"], "a new page");
+    assert_eq!(
+        std::fs::read(&backup).unwrap(),
+        moved.to_string().as_bytes()
+    );
+    let mut files: Vec<_> = std::fs::read_dir(web.dir.path().join("boards"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(files, ["testhost.json", "testhost.pre-edwind.json"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bodies_without_a_nodes_object_are_written_as_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = Web::start(&dir.path().join("hub.sock"));
+    let res = put(&web, Some(EMPTY), migrated().to_string().as_bytes()).await;
+    assert_eq!(res.status, 204);
+    let mut tag = res.header("etag").unwrap().to_owned();
+    // The full wipe, null, and the array shape go through byte for byte.
+    for body in [
+        &b"{\"v\":0}"[..],
+        b"null",
+        b"{\"nodes\":[{\"id\":\"a1\",\"text\":\"t\"}],\"edges\":[]}",
+        b"{ \"v\" : 0 , \"nodes\" : { } }",
+    ] {
+        let res = put(&web, Some(&tag), body).await;
+        assert_eq!(res.status, 204, "{}", String::from_utf8_lossy(body));
+        tag = res.header("etag").unwrap().to_owned();
+        assert!(is_board_etag(&tag, body.len()), "{tag}");
+        let res = web.req("GET", "/api/board").send().await;
+        assert_eq!(res.body, body);
+        assert_eq!(res.header("etag"), Some(tag.as_str()));
+    }
+    assert!(!backup_file(&web).exists());
+}

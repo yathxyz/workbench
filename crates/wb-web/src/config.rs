@@ -34,6 +34,10 @@ pub struct Config {
     /// edwind's `edit.sock`. Absent means no edwind: the notes endpoints stay stubs and
     /// `sample` stays off (edwind spec R15.5).
     pub edit_socket: Option<PathBuf>,
+    /// `services.workbench.edit.frames` (edwind spec R9.20): page cards are Edwin
+    /// frames over `/edit`. Absent means off. `/api/info` reports it as `edit` only
+    /// while `editSocket` is configured too.
+    pub frames: Option<bool>,
     /// The destinations `POST /api/mv` refuses, shared with edwind (R14.8). Absent
     /// means the built-in list.
     pub refuse_paths: Option<Vec<String>>,
@@ -299,6 +303,22 @@ mod tests {
         let (cfg, _) = f.load().unwrap();
         assert!(cfg.edit_socket.is_none());
         assert!(cfg.refuse_paths.is_none());
+    }
+
+    #[test]
+    fn frames_is_off_unless_set() {
+        let f = Fixture::new();
+        let (cfg, _) = f.load().unwrap();
+        assert_eq!(cfg.frames, None);
+        let mut f = Fixture::new();
+        f.cfg["frames"] = json!(true);
+        assert_eq!(f.load().unwrap().0.frames, Some(true));
+        f.cfg["frames"] = json!(false);
+        assert_eq!(f.load().unwrap().0.frames, Some(false));
+        f.cfg["frames"] = Value::Null;
+        assert_eq!(f.load().unwrap().0.frames, None);
+        f.cfg["frames"] = json!("yes");
+        assert!(f.load().is_err());
     }
 
     #[test]

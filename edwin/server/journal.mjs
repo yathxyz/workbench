@@ -83,8 +83,9 @@ export class Journal {
   needsCompaction() { return this.bytes > COMPACT_BYTES || this.lines > COMPACT_LINES; }
 }
 
-/* Read a journal: {header, batches, mv, torn}. A torn last line (no newline, or not JSON) is dropped and
-   reported; any other bad line is a JournalError (the buffer then opens read-only, R8.4). */
+/* Read a journal: {header, batches, mv, anchors, torn}. `anchors` is the last anchors line ({t: 'a', ver, anchors},
+   anchors.mjs) or null. A torn last line (no newline, or not JSON) is dropped and reported; any other bad line is
+   a JournalError (the buffer then opens read-only, R8.4). */
 export function readJournal(file) {
   const text = fs.readFileSync(file, 'utf8');
   const lines = text.split('\n');
@@ -99,6 +100,7 @@ export function readJournal(file) {
   if (header.t !== 'hdr' || !header.jid || !header.base || !Number.isInteger(header.base.ver)) throw new JournalError('bad header', 1);
   if (header.format !== undefined && header.format > FORMAT) throw new JournalError(`journal format ${header.format} is newer than this edwind (${FORMAT})`, 1);
   const batches = [], mv = [];
+  let anchors = null;
   for (let i = 1; i < lines.length; i++) {
     if (lines[i] === '') continue;
     const o = parse(lines[i], i);
@@ -106,9 +108,10 @@ export function readJournal(file) {
       if (!Number.isInteger(o.ver) || !Array.isArray(o.ops)) throw new JournalError(`line ${i + 1}: bad batch`, i + 1);
       batches.push(o);
     } else if (o.t === 'mv') mv.push(o);
+    else if (o.t === 'a') anchors = o;
     /* Unknown line kinds are skipped: a newer edwind may add some (R15.15 covers the format version). */
   }
-  return { header, batches, mv, torn };
+  return { header, batches, mv, anchors, torn };
 }
 
 /* The header line of R8.1. */

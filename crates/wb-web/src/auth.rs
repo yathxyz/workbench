@@ -21,7 +21,7 @@ use crate::http::ApiError;
 const SECRET_HEADER: HeaderName = HeaderName::from_static("x-workbench-proxy-secret");
 
 /// The only paths that upgrade. An `Upgrade` request for any other path is 404.
-const UPGRADE_PATHS: [&str; 3] = ["/pty", "/acp", "/rpc"];
+const UPGRADE_PATHS: [&str; 4] = ["/pty", "/acp", "/rpc", "/edit"];
 
 /// What the floor compares against. Deliberately not `Debug`: it holds the secret.
 pub struct Floor {

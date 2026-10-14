@@ -97,7 +97,7 @@ async fn the_floor_refuses_before_anything_else() {
         .await;
     assert_eq!(res.status, 403, "mutation without Origin");
 
-    for path in ["/pty", "/acp", "/rpc"] {
+    for path in ["/pty", "/acp", "/rpc", "/edit"] {
         let res = upgrade(&web, path).without("Origin").send().await;
         assert_eq!(res.status, 403, "upgrade {path} without Origin");
     }
@@ -123,7 +123,16 @@ async fn the_floor_refuses_before_anything_else() {
 async fn an_authenticated_upgrade_to_an_unknown_path_is_404() {
     let hub = FakeHub::start();
     let web = Web::start(&hub.path);
-    for path in ["/", "/index.html", "/api/info", "/ptyx", "/pty/", "/mcp"] {
+    for path in [
+        "/",
+        "/index.html",
+        "/api/info",
+        "/ptyx",
+        "/pty/",
+        "/mcp",
+        "/edwin/",
+        "/edit/",
+    ] {
         let res = upgrade(&web, path).send().await;
         assert_eq!(res.status, 404, "{path}");
     }
@@ -235,6 +244,40 @@ async fn static_files_have_content_etags() {
         Some("text/javascript; charset=utf-8")
     );
     assert_ne!(res.header("etag"), Some(tag.as_str()));
+
+    // The console: `/edwin/` is its index.html (R9.19), with the same tag; `.scm` is
+    // plain text so the frame runtime can fetch it, and `/edwin/src/` has no index.
+    let console_tag = {
+        let digest = Sha256::digest(common::CONSOLE.as_bytes());
+        let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+        format!("\"{hex}\"")
+    };
+    for path in ["/edwin/", "/edwin/index.html"] {
+        let res = web.req("GET", path).send().await;
+        assert_eq!(res.status, 200, "{path}");
+        assert_eq!(res.body, common::CONSOLE.as_bytes());
+        assert_eq!(res.header("content-type"), Some("text/html; charset=utf-8"));
+        assert_eq!(res.header("etag"), Some(console_tag.as_str()));
+        assert_eq!(
+            res.header("content-security-policy"),
+            Some("object-src 'none'; base-uri 'none'")
+        );
+    }
+    let res = web.req("GET", "/edwin/scm/emacs.scm").send().await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body, common::SCM.as_bytes());
+    assert_eq!(
+        res.header("content-type"),
+        Some("text/plain; charset=utf-8")
+    );
+    let res = web.req("GET", "/edwin/src/scheme.js").send().await;
+    assert_eq!(
+        res.header("content-type"),
+        Some("text/javascript; charset=utf-8")
+    );
+    for path in ["/edwin", "/edwin/src/", "/edwin/scm/", "/edwin/index.html/"] {
+        assert_eq!(web.req("GET", path).send().await.status, 404, "{path}");
+    }
 
     assert_eq!(web.req("POST", "/").send().await.status, 405);
     for path in [

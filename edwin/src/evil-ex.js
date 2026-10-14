@@ -827,7 +827,9 @@ D('insert-file-contents', 'FILENAME', 'Insert the saved file FILENAME at point. 
   const b = cur(), p = b.pt; Ed.insertText(b, v); b.pt = p; return v.length;
 });
 D('revert-buffer', '', 'Reload the current buffer from its saved file, dropping changes.', () => {
-  const b = cur(); if (!b.file) signal('user-error', 'E32: No file name');
+  const b = cur();
+  if (b.shared && Ed.hooks.revertShared) return Ed.hooks.revertShared(b);
+  if (!b.file) signal('user-error', 'E32: No file name');
   const v = Ed.Store.get(b.file); b.text = v ?? ''; b.pt = Math.min(b.pt, b.rope.length); b.modified = false; b.marks = {}; b.jumps = [];
   Ed.message(`"${b.file}" reloaded`); return false;
 });

@@ -348,17 +348,19 @@ CMD('switch-to-buffer', 'BSwitch to buffer: ', 'BUFFER-OR-NAME', 'Display BUFFER
 });
 CMD('kill-buffer', 'bKill buffer: ', '&optional BUFFER-OR-NAME', 'Kill the buffer.', ([n]) => {
   const b = Ed.toBuffer(n === undefined ? false : n);
-  if (b === E.minibuf) return false;
+  if (b.minibuf) return false;
   if (E.buffers.includes(b)) { const save = E.current; E.current = b; try { Ed.runHookSafely('kill-buffer-hook', []); } finally { E.current = save === b ? b : save; } }
   E.buffers = E.buffers.filter(x => x !== b);
   if (!E.buffers.length) Ed.getBufferCreate('*scratch*');
-  for (const w of Ed.windowList()) {
+  if (b.shared && Ed.hooks.killShared) Ed.hooks.killShared(b);
+  const here = Ed.windowList();
+  for (const w of Ed.allWindows()) {
     if (w.buffer !== b) continue;
     const prev = w.prev.find(x => E.buffers.includes(x));
-    if (w.popup && Ed.windowList().length > 1) { Ed.deleteWindow(w); continue; }
+    if (w.popup && here.includes(w) && Ed.windowList().length > 1) { Ed.deleteWindow(w); continue; }
     Ed.setWindowBuffer(prev || E.buffers.find(x => !x.name.startsWith(' ') && x !== b) || E.buffers[0], w);
   }
-  for (const w of Ed.windowList()) w.prev = w.prev.filter(x => x !== b);
+  for (const w of Ed.allWindows()) w.prev = w.prev.filter(x => x !== b);
   if (E.current === b) E.current = E.mini ? E.minibuf : E.win;
   Ed.runHookSafely('buffer-list-update-hook', []);
   return T;
@@ -378,7 +380,7 @@ for (const mode of ['fundamental-mode', 'scheme-mode', 'scheme-interaction-mode'
 D('%save-excursion', 'thunk', 'Call THUNK, then restore the current buffer and point.', ([f]) => {
   const b = cur(), p = b.pt, w = E.current;
   try { return L.apply(f, []); }
-  finally { E.current = w; if (E.buffers.includes(b) || b === E.minibuf) b.pt = Math.min(p, b.rope.length); }
+  finally { E.current = w; if (E.buffers.includes(b) || b.minibuf) b.pt = Math.min(p, b.rope.length); }
 });
 D('%with-current-buffer', 'buffer thunk', 'Call THUNK with BUFFER current.', ([bufArg, f]) => {
   const saved = E.current;
@@ -389,7 +391,7 @@ D('%with-current-buffer', 'buffer thunk', 'Call THUNK with BUFFER current.', ([b
 L.S.gref('%save-excursion').gen = function* ([f]) {
   const b = cur(), p = b.pt, w = E.current;
   try { return yield* L.S.applyG(f, []); }
-  finally { E.current = w; if (E.buffers.includes(b) || b === E.minibuf) b.pt = Math.min(p, b.rope.length); }
+  finally { E.current = w; if (E.buffers.includes(b) || b.minibuf) b.pt = Math.min(p, b.rope.length); }
 };
 L.S.gref('%with-current-buffer').gen = function* ([bufArg, f]) {
   const saved = E.current;
@@ -558,13 +560,20 @@ function lastSexp(b) {
 }
 function evalForm(f) { L.resetOps(); return L.ev(f); }
 function showValue(v) { const s = pr(v, true); Ed.message(typeof v === 'number' && Number.isInteger(v) && v >= 0 ? `${s} (#x${v.toString(16)}, #o${v.toString(8)}${v >= 32 && v < 127 ? ', #\\' + String.fromCharCode(v) : ''})` : s); return v; }
+/* In served mode the interactive evaluations go to the server image (R4.15): hooks.evalServer(text,
+   {insert}) sends call{form} and shows the printed value when the result arrives. */
+const lastSexpText = b => { const end = sexpEnd(b), start = Ed.backwardSexp(b.text, bufLex(b), end); if (start === null) signal('scan-error', 'Containing expression ends prematurely'); return b.rope.slice(start, end); };
 CMD('eval-last-sexp', 'P', 'INSERT', 'Evaluate the sexp before point and show its value. With C-u, insert the value.', ([ins]) => {
-  const b = cur(), v = evalForm(lastSexp(b));
+  const b = cur();
+  if (Ed.hooks.evalServer) return Ed.hooks.evalServer(lastSexpText(b), { insert: truthy(ins) ? 'inline' : null, buf: b });
+  const v = evalForm(lastSexp(b));
   if (truthy(ins)) { b.pt = sexpEnd(b); Ed.insertText(b, pr(v, true)); } else showValue(v);
   return v;
 });
 CMD('eval-print-last-sexp', '*', '', 'Evaluate the sexp before point and insert its value on a new line.', () => {
-  const b = cur(), v = evalForm(lastSexp(b));
+  const b = cur();
+  if (Ed.hooks.evalServer) return Ed.hooks.evalServer(lastSexpText(b), { insert: 'line', buf: b });
+  const v = evalForm(lastSexp(b));
   b.pt = sexpEnd(b); Ed.insertText(b, '\n' + pr(v, true) + '\n'); return v;
 });
 CMD('eval-defun', '', '', 'Evaluate the top-level form around or after point.', () => {
@@ -573,12 +582,21 @@ CMD('eval-defun', '', '', 'Evaluate the top-level form around or after point.', 
   while (s > 0 && !(t.at(s) === '(' && cls[s] === Ed.C.PAR)) s = Ed.bol(t, s - 1);
   if (!(t.at(s) === '(' && cls[s] === Ed.C.PAR)) { s = t.indexOf('(', b.pt); if (s < 0) signal('user-error', 'No top-level form here'); }
   const e = Ed.forwardSexp(t, cls, s); if (e === null) signal('scan-error', 'Unbalanced parentheses');
+  if (Ed.hooks.evalServer) return Ed.hooks.evalServer(t.slice(s, e), { buf: b });
   return showValue(evalForm(L.read(t.slice(s, e))));
 });
 function evalText(text) { let last = false; for (const f of L.readAll(text)) last = evalForm(f); return last; }
-CMD('eval-buffer', '', '&optional BUFFER', 'Evaluate every form in the buffer.', ([b]) => { const buf = Ed.toBuffer(b === undefined ? false : b); evalText(buf.text); Ed.message(`Evaluated ${buf.name}`); return false; });
-CMD('eval-region', 'r', 'START END', 'Evaluate every form in the region.', ([s, e]) => { const b = cur(), [a, z] = region(b, s, e); evalText(b.rope.slice(a, z)); b.markActive = false; return false; });
-CMD('eval-expression', 'xEval: ', 'EXP', 'Evaluate EXP and show its value.', ([x]) => showValue(evalForm(x)));
+CMD('eval-buffer', '', '&optional BUFFER', 'Evaluate every form in the buffer.', ([b]) => {
+  const buf = Ed.toBuffer(b === undefined ? false : b);
+  if (Ed.hooks.evalServer) return Ed.hooks.evalServer(buf.text, { buf, done: `Evaluated ${buf.name}` });
+  evalText(buf.text); Ed.message(`Evaluated ${buf.name}`); return false;
+});
+CMD('eval-region', 'r', 'START END', 'Evaluate every form in the region.', ([s, e]) => {
+  const b = cur(), [a, z] = region(b, s, e); b.markActive = false;
+  if (Ed.hooks.evalServer) return Ed.hooks.evalServer(b.rope.slice(a, z), { buf: b });
+  evalText(b.rope.slice(a, z)); return false;
+});
+CMD('eval-expression', 'xEval: ', 'EXP', 'Evaluate EXP and show its value.', ([x]) => (Ed.hooks.evalServer ? Ed.hooks.evalServer(pr(x, true), {}) : showValue(evalForm(x))));
 CMD('forward-sexp', '^p', '&optional N', 'Move forward over N balanced expressions.', ([n]) => sexpMove(optNum(n, 1)));
 CMD('backward-sexp', '^p', '&optional N', 'Move backward over N balanced expressions.', ([n]) => sexpMove(-optNum(n, 1)));
 function sexpMove(n) {
@@ -601,7 +619,7 @@ L.defvar('indent-tabs-mode', true, 'Non-#f: TAB in a text buffer inserts a tab c
 L.defvar('tab-width', 8, 'Columns between tab stops for the spaces TAB inserts when indent-tabs-mode is #f.');
 CMD('indent-for-tab-command', '*', '', 'Expand a snippet key before point; else indent the line in Scheme buffers; when it is already indented, or elsewhere after a word, complete the word (TAB).', () => {
   const b = cur();
-  if (b === E.minibuf) return L.call('minibuffer-complete', []);
+  if (b.minibuf) return L.call('minibuffer-complete', []);
   const complete = L.get('tab-always-indent') === intern('complete');
   /* yasnippet binds TAB itself, whatever tab-always-indent says. */
   if (globalThis.Yas && globalThis.Yas.keyAt(b)) return globalThis.Yas.expand(b);
@@ -709,6 +727,8 @@ CMD('view-messages', '', '', 'Show the *Messages* buffer.', () => { Ed.setWindow
 /* ---------- files (kept in this browser's local storage) ---------- */
 /* hooks.visited(b, name, fresh) lets stack.js keep recentf and restore the saved place (save-place). */
 function visit(name) {
+  /* In served mode files are edwind's buffers: the protocol client opens the replica (sync.js). */
+  if (Ed.hooks.visit) return Ed.hooks.visit(name);
   const existing = E.buffers.find(b => b.file === name);
   if (existing) { Ed.setWindowBuffer(existing); if (Ed.hooks.visited) Ed.hooks.visited(existing, name, false); return existing; }
   const b = Ed.getBufferCreate(Ed.getBuffer(name) ? L.call('generate-new-buffer-name', [name]) : name);
@@ -731,6 +751,7 @@ function writeTo(b, name) {
 CMD('save-buffer', async () => (cur().file ? [] : [await Ed.readMini('File to save in: ', cur().name.replace(/[*\s]/g, '') || 'untitled', () => Ed.Store.list())]),
   '&optional FILENAME', 'Save the current buffer to its file, asking for a name if it has none.', ([n]) => {
     const b = cur();
+    if (b.shared && Ed.hooks.saveShared) return Ed.hooks.saveShared(b);
     if (b.file && !b.modified && n === undefined) { Ed.message('(No changes need to be saved)'); return false; }
     writeTo(b, n === undefined ? b.file : str(n)); return false;
   });
@@ -1092,22 +1113,56 @@ alias('frame?', 'framep');
 D('frame-live-p', 'x', '#t if X is a frame that has not been deleted.', ([x]) => x instanceof Ed.Frame && E.frames.includes(x));
 D('selected-frame', '', 'The selected frame, or #f in a runtime with no frames.', () => E.frame || false);
 D('frame-list', '', 'All live frames.', () => listOf(E.frames.slice()));
-D('select-frame', 'frame', 'Make FRAME the selected frame.', ([f]) => { Ed.selectFrame(f); Ed.render(); return f; });
-D('delete-frame', '[frame]', 'Delete FRAME (the selected frame by default). Its page elements stay; it stops being drawn.', ([f]) => { const fr = toFrame(f); if (fr) Ed.deleteFrame(fr); return false; });
+D('select-frame', 'frame', 'Make FRAME the selected frame and give it the keyboard.', ([f]) => { Ed.selectFrame(f); f.focus(); Ed.render(); return f; });
+D('delete-frame', '[frame]', 'Delete FRAME (the selected frame by default): its parts leave the page, its buffers stay.', ([f]) => { const fr = toFrame(f); if (fr) fr.destroy(); return false; });
 CMD('other-frame', 'p', 'COUNT', 'Select the COUNTth next frame.', ([n]) => {
   const fs = E.frames; if (fs.length < 2) return false;
   const i = fs.indexOf(E.frame), k = ((i + (typeof n === 'number' ? n : 1)) % fs.length + fs.length) % fs.length;
-  Ed.selectFrame(fs[k]); return false;
+  Ed.selectFrame(fs[k]); fs[k].focus(); return false;
 });
-D('make-frame', 'parent-element . opts', 'Make a frame drawing into PARENT-ELEMENT, a page element. Not available without a page.', ([el]) => {
+/* (make-frame el . opts): opts is a plist, (make-frame el 'buffer b 'kind "card" 'font-size 13). */
+D('make-frame', 'parent-element . opts', 'Make a frame drawing into PARENT-ELEMENT, a page element, with its own windows, echo area and input. OPTS: buffer, kind (card or console), font-size.', ([el, ...rest]) => {
   if (!el || typeof el !== 'object' || !el.ownerDocument) signal('error', 'make-frame needs a page element', el);
-  return Ed.makeFrame(el, {});
+  const o = { kind: 'console' };
+  for (let i = 0; i + 1 < rest.length; i += 2) { const k = rest[i] instanceof Sym ? rest[i].name : String(rest[i]), v = rest[i + 1]; if (k === 'buffer') o.buffer = v; else if (k === 'kind') o.kind = v instanceof Sym ? v.name : String(v); else if (k === 'font-size') o.fontSize = num(v); }
+  return Ed.makeFrame(el, o);
+});
+D('frame-buffer', '[frame]', 'The buffer shown in the selected window of FRAME.', ([f]) => { const fr = toFrame(f); return fr && fr.buffer ? fr.buffer : false; });
+D('frame-kind', '[frame]', "FRAME's kind: card or console.", ([f]) => { const fr = toFrame(f); return fr ? intern(fr.kind) : false; });
+D('line-top', 'frame pos', 'Pixels from the top of FRAME to the top of the drawn line holding POS, or #f when that line is not drawn (R9.12).', ([f, p]) => { const fr = toFrame(f); if (!fr || !fr.root) return false; const r = fr.lineTop(num(p) - 1); return r === null ? false : r; });
+CMD('text-scale-adjust', 'p', 'INC', 'Make the text of this frame larger (C-x C-+), smaller (C-x C--) or the default size again (C-x C-0).', ([n]) => {
+  const f = E.frame; if (!f || !f.root) return false;
+  const ev = L.get('last-command-event'), ch = ev === false ? null : L.chr(ev);
+  const base = f.fontSize || parseFloat(f.root.ownerDocument.defaultView.getComputedStyle(f.root).getPropertyValue('--text-size')) || 14;
+  if (ch === '0') { f.setFontSize(f.baseFontSize || base); return false; }
+  if (!f.baseFontSize) f.baseFontSize = base;
+  f.setFontSize(Math.max(6, Math.min(72, base + (ch === '-' ? -1 : 1) * Math.abs(typeof n === 'number' ? n : 1)))); return false;
+});
+CMD('text-scale-increase', 'p', 'INC', 'Make the text of this frame INC steps larger.', ([n]) => { const f = E.frame; if (f && f.root) { const b = f.fontSize || 14; if (!f.baseFontSize) f.baseFontSize = b; f.setFontSize(Math.min(72, b + (typeof n === 'number' ? n : 1))); } return false; });
+CMD('text-scale-decrease', 'p', 'DEC', 'Make the text of this frame DEC steps smaller.', ([n]) => { const f = E.frame; if (f && f.root) { const b = f.fontSize || 14; if (!f.baseFontSize) f.baseFontSize = b; f.setFontSize(Math.max(6, b - (typeof n === 'number' ? n : 1))); } return false; });
+CMD('ignore', '', '', 'Do nothing.', () => false);
+CMD('eval-in-frame', 'xEval in frame: ', 'FORM', 'Evaluate FORM in this frame runtime, not in the server image: for debugging the frame itself (section 4.6).', ([x]) => showValue(evalForm(x)));
+/* The keys most browsers keep for themselves (R9.8), with what to press instead. */
+const BROWSER_KEYS = [
+  ['C-w', 'closes the tab', 'C-<backspace> or M-DEL deletes a word; in Evil, C-w in Insert state works only in the installed app'],
+  ['C-t', 'opens a tab', 'C-x C-t (transpose-lines) is reachable; use M-x transpose-chars'],
+  ['C-n', 'opens a window', 'use <down> or j; C-x b for buffers'],
+  ['C-q', 'quits the browser (some)', 'use M-x quoted-insert'],
+  ['C-S-v', 'the browser pastes', 'the pasted text goes to the buffer, as a paste event'],
+  ['M-<left> M-<right>', 'history navigation (some browsers)', 'use M-b and M-f, or C-<left> and C-<right>'],
+  ['F1 ... F12', 'browser functions (some)', 'rebind with (global-set-key "<f5>" ...) where the browser lets the key through'],
+];
+CMD('describe-browser-keys', '', '', 'List the keys the browser keeps for itself and their alternatives (R9.8). The installed app (PWA) gets most of them.', () => {
+  const rows = BROWSER_KEYS.map(([k, what, alt]) => `${k.padEnd(20)} ${what.padEnd(34)} ${alt}`).join('\n');
+  helpBuffer(`Keys the browser keeps (they never reach Edwin in a tab; the installed app gets most of them):\n\n${'Key'.padEnd(20)} ${'The browser'.padEnd(34)} Instead\n${rows}\n\nThe board leader (${E.leaderKey}) is released to the page: set-mark-command stays on C-@.\n`);
+  return false;
 });
 
 /* ---------- configuration files: emacs.scm, evil.scm, org.scm, ai.scm and init.scm ---------- */
 /* A lazy config (org.scm) is evaluated at boot without a buffer; :e org.scm then shows the shipped text.
    The host reads the shipped files (R4.1): the page's Scheme blocks in a browser, edwin/scm/ under Node. */
-const CONFIG = [['emacs.scm'], ['evil.scm'], ['org.scm', 'lazy'], ['ai.scm', 'lazy'], ['init.scm']];
+/* markdown.scm is loaded when the host has it (package E of E3); the standalone page may not carry it. */
+const CONFIG = [['emacs.scm'], ['evil.scm'], ['org.scm', 'lazy'], ['markdown.scm', 'lazy'], ['ai.scm', 'lazy'], ['init.scm']];
 const shipped = name => host.config(name);
 function shippedConfig(name) { const c = CONFIG.find(x => x[0] === name && x[1]); return c ? shipped(name) : null; }
 function loadConfig(name, lazy) {
@@ -1172,7 +1227,8 @@ const SCRATCH = `;; Edwin: a small Emacs in the browser, scripted in Scheme, dri
 (evil-define-key 'normal 'global "SPC s" 'shout)
 `;
 /* Ed.boot({host, frame}) starts the editor once all core files have loaded (R9.1). The host is the one
-   the core loaded with; FRAME, when given, is the frame to draw into and take keys from. */
+   the core loaded with; FRAME, when given, is the frame to draw into and take keys from. With no frame
+   the implicit window tree is built (headless, or a served runtime before its first card: Ed.bootServed). */
 let booted = false;
 function boot(opts = {}) {
   if (booted) throw new Error('Edwin has already booted');
@@ -1187,49 +1243,84 @@ function boot(opts = {}) {
   const scratch = Ed.getBufferCreate('*scratch*'); scratch.text = SCRATCH; scratch.pt = 0;
   const errors = [];
   for (const [name, lazy] of CONFIG) { const err = loadConfig(name, lazy); if (err) errors.push(err); }
-  const userErr = loadUserInit(); if (userErr) errors.push(userErr);
+  const userErr = opts.served ? null : loadUserInit(); if (userErr) errors.push(userErr);
   E.buffers = [scratch, ...CONFIG.filter(c => !c[1]).map(([n]) => Ed.getBuffer(n)).filter(Boolean), msgs];
-  E.root = new Ed.Window(scratch); Ed.selectWindow(E.root);
+  if (opts.frame) Ed.selectFrame(opts.frame);
+  E.root = new Ed.Window(scratch); E.sel = null; Ed.selectWindow(E.root);
   if (errors.length) errors.forEach(e => Ed.message(e));
   else Ed.message(Ed.Store.get('init.scm') !== null ? 'Loaded your saved init.scm. :h shows the key reference.' : 'Welcome to Edwin. :h shows the key reference; C-z toggles Emacs keys.');
-  if (opts.frame) { Ed.selectFrame(opts.frame); wire(opts.frame); }
+  if (opts.frame) wire(opts.frame);
   Ed.render();
   Ed.commandLoop();
 }
 Ed.boot = boot;
 
+/* ---------- the page's hooks and keys (section 9.3) ---------- */
+/* The board leader the frame releases (R9.7): a key event whose name equals it is neither handled nor
+   prevented, so the board's which-key opens. */
+E.leaderKey = 'C-SPC';
+Ed.setLeaderKey = name => { E.leaderKey = Ed.normKey(String(name)); return E.leaderKey; };
+/* Set by the page: openPage(name) for wiki-follow and (open-card 'page ...); leaveFrame(frame) asks the
+   page to take the keyboard back. Both do nothing until the page sets them. */
+if (!Ed.hooks.openPage) Ed.hooks.openPage = null;
+if (!Ed.hooks.leaveFrame) Ed.hooks.leaveFrame = null;
+D('open-page', 'name', 'Ask the page to open the note NAME as a card (Ed.hooks.openPage); #f when no page is listening.', ([n]) => { if (!Ed.hooks.openPage) return false; Ed.hooks.openPage(str(n)); return T; });
+CMD('leave-frame', '', '', 'Give the keyboard back to the page (the board), as leader then Esc does.', () => { const f = E.frame; if (f) { if (Ed.hooks.leaveFrame) Ed.hooks.leaveFrame(f); else f.blur(); } return false; });
+
 /* ---------- browser wiring: one frame's input, mouse and menu bar ---------- */
 function wire(f) {
   const ta = f.el('input'), frame = f.root, root = f.el('windows'), doc = frame.ownerDocument, win = doc.defaultView;
+  const on = (el, type, fn, o) => { el.addEventListener(type, fn, o); f.listeners.push([el, type, fn, o]); };
   const focus = () => { if (doc.activeElement !== ta) ta.focus({ preventScroll: true }); };
   const focusHook = name => { try { L.resetOps(); L.runHook(name); } catch (e) { Ed.reportError(e); } };
-  ta.addEventListener('focus', () => { E.focused = true; Ed.selectFrame(f); focusHook('focus-in-hook'); Ed.render(); });
-  ta.addEventListener('blur', () => { E.focused = false; focusHook('focus-out-hook'); Ed.render(); });
-  ta.addEventListener('keydown', e => {
+  on(ta, 'focus', () => {
+    /* Focus follows the textarea: the frame becomes the selected one, and a minibuffer left open in another
+       frame is abandoned (one command loop serves every frame). */
+    const prev = E.frame;
+    if (prev && prev !== f && prev.mini) { prev.mini.done = { quit: true }; Ed.feedKey('<cmd:ignore>'); }
+    if (E.frames.includes(f)) Ed.selectFrame(f);
+    f.focused = true; focusHook('focus-in-hook'); Ed.frameEvent('focus', f); Ed.render();
+  });
+  on(ta, 'blur', () => { f.focused = false; focusHook('focus-out-hook'); Ed.frameEvent('blur', f); Ed.render(); });
+  let composing = false, leaderSaid = false;
+  on(ta, 'keydown', e => {
+    if (composing || e.isComposing) return;
     const k = Ed.keyName(e);
     if (!k) return;
+    if (k === E.leaderKey) {
+      if (!leaderSaid && k === 'C-SPC' && !E.mini) { leaderSaid = true; Ed.message('C-SPC is the board leader; C-@ sets the mark'); Ed.render(); }
+      return;   // released: not handled, not prevented (R9.7)
+    }
     if (k === 'C-v' && Ed.hooks.nativePaste && Ed.hooks.nativePaste()) return;
     e.preventDefault();
     Ed.feedKey(k);
   });
-  ta.addEventListener('beforeinput', e => {
+  on(ta, 'beforeinput', e => {
+    if (composing || e.isComposing) return;
     if (e.inputType === 'deleteContentBackward') { e.preventDefault(); Ed.feedKey('DEL'); }
     else if (e.inputType === 'insertLineBreak' || e.inputType === 'insertParagraph') { e.preventDefault(); Ed.feedKey('RET'); }
   });
-  ta.addEventListener('input', () => {
+  const feedText = v => { for (const ch of v) Ed.feedKey(ch === ' ' ? 'SPC' : ch === '\n' ? 'RET' : ch === '\t' ? 'TAB' : ch); };
+  /* IME composition (Q5): the intermediate values stay in the textarea; the composed text is fed once at
+     compositionend. */
+  on(ta, 'compositionstart', () => { composing = true; ta.value = ''; });
+  on(ta, 'compositionend', e => { composing = false; const v = e.data !== undefined && e.data !== null ? e.data : ta.value; ta.value = ''; if (v) feedText(v); });
+  on(ta, 'input', e => {
+    if (composing || (e && e.isComposing)) return;
     const v = ta.value; ta.value = '';
-    for (const ch of v) Ed.feedKey(ch === ' ' ? 'SPC' : ch === '\n' ? 'RET' : ch === '\t' ? 'TAB' : ch);
+    feedText(v);
   });
-  ta.addEventListener('paste', e => {
+  on(ta, 'paste', e => {
     e.preventDefault();
     const s = e.clipboardData && e.clipboardData.getData('text/plain');
     if (!s) return;
     E.pasteText = s; Ed.feedKey('<cmd:clipboard-yank>');
   });
   let dragFrom = null, dragWin = null;
-  root.addEventListener('mousedown', e => {
-    if (e.button !== 0) return;
+  on(root, 'mousedown', e => {
+    if (e.button !== 0 || e.shiftKey) return;   // Shift-drag moves the card (R9.9)
     e.preventDefault(); focus();
+    if (E.frames.includes(f) && E.frame !== f) Ed.selectFrame(f);
     if (E.mini) return;
     const w = Ed.windowAt(e.clientX, e.clientY);
     if (!w) return;
@@ -1240,10 +1331,10 @@ function wire(f) {
     if (E.isearch) E.isearch = null;
     if (Ed.hooks.mouseDown) Ed.hooks.mouseDown(b, p);
     else { b.pt = p; b.markActive = false; }
-    dragFrom = p; dragWin = w; Ed.render();
+    dragFrom = p; dragWin = w; Ed.frameEvent('point', f, b); Ed.render();
   });
-  win.addEventListener('mousemove', e => {
-    if (dragFrom === null || !(e.buttons & 1) || dragWin !== E.sel) return;
+  on(win, 'mousemove', e => {
+    if (dragFrom === null || !(e.buttons & 1) || dragWin !== E.sel || E.frame !== f) return;
     const p = Ed.posFromPoint(e.clientX, e.clientY, dragWin);
     if (p === null) return;
     const b = dragWin.buffer;
@@ -1251,30 +1342,33 @@ function wire(f) {
     else { b.mark = dragFrom; b.pt = p; b.markActive = p !== dragFrom; }
     Ed.render();
   });
-  win.addEventListener('mouseup', () => { dragFrom = null; dragWin = null; });
-  frame.addEventListener('mousedown', e => { if (!root.contains(e.target) && !e.target.closest('button')) { e.preventDefault(); focus(); } });
-  Ed.hooks.wireWindow = w => {
-    let acc = 0, queued = false;
-    w.view.addEventListener('wheel', e => {
-      e.preventDefault();
-      acc += e.deltaMode === 1 ? e.deltaY * 20 : e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY;
-      if (!queued) { queued = true; host.nextFrame(() => {
-        queued = false; const lh = Ed.lineHeight(); const lines = Math.trunc(acc / lh); if (!lines) return; acc -= lines * lh;
-        Ed.scrollWindow(w, lines);
-        const b = w.buffer, l = Ed.lineNoB(b, w === E.sel ? b.pt : w.pt), l1 = Ed.lineNoB(b, w.start), l2 = l1 + (w.rows || 20) - 1;
-        if (w === E.sel && !E.mini && (l < l1 || l > l2)) { b.pt = Ed.lineStartB(b, l < l1 ? l1 : l2); if (Ed.hooks.clampPoint) Ed.hooks.clampPoint(b); }
-        Ed.frameRender();
-      }); }
-    }, { passive: false });
-  };
+  on(win, 'mouseup', () => { dragFrom = null; dragWin = null; });
+  on(frame, 'mousedown', e => { if (!root.contains(e.target) && !e.target.closest('button')) { e.preventDefault(); focus(); } });
   for (const btn of frame.querySelectorAll('[data-key], [data-cmd]')) {
-    btn.addEventListener('mousedown', e => e.preventDefault());
-    btn.addEventListener('click', () => {
+    on(btn, 'mousedown', e => e.preventDefault());
+    on(btn, 'click', () => {
       focus();
       if (btn.dataset.key) for (const k of Ed.kbd(btn.dataset.key).split(' ')) Ed.feedKey(k);
       else Ed.feedKey('<cmd:' + btn.dataset.cmd + '>');
     });
   }
-  focus();
+  if (f.legacy) focus();
 }
+Ed.hooks.wireFrame = wire;
+/* Wheel scrolling of a window, wired once per window element when it is made (every frame). */
+Ed.hooks.wireWindow = w => {
+  let acc = 0, queued = false;
+  w.view.addEventListener('wheel', e => {
+    e.preventDefault();
+    acc += e.deltaMode === 1 ? e.deltaY * 20 : e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY;
+    if (!queued) { queued = true; host.nextFrame(() => {
+      queued = false; const lh = Ed.metrics(w).lh; const lines = Math.trunc(acc / lh); if (!lines) return; acc -= lines * lh;
+      Ed.scrollWindow(w, lines);
+      const sel = E.frame && E.frame.sel === w;
+      const b = w.buffer, l = Ed.lineNoB(b, sel ? b.pt : w.pt), l1 = Ed.lineNoB(b, w.start), l2 = l1 + (w.rows || 20) - 1;
+      if (sel && !E.mini && (l < l1 || l > l2)) { b.pt = Ed.lineStartB(b, l < l1 ? l1 : l2); if (Ed.hooks.clampPoint) Ed.hooks.clampPoint(b); }
+      Ed.frameRender();
+    }); }
+  }, { passive: false });
+};
 })();
