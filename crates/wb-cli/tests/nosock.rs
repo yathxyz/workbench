@@ -54,7 +54,8 @@ fn usage_errors_exit_2_before_connecting() {
         &["buf", "read", "x", "--lines", "b:a"][..],
         &["eval"][..],
         &["edit"][..],
-        &["frob"][..],
+        &["Frob"][..],
+        &["frob-x"][..],
     ] {
         let run = run_wb(sock, args, None);
         assert_eq!(run.code, 2, "{args:?}: {run:?}");

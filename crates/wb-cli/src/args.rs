@@ -1,6 +1,8 @@
-//! The argv grammar of `wb` (spec §13.1). Usage errors exit 2.
+//! The argv grammar of `wb` (spec §13.1, DESIGN §3.7.4). Usage errors exit 2.
 
 use std::path::PathBuf;
+
+use serde_json::{Map, Value};
 
 /// The usage text printed on a grammar error.
 pub const USAGE: &str = "usage: wb buf ls [--json]
@@ -12,7 +14,29 @@ pub const USAGE: &str = "usage: wb buf ls [--json]
        wb eval FORM | -f FILE [--json]
        wb edit FILE [+LINE] [--wait] [--json]
        wb repl [--json]
+       wb tools [--socket PATH]
+       wb TOOL [--json INPUT] [KEY=VALUE]... [KEY:=JSON]... [--timeout SECS] [--socket PATH]
 ";
+
+/// Board tools that `wb` does not run (W-14): hosts, units and tmux.
+pub const DROPPED_TOOLS: &[&str] = &[
+    "list_hosts",
+    "host_folder",
+    "host_status",
+    "unit_control",
+    "list_tmux",
+    "adopt_tmux",
+];
+
+/// Command words, which are never tool names.
+const COMMANDS: &[&str] = &["buf", "eval", "edit", "repl", "tools"];
+
+/// True when `name` matches `^[a-z][a-z0-9_]*$`.
+pub fn is_tool_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
 
 /// A grammar error: the message, or empty when the usage text alone says enough.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,10 +147,105 @@ pub enum Command {
         wait: bool,
     },
     Repl,
+    /// `wb tools`: the tool list of the leader page.
+    Tools {
+        socket: Option<PathBuf>,
+    },
+    /// `wb TOOL ...`: one board tool in the leader page.
+    Tool(ToolCall),
+}
+
+/// Where `--json` takes the tool input from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonInput {
+    Object(Map<String, Value>),
+    Stdin,
+}
+
+/// One board tool call over `web.sock`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    pub tool: String,
+    /// `--json INPUT`; absent means `{}`.
+    pub json: Option<JsonInput>,
+    /// `KEY=VALUE` (a string) and `KEY:=JSON` (any value), in argv order.
+    pub fields: Vec<(String, Value)>,
+    /// `--timeout SECS`; absent lets wb-web use its default.
+    pub timeout: Option<u64>,
+    pub socket: Option<PathBuf>,
+}
+
+impl ToolCall {
+    /// The input object: INPUT with the fields merged over it, a later field over an
+    /// earlier one. `stdin` is the text read for `--json -`; `None` checks the fields
+    /// alone. Refuses `create_node` with `kind` = `agent` (W-14).
+    pub fn input(&self, stdin: Option<&str>) -> Result<Map<String, Value>, Usage> {
+        let mut input = match (&self.json, stdin) {
+            (Some(JsonInput::Object(obj)), _) => obj.clone(),
+            (Some(JsonInput::Stdin), Some(text)) => object(text, "INPUT from stdin")?,
+            (Some(JsonInput::Stdin), None) | (None, _) => Map::new(),
+        };
+        for (key, value) in &self.fields {
+            input.insert(key.clone(), value.clone());
+        }
+        let agent = input
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|k| k.trim().eq_ignore_ascii_case("agent"));
+        if self.tool == "create_node" && agent {
+            return Err(usage(
+                "create_node with kind=agent is not available from wb",
+            ));
+        }
+        Ok(input)
+    }
+}
+
+/// Parses `text` as a JSON object.
+fn object(text: &str, what: &str) -> Result<Map<String, Value>, Usage> {
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Object(obj)) => Ok(obj),
+        Ok(_) => Err(usage(format!("{what} must be a JSON object"))),
+        Err(e) => Err(usage(format!("bad JSON in {what}: {e}"))),
+    }
+}
+
+/// Parses `KEY=VALUE` or `KEY:=JSON`.
+fn field(arg: &str) -> Result<(String, Value), Usage> {
+    let bad = || usage(format!("expected KEY=VALUE or KEY:=JSON, got {arg:?}"));
+    let (key, text) = arg.split_once('=').ok_or_else(bad)?;
+    let (key, value) = match key.strip_suffix(':') {
+        Some(key) => {
+            let value = serde_json::from_str(text)
+                .map_err(|e| usage(format!("bad JSON in {key}:= ({e})")))?;
+            (key, value)
+        }
+        None => (key, Value::String(text.to_owned())),
+    };
+    if key.is_empty() {
+        return Err(bad());
+    }
+    Ok((key.to_owned(), value))
+}
+
+/// `--url` and `--token` are usage errors (§3.7.4): `wb` finds wb-web by its socket.
+fn refuse_url_token(tokens: &[String]) -> Result<(), Usage> {
+    for tok in tokens.iter().take_while(|t| *t != "--") {
+        for name in ["--url", "--token"] {
+            if tok == name || tok.strip_prefix(name).is_some_and(|v| v.starts_with('=')) {
+                return Err(usage(format!(
+                    "{name} is not an option of wb: it reaches wb-web by --socket or $WB_SOCKET"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Options that take a value (`--name VALUE` or `--name=VALUE`).
 const VALUED: &[&str] = &["--lines", "--base", "--patch", "-f"];
+/// The valued options of `wb TOOL`.
+const TOOL_VALUED: &[&str] = &["--json", "--timeout", "--socket"];
 
 /// Tokens split into positionals and options.
 struct Split {
@@ -135,7 +254,7 @@ struct Split {
 }
 
 impl Split {
-    fn new(tokens: &[String]) -> Result<Split, Usage> {
+    fn new(tokens: &[String], valued: &[&str]) -> Result<Split, Usage> {
         let mut pos = Vec::new();
         let mut opts = Vec::new();
         let mut iter = tokens.iter();
@@ -153,7 +272,7 @@ impl Split {
                 Some((n, v)) => (n.to_owned(), Some(v.to_owned())),
                 None => (tok.clone(), None),
             };
-            let value = if VALUED.contains(&name.as_str()) {
+            let value = if valued.contains(&name.as_str()) {
                 match inline {
                     Some(v) => Some(v),
                     None => Some(
@@ -227,7 +346,7 @@ pub fn parse(argv: &[String]) -> Result<Args, Usage> {
     match head.as_str() {
         "buf" => parse_buf(rest),
         "eval" => {
-            let mut s = Split::new(rest)?;
+            let mut s = Split::new(rest, VALUED)?;
             let json = s.json();
             s.check(&["-f"])?;
             let source = match (s.value("-f"), s.pos.as_slice()) {
@@ -241,7 +360,7 @@ pub fn parse(argv: &[String]) -> Result<Args, Usage> {
             })
         }
         "edit" => {
-            let mut s = Split::new(rest)?;
+            let mut s = Split::new(rest, VALUED)?;
             let json = s.json();
             s.check(&["--wait"])?;
             let mut file = None;
@@ -269,7 +388,7 @@ pub fn parse(argv: &[String]) -> Result<Args, Usage> {
             })
         }
         "repl" => {
-            let mut s = Split::new(rest)?;
+            let mut s = Split::new(rest, VALUED)?;
             let json = s.json();
             s.check(&[])?;
             s.exactly(0, "no arguments after repl")?;
@@ -278,16 +397,74 @@ pub fn parse(argv: &[String]) -> Result<Args, Usage> {
                 json,
             })
         }
+        "tools" => {
+            refuse_url_token(rest)?;
+            let s = Split::new(rest, &["--socket"])?;
+            s.check(&["--socket"])?;
+            s.exactly(0, "no arguments after tools")?;
+            Ok(Args {
+                cmd: Command::Tools {
+                    socket: socket(&s)?,
+                },
+                json: false,
+            })
+        }
         "-h" | "--help" | "help" => Err(usage("")),
+        other if is_tool_name(other) && !COMMANDS.contains(&other) => parse_tool(other, rest),
         other => Err(usage(format!("unknown command {other:?}"))),
     }
+}
+
+/// `--socket PATH`, which must not be empty.
+fn socket(s: &Split) -> Result<Option<PathBuf>, Usage> {
+    match s.value("--socket") {
+        Some("") => Err(usage("--socket needs a path")),
+        v => Ok(v.map(PathBuf::from)),
+    }
+}
+
+/// `wb TOOL [--json INPUT] [KEY=VALUE]... [KEY:=JSON]... [--timeout SECS] [--socket PATH]`.
+/// Here `--json` names the input (spec §13.1); the output is always the result text.
+fn parse_tool(tool: &str, rest: &[String]) -> Result<Args, Usage> {
+    if DROPPED_TOOLS.contains(&tool) {
+        return Err(usage(format!("{tool} is not available from wb")));
+    }
+    refuse_url_token(rest)?;
+    let s = Split::new(rest, TOOL_VALUED)?;
+    s.check(TOOL_VALUED)?;
+    let json = match s.value("--json") {
+        None => None,
+        Some("-") => Some(JsonInput::Stdin),
+        Some(text) => Some(JsonInput::Object(object(text, "INPUT")?)),
+    };
+    let fields = s.pos.iter().map(|p| field(p)).collect::<Result<_, _>>()?;
+    let timeout = match s.value("--timeout") {
+        None => None,
+        Some(v) => match parse_u64("--timeout", v)? {
+            0 => return Err(usage("--timeout needs 1 second or more")),
+            secs => Some(secs),
+        },
+    };
+    let call = ToolCall {
+        tool: tool.to_owned(),
+        json,
+        fields,
+        timeout,
+        socket: socket(&s)?,
+    };
+    // Check what is known now; `--json -` is checked again once stdin is read.
+    call.input(None)?;
+    Ok(Args {
+        cmd: Command::Tool(call),
+        json: false,
+    })
 }
 
 fn parse_buf(argv: &[String]) -> Result<Args, Usage> {
     let (sub, rest) = argv
         .split_first()
         .ok_or_else(|| usage("buf needs a subcommand"))?;
-    let mut s = Split::new(rest)?;
+    let mut s = Split::new(rest, VALUED)?;
     let json = s.json();
     let cmd = match sub.as_str() {
         "ls" => {
@@ -567,8 +744,250 @@ mod tests {
         assert!(ok("repl --json").json);
         assert!(p("repl x").is_err());
         assert!(p("").is_err());
-        assert!(p("frobnicate").is_err());
+        // Not a command and not a tool name.
+        assert!(p("Frob").is_err());
+        assert!(p("frob-nicate").is_err());
+        assert!(p("9lives").is_err());
+        assert!(p("_x").is_err());
         assert!(p("--help").is_err());
+        assert!(p("help").is_err());
+    }
+
+    fn pv(argv: &[&str]) -> Result<Args, Usage> {
+        let argv: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
+        parse(&argv)
+    }
+
+    fn call(argv: &[&str]) -> ToolCall {
+        match pv(argv).unwrap_or_else(|e| panic!("{argv:?}: {e:?}")) {
+            Args {
+                cmd: Command::Tool(call),
+                json: false,
+            } => call,
+            other => panic!("{argv:?}: not a tool call: {other:?}"),
+        }
+    }
+
+    fn obj(v: Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    fn usage_text(argv: &[&str]) -> String {
+        pv(argv)
+            .expect_err(&format!("{argv:?} should be a usage error"))
+            .0
+    }
+
+    #[test]
+    fn tool_names() {
+        for ok in ["read_node", "x", "a1_b2", "frobnicate"] {
+            assert!(is_tool_name(ok), "{ok}");
+        }
+        for bad in ["", "Read", "1x", "_x", "a-b", "a.b", "é"] {
+            assert!(!is_tool_name(bad), "{bad}");
+        }
+        assert_eq!(call(&["frobnicate"]).tool, "frobnicate");
+    }
+
+    #[test]
+    fn tools_command() {
+        assert_eq!(
+            pv(&["tools"]).unwrap(),
+            Args {
+                cmd: Command::Tools { socket: None },
+                json: false
+            }
+        );
+        assert_eq!(
+            pv(&["tools", "--socket", "/x/web.sock"]).unwrap().cmd,
+            Command::Tools {
+                socket: Some("/x/web.sock".into())
+            }
+        );
+        assert_eq!(
+            pv(&["tools", "--socket=/y.sock"]).unwrap().cmd,
+            Command::Tools {
+                socket: Some("/y.sock".into())
+            }
+        );
+        assert!(pv(&["tools", "extra"]).is_err());
+        assert!(pv(&["tools", "--json"]).is_err());
+        assert!(pv(&["tools", "--socket"]).is_err());
+        assert!(pv(&["tools", "--socket", ""]).is_err());
+        assert!(usage_text(&["tools", "--url", "http://x"]).contains("--url"));
+    }
+
+    #[test]
+    fn tool_with_no_input_is_empty_object() {
+        let c = call(&["list_nodes"]);
+        assert_eq!(
+            c,
+            ToolCall {
+                tool: "list_nodes".into(),
+                json: None,
+                fields: vec![],
+                timeout: None,
+                socket: None,
+            }
+        );
+        assert_eq!(c.input(None).unwrap(), Map::new());
+    }
+
+    #[test]
+    fn tool_json_input_and_options() {
+        let c = call(&[
+            "read_node",
+            "--json",
+            r#"{"path":"a/b"}"#,
+            "--timeout",
+            "5",
+            "--socket",
+            "/s.sock",
+        ]);
+        assert_eq!(
+            c.json,
+            Some(JsonInput::Object(obj(serde_json::json!({"path": "a/b"}))))
+        );
+        assert_eq!(c.timeout, Some(5));
+        assert_eq!(c.socket, Some("/s.sock".into()));
+        let c = call(&["read_node", r#"--json={"path":"x=y"}"#, "--timeout=300"]);
+        assert_eq!(
+            c.input(None).unwrap(),
+            obj(serde_json::json!({"path": "x=y"}))
+        );
+        assert_eq!(c.timeout, Some(300));
+        assert_eq!(
+            call(&["read_node", "--json", "-"]).json,
+            Some(JsonInput::Stdin)
+        );
+    }
+
+    #[test]
+    fn tool_fields_merge_over_input() {
+        let c = call(&[
+            "write_page",
+            "--json",
+            r#"{"path":"p","text":"old","n":1}"#,
+            "text=new = text",
+            "confirm:=true",
+            "n:=[1,2]",
+            "empty=",
+            r#"obj:={"a":null}"#,
+        ]);
+        assert_eq!(
+            c.input(None).unwrap(),
+            obj(serde_json::json!({
+                "path": "p",
+                "text": "new = text",
+                "n": [1, 2],
+                "confirm": true,
+                "empty": "",
+                "obj": {"a": null},
+            }))
+        );
+        // A later field wins; `KEY:=` with a string JSON value is a string.
+        let c = call(&["t", "a=1", "a:=2", r#"b:="s""#]);
+        assert_eq!(
+            c.input(None).unwrap(),
+            obj(serde_json::json!({"a": 2, "b": "s"}))
+        );
+        // Fields merge over INPUT read from stdin.
+        let c = call(&["t", "--json", "-", "a=x"]);
+        assert_eq!(
+            c.input(Some(r#"{"a":"y","b":true}"#)).unwrap(),
+            obj(serde_json::json!({"a": "x", "b": true}))
+        );
+        assert!(c.input(Some("[1]")).is_err());
+        assert!(c.input(Some("{")).is_err());
+        assert!(c.input(Some("")).is_err());
+    }
+
+    #[test]
+    fn tool_double_dash_ends_options() {
+        let c = call(&["t", "--", "--weird=1"]);
+        assert_eq!(c.fields, vec![("--weird".to_owned(), Value::from("1"))]);
+    }
+
+    #[test]
+    fn tool_usage_errors() {
+        for argv in [
+            &["t", "--json"][..],
+            &["t", "--json", "[1,2]"][..],
+            &["t", "--json", "\"string\""][..],
+            &["t", "--json", "{bad"][..],
+            &["t", "--json", "{}", "--json", "{}"][..],
+            &["t", "positional"][..],
+            &["t", "=v"][..],
+            &["t", ":=1"][..],
+            &["t", "k:=nope"][..],
+            &["t", "--timeout", "0"][..],
+            &["t", "--timeout", "-1"][..],
+            &["t", "--timeout", "x"][..],
+            &["t", "--socket", ""][..],
+            &["t", "--wait"][..],
+            &["t", "-f", "x"][..],
+        ] {
+            assert!(pv(argv).is_err(), "{argv:?} should be a usage error");
+        }
+    }
+
+    #[test]
+    fn url_and_token_are_usage_errors() {
+        for argv in [
+            &["read_node", "--url", "http://h"][..],
+            &["read_node", "--url=http://h"][..],
+            &["read_node", "--token", "t"][..],
+            &["read_node", "--token=t"][..],
+            &["tools", "--token", "t"][..],
+        ] {
+            let msg = usage_text(argv);
+            assert!(
+                msg.contains("--url") || msg.contains("--token"),
+                "{argv:?}: {msg}"
+            );
+        }
+        // After `--` the word is a field like any other.
+        assert!(pv(&["read_node", "--", "--url=x"]).is_ok());
+    }
+
+    #[test]
+    fn w14_tools_are_usage_errors() {
+        for tool in DROPPED_TOOLS {
+            assert_eq!(
+                usage_text(&[tool]),
+                format!("{tool} is not available from wb")
+            );
+            assert!(pv(&[tool, "--json", "{}"]).is_err());
+        }
+        for argv in [
+            &["create_node", "--json", r#"{"kind":"agent","name":"a"}"#][..],
+            &["create_node", "kind=agent", "name=a"][..],
+            &["create_node", "--json", r#"{"kind":"page"}"#, "kind=agent"][..],
+            &["create_node", "kind:=\"Agent\""][..],
+            &["create_node", "--json", "-", "kind=agent"][..],
+        ] {
+            assert!(
+                usage_text(argv).contains("kind=agent"),
+                "{argv:?} should refuse kind=agent"
+            );
+        }
+        assert!(pv(&["create_node", "kind=page", "name=a"]).is_ok());
+        // A field over INPUT can also lift the refusal.
+        assert!(pv(&["create_node", "--json", r#"{"kind":"agent"}"#, "kind=shell"]).is_ok());
+        // kind=agent on another tool is that tool's business.
+        assert!(pv(&["list_nodes", "kind=agent"]).is_ok());
+        // From stdin it is refused once the text is read.
+        let c = call(&["create_node", "--json", "-"]);
+        assert!(c.input(Some(r#"{"kind":"agent"}"#)).is_err());
+        assert!(c.input(Some(r#"{"kind":"repl"}"#)).is_ok());
+    }
+
+    #[test]
+    fn usage_lists_the_tool_commands() {
+        assert!(USAGE.contains("wb tools [--socket PATH]"));
+        assert!(USAGE.contains(
+            "wb TOOL [--json INPUT] [KEY=VALUE]... [KEY:=JSON]... [--timeout SECS] [--socket PATH]"
+        ));
     }
 
     #[test]
