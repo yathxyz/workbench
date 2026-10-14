@@ -1117,6 +1117,7 @@ The amendments below are binding.
 | F-A21 | Enter on the active card puts the keyboard in it where it stands (a shell's terminal, an agent's composer, a page's text, a web card's address), bringing it into view first when it is off screen, in a closed deck or at far zoom. Shift-Enter opens the card as a focus tab; Enter on a folder still enters it as a workspace |
 | F-A22 | The view is per device, like the camera (F-A7): the entered workspace, the focus tabs and the perspective live in `localStorage` (`wb-view-<host>`, try/catch), never in the board. Inside a perspective, a save writes the manual layout (each node's manual folder, rectangle and order, the stashed folders, no derived folders or ghosts), so the board file always holds the manual perspective; a card shown in a focus tab is saved at its place on the canvas, not at the size of the screen. A clean tab inside a perspective that takes another tab's board goes back to manual, takes it, and builds its perspective again. A board saved inside a perspective before this amendment is turned back into its manual layout when it is loaded or taken, and lends its view to a device that has none yet |
 | F-A23 | Keys are bindings in the keymaps of `web/keys.js` and nothing else (§6.4). A card that has the keyboard keeps the keys it needs: a shell gets every key but ``Ctrl-` `` (so C-k, C-j, Alt-B, Alt-digits and Alt-arrows reach the program and do nothing on the board), a page leaves only the palette, dock, tree, dictation and view keys. Leader Esc leaves any card with the card still selected, and the leader pressed twice reaches the card (NUL for Ctrl-Space in a shell). An artifact forwards the leader to the board through the bridge (`{t:'key', key:'leader'}`, the leader named in `hello.keys` and in a `{t:'keys'}` message when the user picks another). The palette's C-j/C-k move its selection |
+| F-A24 | Desks, phase D1 of §10.8. A desk is a record `{slot, name, members}`: slot 1-8, and each member's rectangle (`[x, y, w, h]`, or null until it is first shown). Pinned desks are in the board (`desks`); scratch desks, the current and previous desk and a camera per desk are in F-A22's view state. On a desk, the Board's folder, rectangle and order of every node wait in a snapshot; members stand at their rectangles (a folder carries what it holds, a member whose folder is not on the desk stands loose) and every other item is hidden as a deck's cards are (`.stashed`: hit tests, layout, neighbours, fit and selection skip it), with its links, the Board's loose ink and the shapes outside the desk's folders (a shape goes with the member folder it lay in on the Board, as a folder drag finds it; a Board arrow shows only with both ends on the desk). An area selection skips hidden ink and shapes. A save writes the Board from the snapshot whichever desk is shown; an item made on the desk goes to the Board with its folder, the card it was spawned from, or the nearest member. Leaving a desk records its rectangles and restores the Board exactly; folder changes made on a desk to items that were on the Board are not kept. A new item joins the desk it is made on; a spawned card joins its parent's desks beside the parent. Desks and perspectives exclude each other: a perspective goes to the Board first, and a desk to the manual perspective. Revealing or focusing a hidden item goes to the Board. A clean tab on a desk that takes another tab's board leaves the desk, takes it, and stands the desk up again (a pinned desk as the board now has it). Leader and `Alt-Shift` `0`-`9` go to desks (9 is kept for D2's attention desk), leader `` ` `` to the previous desk, `m`/`M` send the selection (a move from a desk, a copy from the Board; `M` follows), and `d` opens new, rename, pin, take off, also on, which desks, delete. The keys are rows of `web/keys.js` (F-A23): `desk.N` in the global map (`M-)` … `M-(`, which pages and text fields leave to the board) and the leader, and the leader prefixes `leader-m`, `leader-M`, `leader-d` and `leader-da`. The mode line shows a pager; a scratch desk is in italics |
 
 **ui check amendments.**
 - **N8** expects "No session: press Enter" after a wiped `stateDir`, then Enter → `[new shell]` (H-1).
@@ -1335,7 +1336,7 @@ The test runs numbered steps. The steps this design pins down:
 
 **Pass criterion for "sessions survive":** steps 4, 6 and 9 all pass in one run. The hub PID is unchanged across 4 and 6, and revive succeeds in 9.
 
-### 9.5 UI checks (N27-N55; N1-N26 are the baseline checks of `tests/ui.mjs`, kept with the §6.1 amendments)
+### 9.5 UI checks (N27-N56; N1-N26 are the baseline checks of `tests/ui.mjs`, kept with the §6.1 amendments)
 
 | # | Check |
 |---|---|
@@ -1368,6 +1369,7 @@ The test runs numbered steps. The steps this design pins down:
 | N53 | Leader Esc leaves a shell and a page, with the card still selected and no interior in `keyContext()`; the leader twice sends NUL to the shell; C-k in a page opens the palette |
 | N54 | `WBKeys.check()` with the page's commands has no error; on the board `f` then a card's label selects it; `m`, `l`, `L` move and resize the card and Esc puts it back; `.` lists its actions; C-j/C-k move the palette selection and leave the dock alone |
 | N55 | (demo) The leader pressed inside an artifact frame opens the board's leader and the frame no longer has the keyboard. After the leader is changed to F1 with the artifact open, F1 in it opens the leader, Ctrl-Space and Shift-F1 do not |
+| N56 | Desks (F-A24). Leader `m 2` then leader `2` show desk 2 with only its items, a card loose out of its hidden folder, a non-member hidden; the pager reads `0 2*`; the board file keeps the Board's geometry exactly and no scratch desk; the view state holds desk 2 with the moved card's rectangle. `Alt-Shift-0` restores the Board exactly and leader `` ` `` returns to desk 2's rectangles. A card made on the desk joins it and shows on the Board; a card spawned on the Board joins its parent's desk at the same offset. A pinned desk is in the board file and on a second device; that device, on the desk, takes the first device's move without a bar and stays on the desk |
 
 ### 9.6 v1 acceptance (all must hold before the dogfood clock starts)
 1. `nix flake check` is green on a kvm-capable host: package, clippy, fmt, conformance, security, ui, adapters, module and vm.
@@ -1497,20 +1499,20 @@ The test runs numbered steps. The steps this design pins down:
 1. The new layer is called **desk**. "Workspace" stays for an entered folder until D2 makes it "open folder as desk".
 2. Leader `0`-`9` and `Alt-Shift-0`-`9` go to desks. Top-level folders lose their positional numbers.
 3. A new desk is **scratch** (this device only, removed when empty and left) until it is pinned into the board. Pinned desks keep a saved state that revert returns to.
-4. On a desk other than the Board, non-members are **hidden** (`display: none`), not dimmed.
+4. On a desk other than the Board, non-members are **hidden**, not dimmed (as a deck's cards are: `visibility: hidden`, so a hidden terminal keeps its size).
 
 **Phases.** Each starts after the previous one's PR is merged.
 
 | Phase | Content |
 |---|---|
 | D0 | F-A22: per-device view state; a perspective saves the manual layout (N51) |
-| D1 | Desk records in the board; a desk swap built on the perspective snapshot, with the serializer writing Board geometry; non-members hidden; the pager in the mode line; leader digits, `m`/`M` send (and follow), the `d` submap (new, rename, pin, revert, remove, also-on, promote, sticky); scratch and pinned lifetimes; spawned cards follow their parent's desks |
-| D2 | The overview (leader `g`: arrows move, letters search, digits jump) on far-zoom snapshots; the recent-places ring (leader `w`) over desks, focus tabs and views; the attention desk and pager badges, with the F-A15 key crossing desks; the scratch overlay on ``Ctrl-` ``; perspectives as smart desks |
+| D1 | F-A24 (N56): desk records in the board; a desk swap on a Board snapshot, with the serializer writing Board geometry; non-members hidden; the pager in the mode line; leader digits, `` ` ``, `m`/`M` send (and follow), the `d` submap (new, rename, pin, take off, also on, which desks, delete); scratch and pinned lifetimes; new cards join the desk, spawned cards their parent's desks |
+| D2 | Promote a card to the Board's place it has on the desk; sticky cards on every desk; the `tile` layout. The overview (leader `g`: arrows move, letters search, digits jump) on far-zoom snapshots; the recent-places ring (leader `w`) over desks, focus tabs and views; the attention desk and pager badges, with the F-A15 key (leader `!`) crossing desks; the scratch overlay on leader `x`; perspectives as smart desks |
 | D3 | The `columns` layout; revert; one desk per window (`BroadcastChannel`); `wb desk ls`, `go` and `send` over `web.sock`; the agent tools `list_desks` and `send_to_desk` |
 
 **Keys** (settled with §6.4; D1 and D2 add them as rows in `web/keys.js`, and the checker gates them):
-- Leader `0`-`9` and Alt-Shift-`0`-`9` replace the workspace rows (`ws.N`). Alt-Shift-0 is `M-)`: D1 adds it to `global` and to `TEXT_LEAVES`, or a page keeps it.
-- Leader `m`/`M`, the `d` prefix (a `leader-d` keymap), `g` and `w` are free in the leader map today.
+- Leader `0`-`9` and Alt-Shift-`0`-`9` replaced the workspace rows (`ws.N`) in D1; Alt-Shift-0 is `M-)`, in `global` and in `TEXT_LEAVES`.
+- D1 took leader `` ` ``, `m`, `M` and the `d` prefix (`leader-m`, `leader-M`, `leader-d`, `leader-da`); `g` and `w` are free in the leader map for D2.
 - The scratch overlay does not take ``Ctrl-` ``: that key is the dock, and the only key a shell gives up (K2), so it must stay one toggle that works inside a terminal. The overlay goes on leader `x`.
 - The F-A15 key (next item that needs attention) is leader `!`; on the canvas `!` stays "fit everything", which is a different context.
 

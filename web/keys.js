@@ -76,7 +76,7 @@
       ['C-M-[', 'pane.wider', 'side pane wider'], ['C-M-]', 'pane.narrower', 'side pane narrower'],
       ['M-b', 'tree.toggle', 'folder tree'], ['M-v', 'dictate', 'dictate into the page'],
       ...VIEWS.map((v, i) => ['M-' + (i + 1), 'view.' + v, 'view: ' + v, 'Alt-1…7']),
-      ...range(1, 9).map(i => ['M-' + SHIFT_DIGIT[i], 'ws.' + i, 'workspace ' + i, 'Alt-Shift-1…9']),
+      ...range(0, 9).map(i => ['M-' + SHIFT_DIGIT[i], 'desk.' + i, 'desk n (0 is the Board)', 'Alt-Shift-0…9']),
       ['ESC', 'esc', 'step out: tool, selection, tab, workspace, tag filter'], ['?', 'help', 'keys and gestures'],
     ],
     canvas: [
@@ -106,7 +106,8 @@
     ],
     leader: [
       ['TAB', 'fold.toggle', 'fold / unfold (package)'], ['S-TAB', 'fold.cycle', 'fold the others / unfold all'],
-      ...range(1, 9).map(i => [String(i), 'ws.' + i, 'workspace n', '1…9']), ['`', 'ws.last', 'last workspace'],
+      ...range(0, 9).map(i => [String(i), 'desk.' + i, 'desk n (0 is the Board)', '0…9']), ['`', 'desk.prev', 'previous desk'],
+      ['m', '>leader-m', 'send the selection to desk n'], ['M', '>leader-M', 'send it and go there'], ['d', '>leader-d', 'desk: new rename pin off also which delete'],
       ['u', 'up', 'up (close focus, leave ws)'], ['RET', 'card.enter', 'enter folder, type into node'],
       ['f', 'card.tab', 'focus tab'], ['q', 'tab.close', 'close tab'], ['n', 'tab.next', 'next tab'], ['p', 'tab.prev', 'previous tab'],
       ['h', 'card.left', 'select neighbour', 'h j k l'], ['j', 'card.down', 'select neighbour', 'h j k l'], ['k', 'card.up', 'select neighbour', 'h j k l'], ['l', 'card.right', 'select neighbour', 'h j k l'],
@@ -119,6 +120,13 @@
       ['#', 'tag', 'tag node'], [';', 'hints', 'hints: pick a card from anywhere'], ['/', 'palette.open', 'palette'], ['?', 'help', 'help'],
       ['ESC', 'leave', 'leave the card (on the board: cancel)'], ['C-g', 'cancel', 'cancel'],
     ],
+    // desks (DESIGN §10.8): m and M take a desk number; d is the desk's own map, and d a takes a number too
+    'leader-m': range(0, 9).map(i => [String(i), 'desk.send.' + i, 'desk n (0 takes it off this desk)', '0…9']),
+    'leader-M': range(0, 9).map(i => [String(i), 'desk.follow.' + i, 'desk n (0: off this desk, to the Board)', '0…9']),
+    'leader-da': range(1, 9).map(i => [String(i), 'desk.also.' + i, 'desk n (it stays here too)', '1…9']),
+    'leader-d': [['n', 'desk.new', 'new desk with the selection'], ['r', 'desk.rename', 'rename this desk'], ['p', 'desk.pin', 'pin / unpin: in the board or this device only'],
+      ['x', 'desk.off', 'take the selection off this desk'], ['a', '>leader-da', 'also on desk n (keep it here)'], ['i', 'desk.which', 'which desks hold the selected item'],
+      ['k', 'desk.delete', 'delete this desk (the cards stay)']],
     'leader-v': [['m', 'persp.manual', 'manual'], ['p', 'persp.process', 'process'], ['f', 'persp.fs', 'filesystem'], ['t', 'persp.tag', 'tags'], ['x', 'persp.tmux', 'tmux'],
       ['c', 'persp.proc', 'processes'], ['u', 'persp.unit', 'units'], ['j', 'persp.journal', 'journal'], ['l', 'persp.link', 'links']],
     // transients: the palette and the dialogs keep every key for their own inputs, except Esc
@@ -130,15 +138,15 @@
       ['H', 'arrange.narrower', 'resize', 'H J K L'], ['J', 'arrange.taller', 'resize', 'H J K L'], ['K', 'arrange.shorter', 'resize', 'H J K L'], ['L', 'arrange.wider', 'resize', 'H J K L'],
       ['RET', 'arrange.done', 'done'], ['m', 'arrange.done', 'done'], ['ESC', 'arrange.cancel', 'put it back'],
     ],
-    // places: the desks work (DESIGN §10.8) adds its keys here
+    // places: keys that hold only on the Board, in a workspace or in a focus tab
     board: [], workspace: [], tab: [],
   };
 
   // ---- interiors: the card (or field) that has the keyboard, and the keys it needs
   const ALL = () => true;
-  // what a page or a text field leaves to the board: the palette, the dock, the tree, dictation, the views, the workspaces
+  // what a page or a text field leaves to the board: the palette, the dock, the tree, dictation, the views, the desks
   const TEXT_LEAVES = new Set(['C-k', 's-k', 'C-S-p', 's-S-p', 'C-j', 's-j', 'C-`', 'C-M-[', 'C-M-]', 'M-b', 'M-v',
-    ...range(1, 7).map(i => 'M-' + i), ...range(1, 9).map(i => 'M-' + SHIFT_DIGIT[i])]);
+    ...range(1, 7).map(i => 'M-' + i), ...range(0, 9).map(i => 'M-' + SHIFT_DIGIT[i])]);
   const INTERIORS = {
     // a terminal needs every key (readline, Emacs, vim, tmux, agents' TUIs); Ctrl-` still closes the dock from inside it
     // (leaves: every key it gives up must do something on the board, or the card lost it for nothing)
@@ -200,11 +208,15 @@
   // The leader's own keymap (or a prefix inside it).
   function leaderResolve(key, prefix) { const b = bound(prefix || 'leader', key); return b ? { cmd: b[1], entry: b } : null; }
 
-  // Where a command is bound, for the palette's labels: the global and canvas maps first, then the leader.
+  // Where a command is bound, for the palette's labels: the global and canvas maps first, then the leader and its prefixes.
   function whereIs(cmd, leader = 'C-SPC') {
     for (const m of ['global', 'canvas', 'graph']) for (const r of MAPS[m]) if (r[1] === cmd) return label(r[0]);
-    for (const r of MAPS.leader) if (r[1] === cmd) return LEADERS[leader] + ' ' + label(r[0]);
-    return '';
+    const walk = (map, path, depth) => {
+      for (const r of MAPS[map] || []) if (r[1] === cmd) return path + ' ' + label(r[0]);
+      if (depth < 2) for (const r of MAPS[map] || []) if (r[1][0] === '>') { const w = walk(r[1].slice(1), path + ' ' + label(r[0]), depth + 1); if (w) return w; }
+      return '';
+    };
+    return walk('leader', LEADERS[leader], 0);
   }
   // Rows for which-key and the help: one row per group.
   function rows(map) {

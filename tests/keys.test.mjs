@@ -97,3 +97,17 @@ test('the checker catches a conflict, a reserved key, and a key a card gives up 
   } finally { K.MAPS.canvas = canvas; K.MAPS.global = global; K.reindex(); }
   assert.deepEqual(K.check().errors, []);
 });
+
+test('desks (§10.8): Alt-Shift digits from the board and from a page, leader digits and the desk prefixes', () => {
+  assert.equal(outcome(ctx(), 'M-)'), 'desk.0');
+  assert.equal(outcome(ctx({ interior: 'page' }), 'M-@'), 'desk.2');
+  assert.equal(outcome(ctx({ interior: 'term' }), 'M-@'), 'pass');
+  assert.equal(K.leaderResolve('0').cmd, 'desk.0');
+  assert.equal(K.leaderResolve('`').cmd, 'desk.prev');
+  assert.equal(K.leaderResolve('m').cmd, '>leader-m');
+  assert.equal(K.leaderResolve('3', 'leader-M').cmd, 'desk.follow.3');
+  assert.equal(K.leaderResolve('a', 'leader-d').cmd, '>leader-da');
+  assert.equal(K.leaderResolve('4', 'leader-da').cmd, 'desk.also.4');
+  assert.equal(K.whereIs('desk.delete'), 'Ctrl-Space d k');
+  assert.ok(![...K.commands()].some(c => c.startsWith('ws.') && c !== 'ws.last'), 'no workspace digit rows remain');
+});
