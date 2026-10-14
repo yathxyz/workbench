@@ -1,6 +1,7 @@
 //! wb: the command-line client of edwind (spec §13.1). It speaks the edit protocol
 //! (§7) over `edit.sock` to list, read and write live buffers, evaluate forms in the
-//! server image and open files in a frame.
+//! server image and open files in a frame. The board tool commands (`wb tools`,
+//! `wb TOOL`) speak `web.sock` to wb-web instead (DESIGN §3.3, §3.7.4).
 #![forbid(unsafe_code)]
 
 mod args;
@@ -13,6 +14,7 @@ mod fail;
 mod id;
 mod patch;
 mod text;
+mod tools;
 
 use std::process::ExitCode;
 
@@ -41,9 +43,18 @@ fn main() -> ExitCode {
 /// Runs one parsed command; the exit code of a command that completed its protocol
 /// exchange but reports a non-zero status (`wb edit --wait` aborted) comes back as `Ok`.
 fn run(args: &Args) -> Result<ExitCode> {
-    let json = args.json;
-    let mut client = client::connect()?;
     match &args.cmd {
+        // The board tool commands speak web.sock only, never edit.sock.
+        Command::Tools { socket } => tools::tools(socket.as_deref()),
+        Command::Tool(call) => tools::tool(call),
+        cmd => run_edit(cmd, args.json),
+    }
+}
+
+/// Runs one edit.sock command.
+fn run_edit(cmd: &Command, json: bool) -> Result<ExitCode> {
+    let mut client = client::connect()?;
+    match cmd {
         Command::BufLs => buf::ls(&mut client, json)?,
         Command::BufRead { name, lines, ver } => {
             buf::read(&mut client, name, lines.as_ref(), *ver, json)?;
@@ -58,6 +69,7 @@ fn run(args: &Args) -> Result<ExitCode> {
             return edit::edit(&mut client, file, *line, *wait, json);
         }
         Command::Repl => eval::repl(&mut client, json)?,
+        Command::Tools { .. } | Command::Tool(_) => unreachable!("run() sends these to web.sock"),
     }
     Ok(ExitCode::SUCCESS)
 }
