@@ -95,6 +95,14 @@ impl Config {
                 "{key} must be shorter than {SOCKET_PATH_MAX} bytes"
             );
         }
+        for (i, (a, pa)) in sockets.iter().enumerate() {
+            for (b, pb) in &sockets[i + 1..] {
+                ensure!(
+                    pa.is_none() || pa != pb,
+                    "{a} and {b} must be different paths"
+                );
+            }
+        }
         ensure!(
             valid_host(&self.host),
             "host must match [A-Za-z0-9][A-Za-z0-9._-]*"
@@ -276,6 +284,24 @@ mod tests {
         let mut f = Fixture::new();
         f.cfg["sample"] = Value::Null;
         assert!(f.load().is_err());
+    }
+
+    #[test]
+    fn the_sockets_must_differ() {
+        for (key, other) in [
+            ("hubSocket", "socket"),
+            ("editSocket", "socket"),
+            ("editSocket", "hubSocket"),
+        ] {
+            let mut f = Fixture::new();
+            f.cfg[key] = json!("/run/workbench/one.sock");
+            f.cfg[other] = json!("/run/workbench/one.sock");
+            let err = format!("{:#}", f.load().err().unwrap());
+            assert!(
+                err.contains("must be different paths"),
+                "{key} {other}: {err}"
+            );
+        }
     }
 
     #[test]
