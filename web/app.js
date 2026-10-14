@@ -151,10 +151,14 @@ function dirtyCam() { clearTimeout(camT); camT = setTimeout(() => DAEMON ? store
 const VIEW_KEYS = ['ws', 'focusTabs', 'persp', 'manual'];
 const viewKey = () => 'wb-view-' + (INFO?.host || location.host);
 function viewLoad() { try { const v = JSON.parse(store.get(viewKey())); if (v && typeof v === 'object') return v; } catch {} return null; }
-function viewSave() { if (S && BOOTED) store.set(viewKey(), JSON.stringify({ ws: S.ws || null, focusTabs: S.focusTabs || [], persp: perspCur(), desk: DESK.cur, prevDesk: DESK.prev, scratch: DESK.scratch, deskCams: DESK.cams })); }
+function viewSave() { if (S && BOOTED) store.set(viewKey(), JSON.stringify({ ws: S.ws || null, focusTabs: S.focusTabs || [], persp: perspCur(), desk: DESK.cur, prevDesk: DESK.prev, scratch: DESK.scratch, deskCams: DESK.cams, ring: RING.list, overlay: OVL.ids })); }
 // Desks (§10.8): the current desk, the one before it, the scratch desks and a camera per desk are this device's. snap is the
-// Board's geometry while another desk is shown; mem is that desk's members.
-const DESK = { cur: 0, prev: 0, snap: null, mem: new Set(), scratch: [], cams: {}, shapeIn: new Map(), shapeOld: new Set() };
+// Board's geometry while another desk is shown; mem is that desk's members. smart is the attention desk while it is shown;
+// promoted and relay are what a promote changed on the Board, settled when the desk is left (D2).
+const DESK = { cur: 0, prev: 0, snap: null, mem: new Set(), scratch: [], cams: {}, shapeIn: new Map(), shapeOld: new Set(), smart: null, tiled: '', promoted: new Set(), relay: new Set() };
+// The recent-places ring (desks, focus tabs, views) and the scratch overlay's cards are this device's too (D2).
+const RING = { list: [], on: false, sel: 1 };
+const OVL = { ids: [], on: false, saved: {} };
 function syncBuffers() {
   for (const n of nodeList()) {
     if (n.kind !== 'buffer' || !live[n.id]?.view) continue;
@@ -242,6 +246,7 @@ function boardAdopt(b) {
   try {
     if (b.manual && b.persp && b.persp !== 'manual') b = { ...b, nodes: manualNodesOf(b.nodes || {}, b.manual) };   // saved inside a perspective by a page from before F-A22
     const p = perspCur(); if (p !== 'manual') { perspClear(); S.persp = 'manual'; }
+    ovlHide();
     const dk = deskAt(DESK.cur); if (dk) deskUnapply();   // the same for a desk: take the Board, then stand the desk up again
     const cur = S.nodes;
     for (const id of Object.keys(cur)) if (!b.nodes?.[id] || b.nodes[id].kind !== cur[id].kind) { unmountQuiet(id); delete cur[id]; }
@@ -253,14 +258,14 @@ function boardAdopt(b) {
       const v = live[id]?.view;
       if (o.kind === 'buffer' && v && v.state.doc.toString() !== (o.text || '')) v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: o.text || '' } });
     }
-    S.edges = b.edges || []; S.strokes = b.strokes || []; S.shapes = b.shapes || []; if (Array.isArray(b.desks)) S.desks = b.desks; else delete S.desks; BOARD_CAM = b.cam;
+    S.edges = b.edges || []; S.strokes = b.strokes || []; S.shapes = b.shapes || []; if (Array.isArray(b.desks)) S.desks = b.desks; else delete S.desks; if (Array.isArray(b.sticky)) S.sticky = b.sticky; else delete S.sticky; BOARD_CAM = b.cam;
     deskSlotsFix();
     frameList().filter(f => !live[f.id]).sort((x, y) => depthOf(x) - depthOf(y)).forEach(mount);
     nodeList().filter(n => !live[n.id]).forEach(mount);
     frameList().forEach(placeFrame); nodeList().forEach(place);
     frameList().sort((x, y) => depthOf(y) - depthOf(x)).forEach(f => relayout(f));
     if (p !== 'manual') { perspBuild(p); S.persp = p; perspChip(); wsApply(false); }
-    if (dk) { const d = deskList().find(x => x === dk || (deskPinned(x) && x.slot === dk.slot)); if (d) deskApply(d); }   // a pinned desk comes back as the other device saved it
+    if (dk) { const d = dk.smart ? dk : deskList().find(x => x === dk || (deskPinned(x) && x.slot === dk.slot)); if (d) { if (d.smart) DESK.smart = d; deskApply(d); } }   // a pinned desk comes back as the other device saved it
     deskRefresh(true);
     refreshBlockCards();   // a page the other tab removed, restored or rewrote
     restack(); updateAllTitles(); renderTree(); renderLinks(); renderInk(null);
@@ -1553,7 +1558,7 @@ const kidsOf = fid => Object.values(S.nodes).filter(m => m.in === fid);
 const byOrder = (a, b) => (a.order ?? 0) - (b.order ?? 0) || a.y - b.y || a.x - b.x;
 function descendants(fid, out = []) { for (const k of kidsOf(fid)) { out.push(k); if (k.kind === 'frame') descendants(k.id, out); } return out; }
 function ancestors(n) { const out = []; let cur = n.in, g = 0; while (cur && S.nodes[cur] && g++ < 32) { out.push(S.nodes[cur]); cur = S.nodes[cur].in; } return out; }
-const stashed = n => deskOff(n) || ancestors(n).some(a => a.mode === 'stack');
+const stashed = n => deskOff(n) || ovlOff(n) || ancestors(n).some(a => a.mode === 'stack');
 const visibleOf = n => ancestors(n).reverse().find(a => a.mode === 'stack') || n;
 const depthOf = n => ancestors(n).length;
 const folderPath = n => ancestors(n).reverse().map(a => a.name).join('/');
@@ -2390,7 +2395,8 @@ function removeNode(id) {
   }
   const L = live[id];
   if (L) { L.backend?.kill?.(); L.ro?.disconnect(); L.view?.destroy(); L.term?.dispose(); if (L.frame?.contentWindow) HOSTS.delete(L.frame.contentWindow); if (FR.on) frUnmount(id); L.el.remove(); delete live[id]; }
-  delete S.nodes[id]; DESK.mem.delete(id); for (const d of deskList()) delete d.members[id];
+  delete S.nodes[id]; DESK.mem.delete(id); for (const d of [...deskList(), DESK.smart].filter(Boolean)) delete d.members[id];
+  if (S.sticky) { S.sticky = S.sticky.filter(x => x !== id); if (!S.sticky.length) delete S.sticky; } if (ovlHas({ id })) { OVL.ids = OVL.ids.filter(x => x !== id); delete OVL.saved[id]; viewSave(); }
   S.edges = S.edges.filter(e => e.from !== id && e.to !== id);
   S.strokes = S.strokes.filter(s => s.owner !== id);
   if (parent) relayout(parent, true);
@@ -3150,7 +3156,7 @@ function keyInterior(a = document.activeElement) {
 }
 function keyContext() {
   const ov = $$('.overlay').find(o => !o.hidden);
-  const transient = HINTS.on ? 'hints' : ARR.on ? 'arrange' : ov ? (ov.id === 'palette' ? 'palette' : 'dialog') : null;
+  const transient = HINTS.on ? 'hints' : ARR.on ? 'arrange' : OVW.on ? 'overview' : RING.on ? 'ring' : ov ? (ov.id === 'palette' ? 'palette' : 'dialog') : null;
   return { transient, interior: transient ? null : keyInterior(), view: VIEW, place: FOCUS.cur ? 'tab' : WS.cur ? 'workspace' : 'board' };
 }
 const VIEW_KEYFN = { ranger: e => !e.ctrlKey && !e.metaKey && !e.altKey && rgKey(e), tasks: e => tasksKey(e), review: e => reviewKey(e) };
@@ -4182,7 +4188,7 @@ function setView(v) {
   if (S) placeInkChip();
   if (v !== 'canvas') { if (tool !== 'select') setTool('select'); $('#st-addr').textContent = VIEW_NAMES[v]; $('#st-zoom').textContent = ''; }
   else { $('#st-zoom').textContent = Math.round(cam().z * 100) + '%'; $('#st-addr').textContent = '–'; }
-  updateSideCtx();
+  updateSideCtx(); ringNote();
 }
 $$('[data-view]').forEach(b => b.onclick = () => setView(b.dataset.view));
 // Pages changed somewhere: refresh whichever non-canvas view is showing.
@@ -6406,7 +6412,7 @@ function focusShow(id) {
   if (FOCUS.cur !== id) { reveal(n); FOCUS.rect = { x: n.x, y: n.y, w: n.w, h: n.h }; }
   FOCUS.cur = id; activate(id);
   live[id]?.el.classList.add('focused'); document.body.classList.add('focus');
-  focusGeometry(n); focusStrip();
+  focusGeometry(n); focusStrip(); ringNote();
 }
 function focusRestoreNode() {
   const n = FOCUS.cur && S.nodes[FOCUS.cur]; const L = n && live[n.id];
@@ -6430,7 +6436,7 @@ function focusHide() {
   if (!FOCUS.cur) { focusStrip(); return; }
   focusRestoreNode();
   if (FOCUS.saved) { Object.assign(cam(), FOCUS.saved); applyCam(); FOCUS.saved = null; }
-  focusStrip(); renderLinks(); dirty();
+  focusStrip(); renderLinks(); dirty(); ringNote();
 }
 function focusClose(id) {
   const wasCur = FOCUS.cur === id;
@@ -6449,10 +6455,13 @@ window.addEventListener('resize', () => { if (FOCUS.cur && S?.nodes[FOCUS.cur]) 
 // (S.desks); scratch desks are this device's until pinned, and go when they are left empty.
 const DESK_MAX = 8;
 function deskList() { return [...(S.desks || []), ...DESK.scratch].sort((a, b) => a.slot - b.slot); }
-function deskAt(slot) { return slot ? (S.desks || []).find(d => d.slot === slot) || DESK.scratch.find(d => d.slot === slot) || null : null; }
+function deskAt(slot) { return slot === 9 ? DESK.smart : slot ? (S.desks || []).find(d => d.slot === slot) || DESK.scratch.find(d => d.slot === slot) || null : null; }
 const deskPinned = d => !!d && (S.desks || []).includes(d);
 const deskName = d => d ? d.slot + (d.name && d.name !== String(d.slot) ? ' ' + d.name : '') : '0 Board';
-function deskShown(n) { return DESK.mem.has(n.id) || ancestors(n).some(a => DESK.mem.has(a.id)); }
+// A sticky card is on every desk at its Board place (D2); the scratch overlay's cards are on none until it is shown.
+const isSticky = n => !!S.sticky?.includes(n.id);
+const ovlHas = n => OVL.ids.includes(n.id), ovlOff = n => !OVL.on && ovlHas(n);
+function deskShown(n) { const on = m => DESK.mem.has(m.id) || isSticky(m); return on(n) || (OVL.on && ovlHas(n)) || ancestors(n).some(on); }
 function deskOff(n) { return !!DESK.cur && !deskShown(n); }
 function deskFree() { for (let s = 1; s <= DESK_MAX; s++) if (!deskAt(s)) return s; return 0; }
 // A pinned desk from another device wins its slot; a scratch desk there moves to a free one.
@@ -6463,7 +6472,7 @@ function deskSlotsFix() {
 // the shown desk's rectangles, from the page (a card in a focus tab keeps its rectangle on the desk)
 function deskRecord() {
   const d = deskAt(DESK.cur); if (!d) return;
-  for (const id of [...DESK.mem]) { const n = S.nodes[id]; if (!n) { DESK.mem.delete(id); delete d.members[id]; continue; } const r = FOCUS.cur === id && FOCUS.rect ? FOCUS.rect : n; d.members[id] = [r.x, r.y, r.w, r.h]; }
+  for (const id of [...DESK.mem]) { const n = S.nodes[id]; if (!n) { DESK.mem.delete(id); delete d.members[id]; continue; } const r = FOCUS.cur === id && FOCUS.rect ? FOCUS.rect : OVL.on && OVL.saved[id] || n; d.members[id] = [r.x, r.y, r.w, r.h]; }
 }
 // The Board as it stands under the shown desk, built without touching the page. An item made on the desk goes to the Board
 // with the nearest item that has a place there: its folder, the card it was spawned from, or the closest member.
@@ -6479,12 +6488,15 @@ function deskBoardOf(nodes) {
   };
   for (const n of Object.values(nodes)) {
     const c = { ...n }, p = snap.pos[n.id];
-    if (p) { const f = snap.in[n.id]; if (f && nodes[f]) c.in = f; else delete c.in; [c.x, c.y, c.w, c.h] = p; if (n.id in snap.order) c.order = snap.order[n.id]; else delete c.order; }
+    if (p && isSticky(n) && !DESK.mem.has(n.id) && !ancestorsIn(n, nodes).some(a => DESK.mem.has(a.id))) {   // a sticky card's move on a desk is its move on the Board
+      const f = snap.in[n.id]; if (f && nodes[f]) c.in = f; else delete c.in; if (n.id in snap.order) c.order = snap.order[n.id];
+    } else if (p) { const f = snap.in[n.id]; if (f && nodes[f]) c.in = f; else delete c.in; [c.x, c.y, c.w, c.h] = p; if (n.id in snap.order) c.order = snap.order[n.id]; else delete c.order; }
     else { const [dx, dy] = near(n); c.x += dx; c.y += dy; }
     out[n.id] = c;
   }
   return out;
 }
+function ancestorsIn(n, nodes) { const out = []; for (let c = n.in && nodes[n.in], g = 0; c && g++ < 32; c = c.in && nodes[c.in]) out.push(c); return out; }
 // The folder a shape goes with on a desk: its deck (in), else the member folder it lay in on the Board when the desk was
 // entered (a shape belongs to an open folder by where it lies, as a folder drag finds it), else, for a shape drawn on the
 // desk, the deepest shown folder it lies in now. It goes back to the Board by that folder's offset.
@@ -6507,6 +6519,7 @@ function deskApply(d) {
   DESK.shapeOld = new Set(S.shapes.map(sh => sh.id)); DESK.shapeIn = new Map();
   for (const sh of S.shapes) if (sh.type !== 'arrow' && !sh.in) { const f = mf.filter(f => shapeInside(sh, f)).pop(); if (f) DESK.shapeIn.set(sh.id, f.id); }   // ms is shallow first: the deepest member folder wins
   for (const n of ms) if (n.in && S.nodes[n.in] && !deskShown(S.nodes[n.in])) delete n.in;   // a member whose folder is not on the desk stands loose
+  for (const id of S.sticky || []) { const n = S.nodes[id]; if (n && !DESK.mem.has(id) && n.in && S.nodes[n.in] && !deskShown(S.nodes[n.in])) delete n.in; }   // so does a sticky card
   for (const n of ms) {   // outer first: a folder carries what it holds, then a member inside it takes its own place
     const r = d.members[n.id]; if (!r) continue;
     if (n.kind === 'frame') { moveTree(n, r[0] - n.x, r[1] - n.y); n.w = r[2]; n.h = r[3]; } else [n.x, n.y, n.w, n.h] = r;
@@ -6524,15 +6537,20 @@ function deskUnapply() {
     if (b.in) n.in = b.in; else delete n.in;
     if ('order' in b) n.order = b.order; else delete n.order;
     n.x = b.x; n.y = b.y; n.w = b.w; n.h = b.h;
-    if (!DESK.snap.pos[n.id] && n.in && S.nodes[n.in]) made.add(S.nodes[n.in]);
+    if ((!DESK.snap.pos[n.id] || isSticky(n)) && n.in && S.nodes[n.in]) made.add(S.nodes[n.in]);
   }
-  DESK.cur = 0; DESK.snap = null; DESK.mem = new Set(); DESK.shapeIn = new Map(); DESK.shapeOld = new Set();
+  for (const id of DESK.relay) if (S.nodes[id]) made.add(S.nodes[id]);   // a folder a promoted item left
+  const promoted = [...DESK.promoted].map(id => S.nodes[id]).filter(Boolean).map(n => [n, board[n.id].x, board[n.id].y]);
+  DESK.cur = 0; DESK.snap = null; DESK.mem = new Set(); DESK.shapeIn = new Map(); DESK.shapeOld = new Set(); DESK.smart = null; DESK.promoted = new Set(); DESK.relay = new Set();
   for (const n of Object.values(S.nodes)) placeAny(n);
   for (const f of [...made].sort((a, b) => depthOf(b) - depthOf(a))) relayout(f);   // a folder that took new items on the desk
+  for (const [n, x, y] of promoted) { moveTree(n, x - n.x, y - n.y); SEP.keep = n; separate(n.in ? S.nodes[n.in] : null, n); SEP.keep = null; placeAny(n); }   // a folder's relayout may have pushed it: the Board makes room where it now stands
 }
 // what the page shows after a desk changes; quiet: no save (another device's board is being taken)
 function deskRefresh(quiet) {
   document.body.classList.toggle('on-desk', !!DESK.cur);
+  const d = deskAt(DESK.cur); if (d?.layout === 'tile' && deskSig() !== DESK.tiled) deskTile(true);
+  for (const n of nodeList()) live[n.id]?.el.classList.toggle('sticky', isSticky(n));
   restack(); renderTree(); renderLinks(); updateAllTitles(); deskPager();
   if (VIEW === 'ranger') renderRanger();
   if (!quiet) { viewSave(); dirty(); }
@@ -6540,26 +6558,30 @@ function deskRefresh(quiet) {
 function deskGo(slot, quiet) {
   slot = Math.trunc(+slot);
   if (!(slot >= 0 && slot <= 9)) return;
-  if (slot === 9) { toast('Desk 9 is kept for the attention desk, which comes with the overview (desks D2).'); return; }
   if (slot === DESK.cur) { if (!quiet) toast('Already on desk ' + deskName(deskAt(slot)) + '.'); return; }
+  let d = slot === 9 ? deskAttention() : deskAt(slot), made = false;
+  if (slot === 9 && !d) { toast('Nothing on the board needs a look: the attention desk is empty.'); return; }
   if (VIEW !== 'canvas') setView('canvas');
   if (FOCUS.cur) focusHide();
   if (WS.cur) { WS.cur = null; WS.last = null; wsApply(false); }
   if (perspCur() !== 'manual') perspSet('manual', true);
+  ovlHide();
   LAYOUT_UNDO = null; pickClear();
   const from = DESK.cur, fromD = deskAt(from);
   DESK.cams[from] = { ...cam() };
   deskUnapply();
-  if (fromD && !deskPinned(fromD) && !Object.keys(fromD.members).length) { DESK.scratch = DESK.scratch.filter(x => x !== fromD); delete DESK.cams[from]; }   // i3: an empty desk goes when left
-  let d = deskAt(slot), made = false;
-  if (slot && !d) { d = { slot, name: String(slot), members: {} }; DESK.scratch.push(d); made = true; }
+  if (fromD && !fromD.smart && !deskPinned(fromD) && !Object.keys(fromD.members).length) { DESK.scratch = DESK.scratch.filter(x => x !== fromD); delete DESK.cams[from]; }   // i3: an empty desk goes when left
+  if (slot && slot !== 9 && !d) { d = { slot, name: String(slot), members: {} }; DESK.scratch.push(d); made = true; }
   DESK.prev = from;
+  if (d?.smart) DESK.smart = d;
   if (d) deskApply(d);
+  if (d?.layout === 'tile') deskTile(true);
   deskRefresh();
   const c = DESK.cams[slot];
-  if (c) { Object.assign(cam(), c); applyCam(); } else if (d && Object.keys(d.members).length) fitAll(false);
-  dirtyCam();
-  if (!quiet) toast(!d ? 'Desk 0: the Board, every card where you put it.' : made || !Object.keys(d.members).length
+  if (d?.layout === 'tile') fitAll(false); else if (c) { Object.assign(cam(), c); applyCam(); } else if (d && Object.keys(d.members).length) fitAll(false);
+  dirtyCam(); ringNote();
+  if (!quiet) toast(!d ? 'Desk 0: the Board, every card where you put it.' : d.smart ? `Desk 9: ${Object.keys(d.members).length} card(s) that need a look, tiled. ${LEADERS[leaderName()].label} ! steps through them.`
+    : made || !Object.keys(d.members).length
     ? `Desk ${deskName(d)}: empty. ${LEADERS[leaderName()].label} m ${slot} on the Board sends the active card here; cards you make here join it.`
     : `Desk ${deskName(d)}${deskPinned(d) ? '' : ' (this device)'}: ${Object.keys(d.members).length} item(s). ${LEADERS[leaderName()].label} 0 goes back to the Board.`);
 }
@@ -6587,8 +6609,9 @@ function deskDrop(ns) {
 function deskSend(slot, { follow = false, keep = false } = {}) {
   if (FOCUS.cur) focusHide();
   if (!(Number.isInteger(slot) && slot >= 0 && slot <= 9)) return toast('A desk is a digit: 1-8, or 0 for the Board.');
+  if (DESK.cur === 9 && !keep && slot) keep = true;   // the attention desk is a query: sending from it copies
   const ns = deskTargets(); if (!ns.length) return toast('Pick a card or folder first (click it, or Shift-click several).');
-  if (slot === 9) return toast('Desk 9 is kept for the attention desk (desks D2).');
+  if (slot === 9) return toast('Desk 9 is the attention desk: it holds the cards that need a look, and nothing can be sent there.');
   if (slot === DESK.cur && slot) return toast('Already on this desk.');
   if (slot === 0) {   // every item is on the Board: sending there takes it off this desk
     if (!DESK.cur || keep) return toast('Every item is on the Board already; this takes items off another desk.');
@@ -6606,7 +6629,7 @@ function deskSend(slot, { follow = false, keep = false } = {}) {
 function deskJoin(n) {
   if (n.kind === 'ghost' || PERSP.building) return;
   const cur = deskAt(DESK.cur);
-  if (cur && !(n.in && S.nodes[n.in] && deskShown(S.nodes[n.in]))) { if (n.in) delete n.in; cur.members[n.id] = null; DESK.mem.add(n.id); }
+  if (cur && !(n.in && S.nodes[n.in] && deskShown(S.nodes[n.in]))) { if (n.in) delete n.in; cur.members[n.id] = null; DESK.mem.add(n.id); if (cur.layout === 'tile') setTimeout(() => { if (deskAt(DESK.cur) === cur && deskSig() !== DESK.tiled) { deskTile(); renderLinks(); } }, 0); }
   const p = n.spawnFrom && S.nodes[n.spawnFrom]; if (!p) return;
   for (const d of deskList()) if (d !== cur && p.id in d.members && !(n.id in d.members)) { const r = d.members[p.id]; d.members[n.id] = r ? [r[0] + n.x - p.x, r[1] + n.y - p.y, n.w, n.h] : null; }
 }
@@ -6616,15 +6639,16 @@ function deskNew() {
     const d = { slot, name: clean(v || '').replace(/^node$/, '') || String(slot), members: {} }; DESK.scratch.push(d); deskAdd(d, ns); deskGo(slot);
   });
 }
-function deskRename() { const d = deskAt(DESK.cur); if (!d) return toast('The Board keeps its name.'); askName(`Name desk ${d.slot}`, d.name === String(d.slot) ? '' : d.name, v => { d.name = clean(v || '').replace(/^node$/, '') || String(d.slot); deskRefresh(); }); }
+const SMART_NO = 'The attention desk is built from what needs a look: it has no name, pin or record of its own.';
+function deskRename() { const d = deskAt(DESK.cur); if (!d) return toast('The Board keeps its name.'); if (d.smart) return toast(SMART_NO); askName(`Name desk ${d.slot}`, d.name === String(d.slot) ? '' : d.name, v => { d.name = clean(v || '').replace(/^node$/, '') || String(d.slot); deskRefresh(); }); }
 function deskPin() {
-  const d = deskAt(DESK.cur); if (!d) return toast('The Board is always in the board file.');
+  const d = deskAt(DESK.cur); if (!d) return toast('The Board is always in the board file.'); if (d.smart) return toast(SMART_NO);
   if (deskPinned(d)) { S.desks = S.desks.filter(x => x !== d); DESK.scratch.push(d); toast(`Desk ${deskName(d)} unpinned: on this device only, and gone when left empty.`); }
   else { DESK.scratch = DESK.scratch.filter(x => x !== d); (S.desks ||= []).push(d); toast(`Desk ${deskName(d)} pinned: it is saved in the board, and every device has it.`); }
   deskRefresh();
 }
 function deskDelete() {
-  const d = deskAt(DESK.cur); if (!d) return toast('The Board cannot be deleted.');
+  const d = deskAt(DESK.cur); if (!d) return toast('The Board cannot be deleted.'); if (d.smart) return toast(SMART_NO);
   deskGo(0, true);
   S.desks = (S.desks || []).filter(x => x !== d); DESK.scratch = DESK.scratch.filter(x => x !== d); delete DESK.cams[d.slot];
   deskRefresh(); toast(`Desk ${deskName(d)} deleted. Its cards are still on the Board.`);
@@ -6634,14 +6658,19 @@ function deskAlso() {   // which desks hold the active item
   const on = deskList().filter(d => n.id in d.members || ancestors(n).some(a => a.id in d.members));
   toast(`${pathOf(n.id)}: on the Board${on.map(d => ', desk ' + deskName(d)).join('')}.`);
 }
-// the pager: one button per desk in the mode line, as a desktop pager has
+// the pager: one button per desk in the mode line, as a desktop pager has. A badge counts the cards on that desk that need
+// a look; desk 9, the attention desk, is there while anything does.
+function deskHolds(d, n) { return !d || n.id in d.members || isSticky(n) || ancestors(n).some(a => a.id in d.members); }
+function attnBad() { const out = new Set(); try { for (const it of attnItems()) if (it.attn === 'bad' && it.n && S.nodes[it.n.id] && it.n.kind !== 'frame') out.add(it.n.id); } catch {} return out; }
 function deskPager() {
   const st = $('#st-desk'); if (!st) return;
-  st.replaceChildren(); const ds = deskList();
-  if (!ds.length && !DESK.cur) return;
-  for (const d of [null, ...ds]) {
-    const slot = d ? d.slot : 0, b = el('button', 'dk' + (slot === DESK.cur ? ' on' : '') + (d && !deskPinned(d) ? ' scratch' : ''), d ? deskName(d) : '0');
-    b.title = d ? `Desk ${deskName(d)}: ${Object.keys(d.members).length} item(s)${deskPinned(d) ? ', pinned in the board' : ', this device only'}` : 'Desk 0: the Board';
+  st.replaceChildren(); const ds = deskList(), bad = attnBad();
+  if (!ds.length && !DESK.cur && !bad.size) return;
+  for (const d of [null, ...ds, ...(bad.size || DESK.cur === 9 ? [deskAt(9) || { slot: 9, name: '!', smart: 'attn', members: {} }] : [])]) {
+    const slot = d ? d.slot : 0, b = el('button', 'dk' + (slot === DESK.cur ? ' on' : '') + (d && !d.smart && !deskPinned(d) ? ' scratch' : '') + (d?.smart ? ' attn' : ''), d?.smart ? '9 !' : d ? deskName(d) : '0');
+    const k = slot === 9 ? bad.size : [...bad].filter(id => deskHolds(d, S.nodes[id])).length;
+    if (k) b.dataset.bad = k;
+    b.title = (d?.smart ? `Desk 9: the attention desk, ${bad.size} card(s) that need a look, tiled` : d ? `Desk ${deskName(d)}: ${Object.keys(d.members).length} item(s)${deskPinned(d) ? ', pinned in the board' : ', this device only'}` : 'Desk 0: the Board') + (k && slot !== 9 ? `; ${k} need a look` : '');
     b.dataset.slot = slot; b.onclick = () => deskGo(slot); st.append(b);
   }
 }
@@ -6650,11 +6679,287 @@ function deskRestore(view) {
   DESK.scratch = Array.isArray(view?.scratch) ? view.scratch.filter(d => d && d.slot >= 1 && d.slot <= DESK_MAX && d.members && typeof d.members === 'object') : [];
   DESK.cams = view?.deskCams && typeof view.deskCams === 'object' ? view.deskCams : {};
   if (!Array.isArray(S.desks)) delete S.desks;   // a board without desks keeps no desks key
+  if (!Array.isArray(S.sticky)) delete S.sticky; else S.sticky = S.sticky.filter(id => S.nodes[id]);
   deskSlotsFix();
   DESK.prev = +view?.prevDesk || 0;
+  RING.list = Array.isArray(view?.ring) ? view.ring.filter(k => typeof k === 'string').slice(0, RING_MAX) : [];
+  OVL.ids = Array.isArray(view?.overlay) ? view.overlay.filter(id => S.nodes[id] && S.nodes[id].kind !== 'frame') : [];
   const d = perspCur() === 'manual' && deskAt(+view?.desk || 0); if (d) deskApply(d);
   deskRefresh(true);
 }
+
+// ---- desks D2 (DESIGN §10.8): the tile layout, the attention desk, promote, sticky cards, a folder as a desk, the key
+// that steps through what needs a look, the recent-places ring, the scratch overlay and the overview.
+// The tile layout: the desk's top-level items fill the screen at zoom 1 in rows of near-equal cells, in reading order, the
+// last row stretched to the full width (i3's default split, without nesting). It retiles when the members change.
+const deskSig = () => [...DESK.mem].sort().join();
+const deskTops = () => [...DESK.mem].map(id => S.nodes[id]).filter(n => n && !ancestors(n).some(a => DESK.mem.has(a.id)));
+function tileRects(k, W, H, x0, y0) {
+  let cols = 1, best = Infinity;   // the column count whose cells come nearest 3:2
+  for (let c = 1; c <= k; c++) { const e = Math.abs(Math.log((W / c) / (H / Math.ceil(k / c)) / 1.5)); if (e < best - 1e-9) { best = e; cols = c; } }
+  const rows = Math.ceil(k / cols);
+  W = Math.max(W, cols * 320 + (cols - 1) * GAP); H = Math.max(H, rows * 200 + (rows - 1) * GAP);
+  const out = [], ch = (H - (rows - 1) * GAP) / rows;
+  for (let r = 0, i = 0; r < rows; r++) {
+    const n = Math.min(cols, k - i), cw = (W - (n - 1) * GAP) / n;
+    for (let c = 0; c < n; c++, i++) out.push([Math.round(x0 + c * (cw + GAP)), Math.round(y0 + r * (ch + GAP)), Math.round(cw), Math.round(ch)]);
+  }
+  return out;
+}
+function deskTile(quiet) {
+  const d = deskAt(DESK.cur); if (!d) return;
+  const ns = deskTops().sort((a, b) => (a.y - (a.kind === 'frame' ? LABEL_H : 0)) - (b.y - (b.kind === 'frame' ? LABEL_H : 0)) || a.x - b.x);
+  DESK.tiled = deskSig(); if (!ns.length) return;
+  const a = camArea(), x0 = Math.min(...ns.map(n => n.x)), y0 = Math.min(...ns.map(n => n.y - (n.kind === 'frame' ? LABEL_H : 0)));
+  tileRects(ns.length, Math.round(a.vw * 0.88), Math.round(a.vh * 0.86), x0, y0).forEach(([x, y, w, h], i) => {
+    const n = ns[i];
+    if (n.kind === 'frame') { moveTree(n, x - n.x, y + LABEL_H - n.y); n.w = w; n.h = h - LABEL_H; relayoutInner(n); for (const k of [n, ...descendants(n.id)]) placeAny(k); }
+    else { n.x = x; n.y = y; n.w = w; n.h = h; placeAny(n); }
+  });
+  deskRecord();
+  if (!quiet) { renderLinks(); fitAll(false); dirty(); viewSave(); }
+}
+function deskLayout() {
+  const d = deskAt(DESK.cur); if (!d) return toast('The Board has no layout of its own: its folders have modes (leader t tiles one).');
+  if (d.smart) return toast('The attention desk is always tiled.');
+  if (d.layout === 'tile') { delete d.layout; toast(`Desk ${deskName(d)}: free. The cards stay where the tiling put them; drag them anywhere.`); }
+  else { d.layout = 'tile'; deskTile(); toast(`Desk ${deskName(d)}: tiled. Its items fill the screen and retile as they come and go; ${LEADERS[leaderName()].label} d t frees it.`); }
+  deskRefresh();
+}
+window.addEventListener('resize', () => { clearTimeout(DESK.resizeT); DESK.resizeT = setTimeout(() => { if (S && deskAt(DESK.cur)?.layout === 'tile') deskTile(); }, 250); });
+// Desk 9, the attention desk: the cards that need a look (Attention's bad items), tiled. It is built each time it is
+// entered and lives in no record; a card that stops needing a look stays until the desk is left.
+function deskAttention() {
+  const ids = [...attnBad()]; if (!ids.length) return null;
+  return { slot: 9, name: 'attention', smart: 'attn', layout: 'tile', members: Object.fromEntries(ids.map(id => [id, null])) };
+}
+function deskAttnTick() {   // new cards that need a look join the attention desk while it is shown
+  const d = DESK.cur === 9 && DESK.smart; if (!d) return;
+  const add = [...attnBad()].filter(id => !(id in d.members)).map(id => S.nodes[id]); if (!add.length) return;
+  for (const n of add) { d.members[n.id] = null; DESK.mem.add(n.id); if (n.in && !deskShown(S.nodes[n.in])) delete n.in; }
+  deskTile(); deskRefresh(true);
+}
+// F-A15 across desks (leader !): the next card that needs a look, after the active one, in Attention's order. A card that
+// is not on the shown desk is shown on the first desk that holds it, else on the Board. Items that are not cards (a host,
+// a unit, a task) stay in the Attention list: stepping must not open or adopt anything.
+function attnNext() {
+  const items = attnItems().filter(it => it.attn === 'bad' && it.n && S.nodes[it.n.id] && it.n.kind !== 'frame');
+  if (!items.length) return toast(attnCount() ? 'No card needs a look; the Attention list (palette: Attention) has the rest.' : 'Nothing needs a look.');
+  const i = items.findIndex(it => it.n.id === activeId), it = items[(i + 1) % items.length], n = S.nodes[it.n.id];
+  if (VIEW !== 'canvas') setView('canvas');
+  if (deskOff(n)) { const d = deskList().find(d => deskHolds(d, n)); deskGo(d ? d.slot : 0, true); }
+  jumpNode(n); toast(`${it.name} (${items.indexOf(it) + 1} of ${items.length})` + (DESK.cur ? ' · desk ' + deskName(deskAt(DESK.cur)) : ''));
+}
+// Promote: the Board takes the place the selection has on this desk, with what a folder holds as it stands here. The
+// item leaves its Board folder unless that folder is on this desk; leaving the desk settles the Board around it.
+function deskPromote() {
+  const d = deskAt(DESK.cur); if (!d) return toast('On the Board every card is already at its Board place.');
+  const ns = deskTargets().filter(n => !stashed(n)); if (!ns.length) return toast('Pick a card or folder on this desk first.');
+  const snap = DESK.snap;
+  for (const n of ns) {
+    const was = snap.in[n.id]; if (was && was !== (n.in || null)) DESK.relay.add(was);
+    snap.in[n.id] = n.in || null;
+    for (const m of [n, ...(n.kind === 'frame' ? descendants(n.id) : [])]) { snap.pos[m.id] = [m.x, m.y, m.w, m.h]; if ('order' in m) snap.order[m.id] = m.order; else delete snap.order[m.id]; }
+    if (n.in) DESK.relay.add(n.in);
+    DESK.promoted.add(n.id);
+  }
+  dirty(); toast(`${ns.length} item(s): the Board now has them where they stand on desk ${deskName(d)}.`);
+}
+// Sticky (cards only): on every desk at its Board place. Moving it on any desk moves it on the Board.
+function deskSticky() {
+  const ns = deskTargets().filter(n => n.kind !== 'frame'); if (!ns.length) return toast('Pick a card first (a folder cannot be sticky; put its cards on the desks).');
+  const on = !ns.every(isSticky), here = deskAt(DESK.cur);
+  for (const n of ns) {
+    if (on) {
+      S.sticky = [...new Set([...(S.sticky || []), n.id])];
+      for (const d of deskList()) delete d.members[n.id];
+      DESK.mem.delete(n.id);
+      if (DESK.snap) { DESK.snap.pos[n.id] = [n.x, n.y, n.w, n.h]; if (n.in) DESK.snap.in[n.id] = n.in; }   // where it stands here is its Board place
+    } else {
+      S.sticky = S.sticky.filter(id => id !== n.id); if (!S.sticky.length) delete S.sticky;
+      if (DESK.snap) { DESK.snap.pos[n.id] = [n.x, n.y, n.w, n.h]; if (here) { here.members[n.id] = [n.x, n.y, n.w, n.h]; DESK.mem.add(n.id); } }   // it stays on this desk
+    }
+  }
+  deskRefresh();
+  toast(on ? `${ns.length} card(s) sticky: on every desk at the Board's place.` : `${ns.length} card(s) no longer sticky${here && !here.smart ? ': they stay on this desk and on the Board' : ''}.`);
+}
+// A folder as a desk (decision 1): a desk that holds just the folder, made the first time and reused after.
+function deskOpenFolder() {
+  const f = activeFolderOf(); if (!f) return toast('Pick a folder or something inside one.');
+  const has = deskList().find(d => { const ids = Object.keys(d.members); return ids.length === 1 && ids[0] === f.id; });
+  if (has) return deskGo(has.slot);
+  const slot = deskFree(); if (!slot) return toast(`All ${DESK_MAX} desks are in use. ${LEADERS[leaderName()].label} d k deletes the shown one.`);
+  const d = { slot, name: clean(f.name || '').replace(/^node$/, '') || String(slot), members: {} }; DESK.scratch.push(d);
+  if (DESK.cur) { const r = [f.x, f.y, f.w, f.h]; d.members[f.id] = r; } else deskAdd(d, [f]);
+  deskGo(slot);
+}
+
+// ---- the recent-places ring (leader w): desks, focus tabs and views, most recent first, as Alt-Tab is. w (or Tab, ↓)
+// steps on, W (Shift-Tab, ↑) back, Enter or Space goes, a digit goes to that entry, Esc stays.
+const RING_MAX = 12;
+const placeNow = () => VIEW !== 'canvas' ? 'view:' + VIEW : FOCUS.cur ? 'tab:' + FOCUS.cur : 'desk:' + DESK.cur;
+function placeOk(k) {
+  const [t, v] = [k.slice(0, k.indexOf(':')), k.slice(k.indexOf(':') + 1)];
+  return t === 'view' ? VIEWS.includes(v) : t === 'tab' ? !!S.nodes[v] && FOCUS.tabs.includes(v) : t === 'desk' ? v === '0' || (+v === 9 ? attnBad().size > 0 : !!deskAt(+v)) : false;
+}
+function placeLabel(k) {
+  const v = k.slice(k.indexOf(':') + 1);
+  if (k.startsWith('view:')) return 'view · ' + (VIEW_NAMES[v] || v);
+  if (k.startsWith('tab:')) { const n = S.nodes[v]; return 'tab · ' + (KIND_GLYPH[n?.kind] || '') + ' ' + (n?.name || v); }
+  return 'desk · ' + (+v === 9 ? '9 attention' : deskName(deskAt(+v)));
+}
+function ringNote() { if (!S || !BOOTED) return; const k = placeNow(); if (RING.list[0] === k) return; RING.list = [k, ...RING.list.filter(x => x !== k)].slice(0, RING_MAX); viewSave(); }
+function ringGo(k) {
+  const v = k.slice(k.indexOf(':') + 1);
+  if (k.startsWith('view:')) return setView(v);
+  if (k.startsWith('tab:')) return focusShow(v);
+  if (VIEW !== 'canvas') setView('canvas');
+  if (FOCUS.cur) focusHide();
+  if (+v !== DESK.cur) deskGo(+v, true);
+  ringNote();
+}
+function ringOpen() {
+  ringNote(); RING.list = RING.list.filter(placeOk);
+  if (RING.list.length < 2) return toast('No other place yet: go to a desk, a focus tab or a view first, and leader w comes back here.');
+  RING.on = true; RING.sel = 1; ringRender();
+}
+function ringRender() {
+  let box = $('#ring'); if (!RING.on) { box?.remove(); return; }
+  if (!box) { box = el('div'); box.id = 'ring'; document.body.append(box); }
+  box.replaceChildren(...RING.list.map((k, i) => { const b = el('div', 'rg-item' + (i === RING.sel ? ' sel' : '') + (i === 0 ? ' now' : '')); const n = el('b'); n.textContent = i ? String(i) : '·'; b.append(n, placeLabel(k)); b.onclick = () => { RING.sel = i; ringDone(true); }; return b; }));
+}
+function ringStep(d) { RING.sel = (RING.sel + d + RING.list.length) % RING.list.length; ringRender(); }
+function ringDone(go) { const k = RING.list[RING.sel]; RING.on = false; ringRender(); if (go && k && RING.sel) ringGo(k); }
+
+// ---- the scratch overlay (leader x), as i3's scratchpad: cards kept off every desk and the Board, shown together over
+// whatever is on screen, at reading size, and hidden again. Leader m x puts the selected cards in it (again: takes them
+// out). The cards keep their places: showing lays them out over the screen, hiding puts them back.
+function ovlShow() {
+  OVL.ids = OVL.ids.filter(id => S.nodes[id]);
+  if (!OVL.ids.length) return toast(`The scratch overlay is empty. ${LEADERS[leaderName()].label} m x sends the selected card there.`);
+  if (VIEW !== 'canvas') setView('canvas');
+  if (FOCUS.cur) focusHide();
+  const c = cam(), a = camArea();
+  if (c.z < 0.75) { const cx = c.x + (a.left + a.vw / 2) / c.z, cy = c.y + (a.top + a.vh / 2) / c.z; Object.assign(c, { z: 1, x: cx - (a.left + a.vw / 2), y: cy - (a.top + a.vh / 2) }); applyCam(); }   // reading size
+  const ns = OVL.ids.map(id => S.nodes[id]);
+  const rs = tileRects(ns.length, a.vw * 0.72 / c.z, a.vh * 0.72 / c.z, c.x + (a.left + a.vw * 0.14) / c.z, c.y + (a.top + a.vh * 0.14) / c.z);
+  ns.forEach((n, i) => {
+    OVL.saved[n.id] = { x: n.x, y: n.y, w: n.w, h: n.h, in: n.in || null };
+    delete n.in; [n.x, n.y, n.w, n.h] = rs[i]; placeAny(n);
+    const L = live[n.id]; if (L) { L.el.classList.add('ovl'); if (L.el.parentNode === nodesEl) L.el.style.zIndex = ++topZ; }
+  });
+  OVL.on = true; document.body.classList.add('ovl-on');
+  restack(); renderLinks(); activate(ns[0].id);
+}
+function ovlPut(id) {   // one card back to the place it had before the overlay was shown
+  const n = S.nodes[id], s = OVL.saved[id]; delete OVL.saved[id]; live[id]?.el.classList.remove('ovl');
+  if (!n || !s) return;
+  Object.assign(n, { x: s.x, y: s.y, w: s.w, h: s.h }); if (s.in && S.nodes[s.in]) n.in = s.in; else delete n.in; placeAny(n);
+}
+function ovlHide() {
+  if (!OVL.on) return;
+  for (const id of Object.keys(OVL.saved)) ovlPut(id);
+  OVL.on = false; OVL.saved = {}; document.body.classList.remove('ovl-on');
+  restack(); renderLinks();
+}
+function ovlToggle() { OVL.on ? ovlHide() : ovlShow(); }
+function ovlSend() {
+  const ns = deskTargets().filter(n => n.kind !== 'frame'); if (!ns.length) return toast('Pick a card first (a folder does not go in the scratch overlay).');
+  const out = ns.every(ovlHas);
+  if (out) for (const n of ns) { if (OVL.on) ovlPut(n.id); OVL.ids = OVL.ids.filter(id => id !== n.id); }
+  else { ovlHide(); for (const n of ns) if (!ovlHas(n)) OVL.ids.push(n.id); pickClear(); }
+  if (!OVL.ids.length && OVL.on) { OVL.on = false; document.body.classList.remove('ovl-on'); }
+  restack(); renderLinks(); viewSave();
+  toast(out ? `${ns.length} card(s) out of the scratch overlay, back where they were.` : `${ns.length} card(s) in the scratch overlay (this device). ${LEADERS[leaderName()].label} x shows and hides it over any desk.`);
+}
+// What a save writes for the overlay's cards while it is shown: the places they had before.
+function ovlNodes(nodes) {
+  if (!OVL.on) return nodes;
+  const out = { ...nodes };
+  for (const [id, s] of Object.entries(OVL.saved)) { const n = out[id]; if (!n) continue; const c = { ...n, x: s.x, y: s.y, w: s.w, h: s.h }; if (s.in && out[s.in]) c.in = s.in; else delete c.in; out[id] = c; }
+  return out;
+}
+
+// ---- the overview (leader g): every desk as a far-zoom drawing (folders as frames, cards as named boxes), the Board first
+// and the attention desk last. Arrows move between desks, letters search card names across all of them, Backspace takes
+// a letter back, a digit goes to that desk, Enter goes to the selected desk (with a search, to its first match), Esc stays.
+const OVW = { on: false, sel: 0, q: '', slots: [] };
+function deskItems(slot) {
+  const board = n => { const p = DESK.snap?.pos[n.id]; return p ? { x: p[0], y: p[1], w: p[2], h: p[3] } : { x: n.x, y: n.y, w: n.w, h: n.h }; };
+  const all = Object.values(S.nodes).filter(n => n.kind !== 'ghost' && !ovlHas(n));   // the overlay's cards are on no desk
+  if (slot === DESK.cur) return all.filter(n => !stashed(n)).map(n => ({ n, x: n.x, y: n.y, w: n.w, h: n.h }));
+  if (slot === 0) return all.map(n => ({ n, ...board(n) }));
+  const d = slot === 9 ? deskAttention() : deskAt(slot); if (!d) return [];
+  const out = [], seen = new Set(), ids = Object.keys(d.members).map(id => S.nodes[id]).filter(Boolean).sort((a, b) => depthOf(a) - depthOf(b));
+  const vr = slot === 9 ? tileRects(ids.length, 1600, 900, 0, 0) : null;
+  ids.forEach((m, i) => {
+    const b = board(m), r = vr ? { x: vr[i][0], y: vr[i][1], w: vr[i][2], h: vr[i][3] } : d.members[m.id] ? { x: d.members[m.id][0], y: d.members[m.id][1], w: d.members[m.id][2], h: d.members[m.id][3] } : b;
+    if (!seen.has(m.id)) { out.push({ n: m, ...r }); seen.add(m.id); }
+    if (m.kind === 'frame' && !vr) for (const k of descendants(m.id)) if (!seen.has(k.id) && !(k.id in d.members)) { const q = board(k); out.push({ n: k, x: q.x + r.x - b.x, y: q.y + r.y - b.y, w: q.w, h: q.h }); seen.add(k.id); }
+  });
+  for (const id of S.sticky || []) { const n = S.nodes[id]; if (n && !seen.has(id)) out.push({ n, ...board(n) }); }
+  return out;
+}
+function ovwOpen() {
+  if (VIEW !== 'canvas') setView('canvas');
+  OVW.slots = [0, ...deskList().map(d => d.slot), ...(attnBad().size ? [9] : [])];
+  OVW.on = true; OVW.q = ''; OVW.sel = Math.max(0, OVW.slots.indexOf(DESK.cur)); ovwRender();
+}
+function ovwClose() { OVW.on = false; $('#overview')?.remove(); }
+const ovwMatch = n => !!OVW.q && (n.name || '').toLowerCase().includes(OVW.q);
+function ovwRender() {
+  let box = $('#overview'); if (!box) { box = el('div'); box.id = 'overview'; document.body.append(box); }
+  const head = el('div', 'ov-head'); head.textContent = OVW.q ? 'Search: ' + OVW.q : 'Desks: arrows move · letters search · a digit goes there · Enter goes · Esc stays';
+  const grid = el('div', 'ov-grid'), PW = 240, PH = 140, bad = attnBad();
+  OVW.slots.forEach((slot, i) => {
+    const items = deskItems(slot), hits = items.filter(it => ovwMatch(it.n)).length;
+    const p = el('div', 'ov-desk' + (i === OVW.sel ? ' sel' : '') + (slot === DESK.cur ? ' cur' : '') + (OVW.q && !hits ? ' miss' : '')); p.dataset.slot = slot;
+    const t = el('div', 'ov-title'); const nc = items.filter(it => it.n.kind !== 'frame').length; t.textContent = (slot === 9 ? '9 attention' : deskName(deskAt(slot))) + ' · ' + nc + ' card' + (nc === 1 ? '' : 's') + (OVW.q ? ' · ' + hits + ' match' + (hits === 1 ? '' : 'es') : '');
+    const map = el('div', 'ov-map');
+    if (items.length) {
+      const top = it => it.y - (it.n.kind === 'frame' ? LABEL_H : 0);
+      const x0 = Math.min(...items.map(it => it.x)), y0 = Math.min(...items.map(top)), x1 = Math.max(...items.map(it => it.x + it.w)), y1 = Math.max(...items.map(it => it.y + it.h));
+      const k = Math.min(PW / Math.max(1, x1 - x0), PH / Math.max(1, y1 - y0));
+      for (const it of items.sort((a, b) => (b.n.kind === 'frame') - (a.n.kind === 'frame') || depthOf(a.n) - depthOf(b.n))) {
+        const b = el('div', 'ov-box' + (it.n.kind === 'frame' ? ' f' : '') + (ovwMatch(it.n) ? ' hit' : '') + (bad.has(it.n.id) ? ' bad' : '') + (isSticky(it.n) ? ' sticky' : ''));
+        Object.assign(b.style, { left: Math.round((it.x - x0) * k) + 'px', top: Math.round((top(it) - y0) * k) + 'px', width: Math.max(3, Math.round(it.w * k)) + 'px', height: Math.max(3, Math.round((it.y + it.h - top(it)) * k)) + 'px' });
+        if (it.w * k > 40 && it.h * k > 12) b.textContent = it.n.name || ''; b.title = it.n.name || ''; map.append(b);
+      }
+    }
+    p.append(t, map); p.onclick = () => { OVW.sel = i; ovwGo(); }; grid.append(p);
+  });
+  box.replaceChildren(head, grid);
+}
+function ovwMove(dx, dy) {
+  const ps = $$('#overview .ov-desk'); if (!ps.length) return;
+  const cols = Math.max(1, ps.filter(p => p.offsetTop === ps[0].offsetTop).length);
+  OVW.sel = clamp(OVW.sel + dx + dy * cols, 0, ps.length - 1); ovwRender();
+}
+function ovwType(ch) {
+  OVW.q += ch.toLowerCase();
+  const has = i => deskItems(OVW.slots[i]).some(it => ovwMatch(it.n));
+  if (!has(OVW.sel)) { const j = OVW.slots.findIndex((_, i) => has(i)); if (j >= 0) OVW.sel = j; }
+  ovwRender();
+}
+function ovwGo(slot) {
+  if (slot === undefined) slot = OVW.slots[OVW.sel];
+  const hit = OVW.q && deskItems(slot).map(it => it.n).find(n => n.kind !== 'frame' && ovwMatch(n)) || null;
+  ovwClose();
+  if (slot === 9 && !attnBad().size) return toast('Nothing needs a look.');
+  if (slot !== DESK.cur) deskGo(slot, !!hit);
+  if (hit && S.nodes[hit.id]) jumpNode(S.nodes[hit.id]);
+}
+
+cmd('Desk: overview of every desk', () => ovwOpen(), '@overview');
+cmd('Desk: recent places (desks, focus tabs, views)', () => ringOpen(), '@ring');
+cmd('Desk: the attention desk (cards that need a look)', () => deskGo(9), '@desk.9');
+cmd('Attention: next item that needs a look (across desks)', () => attnNext(), '@attn.next');
+cmd('Desk: promote the selection to the Board (its place on this desk)', () => deskPromote(), '@desk.promote', () => !!DESK.cur);
+cmd('Desk: sticky (the selected cards on every desk) on or off', () => deskSticky(), '@desk.sticky');
+cmd('Desk: tile or free this desk', () => deskLayout(), '@desk.layout', () => !!DESK.cur);
+cmd('Desk: open the active folder as a desk', () => deskOpenFolder(), '@desk.open');
+cmd('Scratch overlay: show or hide', () => ovlToggle(), '@overlay');
+cmd('Scratch overlay: put the selected cards in (again: take them out)', () => ovlSend(), '@overlay.send');
 cmd('Desk: go to…', () => askName('Desk number: 0 Board' + deskList().map(d => '  ·  ' + deskName(d)).join(''), '', v => deskGo(+String(v).trim())));
 cmd('Desk: previous', () => KC['desk.prev'](), '@desk.prev');
 cmd('Desk: send the selection to…', () => askName('Send to desk number (0 takes it off this desk)', '', v => deskSend(+String(v).trim())));
@@ -6951,8 +7256,16 @@ const KC = {
     ['desk.follow.' + i, () => deskSend(i, { follow: true })], ['desk.also.' + i, () => deskSend(i, { keep: true })]])),
   'desk.prev': () => deskGo(DESK.prev === DESK.cur ? 0 : DESK.prev), 'desk.new': () => deskNew(), 'desk.rename': () => deskRename(), 'desk.pin': () => deskPin(),
   'desk.off': () => deskSend(0), 'desk.which': () => deskAlso(), 'desk.delete': () => deskDelete(),
+  'desk.promote': () => deskPromote(), 'desk.sticky': () => deskSticky(), 'desk.layout': () => deskLayout(), 'desk.open': () => deskOpenFolder(),
+  'attn.next': () => attnNext(), overlay: () => ovlToggle(), 'overlay.send': () => ovlSend(),
+  overview: (e, k, via) => { if (via === 'leader') leaveCard(LEADER.target); ovwOpen(); }, 'overview.close': () => ovwClose(), 'overview.go': () => ovwGo(),
+  'overview.left': () => ovwMove(-1, 0), 'overview.right': () => ovwMove(1, 0), 'overview.up': () => ovwMove(0, -1), 'overview.down': () => ovwMove(0, 1),
+  'overview.letter': (e, k) => ovwType(k), 'overview.back': () => { OVW.q = OVW.q.slice(0, -1); ovwRender(); },
+  ...Object.fromEntries([0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(i => ['overview.' + i, () => ovwGo(i)])),
+  ring: (e, k, via) => { if (via === 'leader') leaveCard(LEADER.target); ringOpen(); }, 'ring.next': () => ringStep(1), 'ring.prev': () => ringStep(-1),
+  'ring.go': () => ringDone(true), 'ring.close': () => ringDone(false), ...Object.fromEntries([1, 2, 3, 4, 5, 6, 7, 8, 9].map(i => ['ring.' + i, () => { if (i < RING.list.length) { RING.sel = i; ringDone(true); } }])),
   'ws.last': () => wsToggleLast(),
-  esc: () => { if (VIEW === 'graph' && G.sel) graphSelect(null); else if (tool !== 'select') setTool('select'); else if (PICKED.size) pickClear(); else if (FOCUS.cur) focusHide(); else if (WS.cur) wsLeave(); else if (TAG_FILTER) tagFilter(''); else return false; },
+  esc: () => { if (VIEW === 'graph' && G.sel) graphSelect(null); else if (tool !== 'select') setTool('select'); else if (PICKED.size) pickClear(); else if (OVL.on) ovlHide(); else if (FOCUS.cur) focusHide(); else if (WS.cur) wsLeave(); else if (TAG_FILTER) tagFilter(''); else return false; },
   help: () => { $('#help').hidden = false; },
   'overlay.close': () => closeOverlays(),
   // canvas
@@ -7166,7 +7479,7 @@ function manualNodesOf(nodes, snap) {
 // What a save writes as nodes: a card shown in a focus tab keeps its place on the canvas, and a desk's or a perspective's
 // layout gives way to the Board's.
 function manualNodes() {
-  let nodes = S.nodes; const f = FOCUS.cur && FOCUS.rect && nodes[FOCUS.cur];
+  let nodes = ovlNodes(S.nodes); const f = FOCUS.cur && FOCUS.rect && nodes[FOCUS.cur];
   if (f) nodes = { ...nodes, [f.id]: { ...f, ...FOCUS.rect } };
   if (DESK.snap) return deskBoardOf(nodes);
   return perspCur() !== 'manual' && S.manual ? manualNodesOf(nodes, S.manual) : nodes;
@@ -7244,6 +7557,7 @@ function perspSet(p, quiet) {
   if (FOCUS.cur) focusHide();
   if (WS.cur) { WS.cur = null; WS.last = null; wsApply(false); }
   if (DESK.cur && p !== 'manual') deskGo(0, true);   // a perspective rewrites the Board's folders: it is shown on the Board only
+  ovlHide();
   LAYOUT_UNDO = null;
   if (cur !== 'manual') perspClear();
   if (p !== 'manual') perspBuild(p);
@@ -8012,6 +8326,7 @@ function statusRender() {
   });
   if (c.due != null) add('▦ ' + c.due, c.due + ' flashcard(s) due. Click: review.', c.due ? 'warn' : '', () => setView('review'));
   add('☐ ' + c.tasks + (c.dueToday ? ' (' + c.dueToday + ' due)' : ''), c.tasks + ' open task(s) on the board and in the notes' + (c.dueToday ? ', ' + c.dueToday + ' scheduled or due by today' : '') + '. Click: the tasks view.', c.dueToday ? 'warn' : '', () => setView('tasks'));
+  deskAttnTick(); deskPager();
   const a = attnCount(); add('! ' + a, a ? a + ' item(s) need a look. Click: the Attention list (addresses).' : 'Nothing needs a look.', a ? 'bad' : '', () => { setView('ranger'); rgGo('attn:'); });
 }
 function statusTick() { if (!S) return; if (DAEMON) { for (const h of [null, ...allHosts()]) if (!HOSTCONN[h ? h.url : '']?.down) unitsData(h); tasksLoad(); } else unitsData(null); statusRender(); }
@@ -8046,6 +8361,8 @@ AGENT_TOOLS.push(
 );
 window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 Object.assign(window.__canvas, { keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
-Object.assign(window.__canvas, { DESK, deskGo, deskSend, deskList, deskAt, deskPin, deskDelete, deskOff, deskPinned, serialize, activate, viewKey });
+Object.defineProperty(window.__canvas, 'activeId', { get: () => activeId });   // Object.assign would copy a getter's value once
+Object.assign(window.__canvas, { DESK, deskGo, deskSend, deskList, deskAt, deskPin, deskDelete, deskOff, deskPinned, serialize, activate, viewKey,
+  OVL, RING, OVW, deskTile, deskPromote, deskSticky, deskLayout, deskOpenFolder, attnNext, attnBad, ovlToggle, ovlSend, ovwOpen, ringOpen, deskItems });
 boot();
 })();
