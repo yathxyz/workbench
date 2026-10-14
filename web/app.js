@@ -190,7 +190,11 @@ function save() {
     .then(async r => {
       if (r.status === 204) { BOARD_ETAG = r.headers.get('ETag'); SAVE.lastJson = json; SAVE.err = 0; SAVE.pending = SAVE.again; barClear('save'); return; }
       if (r.type === 'opaqueredirect' || r.status === 401) { SAVE.paused = 'auth'; return netSet('signed_out'); }
-      if (r.status === 412) { SAVE.theirs = (await r.json().catch(() => ({}))).etag; SAVE.paused = 'conflict'; return conflictBar(); }
+      if (r.status === 412) {
+        const theirs = (await r.json().catch(() => ({}))).etag;
+        if (snapOnly(json)) { SAVE.recheck = theirs || 'stale'; SAVE.again = false; return; }   // only a page snapshot: take their board (boardChanged, below)
+        SAVE.theirs = theirs; SAVE.paused = 'conflict'; return conflictBar();
+      }
       throw new Error((await r.json().catch(() => ({}))).error || 'HTTP ' + r.status);
     })
     .catch(e => { SAVE.err++; SAVE.again = false; bar('save', 'Board not saved: ' + e.message + '. Retrying…'); SAVE.retryT = setTimeout(save, backoff(SAVE.err)); netKick(); })
@@ -217,14 +221,18 @@ function conflictBar() {
     ['Overwrite with this tab', () => { BOARD_ETAG = SAVE.theirs; SAVE.paused = null; SAVE.lastJson = null; barClear('conflict'); save(); dbFlush(); }],
   ]);
 }
+// A frames-mode page caches its first lines on the node (snap, F-A27). It is derived from the page's file, so a tab whose
+// only change is a snap is clean for another tab's board: it takes that board instead of showing the conflict bar.
+const noSnap = j => JSON.stringify(JSON.parse(j || '{}'), (k, v) => (k === 'snap' ? undefined : v));
+const snapOnly = (json = serialize()) => FR.on && !SAVE.paused && SAVE.lastJson != null && noSnap(json) === noSnap(SAVE.lastJson);
 // /rpc board{etag}: another tab or device saved (F-A7).
 async function boardChanged(etag) {
   if (!DAEMON || !BOOTED || etag === BOARD_ETAG) return;   // our own save
   if (SAVE.busy) { SAVE.recheck = etag; return; }          // our PUT's 204 may carry this very ETag
-  if (unsaved()) { if (SAVE.paused !== 'auth') { SAVE.theirs = etag; SAVE.paused = 'conflict'; conflictBar(); } return; }
+  if (unsaved() && !snapOnly()) { if (SAVE.paused !== 'auth') { SAVE.theirs = etag; SAVE.paused = 'conflict'; conflictBar(); } return; }
   let b; try { b = await bootFetch('/api/board'); } catch { return netKick(); }
   if (b.etag === BOARD_ETAG || b.body?.v !== 5) return;
-  if (unsaved()) { SAVE.theirs = b.etag; SAVE.paused = 'conflict'; return conflictBar(); }
+  if (unsaved() && !snapOnly()) { SAVE.theirs = b.etag; SAVE.paused = 'conflict'; return conflictBar(); }
   boardAdopt(b.body); BOARD_ETAG = b.etag;
 }
 // A clean tab takes another tab's board in place: nodes, links and ink. The camera and the view stay this device's: a tab
@@ -5639,7 +5647,7 @@ function seedInk() {
 // viewport plus one viewport of margin at zoom >= LOD_Z (or focused), at most FR_CAP per tab (least recently drawn
 // unfocused first); otherwise the card shows the 12-line snapshot from the replica text (Q8). A replica off screen for
 // FR_CLOSE_MS is closed. Pages without buf are migrated to notes/<slug>.md through the replica (R8.17, Q3).
-const FR = { on: false, ready: false, online: false, Ed: null, L: null, booting: null, failed: null, byFrame: new WeakMap(), lastSeen: new Map(), offAt: new Map(), pending: new Map(), claimed: new Set(), anchorCache: {}, localAnchors: {}, perf: [], waiters: [], snapT: new Map() };
+const FR = { on: false, ready: false, online: false, Ed: null, L: null, booting: null, failed: null, byFrame: new WeakMap(), lastSeen: new Map(), offAt: new Map(), pending: new Map(), claimed: new Set(), anchorCache: {}, localAnchors: {}, perf: [], waiters: [], snapT: new Map(), snapMine: new Set() };
 const FR_CAP = 24, FR_FONT = 13, FR_CLOSE_MS = 5 * 60 * 1000, FR_OFF_TEXT = 'Editing is off: workbench-edit is not running';
 // The runtime files in the order of edwin/index.html (host-browser first; markdown after org; ot and sync last).
 const FR_FILES = ['host-browser', 'scheme', 'runtime', 'text', 'editor-core', 'editor-prims', 'evil-core', 'pool', 'complete', 'extras', 'stack', 'ai', 'evil-ex', 'org', 'markdown', 'ot', 'sync'];
@@ -5666,7 +5674,7 @@ function frBoot() {
     Ed.hooks.leaveFrame = f => frLeave(f);
     Ed.onFrameEvent(frEvent);
     const applied = Ed.hooks.applied;   // sync.js's (local batches out, remote batches in): block cards follow every edit to a page's replica
-    Ed.hooks.applied = (b, ops, origin) => { const r = applied ? applied(b, ops, origin) : undefined; frBufEdited(b); return r; };
+    Ed.hooks.applied = (b, ops, origin) => { const r = applied ? applied(b, ops, origin) : undefined; frBufEdited(b, origin); return r; };
     Ed.sync.on('state', frStateChanged);
     Ed.sync.on('epoch', frEpoch);
     Ed.sync.on('display', frDisplay);
@@ -5736,9 +5744,16 @@ function frEvent({ type, frame, buffer }) {
   else if (type === 'point') { FR.lastSeen.set(id, performance.now()); if (focusedBuf === id) scheduleBufAddr(n); frOverlays(id); }
   else if (type === 'status') frOverlays(id);
 }
-// An edit to replica B, from any origin: the block cards of the page it belongs to reload (F-A25).
-function frBufEdited(b) {
-  for (const [id, L] of Object.entries(live)) if (L.buf === b) { const n = S.nodes[id]; if (n && nodeList().some(m => m.block?.page === id)) blockCardsChanged(n); }
+// An edit to replica B, from any origin: the block cards of the page it belongs to reload (F-A25). The page's cached
+// snapshot (snap) is written by the tab that made the edit; an edit from another tab ('remote') reaches this tab's
+// board with that tab's save, so writing it here too would only race the two saves. Disk, server and agent edits have
+// no tab: every tab writes, and snapOnly() settles the race.
+function frBufEdited(b, origin) {
+  for (const [id, L] of Object.entries(live)) if (L.buf === b) {
+    const n = S.nodes[id]; if (!n) continue;
+    if (origin !== 'remote') FR.snapMine.add(id);
+    if (nodeList().some(m => m.block?.page === id)) blockCardsChanged(n);
+  }
 }
 // ---- the page card (mountBuffer in frames mode)
 function frMountPage(n, L) {
@@ -5869,7 +5884,7 @@ function frSnapText(n) { const b = frBufOf(n); const t = b ? b.text : n.snap != 
 function frSnapRefresh(n) { const L = live[n.id]; if (!L?.snap) return; const t = frSnapText(n); if (L.snap.textContent !== t) L.snap.textContent = t; if (L.lod) $('pre', L.lod).textContent = t; }
 function frSnapSoon(n) {
   if (FR.snapT.has(n.id)) return;
-  FR.snapT.set(n.id, setTimeout(() => { FR.snapT.delete(n.id); if (!S.nodes[n.id]) return; const t = frSnapText(n); if (n.buf && n.snap !== t) { n.snap = t; dirty(); } frSnapRefresh(n); if (VIEW === 'tasks') renderTasks(); }, 1500));
+  FR.snapT.set(n.id, setTimeout(() => { FR.snapT.delete(n.id); if (!S.nodes[n.id]) return; const t = frSnapText(n), mine = FR.snapMine.delete(n.id); if (n.buf && n.snap !== t && mine) { n.snap = t; dirty(); } frSnapRefresh(n); if (VIEW === 'tasks') renderTasks(); }, 1500));
 }
 // ---- anchors (R9.12): server markers from meta.anchors; a closed replica's last known set is kept per card
 function frAnchors(n) {
