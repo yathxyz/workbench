@@ -97,7 +97,19 @@ in
   # minor modes, buffer-locals, markers) and the shadow-stack cost bound (R4.34, at most 10%).
   edwin-scheme = pkgs.runCommand "workbench-edwin-scheme" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     node --test ${edwin}/test/scheme*.test.mjs
-    node ${edwin}/test/scheme-bench.mjs
+    touch $out
+  '';
+
+  # The evaluator budgets (E2 gate): the shadow stack at most 10% (R4.34) and generator mode at most 3x direct
+  # (R4.38, measured 1.2x). The bench recurses 1,000 deep in both modes, so it needs more stack than Node's default.
+  edwin-bench = pkgs.runCommand "workbench-edwin-bench" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    node --stack-size=6900 ${edwin}/test/scheme-bench.mjs
+    touch $out
+  '';
+
+  # The worker pool's Node host (E2): jobs on worker_threads, the main-thread fallback, cancellation.
+  edwin-pool = pkgs.runCommand "workbench-edwin-pool" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    node --test ${edwin}/test/pool.test.mjs
     touch $out
   '';
 
@@ -136,6 +148,39 @@ in
   edit-disk = pkgs.runCommand "workbench-edit-disk" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
     node --test ${edwind}/edwin/test/disk.test.mjs
+    touch $out
+  '';
+
+  # The E2 gates of the edwind spec (§17.1): the image log and its replication (edit-image), the notes index,
+  # its grammar and the /api shapes (edit-notes), the block addresses against the golden file (edit-address).
+  edit-image = pkgs.runCommand "workbench-edit-image" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    export HOME=$TMPDIR
+    node --test ${edwind}/edwin/test/image.test.mjs
+    touch $out
+  '';
+  edit-notes = pkgs.runCommand "workbench-edit-notes" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    export HOME=$TMPDIR
+    node --test ${edwind}/edwin/test/notes.test.mjs
+    touch $out
+  '';
+  edit-address = pkgs.runCommand "workbench-edit-address" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    export NODE_PATH=${edwinDevDeps}/node_modules
+    node --test ${edwin}/test/address.test.mjs
+    touch $out
+  '';
+
+  # The Lisp machine (E2, §4.6–§4.9): threads, held buffers, ask and answer, interrupt, timers, server
+  # commands; the debugger, the inspector, introspection and the primitive registry.
+  edit-lisp = pkgs.runCommand "workbench-edit-lisp" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    export HOME=$TMPDIR
+    node --test ${edwind}/edwin/test/threads.test.mjs ${edwind}/edwin/test/debug.test.mjs
+    touch $out
+  '';
+
+  # The Scheme boundary (R16.15, R4.52) and the credential rules (R16.19, in models.test.mjs).
+  edit-security = pkgs.runCommand "workbench-edit-security" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    export HOME=$TMPDIR
+    node --test ${edwind}/edwin/test/security.test.mjs
     touch $out
   '';
 
