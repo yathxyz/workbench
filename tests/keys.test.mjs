@@ -130,3 +130,10 @@ test('desks D2 (§10.8): overview, ring, overlay, attention and the new desk key
   assert.equal(K.whereIs('desk.sticky'), 'Ctrl-Space d s');
   assert.equal(K.whereIs('overlay.send'), 'Ctrl-Space m x');
 });
+
+test('desks D3 (§10.8): revert and keep on the d map; d t steps the layouts', () => {
+  assert.equal(K.leaderResolve('u', 'leader-d').cmd, 'desk.revert');
+  assert.equal(K.leaderResolve('w', 'leader-d').cmd, 'desk.keep');
+  assert.equal(K.leaderResolve('t', 'leader-d').cmd, 'desk.layout');
+  assert.equal(K.whereIs('desk.revert'), 'Ctrl-Space d u');
+});

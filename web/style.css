@@ -911,6 +911,8 @@ body.tree-open[data-view="canvas"] #which-key { left: calc(50% + var(--tree-w, 2
 /* desks D2: pager badges and the attention desk, sticky cards, the scratch overlay, the overview, the recent-places ring */
 #st-desk .dk[data-bad]::after { content: attr(data-bad); margin-left: 3px; padding: 0 4px; border-radius: 6px; font-size: 0.85em; background: var(--err); color: var(--bg); }
 #st-desk .dk.attn { color: var(--err); font-weight: 600; }
+#st-desk .dk.away { text-decoration: underline dotted; }   /* shown in another window (D3) */
+#st-desk .dk.persp { font-style: italic; }
 .node.sticky > .hdr { box-shadow: inset 3px 0 0 var(--accent); }
 .node.ovl { box-shadow: var(--shadow), 0 0 0 2px var(--accent); }
 #overview { position: fixed; inset: 0; z-index: 210; background: var(--scrim); overflow: auto; padding: 8vh 24px 24px; }
