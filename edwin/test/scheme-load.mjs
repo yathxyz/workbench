@@ -11,12 +11,14 @@ import vm from 'node:vm';
 export const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 export const SCHEME_FILE = join(ROOT, 'src', 'scheme.js');
 
-// The evaluator modes a suite runs in: 'direct' (the closure compiler) today; E2 adds a generator mode.
-export const MODES = ['direct'];
+// The evaluator modes a suite runs in: 'direct' (the closure compiler, frames) and 'gen' (generator
+// closures, edwind; R4.38). Both must pass the same suite.
+export const MODES = ['direct', 'gen'];
 export const MODE = process.env.EDWIN_SCHEME_MODE || 'direct';
 
 export function loadScheme(mode = MODE) {
   if (!MODES.includes(mode)) throw new Error('unknown Scheme evaluator mode: ' + mode);
+  globalThis.SCHEME_MODE = mode;
   vm.runInThisContext(readFileSync(SCHEME_FILE, 'utf8'), { filename: 'scheme.js' });
   return globalThis.Scheme;
 }

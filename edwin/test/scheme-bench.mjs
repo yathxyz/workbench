@@ -1,10 +1,11 @@
 // Evaluator benchmarks for Edwin Scheme: `node edwin/test/scheme-bench.mjs [repetitions]`.
 //
 // Runs each benchmark on src/scheme.js with the shadow stack compiled in and compiled out
-// (globalThis.SCHEME_SHADOW_STACK = false at load), and, for information, on the evaluator before
-// this work (the newest commit whose scheme.js has no shadow stack). Every evaluator is loaded into
-// its own contexts; the runs are interleaved and the best is kept. Prints a table and exits 1 when
-// the shadow stack costs more than 10% (geometric mean over the benchmarks).
+// (globalThis.SCHEME_SHADOW_STACK = false at load), in generator mode (globalThis.SCHEME_MODE = 'gen',
+// edwind's evaluator, R4.38), and, for information, on the evaluator before the shadow stack (the
+// newest commit whose scheme.js has none). Every evaluator is loaded into its own contexts; the runs
+// are interleaved and the best is kept. Prints a table and exits 1 when the shadow stack costs more
+// than 10% or generator mode more than 3x direct mode (geometric means over the benchmarks).
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
@@ -14,6 +15,7 @@ import { ROOT, SCHEME_FILE, loadSchemeIn } from './scheme-load.mjs';
 
 const REPS = Number(process.argv[2]) || 7;
 const LIMIT = 0.10;
+const GEN_LIMIT = 3.0;
 
 const BENCHES = [
   ['fib 25', '(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))', '(fib 25)'],
@@ -66,10 +68,12 @@ const base = baselineSource();
 const variants = [
   { name: 'shadow on', load: () => loadSchemeIn(current) },
   { name: 'shadow off', load: () => loadSchemeIn(current, { SCHEME_SHADOW_STACK: false }) },
+  { name: 'generator mode', load: () => loadSchemeIn(current, { SCHEME_MODE: 'gen' }) },
 ];
 if (base) variants.push({ name: `original ${base.commit}`, load: () => loadSchemeIn(base.src) });
 for (const v of variants) v.instances = Array.from({ length: INSTANCES }, v.load);
 if (variants[0].instances[0].shadowStack !== true || variants[1].instances[0].shadowStack !== false) throw new Error('could not load the evaluator with the shadow stack in and out');
+if (variants[2].instances[0].mode !== 'gen') throw new Error('could not load the evaluator in generator mode');
 
 const rows = [];
 for (const [name, setup, expr] of [...BENCHES, ['fib 25 inside guard', '', '(guard (e (#t #f)) (fib 25))']]) {
@@ -91,15 +95,20 @@ for (const [name, setup, expr] of [...BENCHES, ['fib 25 inside guard', '', '(gua
 function v2s(x) { return typeof x === 'bigint' ? x.toString() : String(x); }
 
 const pct = (a, b) => ((a / b - 1) * 100).toFixed(1).padStart(6) + '%';
-const head = ['benchmark'.padEnd(22), ...variants.map(v => v.name.padStart(18)), 'shadow cost'.padStart(12), base ? 'vs original'.padStart(12) : ''];
+const head = ['benchmark'.padEnd(22), ...variants.map(v => v.name.padStart(18)), 'shadow cost'.padStart(12), 'gen / direct'.padStart(12), base ? 'vs original'.padStart(12) : ''];
 console.log(head.join(' '));
-const ratios = [];
+const ratios = [], genRatios = [];
 for (const r of rows) {
-  const cost = r.best[0] / r.best[1];
-  if (!r.info) ratios.push(cost);
-  console.log([r.name.padEnd(22), ...r.best.map(t => (t.toFixed(2) + ' ms').padStart(18)), pct(r.best[0], r.best[1]).padStart(12), base ? pct(r.best[0], r.best[2]).padStart(12) : ''].join(' ') + (r.info ? '   (handler installed: informational)' : ''));
+  const cost = r.best[0] / r.best[1], genCost = r.best[2] / r.best[0];
+  if (!r.info) { ratios.push(cost); genRatios.push(genCost); }
+  console.log([r.name.padEnd(22), ...r.best.map(t => (t.toFixed(2) + ' ms').padStart(18)), pct(r.best[0], r.best[1]).padStart(12), (genCost.toFixed(2) + 'x').padStart(12), base ? pct(r.best[0], r.best[3]).padStart(12) : ''].join(' ') + (r.info ? '   (handler installed: informational)' : ''));
 }
-const geo = Math.exp(ratios.reduce((s, x) => s + Math.log(x), 0) / ratios.length);
+const geomean = xs => Math.exp(xs.reduce((s, x) => s + Math.log(x), 0) / xs.length);
+const geo = geomean(ratios), geoGen = geomean(genRatios);
 console.log(`\nshadow stack overhead (geometric mean of ${ratios.length} benchmarks, best of ${REPS} runs x ${INSTANCES} instances): ${((geo - 1) * 100).toFixed(1)}%  (limit ${LIMIT * 100}%)`);
-if (geo - 1 > LIMIT) { console.log('FAIL: the shadow stack costs more than the limit'); process.exit(1); }
+console.log(`generator mode / direct mode (geometric mean): ${geoGen.toFixed(2)}x  (limit ${GEN_LIMIT}x)`);
+let failed = false;
+if (geo - 1 > LIMIT) { console.log('FAIL: the shadow stack costs more than the limit'); failed = true; }
+if (geoGen > GEN_LIMIT) { console.log('FAIL: generator mode is slower than the limit'); failed = true; }
+if (failed) process.exit(1);
 console.log('ok');
