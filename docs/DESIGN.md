@@ -971,7 +971,7 @@ Nothing else is inherited: no `NOTIFY_SOCKET`, `INVOCATION_ID`, `JOURNAL_STREAM`
 #### 3.7.4 `wb` discovery
 - **Socket:** `--socket`, then `$WB_SOCKET`, then `/run/workbench-web/web.sock`.
 - **Protocol:** one `hello` and one `cmd` per invocation. `--url` and `--token` are usage errors.
-- **Exit codes:** 0 ok, 1 err, 2 usage.
+- **Exit codes:** 0 ok, 1 err, 2 usage, 7 no page (`no_page`; edwind spec §13.1).
 - **Messages:** `wb: cannot reach wb-web at <path> (<errno>)` and `wb: no Workbench page is open`.
 - **Commands:** there are no commands for `hosts`, `host`, `unit start|stop|restart`, `tmux` or `adopt`, and `create_node` does not accept `kind=agent`.
 
@@ -1346,7 +1346,7 @@ The test runs numbered steps. The steps this design pins down:
 
 **Pass criterion for "sessions survive":** steps 4, 6 and 9 all pass in one run. The hub PID is unchanged across 4 and 6, and revive succeeds in 9.
 
-### 9.5 UI checks (N27-N58; N1-N26 are the baseline checks of `tests/ui.mjs`, kept with the §6.1 amendments)
+### 9.5 UI checks (N27-N59; N1-N26 are the baseline checks of `tests/ui.mjs`, kept with the §6.1 amendments)
 
 | # | Check |
 |---|---|
@@ -1382,6 +1382,7 @@ The test runs numbered steps. The steps this design pins down:
 | N56 | Desks (F-A24). Leader `m 2` then leader `2` show desk 2 with only its items, a card loose out of its hidden folder, a non-member hidden; the pager reads `0 2*`; the board file keeps the Board's geometry exactly and no scratch desk; the view state holds desk 2 with the moved card's rectangle. `Alt-Shift-0` restores the Board exactly and leader `` ` `` returns to desk 2's rectangles. A card made on the desk joins it and shows on the Board; a card spawned on the Board joins its parent's desk at the same offset. A pinned desk is in the board file and on a second device; that device, on the desk, takes the first device's move without a bar and stays on the desk |
 | N57 | A touch screen (demo page). Two fingers on a page zoom the camera; a one-finger pan lifted while moving glides on and one that rested does not; a finger down during a flight stops it short of its target; dragging a card keeps the drawn edges of other cards (the same elements) (F-A26) |
 | N58 | Desks D2 (F-A28). Leader `m 3`, `3`, `d t` tile desk 3: its three cards sit in cells that do not overlap. Leader `d b` on one, then `0`: on the Board and in the board file it stands at its desk place, and no sibling lies under it. Leader `d s` makes a card sticky: it shows on desk 3 without being a member, and a move there reaches the Board and the board file (`sticky` lists it). Leader `g` shows the Board first and desk 3; → then Enter goes to desk 3; typed letters mark matching cards. After `Alt-2`, leader `w` lists desk 3 second and Enter returns to it on the canvas. Leader `m x` hides a card; leader `x` shows it inside the view while a save keeps its place; leader `x` again puts it back exactly. A shell that ended puts `9` with a badge in the pager; leader `9` shows it on the tiled attention desk; leader `!` from desk 3 goes to a card that needs a look, shown |
+| N59 | `web.sock` (F-A11, W-4). Two tabs, a client on the harness's web.sock: the hello; each tab sends `active{ago:0}` when its `/rpc` opens; the tab focused last runs a `cmd` and the other does not, in both orders on one connection; a tab visible again but unfocused sends the time since it was last used and ranks below the tab used since; the leader closing before it answers gives `page_gone` well before the timeout and the other tab never runs the `cmd`; an unknown tool gives code `tool` |
 
 ### 9.6 v1 acceptance (all must hold before the dogfood clock starts)
 1. `nix flake check` is green on a kvm-capable host: package, clippy, fmt, conformance, security, ui, adapters, module and vm.
@@ -1481,6 +1482,8 @@ The test runs numbered steps. The steps this design pins down:
 | **M4-N** nix | `nix/module.nix`, `nix/vm.nix`, `nix/checks.nix` | M4-C | `/etc/workbench/bin/wb`; a VM step where a card runs `wb read_node` with a page open (result) and without one (`no_page`, exit 1) | at integration: `nix flake check` green; a deploy shows `hub.stale:false` and an unchanged hub PID |
 
 **M4 exit:** a deploy with no hub restart, and an agent card successfully drives `wb run_in_shell` in the focused tab.
+
+**Built with edwind's EW-M4 (2026-10):** M4-W (`rpc.rs` leader registry, `websock.rs`), M4-C's board tool commands (`wb tools`, `wb TOOL [--json INPUT] [KEY=VALUE]… [KEY:=JSON]… [--timeout S]`; W-14 tools and `create_node kind=agent` are usage errors; no page exits 7), F-A11 and M4-N's VM step (`nix/vm.nix` step 11, with `wbctl page` as the page). F-A12 to F-A15 and their checks (N9, N10, N34, N35, N37, N38) are not part of it.
 
 ### 10.7 M5: notes, review, `sample`, artifacts (web and frontend only)
 **Goal:** the remaining prototype surface ported. Fix 6 frames.

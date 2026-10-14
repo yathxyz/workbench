@@ -13,6 +13,7 @@ import argparse
 import base64
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -83,6 +84,8 @@ def tcp_listeners(pid):
             inodes.add(link[len("socket:["):-1])
     found = []
     for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        if not os.path.exists(table):   # a host or container without IPv6 has no tcp6 table
+            continue
         with open(table) as f:
             next(f)
             for line in f:
@@ -113,6 +116,62 @@ def pty_list(h):
 
 def sids(h):
     return sorted(s["sid"] for s in wbctl.hub_sessions(h.hub_sock))
+
+
+def web_sock_hello(path, timeout=5.0):
+    """The first line web.sock sends to this process, parsed; {"error": ...} if there is none."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(path)
+            line = s.makefile("rb").readline()
+        return json.loads(line) if line else {"error": "closed without a line"}
+    except (OSError, ValueError) as e:
+        return {"error": repr(e)}
+
+
+# Run as another uid: connect to web.sock through an inherited O_PATH descriptor of its directory, so
+# that no directory above it has to admit that uid, and read until the server closes.
+OTHER_UID_READ = """
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+n, eof = 0, False
+try:
+    s.connect(sys.argv[1])
+    while True:
+        b = s.recv(4096)
+        if not b:
+            eof = True
+            break
+        n += len(b)
+except OSError as e:
+    print(json.dumps({"bytes": n, "eof": eof, "error": repr(e)}))
+    sys.exit(0)
+print(json.dumps({"bytes": n, "eof": eof}))
+"""
+
+
+def other_uid_read(path, uid=65534):
+    """What uid `uid` reads from the unix socket at `path` (run as root). The directory gets o+x and
+    the socket o+w for the duration, so the connect reaches the server's SO_PEERCRED check."""
+    d = os.path.dirname(path)
+    modes = {p: os.stat(p).st_mode & 0o7777 for p in (d, path)}
+    fd = os.open(d, os.O_PATH | os.O_DIRECTORY)
+    try:
+        os.chmod(d, modes[d] | 0o001)
+        os.chmod(path, modes[path] | 0o002)
+        r = subprocess.run([sys.executable, "-I", "-c", OTHER_UID_READ, f"/proc/self/fd/{fd}/{os.path.basename(path)}"],
+                           user=uid, group=uid, extra_groups=[], pass_fds=(fd,), cwd="/",
+                           capture_output=True, text=True, timeout=30)
+        try:
+            return json.loads(r.stdout)
+        except ValueError:
+            return {"rc": r.returncode, "stdout": r.stdout[-300:], "stderr": r.stderr[-300:]}
+    finally:
+        os.close(fd)
+        for p, m in modes.items():
+            os.chmod(p, m)
 
 
 def read_until(ws, pattern, timeout=10.0):
@@ -318,12 +377,23 @@ def main():
         t.check("T-S13 hub.sock 0600 in a 0700 directory",
                 (mode(h.hub_sock), mode(os.path.dirname(h.hub_sock))) == (0o600, 0o700),
                 oct(mode(h.hub_sock)))
-        if os.path.exists(h.web_sock):
-            t.check("T-S13 web.sock 0600 in a 0700 directory",
-                    (mode(h.web_sock), mode(os.path.dirname(h.web_sock))) == (0o600, 0o700),
-                    oct(mode(h.web_sock)))
+        # web.sock (DESIGN 3.3): wb-web makes it; SO_PEERCRED admits its own uid and root only, and closes
+        # on anyone else without writing a byte.
+        found = os.path.exists(h.web_sock)
+        t.check("T-S13 web.sock 0600 in a 0700 directory",
+                found and (mode(h.web_sock), mode(os.path.dirname(h.web_sock))) == (0o600, 0o700),
+                oct(mode(h.web_sock)) if found else "no web.sock")
+        hello = web_sock_hello(h.web_sock)
+        t.check("T-S13 web.sock: the service's own uid gets the hello",
+                hello.get("t") == "hello" and hello.get("proto") == 1 and hello.get("server") == "wb-web", repr(hello))
+        if os.geteuid() != 0:
+            t.skip("T-S13 web.sock: a different uid gets 0 bytes", "needs root to connect as another uid")
+        elif not found:
+            t.check("T-S13 web.sock: a different uid gets 0 bytes", False, "no web.sock")
         else:
-            t.skip("T-S13 web.sock", "wb-web did not create web.sock (not part of this build)")
+            got = other_uid_read(h.web_sock)
+            t.check("T-S13 web.sock: a different uid gets 0 bytes",
+                    got == {"bytes": 0, "eof": True} and h.web.poll() is None, repr((got, h.web.poll())))
 
         # S14: none of the hub's canaries reach a card; the fixed variables do.
         r = wbctl.pty_session(caddy_ep, "t-s14", spawn=True, send="env; echo ENV-$((1+1))-DONE",
