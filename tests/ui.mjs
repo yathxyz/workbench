@@ -2292,11 +2292,17 @@ await section('frames', async () => {
   let bfA = await until(blockFrameA, 8000);
   const bfText = bfA ? await bfA.textContent('#frv') : null;
   check('frames: the fence lines of a page frame carry the tear-out chip; the chip and tear_out_block make block cards bound to the page (an id is written for the block without one) and the card renders the block', chips === 2 && torn?.block === 'block1' && torn.info && torn.edge && /^created/.test(tornOut) && bfText === 'one', JSON.stringify({ chips, torn, tornOut, bfText }));
-  await until(() => B2.evaluate(id => !!window.__canvas.S.nodes[id], blk), 15000);   // the board reaches tab B
-  await show(B2, blk); await until(() => frLive(B2, blk), 10000);
-  const edited = await B2.evaluate(id => { const C = window.__canvas, n = C.S.nodes[id], t = C.pageText(id), i = t.indexOf('>one<'); return i >= 0 && C.pageEdit(n, i + 1, i + 4, 'uno'); }, blk);
-  bfA = await until(async () => { const f = await blockFrameA(); return f && (await f.textContent('#frv')) === 'uno' ? f : null; }, 8000);
-  check('frames: an edit to the block in tab B reaches tab A\'s replica and reloads the block card there', edited === true && !!bfA, JSON.stringify({ edited, reloaded: !!bfA }));
+  // Both tabs typed in fr-two above, and each tab's frame cached the page's first lines on its node: tab B must still
+  // take tab A's board (a page snapshot is derived from the file, not a change of B's own).
+  const tookB = await until(() => B2.evaluate(id => !!window.__canvas.S.nodes[id] || null, blk), 15000);
+  const barsAB = [await barOf(A2), await barOf(B2)];
+  check('frames: after both tabs typed in one page neither shows the conflict bar, and tab B takes tab A\'s new page', !!tookB && barsAB.every(b => b.hidden || b.key !== 'conflict'), JSON.stringify({ tookB, barsAB }));
+  if (tookB) {
+    await show(B2, blk); await until(() => frLive(B2, blk), 10000);
+    const edited = await B2.evaluate(id => { const C = window.__canvas, n = C.S.nodes[id], t = C.pageText(id), i = t.indexOf('>one<'); return i >= 0 && C.pageEdit(n, i + 1, i + 4, 'uno'); }, blk);
+    bfA = await until(async () => { const f = await blockFrameA(); return f && (await f.textContent('#frv')) === 'uno' ? f : null; }, 8000);
+    check('frames: an edit to the block in tab B reaches tab A\'s replica and reloads the block card there', edited === true && !!bfA, JSON.stringify({ edited, reloaded: !!bfA }));
+  }
   await A2.evaluate(id => { const C = window.__canvas; for (const n of Object.values(C.S.nodes)) if (n.block?.page === id) C.removeNode(n.id); C.removeNode(id); }, blk);
   await settled(A2); await settled(B2);
 
