@@ -2616,6 +2616,11 @@ await section('N60', async () => {
     const sw = { D: await D.evaluate(() => window.__canvas.DESK.cur), E: await E.evaluate(() => window.__canvas.DESK.cur), mark: await D.evaluate(() => !!document.querySelector('#st-desk .dk.away[data-slot="3"]')) };
     check('N60: a second window that comes up on desk 3 shows the Board instead; going to desk 3 there swaps: the first window shows the Board, its pager marking desk 3 as shown elsewhere',
       e0 === 0 && sw.E === 3 && sw.D === 0 && sw.mark, JSON.stringify({ e0, sw }));
+    // desk to desk: D on desk 4 goes to desk 3, which E shows; E takes desk 4
+    await D.evaluate(() => window.__canvas.deskGo(4, true)); await sleep(500);
+    await D.evaluate(() => window.__canvas.deskGo(3, true)); await sleep(800);
+    const sw2 = { D: await D.evaluate(() => window.__canvas.DESK.cur), E: await E.evaluate(() => window.__canvas.DESK.cur) };
+    check('N60: from desk 4, going to desk 3 that the other window shows swaps the two: that window takes desk 4', sw2.D === 3 && sw2.E === 4, JSON.stringify(sw2));
     await E.close(); E = null; await sleep(300);
     await D.evaluate(() => { const C = window.__canvas; for (const k of [3, 4]) if (C.deskAt(k)) { C.deskGo(k, true); C.deskDelete(); } C.deskGo(0, true); C.pickClear(); });
     await settled(D);

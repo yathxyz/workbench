@@ -6803,8 +6803,9 @@ function winHear(m) {
     return deskPager();
   }
   if (m.t === 'swap' && m.to === WIN.id && DESK.cur === +m.from) {   // another window took this desk: this one takes the desk it left
-    const k = DESK.cur, t = +m.desk >= 0 && +m.desk <= 9 && !WIN.who(+m.desk) && (+m.desk === 0 || deskAt(+m.desk) || +m.desk === 9) ? +m.desk : 0;
-    WIN.seen.set(m.win, { desk: k, since: +m.since || 0 });
+    const k = DESK.cur;
+    WIN.seen.set(m.win, { desk: k, since: +m.since || 0 });   // the requester now shows this desk, not the one it offers
+    const t = +m.desk >= 0 && +m.desk <= 9 && !WIN.who(+m.desk) && (+m.desk === 0 || deskAt(+m.desk) || +m.desk === 9) ? +m.desk : 0;
     WIN.swapping = true; try { if (t) deskGo(t, true); else deskGo(0, true); } finally { WIN.swapping = false; }
     return toast(`Desk ${k} went to the other window; this one shows ${t ? 'desk ' + deskName(deskAt(t)) : 'the Board'}.`);
   }
