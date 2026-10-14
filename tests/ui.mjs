@@ -1838,7 +1838,10 @@ await section('pages', async () => {
     const enterPage = async id => { await show(id); await P.evaluate(() => document.activeElement?.blur()); await P.keyboard.press('Enter'); await sleep(300); };
     const appendAt = async () => { if (vim) { await P.keyboard.press('Shift+G'); await P.keyboard.press('Shift+A'); } else await P.keyboard.press('Control+End'); };
     const gotoLine = async n => { if (vim) await P.keyboard.type(n + 'G'); else { await P.keyboard.press('Control+Home'); for (let i = 1; i < n; i++) await P.keyboard.press('ArrowDown'); } };
-    const palette = async label => { await P.keyboard.press('Control+k'); await sleep(150); await P.fill('#pal-in', '>' + label); await sleep(150); const first = (await palLabels(P))[0]; await P.keyboard.press('Enter'); await sleep(300); return first; };
+    // The palette opens with leader / (keys.js: the leader map), which reaches the board from every card: since F-A23 C-k is
+    // the program's in a shell (the dock has the keyboard after a load) and Edwin's in a page frame (R9.7); N53 covers C-k itself
+    const openPalette = async () => { await P.keyboard.press('Control+Space'); await P.keyboard.press('/'); };
+    const palette = async label => { await openPalette(); await sleep(150); await P.fill('#pal-in', '>' + label); await sleep(150); const first = (await palLabels(P))[0]; await P.keyboard.press('Enter'); await sleep(300); return first; };
 
     // typing: click into the page, type, the text is in the page
     await show(alpha);
@@ -1895,7 +1898,7 @@ await section('pages', async () => {
     await P.fill('#ask-in', 'spot'); await P.keyboard.press('Enter'); await sleep(300);
     st.chip = await P.evaluate(id => [...document.querySelectorAll(`.node[data-id="${id}"] .anchor-chip`)].map(c => c.textContent), alpha);
     st.same = (await pageText(P, alpha)) === t0;
-    await P.keyboard.press('Control+k'); await sleep(150); await P.fill('#pal-in', 'pg-alpha#spot'); await sleep(200); st.palette = await palLabels(P); await P.keyboard.press('Escape');
+    await openPalette(); await sleep(150); await P.fill('#pal-in', 'pg-alpha#spot'); await sleep(200); st.palette = await palLabels(P); await P.keyboard.press('Escape');
     check('pages: the anchor button asks for a name and drops a chip at the cursor that the palette finds as page#name; the text stays', st.asked && st.chip.join() === '⚓spot' && st.same && st.palette.includes('pg-alpha#spot'), JSON.stringify(st));
     await leave();
 
@@ -2077,17 +2080,19 @@ await section('N52', async () => {
     await P.evaluate(() => { window.__n52.length = 0; });
     await P.keyboard.press('Control+Space'); await P.keyboard.press('Control+Space'); await sleep(200);
     const nul = await P.evaluate(() => window.__n52.join('')), still2 = await inTermOf(P, id);
-    // a page leaves C-k to the board, and the leader's Esc leaves it too
+    // a page leaves C-k to the board, and the leader's Esc leaves it too; in frames mode the page is an Edwin frame, which
+    // owns every key but the leader (edwind spec R9.7, the `edwin` interior of keys.js), so C-k is Edwin's and the palette stays shut
+    const pageInterior = FRAMES ? 'edwin' : 'page';
     const pg = await P.evaluate(() => { const C = window.__canvas, n = Object.values(C.S.nodes).find(n => n.kind === 'buffer' && !C.stashed(n)); C.typeInto(n); return n.id; });
     // typeInto may first bring the page into view; the keyboard is in it once its element has the focus
-    const inPage = () => until(() => P.evaluate(id => !!document.activeElement?.closest(`.node[data-id="${id}"]`) && window.__canvas.keyContext().interior === 'page', pg));
+    const inPage = () => until(() => P.evaluate(([id, k]) => !!document.activeElement?.closest(`.node[data-id="${id}"]`) && window.__canvas.keyContext().interior === k, [pg, pageInterior]));
     await inPage();
     await P.keyboard.press('Control+k'); const pal = (await boardState(P)).palette; await P.keyboard.press('Escape');
     await P.evaluate(id => window.__canvas.typeInto(window.__canvas.S.nodes[id]), pg); await inPage();
     await P.keyboard.press('Control+Space'); await P.keyboard.press('Escape'); await sleep(200);
     const leftPage = await P.evaluate(id => ({ ctx: window.__canvas.keyContext(), sel: document.querySelector('.active[data-id]')?.dataset.id === id }), pg);
-    check('N53: the leader\'s Esc leaves a shell and a page with the card still selected; the leader twice reaches the shell; C-k in a page opens the palette',
-      !left.ctx.interior && left.sel && nul === '\x00' && still2 && pal && !leftPage.ctx.interior && leftPage.sel, JSON.stringify({ left, nul, still2, pal, leftPage }));
+    check('N53: the leader\'s Esc leaves a shell and a page with the card still selected; the leader twice reaches the shell; C-k in a page ' + (FRAMES ? 'is Edwin\'s (the palette stays shut)' : 'opens the palette'),
+      !left.ctx.interior && left.sel && nul === '\x00' && still2 && pal === !FRAMES && !leftPage.ctx.interior && leftPage.sel, JSON.stringify({ left, nul, still2, pal, leftPage }));
     await P.evaluate(id => window.__canvas.removeNode(id), id); await settled(P);
   } finally { await P.close(); }
 });
@@ -2357,7 +2362,8 @@ await section('frames', async () => {
   const servedPages = ['m1', 'm2', 'm3'].map(id => served.nodes[id]).map(n => n && { buf: n.buf, text: 'text' in n, anchors: 'anchors' in n });
   const preCopy = (() => { try { return fs.readFileSync(path.join(H.boardsDir, H.host + '.pre-edwind.json')); } catch (e) { return null; } })();
   const anchors = await M.evaluate(() => { const C = window.__canvas; return C.pageAnchors(C.S.nodes.m1); });
-  await M.keyboard.press('Control+k'); await sleep(150); await M.fill('#pal-in', 'Mig One#spot'); await sleep(250); const pal = await palLabels(M); await M.keyboard.press('Escape');
+  // leader / opens the palette: the dock's shell has the keyboard after a load, and C-k is its there (F-A23)
+  await M.keyboard.press('Control+Space'); await M.keyboard.press('/'); await sleep(150); await M.fill('#pal-in', 'Mig One#spot'); await sleep(250); const pal = await palLabels(M); await M.keyboard.press('Escape');
   st = { installed, bufs, files: files.map(f => f && f.slice(0, 20)), servedPages, preCopy: !!preCopy, preSame: !!preCopy && preCopy.equals(fs.readFileSync(preFile)), preJson: !!preCopy && JSON.stringify(JSON.parse(preCopy)) === JSON.stringify(pre), anchors, pal: pal.includes('Mig One#spot'), migLog: migLog.length };
   check('frames: a board with page texts and no buf is migrated on first load: every page gets buf notes/<slug>.md, the files hold the texts, the anchor is back at its place and the palette finds it, the served board carries no text, the original is kept as <host>.pre-edwind.json', st.installed?.event === 'board' && bufs?.join() === 'notes/mig-one.md,notes/mig-two.md,notes/mig-three.md' && files[0] === m1Text && files[1] === m2Text && files[2] === m3Text && servedPages.every((n, i) => n && n.buf === bufs[i] && !n.text && !n.anchors) && st.preCopy && st.preJson && anchors.length === 1 && anchors[0].id === 'a-m1' && anchors[0].pos === m1Text.indexOf('second') && anchors[0].label === 'spot' && st.pal && migLog.length === 3, JSON.stringify(st));
   // a second load migrates nothing more

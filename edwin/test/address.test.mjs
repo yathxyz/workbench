@@ -45,6 +45,8 @@ const ctx = vm.createContext({
   clamp: (v, a, b) => Math.max(a, Math.min(b, v)),
   nodeList: () => page.pages,
   live: page.live,
+  // the page's state in either editor mode (app.js pageState): here always the CodeMirror view's
+  pageState: n => page.live[n.id]?.view?.state || null,
 });
 vm.runInContext(jsSource, ctx, { filename: 'app.js (addresses)' });
 const { bufferAddress, fmtAddr, resolveBufferAddress } = ctx;
