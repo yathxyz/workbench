@@ -14,6 +14,17 @@ const note = (name, text) => { fs.writeFileSync(path.join(dir.dirs.notes, name),
 const value = async (c, form) => { const r = await c.form(form); assert.equal(r.error, undefined, JSON.stringify(r.error)); return r.value; };
 const spin = ms => `(let ((end (+ (current-time) ${ms / 1000}))) (let loop () (if (< (current-time) end) (loop))))`;
 
+test('R4.40 a waiter that times out or is killed leaves the queue: the next unlock or send wakes the live waiter', async () => {
+  const c = await client();
+  /* A timed mutex-lock! expires while a second thread still waits; the unlock must wake that one. */
+  assert.equal(await value(c, '(define m (make-mutex)) (mutex-lock! m) (define t-timed (make-thread (lambda () (mutex-lock! m 0.05)) "timed")) (define t-live (make-thread (lambda () (mutex-lock! m 5) (quote got)) "live")) (thread-yield) (define r1 (thread-join t-timed)) (mutex-unlock! m) (list r1 (thread-join t-live 1))'), '(#f got)');
+  /* A timed mailbox-receive! returns its default; the send then reaches the receiver still waiting. */
+  assert.equal(await value(c, '(define mb (make-mailbox)) (define r-timed (make-thread (lambda () (mailbox-receive! mb 0.05 (quote none))) "rt")) (define r-live (make-thread (lambda () (mailbox-receive! mb 5)) "rl")) (thread-yield) (define a (thread-join r-timed)) (mailbox-send! mb (quote msg)) (list a (thread-join r-live 1))'), '(none msg)');
+  /* A killed waiter leaves the queue too. */
+  assert.equal(await value(c, '(define m2 (make-mutex)) (mutex-lock! m2) (define k (make-thread (lambda () (mutex-lock! m2)) "k")) (define l (make-thread (lambda () (mutex-lock! m2) (quote l-got)) "l")) (thread-yield) (thread-kill k) (thread-yield) (mutex-unlock! m2) (thread-join l 1)'), 'l-got');
+  c.close();
+});
+
 test('R4.40 make-thread, mailboxes and thread-join; a background thread is preempted and killed', async () => {
   const c = await client();
   assert.equal(await value(c, '(define mb (make-mailbox)) (define t1 (make-thread (lambda () (thread-sleep! 0.05) (mailbox-send! mb (quote hi)) 42) "t1")) (list (mailbox-receive! mb 1) (thread-join t1) (thread-alive? t1))'), '(hi 42 #f)');

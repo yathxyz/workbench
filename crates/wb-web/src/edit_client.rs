@@ -425,7 +425,13 @@ impl Control {
                 Some(msg) = outbound.recv() => {
                     match conn.send(&msg).await {
                         Ok(()) => {}
-                        Err(EditError::TooLarge) => self.refuse_too_large(&msg),
+                        Err(EditError::TooLarge) => {
+                            if let Some(cancel) = self.refuse_too_large(&msg)
+                                && conn.send(&cancel).await.is_err()
+                            {
+                                return;
+                            }
+                        }
                         Err(_) => return,
                     }
                 }
@@ -516,26 +522,27 @@ impl Control {
         let _ = stream.to.send(Delivery::Stream { sid, msg });
     }
 
-    /// Answers an outbound `sample` that does not fit a line with an `error` to its tab.
-    fn refuse_too_large(&self, msg: &Value) {
-        if msg["t"] != "sample" {
-            return;
-        }
-        let Some(sid) = msg["sid"].as_str() else {
-            return;
+    /// Ends the stream of an outbound `sample`, `tool_result` or `tool_error` that does not fit
+    /// a line: an `error` to its tab and, when edwind already runs the stream (a tool answer
+    /// its thread waits for), a `cancel` to send to edwind.
+    fn refuse_too_large(&self, msg: &Value) -> Option<Value> {
+        let (what, running) = match msg["t"].as_str() {
+            Some("sample") => ("the request", false),
+            Some("tool_result" | "tool_error") => ("the tool result", true),
+            _ => return None,
         };
-        if let Some(stream) = self
+        let sid = msg["sid"].as_str()?;
+        let stream = self
             .streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(sid)
-        {
-            let error = json!({"t": "error", "id": stream.id, "code": "too_large", "message": "the request is too large"});
-            let _ = stream.to.send(Delivery::Stream {
-                sid: sid.to_owned(),
-                msg: error,
-            });
-        }
+            .remove(sid)?;
+        let error = json!({"t": "error", "id": stream.id, "code": "too_large", "message": format!("{what} is too large")});
+        let _ = stream.to.send(Delivery::Stream {
+            sid: sid.to_owned(),
+            msg: error,
+        });
+        running.then(|| json!({"t": "cancel", "sid": sid}))
     }
 
     /// Ends every open stream with an `error` when the connection is lost.
