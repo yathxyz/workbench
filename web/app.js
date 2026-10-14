@@ -321,8 +321,8 @@ function authBar() {
 }
 function wakeAll() { for (const w of [...WAKE]) w.wake(); }
 addEventListener('online', () => { wakeAll(); netKick(); });
-addEventListener('focus', () => { if (NET.state !== 'up') netKick(); const L = live[activeId]; if (L?.term) L.backend?.resize?.(L.term.cols, L.term.rows); L?.backend?.maybeSeen?.(); });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { wakeAll(); if (NET.state !== 'up') netKick(); live[activeId]?.backend?.maybeSeen?.(); } });
+addEventListener('focus', () => { Rpc.active(); if (NET.state !== 'up') netKick(); const L = live[activeId]; if (L?.term) L.backend?.resize?.(L.term.cols, L.term.rows); L?.backend?.maybeSeen?.(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { Rpc.active(); wakeAll(); if (NET.state !== 'up') netKick(); live[activeId]?.backend?.maybeSeen?.(); } else Rpc.look(true); });
 addEventListener('beforeunload', e => { if (DAEMON && !SAVE.leaving && SAVE.pending && (SAVE.paused || SAVE.err)) { e.preventDefault(); e.returnValue = ''; } });
 // One persistent strip; only the highest-priority key shows. A string action starting with / is a link.
 const BARS = {}, BAR_ORDER = ['auth', 'forbidden', 'conflict', 'save', 'hub'];
@@ -4863,12 +4863,26 @@ AGENT_TOOLS.push({
 // In the local build every `sample` call (assistant, agent nodes, handwriting, hosted artifacts) goes to the daemon over
 // one WebSocket; the key lives in the daemon's environment. In the hosted artifact the outer page's own `sample` answers.
 let INFO = null;
+// F-A11: every /rpc tells its server how long ago this tab was last visible and focused, `active{ago}`, on each (re)open,
+// on focus and on visibilitychange to visible, so `wb` reaches the tab used last (§3.3, §3.5.3). A tab that never was
+// visible and focused sends nothing and ranks below every tab that did.
 class Rpc {
-  constructor(h = null) { this.h = h; this.calls = new Map(); this.seq = 0; this.tries = 0; this.connect(); }
+  static ALL = new Set();
+  static SEEN = null;   // when this tab was last visible and focused (ms); null until it first was
+  static ON = false;    // whether it was at the last look
+  // `leaving` (a blur, a hide): if it was on until now, now is when it last was.
+  static look(leaving = false) { const on = document.visibilityState === 'visible' && document.hasFocus(); if (on || (leaving && Rpc.ON)) Rpc.SEEN = Date.now(); Rpc.ON = on; }
+  static active() { Rpc.look(); for (const r of Rpc.ALL) r.active(); }
+  constructor(h = null) {
+    this.h = h; this.calls = new Map(); this.seq = 0; this.tries = 0;
+    if (!Rpc.ALL.size) addEventListener('blur', () => setTimeout(() => Rpc.look(true)));   // after the event: focus may only have moved into a frame
+    Rpc.ALL.add(this); this.connect();
+  }
+  active() { Rpc.look(); if (Rpc.SEEN != null) this.send({ t: 'active', ago: Math.max(0, Date.now() - Rpc.SEEN) }); }
   connect() {
     clearTimeout(this.timer); WAKE.delete(this);
     const ws = this.ws = new WebSocket(hWs(this.h, '/rpc'));
-    ws.onopen = () => { this.tries = 0; if (!this.h && this.opened) netKick(); this.opened = true; };   // a reopen re-reads /api/info: hubSeen spots a restart
+    ws.onopen = () => { this.tries = 0; this.active(); if (!this.h && this.opened) netKick(); this.opened = true; };   // a reopen re-reads /api/info: hubSeen spots a restart
     ws.onmessage = ev => {
       let m; try { m = JSON.parse(ev.data); } catch { return; }
       if (!this.h && RPC_EVENTS[m.t] && m.id == null) return RPC_EVENTS[m.t](m);
