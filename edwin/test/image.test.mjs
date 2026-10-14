@@ -125,7 +125,10 @@ test('R4.21 one entry is at most 1 MiB: a larger form is evaluated but refused f
 });
 
 test('R4.19, R7.19 a plain restart replays the log after boot: boot differs, imageEpoch stays, frames resume from their gen; a failed replay is listed by image-problems', async () => {
-  const a0 = await cli(); const before = await status(a0); a0.close();
+  const a0 = await cli();
+  /* A definition that calls a module's primitive at definition time replays: modules install before the replay. */
+  assert.equal((await a0.form('(on-server (define saved-mutex (make-mutex "saved")))')).value, 'saved-mutex');
+  const before = await status(a0); a0.close();
   await restart();
   for (const f of frames) { const w = await f.connect(); assert.notEqual(w.boot, before.boot); assert.equal(w.imageEpoch, before.imageEpoch); assert.equal(w.gen, before.imageGen); }
   assert.ok(frames.every(f => f.boots === 1), 'the runtime stays when only boot differs');
@@ -133,6 +136,7 @@ test('R4.19, R7.19 a plain restart replays the log after boot: boot differs, ima
   const a = await cli();
   assert.equal((await a.form('(f1)')).value, '1');
   assert.equal((await a.form('(srv-secret)')).value, '42', 'on-server forms replay on the server');
+  assert.equal((await a.form('(mutex? saved-mutex)')).value, '#t', 'a define using a module primitive replays in the full runtime');
   assert.equal((await a.form("(bound? 'frame-only)")).value, '#f', 'on-frames forms are skipped at replay too');
   assert.equal((await a.form('shared-count')).value, '(1 "two" #t)');
   const p = await a.call('image-problems');

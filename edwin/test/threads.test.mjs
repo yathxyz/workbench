@@ -60,6 +60,10 @@ test('R4.41, R4.28 edits by a command thread are sequenced as one batch with the
   /* Edits on behalf of frame F keep F's cid with via server (R4.28); two inserts become one batch. */
   const r = await f.request({ t: 'call', form: '(goto-char (point-max)) (insert "X") (insert "Y") (buffer-string)', ctx: { point: 1 }, buf: id });
   assert.equal(r.value, '"abc\\nXY"');
+  /* The result is sent only once the batch is in the journal (R16.7): a crash right after it loses nothing. */
+  const jdir = path.join(dir.dirs.state, 'buffers');
+  const journal = fs.readdirSync(jdir).filter(n => n.endsWith('.jsonl')).map(n => fs.readFileSync(path.join(jdir, n), 'utf8')).find(t => JSON.parse(t.split('\n')[0]).id === id);
+  assert.ok(journal && journal.split('\n').some(l => l.includes('"t":"b"') && l.includes('"XY"')), 'the thread batch is on disk when the result arrives');
   const e = await f.next(m => m.t === 'edits' && m.buf === id);
   assert.equal(e.ver, 1); assert.deepEqual(e.ops, [[4, '', 'XY']]);
   assert.equal(e.by.kind, 'frame'); assert.equal(e.by.cid, f.cid); assert.equal(e.by.via, 'server');

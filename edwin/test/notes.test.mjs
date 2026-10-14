@@ -361,6 +361,18 @@ test('§11.3 notes-append appends as an edit to the buffer, creating the file; p
     assert.equal(e.t, 'error', p); assert.equal(e.code, 'bad_request', p);
   }
   assert.equal(fs.readFileSync(path.join(dir.root, 'outside', 'secret.md'), 'utf8'), '# Secret\n');
+  /* A new note under a symlinked or dangling directory: refused before any directory is made (R14.8). */
+  fs.symlinkSync(path.join(dir.dirs.home, '.ssh'), path.join(dir.dirs.notes, 'linkssh'));
+  fs.symlinkSync(path.join(dir.root, 'nowhere'), path.join(dir.dirs.notes, 'dangling'));
+  for (const p of ['linkout/new/note.md', 'linkssh/new/note.md', 'dangling/note.md', 'dangling/new/note.md']) {
+    const e = await a.call('notes-append', [{ path: p, text: 'x' }]);
+    assert.equal(e.t, 'error', p); assert.equal(e.code, 'bad_request', p);
+  }
+  assert.equal(fs.existsSync(path.join(dir.root, 'outside', 'new')), false, 'nothing created through the symlink');
+  assert.equal(fs.existsSync(path.join(dir.dirs.home, '.ssh', 'new')), false, 'nothing created in a refused path');
+  assert.equal(fs.existsSync(path.join(dir.root, 'nowhere')), false, 'a dangling symlink is not made real');
+  /* A real nested directory inside notesDir is still created on demand. */
+  assert.deepEqual(await value(a, 'notes-append', [{ path: 'deep/er/note.md', text: 'ok' }]), { path: 'deep/er/note.md' });
   assert.equal((await a.call('notes-append', [{ path: 'x.md' }])).code, 'bad_request');
   a.close(); b.close();
 });
