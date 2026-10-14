@@ -802,6 +802,11 @@ body.focus .node.focused .rs, body.focus .node.focused .port { display: none; }
 #which-key { position: absolute; left: 50%; bottom: 96px; transform: translateX(-50%); z-index: 120; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 12px; font: 12px var(--mono); color: var(--fg); display: grid; grid-template-columns: repeat(4, max-content); gap: 3px 22px; white-space: nowrap; box-shadow: var(--shadow); max-width: calc(100% - 40px); box-sizing: border-box; }
 #which-key b { color: var(--accent); margin-right: 6px; display: inline-block; min-width: 2ch; }
 #which-key .wk-title { grid-column: 1 / -1; color: var(--muted); margin-bottom: 4px; }
+/* keys (DESIGN §6.4): hint labels over cards and buttons; the card being arranged */
+#hints { position: fixed; inset: 0; pointer-events: none; z-index: 130; }
+#hints .hint { position: absolute; font: 600 12px/1 var(--mono); padding: 3px 5px; background: var(--accent); color: var(--bg); border-radius: var(--radius); text-transform: uppercase; letter-spacing: .04em; }
+#hints .hint-b { background: var(--warn); }
+.node.arranging { outline: 2px dashed var(--accent); outline-offset: 3px; }
 body.tree-open[data-view="canvas"] #focus-tabs { padding-left: calc(var(--tree-w, 240px) + 20px); }
 body.focus #tree-pane { display: none !important; }
 body.tree-open[data-view="canvas"] #which-key { left: calc(50% + var(--tree-w, 240px) / 2 + 10px); }

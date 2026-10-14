@@ -39,7 +39,7 @@ async function page(url, w = 1500, h = 950) {
 
 // ---------------- demo mode
 // tools/build-artifact.py's page, built here from the web root: the APP part of index.html with the styles,
-// the bridge source, vendor.js and app.js inline, and no font link.
+// the bridge source, vendor.js, keys.js and app.js inline, and no font link.
 function demoPage() {
   const rd = f => fs.readFileSync(path.join(ROOT, f), 'utf8'), js = f => rd(f).replaceAll('</script', '<\\/script');
   const body = rd('index.html').split('<!--APP-->')[1].split('<!--/APP-->')[0];
@@ -53,6 +53,9 @@ ${body}
 <script>window.CANVAS_HOSTED = true; window.CLAUDE_BRIDGE_SRC = ${JSON.stringify(rd('bridge.js')).replaceAll('</script', '<\\/script')};</script>
 <script>
 ${js('vendor/vendor.js')}
+</script>
+<script>
+${js('keys.js')}
 </script>
 <script>
 ${js('app.js')}
@@ -100,6 +103,11 @@ const q = await fr.evaluate(async () => { try { const db = await claude.use('db'
   const got = await col.where('tag', '==', 'x').orderBy('n', 'desc').get(); let snaps = 0; const un = col.onSnapshot(s => { snaps = s.size; }); await new Promise(r => setTimeout(r, 100)); await col.doc('d').set({ n: 9 }); await new Promise(r => setTimeout(r, 100)); un();
   return { ids: got.docs.map(d => d.id), size: got.size, snaps }; } catch (e) { return { error: JSON.stringify(e), msg: String(e && e.message) }; } });
 check('db query where/orderBy and onSnapshot', q.ids?.join() === 'a,b' && q.snaps === 4, JSON.stringify(q));
+// N55: the leader pressed inside an artifact reaches the board through the bridge and takes the keyboard out of the frame
+await fr.click('body', { position: { x: 5, y: 5 } }).catch(() => {}); await p.keyboard.press('Control+Space'); await sleep(300);
+st = await p.evaluate(() => ({ leader: !document.getElementById('which-key').hidden, inFrame: document.activeElement?.tagName === 'IFRAME' }));
+await p.keyboard.press('Escape');
+check('N55: the leader inside an artifact opens the board\'s leader and leaves the frame', st.leader && !st.inFrame, JSON.stringify(st));
 // v8 nodes in demo mode
 st = await p.evaluate(() => { const w = window.__canvas.newWeb('example.org/a'); const s = window.__canvas.newSketch(); const L = window.__canvas.live[w.id]; return { url: w.url, name: w.name, frame: !!L.frame, bar: !!L.urlInput, sketch: s.kind, agentHidden: !document.querySelector('#add-agent'), emacsOff: document.querySelector('#add-emacs').disabled }; });
 check('web and sketch nodes, agent button hidden', st.url === 'https://example.org/a' && st.name === 'example.org' && st.frame && st.bar && st.sketch === 'sketch' && st.agentHidden && st.emacsOff, JSON.stringify(st));
@@ -196,7 +204,10 @@ check('Ctrl-Space opens the which-key popup', v10.on && v10.shown && v10.rows >=
 await p.keyboard.press('z'); await sleep(600);
 v10 = await p.evaluate(() => ({ on: window.__canvas.LEADER.on, shown: !document.querySelector('#which-key').hidden }));
 check('leader z runs fit-all and closes the popup', !v10.on && !v10.shown, JSON.stringify(v10));
-await p.evaluate(() => { const ta = document.querySelector('#side-term .xterm-helper-textarea') || document.querySelector('.xterm-helper-textarea'); ta.focus(); window.__got = 0; ta.addEventListener('keydown', e => { if (e.ctrlKey && e.code === 'Space') window.__got++; }); });
+// what the terminal sends to its program: NUL is Ctrl-Space (the textarea's own keydown listeners never see the
+// passed key, because xterm handles it in the capture phase and stops it)
+await p.evaluate(() => { const ta = document.querySelector('#side-term .xterm-helper-textarea') || document.querySelector('.xterm-helper-textarea'); ta.focus(); window.__got = 0;
+  Object.values(window.__canvas.live).find(L => L?.term?.textarea === ta).term.onData(d => { if (d === '\x00') window.__got++; }); });
 await p.keyboard.press('Control+Space'); await sleep(120);
 v10 = await p.evaluate(() => ({ on: window.__canvas.LEADER.on, got: window.__got }));
 await p.keyboard.press('Control+Space'); await sleep(200);
@@ -1734,6 +1745,74 @@ await section('N51', async () => {
     await D.evaluate(() => { const C = window.__canvas, n = Object.values(C.S.nodes).find(n => (n.tags || []).includes('n51')); if (n) C.setTags(n, ['n51'], { remove: true }); });
     await settled(D);
   } finally { await B?.close(); await D?.close(); await ctx2.close(); }
+});
+
+// N52-N54: the key contexts (§6.4). A card keeps the keys it needs, the leader's Esc leaves it, the board has hints,
+// card actions and arrange mode, and no context binds a key twice.
+const boardState = p => p.evaluate(() => ({ view: document.body.dataset.view, palette: !document.getElementById('palette').hidden, tree: document.body.classList.contains('tree-open'),
+  dock: document.body.classList.contains('side-open'), ws: window.__canvas.WS.cur, leader: !document.getElementById('which-key').hidden }));
+const inTermOf = (p, id) => p.evaluate(id => !!document.activeElement?.closest(`.node[data-id="${id}"]`) && document.activeElement.classList.contains('xterm-helper-textarea'), id);
+await section('N52', async () => {
+  const P = await dpage(); await P.bringToFront();
+  try {
+    const id = await newTerm(P, 'n52');
+    await P.evaluate(id => { const C = window.__canvas; C.typeInto(C.S.nodes[id]); window.__n52 = []; C.live[id].term.onData(d => window.__n52.push(d)); }, id);
+    await until(() => inTermOf(P, id));
+    const s0 = await boardState(P);
+    for (const k of ['Control+k', 'Control+j', 'Alt+b', 'Alt+v', 'Alt+1', 'Alt+Shift+Digit5', 'Alt+ArrowLeft', 'Escape']) await P.keyboard.press(k);
+    await sleep(300);
+    const got = await P.evaluate(() => window.__n52.join('')), s1 = await boardState(P), still = await inTermOf(P, id);
+    await P.keyboard.press('Control+c');
+    await P.keyboard.press('Control+Backquote'); await sleep(200); const docked = (await boardState(P)).dock;
+    await P.keyboard.press('Control+Backquote'); await sleep(200);
+    const want = ['\x0b', '\n', '\x1bb', '\x1bv', '\x1b1', '\x1b%', '\x1b'];
+    check('N52: in a shell, C-k, C-j, M-b, M-v, M-1, M-%, M-← and Esc reach the program and change nothing on the board; Ctrl-` still toggles the dock',
+      want.every(w => got.includes(w)) && JSON.stringify(s0) === JSON.stringify(s1) && still && docked !== s1.dock, JSON.stringify({ got, s0, s1, still, docked }));
+    // K3: the leader's Esc leaves the shell, the card stays selected; the leader twice is the leader for the program
+    await P.keyboard.press('Control+Space'); await P.keyboard.press('Escape'); await sleep(200);
+    const left = await P.evaluate(id => ({ ctx: window.__canvas.keyContext(), sel: document.querySelector('.active[data-id]')?.dataset.id === id }), id);
+    await P.evaluate(id => { const C = window.__canvas; C.typeInto(C.S.nodes[id]); }, id); await until(() => inTermOf(P, id));
+    await P.evaluate(() => { window.__n52.length = 0; });
+    await P.keyboard.press('Control+Space'); await P.keyboard.press('Control+Space'); await sleep(200);
+    const nul = await P.evaluate(() => window.__n52.join('')), still2 = await inTermOf(P, id);
+    // a page leaves C-k to the board, and the leader's Esc leaves it too
+    const pg = await P.evaluate(() => { const C = window.__canvas, n = Object.values(C.S.nodes).find(n => n.kind === 'buffer' && !C.stashed(n)); C.typeInto(n); return n.id; });
+    await until(() => P.evaluate(() => !!document.activeElement?.closest('.cm-editor, textarea')));
+    await P.keyboard.press('Control+k'); const pal = (await boardState(P)).palette; await P.keyboard.press('Escape');
+    await P.evaluate(id => window.__canvas.typeInto(window.__canvas.S.nodes[id]), pg); await sleep(300);
+    await P.keyboard.press('Control+Space'); await P.keyboard.press('Escape'); await sleep(200);
+    const leftPage = await P.evaluate(id => ({ ctx: window.__canvas.keyContext(), sel: document.querySelector('.active[data-id]')?.dataset.id === id }), pg);
+    check('N53: the leader\'s Esc leaves a shell and a page with the card still selected; the leader twice reaches the shell; C-k in a page opens the palette',
+      !left.ctx.interior && left.sel && nul === '\x00' && still2 && pal && !leftPage.ctx.interior && leftPage.sel, JSON.stringify({ left, nul, still2, pal, leftPage }));
+    await P.evaluate(id => window.__canvas.removeNode(id), id); await settled(P);
+  } finally { await P.close(); }
+});
+await section('N54', async () => {
+  const P = await dpage(); await P.bringToFront();
+  try {
+    const id = await newTerm(P, 'n54');
+    await P.evaluate(id => { const C = window.__canvas; C.jumpNode(C.S.nodes[id]); document.activeElement?.blur(); }, id); await sleep(600);
+    const errs = await P.evaluate(() => WBKeys.check({ commands: new Set(Object.keys(window.__canvas.KC)) }).errors);
+    await P.keyboard.press('f');
+    const label = await P.evaluate(id => window.__canvas.HINTS.items.find(i => i.node?.id === id)?.label, id);
+    if (label) await P.keyboard.type(label);
+    const picked = await P.evaluate(id => ({ hints: window.__canvas.HINTS.on, sel: document.querySelector('.active[data-id]')?.dataset.id === id }), id);
+    const at = () => P.evaluate(id => { const n = window.__canvas.S.nodes[id]; return [n.x, n.y, n.w, n.h].join(); }, id);
+    const a0 = await at();
+    await P.keyboard.press('m'); await P.keyboard.press('l'); await P.keyboard.press('L');
+    const a1 = await at(), on = await P.evaluate(() => window.__canvas.ARR.on);
+    await P.keyboard.press('Escape'); const a2 = await at();
+    await P.keyboard.press('.'); await sleep(200);
+    const acts = await palLabels(P); await P.keyboard.press('Escape');
+    await P.keyboard.press('Control+Shift+P'); await P.keyboard.type('fold');
+    const sel = async () => P.evaluate(() => [...document.querySelectorAll('#pal-list .pi')].findIndex(x => x.classList.contains('sel')));
+    const p0 = await sel(); await P.keyboard.press('Control+j'); const p1 = await sel(); await P.keyboard.press('Control+k'); const p2 = await sel();
+    const dock = (await boardState(P)).dock; await P.keyboard.press('Escape');
+    check('N54: no context binds a key twice and every bound command exists; f then a label selects the card; m moves and resizes it and Esc puts it back; . lists its actions; C-j and C-k move the palette selection',
+      !errs.length && !!label && !picked.hints && picked.sel && on && a1 !== a0 && a2 === a0 && acts.some(l => /^Arrange/.test(l)) && p1 === p0 + 1 && p2 === p0 && !dock,
+      JSON.stringify({ errs: errs.slice(0, 3), label, picked, a0, a1, a2, on, acts: acts.slice(0, 6), p: [p0, p1, p2], dock }));
+    await P.evaluate(id => window.__canvas.removeNode(id), id); await settled(P);
+  } finally { await P.close(); }
 });
 
 // N11: over the whole daemon phase's request log

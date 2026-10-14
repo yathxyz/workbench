@@ -1,6 +1,6 @@
 # `nix flake check`: package (with cargo test), clippy, fmt, Edwin's headless core and Scheme, the black-box
-# conformance suite, the end-to-end security suite, the browser suite, the adapter probe against the stub, the VM test,
-# the module's assertions. The harness registers wb-fake-acp (the package's `fake` output) as
+# conformance suite, the end-to-end security suite, the browser suite, the key contexts, the adapter probe against
+# the stub, the VM test, the module's assertions. The harness registers wb-fake-acp (the package's `fake` output) as
 # its `stub` agent, so every check that starts it has that output on PATH.
 {
   pkgs,
@@ -106,6 +106,13 @@ in
   edwin-ot = pkgs.runCommand "workbench-edwin-ot" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export NODE_PATH=${edwinDevDeps}/node_modules
     node --test ${edwin}/test/ot.test.mjs
+    touch $out
+  '';
+
+  # The board's key contexts (DESIGN §6.4) over the shipped web/keys.js: one command per key in every context
+  # stack, every card keeps the keys it needs, the leader's Esc leaves any card.
+  web-keys = pkgs.runCommand "workbench-web-keys" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    WB_KEYS=${workbench-web}/keys.js node --test ${tests}/keys.test.mjs
     touch $out
   '';
 
