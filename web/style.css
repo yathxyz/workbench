@@ -904,6 +904,7 @@ body.tree-open[data-view="canvas"] #which-key { left: calc(50% + var(--tree-w, 2
 .fr-off { flex: none; padding: 3px 10px; font: 11px var(--mono); color: var(--warn); background: var(--warn-bg); border-top: 1px solid var(--warn); }
 .fr-anchors { position: absolute; left: 0; right: 0; top: 0; bottom: 0; pointer-events: none; z-index: 6; overflow: hidden; }
 .fr-anchors .anchor-chip { position: absolute; right: 8px; line-height: 1.55; }
+.fr-anchors .cm-tear { position: absolute; right: 8px; margin: 0; pointer-events: auto; }
 .k-buffer .body .edwin-frame[data-kind="card"] { --panel: var(--buf-bg); min-height: 0; }
 #ed-host .fr-ed { height: 100%; display: flex; flex-direction: column; }
 #ed-host .fr-ed .edwin-frame { flex: 1; min-height: 0; }

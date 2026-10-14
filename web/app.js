@@ -4969,7 +4969,9 @@ async function artMount(n, L) {
   f.removeAttribute('srcdoc'); f.removeAttribute('src');
   L.hello = false; L.notice.hidden = true; L.notice.textContent = '';
   if (n.block) {   // a block card: the page's block is the source, in an opaque-origin frame in both modes
-    const b = blockOf(n); L.blockCode = b?.code;
+    let b = blockOf(n);
+    if (!b && FR.on) { const p = S.nodes[n.block.page]; if (p?.buf && !frBufOf(p)) { await frWhenBuf(p); if (L.frame !== f) return; b = blockOf(n); } }   // frames mode: the block is in the replica, not the snapshot
+    L.blockCode = b?.code;
     if (!b) { L.notice.hidden = false; L.notice.textContent = blockMissing(n); return; }
     f.setAttribute('sandbox', 'allow-scripts allow-forms allow-pointer-lock allow-popups allow-modals');
     f.srcdoc = wrapFragment(b.code, await bridgeSrc(), artTheme());
@@ -5270,14 +5272,15 @@ function jumpBlock(n) {
 // Tear the html block at POS of page P out as a card. A block without an id gets one in its info string first, so
 // the card's address survives edits around it.
 function tearOutBlock(p, pos) {
-  const v = live[p.id]?.view; if (!v) { toast('Open the page first.'); return null; }
-  const blocks = htmlBlocks(v.state.doc.toString()), b = blocks.find(b => pos >= b.from && pos <= b.to);
+  const st = pageState(p); if (!st) { toast('Open the page first.'); return null; }   // a CodeMirror state, or the replica's text (frames mode)
+  const text = st.doc.toString(), blocks = htmlBlocks(text), b = blocks.find(b => pos >= b.from && pos <= b.to);
   if (!b) { toast('Put the cursor in a ```html block first.'); return null; }
   let id = b.id;
   if (!id) {
     const ids = new Set(blocks.map(x => x.id)); let k = 1; while (ids.has('block' + k)) k++; id = 'block' + k;
-    const br = v.state.doc.sliceString(b.from, b.head).indexOf('{');
-    v.dispatch({ changes: br >= 0 ? { from: b.from + br + 1, insert: '#' + id + ' ' } : { from: b.head, insert: ' {#' + id + '}' } });
+    const br = text.slice(b.from, b.head).indexOf('{');
+    const at = br >= 0 ? b.from + br + 1 : b.head;
+    if (!pageEdit(p, at, at, br >= 0 ? '#' + id + ' ' : ' {#' + id + '}')) { toast('The page cannot be edited now.'); return null; }
   }
   return newBlockCard(p, id, b.attrs.card);
 }
@@ -5311,7 +5314,7 @@ AGENT_TOOLS.push(
       return `created ${pathOf(n.id)}, showing ${pathOf(p.id)}#${n.block.id}`;
     } },
 );
-cmd('Page: tear out the html block at the cursor as a card', () => { const n = S.nodes[activeId]; tearOutBlock(n, live[n.id].view.state.selection.main.head); }, '', () => S.nodes[activeId]?.kind === 'buffer' && !!live[activeId]?.view);
+cmd('Page: tear out the html block at the cursor as a card', () => { const n = S.nodes[activeId]; tearOutBlock(n, pagePoint(n)); }, '', () => S.nodes[activeId]?.kind === 'buffer' && !!pageState(S.nodes[activeId]));
 cmd('Artifact: jump to its html block', () => jumpBlock(S.nodes[activeId]), '', () => !!S.nodes[activeId]?.block);
 
 // ------------------------------------------------------------------ flashcards: a review view over cards from notes
@@ -5662,6 +5665,8 @@ function frBoot() {
     Ed.hooks.openPage = name => frOpenPage(name);
     Ed.hooks.leaveFrame = f => frLeave(f);
     Ed.onFrameEvent(frEvent);
+    const applied = Ed.hooks.applied;   // sync.js's (local batches out, remote batches in): block cards follow every edit to a page's replica
+    Ed.hooks.applied = (b, ops, origin) => { const r = applied ? applied(b, ops, origin) : undefined; frBufEdited(b); return r; };
     Ed.sync.on('state', frStateChanged);
     Ed.sync.on('epoch', frEpoch);
     Ed.sync.on('display', frDisplay);
@@ -5730,6 +5735,10 @@ function frEvent({ type, frame, buffer }) {
   else if (type === 'edited') { FR.lastSeen.set(id, performance.now()); frSnapSoon(n); scheduleCrossRefresh(); frOverlays(id); if (buffer && buffer.shared) frForgetLocalAnchors(buffer); }
   else if (type === 'point') { FR.lastSeen.set(id, performance.now()); if (focusedBuf === id) scheduleBufAddr(n); frOverlays(id); }
   else if (type === 'status') frOverlays(id);
+}
+// An edit to replica B, from any origin: the block cards of the page it belongs to reload (F-A25).
+function frBufEdited(b) {
+  for (const [id, L] of Object.entries(live)) if (L.buf === b) { const n = S.nodes[id]; if (n && nodeList().some(m => m.block?.page === id)) blockCardsChanged(n); }
 }
 // ---- the page card (mountBuffer in frames mode)
 function frMountPage(n, L) {
@@ -5802,12 +5811,13 @@ function frUpdate() {
   if (!FR.ready || !S) return;
   const c = cam(), z = c.z, vw = VW() / z, vh = VH() / z;
   const x0 = c.x - vw, y0 = c.y - vh, x1 = c.x + 2 * vw, y1 = c.y + 2 * vh, now = performance.now();
-  const want = [];
+  const want = [], held = new Set();   // pages a live block card shows: their replicas stay open (F-A25)
+  for (const m of nodeList()) if (m.block && live[m.id]?.frame) held.add(m.block.page);
   for (const n of nodeList()) {
     if (n.kind !== 'buffer') continue;
     const L = live[n.id]; if (!L?.host) continue;
     if (!n.buf) continue;
-    const vis = !stashed(n) && n.x < x1 && n.x + n.w > x0 && n.y < y1 && n.y + n.h > y0;
+    const vis = held.has(n.id) || (!stashed(n) && n.x < x1 && n.x + n.w > x0 && n.y < y1 && n.y + n.h > y0);
     const focused = FOCUS.cur === n.id || !!(L.frame && L.frame.focused) || (ED.node === n && VIEW === 'editor');
     if (vis || focused) { FR.offAt.delete(n.id); if (!L.buf && !L.open && FR.online) frOpen(n); }
     else if (!FR.offAt.has(n.id)) FR.offAt.set(n.id, now);
@@ -5885,6 +5895,17 @@ function frOverlays(id) {
     if (!a.label) continue;
     const top = L.frame.lineTop(a.pos); if (top == null) continue;
     const s = el('span', 'anchor-chip', '⚓' + a.label); s.style.top = top + 'px'; chips.push(s);
+  }
+  // The tear-out button of every html fence (F-A25), on the fence line, as the CodeMirror widget is
+  const b = L.buf;
+  if (b) {
+    if (!L._blocks || L._blocks.ver !== b.ver) L._blocks = { ver: b.ver, blocks: htmlBlocks(b.text) };
+    for (const blk of L._blocks.blocks) {
+      const top = L.frame.lineTop(blk.head); if (top == null) continue;
+      const s = el('span', 'cm-tear', '⇱ card'); s.title = 'Tear this block out onto the canvas as a live card'; s.style.top = top + 'px';
+      s.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); tearOutBlock(n, blk.head); });
+      chips.push(s);
+    }
   }
   L.chips.replaceChildren(...chips);
   scheduleLineInk(id);
@@ -8008,7 +8029,7 @@ AGENT_TOOLS.push(
   { name: 'host_status', description: 'Health of a host: load, memory, disk, uptime, shells, tmux sessions, unit counts (failed names). host: a name from hosts.json (empty = the serving daemon).', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
     run: async ({ host } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j = await (await hFetch(h, '/api/status')).json(); const gb = b => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}` + (j.sessions?.tmux != null ? ', tmux sessions ' + j.sessions.tmux : ''), j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
-window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
+window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 Object.assign(window.__canvas, { keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
 Object.assign(window.__canvas, { DESK, deskGo, deskSend, deskList, deskAt, deskPin, deskDelete, deskOff, deskPinned, serialize, activate, viewKey });
 boot();
