@@ -131,7 +131,10 @@ function dirtyCam() { clearTimeout(camT); camT = setTimeout(() => DAEMON ? store
 const VIEW_KEYS = ['ws', 'focusTabs', 'persp', 'manual'];
 const viewKey = () => 'wb-view-' + (INFO?.host || location.host);
 function viewLoad() { try { const v = JSON.parse(store.get(viewKey())); if (v && typeof v === 'object') return v; } catch {} return null; }
-function viewSave() { if (S && BOOTED) store.set(viewKey(), JSON.stringify({ ws: S.ws || null, focusTabs: S.focusTabs || [], persp: perspCur() })); }
+function viewSave() { if (S && BOOTED) store.set(viewKey(), JSON.stringify({ ws: S.ws || null, focusTabs: S.focusTabs || [], persp: perspCur(), desk: DESK.cur, prevDesk: DESK.prev, scratch: DESK.scratch, deskCams: DESK.cams })); }
+// Desks (§10.8): the current desk, the one before it, the scratch desks and a camera per desk are this device's. snap is the
+// Board's geometry while another desk is shown; mem is that desk's members.
+const DESK = { cur: 0, prev: 0, snap: null, mem: new Set(), scratch: [], cams: {}, shapeIn: new Map(), shapeOld: new Set() };
 function syncBuffers() {
   for (const n of nodeList()) {
     if (n.kind !== 'buffer' || !live[n.id]?.view) continue;
@@ -145,9 +148,10 @@ function syncBuffers() {
   }
 }
 function serialize() {
-  syncBuffers(); const nodes = manualNodes();
+  syncBuffers(); if (DESK.cur) deskRecord();
+  const nodes = manualNodes(), shapes = DESK.snap ? S.shapes.map(sh => { const d = deskShapeDelta(sh); return d ? { ...sh, x: sh.x + d[0], y: sh.y + d[1] } : sh; }) : S.shapes;
   return JSON.stringify(S, function (k, v) {
-    if (this === S) { if (VIEW_KEYS.includes(k)) return undefined; if (k === 'nodes') return nodes; if (DAEMON && k === 'cam') return BOARD_CAM; }
+    if (this === S) { if (VIEW_KEYS.includes(k)) return undefined; if (k === 'nodes') return nodes; if (k === 'shapes') return shapes; if (DAEMON && k === 'cam') return BOARD_CAM; }
     return k.startsWith('_') ? undefined : v;
   });
 }
@@ -155,6 +159,7 @@ function serialize() {
 const SAVE = { busy: false, again: false, paused: null, pending: false, err: 0, theirs: null, lastJson: null, recheck: null, retryT: null, leaving: false, dbQueue: new Set() };
 function save() {
   if (!S || !BOOTED) return;
+  if (DESK.cur) { deskRecord(); viewSave(); }   // a scratch desk's rectangles live in the view
   if (!DAEMON) return store.set(LS_KEY, serialize());
   if (SAVE.paused) { SAVE.pending = true; if (NET.state === 'signed_out') authBar(); return; }
   if (SAVE.busy) { SAVE.again = true; return; }
@@ -209,6 +214,7 @@ function boardAdopt(b) {
   try {
     if (b.manual && b.persp && b.persp !== 'manual') b = { ...b, nodes: manualNodesOf(b.nodes || {}, b.manual) };   // saved inside a perspective by a page from before F-A22
     const p = perspCur(); if (p !== 'manual') { perspClear(); S.persp = 'manual'; }
+    const dk = deskAt(DESK.cur); if (dk) deskUnapply();   // the same for a desk: take the Board, then stand the desk up again
     const cur = S.nodes;
     for (const id of Object.keys(cur)) if (!b.nodes?.[id] || b.nodes[id].kind !== cur[id].kind) { unmountQuiet(id); delete cur[id]; }
     for (const [id, nn] of Object.entries(b.nodes || {})) {
@@ -219,12 +225,15 @@ function boardAdopt(b) {
       const v = live[id]?.view;
       if (o.kind === 'buffer' && v && v.state.doc.toString() !== (o.text || '')) v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: o.text || '' } });
     }
-    S.edges = b.edges || []; S.strokes = b.strokes || []; S.shapes = b.shapes || []; BOARD_CAM = b.cam;
+    S.edges = b.edges || []; S.strokes = b.strokes || []; S.shapes = b.shapes || []; if (Array.isArray(b.desks)) S.desks = b.desks; else delete S.desks; BOARD_CAM = b.cam;
+    deskSlotsFix();
     frameList().filter(f => !live[f.id]).sort((x, y) => depthOf(x) - depthOf(y)).forEach(mount);
     nodeList().filter(n => !live[n.id]).forEach(mount);
     frameList().forEach(placeFrame); nodeList().forEach(place);
     frameList().sort((x, y) => depthOf(y) - depthOf(x)).forEach(f => relayout(f));
     if (p !== 'manual') { perspBuild(p); S.persp = p; perspChip(); wsApply(false); }
+    if (dk) { const d = deskList().find(x => x === dk || (deskPinned(x) && x.slot === dk.slot)); if (d) deskApply(d); }   // a pinned desk comes back as the other device saved it
+    deskRefresh(true);
     restack(); updateAllTitles(); renderTree(); renderLinks(); renderInk(null);
     SAVE.lastJson = serialize();
   } finally { ADOPTING = false; }
@@ -1513,7 +1522,7 @@ const kidsOf = fid => Object.values(S.nodes).filter(m => m.in === fid);
 const byOrder = (a, b) => (a.order ?? 0) - (b.order ?? 0) || a.y - b.y || a.x - b.x;
 function descendants(fid, out = []) { for (const k of kidsOf(fid)) { out.push(k); if (k.kind === 'frame') descendants(k.id, out); } return out; }
 function ancestors(n) { const out = []; let cur = n.in, g = 0; while (cur && S.nodes[cur] && g++ < 32) { out.push(S.nodes[cur]); cur = S.nodes[cur].in; } return out; }
-const stashed = n => ancestors(n).some(a => a.mode === 'stack');
+const stashed = n => deskOff(n) || ancestors(n).some(a => a.mode === 'stack');
 const visibleOf = n => ancestors(n).reverse().find(a => a.mode === 'stack') || n;
 const depthOf = n => ancestors(n).length;
 const folderPath = n => ancestors(n).reverse().map(a => a.name).join('/');
@@ -1756,11 +1765,12 @@ function pickInRect(a, b) {
     if (n.x >= a.x && top >= a.y && n.x + n.w <= b.x && n.y + n.h <= b.y) pickToggle(n.id, true);
   }
   for (const st of S.strokes) {
-    if (st.aid) continue;
+    if (st.aid || (st.owner ? S.nodes[st.owner] && stashed(S.nodes[st.owner]) : DESK.cur)) continue;   // hidden ink is not picked: the Board's loose ink on a desk, a hidden card's ink
     const pts = strokeWorldPts(st); if (!pts.length) continue;
     if (pts.every(([x, y]) => x >= a.x && y >= a.y && x <= b.x && y <= b.y)) SEL.strokes.add(st.id);
   }
   for (const sh of S.shapes) {
+    if (shapeHidden(sh)) continue;
     if (sh.type === 'arrow') { const e = arrowEnds(sh); if ([[e.x1, e.y1], [e.x2, e.y2]].every(([x, y]) => x >= a.x && y >= a.y && x <= b.x && y <= b.y)) SEL.shapes.add(sh.id); }
     else if (sh.x >= a.x && sh.y >= a.y && sh.x + sh.w <= b.x && sh.y + sh.h <= b.y) SEL.shapes.add(sh.id);
   }
@@ -1869,7 +1879,7 @@ function compact(which) {
   toast(`Compacted ${ids ? ids.length + ' item(s)' : 'the board'}. Ctrl-Z undoes.`);
 }
 // Show something that sits inside stacked folders: spread each enclosing deck, outermost first.
-function reveal(n) { for (const a of ancestors(n).reverse()) if (a.mode === 'stack') setMode(a, a.prevMode || 'free', true); }
+function reveal(n) { deskReveal(n); for (const a of ancestors(n).reverse()) if (a.mode === 'stack') setMode(a, a.prevMode || 'free', true); }
 function slotOrder(t, n, w) {
   renumber(t);
   const sib = kidsOf(t.id).filter(k => k !== n).sort(byOrder);
@@ -2317,6 +2327,7 @@ function addNode(n) {
   if (!n.in || !S.nodes[n.in]) delete n.in;
   if (n.in && S.nodes[n.in].mode === 'pack') n.order = 1e9;
   if (n._spawn !== false) n._spawn = true;   // made in this page: its first open may spawn (SEC-2), unless adopted; `_` keys are never saved
+  deskJoin(n);
   S.nodes[n.id] = n; mount(n);
   SEP.keep = n; if (n.in) relayout(S.nodes[n.in], true); else separate(null, n); SEP.keep = null;
   restack(); renderEdges(); activate(n.id); renderTree(); dirty(); return n;
@@ -2337,7 +2348,7 @@ function removeNode(id) {
   }
   const L = live[id];
   if (L) { L.backend?.kill?.(); L.ro?.disconnect(); L.view?.destroy(); L.term?.dispose(); if (L.frame?.contentWindow) HOSTS.delete(L.frame.contentWindow); L.el.remove(); delete live[id]; }
-  delete S.nodes[id];
+  delete S.nodes[id]; DESK.mem.delete(id); for (const d of deskList()) delete d.members[id];
   S.edges = S.edges.filter(e => e.from !== id && e.to !== id);
   S.strokes = S.strokes.filter(s => s.owner !== id);
   if (parent) relayout(parent, true);
@@ -2460,7 +2471,7 @@ function renderEdges() {
   const rs = rsEdges || (rsEdges = V.rough.svg(edgesSvg));
   const out = [];
   for (const e of [...S.edges, ...PERSP.edges]) {
-    let a = S.nodes[e.from], b = S.nodes[e.to]; if (!a || !b) continue;
+    let a = S.nodes[e.from], b = S.nodes[e.to]; if (!a || !b || deskOff(a) || deskOff(b)) continue;
     a = visibleOf(a); b = visibleOf(b); if (a === b) continue;  // items in a stacked folder connect to its deck
     const [p1, c1, c2, p2] = edgeGeom(a, b);
     const o = { seed: hashSeed(e.id), roughness: 0.9, bowing: 0.8, stroke: 'currentColor', strokeWidth: 1.7 };
@@ -2861,7 +2872,7 @@ function palSearch(q) {
   m = raw.match(/^@\s*(-?\d+)\s*,\s*(-?\d+)$/);
   if (m) out.push({ k: 'point', l: `@${m[1]},${m[2]}`, s: 'world coordinates', score: 1e6, run: onCanvas(() => { pushHistory(); animateTo(camTarget(+m[1] - 200, +m[2] - 150, 400, 300, cam().z)); }) });
   const cands = [];
-  for (const n of nodeList()) cands.push({ k: n.kind === 'term' ? 'shell' : n.kind === 'buffer' ? 'page' : n.kind, l: pathOf(n.id), s: (folderPath(n) ? folderPath(n) + '/' : '') + (stashed(n) ? ' (in a deck)' : ''), run: () => (n.kind === 'buffer' && VIEW === 'editor' ? edOpen(n) : jumpNode(n)) });
+  for (const n of nodeList()) cands.push({ k: n.kind === 'term' ? 'shell' : n.kind === 'buffer' ? 'page' : n.kind, l: pathOf(n.id), s: (folderPath(n) ? folderPath(n) + '/' : '') + (deskOff(n) ? ' (not on this desk)' : stashed(n) ? ' (in a deck)' : ''), run: () => (n.kind === 'buffer' && VIEW === 'editor' ? edOpen(n) : jumpNode(n)) });
   for (const f of frameList()) cands.push({ k: 'folder', l: fullPath(f) + '/', s: `${f.mode || 'free'} · ${kidsOf(f.id).length} item(s)`, run: () => jumpFolder(f) });
   for (const n of nodeList()) {
     if (n.kind !== 'buffer' || !live[n.id]?.view) continue;
@@ -3251,6 +3262,10 @@ function drawShape(s) {
 }
 // Sketch shapes go into a deck with their folder; an arrow hides when either end is in a deck.
 function shapeHidden(s) {
+  if (DESK.cur) {   // on a desk: the shapes of its folders, and what is drawn there; a Board arrow shows only with both ends
+    if (s.type !== 'arrow') { const f = deskShapeFrame(s); if (f ? deskOff(f) : DESK.shapeOld.has(s.id)) return true; }
+    else if (DESK.shapeOld.has(s.id) && !(s.a && s.b)) return true;
+  }
   if (s.in && S.nodes[s.in] && (S.nodes[s.in].mode === 'stack' || stashed(S.nodes[s.in]))) return true;
   if (s.type === 'arrow') for (const e of [s.a, s.b]) { if (!e) continue; const nd = S.nodes[e.id], sh = !nd && S.shapes.find(x => x.id === e.id); if ((nd && stashed(nd)) || (sh && shapeHidden(sh))) return true; }
   return false;
@@ -3365,7 +3380,7 @@ function boardSummary() {
     if (n.kind === 'repl') extra = n.lang === 'js' ? ', JavaScript REPL' : `, ${n.cmd} REPL`;
     if (n.kind === 'buffer') extra = `, ${(n.text || '').split('\n').length} lines`;
     if (n.kind === 'artifact') extra = `, artifact page, capabilities ${Object.keys(n.capabilities || {}).join('/') || 'none'}, version ${String(n.head || '').slice(0, 8)}`;
-    lines.push(`- ${pathOf(n.id)} [${n.kind === 'buffer' ? 'page' : n.kind}${extra}] ${n.in ? 'in folder ' + folderPath(n) + '/' : 'loose on the canvas'}${stashed(n) ? ' (hidden in a deck)' : ''}`);
+    lines.push(`- ${pathOf(n.id)} [${n.kind === 'buffer' ? 'page' : n.kind}${extra}] ${n.in ? 'in folder ' + folderPath(n) + '/' : 'loose on the canvas'}${deskOff(n) ? ' (not on this desk)' : stashed(n) ? ' (hidden in a deck)' : ''}`);
   }
   for (const e of S.edges) if (S.nodes[e.from] && S.nodes[e.to]) lines.push(`edge ${e.type}: ${pathOf(e.from)} -> ${pathOf(e.to)}`);
   const labeled = S.shapes.filter(s => s.text);
@@ -5408,6 +5423,7 @@ async function boot() {
   placeInkChip();
   wireReview(); detectMode(); { const ae = $('#add-emacs'); if (ae) ae.disabled = !DAEMON; }
   if (view.persp && view.persp !== 'manual' && PERSP_NAMES[view.persp]) { perspSet(view.persp, true); if (perspCur() === 'fs') setTimeout(() => { perspEdgesRebuild(); renderLinks(); }, 300); }
+  deskRestore(view);
   wsRestore(); focusRestoreTabs();
   BOOTED = true; SAVE.lastJson = serialize(); viewSave();
 }
@@ -5618,6 +5634,7 @@ function wsApply(animateCam = true) {
 function wsEnter(f, quiet) {
   if (!f || f.kind !== 'frame') return;
   if (VIEW !== 'canvas') setView('canvas');
+  deskReveal(f);
   if (FOCUS.cur) focusHide();
   if (WS.cur !== f.id) WS.last = WS.cur;
   WS.cur = f.id; reveal(f); pushHistory(); activate(f.id);
@@ -5645,7 +5662,7 @@ function wsLeave() {
 }
 function wsGo(i) { const list = wsTop(); const f = list[i - 1]; if (f) wsEnter(f); else toast(`No workspace ${i}: there are ${list.length} top-level folders.`); }
 function wsToggleLast() { const f = WS.last && S.nodes[WS.last]; if (f) wsEnter(f); else if (WS.cur) wsLeave(); }
-function wsRestore() { if (S?.ws && S.nodes[S.ws]) { WS.cur = S.ws; wsApply(false); } }
+function wsRestore() { if (S?.ws && S.nodes[S.ws] && !deskOff(S.nodes[S.ws])) { WS.cur = S.ws; wsApply(false); } }
 
 // ---- focus tabs: a node fills the main area at 100 %; the canvas is untouched underneath; tabs persist
 const FOCUS = { tabs: [], cur: null, saved: null, rect: null };
@@ -5673,6 +5690,7 @@ function focusGeometry(n) {
 function focusShow(id) {
   const n = S.nodes[id]; if (!n || n.kind === 'frame') return;
   if (VIEW !== 'canvas') setView('canvas');
+  deskReveal(n);
   if (FOCUS.cur && FOCUS.cur !== id) focusRestoreNode();
   if (!FOCUS.cur) FOCUS.saved = { ...cam() };
   if (FOCUS.cur !== id) { reveal(n); FOCUS.rect = { x: n.x, y: n.y, w: n.w, h: n.h }; }
@@ -5713,6 +5731,228 @@ function focusClose(id) {
 function focusCycle(d) { if (!FOCUS.tabs.length) return; const i = FOCUS.tabs.indexOf(FOCUS.cur); focusShow(FOCUS.tabs[(i + d + FOCUS.tabs.length) % FOCUS.tabs.length]); }
 function focusRestoreTabs() { FOCUS.tabs = (S?.focusTabs || []).filter(id => S.nodes[id]); focusStrip(); }
 window.addEventListener('resize', () => { if (FOCUS.cur && S?.nodes[FOCUS.cur]) focusGeometry(S.nodes[FOCUS.cur]); });
+
+// ---- desks (DESIGN §10.8, D1): named arrangements of some cards, switched as i3 switches workspaces. Desk 0 is the Board,
+// the only geometry in the board's nodes. On another desk its members stand at the desk's own rectangles (a folder brings
+// what it holds) and every other item is hidden as a deck's cards are. The Board's geometry waits in DESK.snap, so a save
+// writes the Board whichever desk is shown, and leaving the desk puts it back. Pinned desks are records in the board
+// (S.desks); scratch desks are this device's until pinned, and go when they are left empty.
+const DESK_MAX = 8;
+function deskList() { return [...(S.desks || []), ...DESK.scratch].sort((a, b) => a.slot - b.slot); }
+function deskAt(slot) { return slot ? (S.desks || []).find(d => d.slot === slot) || DESK.scratch.find(d => d.slot === slot) || null : null; }
+const deskPinned = d => !!d && (S.desks || []).includes(d);
+const deskName = d => d ? d.slot + (d.name && d.name !== String(d.slot) ? ' ' + d.name : '') : '0 Board';
+function deskShown(n) { return DESK.mem.has(n.id) || ancestors(n).some(a => DESK.mem.has(a.id)); }
+function deskOff(n) { return !!DESK.cur && !deskShown(n); }
+function deskFree() { for (let s = 1; s <= DESK_MAX; s++) if (!deskAt(s)) return s; return 0; }
+// A pinned desk from another device wins its slot; a scratch desk there moves to a free one.
+function deskSlotsFix() {
+  const taken = new Set((S.desks || []).map(d => d.slot));
+  for (const d of [...DESK.scratch]) if (taken.has(d.slot)) { const s = deskFree(); if (s) d.slot = s; else DESK.scratch = DESK.scratch.filter(x => x !== d); }
+}
+// the shown desk's rectangles, from the page (a card in a focus tab keeps its rectangle on the desk)
+function deskRecord() {
+  const d = deskAt(DESK.cur); if (!d) return;
+  for (const id of [...DESK.mem]) { const n = S.nodes[id]; if (!n) { DESK.mem.delete(id); delete d.members[id]; continue; } const r = FOCUS.cur === id && FOCUS.rect ? FOCUS.rect : n; d.members[id] = [r.x, r.y, r.w, r.h]; }
+}
+// The Board as it stands under the shown desk, built without touching the page. An item made on the desk goes to the Board
+// with the nearest item that has a place there: its folder, the card it was spawned from, or the closest member.
+function deskBoardOf(nodes) {
+  const snap = DESK.snap, out = {}, delta = {};
+  for (const n of Object.values(nodes)) { const p = snap.pos[n.id]; if (p) delta[n.id] = [p[0] - n.x, p[1] - n.y]; }
+  const near = n => {
+    for (let c = n.in && nodes[n.in], g = 0; c && g++ < 32; c = c.in && nodes[c.in]) if (delta[c.id]) return delta[c.id];
+    if (n.spawnFrom && delta[n.spawnFrom]) return delta[n.spawnFrom];
+    let best = [0, 0], bd = Infinity;
+    for (const id of DESK.mem) { const m = nodes[id]; if (!m || !delta[id]) continue; const d = Math.hypot(m.x + m.w / 2 - n.x - n.w / 2, m.y + m.h / 2 - n.y - n.h / 2); if (d < bd) { bd = d; best = delta[id]; } }
+    return best;
+  };
+  for (const n of Object.values(nodes)) {
+    const c = { ...n }, p = snap.pos[n.id];
+    if (p) { const f = snap.in[n.id]; if (f && nodes[f]) c.in = f; else delete c.in; [c.x, c.y, c.w, c.h] = p; if (n.id in snap.order) c.order = snap.order[n.id]; else delete c.order; }
+    else { const [dx, dy] = near(n); c.x += dx; c.y += dy; }
+    out[n.id] = c;
+  }
+  return out;
+}
+// The folder a shape goes with on a desk: its deck (in), else the member folder it lay in on the Board when the desk was
+// entered (a shape belongs to an open folder by where it lies, as a folder drag finds it), else, for a shape drawn on the
+// desk, the deepest shown folder it lies in now. It goes back to the Board by that folder's offset.
+const shapeInside = (sh, f) => sh.x >= f.x && sh.y >= f.y - LABEL_H && sh.x + sh.w <= f.x + f.w && sh.y + sh.h <= f.y + f.h;
+function deskShapeFrame(sh) {
+  if (sh.type === 'arrow') return null;
+  if (sh.in) return S.nodes[sh.in] || null;
+  if (DESK.shapeOld.has(sh.id)) return S.nodes[DESK.shapeIn.get(sh.id)] || null;
+  let best = null, bd = -1;
+  for (const f of frameList()) if (!stashed(f) && shapeInside(sh, f)) { const d = depthOf(f); if (d > bd) { bd = d; best = f; } }
+  return best;
+}
+function deskShapeDelta(sh) { const f = DESK.snap && deskShapeFrame(sh), p = f && DESK.snap.pos[f.id]; return p && (p[0] !== f.x || p[1] !== f.y) ? [p[0] - f.x, p[1] - f.y] : null; }
+function deskApply(d) {
+  const snap = { in: {}, pos: {}, order: {} };
+  for (const n of Object.values(S.nodes)) { snap.in[n.id] = n.in || null; snap.pos[n.id] = [n.x, n.y, n.w, n.h]; if ('order' in n) snap.order[n.id] = n.order; }
+  for (const id of Object.keys(d.members)) if (!S.nodes[id]) delete d.members[id];
+  DESK.snap = snap; DESK.cur = d.slot; DESK.mem = new Set(Object.keys(d.members));
+  const ms = [...DESK.mem].map(id => S.nodes[id]).sort((a, b) => depthOf(a) - depthOf(b)), mf = ms.filter(n => n.kind === 'frame');
+  DESK.shapeOld = new Set(S.shapes.map(sh => sh.id)); DESK.shapeIn = new Map();
+  for (const sh of S.shapes) if (sh.type !== 'arrow' && !sh.in) { const f = mf.filter(f => shapeInside(sh, f)).pop(); if (f) DESK.shapeIn.set(sh.id, f.id); }   // ms is shallow first: the deepest member folder wins
+  for (const n of ms) if (n.in && S.nodes[n.in] && !deskShown(S.nodes[n.in])) delete n.in;   // a member whose folder is not on the desk stands loose
+  for (const n of ms) {   // outer first: a folder carries what it holds, then a member inside it takes its own place
+    const r = d.members[n.id]; if (!r) continue;
+    if (n.kind === 'frame') { moveTree(n, r[0] - n.x, r[1] - n.y); n.w = r[2]; n.h = r[3]; } else [n.x, n.y, n.w, n.h] = r;
+  }
+  for (const [id, fid] of DESK.shapeIn) { const sh = S.shapes.find(x => x.id === id), f = S.nodes[fid], p = snap.pos[fid]; if (sh && f) { sh.x += f.x - p[0]; sh.y += f.y - p[1]; } }
+  for (const n of Object.values(S.nodes)) placeAny(n);
+}
+function deskUnapply() {
+  if (!DESK.snap) return;
+  deskRecord();
+  for (const sh of S.shapes) { const d = deskShapeDelta(sh); if (d) { sh.x += d[0]; sh.y += d[1]; } }
+  const board = deskBoardOf(S.nodes), made = new Set();
+  for (const n of Object.values(S.nodes)) {
+    const b = board[n.id];
+    if (b.in) n.in = b.in; else delete n.in;
+    if ('order' in b) n.order = b.order; else delete n.order;
+    n.x = b.x; n.y = b.y; n.w = b.w; n.h = b.h;
+    if (!DESK.snap.pos[n.id] && n.in && S.nodes[n.in]) made.add(S.nodes[n.in]);
+  }
+  DESK.cur = 0; DESK.snap = null; DESK.mem = new Set(); DESK.shapeIn = new Map(); DESK.shapeOld = new Set();
+  for (const n of Object.values(S.nodes)) placeAny(n);
+  for (const f of [...made].sort((a, b) => depthOf(b) - depthOf(a))) relayout(f);   // a folder that took new items on the desk
+}
+// what the page shows after a desk changes; quiet: no save (another device's board is being taken)
+function deskRefresh(quiet) {
+  document.body.classList.toggle('on-desk', !!DESK.cur);
+  restack(); renderTree(); renderLinks(); updateAllTitles(); deskPager();
+  if (VIEW === 'ranger') renderRanger();
+  if (!quiet) { viewSave(); dirty(); }
+}
+function deskGo(slot, quiet) {
+  slot = Math.trunc(+slot);
+  if (!(slot >= 0 && slot <= 9)) return;
+  if (slot === 9) { toast('Desk 9 is kept for the attention desk, which comes with the overview (desks D2).'); return; }
+  if (slot === DESK.cur) { if (!quiet) toast('Already on desk ' + deskName(deskAt(slot)) + '.'); return; }
+  if (VIEW !== 'canvas') setView('canvas');
+  if (FOCUS.cur) focusHide();
+  if (WS.cur) { WS.cur = null; WS.last = null; wsApply(false); }
+  if (perspCur() !== 'manual') perspSet('manual', true);
+  LAYOUT_UNDO = null; pickClear();
+  const from = DESK.cur, fromD = deskAt(from);
+  DESK.cams[from] = { ...cam() };
+  deskUnapply();
+  if (fromD && !deskPinned(fromD) && !Object.keys(fromD.members).length) { DESK.scratch = DESK.scratch.filter(x => x !== fromD); delete DESK.cams[from]; }   // i3: an empty desk goes when left
+  let d = deskAt(slot), made = false;
+  if (slot && !d) { d = { slot, name: String(slot), members: {} }; DESK.scratch.push(d); made = true; }
+  DESK.prev = from;
+  if (d) deskApply(d);
+  deskRefresh();
+  const c = DESK.cams[slot];
+  if (c) { Object.assign(cam(), c); applyCam(); } else if (d && Object.keys(d.members).length) fitAll(false);
+  dirtyCam();
+  if (!quiet) toast(!d ? 'Desk 0: the Board, every card where you put it.' : made || !Object.keys(d.members).length
+    ? `Desk ${deskName(d)}: empty. ${LEADERS[leaderName()].label} m ${slot} on the Board sends the active card here; cards you make here join it.`
+    : `Desk ${deskName(d)}${deskPinned(d) ? '' : ' (this device)'}: ${Object.keys(d.members).length} item(s). ${LEADERS[leaderName()].label} 0 goes back to the Board.`);
+}
+// A card that is not on the shown desk is found on the Board.
+function deskReveal(n) { if (n && deskOff(n)) deskGo(0, true); }
+function deskTargets() { return (PICKED.size ? [...PICKED] : activeId ? [activeId] : []).map(id => S.nodes[id]).filter(Boolean); }
+// The items join desk d in the arrangement they have here, to the right of what the desk already holds.
+function deskAdd(d, ns) {
+  ns = ns.filter(n => !(n.id in d.members)); if (!ns.length) return 0;
+  const top = n => n.y - (n.kind === 'frame' ? LABEL_H : 0), rs = Object.values(d.members).filter(Boolean);
+  const x0 = Math.min(...ns.map(n => n.x)), y0 = Math.min(...ns.map(top));
+  const ox = rs.length ? Math.max(...rs.map(r => r[0] + r[2])) + 3 * GAP : x0, oy = rs.length ? Math.min(...rs.map(r => r[1])) : y0;
+  for (const n of ns) d.members[n.id] = [n.x - x0 + ox, n.y - y0 + oy, n.w, n.h];
+  if (d.slot === DESK.cur) for (const n of ns) DESK.mem.add(n.id);
+  return ns.length;
+}
+// off the shown desk; the Board keeps them. An item shown with its folder goes with the folder only.
+function deskDrop(ns) {
+  const d = deskAt(DESK.cur); if (!d) return 0;
+  const own = ns.filter(n => DESK.mem.has(n.id));
+  for (const n of own) { delete d.members[n.id]; DESK.mem.delete(n.id); PICKED.delete(n.id); live[n.id]?.el.classList.remove('picked'); }
+  if (own.length < ns.length) toast('An item inside a folder on this desk goes with that folder: take the folder off, or drag the item out of it.');
+  pickChip(); return own.length;
+}
+function deskSend(slot, { follow = false, keep = false } = {}) {
+  if (FOCUS.cur) focusHide();
+  const ns = deskTargets(); if (!ns.length) return toast('Pick a card or folder first (click it, or Shift-click several).');
+  if (slot === 9) return toast('Desk 9 is kept for the attention desk (desks D2).');
+  if (slot === DESK.cur && slot) return toast('Already on this desk.');
+  if (slot === 0) {   // every item is on the Board: sending there takes it off this desk
+    if (!DESK.cur || keep) return toast('Every item is on the Board already; this takes items off another desk.');
+    const name = deskName(deskAt(DESK.cur)), k = deskDrop(ns); deskRefresh(); if (follow) deskGo(0, true);
+    if (k) toast(`${k} item(s) off desk ${name}. They stay on the Board.`); return;
+  }
+  let d = deskAt(slot); if (!d) { d = { slot, name: String(slot), members: {} }; DESK.scratch.push(d); }
+  const k = deskAdd(d, ns), moved = !!DESK.cur && !keep;
+  if (moved) deskDrop(ns);   // i3: a card sent on from a desk leaves it
+  deskRefresh();
+  if (follow) deskGo(slot, true);
+  toast(k ? `${k} item(s) ${moved ? 'moved to' : 'now also on'} desk ${deskName(d)}.` : `Already on desk ${deskName(d)}.`);
+}
+// A new item joins the desk it is made on, and a spawned card joins every desk its parent is on, beside the parent.
+function deskJoin(n) {
+  if (n.kind === 'ghost' || PERSP.building) return;
+  const cur = deskAt(DESK.cur);
+  if (cur && !(n.in && S.nodes[n.in] && deskShown(S.nodes[n.in]))) { if (n.in) delete n.in; cur.members[n.id] = null; DESK.mem.add(n.id); }
+  const p = n.spawnFrom && S.nodes[n.spawnFrom]; if (!p) return;
+  for (const d of deskList()) if (d !== cur && p.id in d.members && !(n.id in d.members)) { const r = d.members[p.id]; d.members[n.id] = r ? [r[0] + n.x - p.x, r[1] + n.y - p.y, n.w, n.h] : null; }
+}
+function deskNew() {
+  const ns = deskTargets(), slot = deskFree(); if (!slot) return toast(`All ${DESK_MAX} desks are in use. ${LEADERS[leaderName()].label} d k deletes the shown one.`);
+  askName(`Name desk ${slot}${ns.length ? ` (with ${ns.length} item(s))` : ''}`, '', v => {
+    const d = { slot, name: clean(v || '').replace(/^node$/, '') || String(slot), members: {} }; DESK.scratch.push(d); deskAdd(d, ns); deskGo(slot);
+  });
+}
+function deskRename() { const d = deskAt(DESK.cur); if (!d) return toast('The Board keeps its name.'); askName(`Name desk ${d.slot}`, d.name === String(d.slot) ? '' : d.name, v => { d.name = clean(v || '').replace(/^node$/, '') || String(d.slot); deskRefresh(); }); }
+function deskPin() {
+  const d = deskAt(DESK.cur); if (!d) return toast('The Board is always in the board file.');
+  if (deskPinned(d)) { S.desks = S.desks.filter(x => x !== d); DESK.scratch.push(d); toast(`Desk ${deskName(d)} unpinned: on this device only, and gone when left empty.`); }
+  else { DESK.scratch = DESK.scratch.filter(x => x !== d); (S.desks ||= []).push(d); toast(`Desk ${deskName(d)} pinned: it is saved in the board, and every device has it.`); }
+  deskRefresh();
+}
+function deskDelete() {
+  const d = deskAt(DESK.cur); if (!d) return toast('The Board cannot be deleted.');
+  deskGo(0, true);
+  S.desks = (S.desks || []).filter(x => x !== d); DESK.scratch = DESK.scratch.filter(x => x !== d); delete DESK.cams[d.slot];
+  deskRefresh(); toast(`Desk ${deskName(d)} deleted. Its cards are still on the Board.`);
+}
+function deskAlso() {   // which desks hold the active item
+  const n = activeId && S.nodes[activeId]; if (!n) return toast('Pick a card or folder first.');
+  const on = deskList().filter(d => n.id in d.members || ancestors(n).some(a => a.id in d.members));
+  toast(`${pathOf(n.id)}: on the Board${on.map(d => ', desk ' + deskName(d)).join('')}.`);
+}
+// the pager: one button per desk in the mode line, as a desktop pager has
+function deskPager() {
+  const st = $('#st-desk'); if (!st) return;
+  st.replaceChildren(); const ds = deskList();
+  if (!ds.length && !DESK.cur) return;
+  for (const d of [null, ...ds]) {
+    const slot = d ? d.slot : 0, b = el('button', 'dk' + (slot === DESK.cur ? ' on' : '') + (d && !deskPinned(d) ? ' scratch' : ''), d ? deskName(d) : '0');
+    b.title = d ? `Desk ${deskName(d)}: ${Object.keys(d.members).length} item(s)${deskPinned(d) ? ', pinned in the board' : ', this device only'}` : 'Desk 0: the Board';
+    b.dataset.slot = slot; b.onclick = () => deskGo(slot); st.append(b);
+  }
+}
+// boot: the desk this device was on, its scratch desks and cameras
+function deskRestore(view) {
+  DESK.scratch = Array.isArray(view?.scratch) ? view.scratch.filter(d => d && d.slot >= 1 && d.slot <= DESK_MAX && d.members && typeof d.members === 'object') : [];
+  DESK.cams = view?.deskCams && typeof view.deskCams === 'object' ? view.deskCams : {};
+  if (!Array.isArray(S.desks)) delete S.desks;   // a board without desks keeps no desks key
+  deskSlotsFix();
+  DESK.prev = +view?.prevDesk || 0;
+  const d = perspCur() === 'manual' && deskAt(+view?.desk || 0); if (d) deskApply(d);
+  deskRefresh(true);
+}
+cmd('Desk: go to…', () => askName('Desk number: 0 Board' + deskList().map(d => '  ·  ' + deskName(d)).join(''), '', v => deskGo(+String(v).trim())));
+cmd('Desk: previous', () => KC['desk.prev'](), '@desk.prev');
+cmd('Desk: send the selection to…', () => askName('Send to desk number (0 takes it off this desk)', '', v => deskSend(+String(v).trim())));
+cmd('Desk: new desk with the selection', () => deskNew(), '@desk.new');
+cmd('Desk: rename this desk', () => deskRename(), '@desk.rename', () => !!DESK.cur);
+cmd('Desk: pin or unpin this desk', () => deskPin(), '@desk.pin', () => !!DESK.cur);
+cmd('Desk: take the selection off this desk', () => deskSend(0), '@desk.off', () => !!DESK.cur);
+cmd('Desk: which desks hold the active item', () => deskAlso(), '@desk.which');
+cmd('Desk: delete this desk', () => deskDelete(), '@desk.delete', () => !!DESK.cur);
 
 // ---- i3-style neighbours: focus moves to the nearest sibling in a direction; swapping exchanges places or order
 function siblingsOf(n) { return Object.values(S.nodes).filter(m => m !== n && (m.in || null) === (n.in || null) && !stashed(m)); }
@@ -5837,8 +6077,11 @@ function leaderOpen(prefix) {
   if (!LEADER.on) LEADER.target = document.activeElement;
   LEADER.on = true; LEADER.prefix = prefix || null; wk.hidden = false; wk.replaceChildren();
   const t = el('div', 'wk-title');
+  const desks = '  ·  0 Board' + deskList().map(d => '  ·  ' + deskName(d)).join(''), n = deskTargets().length + ' item(s)';
   t.textContent = prefix === 'leader-v' ? 'Perspective (now: ' + perspCur() + ')'
-    : LEADERS[leaderName()].label + '  ·  ' + (WS.cur && S.nodes[WS.cur] ? 'workspace ' + pathOf(WS.cur) : wsTop().length + ' workspaces') + (FOCUS.tabs.length ? '  ·  ' + FOCUS.tabs.length + ' tab(s)' : '') + (keyInterior(LEADER.target) ? '  ·  Esc leaves the card' : '');
+    : prefix === 'leader-m' ? 'Send ' + n + ' to desk' + desks : prefix === 'leader-M' ? 'Send ' + n + ' to desk and go there' + desks : prefix === 'leader-da' ? 'Also on desk (' + n + ')' + desks
+    : prefix === 'leader-d' ? 'Desk ' + deskName(deskAt(DESK.cur)) + (DESK.cur && !deskPinned(deskAt(DESK.cur)) ? ' (this device)' : '')
+    : LEADERS[leaderName()].label + '  ·  desk ' + deskName(deskAt(DESK.cur)) + (WS.cur && S.nodes[WS.cur] ? '  ·  workspace ' + pathOf(WS.cur) : '') + (FOCUS.tabs.length ? '  ·  ' + FOCUS.tabs.length + ' tab(s)' : '') + (keyInterior(LEADER.target) ? '  ·  Esc leaves the card' : '');
   wk.append(t);
   const rows = WBKeys.rows(prefix || 'leader');
   if (!prefix) rows.push({ keys: 'leader', label: 'send the key through' });
@@ -5992,7 +6235,10 @@ const KC = {
     else toast('Dictation goes into a page: focus one first (Alt-V), or use the Review view.');
   },
   ...Object.fromEntries(VIEWS.map(v => ['view.' + v, () => setView(v)])),
-  ...Object.fromEntries([1, 2, 3, 4, 5, 6, 7, 8, 9].map(i => ['ws.' + i, () => wsGo(i)])),
+  ...Object.fromEntries([0, 1, 2, 3, 4, 5, 6, 7, 8, 9].flatMap(i => [['desk.' + i, () => deskGo(i)], ['desk.send.' + i, () => deskSend(i)],
+    ['desk.follow.' + i, () => deskSend(i, { follow: true })], ['desk.also.' + i, () => deskSend(i, { keep: true })]])),
+  'desk.prev': () => deskGo(DESK.prev === DESK.cur ? 0 : DESK.prev), 'desk.new': () => deskNew(), 'desk.rename': () => deskRename(), 'desk.pin': () => deskPin(),
+  'desk.off': () => deskSend(0), 'desk.which': () => deskAlso(), 'desk.delete': () => deskDelete(),
   'ws.last': () => wsToggleLast(),
   esc: () => { if (VIEW === 'graph' && G.sel) graphSelect(null); else if (tool !== 'select') setTool('select'); else if (PICKED.size) pickClear(); else if (FOCUS.cur) focusHide(); else if (WS.cur) wsLeave(); else if (TAG_FILTER) tagFilter(''); else return false; },
   help: () => { $('#help').hidden = false; },
@@ -6036,7 +6282,7 @@ const KC = {
 { const missing = [...WBKeys.commands()].filter(c => !KC[c]); if (missing.length) console.error('keys: bound but not defined: ' + missing.join(', ')); }
 cmd('Workspace: enter the active folder', () => { const n = activeId && S.nodes[activeId]; if (n?.kind === 'frame') wsEnter(n); else toast('Pick a folder first.'); }, '@card.enter');
 cmd('Workspace: step out', () => wsLeave(), '@esc', () => !!WS.cur);
-cmd('Workspace: switch…', () => { const list = wsTop(); askName('Workspace number: ' + list.map((f, i) => (i + 1) + ' ' + f.name).join('  ·  '), '', v => wsGo(+String(v).trim())); }, 'Ctrl-Space 1…9');
+cmd('Workspace: switch…', () => { const list = wsTop(); askName('Workspace number: ' + list.map((f, i) => (i + 1) + ' ' + f.name).join('  ·  '), '', v => wsGo(+String(v).trim())); });
 cmd('Workspace: last', () => wsToggleLast(), '@ws.last');
 cmd('Focus: open the active node as a tab', () => { const n = activeId && S.nodes[activeId]; if (n) focusOpen(n); else toast('Pick a node first.'); }, '@card.tab');
 cmd('Type into the active node', () => { const n = activeId && S.nodes[activeId]; if (n && n.kind !== 'frame') typeInto(n); else toast('Pick a node first.'); }, '@card.enter');
@@ -6205,11 +6451,12 @@ function manualNodesOf(nodes, snap) {
   }
   return out;
 }
-// What a save writes as nodes: a card shown in a focus tab keeps its place on the canvas, and a perspective's layout
-// gives way to the manual one.
+// What a save writes as nodes: a card shown in a focus tab keeps its place on the canvas, and a desk's or a perspective's
+// layout gives way to the Board's.
 function manualNodes() {
   let nodes = S.nodes; const f = FOCUS.cur && FOCUS.rect && nodes[FOCUS.cur];
   if (f) nodes = { ...nodes, [f.id]: { ...f, ...FOCUS.rect } };
+  if (DESK.snap) return deskBoardOf(nodes);
   return perspCur() !== 'manual' && S.manual ? manualNodesOf(nodes, S.manual) : nodes;
 }
 function perspClear() {
@@ -6284,6 +6531,7 @@ function perspSet(p, quiet) {
   const cur = perspCur(); if (cur === p) { if (!quiet) toast('Already in the ' + p + ' perspective.'); return; }
   if (FOCUS.cur) focusHide();
   if (WS.cur) { WS.cur = null; WS.last = null; wsApply(false); }
+  if (DESK.cur && p !== 'manual') deskGo(0, true);   // a perspective rewrites the Board's folders: it is shown on the Board only
   LAYOUT_UNDO = null;
   if (cur !== 'manual') perspClear();
   if (p !== 'manual') perspBuild(p);
@@ -7086,5 +7334,6 @@ AGENT_TOOLS.push(
 );
 window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 Object.assign(window.__canvas, { keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
+Object.assign(window.__canvas, { DESK, deskGo, deskSend, deskList, deskAt, deskPin, deskDelete, deskOff, deskPinned, serialize, activate, viewKey });
 boot();
 })();
