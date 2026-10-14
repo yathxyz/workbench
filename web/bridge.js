@@ -10,13 +10,14 @@
  *   {t:'tool_result'|'tool_error', id, callId, result|message}   the page answering a tool round-trip
  *   {t:'cancel', id}                           the page's AbortSignal fired
  *   {t:'key', key:'leader'}                    the board's leader key was pressed in the page (hello.keys.leader names it)
+ *   {t:'keys', keys:{leader}}   (host -> page) the leader changed; hello.keys is the first one
  * The host opens with {t:'hello', contract, served:[names]} on the port; without it use() resolves null after 10 s.
  */
 (() => {
   'use strict';
   if (window.claude && typeof window.claude.use === 'function') return;
   const CONTRACT = '0.2.75';
-  let port = null, hello = null, seq = 0;
+  let port = null, hello = null, keys = null, seq = 0;
   const pending = new Map();   // id -> {resolve, reject, onEvent}
   const helloWaiters = [];
 
@@ -38,7 +39,8 @@
   }
   function onMessage(ev) {
     const m = ev.data; if (!m || typeof m !== 'object') return;
-    if (m.t === 'hello') { hello = m; helloWaiters.splice(0).forEach(f => f(m)); return; }
+    if (m.t === 'hello') { hello = m; keys = m.keys || null; helloWaiters.splice(0).forEach(f => f(m)); return; }
+    if (m.t === 'keys') { keys = m.keys || null; return; }   // the user picked another leader
     const rec = pending.get(m.id); if (!rec) return;
     if (m.t === 'ok') { pending.delete(m.id); rec.resolve(m.value); }
     else if (m.t === 'err') { pending.delete(m.id); rec.reject(m.error || err('upstream_error', 'unknown error')); }
@@ -193,10 +195,10 @@
   window.claude = freeze({ use });
   // The board's leader key goes back to the board (hello.keys.leader, Edwin notation): keys typed in this frame never
   // reach the host page, so without this the keyboard could not leave an artifact (Workbench DESIGN §6.4, K3).
-  const leaderOf = e => e.key === 'F1' && !e.ctrlKey && !e.altKey && !e.metaKey ? '<f1>'
+  const leaderOf = e => e.key === 'F1' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey ? '<f1>'
     : (e.code === 'Space' || e.key === ' ') && e.ctrlKey && !e.metaKey && !e.shiftKey ? (e.altKey ? 'C-M-SPC' : 'C-SPC') : null;
   window.addEventListener('keydown', e => {
-    const want = hello && hello.keys && hello.keys.leader;
+    const want = keys && keys.leader;
     if (want && leaderOf(e) === want) { e.preventDefault(); e.stopPropagation(); send({ t: 'key', key: 'leader' }); }
   }, true);
   window.addEventListener('message', ev => { if (ev.data && ev.data.claude === 'ping') say(); });

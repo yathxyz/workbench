@@ -5827,7 +5827,9 @@ const LEADERS = { 'C-SPC': { label: 'Ctrl-Space', key: 'C-SPC' }, 'C-M-SPC': { l
 function leaderName() { return S?.leader && LEADERS[S.leader] ? S.leader : 'C-SPC'; }
 const leaderKeyName = () => LEADERS[leaderName()].key;
 function isLeader(e) { return WBKeys.keyName(e) === leaderKeyName(); }
-function setLeader(k) { if (!LEADERS[k]) return; S.leader = k; dirty(); toast('Leader key: ' + LEADERS[k].label + ' (press it twice to send it to the terminal or editor).'); }
+function setLeader(k) { if (!LEADERS[k]) return; S.leader = k; dirty(); keysToFrames(); toast('Leader key: ' + LEADERS[k].label + ' (press it twice to send it to the terminal or editor).'); }
+// Open artifacts watch for the leader themselves (bridge.js); tell them when it changes.
+function keysToFrames() { for (const L of Object.values(live)) if (L?.port) try { L.port.postMessage({ t: 'keys', keys: { leader: leaderKeyName() } }); } catch {} }
 function folderMode(m, cascade) { const n = activeId && S.nodes[activeId]; const f = n && (n.kind === 'frame' ? n : n.in && S.nodes[n.in]); if (f) cascade ? setModeCascade(f, m) : setMode(f, m); else toast('Pick a folder or something inside one.'); }
 function toggleFullscreen() { try { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen(); } catch (e) { toast('Fullscreen is not available here.'); } }
 function leaderOpen(prefix) {

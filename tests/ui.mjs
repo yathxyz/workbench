@@ -108,6 +108,15 @@ await fr.click('body', { position: { x: 5, y: 5 } }).catch(() => {}); await p.ke
 st = await p.evaluate(() => ({ leader: !document.getElementById('which-key').hidden, inFrame: document.activeElement?.tagName === 'IFRAME' }));
 await p.keyboard.press('Escape');
 check('N55: the leader inside an artifact opens the board\'s leader and leaves the frame', st.leader && !st.inFrame, JSON.stringify(st));
+// a leader picked while the artifact is open reaches it too; Shift-F1 stays the page's
+await p.evaluate(() => window.__canvas.setLeader('F1'));
+const wkOpen = () => p.evaluate(() => !document.getElementById('which-key').hidden);
+const inArt = k => fr.click('body', { position: { x: 5, y: 5 } }).catch(() => {}).then(() => p.keyboard.press(k)).then(() => sleep(250)).then(wkOpen);
+st = { old: await inArt('Control+Space') }; if (st.old) await p.keyboard.press('Escape');
+st.shift = await inArt('Shift+F1'); if (st.shift) await p.keyboard.press('Escape');
+st.f1 = await inArt('F1'); await p.keyboard.press('Escape');
+await p.evaluate(() => window.__canvas.setLeader('C-SPC'));
+check('N55: after the leader changes, an open artifact hands back the new one and no longer the old; Shift-F1 stays in the page', !st.old && !st.shift && st.f1, JSON.stringify(st));
 // v8 nodes in demo mode
 st = await p.evaluate(() => { const w = window.__canvas.newWeb('example.org/a'); const s = window.__canvas.newSketch(); const L = window.__canvas.live[w.id]; return { url: w.url, name: w.name, frame: !!L.frame, bar: !!L.urlInput, sketch: s.kind, agentHidden: !document.querySelector('#add-agent'), emacsOff: document.querySelector('#add-emacs').disabled }; });
 check('web and sketch nodes, agent button hidden', st.url === 'https://example.org/a' && st.name === 'example.org' && st.frame && st.bar && st.sketch === 'sketch' && st.agentHidden && st.emacsOff, JSON.stringify(st));
