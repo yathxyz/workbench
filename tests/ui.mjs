@@ -143,7 +143,15 @@ const gone = await p.evaluate(async ([pid, cid]) => {
   const L = c.live[cid]; return { hidden: L.notice.hidden, text: L.notice.textContent };
 }, [st.page, st.chart?.id]);
 check('block card: a removed block leaves a notice in the card', !gone.hidden && gone.text.includes('no html block #chart'), JSON.stringify(gone));
-await p.evaluate(pid => { const c = window.__canvas; for (const n of Object.values(c.S.nodes)) if (n.block?.page === pid) c.removeNode(n.id); c.removeNode(pid); }, st.page);
+const adopted = await p.evaluate(async pid => {   // another tab removed the page: the adopted board leaves its cards a notice
+  const c = window.__canvas, b = JSON.parse(JSON.stringify({ nodes: c.S.nodes, edges: c.S.edges, strokes: c.S.strokes, shapes: c.S.shapes }));
+  delete b.nodes[pid]; b.edges = b.edges.filter(e => e.from !== pid && e.to !== pid);
+  c.boardAdopt(b); await new Promise(r => setTimeout(r, 100));
+  const card = Object.values(c.S.nodes).find(n => n.block?.page === pid && n.block.id === 'block1'), L = card && c.live[card.id];
+  return { page: !!c.S.nodes[pid], hidden: L?.notice.hidden, text: L?.notice.textContent };
+}, st.page);
+check('block card: a page removed in another tab leaves a notice in its cards', !adopted.page && adopted.hidden === false && adopted.text === 'The page this card came from is gone.', JSON.stringify(adopted));
+await p.evaluate(pid => { const c = window.__canvas; for (const n of Object.values(c.S.nodes)) if (n.block?.page === pid) c.removeNode(n.id); if (c.S.nodes[pid]) c.removeNode(pid); }, st.page);
 // v8 nodes in demo mode
 st = await p.evaluate(() => { const w = window.__canvas.newWeb('example.org/a'); const s = window.__canvas.newSketch(); const L = window.__canvas.live[w.id]; return { url: w.url, name: w.name, frame: !!L.frame, bar: !!L.urlInput, sketch: s.kind, agentHidden: !document.querySelector('#add-agent'), emacsOff: document.querySelector('#add-emacs').disabled }; });
 check('web and sketch nodes, agent button hidden', st.url === 'https://example.org/a' && st.name === 'example.org' && st.frame && st.bar && st.sketch === 'sketch' && st.agentHidden && st.emacsOff, JSON.stringify(st));
