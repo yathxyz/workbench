@@ -120,10 +120,12 @@ export class Server {
     this.L = globalThis.L;
     this.Ed.boot({ host });
     await this.Ed.whenIdle();
-    this.image.replay(this);
     this.buffers = new Buffers({ Ed: this.Ed, auth: this.auth, stateDir: this.cfg.stateDir, log: this.log });
     this.buffers.reload();
     for (const m of MODULES) { await m.install(this); this.modules.push(m); }
+    /* The image is replayed last, in the runtime its definitions were made in: a logged define may call a
+       module's primitive (notes, models, processes, sessions) at definition time (R4.19). */
+    this.image.replay(this);
   }
   /* A server command: FN(client, args, ctx, buf) returns the result object ({value, msg?, out?} or {error}),
      a promise of one, or undefined for a delayed result. */

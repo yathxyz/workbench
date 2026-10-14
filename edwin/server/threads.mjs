@@ -183,8 +183,15 @@ export class Scheduler {
     for (const m of t.owned) { m.owner = null; const w = m.waiters.shift(); if (w) w(true); }
     t.owned.clear();
     this.threads.delete(t.id);
-    if (error !== null) { t.error = error; t.rejectDone(error); if (t.kind === 'background' && !(error instanceof Aborted)) this.reportBackground(t, error); }
-    else { t.result = value; t.resolveDone(value); }
+    const settle = () => {
+      if (error !== null) { t.error = error; t.rejectDone(error); if (t.kind === 'background' && !(error instanceof Aborted)) this.reportBackground(t, error); }
+      else { t.result = value; t.resolveDone(value); }
+    };
+    /* The result waits for the thread's sequenced edits to reach the journal (R4.41 with R16.7): a caller
+       never hears success before its edit is durable, and a journal failure turns the result into that error. */
+    const flushes = t.flushes; t.flushes = null;
+    if (flushes && flushes.length) Promise.all(flushes).then(errs => { const bad = errs.find(e => e); if (bad && error === null) error = bad; settle(); });
+    else settle();
   }
   reportBackground(t, e) {
     const S = this.S;
@@ -215,7 +222,9 @@ export class Scheduler {
     if (!ops.length) return null;
     const seq = this.server.buffers.seq;
     const entry = seq.recordApplied(sb, ops, h.thread.by);
-    const p = seq.commit(sb, entry, null).catch(e => this.log.error('hold', { buf: sb.id, error: e.message }));
+    /* The promise settles when the batch is on disk (or rolled back): null, or the commit's error. */
+    const p = seq.commit(sb, entry, null).then(() => null, e => { this.log.error('hold', { buf: sb.id, error: e.message }); return e; });
+    (h.thread.flushes || (h.thread.flushes = [])).push(p);
     return p;
   }
   /* A blocking point or the end of thread T: its edits are sequenced, the buffers released and the
