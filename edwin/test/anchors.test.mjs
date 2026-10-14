@@ -144,7 +144,10 @@ test('R8.12 after a disk revert an anchor is relocated by prefix and quote, anno
   externalWrite(p, 'four\ntwo\nthree\none\nzero\nfive\n');
   await a.next(m => m.t === 'edits' && m.buf === id && m.by.kind === 'disk');
   assert.equal((await a.open(id)).text, 'FOUR\ntwo\nthree\none\nzero\nfive\n');
-  assert.equal((await anchorsOf(a, id)).find(x => x.id === 'ink-3').pos, 9);
+  // The watcher may see the external write in two parts (two disk batches): read the anchors once the last one landed.
+  let ink3;
+  for (let i = 0; i < 200 && ink3 !== 9; i++) { if (i) await sleep(25); ink3 = (await anchorsOf(a, id)).find(x => x.id === 'ink-3').pos; }
+  assert.equal(ink3, 9);
   // The relocation is in the journal: the last anchors line names the current version and the positions.
   // The append is fsynced after the batch is announced, so wait for it instead of a fixed pause.
   let last;
