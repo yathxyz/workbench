@@ -1714,13 +1714,13 @@ await section('N51', async () => {
       VK.every(k => !(k in disk)) && b1.ws === null && !b1.tabs.length && a1.ws === mine.f && a1.tabs.includes(mine.n), JSON.stringify({ keys: VK.filter(k => k in disk), b1, a1, mine }));
     const before = await D.evaluate(() => { const C = window.__canvas, S = C.S; C.wsLeave(); C.focusClose(C.FOCUS.tabs[0]);
       const n = Object.values(S.nodes).find(n => n.kind === 'buffer'); C.setTags(n, ['n51']);
-      const pos = Object.fromEntries(Object.values(S.nodes).map(n => [n.id, [n.in || null, n.x, n.y, n.w, n.h]]));
+      const pos = Object.fromEntries(Object.values(S.nodes).map(n => [n.id, [n.in || null, n.x, n.y, n.w, n.h, n.order ?? null]]));
       C.perspSet('tag', true); return pos; });
     await sleep(800); await settled(D);
     disk = boardFile();
-    const same = Object.entries(before).every(([id, v]) => disk.nodes[id] && JSON.stringify([disk.nodes[id].in || null, disk.nodes[id].x, disk.nodes[id].y, disk.nodes[id].w, disk.nodes[id].h]) === JSON.stringify(v));
+    const same = Object.entries(before).every(([id, v]) => disk.nodes[id] && JSON.stringify([disk.nodes[id].in || null, disk.nodes[id].x, disk.nodes[id].y, disk.nodes[id].w, disk.nodes[id].h, disk.nodes[id].order ?? null]) === JSON.stringify(v));
     const derivedOnDisk = Object.values(disk.nodes).filter(n => n.derived || n.kind === 'ghost').length, a2 = await viewOf(D);
-    check('N51: inside a perspective the board file keeps the manual layout exactly, and no view key',
+    check('N51: inside a perspective the board file keeps the manual layout and order exactly, and no view key',
       a2.persp === 'tag' && a2.derived > 0 && same && !derivedOnDisk && Object.keys(disk.nodes).length === Object.keys(before).length && VK.every(k => !(k in disk)), JSON.stringify({ a2, same, derivedOnDisk, keys: VK.filter(k => k in disk) }));
     await B.reload(); await until(() => B.evaluate(() => window.__canvas?.BOOTED));
     const mv = await moveCard(B, 70); await settled(B);
