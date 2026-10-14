@@ -6013,8 +6013,8 @@ const PERSP = { building: false, onCwd: null, fsReady: true, edges: [] };
 const PERSP_NAMES = { manual: 'manual: folders as you made them', process: 'process: a shell and what it spawned', fs: 'filesystem: directories on each host', tag: 'tags: one folder per tag, copies under the others', tmux: 'tmux: one folder per session on each host\'s socket', proc: 'processes: each shell with the OS processes under it', unit: 'units: systemd services on each host, shells under their unit', journal: 'journal: year › month › day over the dated pages and journal files', link: 'links: pages under the page that links to them (from one root)' };
 const perspCur = () => S.persp || 'manual';
 function perspSnapshot() {
-  const snap = { in: {}, pos: {}, frames: {} };
-  for (const n of Object.values(S.nodes)) { snap.in[n.id] = n.in || null; snap.pos[n.id] = [n.x, n.y, n.w, n.h]; }
+  const snap = { in: {}, pos: {}, order: {}, frames: {} };   // order: a derived folder renumbers what it takes in
+  for (const n of Object.values(S.nodes)) { snap.in[n.id] = n.in || null; snap.pos[n.id] = [n.x, n.y, n.w, n.h]; if ('order' in n) snap.order[n.id] = n.order; }
   for (const f of frameList()) snap.frames[f.id] = f;
   S.manual = snap;
 }
@@ -6026,7 +6026,7 @@ function manualNodesOf(nodes, snap) {
   for (const n of Object.values(nodes)) {
     if (n.kind === 'ghost' || (n.kind === 'frame' && n.derived) || out[n.id]) continue;
     const c = { ...n };
-    if (snap.in && n.id in snap.in) { const p = snap.in[n.id]; if (p && (out[p] || (nodes[p] && !nodes[p].derived))) c.in = p; else delete c.in; [c.x, c.y, c.w, c.h] = snap.pos[n.id]; }
+    if (snap.in && n.id in snap.in) { const p = snap.in[n.id]; if (p && (out[p] || (nodes[p] && !nodes[p].derived))) c.in = p; else delete c.in; [c.x, c.y, c.w, c.h] = snap.pos[n.id]; if (snap.order) { if (n.id in snap.order) c.order = snap.order[n.id]; else delete c.order; } }
     else if (c.in && !out[c.in]) {
       const hf = c.hostUrl && Object.values(out).find(f => f.kind === 'frame' && !f.derived && f.host && hostRes(f.host)?.url === c.hostUrl);
       if (hf) { c.in = hf.id; c.x = hf.x + PAD; c.y = hf.y + PAD + LABEL_H; } else delete c.in;
@@ -6050,7 +6050,7 @@ function perspClear() {
   for (const [id, f] of Object.entries(snap.frames)) if (!S.nodes[id]) { S.nodes[id] = f; mount(f); }
   const landed = new Set();
   for (const n of Object.values(S.nodes)) {
-    if (n.id in snap.in) { const p = snap.in[n.id]; if (p && S.nodes[p]) n.in = p; else delete n.in; const [x, y, w, h] = snap.pos[n.id]; Object.assign(n, { x, y, w, h }); }
+    if (n.id in snap.in) { const p = snap.in[n.id]; if (p && S.nodes[p]) n.in = p; else delete n.in; const [x, y, w, h] = snap.pos[n.id]; Object.assign(n, { x, y, w, h }); if (snap.order) { if (n.id in snap.order) n.order = snap.order[n.id]; else delete n.order; } }
     else if (n.in && !S.nodes[n.in]) { const hf = n.hostUrl && hostFrames(n.hostUrl).find(f => !f.derived); if (hf) { n.in = hf.id; n.x = hf.x + PAD; n.y = hf.y + PAD + LABEL_H; landed.add(hf); } else delete n.in; }   // made inside a derived folder (an adopted tmux session): home is its host folder
     live[n.id]?.el.classList.remove('persp-dim');
   }
