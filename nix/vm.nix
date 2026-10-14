@@ -5,7 +5,9 @@
 # a PTY corpse with the last screen, journals ending in the death invariant, and a revivable
 # agent. The agent is `stub`, wb-fake-acp acting on prompt keywords. Step 10 is edwind (the edwind spec
 # R16.18, E1 part): the unit, `wb buf` and `wb eval` round trips, a restart that loses nothing, the web
-# restart leaving it alone, and edit.sock refused to another uid (R16.12).
+# restart leaving it alone, and edit.sock refused to another uid (R16.12). Step 11 is `wb` board tools
+# (DESIGN 3.3, fix 4): web.sock's modes, and `wb read_node` from a card without a page (exit 7) and
+# with wbctl's page open on /rpc (the page's text, exit 0).
 { self }:
 let
   secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -427,5 +429,27 @@ in
           assert rc != 0 and "ermission denied" in out, (rc, out)
           rc, out = wb.execute(as_user("bob", f"env HOME=/tmp wb buf ls 2>&1"))
           assert rc != 0, out
+
+      with subtest("11: wb board tools from a card go to the page over web.sock"):
+          WEB_SOCK = "/run/workbench-web/web.sock"
+          PAGE_TEXT = "WBCTL-PAGE-NODE-X"
+          wb.wait_until_succeeds(f"test -S {WEB_SOCK}", timeout=30)
+          assert wb.succeed(f"stat -c %a /run/workbench-web {WEB_SOCK}").split() == ["700", "600"]
+          assert wb.succeed(f"stat -c %U /run/workbench-web {WEB_SOCK}").split() == ["alice", "alice"]
+          # The card finds web.sock through WB_SOCKET, which the hub sets in every child.
+          wbctl("pty-open w1 --spawn --send 'echo W$((0+1))' --expect W1")
+          read = "wb read_node --json '{\"path\":\"x\"}'"
+          # No /rpc client at all (no browser in this test): exit 7 and the message.
+          rc, out = in_card("w1", "W2", read)
+          assert rc == 7 and "wb: no Workbench page is open" in out, (rc, out)
+          # wbctl's page: one /rpc client through the proxy, as a tab; it answers one read_node and ends.
+          proxy.succeed(f"wbctl --url http://wb.test page --text {PAGE_TEXT} --count 1 --seconds 120 </dev/null >/tmp/page.out 2>&1 &")
+          proxy.wait_until_succeeds("grep -q ready /tmp/page.out", timeout=30)
+          rc, out = in_card("w1", "W3", read)
+          assert rc == 0 and PAGE_TEXT in out, (rc, out)
+          proxy.wait_until_succeeds("grep -q done /tmp/page.out", timeout=30)
+          lines = [json.loads(line) for line in proxy.succeed("cat /tmp/page.out").splitlines()]
+          assert {"cmd": {"tool": "read_node", "input": {"path": "x"}}} in lines, lines
+          assert lines[-1] == {"done": True, "answered": 1, "closed": None}, lines
     '';
 }

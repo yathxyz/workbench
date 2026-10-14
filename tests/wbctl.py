@@ -13,6 +13,7 @@ connects to a unix socket, such as the harness's Caddy, instead of the host and 
   wbctl.py [...] acp-revive SID [ACTION...]
   wbctl.py [...] acp-kill SID [--forget]  without --forget waits for the exit, with it for the close
   wbctl.py [...] api-mv SRC DST           POST /api/mv; prints {status, body}
+  wbctl.py [...] page [--text TEXT] [--seconds SECS] [--count N]
   wbctl.py [...] bench [--samples N] [--flood-bytes SIZE] [--ssh-rtt-ms MS]
 
 Hub commands speak NDJSON on hub.sock directly (run them as the hub's user or root):
@@ -34,6 +35,12 @@ Every command but raw prints one JSON object on stdout. pty-open sends spawn:tru
 and leaves spawn out otherwise; pty-attach sends spawn:false. --send types TEXT plus Enter;
 --expect waits until the live output (after the hello) matches REGEX; --wait-exit waits for the
 exit message. The result carries the hello's stream and `lastOut`, the offset to resume from.
+
+page keeps one /rpc client open as a Workbench tab would (DESIGN 3.3, 3.5.3), so that `wb` board
+tools have a page to reach: it sends active{ago:0}, prints {"ready": true}, then answers every
+`cmd`: read_node with TEXT, any other tool with app.js's error for a tool it does not have. It
+prints {"cmd": {tool, input}} per answer and {"done": ...} at the end: after SECS seconds, after N
+answers, or when the server closes the socket (exit 1 then, and on a refused upgrade).
 
 bench measures keystroke echo: a card runs cat with the terminal's echo off, and each sample is
 the time from sending one character to receiving it back. It then floods a second card with
@@ -60,6 +67,7 @@ import time
 import urllib.parse
 
 DEFAULT_URL = "http://127.0.0.1:18443"
+PAGE_TEXT = "wbctl page: read_node"
 DEFAULT_HUB = "/run/workbench-hub/hub.sock"
 SECRET_HEADER = "X-Workbench-Proxy-Secret"
 
@@ -571,6 +579,41 @@ def api_mv(ep, src, dst, timeout=10.0):
     return {"status": status, "body": data.decode(errors="replace")}
 
 
+def page(ep, text, seconds, count, timeout=10.0):
+    """One /rpc client that acts as the page `wb` reaches; see the module text."""
+    status, _, ws = ws_connect(ep.addr, "/rpc", ep.headers(), timeout=timeout)
+    if status != 101:
+        print(json.dumps({"done": True, "status": status}), flush=True)
+        return 1
+    answered, end, closed = 0, time.monotonic() + seconds, None
+    try:
+        ws.send_json({"t": "active", "ago": 0})
+        print(json.dumps({"ready": True}), flush=True)
+        while count is None or answered < count:
+            # One read until the end: a read that times out mid-frame would lose the frame's start.
+            m = ws.recv_json(end - time.monotonic())
+            if m.get("t") != "cmd":
+                continue
+            tool = m.get("tool")
+            if tool == "read_node":
+                ws.send_json({"t": "cmd_result", "id": m.get("id"), "result": text})
+            else:
+                ws.send_json({"t": "cmd_result", "id": m.get("id"),
+                              "error": f"unknown tool {tool} (wb tools lists them)"})
+            answered += 1
+            print(json.dumps({"cmd": {"tool": tool, "input": m.get("input")}}), flush=True)
+    except TimeoutError:
+        pass
+    except WsClosed as e:
+        closed = e.code if e.code is not None else "eof"
+    except OSError as e:
+        closed = type(e).__name__
+    finally:
+        ws.close()
+    print(json.dumps({"done": True, "answered": answered, "closed": closed}), flush=True)
+    return 0 if closed is None else 1
+
+
 def open_frame(sid, cmd="", spawn=None):
     msg = {"t": "open", "id": sid, "cmd": cmd, "parent": "", "cwd": "", "cols": 80, "rows": 24, "env": {}}
     if spawn is not None:
@@ -733,6 +776,10 @@ def main():
     k = sub.add_parser("acp-kill")
     k.add_argument("sid")
     k.add_argument("--forget", action="store_true")
+    g = sub.add_parser("page")
+    g.add_argument("--text", default=PAGE_TEXT, help="the answer to read_node")
+    g.add_argument("--seconds", type=float, default=300.0, help="stay open this long")
+    g.add_argument("--count", type=int, help="end after this many answers")
     m = sub.add_parser("api-mv")
     m.add_argument("src")
     m.add_argument("dst")
@@ -749,6 +796,8 @@ def main():
         return hub_command(a)
     secret = open(a.secret_file).read().strip() if a.secret_file else None
     ep = Endpoint(a.url, a.origin, secret, a.unix)
+    if a.command == "page":
+        return page(ep, a.text, a.seconds, a.count, a.timeout)
     if a.command == "api-mv":
         print(json.dumps(api_mv(ep, a.src, a.dst, a.timeout)))
         return 0
