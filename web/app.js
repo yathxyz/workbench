@@ -74,6 +74,7 @@ function applyCam() {
     else for (const id in live) { live[id].fitNow?.(); scheduleLineInk(id); }
   }
   if (INK.ids.length) placeInkChip();
+  if (FR.on) frSchedule();
   dirtyCam();
 }
 function zoomAt(sx, sy, f) {
@@ -261,6 +262,7 @@ function boardAdopt(b) {
 function unmountQuiet(id) {   // the card went in another tab: drop it here without killing its session
   const L = live[id]; if (!L) return;
   L.backend?.dispose?.(); L.ro?.disconnect(); L.view?.destroy(); L.term?.dispose(); if (L.frame?.contentWindow) HOSTS.delete(L.frame.contentWindow);
+  if (FR.on) frUnmount(id);
   L.el.remove(); delete live[id];
 }
 
@@ -529,8 +531,8 @@ function resolveBufferAddress(q) {
   const para = last && last[2] ? +last[2] : 0, quote = last ? last[3] || '' : '';
   const name = (parts.shift() || '').toLowerCase();
   const n = nodeList().find(x => x.kind === 'buffer' && x.name.toLowerCase() === name) || nodeList().find(x => x.kind === 'buffer' && x.name.toLowerCase().startsWith(name));
-  if (!n || !live[n.id]?.view) return null;
-  const doc = live[n.id].view.state.doc;
+  const pst = n && pageState(n); if (!pst) return null;
+  const doc = pst.doc;
   let from = 1, to = doc.lines, lvl = 0;
   for (const title of parts) {
     let found = false;
@@ -1437,6 +1439,7 @@ function defaultCwd() {
 // An alive session with no card on this board (a "load theirs" conflict, or a tab that missed a card): a card with the
 // same id attaches to it and never spawns (N25).
 function adoptOrphan(s) {
+  if (String(s.sid).startsWith('ed-')) return toast('That session belongs to the editing server (edwind); it has no card.');   // R9.22
   if (S.nodes[s.sid]) return jumpNode(S.nodes[s.sid]);
   const acp = s.kind === 'acp', c = viewCenterWorld(), w = 560, h = acp ? 520 : 320;
   const base = acp ? { kind: 'acp', agent: s.acp?.agent || '', cwd: s.cwd || '' } : { kind: 'term', backend: 'pty', env: {}, ...(s.cwd ? { cwd: s.cwd } : {}) };
@@ -2106,7 +2109,7 @@ function mountNode(n) {
   } else if (n.kind === 'buffer') {
     B('🎙', 'Dictate at the cursor (Alt-V). Say "new line" or "new bullet". Click again to stop.', () => dictateInto(n));
     B('⚓', 'Drop a named anchor at the cursor', () => anchorAtCursor(n));
-    B('⧉', 'Copy a ((block ref)) to the cursor position', () => { const v = live[n.id].view; copyText('((' + fmtAddr(bufferAddress(n, v.state, v.state.selection.main.head)) + '))'); });
+    B('⧉', 'Copy a ((block ref)) to the cursor position', () => { const st = pageState(n); if (st) copyText('((' + fmtAddr(bufferAddress(n, st, pagePoint(n))) + '))'); });
     B('⇢', 'Send the selection (or current line) along pipe edges', () => pipeFrom(n));
     B('❝', 'Pin the selection as a reference card', () => refFrom(n));
   } else if (n.kind === 'ref') {
@@ -2149,7 +2152,7 @@ function mountNode(n) {
   renderInk(n.id);
   return L;
 }
-function place(n) { const L = live[n.id]; if (L) { Object.assign(L.el.style, { left: n.x + 'px', top: n.y + 'px', width: n.w + 'px', height: n.h + 'px' }); fitChrome(n); } }
+function place(n) { const L = live[n.id]; if (L) { Object.assign(L.el.style, { left: n.x + 'px', top: n.y + 'px', width: n.w + 'px', height: n.h + 'px' }); fitChrome(n); if (FR.on && n.kind === 'buffer') frSchedule(); } }
 // a folder's tab and a card's header keep their screen size, so a narrow item (or a far zoom) cannot show all of them:
 // t-narrow drops the count, badge and tags; t-tiny drops the mode buttons, host and all header buttons but ✕. The name
 // is always the last thing to go (ellipsis). Re-run when the zoom moves (applyCam) and when an item is placed.
@@ -2215,6 +2218,7 @@ function mountTerm(n, L) {
 }
 
 function mountBuffer(n, L) {
+  if (FR.on) return frMountPage(n, L);   // frames mode: an Edwin frame on the page's shared buffer (F-A27)
   const text = n.text || '', init = {};
   for (const a of n.anchors || []) init[a.id] = { pos: relocate(text, a), label: a.label };
   const state = V.EditorState.create({
@@ -2377,7 +2381,7 @@ function removeNode(id) {
     for (const k of kidsOf(id)) { if (parent) k.in = parent.id; else delete k.in; }
   }
   const L = live[id];
-  if (L) { L.backend?.kill?.(); L.ro?.disconnect(); L.view?.destroy(); L.term?.dispose(); if (L.frame?.contentWindow) HOSTS.delete(L.frame.contentWindow); L.el.remove(); delete live[id]; }
+  if (L) { L.backend?.kill?.(); L.ro?.disconnect(); L.view?.destroy(); L.term?.dispose(); if (L.frame?.contentWindow) HOSTS.delete(L.frame.contentWindow); if (FR.on) frUnmount(id); L.el.remove(); delete live[id]; }
   delete S.nodes[id]; DESK.mem.delete(id); for (const d of deskList()) delete d.members[id];
   S.edges = S.edges.filter(e => e.from !== id && e.to !== id);
   S.strokes = S.strokes.filter(s => s.owner !== id);
@@ -2408,6 +2412,7 @@ function selectionOf(n) {
   const L = live[n.id];
   if (L.term) return L.term.getSelection();
   if (L.view) { const st = L.view.state, s = st.selection.main; return s.empty ? st.doc.lineAt(s.head).text : st.sliceDoc(s.from, s.to); }
+  if (n.kind === 'buffer' && FR.on) { const b = frBufOf(n); if (!b) return ''; if (b.markActive && b.mark != null && b.mark !== b.pt) return b.text.slice(Math.min(b.pt, b.mark), Math.max(b.pt, b.mark)); return new TextDoc(b.text).lineAt(b.pt).text; }
   if (n.kind === 'acp') { const s = getSelection(); return s && L.body.contains(s.anchorNode) ? String(s) : ''; }
   return '';
 }
@@ -2419,8 +2424,9 @@ function pipeFrom(n) {
   for (const t of targets) {
     const L = live[t.id]; if (!L) continue;
     if (t.kind === 'buffer') {
-      const doc = L.view.state.doc, ins = `\n*from ${pathOf(n.id)}:*\n\`\`\`\n${text.replace(/\s+$/, '')}\n\`\`\`\n`;
-      L.view.dispatch({ changes: { from: doc.length, insert: ins }, scrollIntoView: true });
+      const ins = `\n*from ${pathOf(n.id)}:*\n\`\`\`\n${text.replace(/\s+$/, '')}\n\`\`\`\n`;
+      if (L.view) { const doc = L.view.state.doc; L.view.dispatch({ changes: { from: doc.length, insert: ins }, scrollIntoView: true }); }
+      else frWhenBuf(t).then(b => b && frEdit(b, [[b.text.length, '', ins]]));
     } else if ((t.kind === 'agent' || t.kind === 'acp') && L.ta) {   // drafts into the composer, never sends
       L.ta.value = (L.ta.value ? L.ta.value + '\n' : '') + text; L.ta.focus();
     } else if (L.backend) {
@@ -2438,12 +2444,19 @@ function refFrom(n) {
     const p = L.term.getSelectionPosition();
     const line = p ? p.start.y : 0, lines = p ? p.end.y - p.start.y + 1 : 1;
     src = { node: n.id, line, lines }; label = `${pathOf(n.id)} › L${line + 1}${lines > 1 ? '–' + (line + lines) : ''}`;
-  } else {
+  } else if (L.view) {
     const st = L.view.state, s = st.selection.main;
     if (s.empty) return toast('Select some text first.');
     text = st.sliceDoc(s.from, s.to);
     const aid = uid('a'); L.view.dispatch({ effects: anchorAdd.of({ id: aid, pos: s.from, label: null }) });
     src = { node: n.id, aid }; label = fmtAddr(bufferAddress(n, st, s.from));
+  } else {
+    const b = frBufOf(n), st = pageState(n);
+    if (!b || !st || !b.markActive || b.mark == null || b.mark === b.pt) return toast('Select some text first.');
+    const from = Math.min(b.pt, b.mark), to = Math.max(b.pt, b.mark);
+    text = b.text.slice(from, to);
+    const aid = frAnchorAdd(n, from, null);
+    src = { node: n.id, aid }; label = fmtAddr(bufferAddress(n, st, from));
   }
   const k = childrenOf(n.id, 'ref').length, lines = text.split('\n').length;
   const r = { id: uid('n'), kind: 'ref', in: n.in, name: `${n.name}-ref${k + 1}`, text, src, srcLabel: label, x: n.x + n.w + 70, y: n.y + k * 50, w: 360, h: clamp(70 + lines * 18, 110, 320) };
@@ -2452,10 +2465,12 @@ function refFrom(n) {
 }
 function anchorAtCursor(n) {
   const v = live[n.id].view;
+  if (!v && !(FR.on && n.buf)) return;
   ask('Name this anchor (address becomes ' + n.name + '#name)', '', name => {
     name = name.replace(/[^\w-]/g, '-');
-    v.dispatch({ effects: anchorAdd.of({ id: uid('a'), pos: v.state.selection.main.head, label: name }) });
-    dirty(); toast(`Anchor ${n.name}#${name} set. It moves with the text.`);
+    if (v) { v.dispatch({ effects: anchorAdd.of({ id: uid('a'), pos: v.state.selection.main.head, label: name }) }); dirty(); }
+    else frAnchorAdd(n, pagePoint(n), name);   // a shared marker (R9.12)
+    toast(`Anchor ${n.name}#${name} set. It moves with the text.`);
   });
 }
 
@@ -2464,14 +2479,15 @@ function jumpNode(n, maxZ = 1, done) { if (VIEW !== 'canvas') setView('canvas');
 function jumpBuffer(n, pos) {
   if (VIEW === 'editor') return edOpen(n, pos);
   jumpNode(n, 1, () => {
-    const v = live[n.id]?.view; if (!v) return;
+    const v = live[n.id]?.view;
+    if (!v) { if (FR.on && n.buf) frFocus(n, (f, b) => f.setPoint(Math.min(pos, b.text.length))); return; }
     v.dispatch({ selection: { anchor: pos, head: Math.min(pos + 1, v.state.doc.length) }, scrollIntoView: true }); v.focus();
   });
 }
 function jumpRef(r) {
   const n = S.nodes[r.src?.node]; if (!n) return toast('The source node is gone.');
   if (r.src.aid) {
-    const a = live[n.id]?.view?.state.field(anchorField)[r.src.aid];
+    const a = pageAnchors(n).find(x => x.id === r.src.aid);
     return a ? jumpBuffer(n, a.pos) : jumpNode(n);
   }
   jumpNode(n, 1, () => { const t = live[n.id]?.term; if (t) { t.scrollToLine(Math.max(0, r.src.line - 2)); t.select(0, r.src.line, t.cols * r.src.lines); } });
@@ -2560,7 +2576,12 @@ function strokePath(s) {
 }
 // Top of the anchored line, in the buffer body's own (unscaled) coordinates.
 function lineTopBody(id, aid) {
-  const L = live[id], v = L?.view; if (!v) return null;
+  const L = live[id], v = L?.view;
+  if (!v) {
+    if (!L?.frame || !S.nodes[id]) return null;
+    const a = frAnchors(S.nodes[id]).find(x => x.id === aid); if (!a) return null;
+    const top = L.frame.lineTop(a.pos); return top == null ? null : top + L.host.offsetTop;   // null when the line is not drawn
+  }
   const a = v.state.field(anchorField)[aid]; if (!a) return null;
   const r = v.coordsAtPos(Math.min(a.pos, v.state.doc.length), 1);  // null when the line is outside CodeMirror's rendered viewport
   if (!r) return null;
@@ -2601,12 +2622,18 @@ function commitStroke(pts, sim, size) {
   const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cy = (Math.min(...ys) + Math.max(...ys)) / 2;
   const s = { id: uid('s'), color: inkColor, size, sim, owner: null };
   const node = nodeAt(cx, cy);
-  if (node && node.kind === 'buffer' && cy > node.y + HDR) {
+  const fr = node && node.kind === 'buffer' && FR.on ? live[node.id]?.frame : null, frPos = fr ? (() => { const r = viewport.getBoundingClientRect(), sc = w2s(cx, cy); return fr.posFromPoint(sc.x + r.left, sc.y + r.top); })() : null;
+  if (node && node.kind === 'buffer' && cy > node.y + HDR && (live[node.id].view || frPos != null)) {
     // Anchor to the line under the stroke's centre so the ink follows the text through edits and scrolling.
-    const v = live[node.id].view, r = viewport.getBoundingClientRect(), sc = w2s(cx, cy);
-    const pos = v.posAtCoords({ x: sc.x + r.left, y: sc.y + r.top }, false);
-    const aid = 'ink-' + s.id;
-    v.dispatch({ effects: anchorAdd.of({ id: aid, pos: v.state.doc.lineAt(pos).from, label: null }) });
+    const v = live[node.id].view, aid = 'ink-' + s.id;
+    if (v) {
+      const r = viewport.getBoundingClientRect(), sc = w2s(cx, cy);
+      const pos = v.posAtCoords({ x: sc.x + r.left, y: sc.y + r.top }, false);
+      v.dispatch({ effects: anchorAdd.of({ id: aid, pos: v.state.doc.lineAt(pos).from, label: null }) });
+    } else {   // frames: a shared marker at the line start (R9.12), drawn at the frame's line top
+      const text = live[node.id].buf.text, ls = text.lastIndexOf('\n', frPos - 1) + 1;
+      frAnchorAdd(node, ls, null, aid);
+    }
     const top = lineTopBody(node.id, aid);
     Object.assign(s, { owner: node.id, aid, pts: pts.map(([x, y, p]) => [x - node.x, y - node.y - HDR - top, p]) });
   } else if (node) {
@@ -2678,7 +2705,7 @@ function termLines(L, max) {
 function snapshotText(n, max = 12) {
   const L = live[n.id]; if (!L) return '';
   if (L.term) return termLines(L, max).join('\n');
-  if (n.kind === 'buffer') return (n.text || '').split('\n').slice(0, max).join('\n');
+  if (n.kind === 'buffer') return (FR.on && n.buf ? frSnapText(n) : n.text || '').split('\n').slice(0, max).join('\n');
   if (n.kind === 'acp') return L.backend?.text(max) || '';
   if (n.kind === 'agent') return (n.log || []).filter(m => m.text).slice(-6).map(m => (m.t === 'user' ? '› ' : '') + m.text).join('\n');
   if (n.kind === 'web') return n.url || '';
@@ -2833,7 +2860,7 @@ viewport.addEventListener('dblclick', ev => {
   const r = viewport.getBoundingClientRect(), w = s2w(ev.clientX - r.left, ev.clientY - r.top);
   const count = nodeList().filter(m => m.kind === 'buffer').length + 1;
   const n = addNode({ kind: 'buffer', name: 'note' + count, x: Math.round(w.x - 20), y: Math.round(w.y - 20), w: 420, h: 260, text: '# note' + count + '\n\n- ' });
-  setTimeout(() => { const v = live[n.id].view; v.dispatch({ selection: { anchor: v.state.doc.length } }); v.focus(); }, 30);
+  setTimeout(() => { const v = live[n.id]?.view; if (!v) return focusEnd(n); v.dispatch({ selection: { anchor: v.state.doc.length } }); v.focus(); }, 30);
 });
 
 // ------------------------------------------------------------------ toolbar
@@ -2861,7 +2888,7 @@ function pickShell(then) {
   const d = shellDefault(), order = sh.includes(d) ? [d, ...sh.filter(x => x !== d)] : sh;
   openPicker('Shell', order.map(x => ({ k: 'shell', l: x, s: x === INFO.defaultShell ? 'default' : '', run: () => { store.set(SHELL_KEY, x); then(x); } })));
 }
-$('#add-buffer').onclick = () => { const n = newAt('buffer', { text: '# untitled\n\n- ' }); n.text = `# ${n.name}\n\n- `; live[n.id].view.dispatch({ changes: { from: 0, to: live[n.id].view.state.doc.length, insert: n.text } }); };
+$('#add-buffer').onclick = () => { const n = newAt('buffer', { text: '# untitled\n\n- ' }); const t = `# ${n.name}\n\n- `; if (live[n.id].view) { n.text = t; live[n.id].view.dispatch({ changes: { from: 0, to: live[n.id].view.state.doc.length, insert: n.text } }); } else pageSetText(n, t); };
 $('#add-frame').onclick = () => {
   if (VIEW !== 'canvas') setView('canvas');
   const n = newAt('frame', { mode: 'free', shape: 'folder' });
@@ -2952,7 +2979,7 @@ function palSearch(q) {
   }
   if (q.startsWith('>')) return rank(CMDS.filter(c => !c.when || c.when()), ql.slice(1).trim(), true);
   // exact addresses first: page › heading ¶n, Folder/B3, @x,y
-  if (q.includes('›') || /¶\s*\d/.test(q)) { const r = resolveBufferAddress(q); if (r) out.push({ k: 'position', l: fmtAddr(bufferAddress(r.node, live[r.node.id].view.state, r.pos)), s: 'buffer address', run: () => jumpBuffer(r.node, r.pos), score: 1e6 }); }
+  if (q.includes('›') || /¶\s*\d/.test(q)) { const r = resolveBufferAddress(q); if (r) out.push({ k: 'position', l: fmtAddr(bufferAddress(r.node, pageState(r.node), r.pos)), s: 'buffer address', run: () => jumpBuffer(r.node, r.pos), score: 1e6 }); }
   let m = raw.match(/^(.+)\/([A-Za-z]{1,2})(\d{1,3})$/);
   if (m) { const f = findFolder(m[1]); if (f) { const cx = f.x + colIndex(m[2]) * GRID, cy = f.y + (+m[3] - 1) * GRID; out.push({ k: 'cell', l: `${f.name}/${m[2].toUpperCase()}${m[3]}`, s: 'folder cell', score: 1e6, run: onCanvas(() => { pushHistory(); animateTo(camTarget(cx, cy, GRID, GRID, 1.6)); }) }); } }
   m = raw.match(/^@\s*(-?\d+)\s*,\s*(-?\d+)$/);
@@ -2961,8 +2988,8 @@ function palSearch(q) {
   for (const n of nodeList()) cands.push({ k: n.kind === 'term' ? 'shell' : n.kind === 'buffer' ? 'page' : n.kind, l: pathOf(n.id), s: (folderPath(n) ? folderPath(n) + '/' : '') + (deskOff(n) ? ' (not on this desk)' : stashed(n) ? ' (in a deck)' : ''), run: () => (n.kind === 'buffer' && VIEW === 'editor' ? edOpen(n) : jumpNode(n)) });
   for (const f of frameList()) cands.push({ k: 'folder', l: fullPath(f) + '/', s: `${f.mode || 'free'} · ${kidsOf(f.id).length} item(s)`, run: () => jumpFolder(f) });
   for (const n of nodeList()) {
-    if (n.kind !== 'buffer' || !live[n.id]?.view) continue;
-    for (const [, a] of Object.entries(live[n.id].view.state.field(anchorField))) if (a.label) cands.push({ k: 'anchor', l: `${n.name}#${a.label}`, s: fmtAddr(bufferAddress(n, live[n.id].view.state, a.pos)), run: () => jumpBuffer(n, a.pos) });
+    const pst = n.kind === 'buffer' && pageState(n); if (!pst) continue;
+    for (const a of pageAnchors(n)) if (a.label) cands.push({ k: 'anchor', l: `${n.name}#${a.label}`, s: fmtAddr(bufferAddress(n, pst, a.pos)), run: () => jumpBuffer(n, a.pos) });
   }
   for (const [name, v] of Object.entries(S.views)) cands.push({ k: 'view', l: name, s: `saved view · ${Math.round(v.z * 100)}%`, run: onCanvas(() => { pushHistory(); animateTo(v); }) });
   if (!ql) {
@@ -2972,8 +2999,8 @@ function palSearch(q) {
   const ranked = rank([...cands, ...CMDS.filter(c => !c.when || c.when())], ql);
   if (ql.length >= 3) {
     for (const n of nodeList()) {
-      if (n.kind === 'buffer' && live[n.id]?.view) {
-        const st = live[n.id].view.state, low = st.doc.toString().toLowerCase(); let i = low.indexOf(ql), c = 0;
+      if (n.kind === 'buffer' && pageState(n)) {
+        const st = pageState(n), low = st.doc.toString().toLowerCase(); let i = low.indexOf(ql), c = 0;
         while (i >= 0 && c++ < 3) { ranked.push({ k: 'text', l: fmtAddr(bufferAddress(n, st, i)), s: 'match in page', run: (p => () => jumpBuffer(n, p))(i) }); i = low.indexOf(ql, i + 1); }
       } else if (live[n.id]?.term) {
         const L = live[n.id], b = L.term.buffer.active;
@@ -3102,10 +3129,11 @@ cmd('Help: keys and gestures', () => { $('#help').hidden = false; }, '@help');
 // One capture listener walks the layers of web/keys.js, innermost first: leader, transient (an overlay, hints, arrange),
 // interior (the card or field that has the keyboard), view, place, global. A card gets every key it needs before the
 // board looks at it (K2), and leader Esc takes the keyboard back out of any card (K3).
-const typing = () => { const a = document.activeElement; return a && (a.matches('input, textarea, [contenteditable="true"]') || a.closest('.cm-editor, .xterm')); };
+const typing = () => { const a = document.activeElement; return a && (a.matches('input, textarea, [contenteditable="true"]') || a.closest('.cm-editor, .xterm, .edwin-frame')); };
 function keyInterior(a = document.activeElement) {
   if (!a || a === document.body || a === document.documentElement || a === viewport) return null;
   if (a.closest('.xterm')) return 'term';
+  if (a.closest('.edwin-frame')) return 'edwin';   // an Edwin frame owns every key but the leader (edwind spec R9.7, F-A27)
   if (a.closest('.cm-editor')) return 'page';
   if (a.tagName === 'IFRAME') return 'frame';
   if (a.matches('input, textarea, select, [contenteditable="true"]')) return 'text';
@@ -3225,12 +3253,12 @@ function resolveRef(addr) {
   addr = String(addr).trim(); let hit = null;
   const m = addr.match(/^([^#›]+)#([\w-]+)$/);
   if (m) {
-    const n = findPage(m[1]), v = n && live[n.id]?.view;
-    if (v) for (const a of Object.values(v.state.field(anchorField))) if (a.label === m[2]) hit = { node: n, pos: a.pos };
+    const n = findPage(m[1]);
+    if (n && pageState(n)) for (const a of pageAnchors(n)) if (a.label === m[2]) hit = { node: n, pos: a.pos };
   } else if (addr.includes('›')) hit = resolveBufferAddress(addr);
-  else { const n = findPage(addr); if (n && live[n.id]?.view) hit = { node: n, pos: 0 }; }
-  if (!hit || !live[hit.node.id]?.view) return null;
-  const doc = live[hit.node.id].view.state.doc, line = doc.lineAt(Math.min(hit.pos, doc.length));
+  else { const n = findPage(addr); if (n && pageState(n)) hit = { node: n, pos: 0 }; }
+  const hst = hit && pageState(hit.node); if (!hst) return null;
+  const doc = hst.doc, line = doc.lineAt(Math.min(hit.pos, doc.length));
   let text = (doc.sliceString(hit.pos, line.to).trim() || line.text.trim()).replace(/^([-*+]|\d+\.)\s+|^#+\s+/, '');
   return { ...hit, text: text.length > 90 ? text.slice(0, 88) + '…' : text || hit.node.name };
 }
@@ -3249,10 +3277,12 @@ function openPage(name, from, quiet) {
   return n;
 }
 function focusEnd(n) {
-  const v = live[n.id]?.view; if (!v) return;
+  const v = live[n.id]?.view;
+  if (!v) { if (FR.on && n.kind === 'buffer') frFocus(n, (f, b) => f.setPoint(b.text.length)); return; }
   v.dispatch({ selection: { anchor: v.state.doc.length }, scrollIntoView: true }); v.focus();
 }
 function openToday() {
+  if (FR.on && VIEW !== 'editor') return frOpenToday();   // journal/YYYY-MM-DD.md through edwind
   if (VIEW === 'editor') return edOpen(openPage(TODAY, null, true));
   const n = findPage(TODAY);
   if (n) return jumpNode(n, 1, () => focusEnd(n));
@@ -3268,11 +3298,11 @@ function freeSpot(x, y, w, h) {
 // One pass over every page: each line is lowercased once and its [[name]], ((name#…)) and ((name ›…)) targets are
 // collected, so the cost is the board's text, not pages × pages × lines. A box is rebuilt only when its hits changed.
 function updateBacklinks() {
-  const pages = nodeList().filter(n => n.kind === 'buffer' && live[n.id]?.view);
+  const pages = nodeList().filter(n => n.kind === 'buffer' && pageState(n));
   const names = new Set(pages.map(p => p.name.toLowerCase())), hitsOf = new Map();
   const RX = /\[\[([^\[\]\n]+)\]\]|\(\(([^()#›\n]+?)\s*(?:#|›)/g;
   for (const q of pages) {
-    const st = live[q.id].view.state, doc = st.doc, text = doc.toString();
+    const st = pageState(q), doc = st.doc, text = doc.toString();
     if (!text.includes('[[') && !text.includes('((')) continue;
     for (let i = 1; i <= doc.lines; i++) {
       const line = doc.line(i), low = line.text.toLowerCase(), seen = new Set();
@@ -3495,9 +3525,10 @@ const str = v => (v == null ? '' : String(v));
 const AGENT_TOOLS = [
   { name: 'read_node', description: 'Read a node by path. A page returns its markdown; a shell or REPL returns its last 80 lines of output; a ref returns its text.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
-    run: ({ path }) => {
+    run: async ({ path }) => {
       const n = findNode(path); if (!n) throw new Error('no node at ' + path);
       syncBuffers();
+      if (n.kind === 'buffer' && FR.on) { const b = await frWhenBuf(n); return (b ? b.text : n.text || '').slice(0, 8000); }   // the replica is what every editor sees (R13.7)
       if (n.kind === 'buffer') return (n.text || '').slice(0, 8000);
       if (live[n.id]?.term) return termLines(live[n.id], 80).join('\n') || '(empty)';
       if (n.kind === 'acp') return live[n.id]?.backend?.text(40) ?? '(not mounted)';
@@ -3518,9 +3549,15 @@ const AGENT_TOOLS = [
     } },
   { name: 'write_page', description: 'Write markdown to a page. mode "append" (default) adds at the end; "replace" replaces all text. Creates the page if it does not exist.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' }, text: { type: 'string' }, mode: { type: 'string', enum: ['append', 'replace'] } }, required: ['path', 'text'] },
-    run: ({ path, text, mode }) => {
+    run: async ({ path, text, mode }) => {
       let n = findNode(path); if (!n) n = openPage(str(path), live[activeId] ? S.nodes[activeId] : null, true);
       if (n.kind !== 'buffer') throw new Error(path + ' is not a page');
+      if (FR.on) {   // one edit batch through the replica, one undo group (R13.7)
+        const b = await frWhenBuf(n); if (!b) throw new Error(path + ': the page is not open in edwind');
+        if (mode === 'replace') frReplaceAll(b, str(text)); else frAppend(b, str(text));
+        pulse(n.id);
+        return `ok, ${pathOf(n.id)} now has ${b.text.split('\n').length} lines`;
+      }
       const v = live[n.id].view, doc = v.state.doc, t = str(text);
       if (mode === 'replace') v.dispatch({ changes: { from: 0, to: doc.length, insert: t } });
       else v.dispatch({ changes: { from: doc.length, insert: (doc.length && !doc.toString().endsWith('\n') ? '\n' : '') + t }, scrollIntoView: true });
@@ -3715,12 +3752,13 @@ async function inkToText() {
     const md = res.text.trim().replace(/^```\w*\n?/, '').replace(/\n?```$/, '').trim();
     if (!md) throw new Error('empty');
     const strokes = S.strokes.filter(s => ids.includes(s.id));
-    const onPage = strokes.find(s => s.aid && S.nodes[s.owner]?.kind === 'buffer' && live[s.owner]?.view);
+    const onPage = strokes.find(s => s.aid && S.nodes[s.owner]?.kind === 'buffer' && pageState(S.nodes[s.owner]));
     let where;
     if (onPage) {
-      const n = S.nodes[onPage.owner], v = live[n.id].view, a = v.state.field(anchorField)[onPage.aid];
-      const line = v.state.doc.lineAt(a ? a.pos : v.state.doc.length), ins = '\n' + md.replace(/^# .*\n+/, '');
-      v.dispatch({ changes: { from: line.to, insert: ins }, selection: { anchor: line.to + ins.length } });
+      const n = S.nodes[onPage.owner], v = live[n.id].view, a = pageAnchors(n).find(x => x.id === onPage.aid), st = pageState(n);
+      const line = st.doc.lineAt(a ? a.pos : st.doc.length), ins = '\n' + md.replace(/^# .*\n+/, '');
+      if (v) v.dispatch({ changes: { from: line.to, insert: ins }, selection: { anchor: line.to + ins.length } });
+      else pageEdit(n, line.to, line.to, ins);
       where = n.name;
     } else {
       const b = inkBox(ids), first = md.split('\n')[0].replace(/^[#\-\s]+|TODO\s+/g, '').split(/\s+/).slice(0, 3).join('-').toLowerCase().replace(/[^\w-]/g, '') || 'note';
@@ -3804,6 +3842,7 @@ function wireMic(btn, n) {
   btn.addEventListener('pointerup', release); btn.addEventListener('pointerleave', release); btn.addEventListener('pointercancel', release);
 }
 function dictateInto(n) {
+  if (n !== 'editor' && FR.on && n.buf && !live[n.id]?.view) return frDictateInto(n);
   const v = n === 'editor' ? ED.view : live[n.id]?.view; if (!v) return;
   if (VOICE.rec && VOICE.target === v) { stopListening(); return; }
   let done = 0;
@@ -3817,6 +3856,27 @@ function dictateInto(n) {
       const head = v.state.selection.main.head, prev = v.state.sliceDoc(Math.max(0, head - 1), head);
       const text = spoken((prev && !/\s/.test(prev) ? ' ' : '') + add.trim());
       v.dispatch({ changes: { from: head, insert: text }, selection: { anchor: head + text.length }, scrollIntoView: true });
+    },
+    onEnd: () => { VOICE.target = null; } });
+}
+
+// Dictation into a frame: the recognised text goes in at the frame's point as this frame's own edit.
+function frDictateInto(n) {
+  const L = live[n.id]; if (!L) return;
+  if (VOICE.rec && VOICE.target === n.id) { stopListening(); return; }
+  let done = 0;
+  VOICE.target = n.id;
+  const btn = $$('.hb', L.hdr).find(b => b.textContent === '🎙'); btn?.classList.add('mic', 'on');
+  frFocus(n);
+  listen({ label: n.name,
+    onUpdate: fin => {
+      const add = fin.slice(done); if (!add.trim()) return;
+      done = fin.length;
+      const b = frBufOf(n), f = L.frame; if (!b) return;
+      const head = f ? f.point() : b.pt, prev = b.text.slice(Math.max(0, head - 1), head);
+      const text = spoken((prev && !/\s/.test(prev) ? ' ' : '') + add.trim());
+      frEdit(b, [[head, '', text]]);
+      if (f) f.setPoint(head + text.length); else b.pt = head + text.length;
     },
     onEnd: () => { VOICE.target = null; } });
 }
@@ -4093,7 +4153,7 @@ let VIEW = 'canvas';
 const VIEWS = ['canvas', 'ranger', 'graph', 'editor', 'outline', 'tasks', 'review'];
 const VIEW_NAMES = { canvas: 'Canvas', ranger: 'Navigator', graph: 'Graph', editor: 'Editor', outline: 'Outline', tasks: 'Tasks', review: 'Review' };
 const pages = () => nodeList().filter(n => n.kind === 'buffer');
-const pageText = n => live[n.id]?.view ? live[n.id].view.state.doc.toString() : (n.text || '');
+const pageText = n => live[n.id]?.view ? live[n.id].view.state.doc.toString() : FR.on && n.buf ? (frBufOf(n)?.text ?? n.snap ?? '') : (n.text || '');
 const isJournal = n => /^\d{4}-\d\d-\d\d$/.test(n.name);
 function sortPages(list) { return list.sort((a, b) => (isJournal(b) - isJournal(a)) || (isJournal(a) ? b.name.localeCompare(a.name) : a.name.localeCompare(b.name))); }
 function setView(v) {
@@ -4155,7 +4215,9 @@ function edOpen(n, pos) {
   edLoad(n, pos);
 }
 function edLoad(n, pos) {
+  if (FR.on && n.buf) return frEdLoad(n, pos);   // a second frame on the shared buffer (R9.14)
   ED.next = null;
+  if (ED.frame) { ED.frame.destroy(); ED.frame = null; $('#ed-host').replaceChildren(); }
   if (ED.node !== n || !ED.view || !S.nodes[n.id]) {
     ED.view?.destroy();
     ED.node = n; S.edPage = n.id; dirty();
@@ -4232,11 +4294,12 @@ let edInfoT = null;
 function edInfo() {
   clearTimeout(edInfoT);
   edInfoT = setTimeout(() => {
-    const n = ED.node; if (!n || !ED.view) return;
+    const n = ED.node; if (!n || (!ED.view && !ED.frame)) return;
+    const edText = () => (ED.view ? ED.view.state.doc.toString() : pageText(n));
     const toc = $('#ed-toc'); toc.replaceChildren();
-    for (const h of headingsOf(ED.view.state.doc.toString())) {
+    for (const h of headingsOf(edText())) {
       const b = el('button', 'toc-h'); b.style.paddingLeft = (h.level - 1) * 12 + 6 + 'px'; b.textContent = h.text;
-      b.onclick = () => { ED.view.dispatch({ selection: { anchor: h.pos }, effects: V.EditorView.scrollIntoView(h.pos, { y: 'start', yMargin: 24 }) }); ED.view.focus(); };
+      b.onclick = () => { if (ED.view) { ED.view.dispatch({ selection: { anchor: h.pos }, effects: V.EditorView.scrollIntoView(h.pos, { y: 'start', yMargin: 24 }) }); ED.view.focus(); } else if (ED.frame) { ED.frame.setPoint(h.pos); ED.frame.focus(); } };
       toc.append(b);
     }
     if (!toc.children.length) toc.append(el('p', 'muted small', 'No headings yet. Lines that start with # show here.'));
@@ -4251,7 +4314,7 @@ function edInfo() {
     }
     if (!hits.length) bl.append(el('p', 'muted small', `No page links here yet. Write [[${n.name}]] in another page.`));
     const lb = $('#ed-ul'); lb.replaceChildren();
-    const linked = new Set(backlinksOf(n).map(h => h.q.id)), text = ED.view.state.doc.toString().toLowerCase();
+    const linked = new Set(backlinksOf(n).map(h => h.q.id)), text = edText().toLowerCase();
     for (const q of pages()) {
       if (q === n || linked.has(q.id) || q.name.length < 3) continue;
       const re = new RegExp('(^|[^\\w-])' + n.name.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![\\w-])'), t = pageText(q).toLowerCase(), mm = t.match(re), i = mm ? mm.index + mm[1].length : -1;
@@ -4534,12 +4597,12 @@ const TASK_DATE_RE = /^\s*(SCHEDULED|DEADLINE|CLOSED):\s*[<[](\d{4}-\d{2}-\d{2})
 function collectTasks() {
   const out = [];
   for (const p of pages()) {
-    const v = live[p.id]?.view; if (!v) continue;
-    const doc = v.state.doc;
+    const pst = pageState(p); if (!pst) continue;
+    const doc = pst.doc;
     for (let i = 1; i <= doc.lines; i++) {
       const line = doc.line(i), m = line.text.match(TASK_RE);
       if (!m) continue;
-      const t = { node: p, line: i, kw: m[2], kwFrom: line.from + m[1].length, text: m[4], pos: line.from + m[1].length, st: v.state, fields: {}, body: [] };
+      const t = { node: p, line: i, kw: m[2], kwFrom: line.from + m[1].length, text: m[4], pos: line.from + m[1].length, st: pst, fields: {}, body: [] };
       const pm = t.text.match(/\s*\[#([A-C])\]/); if (pm) t.priority = pm[1];
       for (let j = i + 1; j <= doc.lines; j++) { const l = doc.line(j).text; if (!l.trim() || !/^\s/.test(l) || TASK_RE.test(l) || /^#{1,6} /.test(l)) break; const dm = l.match(TASK_DATE_RE), fm = l.match(FIELD_LINE_RE); if (dm) t[dm[1].toLowerCase()] = dm[2]; else if (fm) t.fields[fm[1].toLowerCase()] = fm[2]; else t.body.push(l.trim()); t.lastLine = j; }
       t.session = t.fields.session; t.dispatched = t.fields.dispatched;
@@ -4601,19 +4664,19 @@ async function dispatchTask(t, { host, shell } = {}) {
     const r = await hFetch(null, '/api/task/' + encodeURIComponent(t.id), { method: 'POST', body: JSON.stringify({ kw, set: { session: sess, dispatched: stamp } }), headers: { 'Content-Type': 'application/json' } });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'could not write session:: into the task'); await tasksLoad(true);
   } else {
-    const v = live[t.node.id]?.view; if (v) { const doc = v.state.doc, head = doc.line(t.line), indent = (head.text.match(/^\s*/) || [''])[0] + '  ', lines = []; for (let j = t.line + 1; j <= (t.lastLine || t.line); j++) lines.push(doc.line(j));
+    const st = pageState(t.node); if (st) { const doc = st.doc, head = doc.line(t.line), indent = (head.text.match(/^\s*/) || [''])[0] + '  ', lines = []; for (let j = t.line + 1; j <= (t.lastLine || t.line); j++) lines.push(doc.line(j));
       const changes = [];
       for (const [k, val] of [['session', sess], ['dispatched', stamp]]) { const ex = lines.find(l => (l.text.match(FIELD_LINE_RE) || [])[1] === k); if (ex) changes.push({ from: ex.from, to: ex.to, insert: indent + k + ':: ' + val }); else changes.push({ from: head.to, insert: '\n' + indent + k + ':: ' + val }); }
-      v.dispatch({ changes }); if (kw) setTask({ ...t, st: v.state }, kw); }
+      pageEdits(t.node, changes); if (kw) setTask(t, kw); }
   }
   if (VIEW === 'tasks') renderTasks();
   return { shell: pathOf(n.id), session: sess, text };
 }
 function setTask(t, kw) {
-  const v = live[t.node.id]?.view; if (!v) return;
-  const line = v.state.doc.line(Math.min(t.line, v.state.doc.lines)), m = line.text.match(TASK_RE);
+  const st = pageState(t.node); if (!st) return;
+  const line = st.doc.line(Math.min(t.line, st.doc.lines)), m = line.text.match(TASK_RE);
   if (!m) return toast('That task moved. Try again.');
-  v.dispatch({ changes: { from: line.from + m[1].length, to: line.from + m[1].length + m[2].length, insert: kw } });
+  pageEdit(t.node, line.from + m[1].length, line.from + m[1].length + m[2].length, kw);
   renderTasks();
 }
 function plainTask(s) { return s.replace(/\[\[([^\]]+)\]\]/g, '$1').replace(/\(\(([^)]+)\)\)/g, (_, a) => resolveRef(a)?.text || a).replace(/\s*\[#[A-C]\]/, '').replace(/\s*\^[\w-]+$/, ''); }
@@ -4674,11 +4737,12 @@ $$('.tk-col').forEach(col => {
   col.addEventListener('dragleave', () => col.classList.remove('over'));
   col.addEventListener('drop', e => { e.preventDefault(); col.classList.remove('over'); const t = renderTasks.drag; renderTasks.drag = null; if (t && COL[t.kw] !== col.dataset.col) taskSetKw(t, col.dataset.col); });
 });
-$('#tk-add').addEventListener('submit', e => {
+$('#tk-add').addEventListener('submit', async e => {
   e.preventDefault(); const i = $('#tk-in'), text = i.value.trim(); if (!text) return;
-  const n = openPage(TODAY, null, true), v = live[n.id].view, doc = v.state.doc, last = doc.line(doc.lines);
-  const ins = /^\s*[-*+]\s*$/.test(last.text) ? { from: last.from, to: last.to, insert: `- TODO ${text}` } : { from: doc.length, insert: (doc.length && !doc.toString().endsWith('\n') ? '\n' : '') + `- TODO ${text}` };
-  v.dispatch({ changes: ins }); i.value = ''; renderTasks(); toast(`Added to ${TODAY}`);
+  const n = openPage(TODAY, null, true), st = await pageStateAsync(n); if (!st) return toast('Today\'s page is not open yet.');
+  const doc = st.doc, last = doc.line(doc.lines);
+  const ins = /^\s*[-*+]\s*$/.test(last.text) ? { from: last.from, to: last.to, insert: `- TODO ${text}` } : { from: doc.length, to: doc.length, insert: (doc.length && !doc.toString().endsWith('\n') ? '\n' : '') + `- TODO ${text}` };
+  pageEdit(n, ins.from, ins.to, ins.insert); i.value = ''; renderTasks(); toast(`Added to ${TODAY}`);
 });
 
 // ------------------------------------------------------------------ side pane: the general-purpose assistant
@@ -5112,8 +5176,9 @@ function artifactSourcePage(n) {
   const name = n.name + '.html';
   let p = findPage(name);
   artSource(n).then(src => {
-    if (!p) { p = openPage(name, n, true); const v = live[p.id].view; v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: src } }); p.artifactOf = n.id; }
+    if (!p) { p = openPage(name, n, true); pageSetText(p, src); p.artifactOf = n.id; }
     else if (live[p.id]?.view && !live[p.id].view.state.doc.length) live[p.id].view.dispatch({ changes: { from: 0, insert: src } });
+    else if (!live[p.id]?.view && pageText(p) === '') pageSetText(p, src);
     p.artifactOf = n.id; if (!S.edges.some(e => e.from === n.id && e.to === p.id)) { S.edges.push({ id: uid('e'), from: n.id, to: p.id, type: 'ref' }); renderLinks(); }
     jumpNode(p); dirty(); toast('Edit the HTML here, then run "Artifact: publish from this page".');
   });
@@ -5432,6 +5497,7 @@ function rvOpenSource() {
   if (DAEMON && !String(c.file).startsWith('roam/')) { const p = `${INFO.notes}/${c.file}`; RG.home = INFO.notes; setView('ranger'); rgGo(FS_PREFIX + p.replace(/\/[^/]*$/, ''), FS_PREFIX + p); return; }
   const name = (c.file || 'card').replace(/^roam\//, '').replace(/\.md$/, ''); const p = findPage(name) || openPage(name, null, true);
   if (live[p.id]?.view && !live[p.id].view.state.doc.length) live[p.id].view.dispatch({ changes: { from: 0, insert: `# ${name}\n\n${c.src}\n` } });
+  else if (!live[p.id]?.view && pageText(p) === '') pageSetText(p, `# ${name}\n\n${c.src}\n`);
   jumpNode(p);
 }
 async function rvAsk() {
@@ -5562,6 +5628,407 @@ function seedInk() {
   inkColor = prev;
 }
 
+// ------------------------------------------------------------------ Edwin frames (edwind spec §9, R8.16-R8.20, R13.7; DESIGN F-A27)
+// With /api/info.edit true (web.json frames: true) a page card is an Edwin frame on a shared buffer, the page's file
+// under notesDir (n.buf), instead of a CodeMirror view on n.text. One frame runtime per tab, loaded from /edwin/src/
+// at boot, one WebSocket to /edit carrying every frame's replica (sync.js). With the flag false nothing below runs and
+// the CodeMirror path is untouched. Frames are lazy (R9.4, R9.5): a frame exists only while its card is within the
+// viewport plus one viewport of margin at zoom >= LOD_Z (or focused), at most FR_CAP per tab (least recently drawn
+// unfocused first); otherwise the card shows the 12-line snapshot from the replica text (Q8). A replica off screen for
+// FR_CLOSE_MS is closed. Pages without buf are migrated to notes/<slug>.md through the replica (R8.17, Q3).
+const FR = { on: false, ready: false, online: false, Ed: null, L: null, booting: null, failed: null, byFrame: new WeakMap(), lastSeen: new Map(), offAt: new Map(), pending: new Map(), claimed: new Set(), anchorCache: {}, localAnchors: {}, perf: [], waiters: [], snapT: new Map() };
+const FR_CAP = 24, FR_FONT = 13, FR_CLOSE_MS = 5 * 60 * 1000, FR_OFF_TEXT = 'Editing is off: workbench-edit is not running';
+// The runtime files in the order of edwin/index.html (host-browser first; markdown after org; ot and sync last).
+const FR_FILES = ['host-browser', 'scheme', 'runtime', 'text', 'editor-core', 'editor-prims', 'evil-core', 'pool', 'complete', 'extras', 'stack', 'ai', 'evil-ex', 'org', 'markdown', 'ot', 'sync'];
+const FR_SCM = ['emacs', 'evil', 'org', 'ai', 'init', 'notes-syntax', 'address', 'markdown'];
+// This browser profile's device id (R9.16), made once; the per-tab client id lives in sessionStorage so a reload keeps it (R7.16).
+function deviceId() { let d = store.get('wb-device'); if (!d) { d = uid('d'); store.set('wb-device', d); } return d; }
+const frSession = { get(k) { try { return sessionStorage.getItem(k); } catch { return null; } }, set(k, v) { try { sessionStorage.setItem(k, v); } catch {} }, del(k) { try { sessionStorage.removeItem(k); } catch {} } };
+function frLoadScript(src) { return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => rej(new Error('could not load ' + src)); document.head.append(s); }); }
+const frTransport = () => new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/edit');
+// Boot (R9.1, R9.17, R4.11): the 17 runtime files, the eight shipped Scheme sources from /edwin/scm/, then Ed.bootServed
+// with this device's id and this tab's cid; the user's init.scm and the image come from edwind, never from localStorage.
+// The runtime is usable (FR.ready) as soon as bootServed has booted the core and started the client; replicas open when
+// the socket is online, so an edwind that is down leaves the cards on their snapshots with the R9.18 notice.
+function frBoot() {
+  if (FR.booting) return FR.booting;
+  FR.booting = (async () => {
+    performance.mark('fr-boot-start');
+    for (const f of FR_FILES) await frLoadScript('/edwin/src/' + f + '.js');
+    const sources = {};
+    await Promise.all(FR_SCM.map(async name => { const r = await fetch(`/edwin/scm/${name}.scm`, { cache: 'no-cache' }); if (!r.ok) throw new Error(`/edwin/scm/${name}.scm: HTTP ${r.status}`); sources[name + '.scm'] = await r.text(); }));
+    const Ed = FR.Ed = window.Ed; FR.L = window.L;
+    Ed.setLeaderKey(leaderKeyName());
+    Ed.hooks.openPage = name => frOpenPage(name);
+    Ed.hooks.leaveFrame = f => frLeave(f);
+    Ed.onFrameEvent(frEvent);
+    Ed.sync.on('state', frStateChanged);
+    Ed.sync.on('epoch', frEpoch);
+    Ed.sync.on('display', frDisplay);
+    let pending = null; try { pending = JSON.parse(frSession.get('wb-edit-pending') || 'null'); } catch {} frSession.del('wb-edit-pending');
+    const booted = Ed.bootServed({ sources, transport: frTransport, device: deviceId(), cid: frSession.get('wb-edit-cid') || undefined, pending: Array.isArray(pending) && pending.length ? pending : undefined });
+    frSession.set('wb-edit-cid', Ed.sync.cid);
+    frWireWindows();
+    FR.ready = true; performance.mark('fr-boot-ready'); performance.measure('fr-boot', 'fr-boot-start', 'fr-boot-ready');
+    frStateChanged(Ed.sync.state);
+    frSchedule();
+    booted.then(() => { frStateChanged(Ed.sync.state); frDropSourceBuffers(); }, e => { console.warn('edwin boot', e); });
+    return Ed;
+  })();
+  FR.booting.catch(e => { FR.failed = e; console.warn('edwin frames: runtime not loaded', e); toast('Page editor runtime did not load: ' + (e?.message || e), 8000); });
+  return FR.booting;
+}
+// Resolves once the runtime is booted and the socket has had its first welcome (opens need it).
+// The served boot leaves the Scheme sources it loaded open as buffers (emacs.scm, evil.scm, init.scm). Their words,
+// read with the Lisp symbol class, reach the completion popup of every page ("first." offered after "first", and RET
+// then takes it instead of continuing the list), so the board closes them: the files stay in the runtime's store.
+function frDropSourceBuffers() {
+  const Ed = FR.Ed; if (!Ed || !FR.L) return;
+  for (const b of Ed.E.buffers.slice()) if (!b.shared && /\.scm$/.test(b.name) && !b.modified) { try { FR.L.call('kill-buffer', [b]); } catch (e) { /* a shown or modified buffer stays */ } }
+}
+function frWhenReady() { if (FR.ready && FR.online) return Promise.resolve(); return new Promise(r => FR.waiters.push(r)); }
+function frStateChanged(s) {
+  FR.online = s === 'online';
+  if (FR.online) { const w = FR.waiters.splice(0); for (const r of w) r(); }
+  const hide = FR.failed ? false : !FR.ready || FR.online;
+  for (const n of nodeList()) { const L = live[n.id]; if (L?.off) L.off.hidden = hide; }
+  document.body.classList.toggle('edit-off', FR.ready && !FR.online);
+  statusRender();
+}
+// R7.19: the image was reset or compacted; the tab starts a fresh frame runtime. The core keeps its state in globals, so
+// the fresh runtime is a page reload; the unsent edits ride through sessionStorage into bootServed's pending.
+function frEpoch() {
+  frSession.set('wb-edit-pending', JSON.stringify(FR.Ed.sync.exportPending()));
+  toast('The editor image changed: reloading');
+  if (changed()) save();
+  SAVE.leaving = true; setTimeout(() => location.reload(), 600);
+}
+// display{buf, how} from edwind (a server command asked for a card): the page that has the buffer, else a new card on it.
+function frDisplay({ buf }) {
+  if (typeof buf !== 'string') return false;
+  let n = nodeList().find(m => m.kind === 'buffer' && m.buf === buf);
+  if (!n) { const c = viewCenterWorld(), name = clean(buf.replace(/^.*\//, '').replace(/\.(md|org)$/, '')); n = addNode({ kind: 'buffer', name, ...freeSpot(c.x - 210, c.y - 150, 420, 300), w: 420, h: 300, buf }); }
+  jumpNode(n, 1, () => frFocus(n));
+  return true;
+}
+// wiki-follow and (open-page name) in a frame: the board's open-or-create page, placed beside the frame's card.
+function frOpenPage(name) {
+  const f = FR.Ed.E.frame, from = f && FR.byFrame.has(f) ? S.nodes[FR.byFrame.get(f)] : null;
+  const t = openPage(name, from);
+  return !!t;
+}
+// Scroll inside a window has no event of its own: the ink and anchor overlays follow the wheel (keys reach them through the point event).
+function frWireWindows() {
+  const Ed = FR.Ed, prev = Ed.hooks.wireWindow;
+  Ed.hooks.wireWindow = w => { if (prev) prev(w); w.view.addEventListener('wheel', () => { const f = Ed.E.frames.find(x => Ed.leaves(x.wroot).includes(w)); const id = f && FR.byFrame.get(f); if (id) requestAnimationFrame(() => frOverlays(id)); }, { passive: true }); };
+}
+// Frame events (Ed.onFrameEvent): the card's title line, snapshot, ink and anchor overlays, status address, LRU.
+function frEvent({ type, frame, buffer }) {
+  const id = FR.byFrame.get(frame); if (!id) { if (type === 'edited' && ED.frame === frame && ED.node) frSnapSoon(ED.node); return; }
+  const n = S.nodes[id], L = live[id]; if (!n || !L) return;
+  if (type === 'focus') { focusedBuf = id; FR.lastSeen.set(id, performance.now()); if (activeId !== id) activate(id); showBufAddr(n); }
+  else if (type === 'edited') { FR.lastSeen.set(id, performance.now()); frSnapSoon(n); scheduleCrossRefresh(); frOverlays(id); if (buffer && buffer.shared) frForgetLocalAnchors(buffer); }
+  else if (type === 'point') { FR.lastSeen.set(id, performance.now()); if (focusedBuf === id) scheduleBufAddr(n); frOverlays(id); }
+  else if (type === 'status') frOverlays(id);
+}
+// ---- the page card (mountBuffer in frames mode)
+function frMountPage(n, L) {
+  L.host = el('div', 'fr-host'); L.snap = el('pre', 'fr-snap'); L.off = el('div', 'fr-off', FR_OFF_TEXT); L.off.hidden = !FR.ready || FR.online; L.chips = el('div', 'fr-anchors');
+  L.body.append(L.host, L.snap, L.off, L.chips);
+  L.backlinks = el('div', 'backlinks'); L.body.append(L.backlinks);
+  L.inkLines = svgEl('svg', { class: 'ink-lines' }); L.body.append(L.inkLines);
+  L.frame = null; L.buf = null;
+  frSnapRefresh(n);
+  if (!n.buf) frAdopt(n); else frSchedule();
+}
+function frUnmount(id) {
+  const L = live[id]; if (!L) return;
+  // Only an Edwin frame: an artifact or web card keeps its iframe in the same field.
+  if (L.frame && FR.byFrame.has(L.frame)) { FR.byFrame.delete(L.frame); L.frame.destroy(); L.frame = null; }
+  FR.lastSeen.delete(id); FR.offAt.delete(id);
+}
+const frBufOf = n => { const b = live[n.id]?.buf; return b && b.shared && b.sver >= 0 ? b : null; };
+// The replica of N, opened if needed (create: the page's file is recreated when it went missing on disk).
+async function frWhenBuf(n) {
+  if (!FR.on || n.kind !== 'buffer') return null;
+  if (!n.buf) await frAdopt(n);
+  if (!n.buf) return null;
+  await frWhenReady();
+  const L = live[n.id]; if (!L) return null;
+  if (L.buf && L.buf.shared) return L.buf.sver >= 0 ? L.buf : FR.Ed.sync.open(n.buf);
+  return frOpen(n);
+}
+// open{create} of notes/<x>.md fails with no_buffer while notes/ does not exist (edwind's paths.realPath needs the parent):
+// notes-append with an empty text makes the directory and the buffer, then the open proceeds.
+async function frOpenCreate(id) {
+  const Ed = FR.Ed;
+  try { return await Ed.sync.open(id, { create: true }); }
+  catch (e) {
+    if (e?.code !== 'no_buffer' || id.startsWith('/') || id.startsWith('~')) throw e;
+    const r = await Ed.sync.call({ cmd: 'notes-append', args: [{ path: id, text: '' }], ctx: {} });
+    if (r.error) throw Object.assign(new Error(r.error.report || r.error.condition), { code: r.error.condition });
+    return Ed.sync.open(id, { create: true });
+  }
+}
+function frOpen(n) {
+  const L = live[n.id]; if (!L || !n.buf || !FR.ready) return Promise.resolve(null);
+  if (L.open) return L.open;
+  L.open = frOpenCreate(n.buf).then(b => {
+    L.open = null; L.buf = b; L.el.classList.remove('fr-error');
+    frSnapRefresh(n); scheduleCrossRefresh(); frSchedule(); if (VIEW === 'tasks') renderTasks();
+    return b;
+  }, e => { L.open = null; L.buf = null; L.el.classList.add('fr-error'); L.snap.textContent = `${n.buf}: ${e?.message || e}`; console.warn('edwin open', n.buf, e); return null; });
+  const early = FR.Ed.sync.buffers.get(n.buf); if (early) L.buf = early;   // the replica object exists before its snapshot: the frame can be made on it
+  return L.open;
+}
+function frCloseReplica(n) {
+  const L = live[n.id], b = L?.buf; if (!b) return;
+  if (b.meta?.anchors) FR.anchorCache[n.id] = b.meta.anchors.map(a => ({ ...a }));
+  L.buf = null;
+  try { if (b.shared) FR.L.call('kill-buffer', [b]); } catch (e) { console.warn('edwin close', e); }
+}
+// ---- lazy frames (R9.4, R9.5)
+let frTimer = 0;
+function frSchedule() { if (!FR.on || frTimer) return; frTimer = requestAnimationFrame(() => { frTimer = 0; frUpdate(); }); }
+function frUpdate() {
+  if (!FR.ready || !S) return;
+  const c = cam(), z = c.z, vw = VW() / z, vh = VH() / z;
+  const x0 = c.x - vw, y0 = c.y - vh, x1 = c.x + 2 * vw, y1 = c.y + 2 * vh, now = performance.now();
+  const want = [];
+  for (const n of nodeList()) {
+    if (n.kind !== 'buffer') continue;
+    const L = live[n.id]; if (!L?.host) continue;
+    if (!n.buf) continue;
+    const vis = !stashed(n) && n.x < x1 && n.x + n.w > x0 && n.y < y1 && n.y + n.h > y0;
+    const focused = FOCUS.cur === n.id || !!(L.frame && L.frame.focused) || (ED.node === n && VIEW === 'editor');
+    if (vis || focused) { FR.offAt.delete(n.id); if (!L.buf && !L.open && FR.online) frOpen(n); }
+    else if (!FR.offAt.has(n.id)) FR.offAt.set(n.id, now);
+    else if (L.buf && now - FR.offAt.get(n.id) > FR_CLOSE_MS && !L.buf.inflight && !L.buf.queue?.length && ED.node !== n) frCloseReplica(n);
+    if (focused || (vis && z >= LOD_Z)) want.push({ n, L, focused });
+    else if (L.frame) frDrop(n);
+  }
+  if (want.length > FR_CAP) {
+    want.sort((a, b) => (b.focused - a.focused) || ((FR.lastSeen.get(b.n.id) || 0) - (FR.lastSeen.get(a.n.id) || 0)));
+    for (const w of want.splice(FR_CAP)) if (w.L.frame) frDrop(w.n);
+  }
+  for (const w of want) if (!w.L.frame && w.L.buf) frMake(w.n);
+}
+// Frame creation is measured (§16.5: under 16 ms median for a 2 KB page) and exposed as window.__perf.frame.
+function frMake(n) {
+  const L = live[n.id]; if (!L || L.frame || !L.buf || !FR.ready) return null;
+  const t0 = performance.now(); performance.mark('fr-frame-start');
+  const f = FR.Ed.makeFrame(L.host, { buffer: L.buf, kind: 'card', fontSize: FR_FONT });
+  performance.mark('fr-frame-end'); performance.measure('fr-frame', 'fr-frame-start', 'fr-frame-end');
+  FR.perf.push(performance.now() - t0); if (FR.perf.length > 500) FR.perf.shift();
+  L.frame = f; FR.byFrame.set(f, n.id); L.el.classList.add('fr-live');
+  if (!FR.lastSeen.has(n.id)) FR.lastSeen.set(n.id, performance.now());
+  requestAnimationFrame(() => frOverlays(n.id));
+  return f;
+}
+function frDrop(n) {
+  const L = live[n.id]; if (!L?.frame) return;
+  FR.byFrame.delete(L.frame); L.frame.destroy(); L.frame = null; L.el.classList.remove('fr-live');
+  L.chips.replaceChildren(); L.inkLines?.replaceChildren();
+  frSnapRefresh(n);
+}
+// A frame for N now (Enter on the card, a jump, dictation): the replica and the frame are made whatever the viewport says,
+// then the frame takes the keyboard; frUpdate keeps a focused frame.
+function frFocus(n, then) {
+  const L = live[n.id]; if (!L?.host) return;
+  const go = () => { const L2 = live[n.id]; if (!L2) return; if (!L2.frame && L2.buf) frMake(n); if (L2.frame) { FR.lastSeen.set(n.id, performance.now()); activate(n.id); L2.frame.focus(); if (then) then(L2.frame, L2.buf); } };
+  if (L.buf && L.buf.sver >= 0) go(); else frWhenBuf(n).then(b => { if (b) go(); });
+}
+// Leader then Esc, or (leave-frame): the keyboard goes back to the board and the card stays selected (R9.6).
+function frLeave(f) {
+  const frame = f && f.root ? f : null;
+  const id = frame ? FR.byFrame.get(frame) : null;
+  if (frame) frame.blur();
+  if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
+  if (id && live[id]) activate(id);
+}
+// ---- snapshots (Q8: the raw first 12 lines) and the node's cached head for a replica that is not open yet (R9.6)
+function frSnapText(n) { const b = frBufOf(n); const t = b ? b.text : n.snap != null ? n.snap : n.text || ''; return t.split('\n').slice(0, 12).join('\n'); }
+function frSnapRefresh(n) { const L = live[n.id]; if (!L?.snap) return; const t = frSnapText(n); if (L.snap.textContent !== t) L.snap.textContent = t; if (L.lod) $('pre', L.lod).textContent = t; }
+function frSnapSoon(n) {
+  if (FR.snapT.has(n.id)) return;
+  FR.snapT.set(n.id, setTimeout(() => { FR.snapT.delete(n.id); if (!S.nodes[n.id]) return; const t = frSnapText(n); if (n.buf && n.snap !== t) { n.snap = t; dirty(); } frSnapRefresh(n); if (VIEW === 'tasks') renderTasks(); }, 1500));
+}
+// ---- anchors (R9.12): server markers from meta.anchors; a closed replica's last known set is kept per card
+function frAnchors(n) {
+  const b = frBufOf(n); const out = b ? b.meta.anchors.slice() : (FR.anchorCache[n.id] || []).slice();
+  for (const [aid, a] of Object.entries(FR.localAnchors)) if (a.buf === n.buf && !out.some(x => x.id === aid)) out.push({ id: aid, pos: a.pos, label: a.label });
+  return out;
+}
+function frForgetLocalAnchors(b) { for (const [aid, a] of Object.entries(FR.localAnchors)) if (a.buf === b.id && b.meta.anchors.some(x => x.id === aid)) delete FR.localAnchors[aid]; }
+// A shared anchor at POS of N's page: known locally at once (ink and ref cards draw from it), confirmed by meta.
+function frAnchorAdd(n, pos, label, id) {
+  const aid = id || uid('a');
+  FR.localAnchors[aid] = { buf: n.buf, pos, label: label || undefined };
+  frWhenBuf(n).then(b => b && FR.Ed.sync.anchorAdd(n.buf, pos, label || null, aid)).then(() => { frOverlays(n.id); }, e => { delete FR.localAnchors[aid]; toast('Anchor not set: ' + (e?.message || e)); });
+  frOverlays(n.id);
+  return aid;
+}
+// Labelled anchors as chips at the right of their line, and the ink lines, placed from the frame's line geometry.
+function frOverlays(id) {
+  const n = S.nodes[id], L = live[id]; if (!n || !L?.chips) return;
+  if (!L.frame) { L.chips.replaceChildren(); return; }
+  const chips = [];
+  for (const a of frAnchors(n)) {
+    if (!a.label) continue;
+    const top = L.frame.lineTop(a.pos); if (top == null) continue;
+    const s = el('span', 'anchor-chip', '⚓' + a.label); s.style.top = top + 'px'; chips.push(s);
+  }
+  L.chips.replaceChildren(...chips);
+  scheduleLineInk(id);
+  // The runtime runs its overlay pass (the resolved text of a ((reference)), markdown.js) only for the selected frame.
+  // Other live frames get the same pass here, after their lines are drawn (two animation frames), unless a completion
+  // popup is open: that pass also places the popup and must only run for the frame that owns it.
+  const Ed = FR.Ed;
+  if (Ed && Ed.hooks.renderOverlay && Ed.withFrame && Ed.E.frame !== L.frame && !Ed.E.corfu && !L.overlayQueued) {
+    L.overlayQueued = true;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      L.overlayQueued = false;
+      if (!L.frame || Ed.E.frame === L.frame || Ed.E.corfu) return;
+      try { Ed.withFrame(L.frame, () => Ed.hooks.renderOverlay()); } catch (e) { /* the overlay is cosmetic */ }
+    }));
+  }
+}
+// ---- edits through the replica: one batch, one undo group of this frame (R13.7; the server tags the origin)
+function frEdit(b, ops) {
+  const Ed = FR.Ed; if (!b || !b.shared || b.sver < 0) return false;
+  ops = ops.filter(([, del, ins]) => (del && del.length) || (ins && ins.length)); if (!ops.length) return true;
+  Ed.sync.pendingUndo = { g: ++b.sync.gCount };
+  try { Ed.applyOps(b, ops, 'local'); } finally { Ed.sync.pendingUndo = null; }
+  return true;
+}
+const frReplaceAll = (b, text) => frEdit(b, [[0, b.text, text]]);
+const frAppend = (b, text) => { const t = b.text; return frEdit(b, [[t.length, '', (t.length && !t.endsWith('\n') ? '\n' : '') + text]]); };
+// ---- migration (R8.16-R8.19, Q3): a page node without buf gets its text written to notes/<slug>.md through the replica
+const frSlug = name => String(name || '').toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9._-]/g, '').replace(/^[.-]+|[.-]+$/g, '').replace(/-{2,}/g, '-') || 'page';
+function frAdopt(n) {
+  if (!FR.on || n.kind !== 'buffer' || n.buf) return Promise.resolve(n.buf || null);
+  if (FR.pending.has(n.id)) return FR.pending.get(n.id);
+  const p = (async () => {
+    await frWhenReady();
+    if (!S.nodes[n.id] || n.buf) return n.buf || null;
+    const Ed = FR.Ed, base = frSlug(n.name), taken = new Set(nodeList().map(m => m.buf).filter(Boolean));
+    let chosen = null, b = null;
+    for (let i = 1; i < 200 && !chosen; i++) {
+      const id = `notes/${base}${i > 1 ? '-' + i : ''}.md`;
+      if (taken.has(id) || FR.claimed.has(id)) continue;
+      FR.claimed.add(id);
+      b = await frOpenCreate(id);
+      const text = n.text || '', cur = b.text;
+      if (cur === '' && text) { frReplaceAll(b, text); const r = await Ed.sync.save(b); if (r.error) console.warn('edwin save', id, r.error); }
+      else if (cur !== '' && cur !== text) { FR.claimed.delete(id); try { FR.L.call('kill-buffer', [b]); } catch {} continue; }   // R8.18: another text, next suffix
+      chosen = id;
+    }
+    if (!chosen || !S.nodes[n.id]) return null;
+    const L = live[n.id]; if (L) L.buf = b;
+    const text = b.text;
+    for (const a of n.anchors || []) { const pos = relocate(text, a); FR.localAnchors[a.id] = { buf: chosen, pos, label: a.label || undefined }; Ed.sync.anchorAdd(chosen, pos, a.label || null, a.id).catch(e => console.warn('edwin anchor', a.id, e)); }
+    n.buf = chosen; n.snap = text.split('\n').slice(0, 12).join('\n'); delete n.text; delete n.anchors;
+    console.log(`edwin: migrated page ${n.name} -> ${chosen}`);
+    dirty(); frSnapRefresh(n); scheduleCrossRefresh(); frSchedule();
+    return chosen;
+  })();
+  FR.pending.set(n.id, p);
+  p.catch(e => { console.warn('edwin migrate', n.name, e); toast(`Page ${n.name} could not be moved to edwind: ${e?.message || e}`, 6000); }).finally(() => FR.pending.delete(n.id));
+  return p;
+}
+// ---- the journal page through edwind (notes-journal makes journal/YYYY-MM-DD.md with its template)
+async function frOpenToday() {
+  const n = findPage(TODAY); if (n) return jumpNode(n, 1, () => focusEnd(n));
+  await frWhenReady();
+  const r = await FR.Ed.sync.call({ cmd: 'notes-journal', args: [{ day: TODAY }], ctx: {} });
+  const id = (r.value && r.value.path) || `journal/${TODAY}.md`;
+  if (r.error) console.warn('edwin journal', r.error);
+  const again = findPage(TODAY); if (again) return jumpNode(again, 1, () => focusEnd(again));
+  const base = S.nodes[activeId], c = viewCenterWorld();
+  const pos = base ? freeSpot(base.x + base.w + 60, base.y + 30, 420, 300) : freeSpot(c.x - 210, c.y - 150, 420, 300);
+  const p = addNode({ kind: 'buffer', name: TODAY, ...pos, w: 420, h: 300, buf: id });
+  toast(`Created page ${TODAY}`);
+  jumpNode(p, 1, () => focusEnd(p));
+}
+// ---- the Editor view (Alt-4) in frames mode: a second frame on the same buffer (R9.14), no CodeMirror mirror
+function frEdLoad(n, pos) {
+  ED.next = null;
+  if (ED.view) { ED.view.destroy(); ED.view = null; }
+  if (ED.frame && ED.node !== n) { ED.frame.destroy(); ED.frame = null; }
+  ED.node = n; S.edPage = n.id; dirty();
+  const host = $('#ed-host');
+  frWhenBuf(n).then(b => {
+    if (!b || ED.node !== n) return;
+    if (!ED.frame) { const root = el('div', 'fr-ed'); host.replaceChildren(root); ED.frame = FR.Ed.makeFrame(root, { buffer: b, kind: 'card', fontSize: 14 }); }
+    if (pos != null) ED.frame.setPoint(Math.min(pos, b.text.length));
+    requestAnimationFrame(() => ED.frame?.focus());
+    edInfo();
+  });
+  $('#ed-crumb').textContent = pathOf(n.id);
+  renderEdList(); edInfo(); updateSideCtx();
+}
+// ---- page text and positions in either mode: a CodeMirror state, or a TextDoc over the replica text with the
+// subset of the Text API the address code reads (lineAt, line, lines, length, sliceString, toString).
+class TextDoc {
+  constructor(text) { this.text = text; this.length = text.length; this._s = null; }
+  get starts() { if (!this._s) { const s = [0]; let i = -1; while ((i = this.text.indexOf('\n', i + 1)) >= 0) s.push(i + 1); this._s = s; } return this._s; }
+  get lines() { return this.starts.length; }
+  line(k) { const s = this.starts, from = s[k - 1], to = k < s.length ? s[k] - 1 : this.length; return { number: k, from, to, text: this.text.slice(from, to), length: to - from }; }
+  lineAt(pos) { const s = this.starts; pos = clamp(pos, 0, this.length); let lo = 0, hi = s.length - 1; while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (s[mid] <= pos) lo = mid; else hi = mid - 1; } return this.line(lo + 1); }
+  sliceString(a, b) { return this.text.slice(a, b); }
+  toString() { return this.text; }
+}
+// The page's state: the CodeMirror view's, or {doc} over the replica (null while no text is at hand).
+function pageState(n) {
+  const L = live[n.id]; if (!L) return null;
+  if (L.view) return L.view.state;
+  const b = frBufOf(n); if (!b) return null;
+  if (!L._doc || L._doc.ver !== b.ver) L._doc = { ver: b.ver, doc: new TextDoc(b.text) };
+  return { doc: L._doc.doc };
+}
+async function pageStateAsync(n) { if (live[n.id]?.view) return live[n.id].view.state; await frWhenBuf(n); return pageState(n); }
+// The anchors of a page as {id, pos, label}: the CodeMirror field, or the shared markers.
+function pageAnchors(n) {
+  const v = live[n.id]?.view;
+  if (v) return Object.entries(v.state.field(anchorField)).map(([id, a]) => ({ id, pos: a.pos, label: a.label }));
+  return FR.on && n.buf ? frAnchors(n) : [];
+}
+// The cursor position of a page: the CodeMirror head, or the frame's point (else the replica's).
+function pagePoint(n) { const L = live[n.id]; if (!L) return 0; if (L.view) return L.view.state.selection.main.head; return L.frame ? L.frame.point() : L.buf ? L.buf.pt : 0; }
+// One edit in either mode: a CodeMirror transaction, or one replica batch.
+function pageEdit(n, from, to, insert) {
+  const L = live[n.id]; if (!L) return false;
+  if (L.view) { L.view.dispatch({ changes: { from, to, insert } }); return true; }
+  const b = frBufOf(n); if (!b) return false;
+  return frEdit(b, [[from, b.text.slice(from, to), insert]]);
+}
+// Several changes at once, all with positions in the text as it is now (the CodeMirror change set contract); the
+// replica applies ops one after another, so they go in from the end of the text backwards.
+function pageEdits(n, changes) {
+  const L = live[n.id]; if (!L || !changes.length) return false;
+  if (L.view) { L.view.dispatch({ changes }); return true; }
+  const b = frBufOf(n); if (!b) return false;
+  const ops = changes.map(c => [c.from, b.text.slice(c.from, c.to ?? c.from), c.insert || '']).sort((x, y) => y[0] - x[0]);
+  return frEdit(b, ops);
+}
+// Replace the whole text: a page still waiting for its file keeps the text on the node for the migration to write.
+async function pageSetText(n, text) {
+  const L = live[n.id];
+  if (L?.view) { L.view.dispatch({ changes: { from: 0, to: L.view.state.doc.length, insert: text } }); return true; }
+  if (!n.buf) { n.text = text; dirty(); return true; }
+  const b = await frWhenBuf(n); return b ? frReplaceAll(b, text) : false;
+}
+// Exposed for the UI suite and debugging: the page's text in either mode, and the live frames count and timing.
+function pageTextById(id) { const n = S?.nodes[id]; return n ? pageText(n) : ''; }
+window.__perf = Object.assign(window.__perf || {}, {
+  frame: {
+    get samples() { return FR.perf.slice(); }, get count() { return FR.perf.length; },
+    get median() { const s = FR.perf.slice().sort((a, b) => a - b); return s.length ? s[Math.floor(s.length / 2)] : null; },
+    get live() { return Object.values(live).filter(L => L.frame && FR.byFrame.has(L.frame)).length; },
+    get cap() { return FR_CAP; }, get ready() { return FR.ready; }, get online() { return FR.online; },
+  },
+});
+
 // ------------------------------------------------------------------ boot
 async function boot() {
   // @font-face fonts load lazily: wait for the faces xterm and CodeMirror measure (at most 1.5 s)
@@ -5574,6 +6041,7 @@ async function boot() {
     if (!(b.body === null && b.etag === '"empty"') && v !== 0 && v !== 5) return bootScreen({ kind: 'format', v: b.body === null ? 'null' : v });
     if (v === 5) board = b.body;   // else a fresh install, or the reset's {"v":0}: seed
     DAEMON = true; BOARD_ETAG = b.etag; INFO = info.body; HUB_STARTED = INFO.hub?.startedAt; bootTries = 0;
+    if (INFO.edit === true) { FR.on = true; frBoot(); }   // pages are Edwin frames over /edit (R9.20); the runtime loads while the board mounts
     RPC = new Rpc();
     if ('serviceWorker' in navigator && window.isSecureContext) navigator.serviceWorker.register('sw.js').catch(() => {});
   } else { const raw = store.get(LS_KEY); if (raw) try { board = JSON.parse(raw); } catch {} }
@@ -5899,7 +6367,7 @@ function focusOpen(n) { if (!n || n.kind === 'frame') return wsEnter(n); if (!FO
 // Enter on the active card puts the keyboard in it where it stands: a shell's cursor, an agent's composer, a page's
 // text, a web card's address. A card that is off screen, in a closed deck or drawn as a far-zoom snapshot is brought
 // into view at reading size first. A card with no text input opens as a focus tab, as Shift-Enter does for any card.
-function cardInput(n) { const L = live[n.id]; return L && (L.term || L.ta || L.view || (n.kind === 'web' && $('.web-bar input', L.body))) || null; }
+function cardInput(n) { const L = live[n.id]; return L && (L.term || L.ta || L.view || (FR.on && n.kind === 'buffer' && L.host && { focus: () => frFocus(n) }) || (n.kind === 'web' && $('.web-bar input', L.body))) || null; }
 function typeInto(n) {
   const t = cardInput(n); if (!t) return focusOpen(n);
   const go = () => { activate(n.id); t.focus(); };
@@ -6259,7 +6727,7 @@ const LEADERS = { 'C-SPC': { label: 'Ctrl-Space', key: 'C-SPC' }, 'C-M-SPC': { l
 function leaderName() { return S?.leader && LEADERS[S.leader] ? S.leader : 'C-SPC'; }
 const leaderKeyName = () => LEADERS[leaderName()].key;
 function isLeader(e) { return WBKeys.keyName(e) === leaderKeyName(); }
-function setLeader(k) { if (!LEADERS[k]) return; S.leader = k; dirty(); keysToFrames(); toast('Leader key: ' + LEADERS[k].label + ' (press it twice to send it to the terminal or editor).'); }
+function setLeader(k) { if (!LEADERS[k]) return; S.leader = k; dirty(); keysToFrames(); if (FR.Ed) FR.Ed.setLeaderKey(leaderKeyName()); toast('Leader key: ' + LEADERS[k].label + ' (press it twice to send it to the terminal or editor).'); }
 // Open artifacts watch for the leader themselves (bridge.js); tell them when it changes.
 function keysToFrames() { for (const L of Object.values(live)) if (L?.port) try { L.port.postMessage({ t: 'keys', keys: { leader: leaderKeyName() } }); } catch {} }
 function folderMode(m, cascade) { const n = activeId && S.nodes[activeId]; const f = n && (n.kind === 'frame' ? n : n.in && S.nodes[n.in]); if (f) cascade ? setModeCascade(f, m) : setMode(f, m); else toast('Pick a folder or something inside one.'); }
@@ -6298,6 +6766,7 @@ function leaderKey(k, e) {
 }
 // Leave the card that has the keyboard (K3): the keyboard goes back to the board and the card stays selected.
 function leaveCard(t = document.activeElement) {
+  const fe = t?.closest?.('.edwin-frame'); if (fe && FR.ready) { const f = FR.Ed.E.frames.find(x => x.root === fe); if (f) return frLeave(f); }
   const id = t?.closest?.('.node')?.dataset.id || (t?.tagName === 'IFRAME' && Object.keys(live).find(i => live[i]?.frame === t || live[i]?.el?.contains(t)));
   try { t?.blur?.(); } catch {}
   if (document.activeElement && document.activeElement !== document.body) try { document.activeElement.blur(); } catch {}
@@ -7462,7 +7931,7 @@ function attnItems() {
     else if (s.state === 'error') items.push({ ...it, name: n.name + ' failed', attn: 'bad', meta: s.fault?.message || a?.last?.error?.message || a?.last?.outcome || '' });
     else if (s.state === 'done') items.push({ ...it, name: n.name + ' finished', attn: '', meta: agentLabel(n.agent) });
   }
-  if (DAEMON && S) for (const s of Object.values(SESS)) if (s.alive && !S.nodes[s.sid] && s.sid !== 'dock')   // running invisibly otherwise; the dock is never a node
+  if (DAEMON && S) for (const s of Object.values(SESS)) if (s.alive && !S.nodes[s.sid] && s.sid !== 'dock' && !String(s.sid).startsWith('ed-'))   // running invisibly otherwise; the dock is never a node; ed-* are edwind's own (R9.22)
     items.push({ key: 'orphan:' + s.sid, name: (s.kind === 'acp' ? agentLabel(s.acp?.agent) : s.pty?.fg?.comm || 'shell') + ' running without a card', kind: 'iattn', attn: 'bad', dir: false, meta: s.cwd || '', go: () => adoptOrphan(s) });
   const due = RV.loaded ? rvQueue().dueNow.length : 0; if (due) items.push({ key: 'attn:review', name: due + ' card' + (due === 1 ? '' : 's') + ' due', kind: 'iattn', dir: false, meta: 'review', go: () => setView('review') });
   for (const t of allTasks()) { if (COL[t.kw] === 'DONE') continue; const due = taskDue(t); if (due && due <= TODAY) items.push({ key: 'attn:' + taskKey(t), name: (due < TODAY ? 'overdue ' : 'due today ') + plainTask(t.text).slice(0, 60), kind: 'iattn', attn: due < TODAY ? 'bad' : '', dir: false, meta: taskAddr(t), go: () => taskOpen(t) }); else if (COL[t.kw] === 'NEXT' && !t.session) items.push({ key: 'attn:' + taskKey(t), name: 'NEXT ' + plainTask(t.text).slice(0, 60), kind: 'iattn', dir: false, meta: taskAddr(t), go: () => taskOpen(t) }); }
@@ -7524,7 +7993,7 @@ AGENT_TOOLS.push(
   { name: 'host_status', description: 'Health of a host: load, memory, disk, uptime, shells, tmux sessions, unit counts (failed names). host: a name from hosts.json (empty = the serving daemon).', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
     run: async ({ host } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j = await (await hFetch(h, '/api/status')).json(); const gb = b => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}` + (j.sessions?.tmux != null ? ', tmux sessions ' + j.sessions.tmux : ''), j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
-window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
+window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 Object.assign(window.__canvas, { keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
 Object.assign(window.__canvas, { DESK, deskGo, deskSend, deskList, deskAt, deskPin, deskDelete, deskOff, deskPinned, serialize, activate, viewKey });
 boot();

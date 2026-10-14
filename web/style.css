@@ -892,3 +892,18 @@ body.tree-open[data-view="canvas"] #which-key { left: calc(50% + var(--tree-w, 2
 .node.net-wait .body { opacity: .55; }
 .node.net-wait::after { content: "reconnecting…"; position: absolute; right: 6px; bottom: 4px; z-index: 8; padding: 0 5px; font: 11px var(--mono);
   color: var(--warn); background: var(--warn-bg); border: 1px solid var(--warn); pointer-events: none; }
+
+/* Edwin frames (edwind spec §9, F-A27): the frame host fills the page card; without a live frame the card shows its
+   12-line snapshot; the R9.18 notice sits at the bottom while edwind is unreachable; anchor chips float at the right of
+   their line, placed by app.js from the frame's line geometry. The frame's own colours come from the tokens above. */
+.k-buffer .body > .fr-host { flex: 1; min-height: 0; display: none; position: relative; }
+.node.fr-live .body > .fr-host { display: flex; }
+.fr-snap { flex: 1; min-height: 0; margin: 0; padding: 8px 10px; font: 13px/1.55 var(--mono); color: var(--fg); white-space: pre-wrap; overflow: hidden; overflow-wrap: anywhere; }
+.node.fr-live .body > .fr-snap { display: none; }
+.node.fr-error .body > .fr-snap { color: var(--err); }
+.fr-off { flex: none; padding: 3px 10px; font: 11px var(--mono); color: var(--warn); background: var(--warn-bg); border-top: 1px solid var(--warn); }
+.fr-anchors { position: absolute; left: 0; right: 0; top: 0; bottom: 0; pointer-events: none; z-index: 6; overflow: hidden; }
+.fr-anchors .anchor-chip { position: absolute; right: 8px; line-height: 1.55; }
+.k-buffer .body .edwin-frame[data-kind="card"] { --panel: var(--buf-bg); min-height: 0; }
+#ed-host .fr-ed { height: 100%; display: flex; flex-direction: column; }
+#ed-host .fr-ed .edwin-frame { flex: 1; min-height: 0; }
