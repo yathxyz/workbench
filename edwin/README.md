@@ -267,8 +267,8 @@ E3 puts Edwin into the page cards (spec §9, §10, R8.16–R8.20, R13.7): with `
 is an Edwin frame on a shared buffer served by edwind, the buffer the agent tools, the notes index and the
 `wb` CLI already share. Nothing moves until the flag is on; with it off the CodeMirror page is as before and
 the whole browser suite passes in both modes (`node tests/ui.mjs <root>` and `WB_FRAMES=1 node tests/ui.mjs
-<root>`). `nix/checks.nix` gains `edit-anchors`, `edwin-markdown` and `edit-frame`, and the `ui` check runs
-the suite in both modes.
+<root>`). `nix/checks.nix` gains `edit-anchors`, `edwin-markdown` and `edit-frame`; `ui` and `ui-frames` run the
+browser suite in each mode, and the VM test turns `edit.frames` on.
 
 Layout added in E3: `src/sync.js` (the replica client: `Ed.sync`, `Ed.bootServed`), frames in
 `src/editor-core.js` (`Frame`, `Ed.makeFrame`, one text-change path `applyOps`) and `src/editor-prims.js`
