@@ -51,7 +51,8 @@ test('R4.43 make-process spawns through the hub: bash -c, the ed- sid, 120x40, o
   assert.equal(await value(c, '(list (process-status p) (process-exit-status p) (process-live-p p))'), '(exit 0 #f)');
   await until(async () => (await value(c, 'events')) !== '()', 'the sentinel');
   assert.equal(await value(c, 'events'), '("finished\\n")');
-  assert.equal(await value(c, '(with-current-buffer "*hello*" (buffer-string))'), '"hi\\r\\n\\nProcess hello finished\\n"', 'raw output at the process mark, then the exit note (no sentinel inserts it; here the sentinel ran, so the note comes from... )'.slice(0, 0) || '"hi\\r\\n"');
+  assert.equal(await value(c, '(with-current-buffer "*hello*" (buffer-string))'), '"hi\r\\n"', 'raw output at the process mark (the writer prints CR raw); with a sentinel, no exit note is inserted');
+  assert.equal(await value(c, '(define pn (make-process :name "noted" :command "echo bye" :buffer "*noted*")) (process-wait pn 5) (accept-process-output pn 1) (with-current-buffer "*noted*" (buffer-string))'), '"bye\r\\n\\nProcess noted finished\\n"', 'without a sentinel the exit note goes to the buffer');
   assert.ok(!child.logs.includes('echo hi'), 'R15.10: the command is not logged');
   c.close();
 });
@@ -66,7 +67,7 @@ test('R4.43 filters run in order on background threads; accept-process-output; p
   const sid = JSON.parse(await value(c, '(process-sid pc)'));
   const inputs = await hub.waitFor(r => r.t === 'pty.input' && r.sid === sid);
   assert.equal(inputs[0].d, 'abc\n');
-  assert.equal(await value(c, '(with-current-buffer "*cat*" (buffer-string))'), '"abc\\r\\n"');
+  assert.equal(await value(c, '(with-current-buffer "*cat*" (buffer-string))'), '"abc\r\\n"');
   assert.equal(await value(c, '(interrupt-process pc) (process-wait pc 5)'), '130');
   const ints = await hub.waitFor(r => r.t === 'pty.input' && r.sid === sid && r.d === '\x03');
   assert.equal(ints.length, 1, 'interrupt-process sends C-c');
@@ -167,12 +168,12 @@ test('hub down: hub-error, then reconnect with backoff and re-attach to the live
   assert.equal(await value(c, '(process-status pr)'), 'run', 'the last known state while the hub is down');
   /* The hub comes back with the same sessions (the real hub persists them); edwind re-attaches with resume. */
   hub = await new FakeHub(hubPath, { sessions }).start();
-  const sess = sessions.get(sid); hub.startShell && (sess.inputFn = d => hub.emitOut(sid, d.replace(/\n/g, '\r\n')));
+  sessions.get(sid).inputFn = d => hub.emitOut(sid, d.replace(/\n/g, '\r\n'));   // the fake cat, on the new hub
   await until(async () => (await value(c, '(hub-status)')) === 'up', 'the reconnect', 15000);
   const [re] = await hub.waitFor(r => r.t === 'pty.open' && r.sid === sid && !r.spawn);
   assert.deepEqual(Object.keys(re.resume).sort(), ['out', 'stream']);
   assert.equal(await value(c, '(process-send-string pr "after\\n") (accept-process-output pr 5)'), '#t');
-  assert.equal(await value(c, '(with-current-buffer "*resume*" (buffer-string))'), '"before\\r\\nafter\\r\\n"');
+  assert.equal(await value(c, '(with-current-buffer "*resume*" (buffer-string))'), '"before\r\\nafter\r\\n"');
   assert.equal(await value(c, '(process-live-p pr)'), '#t');
   c.close();
 });

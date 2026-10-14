@@ -68,6 +68,7 @@ export class Process {
     this.status = 'starting';                             // starting | run | exit | signal | failed | deleted
     this.exitCode = null; this.exitSignal = null; this.exitReason = null; this.alive = false; this.exited = false;
     this.collect = o.collect ? '' : null;                 // accumulated raw output (call-process, shell-run), or null
+    this.unseen = 0;                                      // output chunks processed since the last accept-process-output
     this.queue = []; this.busy = false; this.deleted = false;
     this.exitPromise = new Promise(r => { this.resolveExit = r; });
     this.exitPromise.catch(() => {});
@@ -188,7 +189,7 @@ export class Processes {
     this.server.hub.emit('process.exit', p, event);
     if (p.sentinel) this.enqueue(p, 'exit', function* (self) { yield* self.S.applyG(p.sentinel, [p, event]); });
     else if (p.buffer) this.enqueue(p, 'exit', function* (self) { self.insertAtMark(p, `\nProcess ${p.name} ${event}`); });
-    this.enqueue(p, 'done', function* () { p.resolveExit(p.status === 'signal' ? p.exitSignal : p.exitCode); });
+    this.enqueue(p, 'done', () => p.resolveExit(p.status === 'signal' ? p.exitSignal : p.exitCode));
     this.scheduleList();
   }
 
@@ -216,7 +217,7 @@ export class Processes {
     try { this.Ed.editText(b, pos, 0, text); b.modified = true; }
     finally { this.E.current = saved; }
   }
-  wakeOut(p) { const rest = []; for (const w of this.outWaiters) { if (w.procs.includes(p)) w.resolve(true); else rest.push(w); } this.outWaiters = rest; }
+  wakeOut(p) { p.unseen++; const rest = []; for (const w of this.outWaiters) { if (w.procs.includes(p)) { w.resolve(true); for (const q of w.procs) q.unseen = 0; } else rest.push(w); } this.outWaiters = rest; }
 
   /* ---------- status from the Summary (R4.43) ---------- */
   statusOf(p) {
@@ -428,9 +429,11 @@ export async function install(server) {
   };
   blocking('kill-process', 'process', 'End PROCESS with pty.kill; a card-less process is also forgotten by the hub (R4.43).', killG('kill-process', q => !q.card));
   blocking('delete-process', 'process', 'Kill PROCESS, forget its hub session and drop it from the process list.', killG('delete-process', () => true));
-  blocking('accept-process-output', '[process [seconds]]', 'Wait for output from PROCESS (any process when #f) to arrive and its filter to run; #t if some did, #f after SECONDS.', function* ([p, s]) {
+  blocking('accept-process-output', '[process [seconds]]', 'Wait for output from PROCESS (any process when #f) to arrive and its filter to run, unless some did since the last call; #t if some did, #f after SECONDS.', function* ([p, s]) {
     const procs = absent(p) ? P.all() : [proc(p, 'accept-process-output')];
     if (!procs.length) return false;
+    /* As in Emacs, output that arrived since the last call counts: the filter or the insertion already ran. */
+    if (procs.some(q => q.unseen > 0)) { for (const q of procs) q.unseen = 0; return true; }
     let r = new Promise(resolve => P.outWaiters.push({ procs, resolve }));
     if (!absent(s)) r = Promise.race([r, sleep(secs(s, 'accept-process-output') * 1000).then(() => false)]);
     return yield new S.Block(r, 'process output');

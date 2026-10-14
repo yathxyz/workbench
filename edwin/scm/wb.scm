@@ -27,7 +27,7 @@ session."
 (define (card-kill target . opts)
   "End TARGET's session. Destructive (R5.4): from code pass :force #t; called interactively it asks y-or-n-p
 in the calling frame."
-  (if (or (%wb-opt opts ':force) (y-or-n-p (string-append "Kill " (session-id (card-session target)) "? ")))
+  (if (or (%wb-opt opts ':force) (y-or-n-p (string-append "Kill " (session-id (session-get target)) "? ")))
       (%card-kill target)
       (user-error "Not killed")))
 

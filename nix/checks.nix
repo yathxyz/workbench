@@ -177,6 +177,13 @@ in
     touch $out
   '';
 
+  # Processes through the hub (R4.43-R4.45) and the section 5 session API, against the fake hub.
+  edit-process = pkgs.runCommand "workbench-edit-process" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    export HOME=$TMPDIR
+    node --test ${edwind}/edwin/test/process.test.mjs ${edwind}/edwin/test/wb.test.mjs
+    touch $out
+  '';
+
   # The Scheme boundary (R16.15, R4.52) and the credential rules (R16.19, in models.test.mjs).
   edit-security = pkgs.runCommand "workbench-edit-security" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
