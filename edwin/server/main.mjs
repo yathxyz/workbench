@@ -20,6 +20,9 @@ import { ProtoError } from './proto.mjs';
 import { sha256 } from './files.mjs';
 
 const require = createRequire(import.meta.url);
+/* The E2 modules, installed in this order after the buffers are loaded; each exports install(server) and
+   may export shutdown(server) and name. */
+const MODULES = [];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EDWIN = path.join(HERE, '..');
 export const BUILD = process.env.WB_EDIT_BUILD || 'dev';
@@ -73,6 +76,10 @@ export class Server {
   constructor(cfg, log) {
     this.cfg = cfg; this.log = log; this.build = BUILD; this.boot = randomId(8); this.clients = new Set(); this.stopping = false;
     this.auth = new Authority(cfg);
+    /* Extension points for the E2 modules (notes, models, hub, image, threads): server commands by name
+       (§4.6; `call{cmd}` reaches them after the E1 switch in command()), handlers for message types the
+       session does not know (`sample`, `tool_result`, …), and the installed modules, shut down in reverse. */
+    this.commands = new Map(); this.handlers = new Map(); this.modules = [];
     fs.mkdirSync(cfg.stateDir, { recursive: true, mode: 0o700 });
     fs.mkdirSync(cfg.configDir, { recursive: true, mode: 0o700 });
     this.image = new ImageLog(path.join(cfg.stateDir, 'image.jsonl'));
@@ -92,7 +99,13 @@ export class Server {
     }
     this.buffers = new Buffers({ Ed: this.Ed, auth: this.auth, stateDir: this.cfg.stateDir, log: this.log });
     this.buffers.reload();
+    for (const m of MODULES) { await m.install(this); this.modules.push(m); }
   }
+  /* A server command: FN(client, args, ctx, buf) returns the result object ({value, msg?, out?} or {error}),
+     a promise of one, or undefined for a delayed result. */
+  defineCommand(name, fn) { this.commands.set(name, fn); }
+  /* A handler for message type T from any client: FN(client, msg), may return a promise. */
+  onMessage(t, fn) { this.handlers.set(t, fn); }
 
   /* ---------- the socket (R14.3) ---------- */
   listen() {
@@ -133,6 +146,7 @@ export class Server {
     const closed = this.net ? new Promise(r => this.net.close(() => r())) : null;
     for (const c of [...this.clients]) { c.send({ t: 'error', code: 'shutting_down', msg: 'edwind is stopping' }); c.destroy(); }
     if (closed) await closed;
+    for (const m of [...this.modules].reverse()) if (m.shutdown) { try { await m.shutdown(this); } catch (e) { this.log.error('shutdown', { module: m.name || '?', error: e.message }); } }
     await this.buffers.shutdown();
     try { this.Ed.host.suspend(); } catch (e) { /* storage flush is best effort */ }
     try { fs.unlinkSync(this.cfg.socket); } catch (e) { /* gone */ }
@@ -223,7 +237,11 @@ export class Server {
       }
       case 'list-writers': { const sb = B.get(buf || args[0]); const seen = new Map(); for (const b of sb.hist) seen.set(JSON.stringify(b.by), b.by); return { value: [...seen.values()] }; }
       case 'kill-buffer': { const sb = B.get(typeof args[0] === 'string' ? args[0] : buf); B.kill(sb); return { value: true }; }
-      default: throw new ProtoError('bad_request', `unknown server command ${JSON.stringify(cmd)}`);
+      default: {
+        const fn = this.commands.get(cmd);
+        if (fn) return fn(client, args, ctx, buf);
+        throw new ProtoError('bad_request', `unknown server command ${JSON.stringify(cmd)}`);
+      }
     }
   }
 }

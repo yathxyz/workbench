@@ -108,8 +108,12 @@ export class Client {
         case 'save': case 'revert': return this.onSaveRevert(msg);
         case 'call': return this.onCall(msg);
         case 'image?': return this.onImageQuery(msg);
-        case 'interrupt': case 'answer': return; // calls are synchronous in E1: nothing to interrupt or answer
-        default: return; // unknown t: ignored (R7.4)
+        default: {
+          /* The E2 modules' message types (sample, tool_result, answer, interrupt, …); an unknown t is
+             ignored (R7.4). */
+          const h = this.server.handlers.get(msg.t);
+          return h ? h(this, msg) : undefined;
+        }
       }
     } catch (e) { this.reportError(e, (() => { try { return ridOf(msg); } catch (x) { return undefined; } })(), msg); }
   }

@@ -66,6 +66,9 @@ export class Buffers {
     this.moved = new Map(); // old id → {to, at}
     this.compacting = new Set();
     this.hooks = { killed: null, afterBatch: null };
+    /* Listeners of the E2 modules: on('afterBatch', (sb, entry) => …), on('killed', sb => …),
+       on('created', sb => …), on('saved', sb => …). */
+    this.listeners = new Map();
     /* Edwin's own kill-buffer must reach us: wrap it so a Scheme (kill-buffer) kills everywhere (R6.3). */
     const L = globalThis.L;
     const orig = L.get('kill-buffer');
@@ -156,6 +159,7 @@ export class Buffers {
     sb.eol = eol; sb.special = special;
     sb.savedText = text; sb.savedHash = sha256(text);
     this.byId.set(id, sb); this.byJid.set(jid, sb);
+    this.emit('created', sb);
     return sb;
   }
   /* A fresh journal for SB, based on its current text at its current version. */
@@ -257,7 +261,9 @@ export class Buffers {
   }
 
   sendMeta(sb) { const m = { t: 'meta', buf: sb.id, ...sb.meta() }; for (const c of sb.clients) c.send(m); }
-  afterBatch(sb, entry) { if (this.hooks.afterBatch) this.hooks.afterBatch(sb, entry); }
+  afterBatch(sb, entry) { if (this.hooks.afterBatch) this.hooks.afterBatch(sb, entry); this.emit('afterBatch', sb, entry); }
+  on(event, fn) { let l = this.listeners.get(event); if (!l) { l = []; this.listeners.set(event, l); } l.push(fn); return () => { const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); }; }
+  emit(event, ...args) { const l = this.listeners.get(event); if (l) for (const fn of l) { try { fn(...args); } catch (e) { this.log.error('listener', { event, error: e.stack || e.message }); } } }
   compactSoon(sb) { if (this.compacting.has(sb)) return; this.compacting.add(sb); setTimeout(() => { this.compacting.delete(sb); this.compact(sb).catch(e => this.log.error('compact', { buf: sb.id, error: e.message })); }, 0); }
 
   /* ---------- save / revert (§8.3) ---------- */
@@ -276,6 +282,7 @@ export class Buffers {
     this.log.info('save', { buf: sb.id, bytes: r.bytes, ver });
     this.sendMeta(sb);
     this.watcher.add(sb);
+    this.emit('saved', sb);
     if (sb.journal) await this.compact(sb);
     return { buf: sb.id, ver, saved: true };
   }
@@ -349,6 +356,7 @@ export class Buffers {
     this.byId.delete(sb.id); this.byJid.delete(sb.jid); this.index.delete(sb.jid);
     if (sb.serverEdit) { for (const w of sb.serverEdit.waiters) w(sb.serverEdit.saved ? 0 : 1); sb.serverEdit = null; }
     if (this.hooks.killed) this.hooks.killed(sb);
+    this.emit('killed', sb);
     this.log.info('kill', { buf: sb.id });
   }
 
