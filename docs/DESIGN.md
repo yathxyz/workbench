@@ -1110,6 +1110,7 @@ The amendments below are binding.
 | F-A20 | No toast about a model at load. When `/api/info.sample` is false, the message is said where a model feature is used (assistant, handwriting, an artifact's `sample`), and it names no provider and no environment variable: the server's `sample` backend is configured on the server, its key kept there |
 | F-A21 | Enter on the active card puts the keyboard in it where it stands (a shell's terminal, an agent's composer, a page's text, a web card's address), bringing it into view first when it is off screen, in a closed deck or at far zoom. Shift-Enter opens the card as a focus tab; Enter on a folder still enters it as a workspace |
 | F-A22 | The view is per device, like the camera (F-A7): the entered workspace, the focus tabs and the perspective live in `localStorage` (`wb-view-<host>`, try/catch), never in the board. Inside a perspective, a save writes the manual layout (each node's manual folder, rectangle and order, the stashed folders, no derived folders or ghosts), so the board file always holds the manual perspective; a card shown in a focus tab is saved at its place on the canvas, not at the size of the screen. A clean tab inside a perspective that takes another tab's board goes back to manual, takes it, and builds its perspective again. A board saved inside a perspective before this amendment is turned back into its manual layout when it is loaded or taken, and lends its view to a device that has none yet |
+| F-A23 | Keys are bindings in the keymaps of `web/keys.js` and nothing else (§6.4). A card that has the keyboard keeps the keys it needs: a shell gets every key but ``Ctrl-` `` (so C-k, C-j, Alt-B, Alt-digits and Alt-arrows reach the program and do nothing on the board), a page leaves only the palette, dock, tree, dictation and view keys. Leader Esc leaves any card with the card still selected, and the leader pressed twice reaches the card (NUL for Ctrl-Space in a shell). An artifact forwards the leader to the board through the bridge (`{t:'key', key:'leader'}`, the leader named in `hello.keys`). The palette's C-j/C-k move its selection |
 
 **ui check amendments.**
 - **N8** expects "No session: press Enter" after a wiped `stateDir`, then Enter → `[new shell]` (H-1).
@@ -1149,6 +1150,34 @@ Shells are always explicit (never taken from `$SHELL`). The user picks one from 
 - The shell name (never a path) is stored on the board node and shown in the card header. A stored value that is not a valid shell name (`^[a-z0-9-]{1,32}$`) is ignored, as if the node named no shell.
 - Respawn ("press Enter") reuses the node's shell. If that shell is no longer available, the card says so and offers the default.
 - `wb` commands that type text into a shell (`cd`, `run_in_shell`) are unchanged.
+
+### 6.4 Keys
+
+Decided by the user on 2026-10-14 from the exploration page "Keyboard navigation and keybinding conflicts" (https://claude.ai/artifact/E2GwAfkNZrrM4pPE9nfWTX). The rule is the user's: one key may mean different things in different contexts, never two things in one context, and everything is reachable from the keyboard.
+
+**Layers.** A key walks the active layers from the top and stops at the first one that answers:
+
+| Layer | What it is | Keymap |
+|---|---|---|
+| leader | after the leader (Ctrl-Space by default; Ctrl-Alt-Space or F1) | `leader`, prefixes such as `leader-v` |
+| transient | the palette, a dialog, hints, arrange mode | `palette`, `dialog`, `hints`, `arrange`; hints and arrange swallow every key they do not bind |
+| interior | the card or field that has the keyboard: `term`, `page`, `text`, `control` (a focused button), `frame` (web card, artifact), `edwin` (an Edwin frame, E3) | none: an interior declares the keys it needs, and those end the walk there |
+| view | the main view | `canvas`, `graph` (maps); `ranger`, `tasks`, `review` (functions with key sequences, tried first, declining what they do not handle) |
+| place | board, workspace, focus tab | `board`, `workspace`, `tab` (empty; desks bind here, §10.8) |
+| global | everywhere | `global` |
+
+**Rules.** The checker (`WBKeys.check()`, run by `tests/keys.test.mjs` and the flake check `web-keys`) walks every context stack over every key (about 230 stacks and 146,000 lookups) and fails on any of these:
+- **K1.** A keymap binds a key once. Behaviour that depends on state is one command that branches (`esc` steps out of the tool, the selection, the focus tab, the workspace, the tag filter, in that order).
+- **K2.** A key an interior needs never reaches an outer layer, and a key a shell, page or text field gives up is bound in `global` (else the card lost it for nothing).
+- **K3.** Leader Esc is bound to `leave`: one way out of every card. It extends the edwind spec's R9.7 ("Leader then Esc … leaves the card") from Edwin frames to every card.
+- No keymap binds a leader choice, and none binds a key the browser keeps (C-w C-t C-n C-S-w C-S-t C-S-n C-TAB C-S-TAB C-<prior> C-<next> C-q and the s- forms).
+- With the page's command table: every bound command exists (`KC` in `app.js`; a missing one is also a console error at load, which the ui suite counts).
+
+A fourth rule is a convention, not checked: **K4**, reuse a key across layers when the meanings rhyme (h j k l select a neighbour on the canvas and in the graph, move in arrange mode; `.` is "actions of this" on a card and a graph node).
+
+**Notation.** Edwin's key names, so the same tables can become Edwin keymaps (K4 of §10.9): `C-` `M-` `s-` (Cmd/Super) and `C-S-p` for a shifted Ctrl letter; `RET TAB SPC ESC DEL <left> <f1>`. A shifted digit with a modifier is its symbol (`M-%` is Alt-Shift-5) and a shifted letter is the capital (`M-B`).
+
+**Where keys live.** `web/keys.js` is a module with no DOM: keymaps, interiors, transients, `resolve(ctx, key)`, `leaderResolve`, `whereIs` (the palette's labels), `rows` (which-key) and `check()`. `app.js` keeps one capture keydown listener that computes the context (`keyContext()`), walks `resolve` and runs the command in `KC`. A `cmd()` entry whose keys begin with `@` shows the keys bound to that command, so the palette, which-key and the bindings cannot disagree. New keys (desks included) are rows in `keys.js`; a pull request that adds one runs the checker.
 
 ---
 
@@ -1300,7 +1329,7 @@ The test runs numbered steps. The steps this design pins down:
 
 **Pass criterion for "sessions survive":** steps 4, 6 and 9 all pass in one run. The hub PID is unchanged across 4 and 6, and revive succeeds in 9.
 
-### 9.5 UI checks (N27-N51; N1-N26 are the baseline checks of `tests/ui.mjs`, kept with the §6.1 amendments)
+### 9.5 UI checks (N27-N55; N1-N26 are the baseline checks of `tests/ui.mjs`, kept with the §6.1 amendments)
 
 | # | Check |
 |---|---|
@@ -1329,6 +1358,10 @@ The test runs numbered steps. The steps this design pins down:
 | N49 | With `/api/info.sample:false`, a load shows no toast about a model or an API key, and no `/api` request of the load is refused (the frontend does not call `/api/hosts`, which is 404) |
 | N50 | Enter on the active shell card puts the keyboard in its terminal on the canvas; Shift-Enter opens the card as a focus tab |
 | N51 | Two browser contexts (two devices). A card shown in a focus tab is saved at its canvas rectangle. A workspace and a focus tab entered in A are not in the board file and not in B, and are back in A after a reload. With A in the tag perspective the board file holds A's manual layout exactly, with no derived node and no view key. B moves a card: A takes it without a bar and stays in its perspective, and B never leaves manual (F-A22) |
+| N52 | In a shell card, C-k, C-j, Alt-B, Alt-V, Alt-1, Alt-Shift-5, Alt-← and Esc reach the program and change nothing on the board (palette, tree, dock, view, workspace, leader); ``Ctrl-` `` still toggles the dock from inside it (F-A23) |
+| N53 | Leader Esc leaves a shell and a page, with the card still selected and no interior in `keyContext()`; the leader twice sends NUL to the shell; C-k in a page opens the palette |
+| N54 | `WBKeys.check()` with the page's commands has no error; on the board `f` then a card's label selects it; `m`, `l`, `L` move and resize the card and Esc puts it back; `.` lists its actions; C-j/C-k move the palette selection and leave the dock alone |
+| N55 | (demo) The leader pressed inside an artifact frame opens the board's leader and the frame no longer has the keyboard |
 
 ### 9.6 v1 acceptance (all must hold before the dogfood clock starts)
 1. `nix flake check` is green on a kvm-capable host: package, clippy, fmt, conformance, security, ui, adapters, module and vm.
@@ -1469,4 +1502,21 @@ The test runs numbered steps. The steps this design pins down:
 | D2 | The overview (leader `g`: arrows move, letters search, digits jump) on far-zoom snapshots; the recent-places ring (leader `w`) over desks, focus tabs and views; the attention desk and pager badges, with the F-A15 key crossing desks; the scratch overlay on ``Ctrl-` ``; perspectives as smart desks |
 | D3 | The `columns` layout; revert; one desk per window (`BroadcastChannel`); `wb desk ls`, `go` and `send` over `web.sock`; the agent tools `list_desks` and `send_to_desk` |
 
-Key choices beyond the digits are settled with the keyboard-navigation work (its contexts and conflict checker); this section names the proposed keys only.
+**Keys** (settled with §6.4; D1 and D2 add them as rows in `web/keys.js`, and the checker gates them):
+- Leader `0`-`9` and Alt-Shift-`0`-`9` replace the workspace rows (`ws.N`). Alt-Shift-0 is `M-)`: D1 adds it to `global` and to `TEXT_LEAVES`, or a page keeps it.
+- Leader `m`/`M`, the `d` prefix (a `leader-d` keymap), `g` and `w` are free in the leader map today.
+- The scratch overlay does not take ``Ctrl-` ``: that key is the dock, and the only key a shell gives up (K2), so it must stay one toggle that works inside a terminal. The overlay goes on leader `x`.
+- The F-A15 key (next item that needs attention) is leader `!`; on the canvas `!` stays "fit everything", which is a different context.
+
+### 10.9 Keys: one context per key (frontend only)
+**Goal:** every place reachable from the keyboard, and no key with two meanings in one context (§6.4). Decided by the user on 2026-10-14: the leader stays Ctrl-Space; C-k and C-j go to the program in a shell; hints on `f` on the board and leader `;` anywhere; the canvas digits stay free for desks.
+
+| Phase | Content |
+|---|---|
+| K0 | The measured bugs: board keys taken from a shell (C-k, C-j, C-S-p) or fired twice (Alt-B, Alt-V, Alt-digits, Alt-arrows reached the PTY and the board); the palette's C-j/C-k toggling the dock instead of moving; no key leaving a shell or a page; the leader twice sending nothing to a shell |
+| K1 | `web/keys.js`: the keymaps, the layer walk and one dispatcher in `app.js`; the palette and which-key read their labels from it |
+| K2 | The checker: `tests/keys.test.mjs`, the flake check `web-keys` (N54 runs it in the page as well) |
+| K3 | Coverage: hints (`f`, leader `;`, with the selected card's buttons, and a pipe mode), card actions (`.`), arrange mode (`m`), pan and zoom keys, h j k l and Enter in the graph, the leader through artifacts (N52-N55) |
+| K4 | After E2: the board keymaps become Edwin keymaps, so a user's Scheme can rebind them and Edwin frames take the leader the same way (edwind spec R9.7) |
+
+K0-K3 are one pull request. K4 waits for E2 and does not reorder the E phases.

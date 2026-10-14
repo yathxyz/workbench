@@ -2837,7 +2837,11 @@ function fuzzy(q, s) {
   return { score: score - t.length * 0.03 - idx[0] * 0.2, idx };
 }
 const CMDS = [];
-function cmd(title, run, keys = '', when = null) { CMDS.push({ k: 'command', l: title, keys, run, when, cmd: true }); }
+// keys: a label, or @command to show where web/keys.js binds that command (so the palette follows the keymaps)
+function cmd(title, run, keys = '', when = null) {
+  const kc = keys[0] === '@' ? keys.slice(1) : null;
+  CMDS.push({ k: 'command', l: title, get keys() { return kc ? WBKeys.whereIs(kc, LEADERS[leaderName()].key) : keys; }, run, when, cmd: true });
+}
 const activeFolder = () => { const a = S.nodes[activeId]; return a ? (a.kind === 'frame' ? a : a.in && S.nodes[a.in]) : null; };
 function onCanvas(fn) { return () => { if (VIEW !== 'canvas') setView('canvas'); fn(); }; }
 let PICK = null;  // a sub-list the palette shows instead of everything (pick a folder, a page name…)
@@ -2924,8 +2928,8 @@ let palItems = [], palSel = 0;
 $('#pal-in').addEventListener('input', renderPalette);
 $('#pal-in').addEventListener('keydown', e => {
   const move = d => { palSel = clamp(palSel + d, 0, palItems.length - 1); $$('#pal-list .pi').forEach((x, i) => x.classList.toggle('sel', i === palSel)); $$('#pal-list .pi')[palSel]?.scrollIntoView({ block: 'nearest' }); };
-  if (e.key === 'ArrowDown' || (e.ctrlKey && (e.key === 'n' || e.key === 'j'))) { e.preventDefault(); move(1); }
-  else if (e.key === 'ArrowUp' || (e.ctrlKey && (e.key === 'p' || e.key === 'k'))) { e.preventDefault(); move(-1); }
+  if (e.key === 'ArrowDown' || (e.ctrlKey && ['n', 'j'].includes(e.key.toLowerCase()))) { e.preventDefault(); move(1); }
+  else if (e.key === 'ArrowUp' || (e.ctrlKey && ['p', 'k'].includes(e.key.toLowerCase()))) { e.preventDefault(); move(-1); }
   else if (e.key === 'Enter') { e.preventDefault(); const it = palItems[palSel]; if (it) runItem(it); else closeOverlays(); }
 });
 function askName(label, value, cb) { ask(label, value, cb); }
@@ -2936,23 +2940,22 @@ function pickFolder(prompt, cb) {
 // Every action in the app is a command here. Keys show what is bound; the palette is the way to find the rest.
 {
   const VN = { canvas: 'Canvas', ranger: 'Navigator (ranger)', graph: 'Graph', editor: 'Editor', outline: 'Outline', tasks: 'Tasks' };
-  ['canvas', 'ranger', 'graph', 'editor', 'outline', 'tasks'].forEach((v, i) => cmd(`View: ${VN[v]}`, () => setView(v), `Alt-${i + 1}`));  // Review is Alt-7, registered with its view
+  ['canvas', 'ranger', 'graph', 'editor', 'outline', 'tasks'].forEach((v, i) => cmd(`View: ${VN[v]}`, () => setView(v), '@view.' + v));  // Review is Alt-7, registered with its view
 }
-cmd('Toggle folder tree', () => toggleTree(), 'Alt-B');
-cmd('Toggle the docked terminal', () => toggleDockTerm(), 'Ctrl-`');
-cmd('Toggle docked terminal', () => toggleDockTerm(), 'Ctrl-`');
-cmd('Side pane: wider', () => { toggleSide(true, true); setPaneW((S.paneW || PANE_W) + 80, true); }, 'Ctrl-Alt-[');
-cmd('Side pane: narrower', () => { toggleSide(true, true); setPaneW((S.paneW || PANE_W) - 80, true); }, 'Ctrl-Alt-]');
+cmd('Toggle folder tree', () => toggleTree(), '@tree.toggle');
+cmd('Toggle the docked terminal', () => toggleDockTerm(), '@dock.toggle');
+cmd('Side pane: wider', () => { toggleSide(true, true); setPaneW((S.paneW || PANE_W) + 80, true); }, '@pane.wider');
+cmd('Side pane: narrower', () => { toggleSide(true, true); setPaneW((S.paneW || PANE_W) - 80, true); }, '@pane.narrower');
 cmd('Side pane: reset width', () => setPaneW(PANE_W, true));
 // Listed only while the assistant pane exists (initChat mounts none since v9): run without it, they threw.
 const hasChat = () => !!(S.chat && live.chat);
 cmd('Assistant: new conversation', () => { S.chat.turns = []; S.chat.log = [{ t: 'note', text: CHAT_HELLO }]; renderAgentLog(S.chat); dirty(); toggleSide(true); }, '', hasChat);
 cmd('Assistant: fork the conversation onto the canvas', () => $('#chat-fork').click(), '', hasChat);
 cmd('Assistant: talk (hold-to-talk mic)', () => { toggleSide(true, true); sideTab('chat'); $('.mic', live.chat.body).dispatchEvent(new PointerEvent('pointerdown', { button: 0 })); }, '', hasChat);
-cmd('Dictate into the page', () => { if (VIEW === 'editor' && ED.view) dictateInto('editor'); else if (focusedBuf && S.nodes[focusedBuf]) dictateInto(S.nodes[focusedBuf]); else toast('Click into a page first.'); }, 'Alt-V');
+cmd('Dictate into the page', () => { if (VIEW === 'editor' && ED.view) dictateInto('editor'); else if (focusedBuf && S.nodes[focusedBuf]) dictateInto(S.nodes[focusedBuf]); else toast('Click into a page first.'); }, '@dictate');
 for (const [t, name, key] of [['select', 'select and move', 'V'], ['area', 'select an area (ink, shapes, cards)', 'S'], ['rect', 'rectangle', 'R'], ['diamond', 'diamond', 'D'], ['ellipse', 'ellipse', 'O'], ['arrow', 'arrow', 'A'], ['pen', 'pen', 'P'], ['text', 'text', 'T'], ['erase', 'eraser', 'E']])
-  cmd(`Tool: ${name}`, onCanvas(() => setTool(t)), key);
-cmd('Selection: remove it (ink, shapes, cards)', onCanvas(() => removeSelection()), 'Delete', () => PICKED.size > 0 || SEL.strokes.size > 0 || SEL.shapes.size > 0);
+  cmd(`Tool: ${name}`, onCanvas(() => setTool(t)), '@tool.' + t);
+cmd('Selection: remove it (ink, shapes, cards)', onCanvas(() => removeSelection()), '@selection.remove', () => PICKED.size > 0 || SEL.strokes.size > 0 || SEL.shapes.size > 0);
 cmd('Selection → sketch card', onCanvas(() => sketchFromSelection()), '', () => SEL.strokes.size > 0);
 cmd('Selection → text (read the handwriting)', () => { INK.ids = [...SEL.strokes]; INK.t = Date.now(); inkToText(); }, '', () => SEL.strokes.size > 0);
 cmd('Undo the last removal', () => removeUndo(), '', () => !!REMOVE_UNDO);
@@ -2980,78 +2983,58 @@ cmd('Open today’s journal', () => openToday());
 cmd('Move the active item to a folder…', () => { const n = S.nodes[activeId]; pickFolder(`Move ${n.name} to…`, f => adopt(n, f, null)); }, '', () => !!S.nodes[activeId]);
 cmd('Rename the active item…', () => { const n = S.nodes[activeId]; askName('Rename ' + n.name, n.name, v => { n.name = clean(v); n.kind === 'frame' ? placeFrame(n) : updateAllTitles(); renderTree(); dirty(); }); }, '', () => !!S.nodes[activeId]);
 cmd('Branch the active shell, REPL or agent', () => spawnChild(S.nodes[activeId]), '', () => ['term', 'repl', 'agent', 'acp'].includes(S.nodes[activeId]?.kind));
-cmd('Compact everything', onCanvas(() => compact('all')), 'c');
-cmd('Compact the selection', onCanvas(() => compact('selection')), 'c', () => PICKED.size > 0);
+cmd('Compact everything', onCanvas(() => compact('all')), '@compact', () => !PICKED.size);
+cmd('Compact the selection', onCanvas(() => compact('selection')), '@compact', () => PICKED.size > 0);
 cmd('Select all items in the view', onCanvas(() => { for (const n of Object.values(S.nodes)) if (!stashed(n) && !n.in) pickToggle(n.id, true); }));
-cmd('Clear the selection', () => pickClear(), 'Esc', () => PICKED.size > 0);
-cmd('Undo layout change', () => layoutUndo(), 'Ctrl-Z', () => !!LAYOUT_UNDO);
+cmd('Clear the selection', () => pickClear(), '@esc', () => PICKED.size > 0);
+cmd('Undo layout change', () => layoutUndo(), '@undo.layout', () => !!LAYOUT_UNDO);
 for (const m of ['free', 'pack', 'tile', 'stack']) cmd(`Folder: ${m}`, () => setMode(activeFolder(), m), '', () => !!activeFolder());
 cmd('Folder: pull the walls in to fit', () => setMode(activeFolder(), 'free'), '', () => activeFolder()?.mode === 'free' || !activeFolder()?.mode && !!activeFolder());
 cmd('Folder: change shape', () => { const f = activeFolder(); f.shape = FSHAPES[(FSHAPES.indexOf(f.shape || 'folder') + 1) % FSHAPES.length]; placeFrame(f); dirty(); }, '', () => !!activeFolder());
-cmd('Fit everything', onCanvas(() => fitAll()), 'Shift-1');
+cmd('Fit everything', onCanvas(() => fitAll()), '@fit');
 cmd('Save this view as…', () => setTimeout(() => openPalette('>save '), 0));
-cmd('Back to the previous view', onCanvas(() => { const t = camBack.pop(); if (t) { camFwd.push({ ...cam() }); animateTo(t); } }), 'Alt-←');
+cmd('Back to the previous view', onCanvas(() => { const t = camBack.pop(); if (t) { camFwd.push({ ...cam() }); animateTo(t); } }), '@camera.back');
 cmd('Export as JSON Canvas', () => { syncBuffers(); $('#ex-text').value = toJsonCanvas(); $('#export-box').hidden = false; });
 cmd('Theme: Modus Operandi (light)', () => setTheme('light'));
 cmd('Theme: Modus Vivendi (dark)', () => setTheme('dark'));
 cmd('Theme: follow the system', () => setTheme('auto'));
 cmd('Pages: vim keys on or off', () => setVim(!S.vim));
-cmd('Help: keys and gestures', () => { $('#help').hidden = false; }, '?');
+cmd('Help: keys and gestures', () => { $('#help').hidden = false; }, '@help');
 
-// ------------------------------------------------------------------ keyboard
+// ------------------------------------------------------------------ keyboard (DESIGN §6.4)
+// One capture listener walks the layers of web/keys.js, innermost first: leader, transient (an overlay, hints, arrange),
+// interior (the card or field that has the keyboard), view, place, global. A card gets every key it needs before the
+// board looks at it (K2), and leader Esc takes the keyboard back out of any card (K3).
 const typing = () => { const a = document.activeElement; return a && (a.matches('input, textarea, [contenteditable="true"]') || a.closest('.cm-editor, .xterm')); };
+function keyInterior(a = document.activeElement) {
+  if (!a || a === document.body || a === document.documentElement || a === viewport) return null;
+  if (a.closest('.xterm')) return 'term';
+  if (a.closest('.cm-editor')) return 'page';
+  if (a.tagName === 'IFRAME') return 'frame';
+  if (a.matches('input, textarea, select, [contenteditable="true"]')) return 'text';
+  if (a.matches('button, a[href], summary')) return 'control';
+  return null;
+}
+function keyContext() {
+  const ov = $$('.overlay').find(o => !o.hidden);
+  const transient = HINTS.on ? 'hints' : ARR.on ? 'arrange' : ov ? (ov.id === 'palette' ? 'palette' : 'dialog') : null;
+  return { transient, interior: transient ? null : keyInterior(), view: VIEW, place: FOCUS.cur ? 'tab' : WS.cur ? 'workspace' : 'board' };
+}
+const VIEW_KEYFN = { ranger: e => !e.ctrlKey && !e.metaKey && !e.altKey && rgKey(e), tasks: e => tasksKey(e), review: e => reviewKey(e) };
 window.addEventListener('keydown', e => {
   if (LEADER.pass) return;
-  if (LEADER.on) { e.preventDefault(); e.stopPropagation(); leaderKey(e); return; }
-  if (isLeader(e)) { e.preventDefault(); e.stopPropagation(); leaderOpen(); return; }
-}, true);
-window.addEventListener('keydown', e => {
-  if (e.altKey && e.shiftKey && !e.ctrlKey && !e.metaKey && /^Digit[1-9]$/.test(e.code)) { e.preventDefault(); wsGo(+e.code.slice(5)); return; }
-  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'p') { e.preventDefault(); e.stopPropagation(); PICK = null; openPalette('>'); return; }
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); e.stopPropagation(); PICK = null; openPalette(''); return; }
-  if (e.ctrlKey && (e.key === '`' || e.code === 'Backquote')) { e.preventDefault(); e.stopPropagation(); toggleDockTerm(); return; }
-  if (e.ctrlKey && e.altKey && (e.code === 'BracketLeft' || e.code === 'BracketRight')) { e.preventDefault(); toggleSide(true, true); setPaneW((S.paneW || PANE_W) + (e.code === 'BracketLeft' ? 80 : -80), true); return; }
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'j') { e.preventDefault(); e.stopPropagation(); toggleDockTerm(); return; }
-  if (e.altKey && !e.ctrlKey && !e.metaKey && e.code === 'KeyB') { e.preventDefault(); toggleTree(); return; }
-  if (e.altKey && !e.ctrlKey && !e.metaKey && e.code === 'KeyV') {
-    e.preventDefault();
-    if (VOICE.rec) { stopListening(); return; }
-    if (VIEW === 'editor' && ED.view) dictateInto('editor');
-    else if (focusedBuf && S.nodes[focusedBuf]) dictateInto(S.nodes[focusedBuf]);
-    else toast('Dictation goes into a page: focus one first (Alt-V), or use the Review view.');
-    return;
+  const k = WBKeys.keyName(e); if (!k) return;
+  if (LEADER.on) { e.preventDefault(); e.stopPropagation(); leaderKey(k, e); return; }
+  if (k === leaderKeyName()) { e.preventDefault(); e.stopPropagation(); leaderOpen(); return; }
+  for (const s of WBKeys.resolve(keyContext(), k)) {
+    if (s.pass) return;
+    if (s.swallow) { e.preventDefault(); e.stopPropagation(); return; }
+    if (s.fn) { if (VIEW_KEYFN[s.fn](e)) { e.preventDefault(); e.stopPropagation(); return; } continue; }
+    const f = KC[s.cmd];
+    if (!f) { console.warn('key ' + k + ': no command ' + s.cmd); return; }
+    if (f(e, k) === false) return;   // the command did nothing: the browser keeps the key (Tab moves focus, Ctrl-Z undoes text)
+    e.preventDefault(); e.stopPropagation(); return;
   }
-  if (e.altKey && !e.ctrlKey && !e.metaKey && /^Digit[1-7]$/.test(e.code)) { e.preventDefault(); setView(VIEWS[+e.code.slice(5) - 1]); return; }
-  if (e.key === 'Escape') { if ($$('.overlay').some(o => !o.hidden)) { closeOverlays(); e.preventDefault(); } else if (VIEW === 'graph' && G.sel && !typing()) graphSelect(null); else if (tool !== 'select' && !typing()) setTool('select'); else if (PICKED.size && !typing()) pickClear(); else if (FOCUS.cur && !typing()) focusHide(); else if (WS.cur && !typing()) wsLeave(); else if (TAG_FILTER && !typing()) tagFilter(''); return; }
-  if (e.altKey && VIEW === 'canvas' && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
-    e.preventDefault();
-    const [from, to] = e.key === 'ArrowLeft' ? [camBack, camFwd] : [camFwd, camBack];
-    const t = from.pop(); if (t) { to.push({ ...cam() }); animateTo(t); }
-    return;
-  }
-  if (!typing() && !$$('.overlay').some(o => !o.hidden)) {
-    if (VIEW === 'ranger' && !e.ctrlKey && !e.metaKey && !e.altKey && rgKey(e)) { e.preventDefault(); e.stopPropagation(); return; }
-    if (VIEW === 'review' && reviewKey(e)) { e.preventDefault(); e.stopPropagation(); return; }
-    if (VIEW === 'tasks' && tasksKey(e)) { e.preventDefault(); e.stopPropagation(); return; }
-    if (e.key === ':' && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); PICK = null; openPalette('>'); return; }
-  }
-  if (VIEW === 'canvas' && !typing() && (e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z' && (LAYOUT_UNDO || REMOVE_UNDO)) { e.preventDefault(); LAYOUT_UNDO ? layoutUndo() : removeUndo(); return; }
-  if (typing() || e.ctrlKey || e.metaKey || e.altKey) return;
-  if (VIEW !== 'canvas') { if (e.key === '?') $('#help').hidden = false; return; }
-  if (e.key === ' ') { space = true; return; }
-  if ((e.key === 'Delete' || e.key === 'Backspace') && (PICKED.size || SEL.strokes.size || SEL.shapes.size)) { e.preventDefault(); removeSelection(); return; }
-  if ((e.key === 'Delete' || e.key === 'Backspace') && selShape) { e.preventDefault(); removeShape(selShape); return; }
-  if (e.key === '!' || (e.shiftKey && e.code === 'Digit1')) { fitAll(); return; }
-  if (e.key === '?') { $('#help').hidden = false; return; }
-  if (e.key === 'c') { compact(PICKED.size ? 'selection' : 'all'); return; }
-  if (e.key === '#') { e.preventDefault(); tagPrompt(activeId && S.nodes[activeId]); return; }
-  if (e.key === 'Escape' && PICKED.size) { pickClear(); return; }
-  if (e.key === 'Escape' && TAG_FILTER) { tagFilter(''); return; }
-  if (e.key === 'Tab' && !typing() && VIEW === 'canvas' && !FOCUS.cur) { e.preventDefault(); e.shiftKey ? foldCycle() : foldToggle(); return; }
-  if (e.key === 'Enter' && activeId && S.nodes[activeId]) { e.preventDefault(); const n = S.nodes[activeId]; n.kind === 'frame' ? wsEnter(n) : e.shiftKey ? focusOpen(n) : typeInto(n); return; }
-  if (e.key === 'C') { optimise(null); return; }
-  const keyTools = { v: 'select', 1: 'select', r: 'rect', 2: 'rect', d: 'diamond', 3: 'diamond', o: 'ellipse', 4: 'ellipse', a: 'arrow', 5: 'arrow', s: 'area', 6: 'area', p: 'pen', 7: 'pen', t: 'text', 8: 'text', e: 'erase', 0: 'erase' };
-  const t = keyTools[e.key.toLowerCase()]; if (t) setTool(t);
 }, true);
 window.addEventListener('keyup', e => { if (e.key === ' ') space = false; });
 
@@ -4846,7 +4829,7 @@ window.addEventListener('message', ev => {
   const served = [...new Set([...Object.keys(n.capabilities || {}).filter(c => CAPS_ALL.includes(c) || c === 'self'), 'permissions', 'user'])];
   if (served.includes('artifact')) served.push('self');
   port.onmessage = e => hostCall(n, L, port, e.data);
-  port.postMessage({ t: 'hello', contract: '0.2.75', served });
+  port.postMessage({ t: 'hello', contract: '0.2.75', served, keys: { leader: leaderKeyName() } });   // keys: the page hands the leader back (DESIGN §6.4)
   activity(n.id);
 });
 const LIVE_CALLS = new Map();  // `${node}:${id}` -> {cancel, ...}
@@ -4854,6 +4837,7 @@ async function hostCall(n, L, port, m) {
   if (!m || typeof m !== 'object') return;
   const key = n.id + ':' + m.id;
   if (m.t === 'cancel') { LIVE_CALLS.get(key)?.cancel?.(); LIVE_CALLS.delete(key); return; }
+  if (m.t === 'key') { if (m.key === 'leader') { leaveCard(L.frame); leaderOpen(); } return; }
   if (m.t === 'tool_result' || m.t === 'tool_error') { const c = LIVE_CALLS.get(key); c?.tools?.get(m.callId)?.(m); return; }
   if (m.t !== 'call') return;
   const ok = value => port.postMessage({ t: 'ok', id: m.id, value });
@@ -5284,7 +5268,7 @@ AGENT_TOOLS.push(
       return `added to page cards as ^${anchor}`;
     } },
 );
-cmd('View: Review (flashcards)', () => setView('review'), 'Alt-7');
+cmd('View: Review (flashcards)', () => setView('review'), '@view.review');
 cmd('Review: reload cards from notes', () => { RV.cur = null; rvLoad(true).then(renderReview); }, '', () => VIEW === 'review');
 
 // ------------------------------------------------------------------ device mode: desktop | phone | tablet
@@ -5744,7 +5728,13 @@ function neighbour(n, dir) {
   return best;
 }
 function focusMove(dir) {
-  const n = activeId && S.nodes[activeId]; if (!n) { toast('Click a node first.'); return; }
+  const n = activeId && S.nodes[activeId];
+  if (!n) {   // nothing selected yet: start from the card nearest the middle of the screen
+    const c = s2w(VW() / 2, VH() / 2); let best = null, bd = Infinity;
+    for (const m of Object.values(S.nodes)) { if (stashed(m) || m.id === 'dock' || !live[m.id]?.el?.getClientRects().length) continue; const d = Math.hypot(m.x + m.w / 2 - c.x, m.y + m.h / 2 - c.y); if (d < bd) { bd = d; best = m; } }
+    if (best) activate(best.id); else toast('Nothing on the board yet.');
+    return;
+  }
   const m = neighbour(n, dir); if (!m) { toast('Nothing ' + ({ h: 'to the left', j: 'below', k: 'above', l: 'to the right' })[dir] + '.'); return; }
   if (FOCUS.cur) { if (m.kind !== 'frame') focusOpen(m); return; }
   activate(m.id);
@@ -5831,59 +5821,237 @@ function optimise(f) {
   }
 }
 
-// ---- leader key (Ctrl-Space) with a which-key popup
-const LEADER = { on: false, pass: false, target: null };
-const LEADERS = { 'C-SPC': { label: 'Ctrl-Space', test: e => e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey }, 'C-M-SPC': { label: 'Ctrl-Alt-Space', test: e => e.ctrlKey && e.altKey && !e.metaKey }, 'F1': { label: 'F1', test: e => !e.ctrlKey && !e.altKey && !e.metaKey } };
+// ---- leader key (Ctrl-Space) with a which-key popup. Its keymap is MAPS.leader in web/keys.js (DESIGN §6.4).
+const LEADER = { on: false, pass: false, target: null, prefix: null };
+const LEADERS = { 'C-SPC': { label: 'Ctrl-Space', key: 'C-SPC' }, 'C-M-SPC': { label: 'Ctrl-Alt-Space', key: 'C-M-SPC' }, 'F1': { label: 'F1', key: '<f1>' } };
 function leaderName() { return S?.leader && LEADERS[S.leader] ? S.leader : 'C-SPC'; }
-function isLeader(e) { const k = leaderName(); return k === 'F1' ? e.key === 'F1' && LEADERS.F1.test(e) : (e.code === 'Space' || e.key === ' ') && LEADERS[k].test(e); }
+const leaderKeyName = () => LEADERS[leaderName()].key;
+function isLeader(e) { return WBKeys.keyName(e) === leaderKeyName(); }
 function setLeader(k) { if (!LEADERS[k]) return; S.leader = k; dirty(); toast('Leader key: ' + LEADERS[k].label + ' (press it twice to send it to the terminal or editor).'); }
-const LEADER_MAP = [
-  ['Tab', 'fold / unfold (package)', () => foldToggle()], ['S-Tab', 'fold the others / unfold all', () => foldCycle()],
-  ['1…9', 'workspace n', null], ['`', 'last workspace', () => wsToggleLast()], ['u', 'up (close focus, leave ws)', () => FOCUS.cur ? focusHide() : wsLeave()], ['Enter', 'enter folder, type into node', () => { const n = activeId && S.nodes[activeId]; n && (n.kind === 'frame' ? wsEnter(n) : typeInto(n)); }],
-  ['f', 'focus tab', () => { const n = activeId && S.nodes[activeId]; if (n) focusOpen(n); }], ['q', 'close tab', () => FOCUS.cur && focusClose(FOCUS.cur)], ['n', 'next tab', () => focusCycle(1)], ['p', 'previous tab', () => focusCycle(-1)],
-  ['h j k l', 'focus neighbour', null], ['H J K L', 'swap neighbour', null], ['e', 'folder: free', () => folderMode('free')], ['b', 'folder: pack', () => folderMode('pack')],
-  ['t', 'folder: tile', () => folderMode('tile')], ['s', 'folder: stack', () => folderMode('stack')], ['E B T S', 'same, nested folders too', null], ['v', 'perspective: m p f t x c u j l', () => perspMenu()], ['a', 'go to address', () => askName('Address (board:/path · fs:@host/dir · note:Title#Heading · tag:x · journal:2026/10/10 · link:Page)', currentAddr(), v => goAddr(v))], ['o', 'optimise board', () => optimise(null)],
-  ['O', 'optimise folder', () => { const n = activeId && S.nodes[activeId]; const f = n && (n.kind === 'frame' ? n : n.in && S.nodes[n.in]); f ? optimise(f) : toast('Pick a folder or something inside one.'); }], ['c', 'compact', () => compact(PICKED.size ? 'selection' : 'all')], ['F', 'fullscreen', () => toggleFullscreen()], ['z', 'fit all', () => fitAll()],
-  ['#', 'tag node', () => tagPrompt(activeId && S.nodes[activeId])], ['/', 'palette', () => openPalette('')], ['?', 'help', () => { $('#help').hidden = false; }], ['leader', 'send the key through', null], ['Esc', 'cancel', null],
-];
 function folderMode(m, cascade) { const n = activeId && S.nodes[activeId]; const f = n && (n.kind === 'frame' ? n : n.in && S.nodes[n.in]); if (f) cascade ? setModeCascade(f, m) : setMode(f, m); else toast('Pick a folder or something inside one.'); }
 function toggleFullscreen() { try { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen(); } catch (e) { toast('Fullscreen is not available here.'); } }
-function leaderOpen() {
+function leaderOpen(prefix) {
   const wk = $('#which-key'); if (!wk) return;
-  LEADER.on = true; LEADER.target = document.activeElement; wk.hidden = false; wk.replaceChildren();
-  const t = el('div', 'wk-title'); t.textContent = LEADERS[leaderName()].label + '  ·  ' + (WS.cur && S.nodes[WS.cur] ? 'workspace ' + pathOf(WS.cur) : wsTop().length + ' workspaces') + (FOCUS.tabs.length ? '  ·  ' + FOCUS.tabs.length + ' tab(s)' : ''); wk.append(t);
-  for (const [k, d] of LEADER_MAP) { const r = el('span'); const b = el('b'); b.textContent = k; r.append(b, d); wk.append(r); }
+  if (!LEADER.on) LEADER.target = document.activeElement;
+  LEADER.on = true; LEADER.prefix = prefix || null; wk.hidden = false; wk.replaceChildren();
+  const t = el('div', 'wk-title');
+  t.textContent = prefix === 'leader-v' ? 'Perspective (now: ' + perspCur() + ')'
+    : LEADERS[leaderName()].label + '  ·  ' + (WS.cur && S.nodes[WS.cur] ? 'workspace ' + pathOf(WS.cur) : wsTop().length + ' workspaces') + (FOCUS.tabs.length ? '  ·  ' + FOCUS.tabs.length + ' tab(s)' : '') + (keyInterior(LEADER.target) ? '  ·  Esc leaves the card' : '');
+  wk.append(t);
+  const rows = WBKeys.rows(prefix || 'leader');
+  if (!prefix) rows.push({ keys: 'leader', label: 'send the key through' });
+  for (const r of rows) { const s = el('span'); const b = el('b'); b.textContent = r.keys; s.append(b, r.label); wk.append(s); }
 }
-function leaderClose() { LEADER.on = false; LEADER.sub = null; const wk = $('#which-key'); if (wk) wk.hidden = true; }
-function leaderKey(e) {
-  const k = e.key; leaderClose();
-  if (isLeader(e)) { // leader twice: pass the key through to the terminal or editor that had it (Emacs set-mark, tmux prefix)
-    const t = LEADER.target; if (t && t.isConnected) { LEADER.pass = true; try { t.dispatchEvent(new KeyboardEvent('keydown', { key: e.key, code: e.code, ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey, metaKey: e.metaKey, bubbles: true, cancelable: true })); } finally { LEADER.pass = false; } }
+function leaderClose() { LEADER.on = false; LEADER.prefix = null; const wk = $('#which-key'); if (wk) wk.hidden = true; }
+function leaderKey(k, e) {
+  const prefix = LEADER.prefix; leaderClose();
+  if (k === leaderKeyName()) { // leader twice: pass the key through to the terminal or editor that had it (Emacs set-mark, tmux prefix)
+    const t = LEADER.target; if (t && t.isConnected) {
+      // keyCode is not settable from the constructor and xterm reads it (Ctrl-Space is keyCode 32 → NUL)
+      const ev = new KeyboardEvent('keydown', { key: e.key, code: e.code, ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey, metaKey: e.metaKey, bubbles: true, cancelable: true });
+      for (const p of ['keyCode', 'which']) Object.defineProperty(ev, p, { get: () => e.keyCode });
+      LEADER.pass = true; try { t.dispatchEvent(ev); } finally { LEADER.pass = false; }
+    }
     return;
   }
-  if (k === 'Escape' || k === 'Control' || k === 'Shift' || k === 'Alt' || k === 'Meta') { if (k !== 'Escape') LEADER.on = true, $('#which-key').hidden = false; else LEADER.sub = null; return; }
-  if (LEADER.sub === 'persp') { LEADER.sub = null; const p = { m: 'manual', p: 'process', f: 'fs', t: 'tag', x: 'tmux', c: 'proc', u: 'unit', j: 'journal', l: 'link' }[k]; if (p) perspSet(p); else toast('Perspective: m manual, p process, f filesystem, t tags, x tmux, c processes, u units, j journal, l links.'); return; }
-  if ('EBTS'.includes(k) && k.length === 1) return folderMode({ E: 'free', B: 'pack', T: 'tile', S: 'stack' }[k], true);
-  if (/^[1-9]$/.test(k)) return wsGo(+k);
-  if ('hjkl'.includes(k) && k.length === 1) return focusMove(k);
-  if ('HJKL'.includes(k) && k.length === 1) return swapWith(k.toLowerCase());
-  const m = LEADER_MAP.find(([key]) => key === k); if (m && m[2]) return m[2]();
-  toast('Leader: no binding for ' + k + '. Ctrl-Space ? lists them.');
+  const b = WBKeys.leaderResolve(k, prefix);
+  if (!b) { toast('Leader: no binding for ' + WBKeys.label(k) + '. ' + LEADERS[leaderName()].label + ' ? lists them.'); return; }
+  if (b.cmd[0] === '>') return leaderOpen(b.cmd.slice(1));
+  KC[b.cmd]?.(e, k, 'leader');
 }
-cmd('Workspace: enter the active folder', () => { const n = activeId && S.nodes[activeId]; if (n?.kind === 'frame') wsEnter(n); else toast('Pick a folder first.'); }, 'Enter');
-cmd('Workspace: step out', () => wsLeave(), 'Esc', () => !!WS.cur);
+// Leave the card that has the keyboard (K3): the keyboard goes back to the board and the card stays selected.
+function leaveCard(t = document.activeElement) {
+  const id = t?.closest?.('.node')?.dataset.id || (t?.tagName === 'IFRAME' && Object.keys(live).find(i => live[i]?.frame === t || live[i]?.el?.contains(t)));
+  try { t?.blur?.(); } catch {}
+  if (document.activeElement && document.activeElement !== document.body) try { document.activeElement.blur(); } catch {}
+  if (id && S.nodes[id]) activate(id);
+}
+const activeNode = () => activeId && S.nodes[activeId] || null;
+const activeFolderOf = () => { const n = activeNode(); return n && (n.kind === 'frame' ? n : n.in && S.nodes[n.in]) || null; };
+function panBy(fx, fy) { const c = cam(); animateTo({ z: c.z, x: c.x + fx * VW() / 3 / c.z, y: c.y + fy * VH() / 3 / c.z }); }
+
+// ---- hints (f on the board, leader ; from anywhere): a label on every card on screen and on the selected card's
+// buttons; typing a label picks it, as Vimium and avy do. Mode pipe picks the target of a new pipe instead.
+const HINTS = { on: false, typed: '', items: [], mode: 'pick', from: null };
+const HINT_KEYS = 'fjdkslaghrueiwoqptyzxcvbnm';
+function hintLabels(n) { const A = [...HINT_KEYS]; if (n <= A.length) return A.slice(0, n); const out = []; for (const a of A) for (const b of A) { if (out.length === n) return out; out.push(a + b); } return out; }
+function hintsOpen(mode = 'pick', from = null) {
+  if (VIEW !== 'canvas' && VIEW !== 'graph') setView('canvas');
+  const items = [], vr = viewport.getBoundingClientRect();
+  if (VIEW === 'canvas') for (const n of Object.values(S.nodes)) {
+    const L = live[n.id]; if (stashed(n) || !L?.el?.isConnected || !L.el.getClientRects().length || (mode === 'pipe' && (n.id === from || n.kind === 'frame'))) continue;
+    const a = w2s(n.x, n.kind === 'frame' ? n.y - LABEL_H : n.y), b = w2s(n.x + n.w, n.y + n.h);
+    if (b.x < 0 || b.y < 0 || a.x > VW() || a.y > VH()) continue;
+    items.push({ x: vr.left + clamp(a.x, 0, VW() - 30), y: vr.top + clamp(a.y, 0, VH() - 20), node: n });
+  }
+  if (mode === 'pick') {
+    const scope = VIEW === 'graph' ? $('#g-card') : activeId && live[activeId]?.hdr;
+    if (scope && !scope.hidden) for (const b of $$('button', scope)) if (b.getClientRects().length && !b.disabled) { const r = b.getBoundingClientRect(); items.push({ x: r.left, y: r.top, button: b }); }
+  }
+  if (!items.length) { toast(mode === 'pipe' ? 'No other card on screen to pipe to.' : 'Nothing on screen to pick.'); return; }
+  const labels = hintLabels(items.length), box = el('div'); box.id = 'hints';
+  items.forEach((it, i) => { it.label = labels[i]; it.el = el('span', 'hint' + (it.button ? ' hint-b' : '')); it.el.textContent = it.label; Object.assign(it.el.style, { left: it.x + 'px', top: it.y + 'px' }); box.append(it.el); });
+  $('#hints')?.remove(); document.body.append(box);
+  Object.assign(HINTS, { on: true, typed: '', items, mode, from });
+}
+function hintsClose() { HINTS.on = false; HINTS.items = []; $('#hints')?.remove(); }
+function hintsType(k) {
+  const typed = HINTS.typed + k, left = HINTS.items.filter(it => it.label.startsWith(typed));
+  if (!left.length) { toast('No hint ' + typed + '. Esc cancels.'); return; }
+  HINTS.typed = typed;
+  const hit = left.find(it => it.label === typed);
+  if (!hit) { for (const it of HINTS.items) it.el.hidden = !it.label.startsWith(typed); return; }
+  const { mode, from } = HINTS; hintsClose();
+  if (hit.button) return hit.button.click();
+  const n = hit.node;
+  if (mode === 'pipe') {
+    if (S.edges.some(x => x.from === from && x.to === n.id)) return toast('Those nodes are already linked.');
+    S.edges.push({ id: uid('e'), from, to: n.id, type: 'pipe' }); renderEdges(); dirty();
+    return toast('Pipe added. Select text and press ⇢ to send it.');
+  }
+  activate(n.id);
+}
+// ---- card actions (. on the board): the selected card's buttons and commands, in the palette
+const CARD_CMDS = ['Rename the active item…', 'Move the active item to a folder…', 'Branch the active shell, REPL or agent', 'Agent: start a new session in the active card (ends the current one)', 'Agent: end the active card\'s session (the card stays, ↻ revives)'];
+function cardActions() {
+  const scope = VIEW === 'graph' ? $('#g-card') : null, n = activeNode();
+  if (!scope && !n) return toast('Select a card first: h j k l, or f for hints.');
+  const items = [];
+  const seen = new Set();
+  for (const b of $$('button', scope || live[n.id].hdr)) {
+    if (!b.getClientRects().length || b.disabled) continue;
+    const l = (b.title || b.textContent || '').trim().split(/(?<=[.:;])\s/)[0].replace(/[.:;]$/, '');   // the title's first clause
+    if (!l || seen.has(l)) continue; seen.add(l);
+    items.push({ k: 'button', l, s: b.title ? b.textContent.trim() : '', run: () => b.click() });
+  }
+  if (n && !scope) {
+    if (n.kind !== 'frame') items.push({ k: 'card', l: 'Pipe to… (pick the target with hints)', run: () => hintsOpen('pipe', n.id) });
+    items.push({ k: 'card', l: 'Tag…', run: () => tagPrompt(n) }, { k: 'card', l: 'Arrange: move and resize with the keys', run: () => arrangeOpen() });
+    for (const c of CMDS) if (CARD_CMDS.includes(c.l) && (!c.when || c.when())) items.push({ k: 'card', l: c.l, run: c.run });
+  }
+  openPicker(scope ? 'Actions of ' + (G.N.get(G.sel)?.label || 'the node') : 'Actions of ' + n.name, items);
+}
+// ---- arrange (m on the board): h j k l move the selected card by a grid step (in a pack or tile folder, by one place),
+// H J K L resize it; Enter keeps it, Esc puts it back. One undo step.
+const ARR = { on: false, id: null };
+function arrangeOpen() {
+  const n = activeNode(); if (!n) return toast('Select a card first: h j k l, or f for hints.');
+  layoutSnap('arrange ' + n.name); ARR.on = true; ARR.id = n.id; live[n.id]?.el.classList.add('arranging');
+  toast('Arrange ' + n.name + ': h j k l move · H J K L resize · Enter keeps it · Esc puts it back', 5000);
+}
+function arrangeMove(dx, dy) {
+  const n = S.nodes[ARR.id]; if (!n) return arrangeDone(true);
+  const f = n.in && S.nodes[n.in];
+  if (f && ['pack', 'tile', 'stack'].includes(f.mode)) { renumber(f); n.order += (dx || dy) * 1.5; renumber(f); relayout(f); }
+  else moveTree(n, dx * SNAP, dy * SNAP);
+  renderLinks();
+}
+function arrangeSize(dw, dh) {
+  const n = S.nodes[ARR.id]; if (!n) return arrangeDone(true);
+  if (n.kind === 'frame') return toast('Folders take their size from their cards and their mode; drag the corner, or ⊞ for a tiled folder.');
+  n.w = Math.max(200, n.w + dw * SNAP); n.h = Math.max(110, n.h + dh * SNAP); nodeResized(n); renderLinks();
+}
+function arrangeDone(cancel) {
+  const n = S.nodes[ARR.id]; ARR.on = false; ARR.id = null; if (!n) return;
+  live[n.id]?.el.classList.remove('arranging');
+  if (cancel) { layoutUndo(); return; }
+  const f = n.in && S.nodes[n.in] || null;
+  if (!f || (f.mode || 'free') === 'free') adopt(n, f, { x: n.x + n.w / 2, y: n.y + 8 }, true); else { restack(); renderLinks(); dirty(); }
+}
+// ---- graph keys: h j k l move the selection to the nearest node that way, Enter takes the card's first action
+function graphMove(dir) {
+  if (!G.N.size) return;
+  const cur = G.sel && G.pos.get(G.sel);
+  const from = cur || { x: G.cam.x, y: G.cam.y };
+  let best = null, bd = Infinity;
+  for (const [id, p] of G.pos) {
+    if (id === G.sel) continue;
+    const dx = p.x - from.x, dy = p.y - from.y;
+    const ok = !cur || (dir === 'l' ? dx > 0 && Math.abs(dy) <= Math.abs(dx) * 1.2 : dir === 'h' ? dx < 0 && Math.abs(dy) <= Math.abs(dx) * 1.2 : dir === 'j' ? dy > 0 && Math.abs(dx) <= Math.abs(dy) * 1.2 : dy < 0 && Math.abs(dx) <= Math.abs(dy) * 1.2);
+    if (!ok) continue;
+    const d = Math.hypot(dx, dy); if (d < bd) { bd = d; best = id; }
+  }
+  if (best) { graphSelect(best); graphCenter(best); }
+}
+function graphOpen() { const b = G.sel && $('#g-card .ex-btns button'); if (b) b.click(); }
+
+// The commands the keymaps of web/keys.js name. A command returns false when it did nothing, so the browser keeps the key.
+const KC = {
+  'palette.open': () => { PICK = null; openPalette(''); },
+  'palette.commands': () => { PICK = null; openPalette('>'); },
+  'dock.toggle': () => toggleDockTerm(),
+  'pane.wider': () => { toggleSide(true, true); setPaneW((S.paneW || PANE_W) + 80, true); },
+  'pane.narrower': () => { toggleSide(true, true); setPaneW((S.paneW || PANE_W) - 80, true); },
+  'tree.toggle': () => toggleTree(),
+  dictate: () => {
+    if (VOICE.rec) return stopListening();
+    if (VIEW === 'editor' && ED.view) dictateInto('editor');
+    else if (focusedBuf && S.nodes[focusedBuf]) dictateInto(S.nodes[focusedBuf]);
+    else toast('Dictation goes into a page: focus one first (Alt-V), or use the Review view.');
+  },
+  ...Object.fromEntries(VIEWS.map(v => ['view.' + v, () => setView(v)])),
+  ...Object.fromEntries([1, 2, 3, 4, 5, 6, 7, 8, 9].map(i => ['ws.' + i, () => wsGo(i)])),
+  'ws.last': () => wsToggleLast(),
+  esc: () => { if (VIEW === 'graph' && G.sel) graphSelect(null); else if (tool !== 'select') setTool('select'); else if (PICKED.size) pickClear(); else if (FOCUS.cur) focusHide(); else if (WS.cur) wsLeave(); else if (TAG_FILTER) tagFilter(''); else return false; },
+  help: () => { $('#help').hidden = false; },
+  'overlay.close': () => closeOverlays(),
+  // canvas
+  ...Object.fromEntries([['left', 'h'], ['down', 'j'], ['up', 'k'], ['right', 'l']].flatMap(([d, k]) => [['card.' + d, () => focusMove(k)], ['card.swap' + d[0].toUpperCase() + d.slice(1), () => swapWith(k)],
+    ['graph.' + d, () => graphMove(k)], ['arrange.' + d, () => arrangeMove({ h: -1, l: 1 }[k] || 0, { k: -1, j: 1 }[k] || 0)]])),
+  'arrange.narrower': () => arrangeSize(-1, 0), 'arrange.wider': () => arrangeSize(1, 0), 'arrange.shorter': () => arrangeSize(0, -1), 'arrange.taller': () => arrangeSize(0, 1),
+  'arrange.done': () => arrangeDone(false), 'arrange.cancel': () => arrangeDone(true), arrange: () => arrangeOpen(),
+  hints: (e, k, via) => { if (via === 'leader') leaveCard(LEADER.target); hintsOpen('pick'); },
+  'hints.letter': (e, k) => hintsType(k), 'hints.back': () => { HINTS.typed = HINTS.typed.slice(0, -1); for (const it of HINTS.items) it.el.hidden = !it.label.startsWith(HINTS.typed); }, 'hints.cancel': () => hintsClose(),
+  'card.actions': () => cardActions(), 'graph.actions': () => cardActions(), 'graph.open': () => graphOpen(),
+  'card.enter': () => { const n = activeNode(); if (!n) return false; n.kind === 'frame' ? wsEnter(n) : typeInto(n); },
+  'card.tab': () => { const n = activeNode(); if (!n) return false; focusOpen(n); },
+  'fold.toggle': (e, k, via) => { if (FOCUS.cur && via !== 'leader') return false; foldToggle(); },
+  'fold.cycle': (e, k, via) => { if (FOCUS.cur && via !== 'leader') return false; foldCycle(); },
+  'pan.left': () => panBy(-1, 0), 'pan.right': () => panBy(1, 0), 'pan.up': () => panBy(0, -1), 'pan.down': () => panBy(0, 1),
+  'zoom.in': () => zoomAt(VW() / 2, VH() / 2, 1.25), 'zoom.out': () => zoomAt(VW() / 2, VH() / 2, 0.8),
+  'zoom.card': () => { const n = activeNode(); if (!n) return toast('Select a card first: h j k l, or f for hints.'); jumpNode(n, 1); },
+  fit: () => fitAll(),
+  'camera.back': () => { const t = camBack.pop(); if (t) { camFwd.push({ ...cam() }); animateTo(t); } },
+  'camera.forward': () => { const t = camFwd.pop(); if (t) { camBack.push({ ...cam() }); animateTo(t); } },
+  compact: () => compact(PICKED.size ? 'selection' : 'all'),
+  'optimise.board': () => optimise(null),
+  'optimise.folder': () => { const f = activeFolderOf(); f ? optimise(f) : toast('Pick a folder or something inside one.'); },
+  tag: () => tagPrompt(activeNode()),
+  'selection.remove': () => { if (PICKED.size || SEL.strokes.size || SEL.shapes.size) removeSelection(); else if (selShape) removeShape(selShape); else return false; },
+  'undo.layout': () => { if (!(LAYOUT_UNDO || REMOVE_UNDO)) return false; LAYOUT_UNDO ? layoutUndo() : removeUndo(); },
+  'pan.hold': () => { space = true; return false; },
+  ...Object.fromEntries(['select', 'rect', 'diamond', 'ellipse', 'arrow', 'area', 'pen', 'text', 'erase'].map(t => ['tool.' + t, () => setTool(t)])),
+  // leader
+  up: () => FOCUS.cur ? focusHide() : wsLeave(),
+  'tab.close': () => FOCUS.cur && focusClose(FOCUS.cur), 'tab.next': () => focusCycle(1), 'tab.prev': () => focusCycle(-1),
+  ...Object.fromEntries(['free', 'pack', 'tile', 'stack'].flatMap(m => [['folder.' + m, () => folderMode(m)], ['folder.' + m + '*', () => folderMode(m, true)]])),
+  address: () => askName('Address (board:/path · fs:@host/dir · note:Title#Heading · tag:x · journal:2026/10/10 · link:Page)', currentAddr(), v => goAddr(v)),
+  fullscreen: () => toggleFullscreen(),
+  leave: () => leaveCard(LEADER.target),
+  cancel: () => {},
+  ...Object.fromEntries(['manual', 'process', 'fs', 'tag', 'tmux', 'proc', 'unit', 'journal', 'link'].map(p => ['persp.' + p, () => perspSet(p)])),
+};
+{ const missing = [...WBKeys.commands()].filter(c => !KC[c]); if (missing.length) console.error('keys: bound but not defined: ' + missing.join(', ')); }
+cmd('Workspace: enter the active folder', () => { const n = activeId && S.nodes[activeId]; if (n?.kind === 'frame') wsEnter(n); else toast('Pick a folder first.'); }, '@card.enter');
+cmd('Workspace: step out', () => wsLeave(), '@esc', () => !!WS.cur);
 cmd('Workspace: switch…', () => { const list = wsTop(); askName('Workspace number: ' + list.map((f, i) => (i + 1) + ' ' + f.name).join('  ·  '), '', v => wsGo(+String(v).trim())); }, 'Ctrl-Space 1…9');
-cmd('Workspace: last', () => wsToggleLast(), 'Ctrl-Space `');
-cmd('Focus: open the active node as a tab', () => { const n = activeId && S.nodes[activeId]; if (n) focusOpen(n); else toast('Pick a node first.'); }, 'Shift-Enter');
-cmd('Type into the active node', () => { const n = activeId && S.nodes[activeId]; if (n && n.kind !== 'frame') typeInto(n); else toast('Pick a node first.'); }, 'Enter');
-cmd('Focus: back to the canvas', () => focusHide(), 'Esc', () => !!FOCUS.cur);
-cmd('Focus: close this tab', () => focusClose(FOCUS.cur), 'Ctrl-Space q', () => !!FOCUS.cur);
-cmd('Focus: next tab', () => focusCycle(1), 'Ctrl-Space n', () => FOCUS.tabs.length > 1);
-cmd('Layout: optimise the board', onCanvas(() => optimise(null)), 'Shift-C');
+cmd('Workspace: last', () => wsToggleLast(), '@ws.last');
+cmd('Focus: open the active node as a tab', () => { const n = activeId && S.nodes[activeId]; if (n) focusOpen(n); else toast('Pick a node first.'); }, '@card.tab');
+cmd('Type into the active node', () => { const n = activeId && S.nodes[activeId]; if (n && n.kind !== 'frame') typeInto(n); else toast('Pick a node first.'); }, '@card.enter');
+cmd('Focus: back to the canvas', () => focusHide(), '@esc', () => !!FOCUS.cur);
+cmd('Focus: close this tab', () => focusClose(FOCUS.cur), '@tab.close', () => !!FOCUS.cur);
+cmd('Focus: next tab', () => focusCycle(1), '@tab.next', () => FOCUS.tabs.length > 1);
+cmd('Layout: optimise the board', onCanvas(() => optimise(null)), '@optimise.board');
 cmd('Folder: next tile aspect ratio (⊞ again on a tiled folder)', onCanvas(() => { const n = activeId && S.nodes[activeId]; const f = n && (n.kind === 'frame' ? n : n.in && S.nodes[n.in]); f ? tileAspectCycle(f) : toast('Pick a folder or something inside one.'); }));
-cmd('Layout: optimise the active folder', onCanvas(() => LEADER_MAP.find(m => m[0] === 'O')[2]()), 'Ctrl-Space O');
-cmd('Fullscreen (browser)', () => toggleFullscreen(), 'Ctrl-Space F');
+cmd('Layout: optimise the active folder', onCanvas(() => KC['optimise.folder']()), '@optimise.folder');
+cmd('Fullscreen (browser)', () => toggleFullscreen(), '@fullscreen');
 cmd('Leader key: which-key list', () => leaderOpen(), 'Ctrl-Space');
+cmd('Hints: label the cards and buttons on screen, type one to pick it', () => KC.hints(), '@hints');
+cmd('Card: actions of the selected card…', () => cardActions(), '@card.actions', () => !!activeNode());
+cmd('Card: arrange it with the keys (move, resize)', onCanvas(() => arrangeOpen()), '@arrange', () => !!activeNode());
+cmd('Zoom in', onCanvas(() => KC['zoom.in']()), '@zoom.in');
+cmd('Zoom out', onCanvas(() => KC['zoom.out']()), '@zoom.out');
+cmd('Zoom to the selected card', onCanvas(() => KC['zoom.card']()), '@zoom.card', () => !!activeNode());
 for (const k of Object.keys(LEADERS)) cmd('Leader key: use ' + LEADERS[k].label, () => setLeader(k), '', () => leaderName() !== k);
 // ---- packages: a folded folder is just its tab (user, 10:00). Tab folds and unfolds; Shift-Tab folds the siblings for focus, then unfolds all
 const PKG = { w: 180, h: 10 };
@@ -5909,10 +6077,10 @@ function foldCycle() {
   restack(); renderTree(); renderLinks(); dirty();
   toast(anyOpen ? `Folded ${others.length} folder(s) into packages${f ? '; ' + f.name + ' stays open' : ''}. Shift-Tab again unfolds them.` : `Unfolded ${others.length} folder(s).`);
 }
-cmd('Fold: package the active folder / unfold it', onCanvas(() => foldToggle()), 'Tab');
+cmd('Fold: package the active folder / unfold it', onCanvas(() => foldToggle()), '@fold.toggle');
 cmd('Layout: push apart everything that overlaps', onCanvas(() => { layoutSnap('push apart'); settle(); const n = separateAll(); restack(); renderLinks(); renderTree(); dirty(); toast(n ? 'Pushed overlapping items apart. Ctrl-Z undoes.' : 'Nothing overlaps.'); }));
 cmd('Layout: keep a boundary between items (no overlap)', () => { S.noOverlap = S.noOverlap === false ? true : false; dirty(); toast(S.noOverlap === false ? 'Items may overlap again.' : 'Items keep a boundary: the others move aside on drop, resize, unfold and new items.'); if (S.noOverlap !== false) { SEP.keep = null; for (const f of frameList()) if (!f.in) relayout(f); separate(null, null); restack(); renderLinks(); dirty(); } }, '', null);
-cmd('Fold: package the other folders on this level (focus) / unfold all', onCanvas(() => foldCycle()), 'Shift-Tab');
+cmd('Fold: package the other folders on this level (focus) / unfold all', onCanvas(() => foldCycle()), '@fold.cycle');
 
 // ================================================================ v11: hosts, perspectives, cascading folder modes
 // ---- hosts: a folder may carry a host {name, url, token}. Everything inside it that needs a process (shell, Emacs, file
@@ -6002,7 +6170,7 @@ function setModeCascade(f, m, quiet) {
   restack(); renderTree(); renderLinks(); dirty();
   if (!quiet) toast(`${f.name} and ${fs.length - 1} nested folder(s): ${m}. Ctrl-Z undoes.`);
 }
-for (const [m, key] of [['free', 'E'], ['pack', 'B'], ['tile', 'T'], ['stack', 'S']]) cmd(`Folder: ${m}, cascading to the nested folders`, () => folderMode(m, true), 'Ctrl-Space ' + key);
+for (const [m, key] of [['free', 'E'], ['pack', 'B'], ['tile', 'T'], ['stack', 'S']]) cmd(`Folder: ${m}, cascading to the nested folders`, () => folderMode(m, true), '@folder.' + m + '*');
 AGENT_TOOLS.push({ name: 'folder_mode', description: 'Set a folder\'s mode: free, pack, tile or stack. cascade applies it to the nested folders too. tile on a tiled folder steps to the next aspect ratio (screen, 16:9, 3:2, 4:3, 1:1, 3:4, 9:16).', inputSchema: { type: 'object', properties: { path: { type: 'string' }, mode: { type: 'string' }, cascade: { type: 'boolean' } }, required: ['path', 'mode'] },
   run: ({ path, mode, cascade }) => { const f = findFolder(path); if (!f) throw new Error('no folder at ' + path); if (!FICON[mode]) throw new Error('mode must be free, pack, tile or stack'); cascade ? setModeCascade(f, mode, true) : setMode(f, mode, true); return `${fullPath(f)}: ${mode}${cascade ? ' (cascaded)' : ''}`; } });
 
@@ -6127,12 +6295,7 @@ function perspChip() {
   if (!chip) { chip = el('div'); chip.id = 'persp-chip'; document.body.append(chip); }
   chip.replaceChildren('perspective: ' + p); const x = el('button', 'mini', '✕'); x.title = 'Back to the manual perspective (folders as you made them)'; x.onclick = () => perspSet('manual'); chip.append(x);
 }
-function perspMenu() {
-  const wk = $('#which-key'); if (!wk) return;
-  LEADER.on = true; LEADER.sub = 'persp'; wk.hidden = false; wk.replaceChildren();
-  const t = el('div', 'wk-title'); t.textContent = 'Perspective (now: ' + perspCur() + ')'; wk.append(t);
-  for (const [k, d] of [['m', PERSP_NAMES.manual], ['p', PERSP_NAMES.process], ['f', PERSP_NAMES.fs], ['t', PERSP_NAMES.tag], ['x', PERSP_NAMES.tmux], ['c', PERSP_NAMES.proc], ['u', PERSP_NAMES.unit], ['j', PERSP_NAMES.journal], ['l', PERSP_NAMES.link]]) { const r = el('span'); const b = el('b'); b.textContent = k; r.append(b, d); wk.append(r); }
-}
+function perspMenu() { leaderOpen('leader-v'); }
 cmd('Perspective: manual (folders as you made them)', () => perspSet('manual'), 'Ctrl-Space v m', () => perspCur() !== 'manual');
 cmd('Perspective: process (a shell and what it spawned)', () => perspSet('process'), 'Ctrl-Space v p', () => perspCur() !== 'process');
 cmd('Perspective: filesystem (directories on each host)', () => perspSet('fs'), 'Ctrl-Space v f', () => perspCur() !== 'fs');
@@ -6920,5 +7083,6 @@ AGENT_TOOLS.push(
     run: async ({ host } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j = await (await hFetch(h, '/api/status')).json(); const gb = b => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}` + (j.sessions?.tmux != null ? ', tmux sessions ' + j.sessions.tmux : ''), j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
 window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
+Object.assign(window.__canvas, { keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
 boot();
 })();

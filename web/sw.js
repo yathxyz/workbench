@@ -2,7 +2,7 @@
 // Only a plain same-origin 200 is cached: after a sign-in expiry a subresource fetch follows the redirect to the IdP's
 // login page, and caching that as /app.js would break the PWA until the cache name changes.
 const CACHE = 'workbench-shell-v3';
-const SHELL = ['/', '/index.html', '/style.css', '/app.js', '/bridge.js', '/vendor/vendor.js', '/vendor/xterm.css', '/fonts/fonts.css', '/manifest.webmanifest', '/icon.svg'];
+const SHELL = ['/', '/index.html', '/style.css', '/app.js', '/keys.js', '/bridge.js', '/vendor/vendor.js', '/vendor/xterm.css', '/fonts/fonts.css', '/manifest.webmanifest', '/icon.svg'];
 const cacheable = r => r.ok && !r.redirected && r.type === 'basic';
 const put = (c, p) => fetch(p, { cache: 'no-cache' }).then(r => { if (!cacheable(r)) throw new Error('not cacheable: ' + p); return c.put(p, r); });
 // The font files are the ones fonts.css names (the build generates both), cached with the shell so that a launch after

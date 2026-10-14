@@ -233,12 +233,14 @@
           <dt><kbd>:</kbd> · <kbd data-modkey="Mod-Shift-P">Ctrl-Shift-P</kbd> · <code>&gt;</code></dt><dd>Commands only</dd>
           <dt>Ctrl-N / Ctrl-P, Ctrl-J / Ctrl-K</dt><dd>Move in the palette</dd>
           <dt>Alt-1 … Alt-7</dt><dd>Canvas, Navigator, Graph, Editor, Outline, Tasks, Review</dd>
-          <dt>Alt-B · Ctrl-` (or Ctrl-J)</dt><dd>Folder tree · docked terminal</dd>
+          <dt>Alt-B · Ctrl-` (or Ctrl-J)</dt><dd>Folder tree · docked terminal. Inside a shell, every key goes to the program except Ctrl-`; inside a page, these keys, Ctrl-K and the views stay with the board.</dd>
+          <dt>h j k l · H J K L · f · . · m</dt><dd>On the board: select the neighbour card · swap with it · hints (a label on every card and on the selected card's buttons; type one to pick it) · the selected card's actions · arrange it (h j k l move, H J K L resize, Enter done, Esc puts it back)</dd>
+          <dt>Arrows · - = · z · ! · Alt-← Alt-→</dt><dd>Pan · zoom out, in · the selected card at 100 % · fit everything · previous and next view</dd>
           <dt>Middle-drag · Alt-drag</dt><dd>Pan from anywhere, also over a terminal or editor; the middle button never pastes here. Space-drag pans too when nothing is being typed.</dd>
           <dt>Boundaries</dt><dd>Items on one level never overlap: after a drop, a resize, an unfold or a new item, the others on that level move aside, folder tabs included, and the folder grows to fit. The palette's "keep a boundary" command turns it off.</dd>
           <dt>Tab · Shift-Tab</dt><dd>Tab folds the active folder into a package (just its tab) and unfolds it again; Shift-Tab packages every other folder on the same level so one stays in focus, and a second Shift-Tab unfolds them all. Ctrl-Z undoes.</dd>
           <dt>Enter · Shift-Enter · Esc</dt><dd>Enter the active folder as a workspace (everything else dims; the status bar shows where you are). On a card, Enter puts the cursor in it: the shell's prompt, the agent's composer, the page's text (a card off screen or zoomed far out comes into view first). Shift-Enter opens the active card as a full-screen focus tab. Esc steps out, or back to the canvas.</dd>
-          <dt>Ctrl-Space</dt><dd>Leader key, which-key style (press it twice to send Ctrl-Space itself to Emacs or tmux; the palette can move the leader to Ctrl-Alt-Space or F1): 1 to 9 switch top-level workspaces, ` last workspace, u up, f focus tab, q close tab, n/p next and previous tab, h j k l move focus between neighbours, H J K L swap with a neighbour, e/b/t/s folder modes free/pack/tile/stack, o optimise the board, O optimise this folder, c compact, F browser fullscreen, z fit all, # tag.</dd>
+          <dt>Ctrl-Space</dt><dd>Leader key, which-key style, from anywhere, also inside a shell, a page or an artifact (press it twice to send Ctrl-Space itself to Emacs or tmux; the palette can move the leader to Ctrl-Alt-Space or F1): Esc leaves the card that has the keyboard, ; hints, / palette, a go to an address, 1 to 9 switch top-level workspaces, ` last workspace, u up, f focus tab, q close tab, n/p next and previous tab, h j k l move focus between neighbours, H J K L swap with a neighbour, e/b/t/s folder modes free/pack/tile/stack, o optimise the board, O optimise this folder, c compact, F browser fullscreen, z fit all, # tag.</dd>
           <dt>Shift-click a mode button · Ctrl-Space E B T S</dt><dd>Cascade: the folder mode (free, pack, tile, stack) is applied to every nested folder as well. Ctrl-Z undoes.</dd>
           <dt>Note trees</dt><dd><code>note:</code> in the navigator lists a note's headings as a tree (a heading's parent is the nearest heading above it with a smaller level; list items hang under their heading); <code>h</code> goes up to the parent heading. <code>[[Title#Heading]]</code>, <code>[[Title#^anchor]]</code> and a bare <code>^anchor</code> resolve as addresses (<code>ga</code>, <code>wb go note:Title#Heading</code>). The outline pane shows the heading tree of the focused page; click a heading to jump to it. A note's preview lists its backlinks.</dd>
           <dt>Journal</dt><dd><code>journal:</code> is year › month › day; <code>journal:today</code> is today's entry (created when missing: a board page in the demo, <code>journal/YYYY-MM-DD.md</code> under the notes in the local build). <code>]d</code> / <code>[d</code> in the navigator go to the next / previous day that has an entry; the palette has <i>Journal: today / next / previous</i>. <b>Journal perspective</b> (<code>Ctrl-Space v j</code>): one folder per year with a folder per month, the day pages inside (index-only days as ghosts that open in Emacs; today as a ghost when it has no entry yet).</dd>
@@ -320,6 +322,7 @@
 <div id="toast" role="status" aria-live="polite"></div>
 <!--/APP-->
 <script src="vendor/vendor.js"></script>
+<script src="keys.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
