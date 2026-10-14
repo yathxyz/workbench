@@ -177,11 +177,16 @@ function open(id, { create } = {}) {
 }
 function openPromise(b) { return new Promise((resolve, reject) => b.sync.waiters.push({ resolve, reject })); }
 function settleOpen(b, err) { const ws = b.sync.waiters.splice(0); for (const w of ws) (err ? w.reject(err) : w.resolve(b)); }
+/* Ed.sync.close(buf): the subscription ends and the replica goes with it at once (close has no answer to wait
+   for): kill-buffer moves every window showing it, in any frame, to another buffer first, so closed replicas do
+   not pile up in the buffer list. An open still on its way is settled with an error. */
 function closeBuffer(id) {
   const b = typeof id === 'string' ? sync.buffers.get(id) : id;
   if (!b) return;
   send({ t: 'close', buf: b.id });
   sync.buffers.delete(b.id); b.shared = false;
+  if (b.sync && b.sync.opening) { b.sync.opening = null; settleOpen(b, Object.assign(new Error(`${b.id}: closed`), { code: 'closed' })); }
+  if (E.buffers.includes(b)) { try { L.call('kill-buffer', [b]); } catch (e) { Ed.reportError(e); } Ed.scheduleRender(); }
 }
 function onSnap(msg) {
   const b = bufOf(msg); if (!b) return;

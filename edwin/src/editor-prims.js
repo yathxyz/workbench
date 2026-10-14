@@ -1084,12 +1084,19 @@ L.evalText(`
 
 /* ---------- files for load, include and require (R4.10) ----------
    A path is read from the buffer visiting it, else from the host (the disk under Node), else from the
-   saved files. load-path starts as the host's: ~/.config/edwin/lisp, then the shipped scm/. */
+   saved files, else, for a .scm name, from the shipped files by basename: (require 'markdown) resolves
+   through any load-path entry, with or without markdown.js's edwin:scm entry. load-path starts as the
+   host's: ~/.config/edwin/lisp, then the shipped scm/. */
 L.S.hooks.readFile = path => {
   const vb = E.buffers.find(x => x.file === path);
   if (vb) return vb.text;
   const t = host.readFile(path);
-  return t !== null && t !== undefined ? t : Ed.Store.get(path);
+  if (t !== null && t !== undefined) return t;
+  const saved = Ed.Store.get(path);
+  if (saved !== null && saved !== undefined) return saved;
+  const m = /([^/]+\.scm)$/.exec(String(path));
+  const c = m ? host.config(m[1]) : null;
+  return c !== null && c !== undefined ? c : null;
 };
 L.set('load-path', listOf(host.loadPath.slice()));
 
@@ -1164,7 +1171,10 @@ CMD('describe-browser-keys', '', '', 'List the keys the browser keeps for itself
 /* markdown.scm is loaded when the host has it (package E of E3); the standalone page may not carry it. */
 const CONFIG = [['emacs.scm'], ['evil.scm'], ['org.scm', 'lazy'], ['markdown.scm', 'lazy'], ['ai.scm', 'lazy'], ['init.scm']];
 const shipped = name => host.config(name);
-function shippedConfig(name) { const c = CONFIG.find(x => x[0] === name && x[1]); return c ? shipped(name) : null; }
+/* In served mode (Ed.bootServed) every shipped file is evaluated lazily: the sources are edwind's files, not
+   buffers of this runtime, so the buffer list and the completion word set hold only what the page opened. */
+let servedBoot = false;
+function shippedConfig(name) { const c = CONFIG.find(x => x[0] === name && (x[1] || servedBoot)); return c ? shipped(name) : null; }
 function loadConfig(name, lazy) {
   const saved = Ed.Store.get(name), orig = shipped(name);
   if (orig === null) return null;
@@ -1233,7 +1243,7 @@ let booted = false;
 function boot(opts = {}) {
   if (booted) throw new Error('Edwin has already booted');
   if (opts.host && opts.host !== host) throw new Error('Ed.boot: a different host from the one Edwin loaded with');
-  booted = true; E.booted = true;
+  booted = true; E.booted = true; servedBoot = !!opts.served;
   for (const n of ['global-map', 'minibuffer-local-map', 'scheme-mode-map', 'scheme-interaction-mode-map', 'special-mode-map', 'fundamental-mode-map', 'org-mode-map', 'text-mode-map'])
     L.set(n, new Ed.Keymap(n));
   L.get('scheme-interaction-mode-map').parent = L.get('scheme-mode-map');
@@ -1242,9 +1252,9 @@ function boot(opts = {}) {
   const msgs = Ed.getBufferCreate('*Messages*'); msgs.readOnly = true;
   const scratch = Ed.getBufferCreate('*scratch*'); scratch.text = SCRATCH; scratch.pt = 0;
   const errors = [];
-  for (const [name, lazy] of CONFIG) { const err = loadConfig(name, lazy); if (err) errors.push(err); }
+  for (const [name, lazy] of CONFIG) { const err = loadConfig(name, lazy || servedBoot); if (err) errors.push(err); }
   const userErr = opts.served ? null : loadUserInit(); if (userErr) errors.push(userErr);
-  E.buffers = [scratch, ...CONFIG.filter(c => !c[1]).map(([n]) => Ed.getBuffer(n)).filter(Boolean), msgs];
+  E.buffers = [scratch, ...CONFIG.filter(c => !c[1] && !servedBoot).map(([n]) => Ed.getBuffer(n)).filter(Boolean), msgs];
   if (opts.frame) Ed.selectFrame(opts.frame);
   E.root = new Ed.Window(scratch); E.sel = null; Ed.selectWindow(E.root);
   if (errors.length) errors.forEach(e => Ed.message(e));
@@ -1329,7 +1339,8 @@ function wire(f) {
     if (p === null) { Ed.render(); return; }
     const b = w.buffer;
     if (E.isearch) E.isearch = null;
-    if (Ed.hooks.mouseDown) Ed.hooks.mouseDown(b, p);
+    /* The hook gets the event too (modifier keys, the button); older two-argument hooks ignore it. */
+    if (Ed.hooks.mouseDown) Ed.hooks.mouseDown(b, p, e);
     else { b.pt = p; b.markActive = false; }
     dragFrom = p; dragWin = w; Ed.frameEvent('point', f, b); Ed.render();
   });
