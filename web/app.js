@@ -2715,12 +2715,14 @@ viewport.addEventListener('gotpointercapture', e => CAPTURED.set(e.pointerId, e.
 viewport.addEventListener('lostpointercapture', e => { if (CAPTURED.get(e.pointerId) === e.target) CAPTURED.delete(e.pointerId); }, true);
 for (const t of ['pointerup', 'pointercancel']) window.addEventListener(t, e => {
   if (!TOUCH.delete(e.pointerId) || TOUCH.size) return;
+  viewport.classList.remove('touching');
   viewport.removeEventListener('touchmove', holdTouch, { capture: true });
 }, true);
 viewport.addEventListener('pointerdown', ev => {
   if (ev.pointerType !== 'touch') return;
   camStop();   // a finger down stops a flight or a glide
   TOUCH.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+  viewport.classList.add('touching');   // a web or artifact card's frame would keep the second finger to itself
   if (FOCUS.cur || TOUCH.size !== 2) return;
   const first = [...TOUCH.keys()].find(id => id !== ev.pointerId);
   if (CAPTURED.has(first) && !pointers.has(first)) return;
@@ -2749,7 +2751,7 @@ const MID = { at: 0 };
 const panGrab = ev => !FOCUS.cur && ev.pointerType !== 'touch' && (ev.button === 1 || (ev.button === 0 && ev.altKey && !ev.ctrlKey && !ev.metaKey));
 viewport.addEventListener('pointerdown', ev => {
   if (!panGrab(ev)) return;
-  ev.preventDefault(); ev.stopPropagation(); MID.at = performance.now(); camStop();
+  ev.preventDefault(); ev.stopPropagation(); MID.at = performance.now(); camStop(); GLIDE.ok = false;
   viewport.setPointerCapture(ev.pointerId); pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY }); viewport.classList.add('panning');
 }, true);
 for (const t of ['mousedown', 'mouseup', 'auxclick', 'click']) viewport.addEventListener(t, ev => { if (ev.button === 1) { ev.preventDefault(); ev.stopPropagation(); MID.at = performance.now(); } }, true);
@@ -2812,7 +2814,7 @@ viewport.addEventListener('pointermove', ev => {
     zoomAt(mx, my, d / pinch.d); pinch = { d, mx, my };
   }
 });
-const endPan = ev => { if (!pointers.delete(ev.pointerId)) return; pinch = null; if (!pointers.size) { viewport.classList.remove('panning'); if (GLIDE.ok) glide(ev); } };
+const endPan = ev => { if (!pointers.delete(ev.pointerId)) return; pinch = null; if (!pointers.size) { viewport.classList.remove('panning'); if (GLIDE.ok) glide(ev); GLIDE.ok = false; } };
 viewport.addEventListener('pointerup', endPan); viewport.addEventListener('pointercancel', endPan);
 viewport.addEventListener('wheel', e => {
   if (FOCUS.cur) return;

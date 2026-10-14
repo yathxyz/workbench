@@ -81,6 +81,7 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
   background-image: radial-gradient(var(--dot) 1.1px, transparent 1.3px);
 }
 #viewport.panning { cursor: grabbing; }
+#viewport.touching .node iframe { pointer-events: none; }   /* while a finger is on the canvas, a second one on a framed card still reaches it (F-A26) */
 #viewport.tool-pen, #viewport.tool-pen .hdr { cursor: crosshair; }
 #viewport.tool-erase, #viewport.tool-erase .hdr { cursor: cell; }
 #world { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; }
