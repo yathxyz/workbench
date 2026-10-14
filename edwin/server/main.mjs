@@ -80,6 +80,9 @@ export class Server {
        (§4.6; `call{cmd}` reaches them after the E1 switch in command()), handlers for message types the
        session does not know (`sample`, `tool_result`, …), and the installed modules, shut down in reverse. */
     this.commands = new Map(); this.handlers = new Map(); this.modules = [];
+    /* status (R15.11): each provider returns fields merged into the `status` command's value. */
+    this.statusProviders = [];
+    this.started = Date.now();
     fs.mkdirSync(cfg.stateDir, { recursive: true, mode: 0o700 });
     fs.mkdirSync(cfg.configDir, { recursive: true, mode: 0o700 });
     this.image = new ImageLog(path.join(cfg.stateDir, 'image.jsonl'));
@@ -106,6 +109,16 @@ export class Server {
   defineCommand(name, fn) { this.commands.set(name, fn); }
   /* A handler for message type T from any client: FN(client, msg), may return a promise. */
   onMessage(t, fn) { this.handlers.set(t, fn); }
+  /* The `status` command (R15.11): what wb-web shows under /api/status.edit and reads for /api/info.
+     Modules add fields through statusProviders (notes: notesExists, notesGen; models: sample, models;
+     threads: loopLagP95Ms, ackP95Ms). */
+  status() {
+    let journalBytes = 0;
+    for (const sb of this.buffers.all()) if (sb.journal) journalBytes += sb.journal.bytes;
+    const out = { version: this.build, build: this.build, boot: this.boot, uptimeMs: Date.now() - this.started, clients: this.clients.size, buffers: this.buffers.all().length, journalBytes, imageGen: this.image.gen, imageEpoch: this.image.epoch, loopLagP95Ms: null, ackP95Ms: null, notesExists: false, notesGen: 0, sample: false, models: {} };
+    for (const p of this.statusProviders) { try { Object.assign(out, p()); } catch (e) { this.log.warn('status', { error: e.message }); } }
+    return out;
+  }
 
   /* ---------- the socket (R14.3) ---------- */
   listen() {
@@ -237,6 +250,7 @@ export class Server {
       }
       case 'list-writers': { const sb = B.get(buf || args[0]); const seen = new Map(); for (const b of sb.hist) seen.set(JSON.stringify(b.by), b.by); return { value: [...seen.values()] }; }
       case 'kill-buffer': { const sb = B.get(typeof args[0] === 'string' ? args[0] : buf); B.kill(sb); return { value: true }; }
+      case 'status': return { value: this.status() };
       default: {
         const fn = this.commands.get(cmd);
         if (fn) return fn(client, args, ctx, buf);
