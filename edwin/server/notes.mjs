@@ -30,6 +30,30 @@ const KEY_RE = /^[A-Za-z][\w-]*$/;
 const param = args => (Array.isArray(args) && args[0] && typeof args[0] === 'object' && !Array.isArray(args[0]) ? args[0] : {});
 const bad = (msg) => new ProtoError('bad_request', msg);
 const byPath = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+/* The directory of a new note ID (notesDir-relative, its segments already checked): a new note may sit in a
+   directory that does not exist yet, so walk the existing components as the kernel sees them (a symlink on
+   the way must still land inside notesDir, and a dangling one is refused), then make the missing ones under
+   that real parent, so nothing is created outside the notes tree. Returns the real path the note will have.
+   Shared by notes-append (noteBuffer) and by open{create} in buffers.mjs. Throws ProtoError bad_request or
+   refused_path. */
+export function ensureNoteDir(id, realRoot, auth) {
+  const segs = id.split('/'), dirs = segs.slice(0, -1);
+  let base = realRoot, i = 0;
+  for (; i < dirs.length; i++) {
+    let r;
+    try { r = realPath(path.join(base, dirs[i])); } catch (e) { throw bad(`${id}: ${e.message}`); }
+    if (r.symlink && !r.exists) throw bad(`${id}: ${dirs[i]} is a dangling symlink`);
+    if (!r.exists) break;
+    if (!under(r.real, realRoot)) throw bad(`${id} is outside the notes directory`);
+    base = r.real;
+  }
+  const cand = path.join(base, ...dirs.slice(i), segs[segs.length - 1]);
+  if (!under(cand, realRoot) || cand === realRoot) throw bad(`${id} is outside the notes directory`);
+  try { auth.checkWrite(cand); } catch (e) { throw new ProtoError('refused_path', e.message); }
+  if (i < dirs.length) { try { fs.mkdirSync(path.dirname(cand), { recursive: true, mode: 0o700 }); } catch (e) { throw bad(`${id}: ${e.code || e.message}`); } }
+  return cand;
+}
 /* The shorter path wins an ambiguity (R11.3), then the lexicographically smaller. */
 const shortest = ids => [...ids].sort((a, b) => a.length - b.length || byPath(a, b))[0];
 const stripExt = p => p.replace(/\.[^./]+$/, '');
@@ -425,25 +449,7 @@ export class Notes {
     if (id.startsWith('/') || id.startsWith('~') || id.startsWith('name:') || id.includes('\0')) throw bad(`path must be relative to the notes directory: ${JSON.stringify(id)}`);
     const segs = id.split('/');
     if (segs.some(s => s === '' || s === '.' || s === '..')) throw bad(`bad relative path ${JSON.stringify(id)}`);
-    if (create) {
-      /* A new note may sit in a directory that does not exist yet: walk the existing components as the kernel
-         sees them (a symlink on the way must still land inside notesDir, and a dangling one is refused), then
-         make the missing ones under that real parent, so nothing is created outside the notes tree. */
-      const dirs = segs.slice(0, -1);
-      let base = this.realRoot, i = 0;
-      for (; i < dirs.length; i++) {
-        let r;
-        try { r = realPath(path.join(base, dirs[i])); } catch (e) { throw bad(`${id}: ${e.message}`); }
-        if (r.symlink && !r.exists) throw bad(`${id}: ${dirs[i]} is a dangling symlink`);
-        if (!r.exists) break;
-        if (!under(r.real, this.realRoot)) throw bad(`${id} is outside the notes directory`);
-        base = r.real;
-      }
-      const cand = path.join(base, ...dirs.slice(i), segs[segs.length - 1]);
-      if (!under(cand, this.realRoot) || cand === this.realRoot) throw bad(`${id} is outside the notes directory`);
-      try { this.server.auth.checkWrite(cand); } catch (e) { throw new ProtoError('refused_path', e.message); }
-      if (i < dirs.length) { try { fs.mkdirSync(path.dirname(cand), { recursive: true, mode: 0o700 }); } catch (e) { throw bad(`${id}: ${e.code || e.message}`); } }
-    }
+    if (create) ensureNoteDir(id, this.realRoot, this.server.auth);
     let p;
     try { p = this.server.auth.parseId(id); } catch (e) { if (e instanceof PathError) throw bad(`${id}: ${e.message}`); throw e; }
     if (!under(p.real, this.realRoot) || p.real === this.realRoot) throw bad(`${id} is outside the notes directory`);

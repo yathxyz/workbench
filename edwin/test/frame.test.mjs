@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { createRequire } from 'node:module';
-import { makeDir, startEdwind, stopEdwind, EditClient } from './edit-client.mjs';
+import { makeDir, startEdwind, stopEdwind, EditClient, EDWIN } from './edit-client.mjs';
 import { rng, randOp } from './ot-sim.mjs';
 
 const require = createRequire(import.meta.url);
@@ -77,6 +77,120 @@ class Writer {
   settled() { return until(() => !this.inflight && !this.queue.length, 'writer settled'); }
 }
 
+/* ---------- a small DOM for the frame tests ----------
+   Enough of Element and Document for Ed.makeFrame and a render with no browser (R9.2): a node tree, class,
+   id and data attributes, inline style, listeners, innerHTML parsed for the simple markup the core writes,
+   the selectors the core and the overlay hooks use (.c, #i, tag.c, .c[data-x="v"], lists), and a fixed
+   geometry: a monospace grid of 8 x 21 px in a 600 x 400 view, each .ln at its index. */
+class FakeNode { constructor(doc, type, name) { this.ownerDocument = doc; this.nodeType = type; this.nodeName = name; this.parentNode = null; this.childNodes = []; } get parentElement() { return this.parentNode && this.parentNode.nodeType === 1 ? this.parentNode : null; } }
+class FakeText extends FakeNode { constructor(doc, s) { super(doc, 3, '#text'); this.nodeValue = s; } get textContent() { return this.nodeValue; } }
+const kebab = k => k.replace(/[A-Z]/g, c => '-' + c.toLowerCase());
+const ENT = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+const decode = s => s.replace(/&(#x[0-9a-fA-F]+|#\d+|[a-zA-Z]+);/g, (m, e) => (e[0] === '#' ? String.fromCodePoint(e[1] === 'x' ? parseInt(e.slice(2), 16) : Number(e.slice(1))) : ENT[e] !== undefined ? ENT[e] : m));
+function parseSelector(sel) {
+  return String(sel).split(',').map(part => {
+    const m = /^\s*([a-zA-Z0-9-]+)?((?:[.#][-\w]+|\[[-\w]+(?:="[^"]*")?\])*)\s*$/.exec(part);
+    if (!m) throw new Error('fake DOM: unsupported selector ' + sel);
+    const q = { tag: m[1] ? m[1].toLowerCase() : null, classes: [], id: null, attrs: [] };
+    for (const t of m[2].match(/[.#][-\w]+|\[[^\]]*\]/g) || []) {
+      if (t[0] === '.') q.classes.push(t.slice(1));
+      else if (t[0] === '#') q.id = t.slice(1);
+      else { const a = /^\[([-\w]+)(?:="([^"]*)")?\]$/.exec(t); q.attrs.push({ name: a[1], value: a[2] === undefined ? null : a[2] }); }
+    }
+    return q;
+  });
+}
+function matches(el, q) {
+  if (q.tag && el.localName !== q.tag) return false;
+  if (q.id !== null && el.id !== q.id) return false;
+  for (const c of q.classes) if (!el.classList.contains(c)) return false;
+  for (const a of q.attrs) { if (!el.attrs.has(a.name)) return false; if (a.value !== null && el.attrs.get(a.name) !== a.value) return false; }
+  return true;
+}
+function walk(n, fn) { fn(n); for (const c of n.childNodes) walk(c, fn); }
+class FakeElement extends FakeNode {
+  constructor(doc, tag) {
+    super(doc, 1, tag.toUpperCase());
+    this.tagName = tag.toUpperCase(); this.localName = tag.toLowerCase(); this.attrs = new Map(); this.listeners = []; this.value = ''; this._html = '';
+    const props = new Map();
+    this.style = { cssText: '', setProperty: (k, v) => { props.set(k, String(v)); }, getPropertyValue: k => props.get(k) || '' };
+    const el = this, classes = () => (el.attrs.get('class') || '').split(/\s+/).filter(Boolean), setClasses = cs => { el.attrs.set('class', cs.join(' ')); };
+    this.classList = {
+      contains: c => classes().includes(c),
+      add: (...cs) => { const l = classes(); for (const c of cs) if (!l.includes(c)) l.push(c); setClasses(l); },
+      remove: (...cs) => setClasses(classes().filter(c => !cs.includes(c))),
+      toggle: (c, force) => { const on = force === undefined ? !classes().includes(c) : !!force; if (on) el.classList.add(c); else el.classList.remove(c); return on; },
+    };
+    this.dataset = new Proxy({}, {
+      get: (t, k) => (typeof k === 'string' ? el.attrs.get('data-' + kebab(k)) : undefined),
+      set: (t, k, v) => { el.attrs.set('data-' + kebab(k), String(v)); return true; },
+      deleteProperty: (t, k) => { el.attrs.delete('data-' + kebab(k)); return true; },
+      has: (t, k) => el.attrs.has('data-' + kebab(k)),
+    });
+  }
+  get id() { return this.attrs.get('id') || ''; } set id(v) { this.attrs.set('id', String(v)); }
+  get className() { return this.attrs.get('class') || ''; } set className(v) { this.attrs.set('class', String(v)); }
+  get hidden() { return this.attrs.has('hidden'); } set hidden(v) { if (v) this.attrs.set('hidden', ''); else this.attrs.delete('hidden'); }
+  get title() { return this.attrs.get('title') || ''; } set title(v) { this.attrs.set('title', String(v)); }
+  getAttribute(n) { return this.attrs.has(n) ? this.attrs.get(n) : null; } setAttribute(n, v) { this.attrs.set(n, String(v)); } removeAttribute(n) { this.attrs.delete(n); } hasAttribute(n) { return this.attrs.has(n); }
+  /* Live, as HTMLCollection is: the core reads length and indexes while it adds and removes. */
+  get children() { const el = this, now = () => el.childNodes.filter(c => c.nodeType === 1); return new Proxy([], { get(t, k) { const c = now(); const v = c[k]; return typeof v === 'function' ? v.bind(c) : v; }, has(t, k) { return k in now(); } }); }
+  get firstChild() { return this.childNodes[0] || null; } get lastChild() { return this.childNodes[this.childNodes.length - 1] || null; }
+  get isConnected() { let n = this; while (n.parentNode) n = n.parentNode; return n === this.ownerDocument.documentElement; }
+  appendChild(c) { if (c.parentNode) c.parentNode.removeChild(c); c.parentNode = this; this.childNodes.push(c); return c; }
+  insertBefore(c, ref) { if (!ref) return this.appendChild(c); if (c.parentNode) c.parentNode.removeChild(c); const i = this.childNodes.indexOf(ref); if (i < 0) throw new Error('fake DOM: insertBefore of a non-child'); c.parentNode = this; this.childNodes.splice(i, 0, c); return c; }
+  removeChild(c) { const i = this.childNodes.indexOf(c); if (i < 0) throw new Error('fake DOM: removeChild of a non-child'); this.childNodes.splice(i, 1); c.parentNode = null; return c; }
+  contains(n) { for (; n; n = n.parentNode) if (n === this) return true; return false; }
+  get textContent() { return this.childNodes.map(c => c.textContent).join(''); }
+  set textContent(s) { for (const c of this.childNodes) c.parentNode = null; this.childNodes = []; this._html = ''; if (s !== '' && s !== null && s !== undefined) this.appendChild(new FakeText(this.ownerDocument, String(s))); }
+  get innerHTML() { return this._html; }
+  set innerHTML(s) {
+    this.textContent = ''; this._html = String(s);
+    const re = /<\/([a-zA-Z0-9-]+)\s*>|<([a-zA-Z0-9-]+)((?:\s+[a-zA-Z_:][-\w:.]*(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]+))?)*)\s*(\/?)>|([^<]+)|(<)/g;
+    const voids = new Set(['br', 'hr', 'img', 'input', 'wbr']);
+    let cur = this, m;
+    while ((m = re.exec(this._html))) {
+      if (m[1]) { if (cur !== this) cur = cur.parentNode; }
+      else if (m[2]) {
+        const el = this.ownerDocument.createElement(m[2]);
+        for (const a of m[3].matchAll(/([a-zA-Z_:][-\w:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g)) el.attrs.set(a[1], decode(a[2] ?? a[3] ?? a[4] ?? ''));
+        cur.appendChild(el);
+        if (!m[4] && !voids.has(el.localName)) cur = el;
+      } else cur.appendChild(new FakeText(this.ownerDocument, m[5] !== undefined ? decode(m[5]) : '<'));
+    }
+  }
+  querySelectorAll(sel) { const qs = parseSelector(sel), out = []; walk(this, n => { if (n !== this && n.nodeType === 1 && qs.some(q => matches(n, q))) out.push(n); }); return out; }
+  querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+  closest(sel) { const qs = parseSelector(sel); for (let n = this; n && n.nodeType === 1; n = n.parentNode) if (qs.some(q => matches(n, q))) return n; return null; }
+  addEventListener(t, fn, o) { this.listeners.push([t, fn, o]); } removeEventListener(t, fn) { this.listeners = this.listeners.filter(l => !(l[0] === t && l[1] === fn)); }
+  /* Dispatch TYPE from this element up through its ancestors; returns the event. */
+  dispatch(type, init) { const e = { type, target: this, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...init }; for (let n = this; n; n = n.parentNode) for (const [t, fn] of n.listeners || []) if (t === type) fn(e); return e; }
+  focus() { this.ownerDocument.activeElement = this; } blur() { if (this.ownerDocument.activeElement === this) this.ownerDocument.activeElement = this.ownerDocument.body; }
+  getBoundingClientRect() {
+    const rect = (left, top, width, height) => ({ left, top, width, height, right: left + width, bottom: top + height });
+    const p = this.parentNode;
+    if (this.localName === 'span' && p && p.nodeType === 1 && p.classList.contains('text')) return rect(0, 0, this.textContent.length * 8, 21);   // the metrics probe
+    if (this.classList.contains('ln')) return rect(0, p.children.indexOf(this) * 21, 600, 21);
+    return rect(0, 0, 600, 400);
+  }
+  get clientWidth() { return 600; } get clientHeight() { return 400; } get offsetWidth() { return 600; } get offsetHeight() { return this.classList.contains('ln') ? 21 : 400; } get clientTop() { return 0; }
+}
+function makeDocument() {
+  const doc = { nodeType: 9, listeners: [], hit: null };
+  doc.createElement = tag => new FakeElement(doc, tag);
+  doc.createTextNode = s => new FakeText(doc, s);
+  doc.documentElement = doc.createElement('html'); doc.body = doc.createElement('body'); doc.documentElement.appendChild(doc.body);
+  doc.activeElement = doc.body;
+  doc.getElementById = id => { let r = null; walk(doc.documentElement, n => { if (!r && n.nodeType === 1 && n.id === id) r = n; }); return r; };
+  doc.addEventListener = (t, fn) => { doc.listeners.push([t, fn]); }; doc.removeEventListener = () => {};
+  /* The element and caret under a point: whatever the test put in doc.hit (the view), so posFromPoint
+     falls back to the line rectangles. */
+  doc.elementFromPoint = () => doc.hit;
+  doc.caretPositionFromPoint = () => (doc.hit ? { offsetNode: doc.hit, offset: 0 } : null);
+  doc.defaultView = { document: doc, getComputedStyle: () => ({ lineHeight: '21px', paddingTop: '0px', paddingLeft: '0px', paddingRight: '0px' }), addEventListener: (t, fn) => { doc.listeners.push([t, fn]); }, removeEventListener: () => {}, getSelection: () => null };
+  return doc;
+}
+
 before(async () => {
   dir = makeDir();
   child = await startEdwind(dir);
@@ -96,6 +210,15 @@ test('R4.11 served boot: no frame, the shipped Scheme loaded, nothing read from 
   assert.ok(Ed.getBuffer('*scratch*') && Ed.getBuffer('*Messages*'), 'the local buffers');
   assert.equal(Ed.getBuffer('*scratch*').shared, undefined);
   assert.ok(L.isCommand(L.intern('describe-browser-keys')) && L.isCommand(L.intern('eval-in-frame')));
+});
+
+test('E3 H3 gap 4: served boot evaluates the shipped Scheme without buffers; the buffer list is *scratch* and *Messages*', () => {
+  assert.deepEqual(E.buffers.map(b => b.name).sort(), ['*Messages*', '*scratch*']);
+  assert.equal(Number(L.evalText('(length (buffer-list))')), 2);
+  /* The sources were evaluated all the same: emacs.scm, evil.scm, org.scm, markdown.scm (through org's require) and init.scm. */
+  for (const f of ['emacs', 'evil', 'org', 'markdown', 'notes-syntax', 'address', 'ai', 'init']) assert.equal(L.truthy(L.evalText(`(featurep '${f})`)), true, `(provide '${f})`);
+  assert.ok(L.isCommand(L.intern('markdown-todo-cycle')) && L.isCommand(L.intern('evil-normal-state')) && L.isCommand(L.intern('org-todo')));
+  assert.equal(Ed.getBuffer('emacs.scm'), null); assert.equal(Ed.getBuffer('init.scm'), null);
 });
 
 test('open, snap, typing becomes one edit batch per command, the ack lands and the server has the text', async () => {
@@ -336,4 +459,101 @@ test('killed and moved: a buffer killed on the server leaves the frame; a messag
   await until(() => !E.buffers.includes(b) || !b.shared, 'the kill');
   assert.ok(!sync.buffers.has(id));
   c.close();
+});
+
+test('E3 H3 gap 2: Ed.sync.close kills the local replica and moves the window showing it; a reopen is a fresh replica', async () => {
+  const id = note('cl.md', 'close me\n');
+  const b = await sync.open(id); show(b);
+  assert.ok(E.buffers.includes(b)); assert.equal(E.sel.buffer, b); assert.equal(E.current, b);
+  const n = E.buffers.length;
+  sync.close(id);
+  assert.equal(E.buffers.includes(b), false, 'the replica is killed');
+  assert.equal(E.buffers.length, n - 1);
+  assert.equal(sync.buffers.has(id), false); assert.equal(b.shared, false);
+  assert.notEqual(E.sel.buffer, b, 'the window shows another buffer'); assert.notEqual(E.current, b);
+  assert.ok(E.buffers.includes(E.sel.buffer));
+  /* Closing twice, or an id never opened, is a no-op. */
+  sync.close(id); sync.close('never-opened.md');
+  /* The server took the close: a sel from another client no longer reaches this one through the old replica. */
+  const b2 = await sync.open(id);
+  assert.notEqual(b2, b); assert.equal(b2.text, 'close me\n'); assert.ok(E.buffers.includes(b2));
+  /* A buffer object works as the argument too. */
+  sync.close(b2);
+  assert.equal(E.buffers.includes(b2), false); assert.equal(sync.buffers.has(id), false);
+  /* An open still on its way settles with an error when closed. */
+  const p = sync.open(note('cl2.md', 'x\n'));
+  sync.close('cl2.md');
+  await assert.rejects(p, e => e.code === 'closed');
+  assert.equal(E.buffers.some(x => x.id === 'cl2.md'), false);
+});
+
+test('E3 H3 gap 3: hooks.renderOverlay runs for every frame drawn, with that frame current, the selected frame last', async () => {
+  const doc = makeDocument();
+  const el1 = doc.createElement('div'), el2 = doc.createElement('div'); doc.body.appendChild(el1); doc.body.appendChild(el2);
+  const ba = await sync.open(note('o1.md', 'alpha one\n')), bb = await sync.open(note('o2.md', 'beta two\n'));
+  const f1 = Ed.makeFrame(el1, { buffer: ba, kind: 'card', fontSize: 13 }), f2 = Ed.makeFrame(el2, { buffer: bb, kind: 'card' });
+  assert.equal(E.frame, f1); assert.equal(E.frames.length, 2);
+  assert.ok(el1.classList.contains('edwin-frame') && el1.dataset.kind === 'card' && f1.el('input') && f1.el('windows') && f1.el('echo'));
+  /* Frames and windows are compared by identity only: a deep comparison would walk the whole window tree. */
+  const calls = [], prev = Ed.hooks.renderOverlay, order = () => calls.map(c => c.arg && c.arg.id);
+  Ed.hooks.renderOverlay = f => { calls.push({ arg: f, sel: E.sel, root: E.root, frame: E.frame }); if (prev) prev(f); };
+  try {
+    Ed.render();
+    assert.deepEqual(order(), [f2.id, f1.id], 'both frames, the selected one last');
+    assert.equal(calls[0].sel, f2.sel); assert.equal(calls[0].root, f2.wroot); assert.equal(calls[0].frame, f1, 'E.frame stays the selected frame');
+    assert.equal(calls[1].sel, f1.sel); assert.equal(calls[1].root, f1.wroot);
+    assert.match(f1.sel.view.textContent, /alpha one/); assert.match(f2.sel.view.textContent, /beta two/);
+    assert.ok(f1.sel.el.classList.contains('selected') && !f2.sel.el.classList.contains('selected'));
+    /* The popups stay with the selected frame: no corfu or snipe element was made in the other one. */
+    assert.equal(el2.querySelector('.corfu'), null); assert.equal(el2.querySelector('.snipe'), null);
+    /* Unchanged, the other frame is not drawn again; the selected one always is. (The first drawings move the
+       layout generation, for the window DOM and the echo's height, after the other frame's key was taken, so it
+       is drawn a few more times; then it rests.) */
+    for (let i = 0; i < 3; i++) Ed.render();
+    calls.length = 0; Ed.render();
+    assert.deepEqual(order(), [f1.id]);
+    /* An edit in the other frame's buffer draws it again, with itself current. */
+    Ed.applyOps(bb, [[0, '', 'B']], 'local'); calls.length = 0; Ed.render();
+    assert.deepEqual(order(), [f2.id, f1.id]);
+    assert.equal(calls[0].sel.buffer, bb);
+    assert.match(f2.sel.view.textContent, /Bbeta two/);
+    /* Selecting the other frame flips the order. */
+    Ed.selectFrame(f2); calls.length = 0; Ed.render();
+    assert.deepEqual(order(), [f1.id, f2.id]);
+    await settled(bb);
+  } finally { Ed.hooks.renderOverlay = prev; f1.destroy(); f2.destroy(); sync.close(ba); sync.close(bb); }
+  assert.equal(E.frames.length, 0); assert.equal(E.frame, null);
+});
+
+test('E3 H3 gap 5: hooks.mouseDown gets the event as third argument; readFile falls back to the shipped files by basename', async () => {
+  const doc = makeDocument(); const el = doc.createElement('div'); doc.body.appendChild(el);
+  const text = 'line one\nline two\nline three\n';
+  const b = await sync.open(note('mouse.md', text));
+  const f = Ed.makeFrame(el, { buffer: b, kind: 'card' });
+  Ed.render();
+  doc.hit = f.sel.view;
+  const seen = [], prev = Ed.hooks.mouseDown;
+  Ed.hooks.mouseDown = (bb, p, ev) => { seen.push({ bb, p, ev }); if (prev) prev(bb, p, ev); };
+  try {
+    const ev = f.el('windows').dispatch('mousedown', { button: 0, shiftKey: false, clientX: 20, clientY: 30 });
+    assert.equal(ev.defaultPrevented, true);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].bb, b);
+    assert.equal(seen[0].p, text.indexOf('\n', 9), 'y = 30 px is the second line: point goes to its end');
+    assert.equal(seen[0].ev, ev, 'the event is the third argument');
+    assert.ok(b.pt === text.indexOf('\n', 9) || b.pt === text.indexOf('\n', 9) - 1, 'the default handler (through the chained hooks) moved point; Normal state keeps it off the newline');
+    /* A two-argument hook keeps working. */
+    Ed.hooks.mouseDown = (bb, p) => { bb.pt = p; };
+    f.el('windows').dispatch('mousedown', { button: 0, shiftKey: false, clientX: 0, clientY: 5 });
+    assert.ok(b.pt === text.indexOf('\n') || b.pt === text.indexOf('\n') - 1, 'the first line');
+  } finally { Ed.hooks.mouseDown = prev; f.destroy(); sync.close(b); }
+  /* readFile: a .scm name under a directory that does not exist answers with the shipped file; others stay null. */
+  const shipped = fs.readFileSync(path.join(EDWIN, 'scm/notes-syntax.scm'), 'utf8');
+  assert.equal(L.S.hooks.readFile('/no/such/dir/notes-syntax.scm'), shipped);
+  assert.equal(L.S.hooks.readFile('/no/such/dir/absent.scm'), null);
+  assert.equal(L.S.hooks.readFile('/no/such/dir/notes-syntax.txt'), null);
+  /* markdown.js's edwin:scm entry still answers. */
+  assert.equal(L.S.hooks.readFile('edwin:scm/notes-syntax.scm'), shipped);
+  /* So (load "<any dir>/address.scm") resolves to the shipped file. */
+  assert.equal(L.truthy(L.evalText('(begin (load "/no/such/dir/address.scm") (procedure? address-name))')), true);
 });

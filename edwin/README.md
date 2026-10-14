@@ -131,7 +131,7 @@ Choices E1 made where the spec left one open, and where it had to deviate:
 - **`CRASH_ROUNDS`** sets the kill count of the crash suite (default 1,000); `OT_RUNS` the fast-check runs
   (default 10,000); `EDWIND_LOG=1` streams edwind's log in the test harness.
 
-## Step E2: the Lisp machine (in review)
+## Step E2: the Lisp machine (done)
 
 E2 makes the server image a Lisp machine (spec §4 after E0, §5 sessions, §11, §12, R15.6): the evaluator runs
 in generator mode so threads can block, be preempted, time out and stop in a debugger; every `call{form}` and
@@ -260,3 +260,101 @@ Choices E2 made where the spec left one open, and where it had to deviate:
   and the confirmation flow (R12.10–R12.12), `gptel`, `gptel-rewrite` and presets (R12.9) on the server; a
   backend defined in `init.scm` runs before the module loads (define it after, or on feature `models`).
   Thread batches carry an undo group (`undo: {g: "thread-…"}`) so gptel output undoes like any writer's.
+
+## Step E3: frames in the browser (in review)
+
+E3 puts Edwin into the page cards (spec §9, §10, R8.16–R8.20, R13.7): with `edit.frames` on, every page card
+is an Edwin frame on a shared buffer served by edwind, the buffer the agent tools, the notes index and the
+`wb` CLI already share. Nothing moves until the flag is on; with it off the CodeMirror page is as before and
+the whole browser suite passes in both modes (`node tests/ui.mjs <root>` and `WB_FRAMES=1 node tests/ui.mjs
+<root>`). `nix/checks.nix` gains `edit-anchors`, `edwin-markdown` and `edit-frame`, and the `ui` check runs
+the suite in both modes.
+
+Layout added in E3: `src/sync.js` (the replica client: `Ed.sync`, `Ed.bootServed`), frames in
+`src/editor-core.js` (`Frame`, `Ed.makeFrame`, one text-change path `applyOps`) and `src/editor-prims.js`
+(frame commands, `Ed.setLeaderKey`, served boot), `src/markdown.js` and `scm/markdown.scm` (markdown-mode),
+`server/anchors.mjs` (shared anchors and the frame commands), `console/index.html` (the `/edwin/` console),
+`web/app.js`'s frames block (lazy frames, keys, migration, R13.7 tools), and in wb-web `relay_edit.rs` (the
+`/edit` relay), the `frames` key, `/api/info` `edit`/`editUp`, `/edwin/` static files and the board guard.
+
+The wire (§7, R9.16–R9.17): each tab opens one WebSocket to `/edit`; wb-web opens one Unix connection to
+`edit.sock` per tab and copies text frames to lines and lines to frames, parsing nothing. Close codes: 1003 for
+a binary frame or a frame holding a newline, 1009 over 16 MiB either way, 1011 when edwind closes, 1012 when
+wb-web stops, 1013 with no edwind. The browser sends its own `hello` with `kind: "frame"`.
+
+Frames (R9.1–R9.15): a `Frame` owns its window tree, minibuffer, echo area, input textarea and popups; `E.root`,
+`E.sel`, `E.mini`, `E.echo` are accessors onto the selected frame, so a frame-less runtime (edwind, the tests)
+keeps one implicit tree. `Ed.makeFrame(el, {buffer, kind: "card"|"console", fontSize})` builds the DOM
+(`.edwin-frame > .ed-windows + .ed-echo + .ed-presence + textarea.ed-input`, a menubar for the console) and
+injects one stylesheet mapping Edwin's faces and markdown-mode's `--md-*` variables onto the board's tokens,
+re-rendering on `data-theme` changes; geometry is read through `getBoundingClientRect` so a frame under the
+canvas transform places point and popups correctly. The page keeps a frame only for cards in or within one
+viewport of the view at zoom ≥ 0.45, at most 24 (LRU), and shows the first 12 raw lines otherwise; a replica
+off-screen for 5 min is closed. Enter on a selected card focuses its frame; inside it every key is Edwin's
+except the board leader; leader then Esc leaves (`Ed.hooks.leaveFrame`); Esc alone is Evil's. The mode line
+shows `•` (unacked), `⚠ offline`, `⚠ disk` and `⟳` (a pending server call); presence from other writers'
+`sel` is drawn with a colour per writer, an agent's cursor fading 5 s after its last edit.
+
+The replica (R6.3–R6.23, §7): every text change goes through `applyOps(b, ops, origin)` (rope, markers, log,
+change hooks with `(edit-origin)`, redisplay); local edits are grouped per command (an Evil insert session or a
+run of self-inserts shares a group) and sent as one unacked batch with a queue behind it, composed while
+waiting; incoming batches are transformed against inflight and queue with `ot.js`, as the `ot-sim` model;
+undo on a shared buffer is by group, inverse-transformed through history (`undo: {g, of}`), with the server's
+`undo` command as the fallback for groups before the kept history, while local buffers keep snapshot undo.
+Hash checks every 50 versions, `bad_edit`, `stale_base`, `read_only`, `slow_client`, `shutting_down` and a
+reconnect follow §7; a divergence or a stale base puts the local text in `<name>~offline-<time>`; an image
+epoch change hands the unsent batches to the page, which reloads the runtime with them.
+
+Served boot (R4.11–R4.12): `Ed.bootServed({sources, transport, device, cid, pending})` boots from the eight
+Scheme files edwind ships (`/edwin/scm/`), never from browser storage (an in-memory store replaces it),
+connects, evaluates the user's `init.scm` from the `user-init` command, replays the image (`image?{from: 0}`;
+`on-server` forms skipped), defines the server-only primitives as stubs that signal `server-only`, and binds
+`wiki-candidates` (`capf-candidates`), `notes-directory`, `wiki-follow-function` and `resolve-ref-function`.
+A `(:where 'server)` command runs on the server without blocking the command loop; `M-:` and friends evaluate
+on the server in served mode, `M-x eval-in-frame` locally.
+
+Anchors (R9.12): edwind holds a page's anchors as shared `after` markers (an insert at the anchor advances it,
+as CodeMirror's `mapPos` did), moved by every sequenced edit, journaled as one `{"t":"a"}` line per change and
+after disk batches, relocated after a disk revert by the prefix+quote rule the page used, sent in `meta` with
+`ver`. Commands `anchor-add` (returns the id, which may differ from the requested one), `anchor-remove`,
+`anchors`; primitives `anchor-add!`, `anchor-remove!`, `buffer-anchors`. Ink strokes are anchored as
+`ink-<stroke>`; the page draws chips and ink at `frame.lineTop(pos)`.
+
+markdown-mode (§10): faces `markdown-*` for the parity table, wiki links and block refs (the resolved text
+shown except on the point's line), anchors, `key:: value` fields, priorities; task keywords come from ONE
+table in `scm/notes-syntax.scm` shared with Org (`notes-set-task-keywords!` changes both); commands
+`markdown-outline-enter` (the first RET on an empty item outdents; at level 0 it ends the list),
+`markdown-demote`/`promote`, `markdown-todo-cycle` (`C-c C-t`, `S-<right>`/`S-<left>`), folding, `]] [[ gj gk`,
+`wiki-follow`, `wiki-copy-ref`, `wiki-capf`, `journal-today`, imenu, `markdown-unlinked-mentions` (server).
+Font-lock is incremental: 0.6 ms median per keystroke on a 10,000-line page (budget 2 ms).
+
+Migration (R8.16–R8.20, Q3): with the flag on, a page node without `buf` is migrated once on load to
+`notes/<slug>.md` under notesDir (`-2`, `-3`… on a clash), its anchors re-created at their relocated
+positions, then `buf` is set and `text`/`anchors` dropped; wb-web's PUT guard keeps `buf` and strips `text`
+when an older tab writes the board, and copies the board to `<host>.pre-edwind.json` once before the first
+`buf` arrives.
+
+Choices E3 made where the spec left one open, and where it had to deviate:
+- **The focus tab is the enlarged card with its live frame**, not a second frame; the Editor view (Alt-4) is
+  the second frame on the same buffer. Font size in cards is fixed at 13 px (no per-card size setting exists).
+- **OT undo applies to shared buffers only**; `*scratch*`, `*Messages*` and config buffers keep the snapshot
+  undo, so the standalone page and the headless suites are unchanged. Redo is a new plain group with the
+  inverse ops transformed through later batches. A thread's edits made for a frame come back as a synthetic
+  group `server-<ver>`.
+- **A snapshot that arrives while batches are pending is not a loss when its text equals the acknowledged
+  text** (edwind restarted without history): the pending batches are resent.
+- **The `/edit` relay does not gate on wb-web's control connection**: it connects to `editSocket` and closes
+  1013 on failure, so frames are not refused while the control connection backs off.
+- **Anchors are `after` markers** (the contract text said `before`; CodeMirror's `mapPos(pos, 1)` behaves as
+  `after`). An id already in use yields a server-chosen id; the caller reads it from the result.
+- **The board guard treats `buf: null` as absent** and protects only nodes the PUT carries (a deletion stays a
+  deletion); the pre-edwind copy is also made when a new node first carries `buf`.
+- **`meta` carries `ver`** (not in the §7.3 table) so a frame can map anchor positions through its unacked
+  edits. `sel` is sent from the post-command hook, throttled to 50 ms.
+- **markdown.scm loads through org.scm's trailing `(require 'markdown)`**, after Org and before `init.scm`;
+  Setext headings fold as paragraphs; emphasis markers stay visible as `markdown-markup`.
+- **The `(image-server?)` predicate is `#f` in a frame**; `edwin-import-local-config` (importing the old
+  browser-stored configuration into `~/.config/edwin/`) is not written: served mode simply never reads it.
+- **Not in E3**: K4 (Edwin keymaps in the board's conflict checker) waits for the keymaps PR; a display-text
+  mechanism in the renderer (block-ref text is a DOM post-pass) and an `imenuItems` hook are left for later.
+

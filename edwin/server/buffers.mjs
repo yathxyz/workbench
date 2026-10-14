@@ -12,6 +12,7 @@ import { Journal, readJournal, header as journalHeader, Index, randomId, jidPath
 import { Sequencer } from './sequencer.mjs';
 import { Watcher, diffOps, merge3 } from './watch.mjs';
 import { restore as restoreAnchors, record as anchorsRecord, publicAnchors } from './anchors.mjs';
+import { ensureNoteDir } from './notes.mjs';
 
 const require = createRequire(import.meta.url);
 const OT = require('../src/ot.js');
@@ -182,6 +183,10 @@ export class Buffers {
     if (existing) return existing;
     const mv = this.moved.get(id);
     if (mv && Date.now() - mv.at < MOVED_TTL_MS) return { moved: mv.to };
+    /* A new note under a directory that does not exist yet (R6.1 relative ids only): the directories are made
+       inside notesDir with the walk notes-append uses; elsewhere a missing directory stays no_buffer. */
+    if (create && typeof id === 'string' && id.includes('/') && !/^(\/|~|name:)/.test(id) && !id.includes('\0') && !id.split('/').some(s => s === '' || s === '.' || s === '..'))
+      ensureNoteDir(id, this.auth.realNotesDir(), this.auth);
     let p;
     try { p = this.auth.parseId(id); } catch (e) { if (e instanceof PathError) throw new ProtoError(e.code, e.message); throw e; }
     if (p.kind === 'name') {

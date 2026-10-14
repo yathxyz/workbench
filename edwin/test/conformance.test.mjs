@@ -480,6 +480,38 @@ test('R16.16 the Node flags of bin/edwind are in effect: no eval, frozen intrins
   assert.equal(msgs.length, 4); for (const m of msgs) assert.match(m, /edwind never starts processes/);
 });
 
+test('open{create} of a notesDir-relative id makes the missing directories inside notesDir only (E3 H3 gap 1)', async () => {
+  const a = await client();
+  /* deep/er/ does not exist: open creates it under the real notes directory; the file itself appears on save. */
+  const o = await a.open('deep/er/new.md', { create: true });
+  assert.equal(o.error, null, JSON.stringify(o.error)); assert.equal(o.text, ''); assert.equal(o.ver, 0);
+  assert.ok(fs.statSync(path.join(dir.dirs.notes, 'deep/er')).isDirectory(), 'the directories were made');
+  assert.equal(fs.existsSync(path.join(dir.dirs.notes, 'deep/er/new.md')), false, 'no file before the save');
+  const ack = await a.edit('deep/er/new.md', o.ver, [[0, '', 'new\n']]); assert.equal(ack.t, 'ack');
+  const saved = await a.request({ t: 'save', buf: 'deep/er/new.md' });
+  assert.deepEqual(saved.value, { buf: 'deep/er/new.md', ver: ack.ver, saved: true });
+  assert.equal(fs.readFileSync(path.join(dir.dirs.notes, 'deep/er/new.md'), 'utf8'), 'new\n');
+  /* Without create a missing directory is still no_buffer, and nothing is made. */
+  assert.equal((await a.open('deep/none/y.md')).error.code, 'no_buffer');
+  assert.equal(fs.existsSync(path.join(dir.dirs.notes, 'deep/none')), false);
+  /* A symlink out of notesDir on the way: refused, and nothing is created at its target. */
+  const outside = fs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'edwind-linkout-'));
+  fs.symlinkSync(outside, path.join(dir.dirs.notes, 'linkout'));
+  const r = await a.open('linkout/new/x.md', { create: true });
+  assert.ok(r.error && ['bad_request', 'refused_path'].includes(r.error.code), JSON.stringify(r.error));
+  assert.deepEqual(fs.readdirSync(outside), [], 'nothing created outside notesDir');
+  fs.rmSync(outside, { recursive: true, force: true });
+  /* A dangling symlink on the way is refused too. */
+  fs.symlinkSync(path.join(dir.dirs.notes, 'nowhere'), path.join(dir.dirs.notes, 'dangling'));
+  const d = await a.open('dangling/x.md', { create: true });
+  assert.ok(d.error && ['bad_request', 'refused_path'].includes(d.error.code), JSON.stringify(d.error));
+  assert.equal(fs.existsSync(path.join(dir.dirs.notes, 'nowhere')), false);
+  /* Outside notesDir the behaviour is unchanged: a missing directory is no_buffer even with create. */
+  assert.equal((await a.open(path.join(dir.dirs.home, 'nodir/z.md'), { create: true })).error.code, 'no_buffer');
+  assert.equal(fs.existsSync(path.join(dir.dirs.home, 'nodir')), false);
+  a.close();
+});
+
 test('every §7.8 code is one edwind knows', () => {
   assert.deepEqual(CODES.sort(), ['bad_edit', 'bad_id', 'bad_request', 'no_buffer', 'not_text', 'proto', 'read_only', 'refused_path', 'shutting_down', 'slow_client', 'stale_base', 'too_large']);
 });

@@ -2183,9 +2183,13 @@ function echoMoved(echo) {
   if (h !== echo._h) { echo._h = h; sizeChanged(); }
 }
 /* Redisplay: every frame with page parts is drawn; a frame that is not selected is drawn only when
-   what it shows changed since its last drawing. */
+   what it shows changed since its last drawing. The selected frame is drawn last: the overlay hooks run
+   for every frame drawn (with that frame current), and the ones that place the popups (corfu, snipe) on
+   E.frame then leave them placed for the selected frame. */
 function render() {
-  for (const f of E.frames) if (f.root && f.wroot && f.sel) renderFrame(f);
+  const sel = E.frame, drawable = f => f.root && f.wroot && f.sel;
+  for (const f of E.frames) if (f !== sel && drawable(f)) renderFrame(f);
+  if (sel && drawable(sel)) renderFrame(sel);
 }
 function frameKey(f) {
   let k = (f.mini ? 'm' : '') + f.echo + '|' + f.miniFlash + '|' + E.metricsGen + '|' + E.sizeGen + '|' + (hooks.statusKey ? hooks.statusKey() : '');
@@ -2230,7 +2234,8 @@ function renderOne(f) {
     else setEcho(echo, text, false);
   }
   f.root.classList.toggle('unfocused', !f.focused);
-  if (f === E.frame && hooks.renderOverlay) hooks.renderOverlay();
+  /* Display overlays (block-ref text, the popups) for this frame: F is current (withFrame) for the duration. */
+  if (hooks.renderOverlay) hooks.renderOverlay(f);
   if (hooks.renderPresence) hooks.renderPresence(f);
 }
 /* The client rect of LEN characters at buffer position P in window W, from the drawn lines (null when
