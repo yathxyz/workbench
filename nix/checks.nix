@@ -53,6 +53,37 @@ let
       cp -r node_modules $out/
     '';
   };
+  uiCheck =
+    frames:
+    pkgs.runCommand "workbench-ui${lib.optionalString frames "-frames"}"
+      {
+        nativeBuildInputs = [
+          pkgs.nodejs
+          pkgs.python3
+          pkgs.bashInteractive
+          pkgs.coreutils
+          pkgs.caddy
+          workbench
+          workbench.fake
+        ];
+        WB_PLAYWRIGHT = "${pkgs.playwright-driver}/index.mjs";
+        WB_HARNESS = "${tests}/harness.py";
+        WB_WEB_ROOT = "${workbench-web}";
+        # Chromium and its headless shell; the default launch uses the headless shell.
+        PLAYWRIGHT_BROWSERS_PATH = pkgs.playwright-driver.browsers.override {
+          withFirefox = false;
+          withWebkit = false;
+        };
+        PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
+        # Fallback fonts only: the page must render with the fonts wb-web serves.
+        FONTCONFIG_FILE = pkgs.makeFontsConf { fontDirectories = [ pkgs.liberation_ttf ]; };
+      }
+      ''
+        export HOME=$TMPDIR BASH=${pkgs.bashInteractive}/bin/bash
+        ${lib.optionalString frames "export WB_FRAMES=1"}
+        node ${tests}/ui.mjs
+        touch $out
+      '';
 in
 {
   package = workbench;
@@ -256,36 +287,13 @@ in
 
   # tests/ui.mjs (the frontend's) in headless Chromium from nixpkgs. It starts the harness from
   # WB_HARNESS and imports Playwright from WB_PLAYWRIGHT. The browser reaches the harness's Caddy
-  # through ui.mjs's own 127.0.0.1:18443 forwarder, which accepts only this build's uid.
-  ui =
-    pkgs.runCommand "workbench-ui"
-      {
-        nativeBuildInputs = [
-          pkgs.nodejs
-          pkgs.python3
-          pkgs.bashInteractive
-          pkgs.coreutils
-          pkgs.caddy
-          workbench
-          workbench.fake
-        ];
-        WB_PLAYWRIGHT = "${pkgs.playwright-driver}/index.mjs";
-        WB_HARNESS = "${tests}/harness.py";
-        WB_WEB_ROOT = "${workbench-web}";
-        # Chromium and its headless shell; the default launch uses the headless shell.
-        PLAYWRIGHT_BROWSERS_PATH = pkgs.playwright-driver.browsers.override {
-          withFirefox = false;
-          withWebkit = false;
-        };
-        PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
-        # Fallback fonts only: the page must render with the fonts wb-web serves.
-        FONTCONFIG_FILE = pkgs.makeFontsConf { fontDirectories = [ pkgs.liberation_ttf ]; };
-      }
-      ''
-        export HOME=$TMPDIR BASH=${pkgs.bashInteractive}/bin/bash
-        node ${tests}/ui.mjs
-        touch $out
-      '';
+  # through ui.mjs's own 127.0.0.1:18443 forwarder, which accepts only this build's uid. The suite
+  # runs once per page editor: `ui` with CodeMirror pages, `ui-frames` with pages as Edwin frames
+  # (WB_FRAMES=1: the harness writes web.json frames: true and the frames section runs; edwind comes
+  # from the workbench package on PATH). Two checks rather than one run after the other: each run
+  # takes a browser session of several minutes, and the sandbox gives each its own loopback.
+  ui = uiCheck false;
+  ui-frames = uiCheck true;
 
   # lib.adapterCheck against the stub, so the probe and its plumbing run here too; the real
   # adapters run in the consumer's flake.

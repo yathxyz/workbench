@@ -18,7 +18,15 @@
 //   - frames painted (requestAnimationFrame ticks) and the longest gap between two.
 // It also asserts the behaviours the walk passes through (ok/FAIL lines, as ui.mjs prints them): no toast and no
 // console error at load without a model, Enter on an active shell puts the keyboard in that shell, Shift-Enter opens
-// it full screen. The exit status is 0 only when every check passed; timings never fail the run, they are reported.
+// it full screen. The exit status is 0 only when every check passed; timings never fail the run, they are reported,
+// except the frames budgets below.
+//
+// WB_FRAMES=1 runs the same walk with pages as Edwin frames (harness --frames) and adds the `frames` scenario on the
+// many-card board: the frame runtime's boot time (performance measure fr-boot), the live frame count against the cap
+// (at most 24, R9.5), and keystroke latency in a focused frame with at least 10 frames live (20 keystrokes: keydown
+// to the character in the frame's DOM, asserted against the §16.5 budget p95 <= 16 ms, and keydown to the animation
+// frame that paints it, recorded). The JSON output carries them under `frames`; the budgets without a number in the
+// spec (boot against the CodeMirror baseline) are recorded, not asserted: compare two JSON files.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -128,6 +136,19 @@ async function scenario(name, run) {
   return r;
 }
 const C = (f, a) => p.evaluate(f, a);
+// The keyboard at the end of a page's text, inserting: the CodeMirror view's selection, or the page's Edwin frame
+// (frFocus makes the frame whatever the viewport says) and Evil's G then A.
+async function pageEnd(id) {
+  if (FRAMES) {
+    await C(id => { const C_ = window.__canvas; document.activeElement?.blur(); C_.frFocus(C_.S.nodes[id]); }, id);
+    await until(() => C(id => !!window.__canvas.live[id]?.frame?.focused, id), 15000);
+    await p.keyboard.press('Escape'); await p.keyboard.press('Shift+G'); await p.keyboard.press('Shift+A');
+  } else {
+    await C(id => { const v = window.__canvas.live[id].view; v.dispatch({ selection: { anchor: v.state.doc.length } }); v.focus(); }, id);
+    await p.keyboard.press('Escape'); await p.keyboard.press('A');   // vim: append at the end of the line
+  }
+}
+const frames = FRAMES ? { boot: null, live: null, cap: null, keystroke: null } : null;
 const termText = id => C(id => { const b = window.__canvas.live[id]?.term?.buffer.active; if (!b) return ''; const out = []; for (let i = 0; i < b.length; i++) out.push(b.getLine(i).translateToString(true)); return out.join('\n'); }, id);
 const addTerm = (name, x = 200, y = 200) => C(([name, x, y]) => window.__canvas.addNode({ kind: 'term', backend: 'pty', name, x, y, w: 640, h: 320, env: {} }).id, [name, x, y]);
 
@@ -135,8 +156,16 @@ try {
   // ---- load
   await scenario('load the board', async () => {
     const t = Date.now(); await p.goto(ORIGIN + '/'); await until(() => C(() => window.__canvas?.BOOTED), 20000);
-    const booted = Date.now() - t; await sleep(2500);   // the startup toasts fire within 1.5 s of boot
-    return `BOOTED after ${booted} ms`;
+    const booted = Date.now() - t;
+    let fr = '';
+    if (FRAMES) {   // the frame runtime boots beside the board; replicas open once /edit is online
+      await until(() => C(() => window.__perf?.frame?.ready && window.__perf.frame.online), 30000);
+      const ready = Date.now() - t, m = await C(() => performance.getEntriesByName('fr-boot')[0]?.duration ?? null);
+      frames.boot = { booted, ready, frBoot: m == null ? null : +m.toFixed(0) };
+      fr = ` · frame runtime ready after ${ready} ms (fr-boot ${frames.boot.frBoot} ms)`;
+    }
+    await sleep(2500);   // the startup toasts fire within 1.5 s of boot
+    return `BOOTED after ${booted} ms${fr}`;
   });
   const toasts = await C(() => window.__perf.toasts.map(t => t.text));
   check('load: no toast about a model or an API key when the server has none', !toasts.some(t => /claude|api.?key|anthropic|model/i.test(t)), JSON.stringify(toasts));
@@ -187,11 +216,10 @@ try {
     check('the flood reaches its end marker', !!done);
   });
 
-  // ---- a page (CodeMirror buffer)
+  // ---- a page (a CodeMirror buffer, or an Edwin frame)
   const pg = await C(() => window.__canvas.addNode({ kind: 'buffer', name: 'perf-page', x: 1000, y: 260, w: 520, h: 420, text: '# perf\n' + Array.from({ length: 400 }, (_, i) => `- line ${i} with a [[link ${i % 20}]] and words`).join('\n') }).id);
   await C(id => { const C_ = window.__canvas; C_.jumpNode(C_.S.nodes[id]); }, pg); await sleep(700);
-  await C(id => { const v = window.__canvas.live[id].view; v.dispatch({ selection: { anchor: v.state.doc.length } }); v.focus(); }, pg);
-  await p.keyboard.press('Escape'); await p.keyboard.press('A');   // vim: append at the end of the line
+  await pageEnd(pg);
   await scenario('type 200 characters into a page', async () => { await p.keyboard.type(' typing in a page, word after word '.repeat(6).slice(0, 200), { delay: 8 }); });
   await p.keyboard.press('Escape'); await C(() => document.activeElement?.blur());
 
@@ -228,8 +256,7 @@ try {
   await C(id => window.__canvas.jumpNode(window.__canvas.S.nodes[id]), pg); await sleep(800);
   await scenario(`idle 3 s at reading zoom over ${CARDS + 20} cards`, async () => { await sleep(3000); });
   await scenario(`type into a page with ${CARDS} more cards`, async () => {
-    await C(id => { const v = window.__canvas.live[id].view; v.dispatch({ selection: { anchor: v.state.doc.length } }); v.focus(); }, pg);
-    await p.keyboard.press('Escape'); await p.keyboard.press('A');
+    await pageEnd(pg);
     await p.keyboard.type(' more typing on a big board '.repeat(4).slice(0, 100), { delay: 8 });
   });
   // At a person's pace the keys pause long enough for the board's cross-page refresh (backlinks, refs) between them.
@@ -237,15 +264,57 @@ try {
     await p.keyboard.type(' at a human pace, key by key.'.slice(0, 30), { delay: 150 });
     await p.keyboard.press('Escape');
   });
+  if (FRAMES) {
+    // ---- frames (§16.5): the live frame cap with the bulk pages in view, then keystroke to paint in one of them
+    await scenario(`frames: ${Math.min(PAGES, 20)} pages in view, keystroke to paint`, async () => {
+      // the bulk grid has 12 columns of 440 x 340 cards; at z = 0.6 the viewport holds 6 columns of 5 rows of them
+      await C(() => { const C_ = window.__canvas, z = 0.6; C_.S.cam.z = z; C_.S.cam.x = 3250 - (innerWidth / 2) / z; C_.S.cam.y = 920 - (innerHeight / 2) / z; C_.applyCam(); C_.frSchedule(); });
+      const live = await until(() => C(() => { const f = window.__perf.frame; return f.live >= Math.min(10, f.cap) ? f.live : null; }), 20000);
+      await sleep(800);
+      frames.live = await C(() => window.__perf.frame.live); frames.cap = await C(() => window.__perf.frame.cap);
+      check('frames: at most 24 frames are live with the bulk pages in view (R9.5)', frames.live <= frames.cap && frames.cap === 24, JSON.stringify({ live: frames.live, cap: frames.cap }));
+      check('frames: at least 10 frames are live for the keystroke budget (§16.5)', frames.live >= 10, JSON.stringify({ live, now: frames.live }));
+      const bulk0 = await C(() => Object.values(window.__canvas.S.nodes).find(n => n.name === 'bulk0').id);
+      await pageEnd(bulk0);
+      // Every keystroke's time from keydown to the animation frame after the character is in the frame's lines: the
+      // mutation observer sees the DOM change, the next requestAnimationFrame callback runs just before the paint of it
+      // (performance.now() there, not the callback's timestamp, which is the frame's start and can precede the key).
+      await C(id => {
+        const K = window.__keys = { down: {}, dom: {}, paint: {} };
+        document.addEventListener('keydown', e => { if (e.key.length === 1 && !(e.key in K.down)) K.down[e.key] = performance.now(); }, true);
+        const host = document.querySelector(`.node[data-id="${id}"] .fr-host`);
+        new MutationObserver(() => { const t = performance.now(), text = host.textContent; for (const ch of Object.keys(K.down)) if (!(ch in K.dom) && text.includes('~' + ch)) { K.dom[ch] = t; requestAnimationFrame(() => { K.paint[ch] = performance.now(); }); } }).observe(host, { subtree: true, childList: true, characterData: true });
+      }, bulk0);
+      await p.keyboard.type(' ~'); await sleep(200);
+      const chars = 'ABCDEFGHIJKLMNOPQRST';
+      for (const ch of chars) { await p.keyboard.type(ch); await sleep(60); await p.keyboard.press('Backspace'); await sleep(40); }
+      await sleep(300);
+      const K = await C(() => window.__keys);
+      // Two numbers per key: to the frame's DOM (the runtime's render work) and to the next animation frame callback
+      // (the paint, which waits for the frame boundary: at 60 Hz that wait alone is up to 16.7 ms, so the budget
+      // "keystroke to pixels p95 <= 16 ms" is held to the render work fitting in one frame: DOM p95 <= 16 ms; the
+      // paint-inclusive figure is recorded).
+      const stats = xs => { const got = xs.filter(x => x != null); return { samples: got.length, median: pct(got, 0.5), p95: pct(got, 0.95), max: pct(got, 1) }; };
+      const dom = [...chars].map(ch => K.dom[ch] != null && K.down[ch] != null ? +(K.dom[ch] - K.down[ch]).toFixed(1) : null);
+      const paint = [...chars].map(ch => K.paint[ch] != null && K.down[ch] != null ? +(K.paint[ch] - K.down[ch]).toFixed(1) : null);
+      frames.keystroke = { dom: { ...stats(dom), lat: dom }, paint: { ...stats(paint), lat: paint } };
+      check('frames: every one of the 20 measured keystrokes reached the frame\'s lines and was painted', frames.keystroke.dom.samples === chars.length && frames.keystroke.paint.samples === chars.length, JSON.stringify(frames.keystroke));
+      check('frames: keystroke to the frame\'s DOM p95 <= 16 ms in a focused frame on the many-card board (§16.5, A8: the render work fits one frame)', frames.keystroke.dom.samples === chars.length && frames.keystroke.dom.p95 <= 16, JSON.stringify(frames.keystroke));
+      await p.keyboard.press('Escape'); await C(() => document.activeElement?.blur());
+      return `${frames.live} live frames (cap ${frames.cap}) · keystroke to DOM median ${frames.keystroke.dom.median} p95 ${frames.keystroke.dom.p95} ms · to paint median ${frames.keystroke.paint.median} p95 ${frames.keystroke.paint.p95} max ${frames.keystroke.paint.max} ms`;
+    });
+  }
   await sleep(1500);   // the board save settles
   await scenario(`reload the board with ${CARDS + 20} cards`, async () => {
     const t = Date.now(); await p.reload(); await until(() => C(() => window.__canvas?.BOOTED), 30000);
-    const booted = Date.now() - t; await sleep(1500); return `BOOTED after ${booted} ms`;
+    const booted = Date.now() - t;
+    if (FRAMES) await until(() => C(() => window.__perf?.frame?.ready && window.__perf.frame.online), 30000);
+    await sleep(1500); return `BOOTED after ${booted} ms`;
   });
   check('the reload keeps every card', await C(N => Object.values(window.__canvas.S.nodes).filter(n => /^bulk\d+$/.test(n.name)).length === N, CARDS));
   check('no page error during the walk', !errors.length, JSON.stringify(errors.slice(0, 5)));
 } finally {
-  if (JSON_OUT) fs.writeFileSync(JSON_OUT, JSON.stringify({ when: new Date().toISOString(), cards: CARDS, pages: PAGES, results, errors, http }, null, 1));
+  if (JSON_OUT) fs.writeFileSync(JSON_OUT, JSON.stringify({ when: new Date().toISOString(), cards: CARDS, pages: PAGES, frames, results, errors, http }, null, 1));
   await browser.close(); harness.stdin.end(); fwd.close();
 }
 console.log(`\nFAILS: ${JSON.stringify(fails)}`);

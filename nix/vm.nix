@@ -52,6 +52,8 @@ in
           publicOrigin = "http://wb.test";
           firewall.interface = "eth1";
           proxySecretFile = "${pkgs.writeText "proxy-secret" secret}";
+          # edwind runs by default (edit.enable); frames switches the board editor and shows in /api/info (R9.20).
+          edit.frames = true;
           agents.stub = {
             label = "Stub";
             package = self.packages.${pkgs.stdenv.hostPlatform.system}.fake-acp;
@@ -412,6 +414,12 @@ in
           wb.wait_for_open_port(8090, WB_IP)
           assert main_pid("workbench-edit") == edit_pid, "the web restart touched edwind"
           assert main_pid("workbench-hub") == hub_pid_before, "the web restart touched the hub"
+
+          # R9.20: with edit.frames on, /api/info reports edit: true (pages are Edwin frames) and editUp: true
+          # (wb-web reaches edwind over edit.sock after both restarts).
+          info = json.loads(proxy.succeed("curl -sf http://wb.test/api/info"))
+          assert info["edit"] is True, info
+          assert info["editUp"] is True, info
 
           # R16.12: another uid cannot reach edit.sock (the directory is 0700), and wb refuses a socket it
           # does not own before sending anything.
