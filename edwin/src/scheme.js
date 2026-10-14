@@ -2078,6 +2078,9 @@ function loadFile(path, env) {
 function def(name, fn, opts) {
   fn.procName = name;
   if (opts) { if (opts.doc) fn.doc = opts.doc; if (opts.args) fn.params = opts.args; if (opts.interactive !== undefined) fn.interactive = opts.interactive; }
+  /* The server image records each primitive's definer (file:line) for the registry (R4.48); frames skip the
+     stack capture. The caller of def (D, CMD, pred, a loop) is the first frame after def itself. */
+  if (GEN && fn.defAt === undefined) { try { const o = {}; Error.captureStackTrace(o, def); fn.defAt = o.stack; } catch (e) { fn.defAt = null; } }
   gdef(name, fn); return fn;
 }
 const D = (name, args, doc, fn) => def(name, fn, { args, doc });
