@@ -9,11 +9,15 @@
    userConfig and readFile read the user's files (CONFIG_DIR/init.scm, and files for load and require). */
 'use strict';
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
+const { Worker } = require('node:worker_threads');
 
 const SRC = __dirname;
 const ROOT = path.join(SRC, '..');
+const WORKER_FILE = path.join(ROOT, 'server', 'worker.mjs');
+const JOBS_FILE = path.join(ROOT, 'server', 'jobs.mjs');
 /* The core, in load order: the order of the script tags in index.html. */
 const FILES = ['scheme', 'runtime', 'text', 'editor-core', 'editor-prims', 'evil-core', 'pool', 'complete', 'extras', 'stack', 'ai', 'evil-ex', 'org'];
 
@@ -27,10 +31,56 @@ function memoryStorage(map = new Map()) {
 }
 const readText = p => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return null; } };
 
+/* ---------- the worker pool's threads (R4.47, R15.3) ----------
+   pool.js runs the same code on a Web Worker in the browser and on a worker_threads Worker here; the
+   differences of the two APIs are absorbed by PoolThread, which looks like a Web Worker to the pool:
+   onmessage and onerror properties, postMessage(value, transferList), terminate(). Every thread is the
+   file server/worker.mjs (never code built from a string), which imports the Edwin sources and the named
+   jobs of server/jobs.mjs. ref/unref are Node's: the pool holds a thread only while work is outstanding,
+   so a process whose main thread is done (a test, --check, --export) ends without terminating them. */
+const workerCount = () => Math.min(6, Math.max(1, (os.availableParallelism ? os.availableParallelism() : os.cpus().length) - 1));
+/* A thread's stack must hold what --stack-size tells V8 it may use (edwind sizes it for the Scheme depth
+   cap, R4.34), else deep recursion on a thread would overrun the thread's stack instead of raising. */
+function stackSizeMb() {
+  let kib = 0;
+  for (const a of [...process.execArgv, ...(process.env.NODE_OPTIONS || '').split(/\s+/)]) { const m = /^--stack-size=(\d+)$/.exec(a); if (m) kib = Number(m[1]); }
+  return Math.max(4, Math.ceil(kib / 1024) + 1);
+}
+const STACK_MB = stackSizeMb();
+const THREAD_HEAP_MB = 512;   // a runaway job dies with its thread (the pool starts another) instead of taking edwind past MemoryMax
+class PoolThread {
+  constructor(data) {
+    this.onmessage = null; this.onerror = null; this.closed = false;
+    const w = this.thread = new Worker(WORKER_FILE, { name: 'edwin-thread-' + data.k, workerData: data, resourceLimits: { stackSizeMb: STACK_MB, maxOldGenerationSizeMb: THREAD_HEAP_MB } });
+    w.on('message', m => { if (this.onmessage) this.onmessage({ data: m }); });
+    w.on('error', e => this.fail(e && e.message ? e.message : String(e)));
+    w.on('exit', code => this.fail('the thread exited with code ' + code));
+  }
+  /* A crash reaches the pool once, as a Web Worker error event would; a terminate() of our own is silent. */
+  fail(message) { if (this.closed) return; this.closed = true; if (this.onerror) this.onerror({ message, preventDefault() {} }); }
+  postMessage(m, transfer) { this.thread.postMessage(m, transfer || []); }
+  terminate() { this.closed = true; this.thread.terminate().catch(() => {}); }
+  ref() { this.thread.ref(); }
+  unref() { this.thread.unref(); }
+}
+/* The named jobs of server/jobs.mjs, for the main thread: the functions by name (the fallback when the
+   pool is off, and what EdPool.define may name) and the names jobs.mjs keeps on the main thread. The
+   module is loaded synchronously (require of an ES module, Node 22.12 and later); where that is not
+   possible the pool runs with no threads, as before. */
+function loadJobs() {
+  const ns = require(JOBS_FILE);
+  const fns = new Map();
+  for (const k of Object.keys(ns)) if (typeof ns[k] === 'function') fns.set(k, ns[k]);
+  return { fns, localOnly: new Set(Array.isArray(ns.LOCAL_ONLY) ? ns.LOCAL_ONLY : []) };
+}
+
 function createHost(opts = {}) {
   const scmDir = opts.scmDir || path.join(ROOT, 'scm');
   const configDir = opts.configDir || null;
   const attrs = new Map(), vars = new Map(), suspend = [];
+  /* The pool runs threads unless { workers: false } (tests of the main-thread fallbacks). */
+  let jobs = null, jobsError = null;
+  try { jobs = loadJobs(); } catch (e) { jobsError = e && e.message ? e.message : String(e); }
   const page = {
     getAttr: name => attrs.get(name),
     setAttr: (name, v) => { if (v === undefined || v === null) attrs.delete(name); else attrs.set(name, v); },
@@ -58,6 +108,13 @@ function createHost(opts = {}) {
     onCspViolation() {},
     idle: f => setTimeout(f, 0),
     nextFrame: f => setTimeout(f, 0),
+    /* The worker pool (R4.47): threads from server/worker.mjs, min(6, CPUs - 1) of them, the named jobs of
+       server/jobs.mjs; workers is false when the pool must stay off (then every job runs on the main thread). */
+    workers: opts.workers !== false && !!jobs,
+    workersUnavailable: jobsError,
+    workerCount: workerCount(),
+    jobs,
+    makeWorker: data => new PoolThread(data),
   };
 }
 
@@ -69,4 +126,4 @@ function loadEdwin(host = createHost()) {
   return globalThis.Ed;
 }
 
-module.exports = { FILES, createHost, memoryStorage, loadEdwin };
+module.exports = { FILES, createHost, memoryStorage, loadEdwin, workerCount, WORKER_FILE, JOBS_FILE };

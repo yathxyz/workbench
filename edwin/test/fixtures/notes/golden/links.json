@@ -1,0 +1,278 @@
+{
+ "files": {
+  "alpha.md": {
+   "title": "Alpha",
+   "path": "alpha.md"
+  },
+  "beta.md": {
+   "title": "Beta",
+   "path": "beta.md"
+  },
+  "cards/vocab.md": {
+   "title": "Vocabulary",
+   "path": "cards/vocab.md"
+  },
+  "gamma/delta.org": {
+   "title": "Delta",
+   "path": "gamma/delta.org"
+  },
+  "journal/2026-10-01.md": {
+   "title": "2026-10-01",
+   "path": "journal/2026-10-01.md"
+  },
+  "sub/alpha.md": {
+   "title": "Alpha",
+   "path": "sub/alpha.md"
+  },
+  "tasks.md": {
+   "title": "Tasks",
+   "path": "tasks.md"
+  }
+ },
+ "links": [
+  {
+   "src": "alpha.md#1",
+   "srcFile": "alpha.md",
+   "dst": "Beta",
+   "dstFile": "beta.md",
+   "kind": "wiki",
+   "label": null,
+   "line": 3,
+   "path": "alpha.md"
+  },
+  {
+   "src": "alpha.md#1",
+   "srcFile": "alpha.md",
+   "dst": "Beta",
+   "dstFile": "beta.md",
+   "kind": "wiki",
+   "label": "the b",
+   "line": 3,
+   "path": "alpha.md"
+  },
+  {
+   "src": "alpha.md#5",
+   "srcFile": "alpha.md",
+   "dst": "gamma/delta",
+   "dstFile": "gamma/delta.org",
+   "kind": "wiki",
+   "label": null,
+   "line": 7,
+   "path": "alpha.md"
+  },
+  {
+   "src": "alpha.md#5",
+   "srcFile": "alpha.md",
+   "dst": "Big Delta",
+   "dstFile": "gamma/delta.org",
+   "kind": "wiki",
+   "label": null,
+   "line": 7,
+   "path": "alpha.md"
+  },
+  {
+   "src": "alpha.md#5",
+   "srcFile": "alpha.md",
+   "dst": "Missing note",
+   "dstFile": null,
+   "kind": "wiki",
+   "label": null,
+   "line": 8,
+   "path": "alpha.md"
+  },
+  {
+   "src": "alpha.md#5",
+   "srcFile": "alpha.md",
+   "dst": "Beta#^b1",
+   "dstFile": "beta.md",
+   "kind": "ref",
+   "label": null,
+   "line": 9,
+   "path": "alpha.md"
+  },
+  {
+   "src": "alpha.md#5",
+   "srcFile": "alpha.md",
+   "dst": "^b2",
+   "dstFile": "beta.md",
+   "kind": "ref",
+   "label": null,
+   "line": 9,
+   "path": "alpha.md"
+  },
+  {
+   "src": "alpha.md#5",
+   "srcFile": "alpha.md",
+   "dst": "https://example.org/docs",
+   "dstFile": null,
+   "kind": "url",
+   "label": "docs",
+   "line": 10,
+   "path": "alpha.md"
+  },
+  {
+   "src": "alpha.md#5",
+   "srcFile": "alpha.md",
+   "dst": "sub/alpha.md",
+   "dstFile": "sub/alpha.md",
+   "kind": "file",
+   "label": "second alpha",
+   "line": 10,
+   "path": "alpha.md"
+  },
+  {
+   "src": "alpha.md#5",
+   "srcFile": "alpha.md",
+   "dst": "Alpha",
+   "dstFile": "alpha.md",
+   "kind": "wiki",
+   "label": null,
+   "line": 11,
+   "path": "alpha.md"
+  },
+  {
+   "src": "alpha.md#13",
+   "srcFile": "alpha.md",
+   "dst": "Beta",
+   "dstFile": "beta.md",
+   "kind": "wiki",
+   "label": null,
+   "line": 19,
+   "path": "alpha.md"
+  },
+  {
+   "src": "beta.md",
+   "srcFile": "beta.md",
+   "dst": "Alpha",
+   "dstFile": "alpha.md",
+   "kind": "wiki",
+   "label": null,
+   "line": 8,
+   "path": "beta.md"
+  },
+  {
+   "src": "beta.md#14",
+   "srcFile": "beta.md",
+   "dst": "alpha",
+   "dstFile": "alpha.md",
+   "kind": "wiki",
+   "label": null,
+   "line": 16,
+   "path": "beta.md"
+  },
+  {
+   "src": "cards/vocab.md#3",
+   "srcFile": "cards/vocab.md",
+   "dst": "Beta#^b1",
+   "dstFile": "beta.md",
+   "kind": "wiki",
+   "label": null,
+   "line": 7,
+   "path": "cards/vocab.md"
+  },
+  {
+   "src": "gamma/delta.org",
+   "srcFile": "gamma/delta.org",
+   "dst": "Alpha",
+   "dstFile": "alpha.md",
+   "kind": "wiki",
+   "label": null,
+   "line": 8,
+   "path": "gamma/delta.org"
+  },
+  {
+   "src": "gamma/delta.org",
+   "srcFile": "gamma/delta.org",
+   "dst": "id:7d3e5c10-0000-4000-8000-000000000002",
+   "dstFile": "beta.md",
+   "kind": "title",
+   "label": "see beta",
+   "line": 8,
+   "path": "gamma/delta.org"
+  },
+  {
+   "src": "gamma/delta.org",
+   "srcFile": "gamma/delta.org",
+   "dst": "file:../beta.md",
+   "dstFile": "beta.md",
+   "kind": "file",
+   "label": null,
+   "line": 9,
+   "path": "gamma/delta.org"
+  },
+  {
+   "src": "gamma/delta.org",
+   "srcFile": "gamma/delta.org",
+   "dst": "https://example.org",
+   "dstFile": null,
+   "kind": "url",
+   "label": "a site",
+   "line": 9,
+   "path": "gamma/delta.org"
+  },
+  {
+   "src": "gamma/delta.org#11",
+   "srcFile": "gamma/delta.org",
+   "dst": "Alpha#^links",
+   "dstFile": "alpha.md",
+   "kind": "ref",
+   "label": null,
+   "line": 16,
+   "path": "gamma/delta.org"
+  },
+  {
+   "src": "journal/2026-10-01.md#1",
+   "srcFile": "journal/2026-10-01.md",
+   "dst": "Alpha",
+   "dstFile": "alpha.md",
+   "kind": "wiki",
+   "label": null,
+   "line": 4,
+   "path": "journal/2026-10-01.md"
+  },
+  {
+   "src": "journal/2026-10-01.md#1",
+   "srcFile": "journal/2026-10-01.md",
+   "dst": "^b-alpha",
+   "dstFile": "alpha.md",
+   "kind": "ref",
+   "label": null,
+   "line": 4,
+   "path": "journal/2026-10-01.md"
+  },
+  {
+   "src": "tasks.md#1",
+   "srcFile": "tasks.md",
+   "dst": "Beta",
+   "dstFile": "beta.md",
+   "kind": "wiki",
+   "label": null,
+   "line": 7,
+   "path": "tasks.md"
+  },
+  {
+   "src": "tasks.md#1",
+   "srcFile": "tasks.md",
+   "dst": "Beta",
+   "dstFile": "beta.md",
+   "kind": "wiki",
+   "label": null,
+   "line": 13,
+   "path": "tasks.md"
+  }
+ ],
+ "backlinks": {
+  "beta.md": 10,
+  "gamma/delta.org": 2,
+  "sub/alpha.md": 1,
+  "alpha.md": 6
+ },
+ "outlinks": {
+  "alpha.md": 8,
+  "beta.md": 2,
+  "cards/vocab.md": 1,
+  "gamma/delta.org": 4,
+  "journal/2026-10-01.md": 2,
+  "tasks.md": 2
+ }
+}

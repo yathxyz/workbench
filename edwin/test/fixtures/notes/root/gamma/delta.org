@@ -1,0 +1,20 @@
+:PROPERTIES:
+:ID: 11111111-2222-4333-8444-555555555555
+:ROAM_ALIASES: "Big Delta" dd
+:END:
+#+title: Delta
+#+filetags: :org:x:
+
+Delta is an Org note. It links to [[Alpha]] and to [[id:7d3e5c10-0000-4000-8000-000000000002][see beta]],
+to [[file:../beta.md]] and to [[https://example.org][a site]].
+
+* TODO [#A] Write the Org section                                  :work:
+SCHEDULED: <2026-10-20 Tue> DEADLINE: <2026-10-25 Sat>
+:PROPERTIES:
+:ID: 22222222-2222-4333-8444-555555555555
+:END:
+Body of the Org task, which refers to ((Alpha#^links)).
+** DONE A finished subtask
+CLOSED: [2026-10-02 Thu]
+* Notes
+Nothing to do here.

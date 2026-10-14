@@ -31,15 +31,12 @@ pub struct Config {
     pub notes_dir: PathBuf,
     /// Names the board file; also reported to the frontend.
     pub host: String,
-    /// Absent or `null` disables `sample`.
-    pub sample: Option<Sample>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct Sample {
-    pub api_key_file: PathBuf,
-    pub base_url: String,
+    /// edwind's `edit.sock`. Absent means no edwind: the notes endpoints stay stubs and
+    /// `sample` stays off (edwind spec R15.5).
+    pub edit_socket: Option<PathBuf>,
+    /// The destinations `POST /api/mv` refuses, shared with edwind (R14.8). Absent
+    /// means the built-in list.
+    pub refuse_paths: Option<Vec<String>>,
 }
 
 fn default_socket() -> PathBuf {
@@ -80,9 +77,17 @@ impl Config {
         for (key, path) in paths {
             ensure!(path.is_absolute(), "{key} must be an absolute path");
         }
-        for (key, path) in [("socket", &self.socket), ("hubSocket", &self.hub_socket)] {
+        if let Some(edit) = &self.edit_socket {
+            ensure!(edit.is_absolute(), "editSocket must be an absolute path");
+        }
+        let sockets = [
+            ("socket", Some(&self.socket)),
+            ("hubSocket", Some(&self.hub_socket)),
+            ("editSocket", self.edit_socket.as_ref()),
+        ];
+        for (key, path) in sockets {
             ensure!(
-                path.as_os_str().len() < SOCKET_PATH_MAX,
+                path.is_none_or(|p| p.as_os_str().len() < SOCKET_PATH_MAX),
                 "{key} must be shorter than {SOCKET_PATH_MAX} bytes"
             );
         }
@@ -90,14 +95,10 @@ impl Config {
             valid_host(&self.host),
             "host must match [A-Za-z0-9][A-Za-z0-9._-]*"
         );
-        if let Some(sample) = &self.sample {
+        for path in self.refuse_paths.iter().flatten() {
             ensure!(
-                sample.api_key_file.is_absolute(),
-                "sample.apiKeyFile must be an absolute path"
-            );
-            ensure!(
-                valid_base_url(&sample.base_url),
-                "sample.baseUrl must be https, or http to a loopback host"
+                path.starts_with('/') || path == "~" || path.starts_with("~/"),
+                "refusePaths entries must be absolute paths or start with ~/"
             );
         }
         Ok(())
@@ -112,23 +113,6 @@ fn valid_host(host: &str) -> bool {
         && host
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
-/// `https://…`, or `http://` to a loopback host (tests use a local mock).
-fn valid_base_url(url: &str) -> bool {
-    if let Some(rest) = url.strip_prefix("https://") {
-        return !rest.is_empty() && !rest.starts_with('/');
-    }
-    let Some(rest) = url.strip_prefix("http://") else {
-        return false;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let host = match authority.strip_prefix('[') {
-        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
-        None => authority.split(':').next().unwrap_or_default(),
-    };
-    host.eq_ignore_ascii_case("localhost")
-        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Splits `publicOrigin` into the `Origin` and `Host` values a browser sends for it:
@@ -251,7 +235,8 @@ mod tests {
     fn a_complete_config_loads() {
         let (cfg, floor) = Fixture::new().load().unwrap();
         assert_eq!(cfg.hub_socket, Path::new("/run/workbench-hub/hub.sock"));
-        assert!(cfg.sample.is_none());
+        assert!(cfg.edit_socket.is_none());
+        assert!(cfg.refuse_paths.is_none());
         assert_eq!(floor.expected_origin, "https://wb.example.org");
         assert_eq!(floor.expected_host, "wb.example.org");
         assert_eq!(&*floor.secret, SECRET.as_bytes());
@@ -275,42 +260,62 @@ mod tests {
     }
 
     #[test]
-    fn unknown_keys_fail_also_inside_sample() {
+    fn unknown_keys_fail_and_so_does_the_removed_sample_key() {
         let mut f = Fixture::new();
         f.cfg["origins"] = json!("*");
         assert!(f.load().is_err());
+        // `sample` moved to edit.json (edwind spec R15.6); an old config must say so.
         let mut f = Fixture::new();
-        f.cfg["sample"] = json!({"apiKeyFile": "/k", "baseUrl": "https://api.example.org", "x": 1});
+        f.cfg["sample"] = json!({"apiKeyFile": "/k", "baseUrl": "https://api.example.org"});
+        let err = format!("{:#}", f.load().err().unwrap());
+        assert!(err.contains("unknown field `sample`"), "{err}");
+        let mut f = Fixture::new();
+        f.cfg["sample"] = Value::Null;
         assert!(f.load().is_err());
     }
 
     #[test]
-    fn sample_null_or_valid_loads() {
+    fn edit_socket_and_refuse_paths_load() {
         let mut f = Fixture::new();
-        f.cfg["sample"] = Value::Null;
-        assert!(f.load().unwrap().0.sample.is_none());
-        for url in [
-            "https://api.example.org",
-            "http://127.0.0.1:9000",
-            "http://localhost/x",
-            "http://[::1]:1",
-        ] {
-            f.cfg["sample"] = json!({"apiKeyFile": "/k", "baseUrl": url});
-            assert!(f.load().unwrap().0.sample.is_some(), "{url}");
-        }
+        f.cfg["editSocket"] = json!("/run/workbench-edit/edit.sock");
+        f.cfg["refusePaths"] = json!(["/home/alice/.ssh", "~/.config/systemd"]);
+        let (cfg, _) = f.load().unwrap();
+        assert_eq!(
+            cfg.edit_socket.as_deref(),
+            Some(Path::new("/run/workbench-edit/edit.sock"))
+        );
+        assert_eq!(
+            cfg.refuse_paths.as_deref(),
+            Some(
+                &[
+                    "/home/alice/.ssh".to_owned(),
+                    "~/.config/systemd".to_owned()
+                ][..]
+            )
+        );
+        let mut f = Fixture::new();
+        f.cfg["editSocket"] = Value::Null;
+        f.cfg["refusePaths"] = Value::Null;
+        let (cfg, _) = f.load().unwrap();
+        assert!(cfg.edit_socket.is_none());
+        assert!(cfg.refuse_paths.is_none());
     }
 
     #[test]
-    fn http_base_url_to_a_remote_host_fails() {
+    fn edit_socket_must_be_an_absolute_short_path() {
         let mut f = Fixture::new();
-        for url in [
-            "http://api.example.org",
-            "http://127.0.0.1@example.org/",
-            "http://localhost.example.org",
-            "ftp://x",
-        ] {
-            f.cfg["sample"] = json!({"apiKeyFile": "/k", "baseUrl": url});
-            assert!(f.load().is_err(), "{url}");
+        f.cfg["editSocket"] = json!("run/edit.sock");
+        assert!(f.load().is_err());
+        f.cfg["editSocket"] = json!(format!("/{}", "s".repeat(120)));
+        assert!(f.load().is_err());
+    }
+
+    #[test]
+    fn refuse_paths_must_be_absolute_or_under_home() {
+        for bad in [json!(["relative/dir"]), json!("/x"), json!([1])] {
+            let mut f = Fixture::new();
+            f.cfg["refusePaths"] = bad.clone();
+            assert!(f.load().is_err(), "{bad}");
         }
     }
 

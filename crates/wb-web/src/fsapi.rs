@@ -37,7 +37,8 @@ const CAT_MAX: u64 = 8 << 20;
 const BINARY_PROBE: usize = 4000;
 /// `ls` lists at most this many entries, after sorting.
 const LS_MAX: usize = 2000;
-/// Relative to `$HOME`: the directories `mv` never touches.
+/// Relative to `$HOME`: the directories `mv` never touches when `web.json` carries no
+/// `refusePaths` (edwind spec R14.8).
 const PROTECTED: [&str; 3] = [".ssh", ".config/systemd", ".local/share/systemd"];
 const REFUSED: &str =
     "refused: the destination is in or above ~/.ssh or a systemd user-unit directory";
@@ -100,7 +101,7 @@ async fn cat(query: Result<Query<FsQuery>, QueryRejection>) -> Response {
     run(move |home| read_file(&expand(&raw, home)?, limit)).await
 }
 
-async fn mv(Body(body): Body) -> Response {
+async fn mv(State(app): State<AppState>, Body(body): Body) -> Response {
     let req: MvRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(e) => {
@@ -108,12 +109,14 @@ async fn mv(Body(body): Body) -> Response {
                 .into_response();
         }
     };
+    let refuse = app.cfg.refuse_paths.clone();
     run(move |home| {
         let home = home.ok_or("HOME is not set")?;
         move_path(
             &expand(&req.src, Some(home))?,
             &expand(&req.dst, Some(home))?,
             home,
+            refuse.as_deref(),
         )
     })
     .await
@@ -291,8 +294,9 @@ fn read_file(path: &Path, limit: u64) -> FsResult {
 }
 
 /// Renames `src` (a symlink moves itself) to `dst`, or into `dst` when that is a
-/// directory, never replacing anything.
-fn move_path(src: &Path, dst: &Path, home: &Path) -> FsResult {
+/// directory, never replacing anything. `refuse` is `web.json`'s `refusePaths`, or
+/// `None` for the built-in list.
+fn move_path(src: &Path, dst: &Path, home: &Path, refuse: Option<&[String]>) -> FsResult {
     let Some(name) = src.file_name() else {
         return Err("cannot move /".into());
     };
@@ -303,7 +307,7 @@ fn move_path(src: &Path, dst: &Path, home: &Path) -> FsResult {
     let (Some(dir), Some(name)) = (dst.parent(), dst.file_name()) else {
         return Err("bad destination".into());
     };
-    let protected = protected_dirs(home);
+    let protected = protected_dirs(home, refuse);
     if denied(&protected, &dst) {
         return Err(REFUSED.into());
     }
@@ -330,14 +334,18 @@ fn real_path(dir: &OwnedFd) -> Result<PathBuf, String> {
     fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd())).map_err(|e| e.to_string())
 }
 
-/// Each protected directory as written under `home` and with its symlinks resolved.
-fn protected_dirs(home: &Path) -> Vec<PathBuf> {
-    PROTECTED
-        .iter()
-        .flat_map(|rel| {
-            let dir = home.join(rel);
-            [resolve(&dir), dir]
-        })
+/// Each protected directory as written (under `home` for the built-in list, or as
+/// `refusePaths` gives it, with `~` expanded) and with its symlinks resolved.
+fn protected_dirs(home: &Path, refuse: Option<&[String]>) -> Vec<PathBuf> {
+    let dirs: Vec<PathBuf> = match refuse {
+        Some(list) => list
+            .iter()
+            .filter_map(|raw| expand(raw, Some(home)).ok())
+            .collect(),
+        None => PROTECTED.iter().map(|rel| home.join(rel)).collect(),
+    };
+    dirs.into_iter()
+        .flat_map(|dir| [resolve(&dir), dir])
         .collect()
 }
 
@@ -387,7 +395,23 @@ mod tests {
 
     #[test]
     fn denied_covers_in_on_and_above_but_not_beside() {
-        let protected = protected_dirs(Path::new("/nonexistent-home/alice"));
+        let home = Path::new("/nonexistent-home/alice");
+        let protected = protected_dirs(home, None);
+        // The list the Nix module writes as `refusePaths` into web.json and edit.json
+        // (edwind spec R14.8) must refuse exactly what the built-in list refuses.
+        let module_list = [
+            "/nonexistent-home/alice/.ssh".to_owned(),
+            "/nonexistent-home/alice/.config/systemd".to_owned(),
+            "/nonexistent-home/alice/.local/share/systemd".to_owned(),
+        ];
+        let configured = protected_dirs(home, Some(&module_list));
+        assert_eq!(configured, protected);
+        let tilde = [
+            "~/.ssh".to_owned(),
+            "~/.config/systemd".to_owned(),
+            "~/.local/share/systemd".to_owned(),
+        ];
+        assert_eq!(protected_dirs(home, Some(&tilde)), protected);
         let rows = [
             ("/nonexistent-home/alice/.ssh", true),
             ("/nonexistent-home/alice/.ssh/authorized_keys", true),
@@ -413,6 +437,7 @@ mod tests {
         ];
         for (path, want) in rows {
             assert_eq!(denied(&protected, Path::new(path)), want, "{path}");
+            assert_eq!(denied(&configured, Path::new(path)), want, "{path}");
         }
     }
 
@@ -462,6 +487,7 @@ mod tests {
                 &expand(src, Some(&home))?,
                 &expand(dst, Some(&home))?,
                 &home,
+                None,
             )
         }
 
@@ -535,7 +561,10 @@ mod tests {
         let linked = h.path("home-link");
         let src = h.path("evil");
         let dst = h.path("home/.ssh/authorized_keys");
-        assert_eq!(move_path(&src, &dst, &linked), Err(REFUSED.to_owned()));
+        assert_eq!(
+            move_path(&src, &dst, &linked, None),
+            Err(REFUSED.to_owned())
+        );
         assert!(!dst.exists());
     }
 

@@ -1,0 +1,56 @@
+{
+ "task-keywords": [
+  "TODO",
+  "NEXT",
+  "WAITING",
+  "HOLD",
+  "SOMEDAY",
+  "DONE",
+  "CANCELLED",
+  "DOING",
+  "NOW",
+  "LATER"
+ ],
+ "done-keywords": [
+  "DONE",
+  "CANCELLED"
+ ],
+ "wiki-link": "\\[\\[([^\\[\\]\\n|]+?)(?:\\|([^\\[\\]\\n]*)|\\]\\[([^\\]\\n]*))?\\]\\]",
+ "block-ref": "\\(\\(([^()\\n]+?)\\)\\)",
+ "inline-link": "(?<!!)\\[([^\\]\\n]*)\\]\\(([^)\\s]+)\\)",
+ "anchor": "(?:^|\\s)\\^([A-Za-z0-9_-]+)\\s*$",
+ "field": "^\\s*(?:[-*+]\\s+)?([A-Za-z][\\w-]*)::\\s*(.*?)\\s*$",
+ "priority": "\\[#([A-Z0-9])\\]",
+ "planning": "(SCHEDULED|DEADLINE|CLOSED):\\s*[<\\[](\\d{4}-\\d{2}-\\d{2})[^>\\]\\n]*[>\\]]",
+ "md-heading": "^(#{1,6})[ \\t]+(.*?)[ \\t]*$",
+ "org-heading": "^(\\*+)[ \\t]+(.*?)[ \\t]*$",
+ "md-setext": "^(=+|-+)[ \\t]*$",
+ "list-item": "^(\\s*)([-*+]|\\d+[.)])\\s+(.*)$",
+ "org-keyword": "^#\\+([A-Za-z_]+):[ \\t]*(.*?)[ \\t]*$",
+ "org-drawer-begin": "^[ \\t]*:PROPERTIES:[ \\t]*$",
+ "org-drawer-end": "^[ \\t]*:END:[ \\t]*$",
+ "org-property": "^[ \\t]*:([A-Za-z_][\\w-]*):[ \\t]+(.*?)[ \\t]*$",
+ "org-tags": "\\s+(:[\\w@#%:]+:)\\s*$",
+ "inline-tag": "(?:^|[\\s(])#([A-Za-z][\\w/-]*)",
+ "front-matter": "^---\\s*$",
+ "front-matter-keys": [
+  "title",
+  "tags",
+  "aliases",
+  "alias",
+  "id"
+ ],
+ "fence": "^\\s*(```|~~~)",
+ "card-field": "card",
+ "card-kinds": [
+  "basic",
+  "reverse",
+  "cloze",
+  "type",
+  "pen",
+  "voice"
+ ],
+ "cloze": "\\{\\{c(\\d+)::(.*?)\\}\\}",
+ "journal-path": "^(?:journal|daily|dailies)/(\\d{4})-(\\d{2})-(\\d{2})\\.(?:md|org)$",
+ "url": "^(?:https?|mailto|ftp):"
+}

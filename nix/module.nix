@@ -88,22 +88,27 @@ let
     }) cfg.agents;
   };
 
-  webJson = json.generate "workbench-web.json" {
-    listen = "${cfg.listenAddress}:${toString cfg.port}";
-    inherit (cfg)
-      publicOrigin
-      trustedProxy
-      host
-      boardsDir
-      notesDir
-      ;
-    proxySecretFile = "/run/credentials/workbench-web.service/proxy-secret";
-    socket = "/run/workbench-web/web.sock";
-    hubSocket = "/run/workbench-hub/hub.sock";
-    stateDir = "${home}/.local/state/workbench/web";
-    webRoot = "${cfg.webPackage}";
-    sample = null;
-  };
+  webJson = json.generate "workbench-web.json" (
+    {
+      listen = "${cfg.listenAddress}:${toString cfg.port}";
+      inherit (cfg)
+        publicOrigin
+        trustedProxy
+        host
+        boardsDir
+        notesDir
+        ;
+      proxySecretFile = "/run/credentials/workbench-web.service/proxy-secret";
+      socket = "/run/workbench-web/web.sock";
+      hubSocket = "/run/workbench-hub/hub.sock";
+      stateDir = "${home}/.local/state/workbench/web";
+      webRoot = "${cfg.webPackage}";
+      # The same list edit.json carries (R14.8); wb-web's /api/mv reads it instead of its built-in copy.
+      refusePaths = readOnlyUserPaths;
+    }
+    # With edwind, wb-web forwards the notes endpoints and `sample` over edit.sock (R15.5).
+    // lib.optionalAttrs edit.enable { inherit editSocket; }
+  );
 
   # edwind (edwin/server, the edwind spec §15). `~` in writablePaths is the service user's home.
   edit = cfg.edit;

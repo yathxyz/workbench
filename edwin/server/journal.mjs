@@ -1,4 +1,4 @@
-// Buffer journals, snapshots, the index and the image log (spec §8.1–§8.2, R4.15 log only).
+// Buffer journals, snapshots and the index (spec §8.1–§8.2); the image log is in image.mjs.
 //
 // A journal is one JSON object per line: a header, then a batch per sequenced edit. A batch is
 // acknowledged only after its line is written and fdatasync has returned; batches that arrive within
@@ -133,36 +133,8 @@ export class Index {
   }
 }
 
-/* ---------- the image log (R4.15, log only in E1) ---------- */
-export class ImageLog {
-  constructor(file) { this.file = file; this.gen = 0; this.entries = []; this.epoch = null; this.load(); }
-  load() {
-    let text = '';
-    try { text = fs.readFileSync(this.file, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-    for (const line of text.split('\n')) {
-      if (!line) continue;
-      let o; try { o = JSON.parse(line); } catch (e) { continue; } // a torn last line
-      if (o.t === 'epoch') { this.epoch = o.epoch; continue; }
-      if (o.t === 'form' && Number.isInteger(o.gen)) { this.entries.push(o); this.gen = o.gen; }
-    }
-  }
-  /* The epoch changes only when the image is reset or compacted (R4.20); a fresh log gets one. */
-  ensureEpoch(make) {
-    if (this.epoch) return this.epoch;
-    this.epoch = make();
-    fs.appendFileSync(this.file, JSON.stringify({ t: 'epoch', epoch: this.epoch, at: Date.now() }) + '\n', { mode: 0o600 });
-    return this.epoch;
-  }
-  /* Append a definitional form; returns its generation. */
-  append(form, by) {
-    const entry = { t: 'form', gen: this.gen + 1, form, by, at: Date.now() };
-    const fd = fs.openSync(this.file, 'a', 0o600);
-    try { fs.writeSync(fd, JSON.stringify(entry) + '\n'); fs.fdatasyncSync(fd); } finally { fs.closeSync(fd); }
-    this.entries.push(entry); this.gen = entry.gen;
-    return entry.gen;
-  }
-  after(gen) { return this.entries.filter(e => e.gen > gen); }
-}
+/* The image log lives in image.mjs (E2); the name stays importable from here. */
+export { ImageLog } from './image.mjs';
 
 /* A random id: 96 bits (12 bytes) for a jid (R6.1). */
 export const randomId = (bytes = 12) => randomBytes(bytes).toString('hex');
