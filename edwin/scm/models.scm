@@ -21,7 +21,7 @@
 ;; 30 days of usage.jsonl (R12.14).
 
 (define (gptel-make-anthropic name . keys)
-  "Define an Anthropic Messages API backend NAME: :key (a credential handle) :host :protocol :endpoint :models :tiers :headers :stream."
+  "Define a Messages API backend NAME (the kind the spec names anthropic): :key (a credential handle) :host :protocol :endpoint :models :tiers :headers :stream."
   (apply %make-backend name 'anthropic keys))
 
 (define (gptel-make-openai name . keys)
@@ -54,6 +54,11 @@
     (put! 'temperature (gptel--plist-get keys ':temperature))
     (put! 'caller (gptel--plist-get keys ':caller "gptel"))
     alist))
+
+;; The conditions of this layer: credential-origin (R14.4) and cancelled (a request stopped by cancel or
+;; gptel-abort), both errors, with the predicates credential-origin? and cancelled?.
+(define-condition-type credential-origin error)
+(define-condition-type cancelled error)
 
 ;; The requests running now, as an alist of buffer -> thread, for gptel-abort.
 (define gptel--running '())

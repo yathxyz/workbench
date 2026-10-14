@@ -115,8 +115,14 @@ export class Backend {
 /* ---------- a gate of N slots (R12.13) ---------- */
 export class Gate {
   constructor(n) { this.n = n; this.busy = 0; this.waiters = []; }
-  acquire() { if (this.busy < this.n) { this.busy++; return Promise.resolve(); } return new Promise(r => this.waiters.push(r)); }
-  release() { const w = this.waiters.shift(); if (w) w(); else this.busy = Math.max(0, this.busy - 1); }
+  /* A ticket: its promise resolves when a slot is free; cancel() withdraws a ticket still waiting. */
+  acquire() {
+    if (this.busy < this.n) { this.busy++; return { promise: Promise.resolve(), cancel: () => {} }; }
+    const t = {}; t.promise = new Promise(r => { t.resolve = r; }); this.waiters.push(t);
+    t.cancel = () => { const i = this.waiters.indexOf(t); if (i >= 0) this.waiters.splice(i, 1); };
+    return t;
+  }
+  release() { const w = this.waiters.shift(); if (w) w.resolve(); else this.busy = Math.max(0, this.busy - 1); }
   get queued() { return this.waiters.length; }
 }
 
@@ -353,9 +359,10 @@ export class Models {
     const startedAt = Date.now();
     const t = this.server.threads ? this.server.threads.current : null;
     const rec = { backend: b.name, model: req.model, tier: req.tier || null, caller: req.caller || 'gptel', startedAt };
-    if (t) this.requests.set(t.id, rec);
     let text = '', truncated = false, rounds = 0, error = null;
-    yield new S.Block(this.gate.acquire(), 'a model slot');
+    const ticket = this.gate.acquire();
+    try { yield new S.Block(ticket.promise, 'a model slot'); } catch (e) { ticket.cancel(); throw e; }
+    if (t) this.requests.set(t.id, rec);
     try {
       const msgs = this.messagesOf(b, req);
       const deadline = startedAt + REQUEST_DEADLINE_MS;
@@ -672,7 +679,6 @@ export class Models {
   install() {
     const { server, L, S } = this;
     this.configure();
-    if (typeof S.defineConditionType === 'function') { S.defineConditionType('credential-origin', 'error'); S.defineConditionType('cancelled', 'error'); }
     server.statusProviders.push(() => this.status());
     server.onMessage('sample', (client, msg) => this.onSample(client, msg));
     server.onMessage('tool_result', (client, msg) => this.onToolAnswer(client, msg));

@@ -5,6 +5,7 @@
 // the same path from applyBatch.
 import { createRequire } from 'node:module';
 import { ProtoError } from './proto.mjs';
+import { randomId } from './journal.mjs';
 
 const require = createRequire(import.meta.url);
 const OT = require('../src/ot.js');
@@ -83,7 +84,8 @@ export class Sequencer {
     ops = OT.toOps(OT.fromOps(ops, before.length), before);
     const len = before.length;
     sb.ver++;
-    const entry = { ver: sb.ver, cid: by.cid || null, seq: null, by, ops, undo: undefined, at: Date.now(), len, bytes: JSON.stringify(ops).length };
+    /* One undo group per flush, so undo, undo-global and undo-writer can take a thread's batch back (R6.19). */
+    const entry = { ver: sb.ver, cid: by.cid || null, seq: null, by, ops, undo: { g: 'thread-' + sb.ver + '-' + randomId(4) }, at: Date.now(), len, bytes: JSON.stringify(ops).length };
     entry.recipients = [...sb.clients];
     sb.hist.push(entry); sb.histBytes += entry.bytes;
     this.trim(sb);

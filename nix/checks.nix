@@ -173,7 +173,7 @@ in
   # The Scheme boundary (R16.15, R4.52) and the credential rules (R16.19, in models.test.mjs).
   edit-security = pkgs.runCommand "workbench-edit-security" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/security.test.mjs
+    node --test ${edwind}/edwin/test/security.test.mjs ${edwind}/edwin/test/models.test.mjs
     touch $out
   '';
 
