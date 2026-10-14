@@ -671,6 +671,10 @@ check('N16 demo: the inlined page asks fonts.googleapis.com for nothing', !demoH
   await home(); await sleep(200); c0 = await cam();
   await gesture([bg], [[bg[0] - 300, bg[1]]], 6, 150); await sleep(900); const c2 = await cam();
   check('N57: a one-finger pan that lifts while moving glides on; one that rests before the lift stays', glided > 60 && Math.abs(c2.x - c0.x - 300) < 1, JSON.stringify({ glided, rested: c2.x - c0.x - 300 }));
+  await gesture([bg], [[bg[0] - 300, bg[1]]], 6); await sleep(2500);   // a touch flick, then a quick middle-button drag
+  await T.mouse.move(...bg); await T.mouse.down({ button: 'middle' }); for (let i = 1; i <= 6; i++) await T.mouse.move(bg[0] - 50 * i, bg[1]);
+  await T.mouse.up({ button: 'middle' }); const m0 = await cam(); await sleep(600); const m1 = await cam();
+  check('N57: a mouse pan after a touch flick does not glide', m1.x === m0.x && m1.y === m0.y, JSON.stringify({ m0, m1 }));
   await T.evaluate(() => { const C = window.__canvas; Object.assign(C.S.cam, { x: 15000, y: 15000, z: 0.3 }); C.applyCam(); });
   await sleep(200);
   await T.evaluate(id => { const C = window.__canvas; C.jumpNode(C.S.nodes[id]); }, ids.pg);   // a flight to z 1 of 380 ms
