@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Edwin console</title>
+<!-- The Edwin console (edwind spec R9.4, R9.17): one full-window frame on the same edwind the board's page cards use,
+     booted in served mode over /edit with the shipped Scheme fetched from scm/. It starts in *scratch*; M-x scheme-repl,
+     the debugger and the inspector run here at full size. Served at /edwin/ by wb-web (nix/web.nix copies this file,
+     src/*.js and scm/*.scm), so the relative paths below resolve under /edwin/. Self-contained: the fonts are the
+     board's (/fonts/fonts.css), nothing comes from a third party. -->
+<link rel="stylesheet" href="../fonts/fonts.css">
+<style>
+/* The board's tokens (web/style.css), so the frame renders with the same Modus colours (R9.10, R9.11). */
+:root {
+  color-scheme: light;
+  --bg: #efe9dd; --dot: #c9b9b0; --panel: #fbf7f0; --panel-2: #efe9dd; --fg: #000000; --muted: #595959;
+  --accent: #3546c2; --accent-soft: #ccdfff; --cursor: #d00000; --buf-bg: #fbf7f0; --sel: #c2bcb5;
+  --err: #a60000; --warn: #894000; --warn-bg: #fff576;
+  --syn-keyword: #0031a9; --syn-string: #00598b; --syn-comment: #7f0000; --syn-builtin: #721045; --syn-fnname: #602938;
+  --syn-variable: #00603f; --syn-constant: #531ab6; --syn-type: #306010; --syn-docstring: #304463;
+  --mono: "JetBrainsMono Nerd Font Mono", "JetBrains Mono", ui-monospace, monospace;
+  --sans: "Noto Sans", system-ui, sans-serif;
+  --text-size: 14px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #1d2235; --dot: #4a4f69; --panel: #0d0e1c; --panel-2: #1d2235; --fg: #ffffff; --muted: #989898;
+    --accent: #79a8ff; --accent-soft: #242679; --cursor: #ff66ff; --buf-bg: #0d0e1c; --sel: #555a66;
+    --err: #ff5f59; --warn: #fec43f; --warn-bg: #3a2f00;
+    --syn-keyword: #79a8ff; --syn-string: #2fafff; --syn-comment: #ef8386; --syn-builtin: #feacd0; --syn-fnname: #f78fe7;
+    --syn-variable: #4ae2f0; --syn-constant: #b6a0ff; --syn-type: #11c777; --syn-docstring: #9ac8e0;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #1d2235; --dot: #4a4f69; --panel: #0d0e1c; --panel-2: #1d2235; --fg: #ffffff; --muted: #989898;
+  --accent: #79a8ff; --accent-soft: #242679; --cursor: #ff66ff; --buf-bg: #0d0e1c; --sel: #555a66;
+  --err: #ff5f59; --warn: #fec43f; --warn-bg: #3a2f00;
+  --syn-keyword: #79a8ff; --syn-string: #2fafff; --syn-comment: #ef8386; --syn-builtin: #feacd0; --syn-fnname: #f78fe7;
+  --syn-variable: #4ae2f0; --syn-constant: #b6a0ff; --syn-type: #11c777; --syn-docstring: #9ac8e0;
+}
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 13px/1.4 var(--mono); display: flex; flex-direction: column; padding: 8px; box-sizing: border-box; gap: 6px; }
+#frame { flex: 1; min-height: 0; }
+#status { flex: none; display: flex; gap: 12px; align-items: center; font-size: 12px; color: var(--muted); padding: 0 4px; }
+#status .st { font-weight: 600; }
+#status .st[data-state="online"] { color: var(--syn-type); }
+#status .st[data-state="offline"], #status .st[data-state="connecting"] { color: var(--warn); }
+#status a { color: var(--accent); }
+#notice { flex: none; display: none; padding: 4px 10px; color: var(--warn); background: var(--warn-bg); border: 1px solid var(--warn); border-radius: 4px; font-size: 12px; }
+body.offline #notice { display: block; }
+</style>
+</head>
+<body>
+<div id="notice">Editing is off: workbench-edit is not running. The console keeps working locally and reconnects by itself.</div>
+<div id="frame" aria-label="Edwin"></div>
+<div id="status"><span>Edwin console</span><span class="st" data-state="connecting">connecting</span><span id="who"></span><span style="flex:1"></span><a href="../">back to the board</a></div>
+<!-- The runtime, in the order of edwin/index.html (host-browser first; ot and sync last). -->
+<script src="src/host-browser.js"></script>
+<script src="src/scheme.js"></script>
+<script src="src/runtime.js"></script>
+<script src="src/text.js"></script>
+<script src="src/editor-core.js"></script>
+<script src="src/editor-prims.js"></script>
+<script src="src/evil-core.js"></script>
+<script src="src/pool.js"></script>
+<script src="src/complete.js"></script>
+<script src="src/extras.js"></script>
+<script src="src/stack.js"></script>
+<script src="src/ai.js"></script>
+<script src="src/evil-ex.js"></script>
+<script src="src/org.js"></script>
+<script src="src/markdown.js"></script>
+<script src="src/ot.js"></script>
+<script src="src/sync.js"></script>
+<script>
+(async () => {
+  const SCM = ['emacs', 'evil', 'org', 'ai', 'init', 'notes-syntax', 'address', 'markdown'];
+  const st = document.querySelector('#status .st'), who = document.getElementById('who');
+  const state = s => { st.dataset.state = s; st.textContent = s; document.body.classList.toggle('offline', s !== 'online'); };
+  const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* in memory only */ } } };
+  const session = { get(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } }, set(k, v) { try { sessionStorage.setItem(k, v); } catch (e) { /* per tab only */ } } };
+  // The same device id as the board (localStorage wb-device, R9.16) and a per-tab cid that survives a reload (R7.16).
+  let device = store.get('wb-device'); if (!device) { device = 'd' + Math.random().toString(36).slice(2, 9); store.set('wb-device', device); }
+  const sources = {};
+  try {
+    await Promise.all(SCM.map(async name => { const r = await fetch(`scm/${name}.scm`, { cache: 'no-cache' }); if (!r.ok) throw new Error(`scm/${name}.scm: HTTP ${r.status}`); sources[name + '.scm'] = await r.text(); }));
+  } catch (e) { st.textContent = 'cannot load the Scheme sources: ' + e.message; st.dataset.state = 'offline'; return; }
+  const transport = () => new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/edit');
+  Ed.sync.on('state', state);
+  Ed.sync.on('epoch', () => { session.set('wb-edwin-console-pending', JSON.stringify(Ed.sync.exportPending())); location.reload(); });
+  let pending = null; try { pending = JSON.parse(session.get('wb-edwin-console-pending') || 'null'); } catch (e) { /* none */ } try { sessionStorage.removeItem('wb-edwin-console-pending'); } catch (e) { /* none */ }
+  const booted = Ed.bootServed({ sources, transport, device, cid: session.get('wb-edwin-console-cid') || undefined, pending: Array.isArray(pending) && pending.length ? pending : undefined });
+  session.set('wb-edwin-console-cid', Ed.sync.cid);
+  who.textContent = `device ${device} · tab ${Ed.sync.cid.slice(0, 8)}`;
+  // One full-window frame with the menubar, on *scratch* (R9.4); it exists before the welcome so an edwind that is
+  // down still gives a working local editor with the offline notice (R9.18).
+  const frame = Ed.makeFrame(document.getElementById('frame'), { buffer: Ed.getBuffer('*scratch*'), kind: 'console', fontSize: 14 });
+  frame.focus();
+  state(Ed.sync.state);
+  window.__edwin = { Ed, frame, get state() { return Ed.sync.state; } };
+  booted.catch(e => { console.error(e); st.textContent = 'boot failed: ' + (e && e.message || e); });
+})();
+</script>
+</body>
+</html>
