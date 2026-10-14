@@ -1117,6 +1117,7 @@ The amendments below are binding.
 | F-A21 | Enter on the active card puts the keyboard in it where it stands (a shell's terminal, an agent's composer, a page's text, a web card's address), bringing it into view first when it is off screen, in a closed deck or at far zoom. Shift-Enter opens the card as a focus tab; Enter on a folder still enters it as a workspace |
 | F-A22 | The view is per device, like the camera (F-A7): the entered workspace, the focus tabs and the perspective live in `localStorage` (`wb-view-<host>`, try/catch), never in the board. Inside a perspective, a save writes the manual layout (each node's manual folder, rectangle and order, the stashed folders, no derived folders or ghosts), so the board file always holds the manual perspective; a card shown in a focus tab is saved at its place on the canvas, not at the size of the screen. A clean tab inside a perspective that takes another tab's board goes back to manual, takes it, and builds its perspective again. A board saved inside a perspective before this amendment is turned back into its manual layout when it is loaded or taken, and lends its view to a device that has none yet |
 | F-A23 | Keys are bindings in the keymaps of `web/keys.js` and nothing else (§6.4). A card that has the keyboard keeps the keys it needs: a shell gets every key but ``Ctrl-` `` (so C-k, C-j, Alt-B, Alt-digits and Alt-arrows reach the program and do nothing on the board), a page leaves only the palette, dock, tree, dictation and view keys. Leader Esc leaves any card with the card still selected, and the leader pressed twice reaches the card (NUL for Ctrl-Space in a shell). An artifact forwards the leader to the board through the bridge (`{t:'key', key:'leader'}`, the leader named in `hello.keys` and in a `{t:'keys'}` message when the user picks another). The palette's C-j/C-k move its selection |
+| F-A26 | Touch and the camera. Two fingers move the camera wherever they land, over cards too: the pinch zooms about its midpoint and both fingers pan; while they are down no card scrolls. The second finger takes the camera only when the first holds nothing (a finger that drags a card, a handle or ink keeps it). One finger keeps its meaning: bare canvas pans, a card scrolls or drags its own content. A one-finger pan lifted while moving glides on with its last 100 ms speed, decaying with a 325 ms time constant; a finger that rests 50 ms before the lift does not glide. A camera flight follows van Wijk and Nuij's smooth zoom path (the zoom changes at an even rate; a long jump pulls back and comes in again) in 380 ms, and stops where it is at a finger down, a pan or a wheel, running its done step. `prefers-reduced-motion` is read live: no flight time, no glide, no settle. |
 
 **ui check amendments.**
 - **N8** expects "No session: press Enter" after a wiped `stateDir`, then Enter → `[new shell]` (H-1).
@@ -1335,7 +1336,7 @@ The test runs numbered steps. The steps this design pins down:
 
 **Pass criterion for "sessions survive":** steps 4, 6 and 9 all pass in one run. The hub PID is unchanged across 4 and 6, and revive succeeds in 9.
 
-### 9.5 UI checks (N27-N55; N1-N26 are the baseline checks of `tests/ui.mjs`, kept with the §6.1 amendments)
+### 9.5 UI checks (N27-N55, N57; N1-N26 are the baseline checks of `tests/ui.mjs`, kept with the §6.1 amendments)
 
 | # | Check |
 |---|---|
@@ -1368,6 +1369,7 @@ The test runs numbered steps. The steps this design pins down:
 | N53 | Leader Esc leaves a shell and a page, with the card still selected and no interior in `keyContext()`; the leader twice sends NUL to the shell; C-k in a page opens the palette |
 | N54 | `WBKeys.check()` with the page's commands has no error; on the board `f` then a card's label selects it; `m`, `l`, `L` move and resize the card and Esc puts it back; `.` lists its actions; C-j/C-k move the palette selection and leave the dock alone |
 | N55 | (demo) The leader pressed inside an artifact frame opens the board's leader and the frame no longer has the keyboard. After the leader is changed to F1 with the artifact open, F1 in it opens the leader, Ctrl-Space and Shift-F1 do not |
+| N57 | A touch screen (demo page). Two fingers on a page zoom the camera; a one-finger pan lifted while moving glides on and one that rested does not; a finger down during a flight stops it short of its target; dragging a card keeps the drawn edges of other cards (the same elements) (F-A26) |
 
 ### 9.6 v1 acceptance (all must hold before the dogfood clock starts)
 1. `nix flake check` is green on a kvm-capable host: package, clippy, fmt, conformance, security, ui, adapters, module and vm.

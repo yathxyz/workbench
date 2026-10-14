@@ -21,7 +21,9 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch {} },
   del(k) { try { localStorage.removeItem(k); } catch {} },
 };
-const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const motionQuery = matchMedia('(prefers-reduced-motion: reduce)');
+let reduceMotion = motionQuery.matches;
+motionQuery.addEventListener?.('change', e => { reduceMotion = e.matches; });
 
 // ------------------------------------------------------------------ state
 let S = null;                 // persisted board
@@ -80,22 +82,39 @@ function zoomAt(sx, sy, f) {
   c.x = w.x - sx / c.z; c.y = w.y - sy / c.z;
   applyCam();
 }
-let anim = null;
+let anim = null, animDone = null;
+const GLIDE = { raf: 0, ok: false, trail: [] };   // a flicked one-finger pan carrying on; trail: its last moves, [time, x, y]
+// A flight follows van Wijk and Nuij's smooth zoom path ("Smooth and efficient zooming and panning", 2003, as d3's
+// interpolateZoom): the zoom changes at an even rate on screen, and a long jump at one zoom pulls back and comes
+// in again rather than sliding the whole board past. Any hand on the camera (a pan, a pinch, the wheel) ends it.
+const RHO = Math.SQRT2;
+function zoomPath(cx0, cy0, w0, cx1, cy1, w1) {
+  const dx = cx1 - cx0, dy = cy1 - cy0, d2 = dx * dx + dy * dy;
+  if (d2 < 1e-6 * w0 * w0) { const S = Math.log(w1 / w0) / RHO; return k => [cx0 + k * dx, cy0 + k * dy, w0 * Math.exp(RHO * k * S)]; }
+  const d = Math.sqrt(d2), r2 = RHO * RHO, r4 = r2 * r2;
+  const b0 = (w1 * w1 - w0 * w0 + r4 * d2) / (2 * w0 * r2 * d), b1 = (w1 * w1 - w0 * w0 - r4 * d2) / (2 * w1 * r2 * d);
+  const r0 = -Math.asinh(b0), r1 = -Math.asinh(b1), S = (r1 - r0) / RHO;   // ln(√(b²+1) − b), without the cancellation
+  return k => { const s = k * S, u = w0 / (r2 * d) * (Math.cosh(r0) * Math.tanh(RHO * s + r0) - Math.sinh(r0)); return [cx0 + u * dx, cy0 + u * dy, w0 * Math.cosh(r0) / Math.cosh(RHO * s + r0)]; };
+}
 function animateTo(t, done) {
-  cancelAnimationFrame(anim);
-  const c = cam(), from = { ...c }, T = reduceMotion ? 0 : 380, t0 = performance.now();
+  camStop(false);
+  const c = cam(), T = reduceMotion ? 0 : 380, t0 = performance.now(), W = VW(), H = VH();
+  // the path runs on the screen centre and the width of world in view
+  const path = zoomPath(c.x + W / 2 / c.z, c.y + H / 2 / c.z, W / c.z, t.x + W / 2 / t.z, t.y + H / 2 / t.z, W / t.z);
+  animDone = done || null;
   const step = now => {
     const k = T ? clamp((now - t0) / T, 0, 1) : 1, e = 1 - Math.pow(1 - k, 3);
-    // interpolate the screen-centre point so the motion reads as a straight glide
-    const cx0 = from.x + VW() / 2 / from.z, cy0 = from.y + VH() / 2 / from.z;
-    const cx1 = t.x + VW() / 2 / t.z, cy1 = t.y + VH() / 2 / t.z;
-    c.z = from.z + (t.z - from.z) * e;
-    c.x = cx0 + (cx1 - cx0) * e - VW() / 2 / c.z;
-    c.y = cy0 + (cy1 - cy0) * e - VH() / 2 / c.z;
+    if (k < 1) { const [cx, cy, w] = path(e); c.z = W / w; c.x = cx - W / 2 / c.z; c.y = cy - H / 2 / c.z; }
+    else { c.x = t.x; c.y = t.y; c.z = t.z; }   // land exactly on the target
     applyCam();
-    if (k < 1) anim = requestAnimationFrame(step); else done?.();
+    if (k < 1) anim = requestAnimationFrame(step); else { anim = null; const d = animDone; animDone = null; d?.(); }
   };
   anim = requestAnimationFrame(step);
+}
+// stop whatever moves the camera on its own (a flight, a glide); a cut-short flight still runs its done step
+function camStop(finish = true) {
+  if (anim) { cancelAnimationFrame(anim); anim = null; const d = animDone; animDone = null; if (finish) d?.(); }
+  if (GLIDE.raf) { cancelAnimationFrame(GLIDE.raf); GLIDE.raf = 0; }
 }
 function pushHistory() { camBack.push({ ...cam() }); if (camBack.length > 60) camBack.shift(); camFwd.length = 0; }
 function camArea() {   // the part of the viewport a fit aims at
@@ -1519,7 +1538,13 @@ const depthOf = n => ancestors(n).length;
 const folderPath = n => ancestors(n).reverse().map(a => a.name).join('/');
 const fullPath = f => [...ancestors(f).reverse(), f].map(a => a.name).join('/');
 const placeAny = m => (m.kind === 'frame' ? placeFrame(m) : place(m));
-function evWorld(e) { const r = viewport.getBoundingClientRect(); return s2w(e.clientX - r.left, e.clientY - r.top); }
+// The viewport's box, kept between resizes: a drag or a stroke reads it on every move, right after it has moved
+// things, and getBoundingClientRect() there forced a layout of the whole board per move.
+let VP_RECT = null;
+const vpRect = () => VP_RECT || (VP_RECT = viewport.getBoundingClientRect());
+new ResizeObserver(() => { VP_RECT = null; }).observe(viewport);
+window.addEventListener('resize', () => { VP_RECT = null; });
+function evWorld(e) { const r = vpRect(); return s2w(e.clientX - r.left, e.clientY - r.top); }
 function containerAt(x, y, skip) {
   let best = null, bd = -1;
   for (const f of frameList()) {
@@ -2294,7 +2319,7 @@ function wireNode(n, L, port, rs) {
     port.setPointerCapture(ev.pointerId);
     const p1 = { x: n.x + n.w / 2, y: n.y + n.h };
     const tmp = svgEl('path', { class: 'edge e-temp' }); edgesSvg.append(tmp);
-    const mv = e => { const r = viewport.getBoundingClientRect(), w = s2w(e.clientX - r.left, e.clientY - r.top); tmp.setAttribute('d', `M${p1.x},${p1.y} C${p1.x},${p1.y + 80} ${w.x},${w.y - 80} ${w.x},${w.y}`); };
+    const mv = e => { const w = evWorld(e); tmp.setAttribute('d', `M${p1.x},${p1.y} C${p1.x},${p1.y + 80} ${w.x},${w.y - 80} ${w.x},${w.y}`); };
     const up = e => {
       port.removeEventListener('pointermove', mv); port.removeEventListener('pointerup', up); tmp.remove();
       const t = document.elementFromPoint(e.clientX, e.clientY)?.closest('.node');
@@ -2456,6 +2481,9 @@ function flowPipe(e) {
   setTimeout(() => { if ((FLOWING.get(e.id) || 0) > Date.now()) return; FLOWING.delete(e.id); edgesSvg.querySelector(`.redge[data-edge="${CSS.escape(e.id)}"]`)?.classList.remove('flowing'); }, 2450);
 }
 const hashSeed = id => { let h = 7; for (const c of String(id)) h = (h * 31 + c.charCodeAt(0)) | 0; return (Math.abs(h) % 2147483646) + 1; };
+// An edge's drawing is kept while its ends, its type and its flow stay the same, so a drag redraws only the edges of
+// what moves (each edge was redrawn, rough.js and all, on every pointer move).
+const edgeDrawn = new WeakMap();   // edge → { key, els }
 function renderEdges() {
   const rs = rsEdges || (rsEdges = V.rough.svg(edgesSvg));
   const out = [];
@@ -2463,19 +2491,24 @@ function renderEdges() {
     let a = S.nodes[e.from], b = S.nodes[e.to]; if (!a || !b) continue;
     a = visibleOf(a); b = visibleOf(b); if (a === b) continue;  // items in a stacked folder connect to its deck
     const [p1, c1, c2, p2] = edgeGeom(a, b);
+    const key = [p1.x, p1.y, c1.x, c1.y, c2.x, c2.y, p2.x, p2.y, e.type, e.persp ? 1 : 0, (FLOWING.get(e.id) || 0) > Date.now() ? 1 : 0].join();
+    const had = edgeDrawn.get(e);
+    if (had?.key === key) { out.push(...had.els); continue; }
+    const els = [];
     const o = { seed: hashSeed(e.id), roughness: 0.9, bowing: 0.8, stroke: 'currentColor', strokeWidth: 1.7 };
     const g = svgEl('g', { class: 'redge e-' + e.type + ((FLOWING.get(e.id) || 0) > Date.now() ? ' flowing' : ''), 'data-edge': e.id });
     g.append(rs.path(`M${p1.x},${p1.y} C${c1.x},${c1.y} ${c2.x},${c2.y} ${p2.x},${p2.y}`, e.type === 'spawn' ? o : { ...o, strokeLineDash: e.type === 'pipe' ? [8, 6] : e.type === 'symlink' ? [6, 4] : [2, 5] }));
     const ang = Math.atan2(p2.y - c2.y, p2.x - c2.x), L = 13;
     g.append(rs.linearPath([[p2.x - L * Math.cos(ang - .5), p2.y - L * Math.sin(ang - .5)], [p2.x, p2.y], [p2.x - L * Math.cos(ang + .5), p2.y - L * Math.sin(ang + .5)]], o));
-    out.push(g);
+    els.push(g);
     const mx = .125 * p1.x + .375 * c1.x + .375 * c2.x + .125 * p2.x, my = .125 * p1.y + .375 * c1.y + .375 * c2.y + .125 * p2.y;
     const lg = svgEl('g', { class: `elabel e-${e.type}-l`, transform: `translate(${mx},${my})` });
     const w = e.type.length * 7 + 14;
     lg.append(svgEl('rect', { x: -w / 2, y: -10, width: w, height: 20 }));
     const tx = svgEl('text', { 'text-anchor': 'middle', y: 4 }); tx.textContent = e.type; lg.append(tx);
     const title = svgEl('title'); title.textContent = e.persp ? 'symlink on the host (follows the filesystem)' : 'Click to change type · Shift-click to delete'; lg.append(title);
-    if (e.persp) { out.push(lg); continue; }
+    els.push(lg); edgeDrawn.set(e, { key, els }); out.push(...els);
+    if (e.persp) continue;
     lg.addEventListener('pointerdown', ev => ev.stopPropagation());
     lg.addEventListener('click', ev => {
       ev.stopPropagation();
@@ -2483,9 +2516,11 @@ function renderEdges() {
       else e.type = { spawn: 'pipe', pipe: 'ref', ref: 'spawn' }[e.type];
       renderEdges(); updateAllTitles(); dirty();
     });
-    out.push(lg);
   }
-  edgesSvg.replaceChildren(...out);
+  // put back only what changed when the list keeps its order (a drag), else rebuild it
+  const kids = edgesSvg.children;
+  if (kids.length === out.length && out.every((x, i) => kids[i] === x || !x.isConnected)) out.forEach((x, i) => { if (kids[i] !== x) kids[i].replaceWith(x); });
+  else edgesSvg.replaceChildren(...out);
 }
 function renderLinks() { renderEdges(); renderShapes(); }
 
@@ -2568,7 +2603,7 @@ function commitStroke(pts, sim, size) {
   return s;
 }
 function eraseAt(clientX, clientY) {
-  const r = viewport.getBoundingClientRect(), w = s2w(clientX - r.left, clientY - r.top), thr = 9 / cam().z;
+  const r = vpRect(), w = s2w(clientX - r.left, clientY - r.top), thr = 9 / cam().z;
   const shapeHit = S.shapes.filter(s => {
     if (s.type !== 'arrow') return w.x >= s.x - thr && w.x <= s.x + s.w + thr && w.y >= s.y - thr && w.y <= s.y + s.h + thr;
     const { x1, y1, x2, y2 } = arrowEnds(s), dx = x2 - x1, dy = y2 - y1, t = clamp(((w.x - x1) * dx + (w.y - y1) * dy) / (dx * dx + dy * dy || 1), 0, 1);
@@ -2649,19 +2684,57 @@ viewport.addEventListener('pointermove', e => {
   if (addrRaf) return;
   addrRaf = requestAnimationFrame(() => {
     addrRaf = 0;
-    const r = viewport.getBoundingClientRect(), w = s2w(e.clientX - r.left, e.clientY - r.top), n = nodeAt(w.x, w.y);
+    const w = evWorld(e), n = nodeAt(w.x, w.y);
     $('#st-addr').textContent = canvasAddr(w.x, w.y) + (n ? '  ·  ' + pathOf(n.id) : '');
   });
 });
 
 // ------------------------------------------------------------------ viewport input: ink, pan, pinch, wheel
+// Touch: two fingers move the camera wherever they land, over cards too (the pinch zooms, both fingers pan); one
+// finger keeps its meaning (bare canvas pans, a card scrolls or drags its own content). The second finger takes the
+// camera only when the first holds nothing: a finger that drags a card, a handle or ink keeps it. A one-finger pan
+// glides on after the lift.
+const TOUCH = new Map(), CAPTURED = new Map();   // every finger on the canvas → { x, y }; pointer → the element holding it
+const holdTouch = e => { if (pinch && e.touches.length > 1) { e.preventDefault(); e.stopPropagation(); } };   // no card scrolls under a pinch
+viewport.addEventListener('gotpointercapture', e => CAPTURED.set(e.pointerId, e.target), true);
+viewport.addEventListener('lostpointercapture', e => { if (CAPTURED.get(e.pointerId) === e.target) CAPTURED.delete(e.pointerId); }, true);
+for (const t of ['pointerup', 'pointercancel']) window.addEventListener(t, e => {
+  if (!TOUCH.delete(e.pointerId) || TOUCH.size) return;
+  viewport.removeEventListener('touchmove', holdTouch, { capture: true });
+}, true);
+viewport.addEventListener('pointerdown', ev => {
+  if (ev.pointerType !== 'touch') return;
+  camStop();   // a finger down stops a flight or a glide
+  TOUCH.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+  if (FOCUS.cur || TOUCH.size !== 2) return;
+  const first = [...TOUCH.keys()].find(id => id !== ev.pointerId);
+  if (CAPTURED.has(first) && !pointers.has(first)) return;
+  ev.preventDefault(); ev.stopImmediatePropagation();
+  viewport.addEventListener('touchmove', holdTouch, { capture: true, passive: false });
+  for (const [id, q] of TOUCH) { if (!pointers.has(id)) pointers.set(id, { x: q.x, y: q.y }); try { viewport.setPointerCapture(id); } catch {} }
+  startPinch(); viewport.classList.add('panning');
+}, true);
+viewport.addEventListener('pointermove', ev => { const q = TOUCH.get(ev.pointerId); if (q) { q.x = ev.clientX; q.y = ev.clientY; } }, true);
+function glide(ev) {   // the pan's speed over its last 100 ms carries on and decays (time constant 325 ms)
+  const tr = GLIDE.trail.filter(([t]) => ev.timeStamp - t < 100); GLIDE.trail = [];
+  if (reduceMotion || ev.type !== 'pointerup' || tr.length < 2 || ev.timeStamp - tr[tr.length - 1][0] > 50) return;   // a finger that rested before the lift stays
+  const [t0, x0, y0] = tr[0], [t1, x1, y1] = tr[tr.length - 1], dt = Math.max(8, t1 - t0);
+  let vx = (x1 - x0) / dt, vy = (y1 - y0) / dt, last = performance.now();
+  if (Math.hypot(vx, vy) < 0.25) return;   // px/ms: a slow lift stops where it is
+  const step = now => {
+    const d = Math.min(48, now - last), f = Math.exp(-d / 325); last = now;
+    cam().x -= vx * d / cam().z; cam().y -= vy * d / cam().z; vx *= f; vy *= f; applyCam();
+    GLIDE.raf = Math.hypot(vx, vy) > 0.02 ? requestAnimationFrame(step) : 0;
+  };
+  GLIDE.raf = requestAnimationFrame(step);
+}
 const isChrome = t => t.closest('.hdr button, .port, .rs, .flabel, .elabel, .deck');
 // middle-drag and Alt-drag pan from anywhere, also over a terminal or editor body, and never paste (Linux primary selection)
 const MID = { at: 0 };
 const panGrab = ev => !FOCUS.cur && ev.pointerType !== 'touch' && (ev.button === 1 || (ev.button === 0 && ev.altKey && !ev.ctrlKey && !ev.metaKey));
 viewport.addEventListener('pointerdown', ev => {
   if (!panGrab(ev)) return;
-  ev.preventDefault(); ev.stopPropagation(); MID.at = performance.now();
+  ev.preventDefault(); ev.stopPropagation(); MID.at = performance.now(); camStop();
   viewport.setPointerCapture(ev.pointerId); pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY }); viewport.classList.add('panning');
 }, true);
 for (const t of ['mousedown', 'mouseup', 'auxclick', 'click']) viewport.addEventListener(t, ev => { if (ev.button === 1) { ev.preventDefault(); ev.stopPropagation(); MID.at = performance.now(); } }, true);
@@ -2703,15 +2776,19 @@ viewport.addEventListener('pointerdown', ev => {
   if (bg && ev.button === 0 && PICKED.size) pickClear();
   if (bg && ev.button === 0 && activeId) { live[activeId]?.el.classList.remove('active'); activeId = null; }
   if (bg && selShape) { selShape = null; renderShapes(); }
+  camStop();
   viewport.setPointerCapture(ev.pointerId);
   pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
   viewport.classList.add('panning');
-  if (pointers.size === 2) { const [a, b] = [...pointers.values()]; pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 }; }
+  if (pointers.size === 1) { GLIDE.ok = ev.pointerType === 'touch'; GLIDE.trail = []; }
+  if (pointers.size === 2) startPinch();
 });
+function startPinch() { const [a, b] = [...pointers.values()]; pinch = { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 }; GLIDE.ok = false; }
 viewport.addEventListener('pointermove', ev => {
   const p = pointers.get(ev.pointerId); if (!p) return;
   if (pointers.size === 1) {
     cam().x -= (ev.clientX - p.x) / cam().z; cam().y -= (ev.clientY - p.y) / cam().z; applyCam();
+    if (GLIDE.ok) GLIDE.trail.push([ev.timeStamp, ev.clientX, ev.clientY]);
   }
   p.x = ev.clientX; p.y = ev.clientY;
   if (pointers.size === 2 && pinch) {
@@ -2720,13 +2797,13 @@ viewport.addEventListener('pointermove', ev => {
     zoomAt(mx, my, d / pinch.d); pinch = { d, mx, my };
   }
 });
-const endPan = ev => { if (!pointers.delete(ev.pointerId)) return; pinch = null; if (!pointers.size) viewport.classList.remove('panning'); };
+const endPan = ev => { if (!pointers.delete(ev.pointerId)) return; pinch = null; if (!pointers.size) { viewport.classList.remove('panning'); if (GLIDE.ok) glide(ev); } };
 viewport.addEventListener('pointerup', endPan); viewport.addEventListener('pointercancel', endPan);
 viewport.addEventListener('wheel', e => {
   if (FOCUS.cur) return;
   const inBody = e.target.closest('.node.active .body');
   if (inBody && !e.ctrlKey && !e.metaKey) return;
-  e.preventDefault();
+  e.preventDefault(); camStop();
   if (e.ctrlKey || e.metaKey) zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * (e.deltaMode ? 0.05 : 0.0025) * (e.ctrlKey && !e.metaKey && Math.abs(e.deltaY) < 50 ? 4 : 1)));
   else { const k = e.deltaMode ? 30 : 1; cam().x += e.deltaX * k / cam().z; cam().y += e.deltaY * k / cam().z; applyCam(); }
 }, { passive: false });

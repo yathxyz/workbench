@@ -632,6 +632,61 @@ check('fix 1 (no server): agent text in a permission request stays text; allow_a
 await p.close();
 check('N16 demo: the inlined page asks fonts.googleapis.com for nothing', !demoHosts.has('fonts.googleapis.com'), [...demoHosts].join());
 
+// ---------------- N57: touch and the camera (demo page, a touch screen). Cards far from the seed board, so every
+// touch below lands on what it names; CDP touches go through the browser's own gesture handling.
+{
+  const tc = await browser.newContext({ viewport: { width: 1500, height: 950 }, hasTouch: true });
+  const T = await tc.newPage(); watchErrors(T);
+  await T.goto('file://' + wrapped); await sleep(1500);
+  const cdp = await tc.newCDPSession(T);
+  const touch = (type, pts) => cdp.send('Input.dispatchTouchEvent', { type, touchPoints: pts.map(([x, y], id) => ({ x, y, id })) });
+  const gesture = async (from, to, steps = 10, rest = 0) => {   // fingers from → to, one frame a step; rest: ms still before the lift
+    await touch('touchStart', from);
+    for (let i = 1; i <= steps; i++) { await touch('touchMove', from.map(([x, y], k) => [x + (to[k][0] - x) * i / steps, y + (to[k][1] - y) * i / steps])); if (i < steps) await sleep(16); }
+    if (rest) await sleep(rest);   // else the lift follows the last move at once, as a flick's does
+    await touch('touchEnd', []);
+  };
+  const cam = () => T.evaluate(() => ({ ...window.__canvas.S.cam }));
+  const home = () => T.evaluate(() => { const C = window.__canvas; Object.assign(C.S.cam, { x: 19400, y: 19700, z: 1 }); C.applyCam(); });
+  const ids = await T.evaluate(() => {
+    const C = window.__canvas, S = C.S;
+    const pg = C.addNode({ kind: 'buffer', name: 'n56-page', x: 20000, y: 20000, w: 480, h: 380, text: '# n56\n' + Array.from({ length: 120 }, (_, i) => '- line ' + i).join('\n') }).id;
+    const a = C.addNode({ kind: 'buffer', name: 'n56-a', x: 19700, y: 20000, w: 220, h: 130, text: '# a' }).id;
+    const b = C.addNode({ kind: 'buffer', name: 'n56-b', x: 19700, y: 20250, w: 220, h: 130, text: '# b' }).id;
+    const c = C.addNode({ kind: 'buffer', name: 'n56-c', x: 20600, y: 20000, w: 220, h: 130, text: '# c' }).id;
+    S.edges.push({ id: 'n56-ab', from: a, to: b, type: 'spawn' }, { id: 'n56-pc', from: pg, to: c, type: 'pipe' });
+    return { pg, a, b, c };
+  });
+  await home(); await sleep(400);
+  const mid = [600 + 240, 300 + 190];   // the page's middle
+  const bg = await T.evaluate(() => { const bare = (x, y) => ['viewport', 'world'].includes(document.elementFromPoint(x, y)?.id); for (let y = 500; y < 860; y += 20) for (let x = 1050; x < 1460; x += 20) if (bare(x, y) && bare(x - 320, y) && bare(x - 160, y)) return [x, y]; return null; });
+  const hits = await T.evaluate(([bg, mid]) => [!!bg, !!document.elementFromPoint(...mid)?.closest('.node .body')], [bg, mid]);
+  let c0 = await cam();
+  await gesture([[mid[0] - 50, mid[1]], [mid[0] + 50, mid[1]]], [[mid[0] - 100, mid[1]], [mid[0] + 100, mid[1]]]);
+  let c1 = await cam();
+  check('N57: two fingers on a page zoom the camera (a pinch over a card was ignored)', hits[0] && hits[1] && Math.abs(c1.z / c0.z - 2) < 0.05, JSON.stringify({ hits, z0: c0.z, z1: c1.z }));
+  await home(); await sleep(200); c0 = await cam();
+  await gesture([bg], [[bg[0] - 300, bg[1]]], 6); await sleep(2500); c1 = await cam();   // a glide has run out by then
+  const glided = (c1.x - c0.x) - 300;
+  await home(); await sleep(200); c0 = await cam();
+  await gesture([bg], [[bg[0] - 300, bg[1]]], 6, 150); await sleep(900); const c2 = await cam();
+  check('N57: a one-finger pan that lifts while moving glides on; one that rests before the lift stays', glided > 60 && Math.abs(c2.x - c0.x - 300) < 1, JSON.stringify({ glided, rested: c2.x - c0.x - 300 }));
+  await T.evaluate(() => { const C = window.__canvas; Object.assign(C.S.cam, { x: 15000, y: 15000, z: 0.3 }); C.applyCam(); });
+  await sleep(200);
+  await T.evaluate(id => { const C = window.__canvas; C.jumpNode(C.S.nodes[id]); }, ids.pg);   // a flight to z 1 of 380 ms
+  await sleep(60); await touch('touchStart', [bg]); await sleep(600); const held = await cam(); await touch('touchEnd', []);
+  check('N57: a finger down during a flight stops it where it is (the flight overwrote the hand)', held.z < 0.95, JSON.stringify(held));   // the flight lands at z 1; it may pull back below 0.3 on the way
+  await home(); await sleep(400);
+  const hdr = id => T.evaluate(id => { const r = document.querySelector(`.node[data-id="${id}"] .hdr`).getBoundingClientRect(); return [r.x + 60, r.y + r.height / 2]; }, id);
+  const drag = async (h, dy) => { await T.mouse.move(...h); await T.mouse.down(); for (let i = 1; i <= 8; i++) await T.mouse.move(h[0], h[1] + i * dy / 8); await T.mouse.up(); await sleep(300); };
+  await drag(await hdr(ids.b), 10);   // draws the board's edges
+  await T.evaluate(() => { window.__n56 = document.querySelector('.redge[data-edge="n56-pc"]'); });
+  await drag(await hdr(ids.a), 40);
+  const kept = await T.evaluate(() => ({ same: document.querySelector('.redge[data-edge="n56-pc"]') === window.__n56 && !!window.__n56, ab: !!document.querySelector('.redge[data-edge="n56-ab"]') }));
+  check('N57: dragging a card redraws its own edges and keeps the drawing of the others', kept.same && kept.ab, JSON.stringify(kept));
+  await tc.close();
+}
+
 // ---------------- daemon phase: wb-hub, wb-web and Caddy from the harness
 const PORT = 18443, ORIGIN = `http://127.0.0.1:${PORT}`;
 const EXIT_HUB = 'the Workbench hub restarted';   // app.js EXIT_TEXT.hub_restart
