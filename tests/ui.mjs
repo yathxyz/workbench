@@ -117,6 +117,33 @@ st.shift = await inArt('Shift+F1'); if (st.shift) await p.keyboard.press('Escape
 st.f1 = await inArt('F1'); await p.keyboard.press('Escape');
 await p.evaluate(() => window.__canvas.setLeader('C-SPC'));
 check('N55: after the leader changes, an open artifact hands back the new one and no longer the old; Shift-F1 stays in the page', !st.old && !st.shift && st.f1, JSON.stringify(st));
+// F-A25: an html fence in a page torn out as a block card, bound to the block (hypernotes H0)
+const blockFrame = sel => until(async () => { for (const f of p.frames()) { try { if (await f.$(sel)) return f; } catch {} } return null; }, 8000);
+st = await p.evaluate(async () => {
+  const c = window.__canvas, pg = c.openPage('hn-blocks', null, true), v = c.live[pg.id].view;
+  v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: '# hn\n\n```html {#chart card=420x260}\n<p id=hnv>one</p>\n```\n\n```js\n```html\n```\n\n~~~html\n<b id=hnw>two</b>\n~~~\n' } });
+  const ids = c.htmlBlocks(v.state.doc.toString()).map(b => b.id);
+  const tear = [...c.live[pg.id].el.querySelectorAll('.cm-tear')];
+  tear[1]?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+  const byWidget = Object.values(c.S.nodes).find(n => n.block?.page === pg.id);
+  const out = await c.AGENT_TOOLS.find(t => t.name === 'tear_out_block').run({ page: 'hn-blocks', block: 'chart' });
+  const chart = Object.values(c.S.nodes).find(n => n.block?.page === pg.id && n.block.id === 'chart');
+  return { page: pg.id, ids, tears: tear.length, widget: byWidget?.block?.id, info: v.state.doc.toString().includes('~~~html {#block1}'), out, chart: chart && { id: chart.id, w: chart.w, h: chart.h, caps: Object.keys(chart.capabilities).join(), html: 'html' in chart, edge: c.S.edges.some(e => e.from === pg.id && e.to === chart.id && e.type === 'ref') } };
+});
+check('block cards: the fence button and tear_out_block make cards bound to page blocks; an id is written for a block without one', st.ids.join() === 'chart,' && st.tears === 2 && st.widget === 'block1' && st.info && st.out.startsWith('created') && st.chart?.w === 420 && st.chart.h === 260 && st.chart.caps === 'sample,db' && !st.chart.html && st.chart.edge, JSON.stringify(st));
+let bf = await blockFrame('#hnv');
+const bfOrigin = bf && await bf.evaluate(() => origin);
+check('block card: the block renders in an opaque-origin frame', !!bf && bfOrigin === 'null' && (await bf.textContent('#hnv')) === 'one', String(bfOrigin));
+await p.evaluate(id => { const v = window.__canvas.live[id].view, d = v.state.doc.toString(), i = d.indexOf('one'); v.dispatch({ changes: { from: i, to: i + 3, insert: 'uno' } }); }, st.page);
+bf = await until(async () => { const f = await blockFrame('#hnv'); return f && (await f.textContent('#hnv')) === 'uno' ? f : null; }, 6000);
+check('block card: an edit to the block reloads the card', !!bf);
+const gone = await p.evaluate(async ([pid, cid]) => {
+  const c = window.__canvas, v = c.live[pid].view, d = v.state.doc.toString(), a = d.indexOf('```html {#chart'), b = d.indexOf('```\n', d.indexOf('<p id=hnv>')) + 4;
+  v.dispatch({ changes: { from: a, to: b } }); await new Promise(r => setTimeout(r, 900));
+  const L = c.live[cid]; return { hidden: L.notice.hidden, text: L.notice.textContent };
+}, [st.page, st.chart?.id]);
+check('block card: a removed block leaves a notice in the card', !gone.hidden && gone.text.includes('no html block #chart'), JSON.stringify(gone));
+await p.evaluate(pid => { const c = window.__canvas; for (const n of Object.values(c.S.nodes)) if (n.block?.page === pid) c.removeNode(n.id); c.removeNode(pid); }, st.page);
 // v8 nodes in demo mode
 st = await p.evaluate(() => { const w = window.__canvas.newWeb('example.org/a'); const s = window.__canvas.newSketch(); const L = window.__canvas.live[w.id]; return { url: w.url, name: w.name, frame: !!L.frame, bar: !!L.urlInput, sketch: s.kind, agentHidden: !document.querySelector('#add-agent'), emacsOff: document.querySelector('#add-emacs').disabled }; });
 check('web and sketch nodes, agent button hidden', st.url === 'https://example.org/a' && st.name === 'example.org' && st.frame && st.bar && st.sketch === 'sketch' && st.agentHidden && st.emacsOff, JSON.stringify(st));

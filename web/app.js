@@ -2082,8 +2082,8 @@ function mountNode(n) {
     L.revive.hidden = true;
   } else if (n.kind === 'artifact') {
     B('↻', 'Reload the page', () => artMount(n, live[n.id]));
-    B('✎', 'Edit the source as a page; publish it back from the palette', () => artifactSourcePage(n));
-    B('⧉', 'Versions', () => artifactVersions(n));
+    if (n.block) B('✎', 'Jump to the html block this card shows', () => jumpBlock(n));
+    else { B('✎', 'Edit the source as a page; publish it back from the palette', () => artifactSourcePage(n)); B('⧉', 'Versions', () => artifactVersions(n)); }
     B('⚙', 'Permissions: what this page may use', () => artifactPermissions(n));
     if (n.file) B('⌁', 'File-backed: ' + n.file + ' (reloads when the file changes)', () => toast('Backed by ' + n.file));
   } else if (n.kind === 'web') {
@@ -2186,7 +2186,7 @@ function mountBuffer(n, L) {
       anchorField.init(() => init), linkField, outlineKeys,
       V.EditorView.updateListener.of(u => {
         if (u.docChanged && ED.node === n) mirrorTo(ED.view, u, u.view);
-        if (u.docChanged) { n.text = u.state.doc.toString(); dirty(); scheduleCrossRefresh(); }
+        if (u.docChanged) { n.text = u.state.doc.toString(); dirty(); scheduleCrossRefresh(); blockCardsChanged(n); }
         if ((u.docChanged || u.selectionSet) && focusedBuf === n.id) scheduleBufAddr(n);
         if (u.docChanged || u.geometryChanged || u.viewportChanged) scheduleLineInk(n.id);
       }),
@@ -2195,6 +2195,8 @@ function mountBuffer(n, L) {
         mousedown: e => {
           const link = e.target.closest('.cm-wikilink');
           if (link && !e.shiftKey) { e.preventDefault(); openPage(link.dataset.page, n); return true; }
+          const tear = e.target.closest('.cm-tear');
+          if (tear) { e.preventDefault(); tearOutBlock(n, L.view.posAtDOM(tear)); return true; }
           const ref = e.target.closest('.blockref');
           if (ref) { e.preventDefault(); const r = resolveRef(ref.dataset.ref); if (r) jumpBuffer(r.node, r.pos); return true; }
           return false;
@@ -2341,6 +2343,7 @@ function removeNode(id) {
   S.edges = S.edges.filter(e => e.from !== id && e.to !== id);
   S.strokes = S.strokes.filter(s => s.owner !== id);
   if (parent) relayout(parent, true);
+  if (gone?.kind === 'buffer') blockCardsChanged(gone);
   restack(); renderEdges(); updateAllTitles(); renderTree(); dirty();
 }
 function spawnChild(n, name) {
@@ -3079,6 +3082,11 @@ class RefWidget extends V.WidgetType {
   }
   ignoreEvent() { return false; }
 }
+class TearWidget extends V.WidgetType {
+  eq() { return true; }
+  toDOM() { const s = document.createElement('span'); s.className = 'cm-tear'; s.textContent = '⇱ card'; s.title = 'Tear this block out onto the canvas as a live card'; return s; }
+  ignoreEvent() { return false; }
+}
 const refreshLinks = V.StateEffect.define();
 const REF_DOCS = new WeakMap();   // doc (immutable) → it holds a ((ref)), so its decorations depend on the cursor line and on other pages
 const curLine = (doc, sel) => doc.lineAt(Math.min(sel.main.head, doc.length)).number;
@@ -3103,6 +3111,7 @@ function linkDecos(docObj, selection) {
     const r = resolveRef(m[1]);
     out.push(V.Decoration.replace({ widget: new RefWidget(m[1], r ? r.text : m[1] + ' · not found', !!r) }).range(a, b));
   }
+  for (const b of htmlBlocks(doc)) out.push(V.Decoration.widget({ widget: new TearWidget(), side: 1 }).range(b.head));
   return V.Decoration.set(out, true);
 }
 const linkField = V.StateField.define({
@@ -4064,6 +4073,8 @@ function edLoad(n, pos) {
           mousedown: e => {
             const link = e.target.closest('.cm-wikilink');
             if (link && !e.shiftKey) { e.preventDefault(); const t = openPage(link.dataset.page, n, true); t.kind === 'buffer' ? edOpen(t) : t.kind === 'frame' ? jumpFolder(t) : jumpNode(t); return true; }
+            const tear = e.target.closest('.cm-tear');
+            if (tear) { e.preventDefault(); const pos = ED.view.posAtDOM(tear); setView('canvas'); tearOutBlock(n, pos); return true; }
             const ref = e.target.closest('.blockref');
             if (ref) { e.preventDefault(); const r = resolveRef(ref.dataset.ref); if (r) edOpen(r.node, r.pos); return true; }
             return false;
@@ -4785,6 +4796,7 @@ async function artPublish(n, { html, files } = {}, capabilities) {
   return { version: sha, changed: true, shas: {} };
 }
 async function artSource(n, sha) {
+  if (n.block) return blockOf(n)?.code || '';
   if (!DAEMON) { const v = sha && (n.versions || []).find(v => v.sha === sha); return v ? v.html : (n.html || ''); }
   const r = await fetch(`/api/artifact/${n.id}${sha ? '?v=' + sha : ''}`); const j = await r.json();
   const c = j.content; if (!c) return n.html || '';
@@ -4794,7 +4806,12 @@ async function artMount(n, L) {
   const f = L.frame; if (!f) return;
   f.removeAttribute('srcdoc'); f.removeAttribute('src');
   L.hello = false; L.notice.hidden = true; L.notice.textContent = '';
-  if (DAEMON) {
+  if (n.block) {   // a block card: the page's block is the source, in an opaque-origin frame in both modes
+    const b = blockOf(n); L.blockCode = b?.code;
+    if (!b) { L.notice.hidden = false; L.notice.textContent = blockMissing(n); return; }
+    f.setAttribute('sandbox', 'allow-scripts allow-forms allow-pointer-lock allow-popups allow-modals');
+    f.srcdoc = wrapFragment(b.code, await bridgeSrc(), artTheme());
+  } else if (DAEMON) {
     if (n.file) { try { await artFromFile(n, L); } catch (e) { L.notice.hidden = false; L.notice.textContent = 'Cannot read ' + n.file + ': ' + (e?.message || e); return; } }
     if (!n.head && n.html) { try { await artPublish(n, { html: n.html }); } catch {} }
     if (!n.head) { L.notice.hidden = false; L.notice.textContent = 'Empty artifact. Publish a page from the assistant or the palette.'; return; }
@@ -5025,6 +5042,7 @@ AGENT_TOOLS.push(
     inputSchema: { type: 'object', properties: { name: { type: 'string' }, html: { type: 'string' }, capabilities: { type: 'object', description: 'e.g. {"sample":{"images":true},"db":{}}' } }, required: ['name', 'html'] },
     run: async ({ name, html, capabilities }) => {
       const ex = nodeList().find(x => x.kind === 'artifact' && x.name.toLowerCase() === str(name).toLowerCase());
+      if (ex?.block) throw new Error(`${pathOf(ex.id)} shows a block of a page; edit the block with write_page instead`);
       if (ex) { const r = await artPublish(ex, { html: str(html) }, capabilities); artMount(ex, live[ex.id]); pulse(ex.id); return `${pathOf(ex.id)} now at version ${r.version.slice(0, 8)}`; }
       const n = await newArtifact(str(name), str(html), capabilities); return `created artifact ${pathOf(n.id)}`;
     } },
@@ -5035,13 +5053,102 @@ AGENT_TOOLS.push(
 cmd('New artifact (hello page)', () => newArtifact('artifact' + (nodeList().filter(n => n.kind === 'artifact').length + 1)));
 cmd('New artifact from a file… (any agent writes the HTML, the node reloads)', () => askName('HTML file path', INFO?.notes ? INFO.notes + '/' : '~/', f => newArtifactFromFile(f)), '', () => DAEMON);
 cmd('New artifact from HTML…', () => askName('Artifact name', '', name => { const n = newArtifact(name, '<title>' + name + '</title>\n<h1>' + name + '</h1>'); setTimeout(() => n.then?.(a => artifactSourcePage(a)), 300); }));
-cmd('Artifact: edit the source page', () => artifactSourcePage(S.nodes[activeId]), '', () => S.nodes[activeId]?.kind === 'artifact');
+cmd('Artifact: edit the source page', () => artifactSourcePage(S.nodes[activeId]), '', () => S.nodes[activeId]?.kind === 'artifact' && !S.nodes[activeId].block);
 cmd('Artifact: publish from this page', () => publishFromPage(S.nodes[activeId]), '', () => S.nodes[activeId]?.kind === 'buffer' && /\.html$/.test(S.nodes[activeId].name));
 cmd('Artifact: reload', () => artMount(S.nodes[activeId], live[activeId]), '', () => S.nodes[activeId]?.kind === 'artifact');
-cmd('Artifact: versions…', () => artifactVersions(S.nodes[activeId]), '', () => S.nodes[activeId]?.kind === 'artifact');
+cmd('Artifact: versions…', () => artifactVersions(S.nodes[activeId]), '', () => S.nodes[activeId]?.kind === 'artifact' && !S.nodes[activeId].block);
 cmd('Artifact: permissions…', () => artifactPermissions(S.nodes[activeId]), '', () => S.nodes[activeId]?.kind === 'artifact');
 cmd('Artifact: open the Workbench demo inside itself', () => openWorkbenchInside(), '', () => DAEMON && !!INFO?.dist);   // wb-web reports dist:null until M5
 cmd('Artifact: paste HTML from the clipboard as a new artifact', async () => { try { const t = await navigator.clipboard.readText(); if (!t.trim()) return toast('Clipboard is empty.'); askName('Artifact name', 'pasted', name => newArtifact(name, t)); } catch { toast('Clipboard read is not allowed here. Use "New artifact from HTML…" and paste into the page.'); } });
+
+// ------------------------------------------------------------------ block cards: ```html fences in a page as live cards
+// A fenced html block in a page can be torn out onto the canvas. The card is an artifact node bound to the block by
+// {page, id}: it keeps no source of its own, shows the block in an opaque-origin srcdoc frame and reloads when the block
+// changes. The info string carries the attributes, as Pandoc reads them: ```html {#chart card=520x430}. Step H0 of the
+// hypernotes plan (docs/HYPERNOTES.md); nothing in a block runs outside its frame.
+function blockAttrs(s) {
+  const a = {};
+  for (const t of String(s || '').trim().split(/\s+/)) { if (t[0] === '#') a.id = t.slice(1); else { const i = t.indexOf('='); if (i > 0) a[t.slice(0, i)] = t.slice(i + 1); } }
+  return a;
+}
+// The html fences of TEXT: {id, attrs, from (fence line start), head (fence line end), to (block end), code}.
+function htmlBlocks(text) {
+  const out = [];
+  if (!/^ {0,3}(`{3,}|~{3,})[ \t]*html\b/mi.test(text)) return out;
+  let pos = 0, open = null;
+  const done = (to, code) => { if (open.lang === 'html') { const attrs = blockAttrs(open.attrs); out.push({ id: attrs.id || null, attrs, from: open.from, head: open.head, to, code }); } open = null; };
+  for (const line of text.split('\n')) {
+    const end = pos + line.length;
+    if (!open) {
+      const m = line.match(/^ {0,3}(`{3,}|~{3,})[ \t]*([^\s{`~]*)[ \t]*(?:\{([^}\n]*)\})?/);
+      if (m) open = { fence: m[1], lang: m[2].toLowerCase(), attrs: m[3], from: pos, head: end };
+    } else {
+      const c = line.match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
+      if (c && c[1][0] === open.fence[0] && c[1].length >= open.fence.length) done(end, text.slice(open.head + 1, pos).replace(/\n$/, ''));
+    }
+    pos = end + 1;
+  }
+  if (open) done(text.length, text.slice(open.head + 1));   // an unclosed fence runs to the end, as in CommonMark
+  return out;
+}
+function blockOf(n) {
+  const p = S.nodes[n.block?.page];
+  return p ? htmlBlocks(pageText(p)).find(b => b.id === n.block.id) || null : null;
+}
+function blockMissing(n) {
+  const p = S.nodes[n.block.page];
+  return p ? `${p.name} has no html block #${n.block.id} now. Put it back, or close this card.` : 'The page this card came from is gone.';
+}
+function jumpBlock(n) {
+  const p = S.nodes[n.block?.page], b = p && blockOf(n);
+  if (!b) return toast(blockMissing(n));
+  jumpBuffer(p, Math.min(b.head + 1, b.to));
+}
+// Tear the html block at POS of page P out as a card. A block without an id gets one in its info string first, so
+// the card's address survives edits around it.
+function tearOutBlock(p, pos) {
+  const v = live[p.id]?.view; if (!v) { toast('Open the page first.'); return null; }
+  const blocks = htmlBlocks(v.state.doc.toString()), b = blocks.find(b => pos >= b.from && pos <= b.to);
+  if (!b) { toast('Put the cursor in a ```html block first.'); return null; }
+  let id = b.id;
+  if (!id) {
+    const ids = new Set(blocks.map(x => x.id)); let k = 1; while (ids.has('block' + k)) k++; id = 'block' + k;
+    const br = v.state.doc.sliceString(b.from, b.head).indexOf('{');
+    v.dispatch({ changes: br >= 0 ? { from: b.from + br + 1, insert: '#' + id + ' ' } : { from: b.head, insert: ' {#' + id + '}' } });
+  }
+  return newBlockCard(p, id, b.attrs.card);
+}
+function newBlockCard(p, id, size) {
+  if (VIEW !== 'canvas') setView('canvas');
+  const m = /^(\d+)x(\d+)$/.exec(size || ''), w = clamp(m ? +m[1] : 480, 200, 1600), h = clamp(m ? +m[2] : 360, 120, 1200);
+  const k = nodeList().filter(x => x.block?.page === p.id).length;
+  const n = addNode({ kind: 'artifact', name: clean(p.name + '-' + id), ...freeSpot(p.x + p.w + 60, p.y + k * 40, w, h), w, h, block: { page: p.id, id }, capabilities: { sample: { images: true }, db: {} }, grants: {}, db: { docs: {} } });
+  S.edges.push({ id: uid('e'), from: p.id, to: n.id, type: 'ref' }); renderLinks(); dirty();
+  jumpNode(n); return n;
+}
+// After an edit to page P settles, every card of its blocks whose code changed (or vanished) reloads.
+const BLOCK_T = new Map();
+function blockCardsChanged(p) {
+  clearTimeout(BLOCK_T.get(p.id));
+  BLOCK_T.set(p.id, setTimeout(() => {
+    BLOCK_T.delete(p.id);
+    for (const n of nodeList()) if (n.kind === 'artifact' && n.block?.page === p.id && live[n.id]?.frame && blockOf(n)?.code !== live[n.id].blockCode) artMount(n, live[n.id]);
+  }, 400));
+}
+AGENT_TOOLS.push(
+  { name: 'tear_out_block', description: 'Put a ```html block of a page on the canvas as a live card. The card shows the block in a sandboxed frame (window.claude.use offers sample and db) and reloads whenever the block changes, so edit the block with write_page to change the card. block is the id from the info string (```html {#chart}) or the 1-based position among the page\'s html blocks; a block without an id gets one.',
+    inputSchema: { type: 'object', properties: { page: { type: 'string', description: 'page path' }, block: { type: 'string' } }, required: ['page'] },
+    run: async ({ page, block }) => {
+      const p = findNode(str(page)); if (!p || p.kind !== 'buffer') throw new Error('no page at ' + page);
+      const blocks = htmlBlocks(pageText(p)), want = str(block || '1');
+      const b = blocks.find(x => x.id === want) || (/^\d+$/.test(want) ? blocks[+want - 1] : null);
+      if (!b) throw new Error(`${pathOf(p.id)} has no html block ${want} (it has ${blocks.length})`);
+      const n = tearOutBlock(p, b.from); if (!n) throw new Error('could not tear out the block');
+      return `created ${pathOf(n.id)}, showing ${pathOf(p.id)}#${n.block.id}`;
+    } },
+);
+cmd('Page: tear out the html block at the cursor as a card', () => { const n = S.nodes[activeId]; tearOutBlock(n, live[n.id].view.state.selection.main.head); }, '', () => S.nodes[activeId]?.kind === 'buffer' && !!live[activeId]?.view);
+cmd('Artifact: jump to its html block', () => jumpBlock(S.nodes[activeId]), '', () => !!S.nodes[activeId]?.block);
 
 // ------------------------------------------------------------------ flashcards: a review view over cards from notes
 // Cards are blocks in notes (card:: basic|reverse|cloze|type|pen|voice; back::; deck::), read through the daemon's index.
@@ -7084,7 +7191,7 @@ AGENT_TOOLS.push(
   { name: 'host_status', description: 'Health of a host: load, memory, disk, uptime, shells, tmux sessions, unit counts (failed names). host: a name from hosts.json (empty = the serving daemon).', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
     run: async ({ host } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j = await (await hFetch(h, '/api/status')).json(); const gb = b => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}` + (j.sessions?.tmux != null ? ', tmux sessions ' + j.sessions.tmux : ''), j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
-window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
+window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 Object.assign(window.__canvas, { keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
 boot();
 })();

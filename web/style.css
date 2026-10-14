@@ -265,6 +265,8 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 .cm-wikilink .cm-brk, .cm-brk { opacity: .45; }
 .blockref { display: inline; font-size: 12px; background: var(--ref-bg); border-bottom: 1.5px solid var(--ref); padding: 0 3px; border-radius: var(--radius); cursor: pointer; }
 .blockref.missing { border-bottom-style: dashed; color: var(--muted); }
+.cm-tear { margin-left: 10px; font: 11px/1.4 var(--mono); padding: 0 5px; border: 1px solid var(--ref); color: var(--ref); background: var(--ref-bg); border-radius: var(--radius); cursor: pointer; user-select: none; }
+.cm-tear:hover { background: var(--ref); color: var(--panel); }
 .k-buffer .body { display: flex; flex-direction: column; }
 .k-buffer .body > .cm-editor { flex: 1; min-height: 0; }
 .backlinks { flex: none; max-height: 38%; overflow: auto; border-top: 1px dashed var(--line); padding: 6px 10px 8px; font-size: 12px; background: var(--panel-2); }
