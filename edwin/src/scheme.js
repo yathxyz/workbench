@@ -15,6 +15,8 @@ function schemeModule(g) {
 'use strict';
 /* Read once at load: false compiles the shadow stack out (scheme-bench.mjs measures its cost). */
 const SHADOW = g.SCHEME_SHADOW_STACK !== false;
+/* Generator mode (R4.38): set at load with g.SCHEME_MODE = 'gen', or later with Scheme.setMode. */
+let GEN = g.SCHEME_MODE === 'gen';
 
 /* ---------- data ---------- */
 class Sym { constructor(name) { this.name = name; } toString() { return this.name; } }
@@ -188,7 +190,7 @@ for (const k of ['user-error', 'wrong-type-argument', 'unbound-variable', 'range
   'http-error', 'wrong-number-of-arguments', 'divide-by-zero', 'syntax-error', 'read-error', 'assertion-failed', 'recursion-depth', 'control-error',
   'buffer-read-only', 'search-failed', 'beginning-of-buffer', 'end-of-buffer', 'beginning-of-line', 'end-of-line', 'scan-error', 'void-function',
   'invalid-regexp', 'setting-constant', 'ship-error', 'job-error', 'no-worker', 'thread-died', 'thread-cancelled']) defineConditionType(k, 'error');
-defineConditionType('args-out-of-range', 'range-error'); defineConditionType('end-of-file', 'read-error'); defineConditionType('thread-timeout', 'timeout');
+defineConditionType('cannot-block', 'control-error'); defineConditionType('args-out-of-range', 'range-error'); defineConditionType('end-of-file', 'read-error'); defineConditionType('thread-timeout', 'timeout');
 
 /* ---------- signalling: handlers run before unwinding ---------- */
 /* HANDLERS is the dynamic stack of exception handlers, innermost first: { h, js, next }. A Scheme
@@ -507,12 +509,19 @@ function isBound(name) { const b = globals.get(name); return !!b && b.value !== 
    (tail calls and do iterations); every 2^18 steps the clock is read, and after watchdog.limitMs
    since the last watchdog.reset() (each command, timer and evaluation starts one) the step throws. */
 let tickN = 0, stepT0 = 0;
+/* In generator mode the clock is read every 2^12 steps: a background thread's slice is 5 ms (R4.40). */
+let TICK_MASK = GEN ? 0xFFF : 0x3FFFF;
 const watchdog = { limitMs: 8000, reset() { tickN = 0; stepT0 = 0; } };
+/* Returns true when the running thread's time slice is over (generator mode; the caller yields). A
+   thread past its deadline (R14.13, runnable time, kept by the scheduler) gets the timeout
+   condition, and one second more to unwind before it is signalled again. */
 function tick() {
-  if ((++tickN & 0x3FFFF) !== 0) return;
+  if ((++tickN & TICK_MASK) !== 0) return false;
   const now = performance.now();
-  if (!stepT0) { stepT0 = now; return; }
+  if (now >= TS.deadlineAt) { TS.deadlineAt = now + 1000; throw new SchemeError('timeout', 'Timed out: the command passed its deadline', []); }
+  if (!stepT0) { stepT0 = now; return false; }
   if (now - stepT0 > watchdog.limitMs) { stepT0 = 0; throw new SchemeError('scheme-interrupt', `Interrupted: evaluation ran for more than ${Math.round(watchdog.limitMs / 1000)} s`, []); }
+  return now >= TS.sliceEnd;
 }
 
 /* ---------- the shadow stack ---------- */
@@ -529,12 +538,38 @@ function tick() {
 let MAX_DEPTH = 10000;
 const DEPTH_SLACK = 2000;
 let depthLimit = MAX_DEPTH, sp = 1, site = null, siteProc = null;
-const ST = new Array((MAX_DEPTH + 2 * DEPTH_SLACK) * 3).fill(null);
+let ST = new Array((MAX_DEPTH + 2 * DEPTH_SLACK) * 3).fill(null);
 function setMaxDepth(n) {
   MAX_DEPTH = n; depthLimit = n;
   for (let need = (n + 2 * DEPTH_SLACK) * 3; ST.length < need;) ST.push(null);
 }
 function resetStack() { sp = 1; depthLimit = MAX_DEPTH; site = null; siteProc = null; }
+/* A thread's evaluator state (generator mode, R4.38-R4.40): its shadow stack, handlers, restarts and
+   dynamic bindings (dyn holds parameter, outer value, own value per binding), the end of its time
+   slice and its deadline (absolute, performance.now() terms; the scheduler sets both), whether the
+   debugger may hold it, and a slot for the scheduler's own data. The main state owns the
+   preallocated stack; a thread's grows as it recurses. */
+class ThreadState {
+  constructor(name) {
+    this.name = name || null; this.ST = [null, null, null]; this.sp = 1; this.site = null; this.siteProc = null; this.depthLimit = MAX_DEPTH;
+    this.handlers = null; this.restarts = null; this.dyn = []; this.sliceEnd = Infinity; this.deadlineAt = Infinity; this.canSuspend = false; this.data = null;
+  }
+}
+let TS = new ThreadState('main'); TS.ST = ST;
+/* Make TS the running thread: the current state is saved into the state that was running, which is
+   returned. Parameter bindings are undone and redone so each thread sees its own. */
+function switchTo(ts) {
+  const prev = TS;
+  if (ts === prev) return prev;
+  prev.ST = ST; prev.sp = sp; prev.site = site; prev.siteProc = siteProc; prev.depthLimit = depthLimit; prev.handlers = handlers; prev.restarts = restarts;
+  const pd = prev.dyn;
+  for (let i = pd.length - 3; i >= 0; i -= 3) { const p = pd[i]; pd[i + 2] = p.value; p.value = pd[i + 1]; }
+  if (hooks.threadSwitch) hooks.threadSwitch(prev, ts);
+  TS = ts; ST = ts.ST; sp = ts.sp; site = ts.site; siteProc = ts.siteProc; depthLimit = ts.depthLimit; handlers = ts.handlers; restarts = ts.restarts;
+  const d = ts.dyn;
+  for (let i = 0; i < d.length; i += 3) { const p = d[i]; d[i + 1] = p.value; p.value = d[i + 2]; }
+  return prev;
+}
 function snapshot() { return { raw: ST.slice(3, sp * 3), site, proc: siteProc }; }
 /* The entries of a snapshot, innermost first: { proc, frame, loc }. */
 function frames(snap) {
@@ -769,8 +804,16 @@ function body(forms, scope, tail) {
   const list = arr(forms);
   if (!list.length) return K(UNSPEC);
   const compiled = [];
-  // Pre-scan for internal defines to allocate slots before compiling (mutual recursion).
-  if (scope) for (const f of list) {
+  scanDefines(list, scope);
+  for (let i = 0; i < list.length; i++) compiled.push(comp(list[i], scope, tail && i === list.length - 1));
+  if (compiled.length === 1) return compiled[0];
+  const n = compiled.length - 1;
+  return env => { for (let i = 0; i < n; i++) compiled[i](env); return compiled[n](env); };
+}
+// Pre-scan a body for internal defines to allocate slots before compiling (mutual recursion).
+function scanDefines(list, scope) {
+  if (!scope) return;
+  for (const f of list) {
     if (f instanceof Pair && special(scope, f.car) === 'define') {
       const target = f.cdr.car;
       const name = target instanceof Pair ? target.car : target;
@@ -779,10 +822,6 @@ function body(forms, scope, tail) {
     if (f instanceof Pair && special(scope, f.car) === 'define-values') { for (const n of arr(f.cdr.car)) if (isId(n) && !scope.names.has(n)) scope.add(n); }
     if (f instanceof Pair && special(scope, f.car) === 'define-record-type') { const spec = arr(f.cdr); const ctor = spec[1] instanceof Pair ? spec[1].car : spec[1]; for (const n of [ctor, spec[2]]) if (isId(n) && !scope.names.has(n)) scope.add(n); for (const fd of spec.slice(3)) for (const n of arr(fd).slice(1)) if (isId(n) && !scope.names.has(n)) scope.add(n); }
   }
-  for (let i = 0; i < list.length; i++) compiled.push(comp(list[i], scope, tail && i === list.length - 1));
-  if (compiled.length === 1) return compiled[0];
-  const n = compiled.length - 1;
-  return env => { for (let i = 0; i < n; i++) compiled[i](env); return compiled[n](env); };
 }
 function parseParams(params) {
   // Returns { names: [ids], rest: id|null, optional: [ids] } supporting #!optional and dotted rest.
@@ -808,10 +847,21 @@ function makeLambda(params, bodyForms, scope, name, loc) {
   if (bodyForms instanceof Pair && typeof bodyForms.car === 'string' && bodyForms.cdr !== NIL) { doc = bodyForms.car; bodyForms = bodyForms.cdr; }
   /* The source form, kept on every closure so a thread can be given a copy of it (pool.js). */
   const srcForm = new Pair(S.lambda, new Pair(params, bodyForms));
-  const run = body(bodyForms, inner, true);
   const nReq = names.length, nOpt = optional.length, hasRest = !!rest;
   const slotRest = nReq + nOpt + 1;
   const lambdaLoc = loc || null;
+  if (GEN) {
+    /* Generator mode: the body is a generator node (gbody, run by applyG); the plain entry drives it
+       to completion for callers that cannot yield. */
+    const run = bodyG(bodyForms, inner, true);
+    return env => {
+      const f = function (args) { const t = sp; const frame = enterFrame(f, args); const r = run.d ? run(frame) : driveSync(run(frame)); sp = t; return r; };
+      f.procName = name || null; f.doc = doc; f.arity = nReq; f.rest = hasRest; f.optional = nOpt; f.params = params;
+      f.src = srcForm; f.scope = inner; f.env = env; f.loc = lambdaLoc; f.gbody = run;
+      return f;
+    };
+  }
+  const run = body(bodyForms, inner, true);
   return env => {
     const f = function (args) {
       const n = args.length;
@@ -847,18 +897,20 @@ function compRef(id, scope) {
   const box = gbox(name);
   return () => { const v = box.value; if (v === undefined) return unboundRef(box, name); return v; };
 }
-function compSet(id, valc, scope, define) {
+/* The store of a value into ID (a define or a set!): (env, value) -> the form's value. */
+function compStore(id, scope, define) {
   const r = lookup(scope, id);
   if (scan) scan.refs.push([id, r]);
   if (r && r.macro) throw new SchemeError('syntax-error', 'Cannot assign to a macro: ' + baseName(id).name);
   if (r) {
     const { depth, index } = r;
-    return env => { let e = env; for (let d = 0; d < depth; d++) e = e[0]; const v = valc(env); if (define && typeof v === 'function' && !v.procName) v.procName = baseName(id).name; e[index] = v; return define ? baseName(id) : UNSPEC; };
+    return (env, v) => { let e = env; for (let d = 0; d < depth; d++) e = e[0]; if (define && typeof v === 'function' && !v.procName) v.procName = baseName(id).name; e[index] = v; return define ? baseName(id) : UNSPEC; };
   }
   const name = baseName(id).name, box = gbox(name);
-  if (define) return env => { const v = valc(env); if (typeof v === 'function' && !v.procName) v.procName = name; box.value = v; return baseName(id); };
-  return env => { const v = valc(env); if (box.value === undefined) return unboundSet(box, name, v); box.value = v; return UNSPEC; };
+  if (define) return (env, v) => { if (typeof v === 'function' && !v.procName) v.procName = name; box.value = v; return baseName(id); };
+  return (env, v) => { if (box.value === undefined) return unboundSet(box, name, v); box.value = v; return UNSPEC; };
 }
+function compSet(id, valc, scope, define) { const st = compStore(id, scope, define); return env => st(env, valc(env)); }
 function compCall(form, scope, tail) {
   const fc = comp(form.car, scope, false);
   const argcs = arr(form.cdr).map(a => comp(a, scope, false));
@@ -1219,6 +1271,738 @@ function compSpecial(name, x, scope, tail) {
   }
   throw new SchemeError('syntax-error', 'Unknown special form ' + name);
 }
+/* ---------- generator mode (R4.38) ---------- */
+/* In generator mode (edwind) the compiler emits generator closures. A compiled node is a generator
+   function of the frame, run with yield*, unless it can call no compound procedure: constants,
+   variable references, lambda, and calls to a global bound to a primitive when compiled, with such
+   nodes as arguments, stay plain closures flagged .d (consumers test the flag and call them). A
+   compound procedure compiled in this mode carries gbody, the generator node of its body, and its
+   plain JS entry drives that body to completion (driveSync) for callers that cannot yield: JS
+   primitives without a generator variant, and direct-mode code. There a blocking primitive signals
+   cannot-block. A node yields a Block (wait for a promise), PREEMPT (the time slice is over) or a
+   Suspend (the debugger holds the thread); edwind's scheduler resumes the thread with the promise's
+   value, or throws into it. Thread state (the shadow stack, handlers, restarts, dynamic bindings)
+   is swapped by switchTo. A global unbound when compiled compiles to a generator node, so the
+   unbound-variable restarts (use-value, store-value) can hold the thread in the debugger. */
+class Block { constructor(promise, what) { this.promise = promise; this.what = what || null; } }
+class Suspend { constructor(condition, continuable) { this.condition = condition; this.continuable = continuable; } }
+const PREEMPT = { toString() { return '#<preempt>'; } };
+const D1 = f => { f.d = true; return f; };
+let syncDepth = 0;
+const isPrimitive = v => typeof v === 'function' && v.gbody === undefined && v.gen === undefined;
+const cannotBlock = what => new SchemeError('cannot-block', `Cannot wait here${what ? ' for ' + what : ''}: this code runs where its thread cannot be suspended`, []);
+/* Run the generator IT to completion here: slices are ignored, a wait is refused. */
+function driveSync(it) {
+  syncDepth++;
+  try {
+    let r = it.next();
+    while (!r.done) {
+      const y = r.value;
+      if (y === PREEMPT) r = it.next();
+      else r = it.throw(cannotBlock(y instanceof Block ? y.what : y instanceof Suspend ? 'the debugger' : null));
+    }
+    return r.value;
+  } finally { syncDepth--; }
+}
+const syncNode = (c, env) => c.d ? c(env) : driveSync(c(env));
+/* Bind the parameter P to V for the current thread until the returned function is called. */
+function bindDyn(p, v) {
+  const dyn = TS.dyn, base = dyn.length;
+  dyn.push(p, p.value, v); p.value = v;
+  return () => { for (let i = dyn.length - 3; i >= base; i -= 3) dyn[i].value = dyn[i + 1]; dyn.length = base; };
+}
+function* withDynG(p, v, run) { const undo = bindDyn(p, v); try { return yield* run(); } finally { undo(); } }
+
+/* The frame of an application of the compound procedure F to ARGS, pushed on the shadow stack. */
+function enterFrame(f, args) {
+  const n = args.length, nReq = f.arity, nOpt = f.optional, hasRest = f.rest;
+  if (n < nReq || (!hasRest && n > nReq + nOpt)) throw new SchemeError('wrong-number-of-arguments', `${f.procName || 'procedure'}: expected ${hasRest ? 'at least ' : ''}${nReq}${nOpt && !hasRest ? '..' + (nReq + nOpt) : ''} argument${nReq === 1 ? '' : 's'}, got ${n}`);
+  const frame = new Array(f.scope.size);
+  frame[0] = f.env;
+  for (let i = 0; i < nReq + nOpt; i++) frame[i + 1] = i < n ? args[i] : false;
+  if (hasRest) frame[nReq + nOpt + 1] = n > nReq + nOpt ? listOf(args.slice(nReq + nOpt)) : NIL;
+  if (SHADOW) {
+    const t = sp; if (t > depthLimit) depthExceeded();
+    const b = t * 3; ST[b] = f; ST[b + 1] = site; ST[b + 2] = frame; sp = t + 1;
+  }
+  return frame;
+}
+function* depthExceededG() {
+  const e = new SchemeError('recursion-depth', 'Recursion too deep', []);
+  if (depthLimit > MAX_DEPTH) throw e;
+  depthLimit = MAX_DEPTH + DEPTH_SLACK;
+  try { return yield* signalG(e, false); } finally { depthLimit = MAX_DEPTH; }
+}
+/* A compound procedure whose body node is direct runs here, in a plain function (V8 optimises its
+   loops, which it does not do inside a generator), through tail calls to such procedures, until the
+   value, a tail call to anything else, or the end of the slice: the generator that called then yields.
+   PREEMPT_DUE carries that last case to it. */
+let preemptDue = false;
+function runD(f, args, l) {
+  for (;;) {
+    if (SHADOW) { site = l; siteProc = f; }
+    const t = sp, frame = enterFrame(f, args);
+    const r = f.gbody(frame);
+    sp = t;
+    if (!(r instanceof TailCall)) return r;
+    const h = r.f;
+    if (typeof h !== 'function' || h.gbody === undefined || !h.gbody.d) return r;
+    if (tick()) { preemptDue = true; return r; }
+    f = h; args = r.args; if (r.loc) l = r.loc;
+  }
+}
+/* Apply F to ARGS in generator mode, running tail calls; LOC is the call site. */
+function* applyG(f, args, loc) {
+  const s = sp; let l = loc === undefined ? (s === 1 ? null : site) : loc;
+  try {
+    for (;;) {
+      let r;
+      if (typeof f === 'function') {
+        const run = f.gbody;
+        if (run !== undefined) {
+          if (tick()) yield PREEMPT;
+          if (SHADOW && sp > depthLimit) yield* depthExceededG();
+          if (run.d) { r = runD(f, args, l); if (preemptDue) { preemptDue = false; yield PREEMPT; } }
+          else {
+            if (SHADOW) { site = l; siteProc = f; }
+            const t = sp, frame = enterFrame(f, args);
+            r = yield* run(frame);
+            sp = t;
+          }
+        } else {
+          if (SHADOW) { site = l; siteProc = f; }
+          r = f.gen !== undefined ? yield* f.gen(args) : f(args);
+        }
+      } else r = callProc(f, args);
+      if (!(r instanceof TailCall)) return r;
+      f = r.f; args = r.args; if (r.loc) l = r.loc;
+    }
+  } catch (e) { yield* unwoundG(e, s); }
+}
+/* The debugger hook (hooks.debugG, a generator function) sees a condition no handler took, once, on a
+   thread the scheduler can hold; it returns {value} to continue a continuable condition, undefined
+   to let the condition propagate, or throws (an Unwind to a restart). */
+function* debugG(r, continuable) {
+  if (r.debugged || syncDepth !== 0 || !TS.canSuspend || !hooks.debugG) return undefined;
+  if (isPassive(r instanceof Raise ? r.obj : r)) return undefined;
+  r.debugged = true;
+  return yield* hooks.debugG(r, continuable);
+}
+function* unwoundG(e, s) {
+  if (e instanceof SchemeError) {
+    if (!e.signalled) yield* signalG(e, false);
+    if (e.shadow === undefined) e.shadow = snapshot();
+    yield* debugG(e, false);
+    if (handlers === null) e.signalled = false;
+  } else if (e instanceof Raise) { if (e.shadow === undefined) e.shadow = snapshot(); yield* debugG(e, false); }
+  sp = s;
+  throw e;
+}
+function* signalG(obj, continuable) {
+  const top = handlers;
+  if (obj instanceof SchemeError) { obj.signalled = true; if (obj.shadow === undefined) obj.shadow = snapshot(); }
+  if (top !== null) {
+    const passive = isPassive(obj);
+    try {
+      for (let n = top; n !== null; n = n.next) {
+        if (passive && !n.js) continue;
+        handlers = n.next;
+        let v;
+        try { v = n.js ? n.h(obj, continuable) : yield* applyG(n.h, [obj]); }
+        catch (e) { if (e instanceof SchemeError || e instanceof Raise) e.signalled = true; throw e; }
+        if (n.js && v === DECLINE) continue;
+        if (continuable) return v;
+        yield* signalG(new SchemeError('error', 'Exception handler returned from a non-continuable raise of ' + (obj instanceof SchemeError ? errorMessage(obj) : write(obj)), [obj]), false);
+      }
+    } finally { handlers = top; }
+  }
+  let r = obj;
+  if (!(obj instanceof SchemeError)) { r = new Raise(obj, continuable); r.signalled = true; r.shadow = snapshot(); }
+  const d = yield* debugG(r, continuable);
+  if (d !== undefined && continuable) return d.value;
+  throw r;
+}
+function* establishG(rs, tag, run) {
+  const saved = restarts, s = sp;
+  let chain = saved;
+  for (let i = rs.length - 1; i >= 0; i--) chain = { r: rs[i], next: chain };
+  restarts = chain;
+  try { return yield* run(); }
+  catch (e) {
+    if (!(e instanceof Unwind) || e.tag !== tag) throw e;
+    sp = s; restarts = saved;
+    const r = e.a;
+    if (r.js) return r.fn(...e.b);
+    return yield* applyG(r.fn, e.b);
+  } finally { restarts = saved; }
+}
+function* withRestartsG(specs, run) {
+  const tag = {};
+  return yield* establishG(specs.map(s => s instanceof Restart ? s : new Restart(restartName(s.name), s.report, s.interactive, s.fn, tag, true)), tag, run);
+}
+function* unboundRefG(box, name) {
+  const tag = {};
+  siteProc = null;
+  const need = v => { if (v === undefined) throw new SchemeError('wrong-number-of-arguments', name + ': the restart needs a value', []); return v; };
+  return yield* establishG([
+    new Restart(USE_VALUE, `Specify a value to use instead of ${name}.`, null, v => need(v), tag, true),
+    new Restart(STORE_VALUE, `Define ${name} to a given value.`, null, v => { box.value = need(v); return v; }, tag, true),
+  ], tag, function* () { return yield* signalG(new SchemeError('unbound-variable', `Unbound variable: ${name}`, [intern(name)]), false); });
+}
+
+/* ---------- the compiler, generator mode ---------- */
+function compG(x, scope, tail) {
+  if (isId(x)) { if (isKeyword(baseName(x))) return D1(K(baseName(x))); return compRefG(x, scope); }
+  if (!(x instanceof Pair)) { if (x === NIL) throw new SchemeError('syntax-error', 'Empty combination ()'); return D1(K(x)); }
+  const head = x.car;
+  const m = macroFor(scope, head);
+  if (m && scan) scan.macros.push([head, lookup(scope, head)]);
+  if (m) {
+    const exp = expandMacro(m, x, scope);
+    if (exp instanceof Pair && !locs.has(exp)) { const l = locs.get(x); if (l) locs.set(exp, l); }
+    return compG(exp, scope, tail);
+  }
+  const sf = special(scope, head);
+  if (sf) return compSpecialG(sf, x, scope, tail);
+  return compCallG(x, scope, tail);
+}
+function compRefG(id, scope) {
+  const d = compRef(id, scope);
+  if (lookup(scope, id)) return D1(d);
+  const name = baseName(id).name, box = gbox(name);
+  /* A box with an accessor (a magic variable) is read only at run time. */
+  const desc = Object.getOwnPropertyDescriptor(box, 'value');
+  if (desc && desc.get) return D1(d);
+  if (box.value !== undefined) { const c = D1(d); c.gbox = box; return c; }
+  const c = function* () { const v = box.value; return v !== undefined ? v : yield* unboundRefG(box, name); };
+  c.box = box; c.vname = name;
+  return c;
+}
+function compSetG(id, vc, scope, define) {
+  const st = compStore(id, scope, define);
+  if (vc.d) return D1(env => st(env, vc(env)));
+  return function* (env) { return st(env, yield* vc(env)); };
+}
+function bodyG(forms, scope, tail) {
+  const list = arr(forms);
+  if (!list.length) return D1(K(UNSPEC));
+  scanDefines(list, scope);
+  const compiled = [];
+  for (let i = 0; i < list.length; i++) compiled.push(compG(list[i], scope, tail && i === list.length - 1));
+  if (compiled.length === 1) return compiled[0];
+  const n = compiled.length - 1;
+  if (compiled.every(c => c.d)) return D1(env => { for (let i = 0; i < n; i++) compiled[i](env); return compiled[n](env); });
+  return function* (env) {
+    for (let i = 0; i < n; i++) { const c = compiled[i]; if (c.d) c(env); else yield* c(env); }
+    const c = compiled[n]; return c.d ? c(env) : yield* c(env);
+  };
+}
+function compCallG(form, scope, tail) {
+  const fc = compG(form.car, scope, false);
+  const argcs = arr(form.cdr).map(a => compG(a, scope, false));
+  const n = argcs.length, loc = locs.get(form) || null;
+  const argsD = argcs.every(c => c.d);
+  if (fc.d && argsD) {
+    if (tail) {
+      const [a0, a1, a2] = argcs;
+      if (n === 0) return D1(env => new TailCall(fc(env), [], loc));
+      if (n === 1) return D1(env => new TailCall(fc(env), [a0(env)], loc));
+      if (n === 2) return D1(env => new TailCall(fc(env), [a0(env), a1(env)], loc));
+      if (n === 3) return D1(env => new TailCall(fc(env), [a0(env), a1(env), a2(env)], loc));
+      return D1(env => { const f = fc(env), args = []; for (let i = 0; i < n; i++) args.push(argcs[i](env)); return new TailCall(f, args, loc); });
+    }
+    const box = fc.gbox;
+    if (box !== undefined && isPrimitive(box.value)) {
+      /* A call to a primitive runs in place; if the global is rebound to a compound procedure later,
+         the call still works but cannot hold the thread. */
+      const prim = box.value;
+      const [a0, a1, a2] = argcs;
+      const evalArgs = n === 0 ? () => [] : n === 1 ? env => [a0(env)] : n === 2 ? env => [a0(env), a1(env)] : n === 3 ? env => [a0(env), a1(env), a2(env)]
+        : env => { const args = new Array(n); for (let i = 0; i < n; i++) args[i] = argcs[i](env); return args; };
+      return D1(env => {
+        const f = box.value, args = evalArgs(env);
+        if (f !== prim) return callProc(f, args);
+        /* With a handler installed, an error the primitive throws reaches it here, before anything
+           unwinds (R4.31); that handler runs in place and cannot hold the thread. */
+        if (handlers !== null) return callGuarded(f, args, loc);
+        if (SHADOW) { site = loc; siteProc = f; }
+        let r = f(args);
+        while (r instanceof TailCall) r = callProc(r.f, r.args);
+        return r;
+      });
+    }
+  }
+  const hbox = fc.box, hname = fc.vname;
+  const [c0, c1, c2] = argcs;
+  return function* (env) {
+    let f;
+    if (hbox !== undefined) { f = hbox.value; if (f === undefined) f = yield* unboundRefG(hbox, hname); }
+    else f = fc.d ? fc(env) : yield* fc(env);
+    /* Argument arrays are literals where they can be: a filled new Array(n) is holey and slow. */
+    let args;
+    if (n === 0) args = [];
+    else if (n === 1) args = [c0.d ? c0(env) : yield* c0(env)];
+    else if (n === 2) args = [c0.d ? c0(env) : yield* c0(env), c1.d ? c1(env) : yield* c1(env)];
+    else if (n === 3) args = [c0.d ? c0(env) : yield* c0(env), c1.d ? c1(env) : yield* c1(env), c2.d ? c2(env) : yield* c2(env)];
+    else { args = []; for (let i = 0; i < n; i++) { const c = argcs[i]; args.push(c.d ? c(env) : yield* c(env)); } }
+    if (tail) return new TailCall(f, args, loc);
+    /* applyG, inlined: one generator per call instead of two. */
+    const s = sp; let l = loc;
+    try {
+      for (;;) {
+        let r;
+        if (typeof f === 'function') {
+          const run = f.gbody;
+          if (run !== undefined) {
+            if (tick()) yield PREEMPT;
+            if (SHADOW && sp > depthLimit) yield* depthExceededG();
+            if (run.d) { r = runD(f, args, l); if (preemptDue) { preemptDue = false; yield PREEMPT; } }
+            else {
+              if (SHADOW) { site = l; siteProc = f; }
+              const t = sp, frame = enterFrame(f, args);
+              r = yield* run(frame);
+              sp = t;
+            }
+          } else {
+            if (SHADOW) { site = l; siteProc = f; }
+            r = f.gen !== undefined ? yield* f.gen(args) : f(args);
+          }
+        } else r = callProc(f, args);
+        if (!(r instanceof TailCall)) return r;
+        f = r.f; args = r.args; if (r.loc) l = r.loc;
+      }
+    } catch (e) { yield* unwoundG(e, s); }
+  };
+}
+function mapG(c, f) { if (c.d) return D1(env => f(c(env))); return function* (env) { return f(yield* c(env)); }; }
+function qqG(x, scope, depth) {
+  if (x instanceof Pair) {
+    if (isId(x.car) && baseName(x.car) === S.unquote) {
+      if (depth === 1) return compG(x.cdr.car, scope, false);
+      return mapG(qqG(x.cdr.car, scope, depth - 1), v => list(S.unquote, v));
+    }
+    if (isId(x.car) && baseName(x.car) === S.quasiquote) return mapG(qqG(x.cdr.car, scope, depth + 1), v => list(S.quasiquote, v));
+    const parts = []; let c = x;
+    while (c instanceof Pair) {
+      if (isId(c.car) && baseName(c.car) === S.unquote) break;
+      const item = c.car;
+      if (item instanceof Pair && isId(item.car) && baseName(item.car) === S['unquote-splicing'] && depth === 1) parts.push({ splice: true, c: compG(item.cdr.car, scope, false) });
+      else parts.push({ splice: false, c: qqG(item, scope, depth) });
+      c = c.cdr;
+    }
+    const tailc = c === NIL ? D1(K(NIL)) : qqG(c, scope, depth);
+    const build = (vals, t) => {
+      let r = t;
+      for (let i = parts.length - 1; i >= 0; i--) {
+        if (!parts[i].splice) r = new Pair(vals[i], r);
+        else { const items = arr(vals[i]); for (let j = items.length - 1; j >= 0; j--) r = new Pair(items[j], r); }
+      }
+      return r;
+    };
+    if (tailc.d && parts.every(p => p.c.d)) return D1(env => build(parts.map(p => p.c(env)), tailc(env)));
+    return function* (env) {
+      const vals = new Array(parts.length);
+      for (let i = 0; i < parts.length; i++) { const c = parts[i].c; vals[i] = c.d ? c(env) : yield* c(env); }
+      return build(vals, tailc.d ? tailc(env) : yield* tailc(env));
+    };
+  }
+  if (Array.isArray(x)) return mapG(qqG(listOf(x), scope, depth), arr);
+  return D1(K(strip(x)));
+}
+const bindingsOf = a => arr(a).map(b => b instanceof Pair ? [b.car, b.cdr === NIL ? false : b.cdr.car] : [b, false]);
+function compSpecialG(name, x, scope, tail) {
+  const a = arr(x.cdr);
+  const need = (n, msg) => { if (a.length < n) throw new SchemeError('syntax-error', `${name}: ${msg || 'too few forms'} in ${write(strip(x))}`); };
+  switch (name) {
+    case 'quote': need(1); return D1(K(strip(a[0])));
+    case 'quasiquote': need(1); return qqG(a[0], scope, 1);
+    case 'if': {
+      need(2);
+      const c = compG(a[0], scope, false), t = compG(a[1], scope, tail), e = a.length > 2 ? compG(a[2], scope, tail) : D1(K(UNSPEC));
+      if (c.d && t.d && e.d) return D1(env => c(env) !== false ? t(env) : e(env));
+      return function* (env) { return (c.d ? c(env) : yield* c(env)) !== false ? (t.d ? t(env) : yield* t(env)) : (e.d ? e(env) : yield* e(env)); };
+    }
+    case 'define': {
+      need(1);
+      const target = a[0];
+      if (target instanceof Pair) {
+        let nameSpec = target.car, params = target.cdr, bodyForms = x.cdr.cdr;
+        while (nameSpec instanceof Pair) { bodyForms = list(new Pair(S.lambda, new Pair(params, bodyForms))); params = nameSpec.cdr; nameSpec = nameSpec.car; }
+        const lam = makeLambda(params, bodyForms, scope, baseName(nameSpec).name, locs.get(x));
+        return D1(compSet(nameSpec, lam, scope, true));
+      }
+      if (!isId(target)) throw new SchemeError('syntax-error', 'define: bad target ' + write(strip(target)));
+      if (a.length === 1) return D1(compSet(target, K(UNSPEC), scope, true));
+      let valForm = a[1], doc = null;
+      if (typeof valForm === 'string' && a.length > 2) { doc = valForm; valForm = a[2]; }
+      const setter = compSetG(target, compG(valForm, scope, false), scope, true);
+      if (!doc) return setter;
+      const withDoc = (env, r) => { const v = lookupValue(target, scope, env); if (typeof v === 'function') v.doc = doc; else gdoc.set(baseName(target).name, doc); return r; };
+      if (setter.d) return D1(env => withDoc(env, setter(env)));
+      return function* (env) { return withDoc(env, yield* setter(env)); };
+    }
+    case 'set!': need(2); return compSetG(a[0], compG(a[1], scope, false), scope, false);
+    case 'lambda': need(1); return D1(makeLambda(a[0], x.cdr.cdr, scope, null, locs.get(x)));
+    case 'named-lambda': { need(1); const spec = a[0]; return D1(makeLambda(spec.cdr, x.cdr.cdr, scope, baseName(spec.car).name, locs.get(x))); }
+    case 'begin': return bodyG(x.cdr, scope, tail);
+    case 'let': {
+      need(1);
+      if (isId(a[0])) {
+        const nm = a[0], bindings = arr(a[1]).map(b => b instanceof Pair ? [b.car, b.cdr === NIL ? UNSPEC : b.cdr.car] : [b, UNSPEC]);
+        const loopScope = new Scope(scope, [nm]);
+        const lam = makeLambda(listOf(bindings.map(b => b[0])), x.cdr.cdr.cdr, loopScope, baseName(nm).name, locs.get(x));
+        const inits = bindings.map(b => compG(b[1] === UNSPEC ? false : b[1], scope, false));
+        const n = inits.length;
+        if (tail && inits.every(c => c.d)) return D1(env => { const frame = [env, null]; const f = lam(frame); frame[1] = f; const args = []; for (let i = 0; i < n; i++) args.push(inits[i](env)); return new TailCall(f, args); });
+        return function* (env) {
+          const frame = [env, null]; const f = lam(frame); frame[1] = f;
+          const args = [];
+          for (let i = 0; i < n; i++) { const c = inits[i]; args.push(c.d ? c(env) : yield* c(env)); }
+          return tail ? new TailCall(f, args) : yield* applyG(f, args);
+        };
+      }
+      const bindings = bindingsOf(a[0]);
+      const inits = bindings.map(b => compG(b[1], scope, false));
+      const inner = new Scope(scope, bindings.map(b => b[0]));
+      const run = bodyG(x.cdr.cdr, inner, tail);
+      const n = inits.length;
+      if (run.d && inits.every(c => c.d)) return D1(env => { const frame = new Array(inner.size); frame[0] = env; for (let i = 0; i < n; i++) frame[i + 1] = inits[i](env); return run(frame); });
+      return function* (env) {
+        const frame = new Array(inner.size); frame[0] = env;
+        for (let i = 0; i < n; i++) { const c = inits[i]; frame[i + 1] = c.d ? c(env) : yield* c(env); }
+        return run.d ? run(frame) : yield* run(frame);
+      };
+    }
+    case 'let*': {
+      need(1);
+      const bindings = bindingsOf(a[0]);
+      if (!bindings.length) return bodyG(x.cdr.cdr, new Scope(scope, []), tail);
+      const inner = new Scope(scope, []);
+      const steps = bindings.map(([id, init]) => { const ic = compG(init, inner, false); const slot = inner.add(id); return [slot, ic]; });
+      const run = bodyG(x.cdr.cdr, inner, tail);
+      if (run.d && steps.every(s => s[1].d)) return D1(env => { const frame = new Array(inner.size); frame[0] = env; for (const [slot, ic] of steps) frame[slot] = ic(frame); return run(frame); });
+      return function* (env) {
+        const frame = new Array(inner.size); frame[0] = env;
+        for (const [slot, ic] of steps) frame[slot] = ic.d ? ic(frame) : yield* ic(frame);
+        return run.d ? run(frame) : yield* run(frame);
+      };
+    }
+    case 'letrec': case 'letrec*': {
+      need(1);
+      const bindings = arr(a[0]).map(b => [b.car, b.cdr === NIL ? false : b.cdr.car]);
+      const inner = new Scope(scope, bindings.map(b => b[0]));
+      const names = bindings.map(([id]) => baseName(id).name);
+      const inits = bindings.map(([, init]) => compG(init, inner, false));
+      const run = bodyG(x.cdr.cdr, inner, tail);
+      const nameIt = (v, i) => { if (typeof v === 'function' && !v.procName) v.procName = names[i]; return v; };
+      if (run.d && inits.every(c => c.d)) return D1(env => { const frame = new Array(inner.size); frame[0] = env; for (let i = 0; i < inits.length; i++) frame[i + 1] = nameIt(inits[i](frame), i); return run(frame); });
+      return function* (env) {
+        const frame = new Array(inner.size); frame[0] = env;
+        for (let i = 0; i < inits.length; i++) { const c = inits[i]; frame[i + 1] = nameIt(c.d ? c(frame) : yield* c(frame), i); }
+        return run.d ? run(frame) : yield* run(frame);
+      };
+    }
+    case 'cond': {
+      const clauses = a.map(cl => {
+        const c = arr(cl);
+        if (isId(c[0]) && baseName(c[0]) === S.else) return { els: bodyG(cl.cdr, scope, tail) };
+        if (c.length > 1 && isId(c[1]) && baseName(c[1]) === S['=>']) return { test: compG(c[0], scope, false), arrow: compG(c[2], scope, false) };
+        return { test: compG(c[0], scope, false), run: c.length > 1 ? bodyG(cl.cdr, scope, tail) : null };
+      });
+      const allD = clauses.every(cl => (!cl.els || cl.els.d) && (!cl.test || cl.test.d) && (!cl.run || cl.run.d) && !cl.arrow);
+      if (allD) return D1(env => { for (const cl of clauses) { if (cl.els) return cl.els(env); const v = cl.test(env); if (v !== false) return cl.run ? cl.run(env) : v; } return UNSPEC; });
+      return function* (env) {
+        for (const cl of clauses) {
+          if (cl.els) return cl.els.d ? cl.els(env) : yield* cl.els(env);
+          const v = cl.test.d ? cl.test(env) : yield* cl.test(env);
+          if (v !== false) {
+            if (cl.arrow) { const f = cl.arrow.d ? cl.arrow(env) : yield* cl.arrow(env); return tail ? new TailCall(f, [v]) : yield* applyG(f, [v]); }
+            return cl.run ? (cl.run.d ? cl.run(env) : yield* cl.run(env)) : v;
+          }
+        }
+        return UNSPEC;
+      };
+    }
+    case 'case': {
+      need(1);
+      const keyc = compG(a[0], scope, false);
+      const clauses = a.slice(1).map(cl => {
+        const c = arr(cl);
+        const els = isId(c[0]) && baseName(c[0]) === S.else;
+        const data = els ? null : arr(strip(c[0]));
+        if (c.length > 1 && isId(c[1]) && baseName(c[1]) === S['=>']) return { els, data, arrow: compG(c[2], scope, false) };
+        return { els, data, run: bodyG(cl.cdr, scope, tail) };
+      });
+      const hit = (cl, k) => cl.els || cl.data.some(d => eqv(d, k));
+      if (keyc.d && clauses.every(cl => !cl.arrow && cl.run.d)) return D1(env => { const k = keyc(env); for (const cl of clauses) if (hit(cl, k)) return cl.run(env); return UNSPEC; });
+      return function* (env) {
+        const k = keyc.d ? keyc(env) : yield* keyc(env);
+        for (const cl of clauses) {
+          if (hit(cl, k)) {
+            if (cl.arrow) { const f = cl.arrow.d ? cl.arrow(env) : yield* cl.arrow(env); return tail ? new TailCall(f, [k]) : yield* applyG(f, [k]); }
+            return cl.run.d ? cl.run(env) : yield* cl.run(env);
+          }
+        }
+        return UNSPEC;
+      };
+    }
+    case 'and': {
+      if (!a.length) return D1(K(true));
+      const cs = a.map((e, i) => compG(e, scope, tail && i === a.length - 1));
+      if (cs.every(c => c.d)) return D1(env => { let v = true; for (let i = 0; i < cs.length; i++) { v = cs[i](env); if (v === false) return false; } return v; });
+      return function* (env) { let v = true; for (let i = 0; i < cs.length; i++) { const c = cs[i]; v = c.d ? c(env) : yield* c(env); if (v === false) return false; } return v; };
+    }
+    case 'or': {
+      if (!a.length) return D1(K(false));
+      const cs = a.map((e, i) => compG(e, scope, tail && i === a.length - 1));
+      if (cs.every(c => c.d)) return D1(env => { for (let i = 0; i < cs.length; i++) { const v = cs[i](env); if (v !== false) return v; } return false; });
+      return function* (env) { for (let i = 0; i < cs.length; i++) { const c = cs[i]; const v = c.d ? c(env) : yield* c(env); if (v !== false) return v; } return false; };
+    }
+    case 'when': case 'unless': {
+      need(1);
+      const c = compG(a[0], scope, false), run = bodyG(x.cdr.cdr, scope, tail), want = name === 'when';
+      if (c.d && run.d) return D1(env => (c(env) !== false) === want ? run(env) : UNSPEC);
+      return function* (env) { return ((c.d ? c(env) : yield* c(env)) !== false) === want ? (run.d ? run(env) : yield* run(env)) : UNSPEC; };
+    }
+    case 'do': {
+      need(2);
+      const specs = arr(a[0]).map(s => { const ss = arr(s); return { id: ss[0], init: ss[1], step: ss.length > 2 ? ss[2] : null }; });
+      const inner = new Scope(scope, specs.map(s => s.id));
+      const inits = specs.map(s => compG(s.init, scope, false));
+      const steps = specs.map(s => s.step === null ? null : compG(s.step, inner, false));
+      const endSpec = arr(a[1]);
+      const test = compG(endSpec[0], inner, false), result = bodyG(a[1].cdr, inner, false);
+      const cmds = bodyG(x.cdr.cdr.cdr, inner, false);
+      if (test.d && result.d && cmds.d && steps.every(c => c === null || c.d)) {
+        /* Every part is direct: the loop runs in a plain function until it ends or the slice is over. */
+        const loop = (frame, env, out) => {
+          for (;;) {
+            if (test(frame) !== false) { out[0] = result(frame); return null; }
+            if (tick()) return frame;
+            cmds(frame);
+            const next = new Array(inner.size); next[0] = env;
+            for (let i = 0; i < steps.length; i++) next[i + 1] = steps[i] ? steps[i](frame) : frame[i + 1];
+            frame = next;
+          }
+        };
+        return function* (env) {
+          let frame = new Array(inner.size); frame[0] = env;
+          for (let i = 0; i < inits.length; i++) { const c = inits[i]; frame[i + 1] = c.d ? c(env) : yield* c(env); }
+          const out = [UNSPEC];
+          while ((frame = loop(frame, env, out)) !== null) yield PREEMPT;
+          return out[0];
+        };
+      }
+      return function* (env) {
+        let frame = new Array(inner.size); frame[0] = env;
+        for (let i = 0; i < inits.length; i++) { const c = inits[i]; frame[i + 1] = c.d ? c(env) : yield* c(env); }
+        for (;;) {
+          if ((test.d ? test(frame) : yield* test(frame)) !== false) return result.d ? result(frame) : yield* result(frame);
+          if (tick()) yield PREEMPT;
+          if (cmds.d) cmds(frame); else yield* cmds(frame);
+          const next = new Array(inner.size); next[0] = env;
+          for (let i = 0; i < steps.length; i++) { const c = steps[i]; next[i + 1] = c === null ? frame[i + 1] : c.d ? c(frame) : yield* c(frame); }
+          frame = next;
+        }
+      };
+    }
+    case 'define-syntax': case 'let-syntax': case 'letrec-syntax': {
+      if (name === 'define-syntax') {
+        need(2);
+        const id = a[0], spec = a[1];
+        let m;
+        if (spec instanceof Pair && isId(spec.car) && baseName(spec.car) === S['syntax-rules']) m = parseRules(spec, scope);
+        else { const pc = compG(spec, scope, false); m = { kind: 'proc', proc: null, lazy: env => syncNode(pc, env) }; }
+        if (scope) { if (!scope.macros) scope.macros = new Map(); if (m.lazy) { m.proc = m.lazy(null); } scope.macros.set(id, m); }
+        else { if (m.lazy) m.proc = m.lazy(null); m.src = strip(x); macros.set(baseName(id).name, m); }
+        return D1(K(baseName(id)));
+      }
+      const inner = new Scope(scope, []); inner.macros = new Map();
+      for (const b of arr(a[0])) { const bb = arr(b); inner.macros.set(bb[0], parseRules(bb[1], name === 'letrec-syntax' ? inner : scope)); }
+      const run = bodyG(x.cdr.cdr, inner, tail);
+      if (run.d) return D1(env => run([env]));
+      return function* (env) { return yield* run([env]); };
+    }
+    case 'define-macro': {
+      need(2);
+      const target = a[0];
+      const nameId = target instanceof Pair ? target.car : target;
+      const proc = target instanceof Pair ? makeLambda(target.cdr, x.cdr.cdr, scope, baseName(nameId).name, locs.get(x))(null) : syncNode(compG(a[1], scope, false), null);
+      const m = { kind: 'proc', proc };
+      if (scope) { if (!scope.macros) scope.macros = new Map(); scope.macros.set(nameId, m); } else { m.src = strip(x); macros.set(baseName(nameId).name, m); }
+      return D1(K(baseName(nameId)));
+    }
+    case 'parameterize': {
+      need(1);
+      const bs = arr(a[0]).map(b => { const bb = arr(b); return [compG(bb[0], scope, false), compG(bb[1], scope, false)]; });
+      const run = bodyG(x.cdr.cdr, scope, false);
+      return function* (env) {
+        const ps = [];
+        for (const [pc, vc] of bs) {
+          const p = pc.d ? pc(env) : yield* pc(env);
+          if (!(p instanceof Param)) throw typeErr('parameter', p, 'parameterize');
+          ps.push([p, vc.d ? vc(env) : yield* vc(env)]);
+        }
+        const dyn = TS.dyn, base = dyn.length;
+        for (const [p, v] of ps) { const nv = p.converter ? yield* applyG(p.converter, [v]) : v; dyn.push(p, p.value, nv); p.value = nv; }
+        try { return run.d ? run(env) : yield* run(env); }
+        finally { for (let i = dyn.length - 3; i >= base; i -= 3) dyn[i].value = dyn[i + 1]; dyn.length = base; }
+      };
+    }
+    case 'guard': {
+      need(2);
+      const spec = a[0], v = spec.car;
+      const inner = new Scope(scope, [v]);
+      const cls = arr(spec.cdr).map(cl => {
+        const c = arr(cl);
+        if (isId(c[0]) && baseName(c[0]) === S.else) return { test: null, run: bodyG(cl.cdr, inner, false) };
+        if (c.length > 2 && isId(c[1]) && baseName(c[1]) === S['=>']) return { test: compG(c[0], inner, false), arrow: compG(c[2], inner, false) };
+        return { test: compG(c[0], inner, false), run: c.length > 1 ? bodyG(cl.cdr, inner, false) : null };
+      });
+      const run = bodyG(x.cdr.cdr, scope, false);
+      return function* (env) {
+        const tag = {};
+        /* The clause tests run in the handler, where the condition was raised, so they cannot hold the thread. */
+        const choose = obj => {
+          if (isPassive(obj)) return null;
+          const frame = [env, obj];
+          for (let i = 0; i < cls.length; i++) { const t = cls[i].test; if (!t) return [i, true]; const tv = syncNode(t, frame); if (tv !== false) return [i, tv]; }
+          return null;
+        };
+        const saved = handlers, s = sp;
+        handlers = { h: obj => { const c = choose(obj); if (!c) return DECLINE; throw new Unwind(tag, obj, c); }, js: true, next: saved };
+        let obj, c;
+        try { return run.d ? run(env) : yield* run(env); }
+        catch (e) {
+          if (e instanceof Unwind && e.tag === tag) { obj = e.a; c = e.b; }
+          else if (e instanceof Escape || e instanceof Unwind || ((e instanceof SchemeError || e instanceof Raise) && e.signalled)) throw e;
+          else if (e instanceof RangeError) {
+            handlers = saved;
+            obj = new SchemeError('recursion-depth', `Recursion too deep: the JavaScript stack ran out at depth ${Math.max(0, sp - 1)}`, []);
+            sp = s;
+            c = choose(obj);
+            if (!c) throw e;
+          } else if (e instanceof SchemeError) {
+            try { yield* signalG(e, false); } catch (e2) { if (e2 instanceof Unwind && e2.tag === tag) { obj = e2.a; c = e2.b; } else throw e2; }
+          } else {
+            handlers = saved; sp = s;
+            obj = e instanceof Raise ? e.obj : e;
+            c = choose(obj);
+            if (!c) throw e;
+          }
+        } finally { handlers = saved; }
+        sp = s;
+        const frame = [env, obj], cl = cls[c[0]];
+        if (cl.arrow) return yield* applyG(cl.arrow.d ? cl.arrow(frame) : yield* cl.arrow(frame), [c[1]]);
+        return cl.run ? (cl.run.d ? cl.run(frame) : yield* cl.run(frame)) : c[1];
+      };
+    }
+    case 'define-record-type': {
+      need(3);
+      const typeName = a[0] instanceof Pair ? a[0].car : a[0];
+      let printerc = null;
+      if (a[0] instanceof Pair) { const o = arr(a[0].cdr); for (let i = 0; i + 1 < o.length; i += 2) if (isId(o[i]) && baseName(o[i]).name === ':printer') printerc = compG(o[i + 1], scope, false); }
+      const ctorSpec = a[1], predName = a[2], fields = a.slice(3).map(f => arr(f));
+      const fieldNames = fields.map(f => baseName(f[0]));
+      const rt = new RecordType(baseName(typeName).name, fieldNames.map(s => s.name));
+      rt.src = strip(x);
+      const tag = f => { f.recordType = rt; return f; };
+      const defs = [];
+      defs.push([typeName, K(rt)]);
+      if (ctorSpec instanceof Pair) {
+        const ctorName = ctorSpec.car, ctorFields = arr(ctorSpec.cdr).map(baseName);
+        const idx = ctorFields.map(f => fieldNames.indexOf(f));
+        defs.push([ctorName, K(tag(named(arity(args => { const r = new Record(rt, new Array(fieldNames.length).fill(false)); idx.forEach((k, i) => { r.fields[k] = args[i]; }); return r; }, idx.length), baseName(ctorName).name)))]);
+      } else if (isId(ctorSpec)) defs.push([ctorSpec, K(tag(named(args => new Record(rt, args.slice()), baseName(ctorSpec).name)))]);
+      defs.push([predName, K(tag(named(arity(args => args[0] instanceof Record && args[0].type === rt, 1), baseName(predName).name)))]);
+      fields.forEach((f, k) => {
+        if (f[1]) defs.push([f[1], K(tag(named(arity(args => { if (!(args[0] instanceof Record) || args[0].type !== rt) throw typeErr(rt.name, args[0], baseName(f[1]).name); return args[0].fields[k]; }, 1), baseName(f[1]).name)))]);
+        if (f[2]) defs.push([f[2], K(tag(named(arity(args => { if (!(args[0] instanceof Record) || args[0].type !== rt) throw typeErr(rt.name, args[0], baseName(f[2]).name); args[0].fields[k] = args[1]; return UNSPEC; }, 2), baseName(f[2]).name)))]);
+      });
+      const setters = defs.map(([id, vc]) => compSet(id, vc, scope, true));
+      return D1(env => { if (printerc) rt.printer = syncNode(printerc, env); for (const s of setters) s(env); return baseName(typeName); });
+    }
+    case 'let-values': case 'receive': case 'define-values': {
+      if (name === 'receive') {
+        need(2);
+        const formals = a[0], prodc = compG(a[1], scope, false);
+        const { names, rest } = parseParams(formals);
+        const all = rest ? [...names, rest] : names;
+        const inner = new Scope(scope, all);
+        const run = bodyG(x.cdr.cdr.cdr, inner, tail);
+        return function* (env) {
+          const v = prodc.d ? prodc(env) : yield* prodc(env);
+          const vals = v instanceof Values ? v.vals : [v];
+          const frame = new Array(inner.size); frame[0] = env;
+          for (let i = 0; i < names.length; i++) frame[i + 1] = vals[i];
+          if (rest) frame[names.length + 1] = listOf(vals.slice(names.length));
+          return run.d ? run(frame) : yield* run(frame);
+        };
+      }
+      if (name === 'define-values') {
+        need(2);
+        const formals = arr(a[0]), prodc = compG(a[1], scope, false);
+        const setters = formals.map((id, i) => compSet(id, env => env.__vals[i], scope, true));
+        return function* (env) {
+          const v = prodc.d ? prodc(env) : yield* prodc(env);
+          const vals = v instanceof Values ? v.vals : [v];
+          const e2 = env || []; const saved = e2.__vals; e2.__vals = vals;
+          try { for (const s of setters) s(e2); } finally { e2.__vals = saved; }
+          return UNSPEC;
+        };
+      }
+      need(1);
+      const bs = arr(a[0]).map(b => { const bb = arr(b); return { formals: parseParams(bb[0]), prod: compG(bb[1], scope, false) }; });
+      const all = []; bs.forEach(b => { all.push(...b.formals.names); if (b.formals.rest) all.push(b.formals.rest); });
+      const inner = new Scope(scope, all);
+      const run = bodyG(x.cdr.cdr, inner, tail);
+      return function* (env) {
+        const frame = new Array(inner.size); frame[0] = env; let k = 1;
+        for (const b of bs) {
+          const v = b.prod.d ? b.prod(env) : yield* b.prod(env);
+          const vals = v instanceof Values ? v.vals : [v];
+          for (let i = 0; i < b.formals.names.length; i++) frame[k++] = vals[i];
+          if (b.formals.rest) frame[k++] = listOf(vals.slice(b.formals.names.length));
+        }
+        return run.d ? run(frame) : yield* run(frame);
+      };
+    }
+    case 'assert': {
+      need(1);
+      const c = compG(a[0], scope, false); const src = write(strip(a[0]));
+      return function* (env) { if ((c.d ? c(env) : yield* c(env)) === false) { siteProc = null; yield* signalG(new SchemeError('assertion-failed', 'Assertion failed: ' + src), false); } return true; };
+    }
+    case 'delay': {
+      need(1);
+      const c = compG(a[0], scope, false);
+      return D1(env => {
+        let done = false, v;
+        const p = () => { if (!done) { v = syncNode(c, env); done = true; } return v; };
+        p.isPromise = true;
+        p.gen = function* () { if (!done) { v = c.d ? c(env) : yield* c(env); done = true; } return v; };
+        return p;
+      });
+    }
+    case 'case-lambda': {
+      const clauses = a.map(cl => makeLambda(cl.car, cl.cdr, scope, null, locs.get(cl) || locs.get(x)));
+      return D1(env => {
+        const fs = clauses.map(c => c(env));
+        const pick = args => { for (const g of fs) if (args.length === g.arity || (g.rest && args.length >= g.arity) || (args.length >= g.arity && args.length <= g.arity + (g.optional || 0))) return g; throw new SchemeError('wrong-number-of-arguments', 'case-lambda: no clause for ' + args.length + ' arguments'); };
+        const f = args => pick(args)(args);
+        f.gen = function* (args) { return yield* applyG(pick(args), args); };
+        return f;
+      });
+    }
+    case 'the-environment': return D1(scope ? env => new Environment(scope, env) : K(GLOBAL_ENV));
+    case 'include': {
+      const forms = [];
+      for (const f of a) { const file = str(strip(f), 'include'); forms.push(...readAll(readFileText(file), file)); }
+      return bodyG(listOf(forms), scope, tail);
+    }
+  }
+  throw new SchemeError('syntax-error', 'Unknown special form ' + name);
+}
+
 function lookupValue(id, scope, env) {
   const r = lookup(scope, id);
   if (r && !r.macro) { let e = env; for (let d = 0; d < r.depth; d++) e = e[0]; return e[r.index]; }
@@ -1228,20 +2012,46 @@ const gdoc = new Map();
 /* Host hooks: output(string) for the console port, errorOutput(string) for current-error-port,
    isQuit(condition), readFile(path) -> string or null for load/include/require, and
    restartArgs(restart) -> array for invoke-restart-interactively. */
-const hooks = { isQuit: null, output: null, errorOutput: null, readFile: null, restartArgs: null };
+const hooks = { isQuit: null, output: null, errorOutput: null, readFile: null, restartArgs: null, threadSwitch: null, debugG: null };
 
 /* ---------- evaluation entry points ---------- */
 let steps = 0;
 function evalForm(form) {
+  if (GEN) return driveSync(evalFormG(form));
   const s = sp;
   try { const c = comp(form, null, false); return c(null); } catch (e) { return unwound(e, s); }
 }
 /* Evaluate FORM in ENV (an Environment): definitions bind in ENV's own frame. */
 function evalIn(form, env) {
+  if (GEN) return driveSync(evalInG(form, env));
   if (env === undefined || env === null || env === GLOBAL_ENV) return evalForm(form);
   if (!(env instanceof Environment)) throw typeErr('environment', env, 'eval');
   const s = sp;
   try { const c = body(new Pair(form, NIL), env.scope, false); return c(env.frame); } catch (e) { return unwound(e, s); }
+}
+/* The same as generators, for a thread (generator mode). */
+function* evalFormG(form) {
+  const s = sp;
+  try { const c = compG(form, null, false); return c.d ? c(null) : yield* c(null); } catch (e) { yield* unwoundG(e, s); }
+}
+function* evalInG(form, env) {
+  if (env === undefined || env === null || env === GLOBAL_ENV) return yield* evalFormG(form);
+  if (!(env instanceof Environment)) throw typeErr('environment', env, 'eval');
+  const s = sp;
+  try { const c = bodyG(new Pair(form, NIL), env.scope, false); return c.d ? c(env.frame) : yield* c(env.frame); } catch (e) { yield* unwoundG(e, s); }
+}
+function* loadFileG(path, env) {
+  for (const f of readAll(readFileText(path), path)) yield* evalInG(f, env);
+  return true;
+}
+/* Switch the compiler between 'direct' (frames) and 'gen' (edwind); the prelude is recompiled so its
+   procedures are of the new kind. Code compiled before keeps working: a direct-mode procedure called
+   from a thread runs in place and cannot hold it. */
+function setMode(mode) {
+  if (mode !== 'gen' && mode !== 'direct') throw new Error('Scheme.setMode: unknown mode ' + mode);
+  const was = GEN;
+  GEN = mode === 'gen'; TICK_MASK = GEN ? 0xFFF : 0x3FFFF;
+  if (was !== GEN) evalString(PRELUDE);
 }
 /* Compile FORM in SCOPE only to see what it uses: { scopes, refs: [[id, lookup result or null]],
    macros: [[keyword, lookup result or null]] }. The scopes are the ones FORM binds itself. */
@@ -2013,6 +2823,68 @@ D('regexp-replace', 'regexp s replacement', 'S with every match replaced (replac
 D('regexp-split', 'regexp s', 'S split at every match.', ([r, s]) => listOf(str(s).split(r)));
 D('regexp-quote', 's', 'S with regexp metacharacters escaped.', ([s]) => str(s).replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&'));
 
+/* ---------- generator variants of the higher-order primitives (R4.38) ---------- */
+/* In generator mode a primitive that calls a procedure runs its .gen variant, so the procedure can
+   hold the thread. Primitives without one (sort's comparator, assoc's equality, regexp-replace's
+   procedure) call back into Scheme in place; such a callback cannot block. */
+const G = (name, gen) => { gref(name).gen = gen; };
+const minLen = as => as.length ? Math.min(...as.map(a => a.length)) : 0;
+G('map', function* ([f, ...ls]) { const as = ls.map(l => arr(l)); const n = minLen(as); const out = new Array(n); for (let i = 0; i < n; i++) out[i] = yield* applyG(f, as.map(a => a[i])); return listOf(out); });
+G('for-each', function* ([f, ...ls]) { const as = ls.map(l => arr(l)); const n = minLen(as); for (let i = 0; i < n; i++) yield* applyG(f, as.map(a => a[i])); return UNSPEC; });
+G('append-map', function* ([f, l]) { const out = []; for (const x of arr(l)) out.push(...arr(yield* applyG(f, [x]))); return listOf(out); });
+G('filter-map', function* ([f, l]) { const out = []; for (const x of arr(l)) { const v = yield* applyG(f, [x]); if (v !== false) out.push(v); } return listOf(out); });
+G('filter', function* ([p, l]) { const out = []; for (const x of arr(l)) if ((yield* applyG(p, [x])) !== false) out.push(x); return listOf(out); });
+G('remove', function* ([p, l]) { const out = []; for (const x of arr(l)) if ((yield* applyG(p, [x])) === false) out.push(x); return listOf(out); });
+G('partition', function* ([p, l]) { const a = [], b = []; for (const x of arr(l)) ((yield* applyG(p, [x])) !== false ? a : b).push(x); return new Values([listOf(a), listOf(b)]); });
+G('reduce', function* ([f, init, l]) { const a = arr(l); if (!a.length) return init; let acc = a[0]; for (let i = 1; i < a.length; i++) acc = yield* applyG(f, [a[i], acc]); return acc; });
+G('fold', function* ([f, init, ...ls]) { const as = ls.map(l => arr(l)); const n = minLen(as); let acc = init; for (let i = 0; i < n; i++) acc = yield* applyG(f, [...as.map(a => a[i]), acc]); return acc; });
+G('fold-left', function* ([f, init, l]) { let acc = init; for (const x of arr(l)) acc = yield* applyG(f, [acc, x]); return acc; });
+G('fold-right', function* ([f, init, l]) { let acc = init; const a = arr(l); for (let i = a.length - 1; i >= 0; i--) acc = yield* applyG(f, [a[i], acc]); return acc; });
+G('find', function* ([p, l]) { for (const x of arr(l)) if ((yield* applyG(p, [x])) !== false) return x; return false; });
+G('find-tail', function* ([p, l]) { let c = l; while (c instanceof Pair) { if ((yield* applyG(p, [c.car])) !== false) return c; c = c.cdr; } return false; });
+G('any', function* ([p, ...ls]) { const as = ls.map(l => arr(l)); const n = minLen(as); for (let i = 0; i < n; i++) { const v = yield* applyG(p, as.map(a => a[i])); if (v !== false) return v; } return false; });
+G('every', function* ([p, ...ls]) { const as = ls.map(l => arr(l)); const n = minLen(as); let v = true; for (let i = 0; i < n; i++) { v = yield* applyG(p, as.map(a => a[i])); if (v === false) return false; } return v; });
+G('count', function* ([p, l]) { let n = 0; for (const x of arr(l)) if ((yield* applyG(p, [x])) !== false) n++; return n; });
+G('take-while', function* ([p, l]) { const out = []; for (const x of arr(l)) { if ((yield* applyG(p, [x])) === false) break; out.push(x); } return listOf(out); });
+G('drop-while', function* ([p, l]) { let c = l; while (c instanceof Pair && (yield* applyG(p, [c.car])) !== false) c = c.cdr; return c; });
+G('apply', function* ([f, ...a]) { return new TailCall(f, a.length ? a.slice(0, -1).concat(arr(a[a.length - 1])) : []); });
+G('vector-map', function* ([f, v]) { const a = vec(v), out = new Array(a.length); for (let i = 0; i < a.length; i++) out[i] = yield* applyG(f, [a[i]]); return out; });
+G('vector-for-each', function* ([f, v]) { const a = vec(v); for (let i = 0; i < a.length; i++) yield* applyG(f, [a[i]]); return UNSPEC; });
+G('string-for-each', function* ([f, s]) { for (const c of str(s)) yield* applyG(f, [mkchar(c.codePointAt(0))]); return UNSPEC; });
+G('string-map', function* ([f, s]) { let out = ''; for (const c of str(s)) { const r = yield* applyG(f, [mkchar(c.codePointAt(0))]); out += r instanceof Char ? cs(r) : str(r); } return out; });
+G('hash-table-walk', function* ([t, f]) { for (const [k, v] of [...ht(t)]) yield* applyG(f, [k, v]); return UNSPEC; });
+G('hash-for-each', function* ([f, t]) { for (const [k, v] of [...ht(t)]) yield* applyG(f, [k, v]); return UNSPEC; });
+G('hash-map->list', function* ([f, t]) { const out = []; for (const [k, v] of [...ht(t)]) out.push(yield* applyG(f, [k, v])); return listOf(out); });
+G('hash-table-update!', function* ([t, k, f, d]) { const cur = ht(t).get(k); if (cur === undefined && d === undefined) throw err('hash-table-update!: no value for key', k); const base = cur === undefined ? yield* applyG(d, []) : cur; t.set(k, yield* applyG(f, [base])); return UNSPEC; });
+G('hash-table-update!/default', function* ([t, k, f, d]) { const cur = ht(t).get(k); t.set(k, yield* applyG(f, [cur === undefined ? d : cur])); return UNSPEC; });
+G('call-with-values', function* ([p, c]) { const v = yield* applyG(p, []); return new TailCall(c, v instanceof Values ? v.vals : [v]); });
+G('call/ec', function* ([f]) {
+  const tag = {}; const k = named(args => { throw new Escape(tag, args); }, 'escape');
+  const s = sp;
+  try { return yield* applyG(f, [k]); } catch (e) { if (e instanceof Escape && e.tag === tag) { sp = s; return e.vals.length === 1 ? e.vals[0] : new Values(e.vals); } throw e; }
+});
+G('dynamic-wind', function* ([b, t, a]) { yield* applyG(b, []); try { return yield* applyG(t, []); } finally { yield* applyG(a, []); } });
+G('force', function* ([p]) { if (typeof p === 'function' && p.isPromise) return p.gen ? yield* p.gen() : p(); return p; });
+G('with-exception-handler', function* ([h, t]) { proc(h, 'with-exception-handler'); const saved = handlers; handlers = { h, js: false, next: saved }; try { return yield* applyG(t, []); } finally { handlers = saved; } });
+G('error', function* ([m, ...irr]) { return yield* signalG(m instanceof SchemeError ? m : new SchemeError('error', typeof m === 'string' ? m : write(m), irr), false); });
+G('user-error', function* ([m, ...a]) { return yield* signalG(new SchemeError('user-error', fmt(str(m, 'user-error'), a), []), false); });
+G('raise', function* ([o]) { return yield* signalG(o, false); });
+G('raise-continuable', function* ([o]) { return yield* signalG(o, true); });
+G('%restart-case', function* ([thunk, ...specs]) {
+  const tag = {}, rs = [];
+  for (let i = 0; i + 3 < specs.length; i += 4) rs.push(new Restart(specs[i], specs[i + 1], specs[i + 2], specs[i + 3], tag, false));
+  return yield* establishG(rs, tag, function* () { return yield* applyG(thunk, []); });
+});
+G('%with-simple-restart', function* ([n, thunk, f, ...a]) {
+  const tag = {};
+  return yield* establishG([new Restart(n, typeof f === 'string' ? fmt(f, a) : false, null, () => new Values([false, true]), tag, true)], tag, function* () { return yield* applyG(thunk, []); });
+});
+G('eval', function* ([x, env]) { return yield* evalInG(x, env); });
+G('load', function* ([f, env]) { return yield* loadFileG(str(f, 'load'), env); });
+G('with-output-to-string', function* ([t]) { const p = makeStringOutputPort(); if (t !== undefined) yield* withDynG(curOut, p, function* () { return yield* applyG(t, []); }); return p.string(); });
+G('call-with-output-string', function* ([f]) { const p = makeStringOutputPort(); yield* applyG(f, [p]); return p.string(); });
+G('with-input-from-string', function* ([s, t]) { return yield* withDynG(curIn, makeStringInputPort(str(s, 'with-input-from-string')), function* () { return yield* applyG(t, []); }); });
+
 /* standard macros written in Scheme itself */
 const PRELUDE = `
 (define-syntax while
@@ -2116,6 +2988,9 @@ const Scheme = {
   signal, withHandler, DECLINE, Restart, withRestarts, computeRestarts, findRestart, invokeRestart, restartArgs, restartReport, Unwind,
   // the shadow stack (R4.34)
   backtrace: () => backtrace(), conditionBacktrace, resetStack, stackDepth: () => sp - 1, setMaxDepth, get maxDepth() { return MAX_DEPTH; }, shadowStack: SHADOW,
+  // generator mode and threads (R4.38-R4.40)
+  setMode, get mode() { return GEN ? 'gen' : 'direct'; }, Block, Suspend, PREEMPT, applyG, evalFormG, evalInG, loadFileG, signalG, establishG, withRestartsG, unwoundG,
+  driveSync, ThreadState, switchTo, get threadState() { return TS; }, bindDyn, withDynG, isPrimitive, tick,
 };
 g.Scheme = Scheme;
 if (typeof module !== 'undefined') module.exports = Scheme;

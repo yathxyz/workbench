@@ -378,6 +378,17 @@ D('%with-current-buffer', 'buffer thunk', 'Call THUNK with BUFFER current.', ([b
   E.current = Ed.toBuffer(bufArg);
   try { return L.apply(f, []); } finally { E.current = saved; }
 });
+/* In generator mode (edwind) the thunks run as generators, so a server thread can block inside them. */
+L.S.gref('%save-excursion').gen = function* ([f]) {
+  const b = cur(), p = b.pt, w = E.current;
+  try { return yield* L.S.applyG(f, []); }
+  finally { E.current = w; if (E.buffers.includes(b) || b === E.minibuf) b.pt = Math.min(p, b.rope.length); }
+};
+L.S.gref('%with-current-buffer').gen = function* ([bufArg, f]) {
+  const saved = E.current;
+  E.current = Ed.toBuffer(bufArg);
+  try { return yield* L.S.applyG(f, []); } finally { E.current = saved; }
+};
 
 /* ---------- windows ---------- */
 D('selected-window', '', 'The selected window.', () => E.sel);
