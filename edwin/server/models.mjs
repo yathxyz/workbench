@@ -798,7 +798,10 @@ export class Models {
         }
       }, { kind: 'background', name: `gptel ${b.name}`, by: { kind: 'agent', agent: `gptel:${b.name}` }, debugOnError: false });
     });
-    D('%model-usage', '[days]', 'The usage of the last DAYS days (default 30) as an alist (R12.14).', ([d]) => jsonToScheme(S, this.usage(d === undefined || d === false ? USAGE_DAYS : S.num(d, 'model-usage'))));
+    /* The usage summary with Scheme-style keys: ((days . 30) (requests . n) (input-tokens . n) (by-model . ((name . ((requests . n) ...)))) ...). */
+    const kebab = k => k.replace(/[A-Z]/g, c => '-' + c.toLowerCase());
+    const usageAlist = u => { const o = {}; for (const [k, v] of Object.entries(u)) { if (k.startsWith('by')) { const g = {}; for (const [nm, row] of Object.entries(v)) { const r = {}; for (const [rk, rv] of Object.entries(row)) r[kebab(rk)] = rv; g[nm] = r; } o[kebab(k)] = g; } else o[kebab(k)] = v; } return jsonToScheme(S, o); };
+    D('%model-usage', '[days]', 'The usage of the last DAYS days (default 30) as an alist (R12.14): days since requests errors input-tokens output-tokens latency-ms by-model by-caller by-backend.', ([d]) => usageAlist(this.usage(d === undefined || d === false ? USAGE_DAYS : S.num(d, 'model-usage'))));
     D('%model-requests', '', 'The model requests running now, as alists.', () => S.listOf([...this.requests.values()].map(r => jsonToScheme(S, { ...r, runningMs: Date.now() - r.startedAt }))));
   }
   shutdown() {

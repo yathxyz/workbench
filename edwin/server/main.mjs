@@ -24,11 +24,12 @@ import * as imageModule from './image.mjs';
 import * as notesModule from './notes.mjs';
 import * as threadsModule from './threads.mjs';
 import * as debugModule from './debug.mjs';
+import * as modelsModule from './models.mjs';
 
 const require = createRequire(import.meta.url);
 /* The E2 modules, installed in this order after the buffers are loaded; each exports install(server) and
    may export shutdown(server) and name. */
-const MODULES = [imageModule, notesModule, threadsModule, debugModule];
+const MODULES = [imageModule, notesModule, threadsModule, debugModule, modelsModule];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EDWIN = path.join(HERE, '..');
 export const BUILD = process.env.WB_EDIT_BUILD || 'dev';
@@ -75,9 +76,16 @@ export function loadConfig(file) {
     out[k] = v.map(x => abs(k, x));
   }
   for (const k of ['socket', 'hubSocket', 'webSocket']) if (out[k] && Buffer.byteLength(out[k]) >= 108) throw new Error(`${file}: ${k} is too long for a socket path (108 bytes)`);
-  if (out.models && typeof out.models === 'object') for (const [name, m] of Object.entries(out.models)) {
-    if (!m || typeof m !== 'object') throw new Error(`${file}: models.${name} must be an object`);
-    if (m.baseUrl !== undefined) { let u; try { u = new URL(m.baseUrl); } catch (e) { throw new Error(`${file}: models.${name}.baseUrl is not a URL`); } if (u.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(u.hostname)) throw new Error(`${file}: models.${name}.baseUrl: plain http only to loopback`); else if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error(`${file}: models.${name}.baseUrl must be http or https`); }
+  /* models (§15.2, R15.4): backends `anthropic` and `openai` ({baseUrl, credential}), `tiers` (tier -> model) and
+     `credentials` (name -> {origin}); a plain http URL only to loopback (R14.4). */
+  const checkUrl = (k, v) => { let u; try { u = new URL(v); } catch (e) { throw new Error(`${file}: ${k} is not a URL`); } if (u.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(u.hostname)) throw new Error(`${file}: ${k}: plain http only to loopback`); if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error(`${file}: ${k} must be http or https`); };
+  if (!out.models || typeof out.models !== 'object' || Array.isArray(out.models)) throw new Error(`${file}: models must be an object`);
+  for (const [name, m] of Object.entries(out.models)) {
+    if (!m || typeof m !== 'object' || Array.isArray(m)) throw new Error(`${file}: models.${name} must be an object`);
+    if (name === 'tiers') { for (const [t, v] of Object.entries(m)) if (typeof v !== 'string' || !v) throw new Error(`${file}: models.tiers.${t} must be a model name`); continue; }
+    if (name === 'credentials') { for (const [c, e] of Object.entries(m)) { if (!/^[a-z0-9-]{1,32}$/.test(c)) throw new Error(`${file}: models.credentials: ${JSON.stringify(c)} is not a credential name`); if (!e || typeof e.origin !== 'string') throw new Error(`${file}: models.credentials.${c}.origin is required`); checkUrl(`models.credentials.${c}.origin`, e.origin); } continue; }
+    if (m.baseUrl !== undefined) { if (typeof m.baseUrl !== 'string') throw new Error(`${file}: models.${name}.baseUrl must be a string`); checkUrl(`models.${name}.baseUrl`, m.baseUrl); }
+    if (m.credential !== undefined && (typeof m.credential !== 'string' || !/^[a-z0-9-]{1,32}$/.test(m.credential))) throw new Error(`${file}: models.${name}.credential must be a credential name`);
   }
   return out;
 }
