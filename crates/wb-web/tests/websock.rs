@@ -514,7 +514,7 @@ async fn malformed_cmds_are_bad_request_and_never_reach_a_page() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn web_sock_is_0600_replaces_a_stale_socket_and_goes_at_exit() {
+async fn web_sock_is_0600_replaces_only_a_stale_socket_and_goes_at_exit() {
     let mut web = web();
     let meta = std::fs::symlink_metadata(web.socket()).unwrap();
     assert!(meta.file_type().is_socket());
@@ -531,6 +531,20 @@ async fn web_sock_is_0600_replaces_a_stale_socket_and_goes_at_exit() {
     let mut cli = Cli::connect(&path).await;
     assert_eq!(cli.recv().await["server"], "wb-web");
     drop(web);
+
+    // A socket that something still serves stops startup, and is left alone.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::fixture(dir.path(), Path::new(NO_HUB));
+    let path = dir.path().join("web.sock");
+    let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let config = dir.path().join("web.json");
+    std::fs::write(&config, cfg.to_string()).unwrap();
+    let (status, stderr) = common::run_to_exit(&["--config", config.to_str().unwrap()]);
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("is in use by another process"), "{stderr}");
+    assert!(!stderr.contains("listening on"), "{stderr}");
+    assert!(path.exists());
+    drop(live);
 
     // Any other file there stops startup, and is left alone.
     let dir = tempfile::tempdir().unwrap();

@@ -40,8 +40,7 @@ type Lines = BufReader<OwnedReadHalf>;
 /// `RuntimeDirectory` (0700), as for `hub.sock`.
 pub fn bind(path: &Path) -> Result<UnixListener> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path)
-            .with_context(|| format!("cannot remove the stale {}", path.display()))?,
+        Ok(meta) if meta.file_type().is_socket() => remove_stale(path)?,
         Ok(_) => bail!("{} exists and is not a socket", path.display()),
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("cannot inspect {}", path.display())),
@@ -51,6 +50,18 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
     std::fs::set_permissions(path, Permissions::from_mode(0o600))
         .with_context(|| format!("cannot set the mode of {}", path.display()))?;
     Ok(listener)
+}
+
+/// Removes the socket at `path` only when nothing accepts on it. A live socket (a
+/// second wb-web, or a typo that names hub.sock) is left alone and stops startup.
+fn remove_stale(path: &Path) -> Result<()> {
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => bail!("{} is in use by another process", path.display()),
+        Err(e) if e.kind() == ErrorKind::ConnectionRefused => std::fs::remove_file(path)
+            .with_context(|| format!("cannot remove the stale {}", path.display())),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("cannot probe {}", path.display())),
+    }
 }
 
 /// Accepts connections until shutdown begins. `main` removes the socket file at exit.

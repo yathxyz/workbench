@@ -4868,17 +4868,20 @@ let INFO = null;
 // visible and focused sends nothing and ranks below every tab that did.
 class Rpc {
   static ALL = new Set();
-  static SEEN = null;   // when this tab was last visible and focused (ms); null until it first was
+  // When this tab was last visible and focused, on both clocks; null until it first was. `ago` is the larger
+  // span: the monotonic one hides a wall-clock step back, the wall one counts time the machine slept.
+  static SEEN = null;
   static ON = false;    // whether it was at the last look
   // `leaving` (a blur, a hide): if it was on until now, now is when it last was.
-  static look(leaving = false) { const on = document.visibilityState === 'visible' && document.hasFocus(); if (on || (leaving && Rpc.ON)) Rpc.SEEN = Date.now(); Rpc.ON = on; }
+  static look(leaving = false) { const on = document.visibilityState === 'visible' && document.hasFocus(); if (on || (leaving && Rpc.ON)) Rpc.SEEN = { wall: Date.now(), mono: performance.now() }; Rpc.ON = on; }
   static active() { Rpc.look(); for (const r of Rpc.ALL) r.active(); }
   constructor(h = null) {
     this.h = h; this.calls = new Map(); this.seq = 0; this.tries = 0;
     if (!Rpc.ALL.size) addEventListener('blur', () => setTimeout(() => Rpc.look(true)));   // after the event: focus may only have moved into a frame
     Rpc.ALL.add(this); this.connect();
   }
-  active() { Rpc.look(); if (Rpc.SEEN != null) this.send({ t: 'active', ago: Math.max(0, Date.now() - Rpc.SEEN) }); }
+  static ago() { const s = Rpc.SEEN; return Math.max(0, Math.round(Math.max(Date.now() - s.wall, performance.now() - s.mono))); }
+  active() { Rpc.look(); if (Rpc.SEEN != null) this.send({ t: 'active', ago: Rpc.ago() }); }
   connect() {
     clearTimeout(this.timer); WAKE.delete(this);
     const ws = this.ws = new WebSocket(hWs(this.h, '/rpc'));
