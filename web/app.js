@@ -4172,6 +4172,7 @@ const isJournal = n => /^\d{4}-\d\d-\d\d$/.test(n.name);
 function sortPages(list) { return list.sort((a, b) => (isJournal(b) - isJournal(a)) || (isJournal(a) ? b.name.localeCompare(a.name) : a.name.localeCompare(b.name))); }
 function setView(v) {
   if (!VIEWS.includes(v)) return;
+  ringNote();   // the place being left, so the first switch away from it can come back
   const prev = VIEW; VIEW = v;
   if (S && S.view !== v) { S.view = v; dirty(); }
   document.body.dataset.view = v;
@@ -6677,8 +6678,15 @@ function deskAlso() {   // which desks hold the active item
 }
 // the pager: one button per desk in the mode line, as a desktop pager has. A badge counts the cards on that desk that need
 // a look; desk 9, the attention desk, is there while anything does.
-function deskHolds(d, n) { return !d || n.id in d.members || isSticky(n) || ancestors(n).some(a => a.id in d.members); }
-function attnBad() { const out = new Set(); try { for (const it of attnItems()) if (it.attn === 'bad' && it.n && S.nodes[it.n.id] && it.n.kind !== 'frame') out.add(it.n.id); } catch {} return out; }
+// Another desk's membership follows the Board's folders: the shown desk may stand a card loose out of its hidden folder.
+function boardAncestors(n) {
+  const up = id => DESK.snap && id in DESK.snap.in ? DESK.snap.in[id] : S.nodes[id]?.in, out = [];
+  for (let c = up(n.id), g = 0; c && S.nodes[c] && g++ < 32; c = up(c)) out.push(S.nodes[c]);
+  return out;
+}
+function deskHolds(d, n) { return !d || n.id in d.members || isSticky(n) || (d.slot === DESK.cur ? ancestors(n) : boardAncestors(n)).some(a => a.id in d.members); }
+// cards that need a look; a card kept in the hidden scratch overlay waits there until the overlay is shown
+function attnBad() { const out = new Set(); try { for (const it of attnItems()) if (it.attn === 'bad' && it.n && S.nodes[it.n.id] && it.n.kind !== 'frame' && !ovlOff(S.nodes[it.n.id])) out.add(it.n.id); } catch {} return out; }
 function deskPager() {
   const st = $('#st-desk'); if (!st) return;
   st.replaceChildren(); const ds = deskList(), bad = attnBad();
@@ -6760,7 +6768,7 @@ function deskAttnTick() {   // new cards that need a look join the attention des
 // is not on the shown desk is shown on the first desk that holds it, else on the Board. Items that are not cards (a host,
 // a unit, a task) stay in the Attention list: stepping must not open or adopt anything.
 function attnNext() {
-  const items = attnItems().filter(it => it.attn === 'bad' && it.n && S.nodes[it.n.id] && it.n.kind !== 'frame');
+  const items = attnItems().filter(it => it.attn === 'bad' && it.n && S.nodes[it.n.id] && it.n.kind !== 'frame' && !ovlOff(S.nodes[it.n.id]));
   if (!items.length) return toast(attnCount() ? 'No card needs a look; the Attention list (palette: Attention) has the rest.' : 'Nothing needs a look.');
   const i = items.findIndex(it => it.n.id === activeId), it = items[(i + 1) % items.length], n = S.nodes[it.n.id];
   if (VIEW !== 'canvas') setView('canvas');
