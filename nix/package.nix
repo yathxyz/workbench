@@ -73,19 +73,15 @@ rustPlatform.buildRustPackage {
     # edwind: Edwin's core, Scheme files and the server (R15.3), and the wrapper with the Node flags of
     # R14.11. R14.12's permission model is not among them: Node disables fsync under it, which the journal
     # and atomic save need (R8.3, R8.7); edwind guards child_process in-process instead (edwin/README.md, E1).
-    # The stack is sized to the soft limit minus headroom, at most 32000 KiB (the unit sets LimitSTACK).
+    # No --stack-size: main.mjs runs the server on a worker thread whose stack it sizes for the Scheme cap.
     mkdir -p $out/share/edwin
     cp -r edwin/src edwin/scm edwin/server $out/share/edwin/
     cat > $out/bin/edwind <<EOF
     #!${stdenv.shell}
     : "\''${EDWIND_MEMORY_MIB:=1024}"
-    lim=\$(ulimit -s)
-    if [ "\$lim" = unlimited ]; then stack=32000; else stack=\$((lim - 1200)); fi
-    [ "\$stack" -gt 32000 ] && stack=32000
-    [ "\$stack" -lt 984 ] && stack=984
     export WB_EDIT_BUILD=$WB_EDIT_BUILD
     exec ${nodejs}/bin/node --disallow-code-generation-from-strings --frozen-intrinsics \
-      --no-warnings=ExperimentalWarning --max-old-space-size="\$EDWIND_MEMORY_MIB" --stack-size="\$stack" \
+      --no-warnings=ExperimentalWarning --max-old-space-size="\$EDWIND_MEMORY_MIB" \
       $out/share/edwin/server/main.mjs "\$@"
     EOF
     chmod 555 $out/bin/edwind

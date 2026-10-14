@@ -262,13 +262,13 @@ const $ = name => (E.frame ? E.frame.el(name) : null);
 /* ---------- text primitives (0-based internally; Lisp sees 1-based) ---------- */
 function checkRO(b) { if (b.readOnly && !E.inhibitRO && !(L.get('inhibit-read-only') && L.get('inhibit-read-only').value)) signal('buffer-read-only', b); }
 /* ---------- the edit log ----------
-   Each change appends { v, pos, del, ins, len }: at POS, DEL was replaced by INS, leaving a text of
-   LEN characters at version V. Caches remember the version they were built from and ask spanOf for
+   Each change appends { v, pos, del, ins, len, o }: at POS, DEL was replaced by INS, leaving a text of
+   LEN characters at version V; O is the edit's origin (E.editOrigin: local, remote, server, agent, disk). Caches remember the version they were built from and ask spanOf for
    the part that changed since; undo goes back by applying the deltas in reverse. Entries older than
    every snapshot that may still be restored are dropped. */
 function logEdit(b, pos, del, ins) {
   const log = b.log;
-  log.push({ v: ++b.ver, pos, del, ins, len: b.rope.length });
+  log.push({ v: ++b.ver, pos, del, ins, len: b.rope.length, o: E.editOrigin });
   if (log.length > 512 && (log.length & 127) === 0) trimLog(b);
   if (hooks.edited) hooks.edited(b);
 }

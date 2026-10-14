@@ -51,6 +51,8 @@ export class Sequencer {
      against a string copy before the rope changes). */
   applyBatch(sb, ops, by, { cid = null, seq = null, undo = null } = {}) {
     const Ed = this.Ed;
+    /* A thread holding SB (R4.41) has its pending edits sequenced first, so the history stays in rope order. */
+    if (sb.hold && this.flushHold) this.flushHold(sb);
     const text = sb.ed.rope.toString();
     try { OT.apply(text, ops); } catch (e) { throw new ProtoError('bad_edit', e.message); }
     const len = sb.ed.rope.length;
@@ -70,6 +72,27 @@ export class Sequencer {
     sb.touched();
     return entry;
   }
+
+  /* Record OPS, already applied to SB's rope by a thread (R4.41), as one sequenced batch by BY: the history
+     entry, with the text length before the batch computed from the ops. Returns the entry. */
+  recordApplied(sb, ops, by) {
+    /* The thread's edits, one log entry each, in normal form: adjacent inserts merge, an insert next to a
+       delete goes first (OT.fromOps), so the batch is as small as a client's. */
+    const after = sb.ed.rope.toString();
+    const before = OT.apply(after, OT.invert(ops));
+    ops = OT.toOps(OT.fromOps(ops, before.length), before);
+    const len = before.length;
+    sb.ver++;
+    const entry = { ver: sb.ver, cid: by.cid || null, seq: null, by, ops, undo: undefined, at: Date.now(), len, bytes: JSON.stringify(ops).length };
+    entry.recipients = [...sb.clients];
+    sb.hist.push(entry); sb.histBytes += entry.bytes;
+    this.trim(sb);
+    sb.touched();
+    return entry;
+  }
+  /* Client edits wait while a thread holds SB; drainHeld lets them go on, in arrival order. */
+  async waitHeld(sb) { while (sb.hold) await new Promise(r => { (sb.heldQueue || (sb.heldQueue = [])).push(r); }); }
+  drainHeld(sb) { const q = sb.heldQueue; if (!q) return; sb.heldQueue = null; for (const r of q) r(); }
 
   /* Drop history past the retention rule (R7.17). */
   trim(sb) {
@@ -95,6 +118,7 @@ export class Sequencer {
       return;
     }
     if (sb.readOnly) throw new ProtoError('read_only', typeof sb.readOnly === 'string' ? sb.readOnly : 'the buffer is read-only', { buf: sb.id, seq });
+    if (sb.hold) await this.waitHeld(sb);
     const applied = this.rebase(sb, ops, base);
     const entry = this.applyBatch(sb, applied, client.by(), { cid: client.cid, seq, undo });
     await this.commit(sb, entry, client);

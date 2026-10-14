@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
@@ -27,14 +27,10 @@ export function makeDir(extra = {}) {
 /* The Node flags bin/edwind runs with (R14.11, R16.16): the same list nix/package.nix composes in the wrapper,
    so the gate suites test edwind as the unit runs it. Node's permission model (`--permission`, R14.12) is not
    among them: Node 22 and 24 disable fsync and fdatasync under it, which R8.3 and R8.7 need; edwind guards
-   child_process in-process instead (main.mjs guardProcesses). The stack is sized to the soft limit
-   (`ulimit -s`) minus headroom, at most 32000 KiB; the Scheme cap of 10,000 frames needs about 7 MiB. */
-export function nodeFlags({ stackKiB } = {}) {
-  if (stackKiB === undefined) {
-    const lim = spawnSync('sh', ['-c', 'ulimit -s'], { encoding: 'utf8' }).stdout.trim();
-    stackKiB = lim === 'unlimited' ? 32000 : Math.min(32000, Math.max(984, Number(lim) - 1200));
-  }
-  return ['--disallow-code-generation-from-strings', '--frozen-intrinsics', '--no-warnings=ExperimentalWarning', `--stack-size=${stackKiB}`];
+   child_process in-process instead (main.mjs guardProcesses). No --stack-size: the server runs on a worker
+   thread whose stack main.mjs sizes for the Scheme cap of 10,000 frames (R4.34). */
+export function nodeFlags() {
+  return ['--disallow-code-generation-from-strings', '--frozen-intrinsics', '--no-warnings=ExperimentalWarning'];
 }
 
 /* Every edwind this process started dies with it, whatever the test did. */

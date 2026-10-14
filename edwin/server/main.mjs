@@ -12,29 +12,36 @@ import path from 'node:path';
 import os from 'node:os';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { Worker, isMainThread, parentPort } from 'node:worker_threads';
 import { Authority, expandHome } from './paths.mjs';
 import { Buffers } from './buffers.mjs';
-import { Client, DEFINITIONAL } from './session.mjs';
+import { Client } from './session.mjs';
 import { ImageLog, randomId, readJournal, jidPath } from './journal.mjs';
 import { ProtoError } from './proto.mjs';
 import { sha256 } from './files.mjs';
 import * as imageModule from './image.mjs';
 import * as notesModule from './notes.mjs';
+import * as threadsModule from './threads.mjs';
 
 const require = createRequire(import.meta.url);
 /* The E2 modules, installed in this order after the buffers are loaded; each exports install(server) and
    may export shutdown(server) and name. */
-const MODULES = [imageModule, notesModule];
+const MODULES = [imageModule, notesModule, threadsModule];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EDWIN = path.join(HERE, '..');
 export const BUILD = process.env.WB_EDIT_BUILD || 'dev';
 const MIN_NODE = [22, 13];
+/* The JS stack of the server thread in MiB (R4.34): the Scheme cap of 10,000 frames needs about 8 MiB in
+   generator mode; 32 leaves room for deep primitives. EDWIND_STACK_MIB overrides it. */
+const STACK_MB = Math.max(8, Number(process.env.EDWIND_STACK_MIB) || 32);
 
 /* ---------- log (R15.10): one line per event, never buffer text ---------- */
 const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
 export function makeLog(level = 'info') {
   const max = LEVELS[level] ?? 2;
-  const out = (lvl, ev, fields) => { if (LEVELS[lvl] > max) return; process.stderr.write(`${lvl} ${ev} ${JSON.stringify(fields || {})}\n`); };
+  /* Written synchronously: the server runs on a worker thread, whose process.stderr is an asynchronous relay
+     that can lose the last lines at exit. */
+  const out = (lvl, ev, fields) => { if (LEVELS[lvl] > max) return; fs.writeSync(2, `${lvl} ${ev} ${JSON.stringify(fields || {})}\n`); };
   return { error: (e, f) => out('error', e, f), warn: (e, f) => out('warn', e, f), info: (e, f) => out('info', e, f), debug: (e, f) => out('debug', e, f) };
 }
 
@@ -95,7 +102,7 @@ export class Server {
     const { createHost, loadEdwin } = require(path.join(EDWIN, 'src/host-node.js'));
     const storageFile = path.join(this.cfg.stateDir, 'storage.json');
     const host = createHost({ scmDir: path.join(EDWIN, 'scm'), configDir: this.cfg.configDir, storage: fileStorage(storageFile, this.log) });
-    this.Ed = loadEdwin(host);
+    this.Ed = loadEdwin(host, { mode: 'gen' });
     this.L = globalThis.L;
     this.Ed.boot({ host });
     await this.Ed.whenIdle();
@@ -147,7 +154,7 @@ export class Server {
         } catch (e) { server.close(); reject(e); return; }
         this.net = server;
         this.log.info('listen', { socket: sock, build: this.build, boot: this.boot });
-        process.stderr.write(`listening on ${sock}\n`);
+        fs.writeSync(2, `listening on ${sock}\n`);
         resolve(server);
       });
     });
@@ -166,7 +173,13 @@ export class Server {
   }
 
   /* ---------- evaluation (§7.4, R14.13, R4.15) ---------- */
-  evalForm(client, form) {
+  /* The forms of FORM run on a command thread for CLIENT (threads.mjs); before the module is installed
+     (image replay, tests of the bare server) they run directly. Resolves to the result object of §7.4. */
+  evalForm(client, form, ctx = {}, buf) {
+    if (this.threads) return this.threads.evalForms(client, form, { ctx, buf });
+    return Promise.resolve(this.evalFormDirect(client, form));
+  }
+  evalFormDirect(client, form) {
     const { L, Ed } = this;
     const S = L.S;
     const outParts = [];
@@ -254,21 +267,12 @@ export class Server {
       default: {
         const fn = this.commands.get(cmd);
         if (fn) return fn(client, args, ctx, buf);
+        /* A Scheme command declared (:where 'server) runs on a command thread (R4.27). */
+        if (this.threads && this.threads.isServerCommand(cmd)) return this.threads.runCommand(client, cmd, args, ctx, buf);
         throw new ProtoError('bad_request', `unknown server command ${JSON.stringify(cmd)}`);
       }
     }
   }
-}
-
-/* Is FORM (a read datum) definitional (R4.14)? */
-function isDefinitional(form, S) {
-  if (!(form instanceof S.Pair)) return false;
-  const head = form.car;
-  if (!(head instanceof S.Sym)) return false;
-  if (head.name === 'begin' || head.name === 'progn') { let p = form.cdr; while (p instanceof S.Pair) { if (!isDefinitional(p.car, S)) return false; p = p.cdr; } return p === S.NIL; }
-  if (!DEFINITIONAL.has(head.name)) return false;
-  if (head.name === 'set!' || head.name === 'setq') return form.cdr instanceof S.Pair && form.cdr.car instanceof S.Sym;
-  return true;
 }
 
 /* Edwin's key-value store, kept as one JSON file in stateDir (settings and recentf; buffers are not in it). */
@@ -354,15 +358,33 @@ export async function main(argv) {
   if (mode === 'roots') { const a = new Authority(cfg); for (const r of [...a.writeRootsForFlags(), path.dirname(cfg.socket)]) process.stdout.write(r + '\n'); return 0; }
   if (mode === 'check') return check(cfg) ? 0 : 1;
   if (mode === 'export') { const n = await exportAll(cfg, exportDir, log); process.stdout.write(`${n} buffers exported to ${exportDir}\n`); return 0; }
+  if (isMainThread && !process.env.EDWIND_NO_THREAD) return runInThread(argv, log);
   const server = new Server(cfg, log);
   try { await server.start(); await server.listen(); }
   catch (e) { process.stderr.write(`edwind: ${e.message}\n`); log.error('start', { error: e.message }); return 1; }
   let stopping = null;
   const stop = sig => { if (stopping) return; log.info('signal', { sig }); stopping = server.stop().then(() => process.exit(0), e => { log.error('stop', { error: e.message }); process.exit(1); }); };
-  process.on('SIGTERM', () => stop('SIGTERM')); process.on('SIGINT', () => stop('SIGINT'));
+  if (isMainThread) { process.on('SIGTERM', () => stop('SIGTERM')); process.on('SIGINT', () => stop('SIGINT')); }
+  else parentPort.on('message', m => { if (m && m.t === 'stop') stop(m.sig); });
   process.on('uncaughtException', e => { log.error('uncaught', { error: e.stack || String(e) }); });
   process.on('unhandledRejection', e => { log.error('unhandled', { error: (e && e.stack) || String(e) }); });
   return new Promise(() => {});
+}
+
+/* The server runs on a worker thread with a stack sized for the Scheme cap (STACK_MB): Node's main thread
+   gets about 1,500 Scheme frames from its default stack and `ulimit -s` belongs to the operator, while a
+   worker's stack is the process's own choice. The main thread only relays SIGTERM and SIGINT to the server
+   and exits with its code. EDWIND_NO_THREAD=1 runs the server on the main thread (debugging, benchmarks). */
+function runInThread(argv, log) {
+  return new Promise(resolve => {
+    const resourceLimits = { stackSizeMb: STACK_MB };
+    if (Number(process.env.EDWIND_MEMORY_MIB) > 0) resourceLimits.maxOldGenerationSizeMb = Number(process.env.EDWIND_MEMORY_MIB);
+    const w = new Worker(fileURLToPath(import.meta.url), { argv, resourceLimits });
+    const stop = sig => w.postMessage({ t: 'stop', sig });
+    process.on('SIGTERM', () => stop('SIGTERM')); process.on('SIGINT', () => stop('SIGINT'));
+    w.on('error', e => { log.error('thread', { error: e.stack || String(e) }); });
+    w.on('exit', code => resolve(code));
+  });
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

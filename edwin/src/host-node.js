@@ -118,10 +118,13 @@ function createHost(opts = {}) {
   };
 }
 
-/* Run the core files in this process with HOST, and give back Ed. Ed.boot({host}) starts it. */
-function loadEdwin(host = createHost()) {
+/* Run the core files in this process with HOST, and give back Ed. Ed.boot({host}) starts it. MODE is the
+   evaluator's mode (R4.38): 'gen' for the server image (threads, blocking calls, deadlines), 'direct' for
+   frames and workers. */
+function loadEdwin(host = createHost(), { mode = 'direct' } = {}) {
   if (globalThis.Ed) throw new Error('Edwin is already loaded in this process');
   globalThis.EdHost = host;
+  globalThis.SCHEME_MODE = mode;
   for (const f of FILES) vm.runInThisContext(fs.readFileSync(path.join(SRC, f + '.js'), 'utf8'), { filename: path.join(SRC, f + '.js') });
   return globalThis.Ed;
 }
