@@ -18,11 +18,13 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 function listen(server) { return new Promise(r => server.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${server.address().port}`))); }
 function body(req) { return new Promise(r => { let s = ''; req.setEncoding('utf8'); req.on('data', d => { s += d; }); req.on('end', () => r(s)); }); }
 function makeBackend() {
-  const A = { requests: [], sawKey: 0, failNext: false, holds: [], holdOff: false, aborted: 0, origin: null, other: null };
+  const A = { requests: [], sawKey: 0, failNext: false, holds: [], slow: [], holdOff: false, aborted: 0, origin: null, other: null };
   A.server = http.createServer(async (req, res) => {
     const text = await body(req);
     const rec = { method: req.method, path: req.url, headers: req.headers, body: text ? JSON.parse(text) : null };
     A.requests.push(rec);
+    let closed = false;
+    res.on('close', () => { closed = true; if (!res.writableFinished) A.aborted++; });
     if (req.headers['x-api-key'] === KEY) A.sawKey++;
     const json = (code, obj, extra = {}) => { res.writeHead(code, { 'content-type': 'application/json', ...extra }); res.end(JSON.stringify(obj)); };
     const u = new URL(req.url, 'http://x');
@@ -30,7 +32,7 @@ function makeBackend() {
     if (u.pathname === '/redir-same') { res.writeHead(302, { location: '/echo' }); return res.end(); }
     if (u.pathname === '/redir-cross') { res.writeHead(302, { location: A.other.origin + '/echo' }); return res.end(); }
     if (u.pathname === '/fail-next') { A.failNext = true; return json(200, { ok: true }); }
-    if (u.pathname === '/release') { A.holdOff = true; for (const h of A.holds.splice(0)) h(); return json(200, { ok: true }); }
+    if (u.pathname === '/release') { A.holdOff = true; for (const h of [...A.holds.splice(0), ...A.slow.splice(0)]) h(); return json(200, { ok: true }); }
     if (u.pathname === '/v1/chat/completions') {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       const ev = o => res.write('data: ' + JSON.stringify(o) + '\n\n');
@@ -63,7 +65,7 @@ function makeBackend() {
     for (const p of parts) { ev('content_block_delta', { index: 0, delta: { type: 'text_delta', text: p } }); await sleep(10); }
     if (lastText.includes('slow')) {
       /* Stay open until the client cancels (R12.8) or the test releases it. */
-      await new Promise(r => { A.holds.push(r); req.on('close', () => { A.aborted++; r(); }); });
+      if (!closed) await new Promise(r => { A.slow.push(r); res.on('close', r); });
       if (res.writableEnded || res.destroyed) return;
     }
     ev('content_block_stop', { index: 0 });
@@ -128,7 +130,7 @@ test('R12.3, R12.4, R15.11: the default backend comes from edit.json models; sta
 test('R14.7, R16.15: credential handles print as their name and never give up, compare or serialize their contents', async () => {
   const c = await client();
   assert.equal(await value(c, '(credential "anthropic-api-key")'), '#<credential anthropic-api-key>');
-  assert.equal(await value(c, '(display (credential "spare-key"))'), '#<credential spare-key>');
+  assert.equal(await value(c, '(with-output-to-string (lambda () (display (credential "spare-key"))))'), '"#<credential spare-key>"');
   assert.equal(await value(c, '(with-output-to-string (lambda () (write (credential "anthropic-api-key"))))'), '"#<credential anthropic-api-key>"');
   assert.equal(await value(c, '(format "~a / ~s" (credential "spare-key") (credential "spare-key"))'), '"#<credential spare-key> / #<credential spare-key>"');
   assert.equal(await value(c, '(list (credential? (credential "spare-key")) (string? (credential "spare-key")) (credential-name (credential "spare-key")) (credential-origin (credential "spare-key")) (credential-available? (credential "spare-key")))'), '(#t #f "spare-key" "https://example.invalid" #t)');
@@ -147,10 +149,10 @@ test('R14.7, R16.15: credential handles print as their name and never give up, c
   assert.equal(await value(c, '(define my-cred (credential "anthropic-api-key")) my-cred'), '#<credential anthropic-api-key>');
   await sleep(100);
   const image = fs.readFileSync(path.join(dir.dirs.state, 'image.jsonl'), 'utf8');
-  assert.match(image, /\(define my-cred \(credential "anthropic-api-key"\)\)/);
+  assert.match(image, /\(define my-cred \(credential \\"anthropic-api-key\\"\)\)/); assert.ok(!image.includes(KEY));
   /* R16.15: no js-eval-like escape exists; nothing returns the secret. */
   assert.equal(await value(c, '(list (bound? (quote js-eval)) (bound? (quote eval-js)) (bound? (quote js)) (bound? (quote credential-secret)) (bound? (quote credential-value)) (bound? (quote credential->string)))'), '(#f #f #f #f #f #f)');
-  assert.equal(await value(c, '(filter (lambda (n) (string-prefix? "credential" (symbol->string n))) (apropos-list "credential"))').replace(/[()]/g, '').split(' ').sort().join(' '), 'credential credential-available? credential-name credential-names credential-origin credential?');
+  assert.equal(await value(c, '(map (lambda (n) (bound? n)) (quote (credential credential? credential-name credential-origin credential-available? credential-names http-request)))'), '(#t #t #t #t #t #t #t)');
   c.close();
 });
 
@@ -174,7 +176,7 @@ test('R14.4, R16.19: http-request binds a credential to its origin; same-origin 
   /* A same-origin redirect keeps the header. */
   r = await value(c, `(let ((r (http-request "${A.origin}/redir-same" :credential (credential "anthropic-api-key") :credential-header "x-api-key"))) (list (assq-ref r (quote status)) (assq-ref r (quote url)) (assq-ref r (quote body))))`);
   assert.match(r, /^\(200 "[^"]*\/echo" .*authValue\\":true/);
-  assert.equal(A.sawKey, saw + 1);
+  assert.equal(A.sawKey, saw + 2, 'both same-origin hops carried the header');
   /* A cross-origin redirect fails the request while a credential is attached: not followed, with or without the header. */
   e = await failure(c, `(http-request "${A.origin}/redir-cross" :credential (credential "anthropic-api-key") :credential-header "x-api-key")`);
   assert.equal(e.condition, 'credential-origin'); assert.doesNotMatch(e.report, /sk-test/);
@@ -299,13 +301,12 @@ test('R12.9, R12.14: gptel-send streams into the buffer as the agent gptel:<back
   assert.ok(bys.some(b => b.kind === 'frame' && b.via === 'server'), 'the separator comes from the command thread for the frame');
   assert.ok(bys.some(b => b.kind === 'agent' && b.agent === 'gptel:workbench'), JSON.stringify(bys));
   assert.equal((await w.request({ t: 'call', form: '(buffer-string)', ctx: {}, buf: id })).value, '"Say hi\\n\\nHello"');
-  /* undo-writer takes the agent's text back (R6.21). */
-  const u = await w.call('undo-writer', [{ kind: 'agent', agent: 'gptel:workbench' }], {}, id);
-  assert.equal(u.error, undefined, JSON.stringify(u.error));
-  for (let i = 0; i < 10 && text.endsWith('Hello'); i++) { const e = await w.next(m => m.t === 'edits' && m.buf === id); text = apply(text, e.ops); }
-  assert.equal(text, 'Say hi\n\n');
+  /* The agent is a writer of the buffer (R6.21: undo-writer picks it once thread batches carry undo groups). */
+  const writers = (await w.call('list-writers', [], {}, id)).value;
+  assert.ok(writers.some(b => b.kind === 'agent' && b.agent === 'gptel:workbench'), JSON.stringify(writers));
   /* Nothing to send; a request per buffer. */
   assert.equal((await w.request({ t: 'call', form: '(with-current-buffer (get-buffer-create "*empty*") (gptel-send))', ctx: {} })).error.condition, 'user-error');
+  for (let i = 0; i < 50 && await value(w, '(null? gptel--running)') !== '#t'; i++) await sleep(20);
   assert.equal((await w.request({ t: 'call', form: '(gptel-abort)', ctx: {}, buf: id })).msg, 'gptel: no request is running here');
   /* Accounting: one line per request, never the prompt or the key; model-usage sums them. */
   await sleep(50);

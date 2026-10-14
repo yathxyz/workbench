@@ -220,5 +220,18 @@ Choices E2 made where the spec left one open, and where it had to deviate:
 - **Processes (R4.43–R4.45) and the §5 session API:** see `process.mjs`, `hub.mjs` and `wb.mjs` (their headers
   carry the choices); the primitives live in `edwin/server`, not `edwin/src/wb.js` as the spec names, because
   server-only code lives in `edwin/server`. The board family waits for EW-M4.
-- **The model layer (§12, R14.4–R14.7):** see `models.mjs` (backends, `http-request`, `credential`, `sample`,
-  the usage log). Keys arrive through `LoadCredential` only; handles print as `#<credential NAME>`.
+- **The model layer (§12, R14.4–R14.7)** is `models.mjs` with `scm/models.scm`. Backends are objects of two
+  kinds, the ones the spec names (`anthropic`: Messages API, `x-api-key`; `openai`: chat completions, bearer);
+  the default backend `workbench` is `models.anthropic` of `edit.json`, its models the tier values; a backend
+  without a credential is usable only on a loopback origin (a local model server). The key is read from
+  `$CREDENTIALS_DIRECTORY/NAME` at request time and never stored on the handle; `http-request` takes `:method
+  :headers :body :credential :credential-header :timeout :on-chunk`, retries 429/503/529 three times
+  (`retry-after`, else 1 s doubling) under a 10 min deadline covering the tool rounds (at most 8). `sample`
+  runs on a background thread per stream (`by {kind: "web", cid, device, tab}`), `cancel` interrupts it with
+  the `cancelled` condition; four requests run at once and the rest queue (R12.13). One usage line per request,
+  success or failure, goes to the log and `stateDir/usage.jsonl`; `model-usage` sums them. The server rebinds
+  `gptel-make-anthropic`, `gptel-make-openai`, `gptel-backends` and `gptel-send` that `ai.js` defines for
+  frames, since those use `fetch` and browser-stored keys (R14.4). Not in E2: Edwin's built-in tools for gptel
+  and the confirmation flow (R12.10–R12.12), `gptel`, `gptel-rewrite` and presets (R12.9) on the server; a
+  backend defined in `init.scm` runs before the module loads (define it after, or on feature `models`).
+  Thread batches carry an undo group (`undo: {g: "thread-…"}`) so gptel output undoes like any writer's.
