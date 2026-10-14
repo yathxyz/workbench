@@ -1782,6 +1782,8 @@ function pickChip() {
   const show = (act, on) => { const b = $(`[data-act=${act}]`, c); if (b) b.hidden = !on; };
   show('compact', ids.length > 0); show('sketch', ns > 0); show('read', ns > 0);
 }
+// Hidden ink is not picked or erased: the Board's loose ink on a desk, a hidden card's ink.
+const inkHidden = st => st.owner ? !!S.nodes[st.owner] && stashed(S.nodes[st.owner]) : !!DESK.cur;
 // everything whose box lies fully inside the world rectangle a..b: cards and folders (tab included), ink strokes (board or
 // folder ink; ink anchored to a page line stays), drawn shapes (an arrow needs both ends inside)
 function pickInRect(a, b) {
@@ -1791,7 +1793,7 @@ function pickInRect(a, b) {
     if (n.x >= a.x && top >= a.y && n.x + n.w <= b.x && n.y + n.h <= b.y) pickToggle(n.id, true);
   }
   for (const st of S.strokes) {
-    if (st.aid || (st.owner ? S.nodes[st.owner] && stashed(S.nodes[st.owner]) : DESK.cur)) continue;   // hidden ink is not picked: the Board's loose ink on a desk, a hidden card's ink
+    if (st.aid || inkHidden(st)) continue;   // ink anchored to a page line stays with it
     const pts = strokeWorldPts(st); if (!pts.length) continue;
     if (pts.every(([x, y]) => x >= a.x && y >= a.y && x <= b.x && y <= b.y)) SEL.strokes.add(st.id);
   }
@@ -2619,13 +2621,14 @@ function commitStroke(pts, sim, size) {
 }
 function eraseAt(clientX, clientY) {
   const r = vpRect(), w = s2w(clientX - r.left, clientY - r.top), thr = 9 / cam().z;
-  const shapeHit = S.shapes.filter(s => {
+  const shapeHit = S.shapes.filter(s => {   // only what is shown: a desk or a closed deck hides the rest
+    if (shapeHidden(s)) return false;
     if (s.type !== 'arrow') return w.x >= s.x - thr && w.x <= s.x + s.w + thr && w.y >= s.y - thr && w.y <= s.y + s.h + thr;
     const { x1, y1, x2, y2 } = arrowEnds(s), dx = x2 - x1, dy = y2 - y1, t = clamp(((w.x - x1) * dx + (w.y - y1) * dy) / (dx * dx + dy * dy || 1), 0, 1);
     return Math.hypot(x1 + t * dx - w.x, y1 + t * dy - w.y) < thr;
   });
   if (shapeHit.length) { shapeHit.forEach(s => removeShape(s.id)); }
-  const hit = S.strokes.filter(s => strokeWorldPts(s).some(([x, y]) => Math.hypot(x - w.x, y - w.y) < thr + s.size / 2));
+  const hit = S.strokes.filter(s => !inkHidden(s) && strokeWorldPts(s).some(([x, y]) => Math.hypot(x - w.x, y - w.y) < thr + s.size / 2));
   if (!hit.length) return;
   S.strokes = S.strokes.filter(s => !hit.includes(s));
   new Set(hit.map(s => s.owner)).forEach(o => renderInk(o || null));
@@ -6064,6 +6067,7 @@ function deskDrop(ns) {
 }
 function deskSend(slot, { follow = false, keep = false } = {}) {
   if (FOCUS.cur) focusHide();
+  if (!(Number.isInteger(slot) && slot >= 0 && slot <= 9)) return toast('A desk is a digit: 1-8, or 0 for the Board.');
   const ns = deskTargets(); if (!ns.length) return toast('Pick a card or folder first (click it, or Shift-click several).');
   if (slot === 9) return toast('Desk 9 is kept for the attention desk (desks D2).');
   if (slot === DESK.cur && slot) return toast('Already on this desk.');
