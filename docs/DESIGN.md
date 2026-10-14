@@ -1109,6 +1109,7 @@ The amendments below are binding.
 | F-A19 | URL elicitations show the full origin, never auto-open, and only `https:` is openable |
 | F-A20 | No toast about a model at load. When `/api/info.sample` is false, the message is said where a model feature is used (assistant, handwriting, an artifact's `sample`), and it names no provider and no environment variable: the server's `sample` backend is configured on the server, its key kept there |
 | F-A21 | Enter on the active card puts the keyboard in it where it stands (a shell's terminal, an agent's composer, a page's text, a web card's address), bringing it into view first when it is off screen, in a closed deck or at far zoom. Shift-Enter opens the card as a focus tab; Enter on a folder still enters it as a workspace |
+| F-A22 | The view is per device, like the camera (F-A7): the entered workspace, the focus tabs and the perspective live in `localStorage` (`wb-view-<host>`, try/catch), never in the board. Inside a perspective, a save writes the manual layout (each node's manual folder and rectangle, the stashed folders, no derived folders or ghosts), so the board file always holds the manual perspective; a card shown in a focus tab is saved at its place on the canvas, not at the size of the screen. A clean tab inside a perspective that takes another tab's board goes back to manual, takes it, and builds its perspective again. A board saved inside a perspective before this amendment is turned back into its manual layout when it is loaded or taken, and lends its view to a device that has none yet |
 
 **ui check amendments.**
 - **N8** expects "No session: press Enter" after a wiped `stateDir`, then Enter → `[new shell]` (H-1).
@@ -1299,7 +1300,7 @@ The test runs numbered steps. The steps this design pins down:
 
 **Pass criterion for "sessions survive":** steps 4, 6 and 9 all pass in one run. The hub PID is unchanged across 4 and 6, and revive succeeds in 9.
 
-### 9.5 UI checks (N27-N50; N1-N26 are the baseline checks of `tests/ui.mjs`, kept with the §6.1 amendments)
+### 9.5 UI checks (N27-N51; N1-N26 are the baseline checks of `tests/ui.mjs`, kept with the §6.1 amendments)
 
 | # | Check |
 |---|---|
@@ -1327,6 +1328,7 @@ The test runs numbered steps. The steps this design pins down:
 | N48 | The new-terminal shell picker lists what `/api/info.shells` lists, and a second terminal defaults to the last choice (§6.3) |
 | N49 | With `/api/info.sample:false`, a load shows no toast about a model or an API key, and no `/api` request of the load is refused (the frontend does not call `/api/hosts`, which is 404) |
 | N50 | Enter on the active shell card puts the keyboard in its terminal on the canvas; Shift-Enter opens the card as a focus tab |
+| N51 | Two browser contexts (two devices). A card shown in a focus tab is saved at its canvas rectangle. A workspace and a focus tab entered in A are not in the board file and not in B, and are back in A after a reload. With A in the tag perspective the board file holds A's manual layout exactly, with no derived node and no view key. B moves a card: A takes it without a bar and stays in its perspective, and B never leaves manual (F-A22) |
 
 ### 9.6 v1 acceptance (all must hold before the dogfood clock starts)
 1. `nix flake check` is green on a kvm-capable host: package, clippy, fmt, conformance, security, ui, adapters, module and vm.
@@ -1442,3 +1444,29 @@ The test runs numbered steps. The steps this design pins down:
 **Superseded (2026-10-12):** M5-W1 and M5-W2 are not built in Rust. Edwin, run headless as the text daemon edwind, owns the notes index and the `sample` backend instead, with provider-agnostic model backends and keys on the server; pages become files in `notesDir`. The plan is in `edwin/README.md`. M5-W3, M5-F and the parts of M5-T and M5-N that do not depend on W1 and W2 stand.
 
 **M5 exit:** all of §9.6 holds. The **two-week dogfood clock** starts, and it ends with the removal review: every feature untouched in two weeks is listed for deletion (§1).
+
+### 10.8 Desks: the canvas as a multi-desktop (frontend only, after v1's fixes)
+**Goal:** temporary arrangements of cards, switched from the keyboard as desktops are in KDE or i3, without moving anything on the board. Decided by the user on 2026-10-14 from the exploration page "Canvas Desks" (https://claude.ai/artifact/HmeEVCYMGFriqeRT3YTmrh).
+
+**Model.**
+- A **desk** is a named arrangement of some cards with a slot (1-8), its own rectangle per member and a layout policy (`free`, `tile`, `columns`). A card can be on several desks. Members are cards or folders; a folder brings its subtree.
+- **Desk 0 is the Board**: every card at its node position. Board `nodes` keep only the Board's geometry; desks are records in the board (`desks`, `sticky`).
+- **Slot 9 is the attention desk**, a smart desk (`state:bad`, tiled). Other smart desks are queries (`tag:`, `host:`, `kind:`, `board:`); the perspectives become smart desks later and stop rewriting the Board.
+- The current desk, the previous desk, the recent-places ring and a camera per desk are per device (F-A22's storage), with a per-window override in `sessionStorage`.
+
+**Decisions (2026-10-14).**
+1. The new layer is called **desk**. "Workspace" stays for an entered folder until D2 makes it "open folder as desk".
+2. Leader `0`-`9` and `Alt-Shift-0`-`9` go to desks. Top-level folders lose their positional numbers.
+3. A new desk is **scratch** (this device only, removed when empty and left) until it is pinned into the board. Pinned desks keep a saved state that revert returns to.
+4. On a desk other than the Board, non-members are **hidden** (`display: none`), not dimmed.
+
+**Phases.** Each starts after the previous one's PR is merged.
+
+| Phase | Content |
+|---|---|
+| D0 | F-A22: per-device view state; a perspective saves the manual layout (N51) |
+| D1 | Desk records in the board; a desk swap built on the perspective snapshot, with the serializer writing Board geometry; non-members hidden; the pager in the mode line; leader digits, `m`/`M` send (and follow), the `d` submap (new, rename, pin, revert, remove, also-on, promote, sticky); scratch and pinned lifetimes; spawned cards follow their parent's desks |
+| D2 | The overview (leader `g`: arrows move, letters search, digits jump) on far-zoom snapshots; the recent-places ring (leader `w`) over desks, focus tabs and views; the attention desk and pager badges, with the F-A15 key crossing desks; the scratch overlay on ``Ctrl-` ``; perspectives as smart desks |
+| D3 | The `columns` layout; revert; one desk per window (`BroadcastChannel`); `wb desk ls`, `go` and `send` over `web.sock`; the agent tools `list_desks` and `send_to_desk` |
+
+Key choices beyond the digits are settled with the keyboard-navigation work (its contexts and conflict checker); this section names the proposed keys only.
