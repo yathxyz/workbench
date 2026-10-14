@@ -10,7 +10,7 @@ import { Worker, MessageChannel, receiveMessageOnPort } from 'node:worker_thread
 import { fileURLToPath } from 'node:url';
 import { ProtoError } from './proto.mjs';
 import { writeAtomic } from './files.mjs';
-import { PathError, under } from './paths.mjs';
+import { PathError, under, realPath } from './paths.mjs';
 import { parseFile, compileGrammar, NOTE_EXT, ignoreMatcher } from './notes-parse.mjs';
 
 export const name = 'notes';
@@ -537,7 +537,8 @@ export class Notes {
     try { names = fs.readdirSync(dir).filter(n => n.endsWith('.jsonl')).sort(); } catch (e) { return { dir, reviews: out }; }
     for (const n of names) {
       let text;
-      try { text = fs.readFileSync(path.join(dir, n), 'utf8'); } catch (e) { continue; }
+      /* A symlinked log is read through the authority like any file (never a refused path). */
+      try { text = fs.readFileSync(this.server.auth.checkRead(realPath(path.join(dir, n)).real), 'utf8'); } catch (e) { continue; }
       for (const line of text.split('\n')) { if (!line.trim()) continue; try { out.push(JSON.parse(line)); } catch (e) { /* a torn line */ } }
     }
     return { dir, reviews: out };
@@ -545,9 +546,19 @@ export class Notes {
   appendReviews(p) {
     const reviews = p.reviews;
     if (!Array.isArray(reviews) || !reviews.every(r => r && typeof r === 'object')) throw bad('reviews must be a list of objects');
-    const dir = this.reviewsDir(), file = path.join(dir, `${this.server.cfg.host}.jsonl`);
-    try { this.server.auth.checkWrite(file); } catch (e) { throw new ProtoError('refused_path', e.message); }
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const dir = this.reviewsDir();
+    /* The write goes to the real paths: .reviews and the log resolved through the kernel, so a symlink planted in
+       notesDir cannot carry the append outside the write roots or into a refused path (R6.1, R14.8). */
+    let file;
+    try {
+      const d = realPath(dir);
+      if (d.symlink && !d.exists) throw new PathError('refused_path', `${dir}: a dangling symlink`);
+      this.server.auth.checkWrite(d.real);
+      if (!d.exists) fs.mkdirSync(d.real, { recursive: true, mode: 0o700 });
+      const f = realPath(path.join(d.real, `${this.server.cfg.host}.jsonl`));
+      if (f.symlink && !f.exists) throw new PathError('refused_path', `${f.real}: a dangling symlink`);
+      file = this.server.auth.checkWrite(f.real);
+    } catch (e) { throw new ProtoError('refused_path', e.message); }
     if (reviews.length) fs.appendFileSync(file, reviews.map(r => JSON.stringify(r) + '\n').join(''), { mode: 0o600 });
     return { dir, appended: reviews.length };
   }

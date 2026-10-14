@@ -385,6 +385,40 @@ test('§11.3 notes-reviews reads .reviews/*.jsonl and notes-reviews-append appen
   a.close();
 });
 
+test('R14.8 notes-reviews-append writes through the real path: a symlinked .reviews or log never leaves the write roots', async () => {
+  const a = await client();
+  const reviewsDir = path.join(dir.dirs.notes, '.reviews'), log = path.join(reviewsDir, 'test.jsonl');
+  /* ~/.ssh is on the refusal list of the test configuration (the root itself is writable). */
+  const refused = path.join(dir.dirs.home, '.ssh');
+  fs.mkdirSync(refused, { recursive: true });
+  fs.writeFileSync(path.join(refused, 'leak.jsonl'), 'keep\n');
+  const one = [{ card: 'y', g: 1, t: '2026-10-14T10:00:00.000Z' }];
+  /* The log itself is a symlink to a refused file. */
+  fs.renameSync(log, log + '.keep');
+  fs.symlinkSync(path.join(refused, 'leak.jsonl'), log);
+  try {
+    assert.equal((await a.call('notes-reviews-append', [{ reviews: one }])).code, 'refused_path');
+    assert.equal(fs.readFileSync(path.join(refused, 'leak.jsonl'), 'utf8'), 'keep\n');
+  } finally { fs.unlinkSync(log); fs.renameSync(log + '.keep', log); }
+  /* A dangling symlink as the log is refused too (appendFileSync would create its target). */
+  fs.renameSync(log, log + '.keep');
+  fs.symlinkSync(path.join(dir.root, 'outside', 'dangling.jsonl'), log);
+  try {
+    assert.equal((await a.call('notes-reviews-append', [{ reviews: one }])).code, 'refused_path');
+    assert.ok(!fs.existsSync(path.join(dir.root, 'outside', 'dangling.jsonl')));
+  } finally { fs.unlinkSync(log); fs.renameSync(log + '.keep', log); }
+  /* The .reviews directory is a symlink to a refused directory. */
+  fs.renameSync(reviewsDir, reviewsDir + '.keep');
+  fs.symlinkSync(refused, reviewsDir);
+  try {
+    assert.equal((await a.call('notes-reviews-append', [{ reviews: one }])).code, 'refused_path');
+    assert.ok(!fs.existsSync(path.join(refused, 'test.jsonl')));
+  } finally { fs.unlinkSync(reviewsDir); fs.renameSync(reviewsDir + '.keep', reviewsDir); }
+  /* Restored, the append works again. */
+  assert.deepEqual(await value(a, 'notes-reviews-append', [{ reviews: one }]), { dir: reviewsDir, appended: 1 });
+  a.close();
+});
+
 test('R11.10 from Lisp: notes-query, notes-backlinks, notes-file, notes-tasks, notes-cards, notes-find, unlinked-mentions, notes-grep', async () => {
   const a = await client();
   const ev = async form => { const r = await a.form(form); assert.equal(r.t, 'result', JSON.stringify(r)); assert.equal(r.error, undefined, JSON.stringify(r)); return r.value; };

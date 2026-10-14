@@ -563,6 +563,24 @@ export async function install(server) {
   blocking('sleep-for', 'seconds', 'Suspend the thread for SECONDS (a blocking point).', sleepG('sleep-for'));
   blocking('sit-for', 'seconds', 'Suspend the thread for SECONDS; #t.', function* ([s]) { yield new S.Block(sleep(secs(s, 'sit-for') * 1000), `sit-for ${s}`); return true; });
   /* Mutexes and mailboxes (R4.40). */
+  /* A wait queue entry is {wake}; the waiter leaves the queue when it stops waiting for any reason (the timeout,
+     an interrupt, a kill), so a stale entry never swallows the wake meant for a live waiter. A waiter that was
+     woken but saw its timeout first passes the wake on. */
+  const wakeOne = q => { const w = q.shift(); if (w) w.wake(true); };
+  function* awaitTurn(q, to, who, what) {
+    const w = { wake: null };
+    let p = new Promise(r => { w.wake = r; });
+    q.push(w);
+    if (to !== undefined && to !== false) p = Promise.race([p, sleep(secs(to, who) * 1000).then(() => 'timeout')]);
+    let r;
+    try { r = yield new S.Block(p, what); }
+    finally {
+      const i = q.indexOf(w);
+      if (i >= 0) q.splice(i, 1);
+      else if (r !== true) wakeOne(q);   // woken while leaving (timeout or interrupt): hand the wake to the next waiter
+    }
+    return r;
+  }
   class Mutex { constructor(nm) { this.name = nm || null; this.owner = null; this.waiters = []; } __print() { return `#<mutex${this.name ? ' ' + this.name : ''}>`; } }
   class Mailbox { constructor(nm) { this.name = nm || null; this.items = []; this.waiters = []; } __print() { return `#<mailbox${this.name ? ' ' + this.name : ''}>`; } }
   D('make-mutex', '[name]', 'A mutex.', ([nm]) => new Mutex(nm === undefined || nm === false ? null : String(nm)));
@@ -573,27 +591,23 @@ export async function install(server) {
     const me = cur();
     if (m.owner === me) throw new S.SchemeError('error', 'mutex-lock!: the thread holds the mutex already', [m]);
     while (m.owner) {
-      let p = new Promise(r => m.waiters.push(r));
-      if (to !== undefined && to !== false) p = Promise.race([p, sleep(secs(to, 'mutex-lock!') * 1000).then(() => 'timeout')]);
-      if ((yield new S.Block(p, 'mutex ' + (m.name || ''))) === 'timeout') return false;
+      if ((yield* awaitTurn(m.waiters, to, 'mutex-lock!', 'mutex ' + (m.name || ''))) === 'timeout') return false;
     }
     m.owner = me; if (me) me.owned.add(m); return true;
   });
   D('mutex-unlock!', 'mutex', 'Release MUTEX and wake one waiter.', ([m]) => {
     if (!(m instanceof Mutex)) throw S.typeErr('mutex', m, 'mutex-unlock!');
     if (m.owner) m.owner.owned.delete(m);
-    m.owner = null; const w = m.waiters.shift(); if (w) w(true); return S.UNSPEC;
+    m.owner = null; wakeOne(m.waiters); return S.UNSPEC;
   });
   D('make-mailbox', '[name]', 'A mailbox: a queue of values between threads.', ([nm]) => new Mailbox(nm === undefined || nm === false ? null : String(nm)));
   D('mailbox?', 'x', '#t if X is a mailbox.', ([x]) => x instanceof Mailbox);
-  D('mailbox-send!', 'mailbox value', 'Put VALUE in MAILBOX and wake a receiver.', ([mb, v]) => { if (!(mb instanceof Mailbox)) throw S.typeErr('mailbox', mb, 'mailbox-send!'); mb.items.push(v); const w = mb.waiters.shift(); if (w) w(); return S.UNSPEC; });
+  D('mailbox-send!', 'mailbox value', 'Put VALUE in MAILBOX and wake a receiver.', ([mb, v]) => { if (!(mb instanceof Mailbox)) throw S.typeErr('mailbox', mb, 'mailbox-send!'); mb.items.push(v); wakeOne(mb.waiters); return S.UNSPEC; });
   D('mailbox-empty?', 'mailbox', '#t if MAILBOX holds nothing.', ([mb]) => { if (!(mb instanceof Mailbox)) throw S.typeErr('mailbox', mb, 'mailbox-empty?'); return !mb.items.length; });
   blocking('mailbox-receive!', 'mailbox [timeout [default]]', 'The next value of MAILBOX, waiting for one; after TIMEOUT seconds DEFAULT (or the timeout condition).', function* ([mb, to, dflt]) {
     if (!(mb instanceof Mailbox)) throw S.typeErr('mailbox', mb, 'mailbox-receive!');
     while (!mb.items.length) {
-      let p = new Promise(r => mb.waiters.push(r));
-      if (to !== undefined && to !== false) p = Promise.race([p, sleep(secs(to, 'mailbox-receive!') * 1000).then(() => 'timeout')]);
-      if ((yield new S.Block(p, 'mailbox ' + (mb.name || ''))) === 'timeout') { if (dflt !== undefined) return dflt; throw new S.SchemeError('timeout', 'mailbox-receive!: nothing arrived in time', [mb]); }
+      if ((yield* awaitTurn(mb.waiters, to, 'mailbox-receive!', 'mailbox ' + (mb.name || ''))) === 'timeout') { if (dflt !== undefined) return dflt; throw new S.SchemeError('timeout', 'mailbox-receive!: nothing arrived in time', [mb]); }
     }
     return mb.items.shift();
   });

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use common::{FakeEdit, FakeHub, Web, Ws, edit_status, next_json, read_to_close, send_json};
 use serde_json::{Value, json};
+use wb_proto::limits::MAX_LINE;
 
 const NOT_RUNNING: &str = "workbench-edit is not running";
 
@@ -588,6 +589,70 @@ async fn sample_streams_round_trip_through_edwind() {
     assert_eq!(
         next_json(&mut other).await,
         json!({"t": "error", "id": "s1", "code": "unavailable", "message": NOT_RUNNING})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversized_tool_result_ends_the_stream_and_cancels_it() {
+    let hub = FakeHub::start();
+    let edit = FakeEdit::start();
+    let web = web_with_edit(&hub, &edit.path);
+    wait_edit(&web, true).await;
+    let mut ws = rpc(&web).await;
+
+    send_json(
+        &mut ws,
+        json!({"t": "sample", "id": "s1", "input": "hello"}),
+    )
+    .await;
+    let (_, fwd) = edit.wait_for(|m| m["t"] == "sample").await;
+    let sid = fwd["sid"].as_str().unwrap().to_owned();
+    edit.send(
+        0,
+        json!({"t": "sample.tool", "sid": sid, "callId": "c1", "name": "read_node", "input": {}}),
+    );
+    assert_eq!(next_json(&mut ws).await["callId"], "c1");
+
+    // A result that fits the /rpc message limit but not an edit.sock line (R7.2): the
+    // forwarded line would be one byte over MAX_LINE.
+    let shell = json!({"t": "tool_result", "sid": sid, "callId": "c1", "result": ""}).to_string();
+    let result = "x".repeat(MAX_LINE + 1 - shell.len());
+    send_json(
+        &mut ws,
+        json!({"t": "tool_result", "id": "s1", "callId": "c1", "result": result}),
+    )
+    .await;
+    // The tab learns that its stream ended, and edwind's thread is told to stop waiting.
+    assert_eq!(
+        next_json(&mut ws).await,
+        json!({"t": "error", "id": "s1", "code": "too_large", "message": "the tool result is too large"})
+    );
+    assert_eq!(
+        edit.wait_for(|m| m["t"] == "cancel").await.1,
+        json!({"t": "cancel", "sid": sid})
+    );
+    assert!(
+        !edit.requests().iter().any(|(_, m)| m["t"] == "tool_result"),
+        "{:?}",
+        edit.requests()
+    );
+    // The stream is forgotten: what edwind still says about it is dropped, and the tab
+    // can start a new one.
+    edit.send(
+        0,
+        json!({"t": "sample.error", "sid": sid, "code": "cancelled", "message": "cancelled"}),
+    );
+    send_json(
+        &mut ws,
+        json!({"t": "sample", "id": "s2", "input": "again"}),
+    )
+    .await;
+    let (_, second) = edit.wait_count(2, |m| m["t"] == "sample").await.remove(1);
+    let sid2 = second["sid"].as_str().unwrap().to_owned();
+    edit.send(0, json!({"t": "sample.text", "sid": sid2, "text": "ok"}));
+    assert_eq!(
+        next_json(&mut ws).await,
+        json!({"t": "text", "id": "s2", "text": "ok"})
     );
 }
 
