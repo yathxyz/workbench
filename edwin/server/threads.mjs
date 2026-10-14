@@ -32,6 +32,8 @@ export const ASK_KINDS = ['string', 'completing', 'y-or-n', 'yes-or-no', 'number
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCM_FILE = path.join(HERE, '..', 'scm', 'threads.scm');
 const ABORTED = { toString() { return '#<aborted>'; } };
+/* The end of a thread whose abort restart was invoked (R4.37): the call's result is the aborted condition. */
+export class Aborted extends Error { constructor() { super('Aborted'); } }
 
 let nextId = 1;
 
@@ -53,7 +55,8 @@ export class Thread {
     this.runnableMs = 0; this.startedAt = Date.now();
     this.held = new Set(); this.holdSince = 0; this.owned = new Set();     // mutexes held, released at the end
     this.suspend = null;                                // the Suspend yielded, while suspended
-    this.result = undefined; this.error = null; this.debugOnError = opts.debugOnError !== undefined ? opts.debugOnError : this.kind === 'command';
+    /* debug-on-error (R4.35, R13.10): commands run for a frame may suspend in the debugger; cli calls and background threads report. */
+    this.result = undefined; this.error = null; this.debugOnError = opts.debugOnError !== undefined ? opts.debugOnError : this.kind === 'command' && !!this.client && this.client.kind === 'frame';
     this.done = new Promise((resolve, reject) => { this.resolveDone = resolve; this.rejectDone = reject; });
     this.done.catch(() => {});                          // joiners see the error through thread-join
     this.ask = null;                                    // the pending ask {resolve, reject}, if any
@@ -64,8 +67,10 @@ export class Thread {
   /* Deliver condition C to the thread at its next step (quit, timeout, thread-cancelled). */
   interrupt(c) {
     if (!this.alive) return false;
-    if (this.state === 'blocked' || this.state === 'suspended') { this.waitToken++; this.resume = { throw: c }; if (this.ask) { this.ask = null; } this.sched.ready(this); }
-    else this.pendingThrow = c;
+    if (this.state === 'blocked' || this.state === 'suspended') {
+      if (this.state === 'suspended' && this.sched.onUnsuspend) this.sched.onUnsuspend(this);
+      this.waitToken++; this.resume = { throw: c }; this.ask = null; this.suspend = null; this.sched.ready(this);
+    } else this.pendingThrow = c;
     return true;
   }
   /* Kill: invoke the thread's abort restart (R4.37). */
@@ -101,7 +106,9 @@ export class Scheduler {
     t.abortRestart = new S.Restart(S.intern('abort'), opts.kind === 'command' ? 'Abort the command.' : 'Abort the thread.', null, () => ABORTED, tag, true);
     const self = this;
     t.gen = (function* () {
-      return yield* S.establishG([t.abortRestart], tag, function* () { return yield* body(t); });
+      const r = yield* S.establishG([t.abortRestart], tag, function* () { return yield* body(t); });
+      if (r === ABORTED) throw new Aborted();
+      return r;
     })();
     this.threads.set(t.id, t);
     this.ready(t);
@@ -176,12 +183,12 @@ export class Scheduler {
     for (const m of t.owned) { m.owner = null; const w = m.waiters.shift(); if (w) w(true); }
     t.owned.clear();
     this.threads.delete(t.id);
-    if (error !== null) { t.error = error; t.rejectDone(error); if (t.kind === 'background') this.reportBackground(t, error); }
+    if (error !== null) { t.error = error; t.rejectDone(error); if (t.kind === 'background' && !(error instanceof Aborted)) this.reportBackground(t, error); }
     else { t.result = value; t.resolveDone(value); }
   }
   reportBackground(t, e) {
     const S = this.S;
-    if (e instanceof S.Unwind) return; // aborted
+    if (e instanceof S.Unwind || e instanceof Aborted) return; // aborted
     const report = e instanceof S.SchemeError ? S.errorMessage(e) : e instanceof S.Raise ? 'raised ' + S.write(e.obj) : (e && e.message) || String(e);
     this.log.warn('thread', { thread: t.name, event: 'error', report });
     try { this.Ed.message(`Thread ${t.name}: ${report}`); } catch (x) { /* no echo area */ }
@@ -304,7 +311,7 @@ export class Scheduler {
   errorResult(e, t, outParts, msg, client) {
     const { S } = this;
     const error = this.server.conditionOf(e);
-    if (t && e instanceof S.Unwind) { error.condition = 'aborted'; error.report = 'Aborted'; }
+    if (e instanceof Aborted || (t && e instanceof S.Unwind)) { error.condition = 'aborted'; error.report = 'Aborted'; error.backtrace = []; }
     if (t) error.thread = t.id;
     const r = { error };
     const out = outParts.join(''); if (out) r.out = out;
@@ -546,7 +553,7 @@ export async function install(server) {
     const r = yield new S.Block(p, 'thread ' + t.name);
     if (r.timeout) throw new S.SchemeError('timeout', `thread-join: ${t.name} did not finish in time`, [t]);
     if (r.ok) return r.v;
-    if (r.e instanceof S.Unwind) throw new S.SchemeError('thread-cancelled', `Thread ${t.name} was aborted`, [t]);
+    if (r.e instanceof Aborted || r.e instanceof S.Unwind) throw new S.SchemeError('thread-cancelled', `Thread ${t.name} was aborted`, [t]);
     if (r.e instanceof S.SchemeError) { const c = new S.SchemeError('thread-died', `Thread ${t.name}: ${S.errorMessage(r.e)}`, [t]); c.payload = r.e; throw c; }
     throw new S.SchemeError('thread-died', `Thread ${t.name}: ${r.e && r.e.message ? r.e.message : String(r.e)}`, [t]);
   });
@@ -648,7 +655,7 @@ export async function install(server) {
   /* Introspection of the scheduler for list-threads and the inspector. */
   D('%thread-info', 'thread', 'An alist describing THREAD.', ([t]) => jsonToScheme(S, thr(t, '%thread-info').info()));
   D('%thread-suspended-condition', 'thread', 'The condition a suspended THREAD stopped at, or #f.', ([t]) => (thr(t, '%thread-suspended-condition').suspend ? t.suspend.condition : false));
-  server.defineCommand('list-threads', () => ({ value: [...sched.threads.values()].map(t => t.info()) }));
+  server.defineCommand('thread-list', () => ({ value: [...sched.threads.values()].map(t => t.info()) }));
   server.defineCommand('thread-kill', (client, args) => { const id = Number(Array.isArray(args) ? args[0] : NaN); const t = sched.threads.get(id); if (!t) throw new ProtoError('bad_request', `no thread ${args && args[0]}`); return { value: t.kill() }; });
 
   L.evalText(fs.readFileSync(SCM_FILE, 'utf8'));

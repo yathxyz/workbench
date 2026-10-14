@@ -4,6 +4,7 @@
 //   edwind --config … --check                         verify every journal and snapshot offline (R15.12)
 //   edwind --config … --export DIR                    write every live buffer's text to DIR (R15.12)
 //   edwind --config … --write-roots                   print the write roots, one per line (for bin/edwind's flags)
+//   edwind --config … --primitives                    print the primitive registry as JSON (R4.48)
 //
 // The process loads Edwin's core headless (host-node.js), replays the journals, then listens on edit.sock.
 import fs from 'node:fs';
@@ -22,11 +23,12 @@ import { sha256 } from './files.mjs';
 import * as imageModule from './image.mjs';
 import * as notesModule from './notes.mjs';
 import * as threadsModule from './threads.mjs';
+import * as debugModule from './debug.mjs';
 
 const require = createRequire(import.meta.url);
 /* The E2 modules, installed in this order after the buffers are loaded; each exports install(server) and
    may export shutdown(server) and name. */
-const MODULES = [imageModule, notesModule, threadsModule];
+const MODULES = [imageModule, notesModule, threadsModule, debugModule];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EDWIN = path.join(HERE, '..');
 export const BUILD = process.env.WB_EDIT_BUILD || 'dev';
@@ -325,7 +327,7 @@ export async function exportAll(cfg, dir, log) {
 }
 
 /* ---------- main ---------- */
-function usage() { process.stderr.write('usage: edwind --config PATH [--check | --export DIR | --write-roots]\n'); return 2; }
+function usage() { process.stderr.write('usage: edwind --config PATH [--check | --export DIR | --write-roots | --primitives]\n'); return 2; }
 /* R4.45, R14.12: edwind never starts processes. Node's permission model would enforce this, but it also
    disables fsync and fdatasync (Node 22 and 24), which the journal and atomic save need (R8.3, R8.7). So the
    backstop is in-process: every function of child_process is replaced before anything else runs, for CJS
@@ -347,6 +349,7 @@ export async function main(argv) {
     else if (a === '--check') mode = 'check';
     else if (a === '--export') { mode = 'export'; exportDir = args.shift(); }
     else if (a === '--write-roots') mode = 'roots';
+    else if (a === '--primitives') mode = 'primitives';
     else return usage();
   }
   if (!config || (mode === 'export' && !exportDir)) return usage();
@@ -358,6 +361,14 @@ export async function main(argv) {
   if (mode === 'roots') { const a = new Authority(cfg); for (const r of [...a.writeRootsForFlags(), path.dirname(cfg.socket)]) process.stdout.write(r + '\n'); return 0; }
   if (mode === 'check') return check(cfg) ? 0 : 1;
   if (mode === 'export') { const n = await exportAll(cfg, exportDir, log); process.stdout.write(`${n} buffers exported to ${exportDir}\n`); return 0; }
+  if (mode === 'primitives') {
+    /* The registry (R4.48) needs the image with every module installed; nothing listens. */
+    const server = new Server(cfg, makeLog('error'));
+    await server.start();
+    process.stdout.write(JSON.stringify(server.debugger.registry(), null, 1) + '\n');
+    await server.stop();
+    return 0;
+  }
   if (isMainThread && !process.env.EDWIND_NO_THREAD) return runInThread(argv, log);
   const server = new Server(cfg, log);
   try { await server.start(); await server.listen(); }

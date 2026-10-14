@@ -685,21 +685,21 @@ of a line, swap the two characters before point."
 (define-command (image-log)
   "Show the image log in the read-only buffer *image-log*: every entry with its
 generation, time and origin, newest last."
-  (interactive)
+  (interactive) (:where 'server)
   (%image-command "image-log")
   (message "Image log: see the buffer *image-log*"))
 
 (define-command (image-compact)
   "Drop image-log entries superseded by a later definition of the same name.
 The image epoch changes, so every frame restarts its runtime."
-  (interactive)
+  (interactive) (:where 'server)
   (let ((r (%image-command "image-compact")))
     (message "Image compacted: ~a dropped, ~a kept" (image-result-field r 'dropped) (image-result-field r 'kept))))
 
 (define-command (image-reset confirm)
   "Move the image log aside as image.<time>.jsonl and start fresh at generation 0.
 Every frame restarts its runtime.  CONFIRM must be the string yes."
-  (interactive "sReset the image log (the old log is kept aside)? Type yes: ")
+  (interactive "sReset the image log (the old log is kept aside)? Type yes: ") (:where 'server)
   (if (equal? confirm "yes")
       (let ((r (%image-command "image-reset" #t)))
         (message "Image reset; the old log is ~a" (image-result-field r 'archived)))
@@ -708,7 +708,7 @@ Every frame restarts its runtime.  CONFIRM must be the string yes."
 (define-command (image-save-to-init confirm)
   "Append the live image-log entries to init.scm in the config directory, then
 reset the log.  CONFIRM must be the string yes."
-  (interactive "sSave the image log to init.scm and reset it? Type yes: ")
+  (interactive "sSave the image log to init.scm and reset it? Type yes: ") (:where 'server)
   (if (equal? confirm "yes")
       (let ((r (%image-command "image-save-to-init" #t)))
         (message "~a entries saved to ~a; image reset" (image-result-field r 'saved) (image-result-field r 'file)))
@@ -716,7 +716,7 @@ reset the log.  CONFIRM must be the string yes."
 
 (define-command (image-problems)
   "List the image-log entries that failed at replay (R4.19) with their errors."
-  (interactive)
+  (interactive) (:where 'server)
   (let ((problems (%image-command "image-problems")))
     (if (null? problems)
         (message "Every image entry replayed")
@@ -729,7 +729,7 @@ reset the log.  CONFIRM must be the string yes."
 (define-command (image-revert-entry gen)
   "Remove the image-log entry with generation GEN; every frame rebuilds its runtime
 without it.  The server image keeps the definition until its next start."
-  (interactive "nRevert image entry (generation): ")
+  (interactive "nRevert image entry (generation): ") (:where 'server)
   (let ((r (%image-command "image-revert-entry" gen)))
     (message "Image entry ~a reverted: ~a" gen (image-result-field r 'form))))
 

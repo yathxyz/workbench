@@ -648,6 +648,9 @@ function describeFn(sym) {
   const inter = Ed.isCommand(f) ? 'an interactive command, ' + kind : kind;
   const keys = Ed.whereIs(sym);
   let out = `${name} is ${inter}.\n\n`;
+  /* Where it runs (R4.48, R4.27): a primitive's or command's where mark; plain Scheme runs in every runtime. */
+  const where = f.where || (scheme ? null : 'both');
+  if (where) out += `It runs ${where === 'server' ? 'on the server' : where === 'frame' ? 'in frames' : 'in every runtime'}.\n\n`;
   if (keys.length) out += `It is bound to ${keys.join(', ')}.\n\n`;
   out += signature(name, f) + '\n\n' + (f.doc || 'Not documented.') + '\n';
   const ads = Ed.adviceOf(name);

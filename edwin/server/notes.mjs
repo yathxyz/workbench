@@ -619,22 +619,29 @@ export class Notes {
     for (const id of this.derived().ids) { const sb = this.bufferFor(id); out.push(sb ? { id, text: sb.text } : { id, file: path.join(this.root, id) }); }
     return out;
   }
-  grep(source, flags, { excludeLinks = false, max = GREP_MAX, exclude = null } = {}) {
+  /* The grep job for SOURCE: {files, source, flags, excludeLinks, max}; a bad pattern fails here, on this thread. */
+  grepJob(source, flags, { excludeLinks = false, max = GREP_MAX, exclude = null } = {}) {
     if (typeof source !== 'string') throw new Error('notes-grep: a regexp source string is required');
     if (flags === undefined || flags === null) flags = /[A-Z]/.test(source.replace(/\\./g, '')) ? '' : 'i';
-    new RegExp(source, flags.replace('g', ''));   // a bad pattern fails here, on this thread
+    new RegExp(source, flags.replace('g', ''));
     const files = this.grepFiles().filter(f => f.id !== exclude);
-    return this.syncJob({ t: 'grep', files, source, flags, excludeLinks, max }).hits;
+    return { t: 'grep', files, source, flags, excludeLinks, max };
   }
-  unlinkedMentions(x) {
+  /* Synchronous (outside a thread: the sync channel) and blocking (on a thread: the worker answers while the
+     thread waits, R4.42) forms of the grep. */
+  grep(source, flags, opts) { return this.syncJob(this.grepJob(source, flags, opts)).hits; }
+  grepAsync(source, flags, opts) { return this.job(this.grepJob(source, flags, opts)).then(r => r.hits); }
+  mentionsJob(x) {
     const id = this.fileIdOf(x);
-    if (!id) return [];
+    if (!id) return null;
     const f = this.files.get(id).rec.file;
     const names = [f.title, ...f.aliases].filter(Boolean).map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-    if (!names.length) return [];
+    if (!names.length) return null;
     const source = `(?<![\\p{L}\\p{N}_])(?:${names.join('|')})(?![\\p{L}\\p{N}_])`;
-    return this.grep(source, 'iu', { excludeLinks: true, exclude: id });
+    return this.grepJob(source, 'iu', { excludeLinks: true, exclude: id });
   }
+  unlinkedMentions(x) { const j = this.mentionsJob(x); return j ? this.syncJob(j).hits : []; }
+  unlinkedMentionsAsync(x) { const j = this.mentionsJob(x); return j ? this.job(j).then(r => r.hits) : Promise.resolve([]); }
   definePrimitives() {
     const { L, S } = this;
     const def = (name, args, doc, fn) => { const f = L.D(name, args, doc, fn); f.where = 'server'; return f; };
@@ -646,8 +653,13 @@ export class Notes {
     def('notes-cards', '[deck]', 'The flashcards of DECK, or all of them.', ([deck]) => list(this.derived().cards.filter(c => !deck || deck === false || c.deck === deck)));
     def('notes-rebuild', '', 'Start a full rebuild of the notes index; notes-generation changes when it is done.', () => { this.rebuild().catch(e => this.log.warn('notes', { rebuild: e.message })); return true; });
     def('notes-find', '[text]', 'Titles and aliases of the notes, those containing TEXT when given: the candidates of a completing read.', ([q]) => S.listOf(this.find(q === undefined || q === false ? '' : String(q))));
-    def('unlinked-mentions', 'file', 'Mentions of FILE\'s title or aliases in other notes that are not links, as #(path line column text).', ([x]) => S.listOf(this.unlinkedMentions(x)));
-    def('notes-grep', 'regexp [flags]', 'Search every note for REGEXP (a source string; FLAGS as for JavaScript, smart case when absent) in the index worker: a list of #(path line column text).', ([re, flags]) => S.listOf(this.grep(String(re), flags === undefined || flags === false ? null : String(flags))));
+    /* On a thread these block while the worker searches (S.Block); the plain forms wait on the sync channel. */
+    const self = this;
+    def('unlinked-mentions', 'file', 'Mentions of FILE\'s title or aliases in other notes that are not links, as #(path line column text).', ([x]) => S.listOf(this.unlinkedMentions(x)))
+      .gen = function* ([x]) { return S.listOf(yield new S.Block(self.unlinkedMentionsAsync(x), 'the notes worker')); };
+    const flagsOf = flags => (flags === undefined || flags === false ? null : String(flags));
+    def('notes-grep', 'regexp [flags]', 'Search every note for REGEXP (a source string; FLAGS as for JavaScript, smart case when absent) in the index worker: a list of #(path line column text).', ([re, flags]) => S.listOf(this.grep(String(re), flagsOf(flags))))
+      .gen = function* ([re, flags]) { return S.listOf(yield new S.Block(self.grepAsync(String(re), flagsOf(flags)), 'the notes worker')); };
     def('notes-ambiguous-links', '', 'Links whose target names several files, each with its candidates and the chosen (shortest) path.', () => list(this.derived().ambiguous));
   }
 }

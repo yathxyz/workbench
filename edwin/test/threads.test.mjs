@@ -104,7 +104,7 @@ test('R4.36 interrupt{rid} stops a running command with quit; the thread is gone
   const t0 = Date.now();
   const r = await f.next(m => m.rid === rid && m.t === 'result');
   assert.equal(r.error.condition, 'quit'); assert.ok(Date.now() - t0 < 1000);
-  const threads = (await f.call('list-threads')).value;
+  const threads = (await f.call('thread-list')).value;
   assert.equal(threads.filter(t => t.client === f.cid).length, 0, 'the interrupted thread is gone');
   f.close();
 });
