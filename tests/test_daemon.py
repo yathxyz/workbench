@@ -10,13 +10,10 @@ mv denylist act on throwaway directories. Prints one line per check and exits 1 
 """
 
 import argparse
-import errno
 import json
 import os
 import sys
-import tempfile
 import threading
-from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -220,8 +217,11 @@ def fs(t, h):
 
     (home / "a.txt").write_text("A")
     (home / "b.txt").write_text("B")
+    # The harness runs edwind, so a move is its rename-file (edwind spec R4.49): the answer also names the buffer
+    # ids of both ends (R6.1).
     st, body = mv("~/a.txt", "~/c.txt")
-    t.check("fs: mv renames", (st, body) == (200, {"ok": True, "src": str(home / "a.txt"), "dst": str(home / "c.txt")})
+    t.check("fs: mv renames", (st, body) == (200, {"ok": True, "src": str(home / "a.txt"), "dst": str(home / "c.txt"),
+                                                    "from": "~/a.txt", "to": "~/c.txt"})
             and (home / "c.txt").read_text() == "A", repr((st, body)))
     st, body = mv("~/c.txt", "~/b.txt")
     t.check("fs: mv never replaces", (st, body) == (400, {"error": "destination exists"})
@@ -247,27 +247,27 @@ def fs(t, h):
             not denied, repr(denied))
     t.check("fs: refused moves leave the source and create nothing", evil.exists() and not created, repr(created))
 
-    # Moving ~/.config aside is allowed; putting a directory that carries systemd/user in its place is not.
+    # edwind's authority covers the source too (R14.8): moving ~/.config aside moves ~/.config/systemd and is
+    # refused. With ~/.config gone (moved here directly), a directory that carries systemd/user may not take its
+    # place either.
     planted = root / "planted"
     (planted / "systemd" / "user").mkdir(parents=True)
     (planted / "systemd" / "user" / "x.service").write_text("[Service]\n")
     st, _ = mv("~/.config", "~/config-old")
+    aside = (home / ".config").is_dir()
+    os.rename(home / ".config", home / "config-old")
     st2, body = mv(planted, "~/.config")
-    t.check("fs: mv refuses a destination above a protected directory",
-            st == 200 and (st2, body) == (400, {"error": REFUSED}) and planted.is_dir()
-            and not (home / ".config").exists(), repr((st, st2, body)))
+    t.check("fs: mv refuses a source or destination above a protected directory",
+            st == 400 and aside and (st2, body) == (400, {"error": REFUSED}) and planted.is_dir()
+            and not (home / ".config").exists(), repr((st, aside, st2, body)))
 
-    shm = Path("/dev/shm")
-    if not shm.is_dir() or shm.stat().st_dev == root.stat().st_dev:
-        t.skip("fs: mv across filesystems", "/dev/shm is missing or on the same filesystem")
-    else:
-        with tempfile.TemporaryDirectory(dir=shm) as other:
-            src = root / "cross.txt"
-            src.write_text("X")
-            st, body = mv(src, Path(other) / "cross.txt")
-            t.check("fs: mv across filesystems is 400 with the OS message",
-                    st == 400 and str((body or {}).get("error", "")).startswith(os.strerror(errno.EXDEV))
-                    and src.exists() and not (Path(other) / "cross.txt").exists(), repr((st, body)))
+    # Both ends must be in edwind's writable paths (the harness gives it the home): a move out of it moves nothing.
+    src = home / "out.txt"
+    src.write_text("X")
+    st, body = mv(src, root / "out.txt")
+    t.check("fs: mv outside edwind's writable paths is 400 and moves nothing",
+            st == 400 and "outside the writable paths" in str((body or {}).get("error", ""))
+            and src.exists() and not (root / "out.txt").exists(), repr((st, body)))
 
 
 SECTIONS = [board, fs]

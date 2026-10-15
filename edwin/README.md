@@ -355,6 +355,25 @@ Choices E3 made where the spec left one open, and where it had to deviate:
   Setext headings fold as paragraphs; emphasis markers stay visible as `markdown-markup`.
 - **The `(image-server?)` predicate is `#f` in a frame**; `edwin-import-local-config` (importing the old
   browser-stored configuration into `~/.config/edwin/`) is not written: served mode simply never reads it.
+- **Notes and files open as pages (decided 2026-10-15, reversing the spec's NG5/D6 as the default opener).** With
+  frames on, `noteOpen` (the navigator, tasks, the journal, note ghosts) and `ghostOpen` (file ghosts of this host)
+  open an Edwin page card on the file. edwind decides through the server command `visit-id`: the id it would visit
+  the file under, or a refusal (the refusal list, not UTF-8, missing), or read-only (outside the writable paths,
+  over 32 MiB). A refusal, a read-only answer, a ghost of another host and an edwind that is down keep the Emacs
+  card; `open_in_emacs` and the Emacs button still make Emacs cards. A page with a file has an `fsIdent`, so the
+  fs perspective shows it under its directory and a drag moves its file.
+- **`rename-file` (R4.49, R6.1, R8.1, §7 moved)** is a server command, `[{src, dst}]` as POST /api/mv sends it;
+  wb-web's `/api/mv` forwards to it whenever `editSocket` is set (refusals 400, 503 while edwind is down: nothing
+  moves behind its back). Both ends pass `checkWrite`, so `/api/mv` is narrower than wb-web's own rule: the source
+  may not be in or above the refusal list either, both ends must be in the writable paths, and edwind's own
+  directories stay put. Node has no `renameat2`, so the destination is claimed first (an exclusive create, or
+  `mkdir` for a directory) and the rename replaces only the claim. Buffers under the source keep their SBuf, jid
+  and history and are updated before the first await, so the watcher never sees their files missing (R8.15 for
+  renames). The moved records (old id, new id, time, `dir`) live in `index.json`, not only in the `mv` journal
+  lines, so they outlive a kill, a compaction and a restart for their 24 h; a directory's record covers the ids
+  under it, and an old id is sent on only while nothing is at the old path again. The answer adds `from` and `to`
+  (the ids of both ends) for pages whose replicas are closed. No Scheme primitive yet: `rename-file` in a frame is
+  still the browser store's.
 - **Not in E3**: K4 (Edwin keymaps in the board's conflict checker) waits for the keymaps PR; a display-text
   mechanism in the renderer (block-ref text is a DOM post-pass) and an `imenuItems` hook are left for later.
 

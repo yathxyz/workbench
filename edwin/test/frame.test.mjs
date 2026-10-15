@@ -461,6 +461,24 @@ test('killed and moved: a buffer killed on the server leaves the frame; a messag
   c.close();
 });
 
+test('moved: a file renamed on the server moves the replica to the new id; the frame keeps editing it and the page hears of it', async () => {
+  const id = note('mv-frame.md', 'move me\n');
+  const b = await sync.open(id); show(b);
+  const heard = []; const off = sync.on('moved', m => heard.push(m));
+  const c = await client();
+  const r = await c.call('rename-file', [{ src: id, dst: 'mv-framed.md' }]);
+  assert.equal(r.value.to, 'mv-framed.md');
+  await until(() => b.id === 'mv-framed.md' && !b.sync.opening, 'the replica to follow');
+  assert.deepEqual(heard, [{ buf: id, to: 'mv-framed.md' }]); off();
+  assert.equal(sync.buffers.get('mv-framed.md'), b); assert.equal(sync.buffers.has(id), false);
+  assert.equal(b.text, 'move me\n');
+  await type('A, still mine'); await keys('ESC');
+  await settled(b);
+  assert.equal(await serverText('mv-framed.md'), 'move me, still mine\n');
+  assert.equal(fs.existsSync(path.join(dir.dirs.notes, id)), false);
+  c.close();
+});
+
 test('E3 H3 gap 2: Ed.sync.close kills the local replica and moves the window showing it; a reopen is a fresh replica', async () => {
   const id = note('cl.md', 'close me\n');
   const b = await sync.open(id); show(b);

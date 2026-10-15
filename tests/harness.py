@@ -54,7 +54,9 @@ $WB_WEB_ROOT (for example the output of `nix build .#workbench-web`).
 
 edwind (the editing server, edwin/server/main.mjs) runs beside wb-web with an edit.json: its socket
 in a 0700 directory under the temporary root, the harness's notesDir and boardsDir, the hub and web
-sockets, and the same host as web.json, whose editSocket points at it. `edwind` comes from --bin-dir
+sockets, the home as its writable path and the module's refusal list (so POST /api/mv, which wb-web
+forwards to edwind, has the authority it has in production), and the same host as web.json, whose
+editSocket points at it. `edwind` comes from --bin-dir
 or PATH when present; otherwise the harness runs edwin/server/main.mjs from this checkout with node
 and the flags of the package wrapper ($EDWIND_MAIN names another main.mjs). --frames writes
 `frames: true` into web.json (ui.mjs and perf.mjs pass it when WB_FRAMES=1); without it the key is
@@ -243,6 +245,8 @@ class Harness:
             "notesDir": str(self.notes_dir),
             "boardsDir": str(self.boards_dir),
             "configDir": str(self.root / "config" / "edwin"),
+            "writablePaths": [str(self.home)],
+            "refusePaths": [str(self.home / d) for d in (".ssh", ".config/systemd", ".local/share/systemd")],
             "host": host,
             "logLevel": "info",
         }

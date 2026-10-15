@@ -2385,6 +2385,51 @@ await section('frames', async () => {
   await A2.evaluate(id => { const C = window.__canvas; for (const n of Object.values(C.S.nodes)) if (n.block?.page === id) C.removeNode(n.id); C.removeNode(id); }, blk);
   await settled(A2); await settled(B2);
 
+  // (j) notes and files open as Edwin pages (noteOpen, ghostOpen), not as Emacs cards; the frame starts at the note's
+  // line. A file edwind will not edit (here: not UTF-8 text) still opens in an Emacs card.
+  fs.writeFileSync(noteFile('open-me.md'), '# open me\n\nsecond body line\nthird');
+  fs.writeFileSync(noteFile('ghost-me.md'), '# ghost me\n');
+  fs.writeFileSync(noteFile('bin.md'), Buffer.from([0xff, 0xfe, 0x00, 0x41]));
+  await A2.bringToFront();
+  const opened = await A2.evaluate(async () => { const n = await window.__canvas.noteOpen({ path: 'open-me.md', line: 3 }); return n && { id: n.id, kind: n.kind, buf: n.buf || null, emacs: n.emacs || null }; });
+  const openPt = opened && await until(() => A2.evaluate(id => { const L = window.__canvas.live[id]; return L?.frame?.focused ? L.frame.point() : null; }, opened.id), 10000);
+  await leave(A2);
+  const ghost = await A2.evaluate(abs => window.__canvas.addNode({ kind: 'ghost', ghost: true, name: 'ghost-me.md', path: abs, in: undefined, x: 12000, y: 14500, w: 220, h: 54 }).id, noteFile('ghost-me.md'));
+  const fromGhost = await A2.evaluate(async id => { const C = window.__canvas, n = await C.ghostOpen(C.S.nodes[id]); return n && { id: n.id, kind: n.kind, buf: n.buf || null, ghostGone: !C.S.nodes[id] }; }, ghost);
+  await leave(A2);
+  const bin = await A2.evaluate(async () => { const n = await window.__canvas.noteOpen({ path: 'bin.md' }); return n && { id: n.id, kind: n.kind, emacs: n.emacs || null, buf: n.buf || null }; });
+  // the terminal settles before it goes: xterm disposed right after it opened throws from its next render
+  if (bin?.id) { await until(() => A2.evaluate(id => !!window.__canvas.live[id]?.term?.element || null, bin.id), 5000); await sleep(500); await A2.evaluate(id => window.__canvas.removeNode(id), bin.id); }
+  check('frames: a note and a file ghost open as Edwin page cards on their files, the frame at the note\'s line; a file edwind will not edit (not UTF-8) opens in an Emacs card',
+    opened?.kind === 'buffer' && opened.buf === 'open-me.md' && !opened.emacs && openPt === '# open me\n\n'.length && fromGhost?.kind === 'buffer' && fromGhost.buf === 'ghost-me.md' && fromGhost.ghostGone && bin?.kind === 'term' && /bin\.md$/.test(bin.emacs || '') && !bin.buf,
+    JSON.stringify({ opened, openPt, fromGhost, bin }));
+
+  // (k) a page whose file moves through POST /api/mv (edwind's rename-file) keeps editing the same text: the node and the
+  // served board take the new id, tab B's open replica follows, typing lands in the moved file, and neither tab shows
+  // the conflict bar
+  if (opened?.id) {
+    const mvPage = opened.id;
+    await enterPage(A2, mvPage); await appendAt(A2); await A2.keyboard.type(' before-move'); await leave(A2);
+    await until(async () => (await frSync(A2, mvPage)) === '', 10000);
+    await until(() => B2.evaluate(id => !!window.__canvas.S.nodes[id] || null, mvPage), 15000);
+    await show(B2, mvPage); await until(() => frLive(B2, mvPage), 10000);
+    fs.mkdirSync(noteFile('moved'), { recursive: true });
+    const mv = await A2.evaluate(async ([src, dst]) => { try { return await window.__canvas.fsMv(null, src, dst); } catch (e) { return { error: e.message }; } }, [noteFile('open-me.md'), noteFile('moved')]);
+    const bufA = await until(() => A2.evaluate(id => window.__canvas.S.nodes[id]?.buf === 'moved/open-me.md' || null, mvPage), 5000);
+    const served = await until(async () => (await (await api('/api/board')).json()).nodes[mvPage]?.buf === 'moved/open-me.md' || null, 10000);
+    const bufB = await until(() => B2.evaluate(id => window.__canvas.live[id]?.buf?.id === 'moved/open-me.md' || null, mvPage), 10000);
+    await enterPage(A2, mvPage); await appendAt(A2); await A2.keyboard.type(' after-move'); await leave(A2);
+    const disk = await until(() => { const t = readNote('moved/open-me.md'); return t && t.includes('after-move') ? t : null; }, 15000);
+    const textB = await until(async () => { const t = await pageText(B2, mvPage); return t.endsWith('after-move') ? t : null; }, 5000);
+    await settled(A2); await settled(B2);
+    const barsMv = [await barOf(A2), await barOf(B2)];
+    check('frames: a page whose file moves through /api/mv keeps editing the same text: the node and the served board take the new id, the other tab\'s replica follows, typing lands in the moved file, no conflict bar',
+      mv?.from === 'open-me.md' && mv.to === 'moved/open-me.md' && !!bufA && !!served && !!bufB && disk === '# open me\n\nsecond body line\nthird before-move after-move' && readNote('open-me.md') === null && !!textB && barsMv.every(b => b.hidden || b.key !== 'conflict'),
+      JSON.stringify({ mv, bufA, served, bufB, disk, textB: textB && textB.slice(-40), barsMv }));
+  }
+  await A2.evaluate(ids => { for (const id of ids) if (id && window.__canvas.S.nodes[id]) window.__canvas.removeNode(id); }, [opened?.id, fromGhost?.id]);
+  await settled(A2); await settled(B2);
+
   // (d) edwind down: the card shows the R9.18 notice, the mode line says offline, typing still works locally
   await enterPage(A2, two); await appendAt(A2);
   const stopped = await harnessCtl('stop edit');

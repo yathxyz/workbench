@@ -103,7 +103,7 @@ export class Client {
         case 'ping': this.send({ t: 'pong', rid: msg.rid }); return;
         case 'pong': return;
         case 'open': return this.onOpen(msg);
-        case 'close': { const sb = this.server.buffers.byId.get(str(msg, 'buf')); if (sb) this.server.buffers.close(this, sb); return; }
+        case 'close': { const sb = this.server.buffers.live(str(msg, 'buf')); if (sb) this.server.buffers.close(this, sb); return; }
         case 'edit': return this.onEdit(msg);
         case 'sel': return this.onSel(msg);
         case 'save': case 'revert': return this.onSaveRevert(msg);
@@ -150,7 +150,7 @@ export class Client {
     this.selTimes = this.selTimes.filter(t => now - t < 1000);
     if (this.selTimes.length >= SEL_PER_SECOND) return; // throttled: presence is best effort
     this.selTimes.push(now);
-    const sb = this.server.buffers.byId.get(buf);
+    const sb = this.server.buffers.live(buf);
     if (!sb || !Array.isArray(msg.ranges)) return;
     const out = { t: 'sel', buf: sb.id, by: this.by(), ranges: msg.ranges };
     for (const c of sb.clients) if (c !== this) c.sendBulkish(out);

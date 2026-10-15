@@ -1,7 +1,8 @@
 // Disk changes (spec §8.4): a watcher per directory of a loaded file plus a 10 s stat sweep; reverts as
 // one batch by `disk` when the buffer is unmodified, a three-way merge against the saved text when it is
 // modified, a conflict mark when hunks overlap, a deleted mark when the file is gone. Own saves are
-// recognised by their hash (R8.15). The line-then-character diff and the merge live here too.
+// recognised by their hash (R8.15), own renames by the buffer having moved with the file before any event is
+// read. The line-then-character diff and the merge live here too.
 import fs from 'node:fs';
 import path from 'node:path';
 import { readText, sha256, diskState, sameDisk } from './files.mjs';
@@ -133,6 +134,14 @@ export class Watcher {
       w.on('error', () => { w.close(); this.dirs.delete(dir); });
       this.dirs.set(dir, w);
     } catch (e) { this.log.warn('watch', { dir, error: e.code || e.message }); }
+  }
+  /* edwind renamed SB's file from OLD (R8.15 for renames): SB already visits the new path with its disk state, so
+     events for the old path find no buffer and the new one is unchanged; a check queued for the old path is
+     dropped, and the new directory is watched. */
+  moved(sb, old) {
+    const t = this.pending.get(old);
+    if (t) { clearTimeout(t); this.pending.delete(old); }
+    this.add(sb);
   }
   /* A change event for REAL: look at it shortly, once events settle. */
   changed(real) {

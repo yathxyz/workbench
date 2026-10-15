@@ -322,11 +322,13 @@ export class Notes {
     this.snapshotTimer = setInterval(() => this.snapshot(), SNAPSHOT_MS);
     this.snapshotTimer.unref();
   }
+  /* Whether the notesDir-relative REL is a file the index covers (R11.1). */
+  indexable(rel) { return NOTE_EXT.test(rel) && !rel.split('/').some(s => s.startsWith('.')) && !ignoreMatcher(this.ignorePatterns())(rel, false); }
   onFsEvent(fname) {
     if (this.stopped) return;
     if (!fname) { this.scheduleSweep(500); return; }
     const rel = String(fname).split(path.sep).join('/');
-    if (NOTE_EXT.test(rel) && !rel.split('/').some(s => s.startsWith('.')) && !ignoreMatcher(this.ignorePatterns())(rel, false)) {
+    if (this.indexable(rel)) {
       const t = this.fsTimers.get(rel); if (t) clearTimeout(t);
       this.fsTimers.set(rel, setTimeout(() => { this.fsTimers.delete(rel); this.checkFile(rel); }, FS_DEBOUNCE_MS));
       return;
@@ -343,6 +345,23 @@ export class Notes {
     const e = this.files.get(rel);
     if (e && !e.fromBuffer && e.mtimeMs === st.mtimeMs && e.size === st.size) return;
     this.job({ t: 'parse', items: [{ id: rel, file: abs }] }).catch(err => this.log.warn('notes', { file: rel, error: err.message }));
+  }
+  /* edwind renamed FROM to TO (real paths, buffers.rename): the old ids leave the index at once, the moved buffers
+     are parsed from their text, and what else arrived under notesDir is read by checkFile or, for a directory, by
+     the sweep. */
+  renamed(from, to) {
+    const rel = p => (under(p, this.realRoot) && p !== this.realRoot ? p.slice(this.realRoot.length + 1) : null);
+    const a = rel(from);
+    let dropped = false;
+    if (a !== null) for (const id of [...this.files.keys()]) if (id === a || id.startsWith(a + '/')) { this.files.delete(id); dropped = true; }
+    if (dropped) this.changed();
+    for (const sb of this.server.buffers.all()) if (sb.file && under(sb.file, to) && this.noteIdOf(sb)) this.indexBufferNow(sb);
+    const b = rel(to);
+    if (b === null) return;
+    let st;
+    try { st = fs.statSync(to); } catch (e) { return; }
+    if (st.isDirectory()) this.scheduleSweep(0);
+    else if (!this.bufferFor(b) && this.indexable(b)) this.checkFile(b);
   }
   scheduleSweep(ms) { if (this.sweepSoon) return; this.sweepSoon = setTimeout(() => { this.sweepSoon = null; this.sweep().catch(e => this.log.warn('notes', { sweep: e.message })); }, ms); this.sweepSoon.unref(); }
   /* Scan the tree in the worker and parse what differs from the index (FULL: everything). */
@@ -412,6 +431,7 @@ export class Notes {
     }).catch(e => this.log.error('notes', { start: 'failed', error: e.message }));
     server.buffers.on('afterBatch', sb => this.scheduleBuffer(sb));
     server.buffers.on('saved', sb => { const id = this.noteIdOf(sb); if (id) this.refreshStat(id, sb); });
+    server.buffers.on('renamed', (from, to) => this.renamed(from, to));
     server.buffers.on('killed', sb => { const id = this.noteIdOf(sb); if (!id) return; const t = this.bufferTimers.get(sb); if (t) { clearTimeout(t); this.bufferTimers.delete(sb); } this.checkFile(id); });
     this.startWatch();
     server.statusProviders.push(() => ({ notesExists: this.exists(), notesGen: this.gen }));

@@ -533,6 +533,7 @@ function onMoved(msg) {
   b.sync.acked = new Set();
   Ed.message(`${b.name}: the file moved to ${msg.to}`);
   sendOpen(b, { snap: true });
+  sync.emit('moved', { buf: msg.buf, to: msg.to });   // the page that names the buffer by id follows (app.js)
 }
 function onKilled(msg) {
   const b = bufOf(msg); if (!b) return;

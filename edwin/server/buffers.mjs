@@ -1,13 +1,13 @@
 // Server buffers (spec §6.1–§6.2, §6.5, §8): the registry of shared buffers by id and jid, their load from
-// files and journals, snapshots to clients, saves, reverts, disk changes, kills, the index and the
+// files and journals, snapshots to clients, saves, reverts, renames, disk changes, kills, the index and the
 // server side of undo. Every text change goes through the sequencer, so Edwin's markers and hooks
 // follow it and every batch is journaled before anyone is told.
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { ProtoError, CHUNK } from './proto.mjs';
-import { PathError } from './paths.mjs';
-import { readText, saveAtomic, writeAtomic, sha256, diskState, FileError, BIG } from './files.mjs';
+import { PathError, expandHome, under } from './paths.mjs';
+import { readText, saveAtomic, writeAtomic, fsyncDir, sha256, diskState, FileError, BIG } from './files.mjs';
 import { Journal, readJournal, header as journalHeader, Index, randomId, jidPath } from './journal.mjs';
 import { Sequencer } from './sequencer.mjs';
 import { Watcher, diffOps, merge3 } from './watch.mjs';
@@ -22,6 +22,11 @@ export const MOVED_TTL_MS = 24 * 3600 * 1000;
 export const UNLOAD_AFTER_MS = 7 * 24 * 3600 * 1000;
 const DISK_BY = { kind: 'disk' };
 const SERVER_BY = { kind: 'server' };
+/* The refusal of a destination in, on or above a refused path: the words of wb-web's POST /api/mv (fsapi.rs), which
+   forwards its moves here. */
+export const REFUSED_DST = 'refused: the destination is in or above ~/.ssh or a systemd user-unit directory';
+/* An fs error as the message of a refusal: its code and text, without the paths Node appends. */
+const osMessage = e => (e && e.code ? String(e.message).replace(/, \w+ '.*$/, '') : String(e && e.message || e));
 
 /* One shared buffer as edwind keeps it (§6.2). */
 export class SBuf {
@@ -67,11 +72,14 @@ export class Buffers {
     this.index = new Index(path.join(stateDir, 'index.json'));
     this.seq = new Sequencer(Ed, log);
     this.watcher = new Watcher(this, log);
-    this.moved = new Map(); // old id → {to, at}
+    /* Renames (R6.1, §7 moved): old id → {to, at, dir}, kept 24 h in index.json; a directory's record covers the
+       ids under it. */
+    this.moved = this.index.moved;
+    this.pruneMoved();
     this.compacting = new Set();
     this.hooks = { killed: null, afterBatch: null };
     /* Listeners of the E2 modules: on('afterBatch', (sb, entry) => …), on('killed', sb => …),
-       on('created', sb => …), on('saved', sb => …). */
+       on('created', sb => …), on('saved', sb => …), on('renamed', (fromReal, toReal) => …). */
     this.listeners = new Map();
     /* Edwin's own kill-buffer must reach us: wrap it so a Scheme (kill-buffer) kills everywhere (R6.3). */
     const L = globalThis.L;
@@ -88,6 +96,9 @@ export class Buffers {
     L.set('kill-buffer', wrapped);
   }
   all() { return [...this.byJid.values()]; }
+  /* The loaded buffer ID names, or the one it was renamed to (an edit, sel or close sent before the client
+     learnt of the move). */
+  live(id) { const sb = this.byId.get(id); if (sb) return sb; const to = this.movedTo(id); return to ? this.byId.get(to) || null : null; }
   byFile(real) { for (const sb of this.byJid.values()) if (sb.file === real) return sb; return null; }
   ofEd(ed) { for (const sb of this.byJid.values()) if (sb.ed === ed) return sb; return null; }
   autosaves(sb) { return !!sb.file && !sb.special && !sb.big && sb.file.startsWith(this.auth.realNotesDir() + '/'); }
@@ -104,7 +115,9 @@ export class Buffers {
     if (!fs.existsSync(jfile)) { this.index.delete(e.jid); return; }
     /* Unload stale saved buffers: a header-only journal and no open for 7 days (R8.6). */
     const { header, batches, mv, anchors, torn } = readJournal(jfile);
-    const id = mv.length ? mv[mv.length - 1].id : header.id;
+    /* The newest mv line names the current id, file and name (R8.1); compaction folds them into the header. */
+    const last = mv.length ? mv[mv.length - 1] : null;
+    const id = last ? last.id : header.id;
     let base = null, baseWhy = '';
     const saved = jidPath(this.stateDir, e.jid, '.saved'), snap = jidPath(this.stateDir, e.jid, '.snap');
     for (const f of [snap, saved]) {
@@ -113,13 +126,13 @@ export class Buffers {
       if (sha256(t) === header.base.sha256) { base = t; break; }
       baseWhy = `${path.basename(f)} does not match the journal base`;
     }
-    let file = header.file, eol = 'lf', disk = null, savedText = null;
+    let file = last && last.file !== undefined ? last.file : header.file, eol = 'lf', disk = null, savedText = null;
     if (file) {
       try { const r = readText(file); eol = r.eol; disk = diskState(r.stat); savedText = r.text; if (base === null && sha256(r.text) === header.base.sha256) base = r.text; }
       catch (err) { if (err.code !== 'no_buffer') baseWhy = `${file}: ${err.message}`; }
     }
     if (base === null && header.base.ver === 0 && !batches.length && header.base.sha256 === sha256('')) base = '';
-    const sb = this.create({ id, jid: e.jid, name: header.name, file, text: base ?? '', eol });
+    const sb = this.create({ id, jid: e.jid, name: (last && last.name) || header.name, file, text: base ?? '', eol });
     sb.disk = disk;
     if (fs.existsSync(saved)) { const t = fs.readFileSync(saved, 'utf8'); sb.savedText = t; sb.savedHash = sha256(t); }
     else if (savedText !== null) { sb.savedText = savedText; sb.savedHash = sha256(savedText); }
@@ -162,6 +175,7 @@ export class Buffers {
     }
     const sb = new SBuf(this, { id, jid, name: ed.name, file, ed });
     sb.eol = eol; sb.special = special;
+    if (this.moved.delete(id)) this.index.schedule();
     sb.savedText = text; sb.savedHash = sha256(text);
     this.byId.set(id, sb); this.byJid.set(jid, sb);
     this.emit('created', sb);
@@ -181,8 +195,9 @@ export class Buffers {
   resolve(id, create) {
     const existing = this.byId.get(id);
     if (existing) return existing;
-    const mv = this.moved.get(id);
-    if (mv && Date.now() - mv.at < MOVED_TTL_MS) return { moved: mv.to };
+    /* A renamed file's old id names where it went, unless a file is at the old path again. */
+    const to = this.movedTo(id);
+    if (to && !this.fileExists(id)) return { moved: to };
     /* A new note under a directory that does not exist yet (R6.1 relative ids only): the directories are made
        inside notesDir with the walk notes-append uses; elsewhere a missing directory stays no_buffer. */
     if (create && typeof id === 'string' && id.includes('/') && !/^(\/|~|name:)/.test(id) && !id.includes('\0') && !id.split('/').some(s => s === '' || s === '.' || s === '..'))
@@ -260,7 +275,7 @@ export class Buffers {
   detachAll(client) { for (const sb of client.buffers) sb.clients.delete(client); client.buffers.clear(); }
   /* A loaded buffer by id, else no_buffer. */
   get(id) {
-    const sb = this.byId.get(id);
+    const sb = this.live(id);
     if (!sb) {
       /* An id in another spelling of the same file. */
       try { const p = this.auth.parseId(id); if (p.kind === 'file') { const b = this.byFile(p.real); if (b) return b; } } catch (e) { throw new ProtoError(e.code || 'bad_id', e.message); }
@@ -335,6 +350,122 @@ export class Buffers {
       this.log.info('disk', { buf: sb.id, change: 'merged', ver: sb.ver });
     }).catch(e => this.log.error('disk', { buf: sb.id, error: e.message }));
   }
+
+  /* ---------- the board's file opener ---------- */
+  /* The id a frame would open the file ID (any id form of R6.1) under, and whether edwind would edit it, without
+     loading it: {buf, readOnly}, readOnly false or the reason a frame would show. Throws ProtoError as open does
+     (bad_id, refused_path, no_buffer, not_text), so the board keeps the list of what edwind refuses here. */
+  visitInfo(id) {
+    const live = this.live(id);
+    if (live) return { buf: live.id, readOnly: live.readOnly || false };
+    let p;
+    try { p = this.auth.parseId(id); } catch (e) { if (e instanceof PathError) throw new ProtoError(e.code, e.message); throw e; }
+    if (p.kind === 'name') throw new ProtoError('bad_request', `${id} names no file`);
+    const loaded = this.byFile(p.real);
+    if (loaded) return { buf: loaded.id, readOnly: loaded.readOnly || false };
+    try { this.auth.checkRead(p.real); } catch (e) { throw new ProtoError('refused_path', e.message); }
+    let st;
+    try { st = fs.statSync(p.real); } catch (e) { throw new ProtoError('no_buffer', `no file ${p.real}`); }
+    if (!st.isFile()) throw new ProtoError('not_text', `${p.real}: not a regular file`);
+    const buf = this.auth.idOf(p.real);
+    try { this.auth.checkWrite(p.real); } catch (e) { return { buf, readOnly: 'outside the writable paths' }; }
+    if (st.size > BIG) return { buf, readOnly: `file larger than ${BIG >> 20} MiB: read-only` };
+    try { readText(p.real); } catch (e) { if (e instanceof FileError) throw new ProtoError(e.code, e.message); throw e; }
+    return { buf, readOnly: false };
+  }
+
+  /* ---------- rename (R4.49, R6.1, R8.1, R8.8, §7 moved) ---------- */
+  /* Rename the file or directory SRC to DST, or into DST when that is an existing directory, never replacing
+     anything: the rule of wb-web's POST /api/mv, which forwards here when edwind is configured. Paths are absolute,
+     ~/… or notesDir-relative. Both ends pass the file authority (R14.8; a source above a refused path moves it too,
+     so it is refused), and edwind's own directories and everything above them stay where they are. Loaded buffers
+     visiting the file, or files under the directory, keep their SBuf, jid and history and take the new id: an mv
+     journal line each, a moved record kept 24 h, and moved{buf, to} to every attached client, who stays attached.
+     Returns {ok, src, dst, from, to, dir?}: the expanded paths and the ids of both ends, so a caller holding ids of
+     buffers that are not loaded can follow too. Throws ProtoError. */
+  async rename(src, dst) {
+    const auth = this.auth;
+    const lexical = p => {
+      if (typeof p !== 'string' || !p || p.includes('\0')) throw new ProtoError('bad_request', 'src and dst must be non-empty paths');
+      if (p === '~' || p.startsWith('~/') || p.startsWith('/')) return path.resolve(expandHome(p));
+      if (p.startsWith('name:') || p.split('/').some(x => x === '' || x === '.' || x === '..')) throw new ProtoError('bad_request', `bad path ${JSON.stringify(p)}`);
+      return path.join(auth.notesDir, p);
+    };
+    /* The parent resolved by the kernel and the last component left alone: what a rename moves (a symlink itself). */
+    const real = p => { try { return path.join(fs.realpathSync.native(path.dirname(p)), path.basename(p)); } catch (e) { throw new ProtoError('bad_request', osMessage(e)); } };
+    const srcAbs = lexical(src);
+    let dstAbs = lexical(dst);
+    if (srcAbs === '/') throw new ProtoError('bad_request', 'cannot move /');
+    try { if (fs.statSync(dstAbs).isDirectory()) dstAbs = path.join(dstAbs, path.basename(srcAbs)); } catch (e) { /* a new name */ }
+    if (auth.refused(dstAbs)) throw new ProtoError('refused_path', REFUSED_DST);
+    const dstReal = real(dstAbs);
+    if (auth.refused(dstReal)) throw new ProtoError('refused_path', REFUSED_DST);
+    const srcReal = real(srcAbs);
+    let st;
+    try { st = fs.lstatSync(srcReal); } catch (e) { throw new ProtoError('bad_request', osMessage(e)); }
+    try { auth.checkWrite(srcReal); auth.checkWrite(dstReal); } catch (e) { throw new ProtoError('refused_path', e.message); }
+    for (const root of [auth.notesDir, auth.stateDir, auth.configDir]) {
+      let r = root; try { r = fs.realpathSync.native(root); } catch (e) { /* not made yet */ }
+      if (under(r, srcReal)) throw new ProtoError('refused_path', `${srcReal}: holds edwind's directory ${root}`);
+    }
+    const dir = st.isDirectory();
+    if (this.all().some(sb => sb.file && under(sb.file, dstReal))) throw new ProtoError('bad_request', 'destination exists');
+    /* Node has no renameat2: the destination is claimed first (an exclusive create, or mkdir), so a name that
+       appears meanwhile is never replaced, and the rename then replaces only the claim. */
+    try { if (dir) fs.mkdirSync(dstReal, 0o700); else fs.closeSync(fs.openSync(dstReal, 'wx', 0o600)); }
+    catch (e) { throw new ProtoError('bad_request', e.code === 'EEXIST' ? 'destination exists' : osMessage(e)); }
+    try { fs.renameSync(srcReal, dstReal); }
+    catch (e) { try { if (dir) fs.rmdirSync(dstReal); else fs.unlinkSync(dstReal); } catch (x) { /* gone */ } throw new ProtoError('bad_request', osMessage(e)); }
+    fsyncDir(path.dirname(dstReal));
+    if (path.dirname(srcReal) !== path.dirname(dstReal)) fsyncDir(path.dirname(srcReal));
+    /* From here to the first await the buffers follow, so the watcher never sees their files missing (R8.15). */
+    const from = auth.idOf(srcReal), to = auth.idOf(dstReal), at = Date.now();
+    const moved = [];
+    for (const sb of this.all()) {
+      if (!sb.file || !under(sb.file, srcReal)) continue;
+      const was = { id: sb.id, file: sb.file };
+      const file = dstReal + sb.file.slice(srcReal.length), id = auth.idOf(file), name = path.basename(file);
+      this.byId.delete(sb.id); sb.id = id; sb.file = file; sb.ed.file = file; this.byId.set(id, sb);
+      if (sb.ed.name !== name) sb.ed.name = this.Ed.getBuffer(name) ? globalThis.L.call('generate-new-buffer-name', [name]) : name;
+      sb.name = sb.ed.name;
+      try { sb.disk = diskState(fs.statSync(file)); } catch (e) { /* not on disk yet */ }
+      this.watcher.moved(sb, was.file);
+      this.addMoved(was.id, id, at, false);
+      this.index.set(sb.indexEntry());
+      moved.push({ sb, was });
+    }
+    if (!st.isSymbolicLink()) this.addMoved(from, to, at, dir);
+    for (const { sb, was } of moved) for (const c of sb.clients) c.send({ t: 'moved', buf: was.id, to: sb.id });
+    this.emit('renamed', srcReal, dstReal);
+    this.log.info('rename', { src: srcReal, dst: dstReal, buffers: moved.length });
+    await Promise.all(moved.map(({ sb }) => sb.journal && sb.journal.append({ t: 'mv', id: sb.id, file: sb.file, name: sb.name, at })
+      .catch(e => this.log.error('rename', { buf: sb.id, journal: e.code || e.message }))));
+    return { ok: true, src: srcAbs, dst: dstAbs, from, to, ...(dir ? { dir: true } : {}) };
+  }
+  addMoved(from, to, at, dir) {
+    if (from === to) return;
+    this.moved.delete(to);   // a record from the new id would send its opens away from the file now there
+    this.moved.set(from, { to, at, dir });
+    this.pruneMoved();
+    this.index.schedule();
+  }
+  pruneMoved() { const now = Date.now(); for (const [k, m] of this.moved) if (now - m.at >= MOVED_TTL_MS) this.moved.delete(k); }
+  /* Where ID went, following moved records younger than 24 h; null when it did not move. */
+  movedTo(id) {
+    if (typeof id !== 'string' || !this.moved.size) return null;
+    const now = Date.now(), seen = new Set([id]);
+    let cur = id;
+    for (;;) {
+      let next = null;
+      const m = this.moved.get(cur);
+      if (m && now - m.at < MOVED_TTL_MS) next = m.to;
+      else for (const [from, d] of this.moved) if (d.dir && now - d.at < MOVED_TTL_MS && cur.startsWith(from + '/')) { next = d.to + cur.slice(from.length); break; }
+      if (next === null || seen.has(next)) break;
+      seen.add(next); cur = next;
+    }
+    return cur === id ? null : cur;
+  }
+  fileExists(id) { try { const p = this.auth.parseId(id); return p.kind === 'file' && p.exists; } catch (e) { return false; } }
 
   /* ---------- journal compaction (R8.5) ---------- */
   async compact(sb) {

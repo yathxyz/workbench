@@ -261,7 +261,10 @@ in
                               (".config", "rw"), (".local", "rw"), (".local/share", "rw")]:
                   opts = wb.succeed(f"awk '$5 == \"{HOME}/{d}\" {{print $6}}' /proc/{main_pid(unit)}/mountinfo").strip()
                   assert opts.split(",")[0] == want, f"{unit}: ~/{d} mount options {opts!r}"
-          # T-S16 in the VM: /api/mv into ~/.ssh is refused, and the source stays put.
+          # T-S16 in the VM: /api/mv into ~/.ssh is refused, and the source stays put. With edit.enable the move is
+          # edwind's rename-file (wb-web answers 503 until it reaches edit.sock), so wait for both first.
+          wb.wait_for_unit("workbench-edit.service")
+          proxy.wait_until_succeeds("curl -sf http://wb.test/api/info | grep -q '\"editUp\":true'", timeout=60)
           wb.succeed("runuser -u alice -- sh -c 'echo key > ~/mv-key'")
           r = wbctl(f"api-mv {HOME}/mv-key {HOME}/.ssh/authorized_keys")
           assert r["status"] == 400, r

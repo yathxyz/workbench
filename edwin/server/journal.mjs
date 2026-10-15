@@ -118,13 +118,16 @@ export function readJournal(file) {
 export const header = ({ jid, id, name, file, mode, baseVer, baseText }) => ({ t: 'hdr', format: FORMAT, jid, id, name, file, mode, base: { ver: baseVer, sha256: sha256(baseText) } });
 
 /* ---------- the index (R8.1) ---------- */
+/* The buffers by jid, and the moved records of renames (R6.1, §7: old id → {to, at, dir}). The moved records live
+   here rather than in the journals so they outlive a kill of the buffer and a restart; the caller prunes them. */
 export class Index {
-  constructor(file) { this.file = file; this.buffers = new Map(); this.timer = null; this.load(); }
+  constructor(file) { this.file = file; this.buffers = new Map(); this.moved = new Map(); this.timer = null; this.load(); }
   load() {
     try {
       const o = JSON.parse(fs.readFileSync(this.file, 'utf8'));
       if (o.format !== undefined && o.format > FORMAT) throw new Error(`index format ${o.format} is newer than this edwind (${FORMAT})`);
       for (const b of o.buffers || []) this.buffers.set(b.jid, b);
+      for (const m of o.moved || []) if (m && typeof m.from === 'string' && typeof m.to === 'string' && Number.isFinite(m.at)) this.moved.set(m.from, { to: m.to, at: m.at, dir: !!m.dir });
     } catch (e) { if (e.code !== 'ENOENT') throw e; }
   }
   set(entry) { this.buffers.set(entry.jid, entry); this.schedule(); }
@@ -132,7 +135,8 @@ export class Index {
   schedule() { if (!this.timer) this.timer = setTimeout(() => this.write(), 50); }
   write() {
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
-    writeAtomic(this.file, JSON.stringify({ format: FORMAT, buffers: [...this.buffers.values()] }, null, 1) + '\n');
+    const moved = [...this.moved].map(([from, m]) => ({ from, to: m.to, at: m.at, ...(m.dir ? { dir: true } : {}) }));
+    writeAtomic(this.file, JSON.stringify({ format: FORMAT, buffers: [...this.buffers.values()], ...(moved.length ? { moved } : {}) }, null, 1) + '\n');
   }
 }
 

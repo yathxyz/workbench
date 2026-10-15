@@ -246,8 +246,9 @@ function conflictBar() {
   ]);
 }
 // A frames-mode page caches its first lines on the node (snap, F-A27). It is derived from the page's file, so a tab whose
-// only change is a snap is clean for another tab's board: it takes that board instead of showing the conflict bar.
-const noSnap = j => JSON.stringify(JSON.parse(j || '{}'), (k, v) => (k === 'snap' ? undefined : v));
+// only change is a snap is clean for another tab's board: it takes that board instead of showing the conflict bar. A
+// page's buf that only followed a rename edwind made (frMoved) counts the same way: ids compare as they are now.
+const noSnap = j => JSON.stringify(JSON.parse(j || '{}'), (k, v) => (k === 'snap' ? undefined : k === 'buf' ? frBufNow(v) : v));
 const snapOnly = (json = serialize()) => FR.on && !SAVE.paused && SAVE.lastJson != null && noSnap(json) === noSnap(SAVE.lastJson);
 // /rpc board{etag}: another tab or device saved (F-A7).
 async function boardChanged(etag) {
@@ -2167,7 +2168,7 @@ function mountNode(n) {
     B('Aa', 'Turn the ink on this card into a page (needs a model that reads images)', () => sketchToPage(n));
     B('⌫', 'Clear the ink on this card', () => sketchClear(n));
   } else if (n.kind === 'ghost') {
-    B('↗', n.alias ? 'Jump to the real node' : n.tmuxTarget ? 'Adopt: a card attached to this tmux session' : n.dir ? 'Open: this directory becomes a folder' : 'Open: make it real (Emacs on the file; a page in demo mode)', () => ghostOpen(n));
+    B('↗', n.alias ? 'Jump to the real node' : n.tmuxTarget ? 'Adopt: a card attached to this tmux session' : n.dir ? 'Open: this directory becomes a folder' : 'Open: make it real (a page on the file when edwind edits it, else Emacs; a page in demo mode)', () => ghostOpen(n));
   }
   B('✕', 'Delete (click twice)', b => confirmDel(b, () => removeNode(n.id)));
   place(n); updateTitle(n);
@@ -5699,7 +5700,7 @@ function seedInk() {
 // viewport plus one viewport of margin at zoom >= LOD_Z (or focused), at most FR_CAP per tab (least recently drawn
 // unfocused first); otherwise the card shows the 12-line snapshot from the replica text (Q8). A replica off screen for
 // FR_CLOSE_MS is closed. Pages without buf are migrated to notes/<slug>.md through the replica (R8.17, Q3).
-const FR = { on: false, ready: false, online: false, Ed: null, L: null, booting: null, failed: null, byFrame: new WeakMap(), lastSeen: new Map(), offAt: new Map(), pending: new Map(), claimed: new Set(), anchorCache: {}, localAnchors: {}, perf: [], waiters: [], snapT: new Map(), snapMine: new Set() };
+const FR = { on: false, ready: false, online: false, Ed: null, L: null, booting: null, failed: null, byFrame: new WeakMap(), lastSeen: new Map(), offAt: new Map(), pending: new Map(), claimed: new Set(), anchorCache: {}, localAnchors: {}, perf: [], waiters: [], snapT: new Map(), snapMine: new Set(), moved: new Map() };
 const FR_CAP = 24, FR_FONT = 13, FR_CLOSE_MS = 5 * 60 * 1000, FR_OFF_TEXT = 'Editing is off: workbench-edit is not running';
 // The runtime files in the order of edwin/index.html (host-browser first; markdown after org; ot and sync last).
 const FR_FILES = ['host-browser', 'scheme', 'runtime', 'text', 'editor-core', 'editor-prims', 'evil-core', 'pool', 'complete', 'extras', 'stack', 'ai', 'evil-ex', 'org', 'markdown', 'ot', 'sync'];
@@ -5730,6 +5731,7 @@ function frBoot() {
     Ed.sync.on('state', frStateChanged);
     Ed.sync.on('epoch', frEpoch);
     Ed.sync.on('display', frDisplay);
+    Ed.sync.on('moved', ({ buf, to }) => frMoved(buf, to, false));
     let pending = null; try { pending = JSON.parse(frSession.get('wb-edit-pending') || 'null'); } catch {} frSession.del('wb-edit-pending');
     const booted = Ed.bootServed({ sources, transport: frTransport, device: deviceId(), cid: frSession.get('wb-edit-cid') || undefined, pending: Array.isArray(pending) && pending.length ? pending : undefined });
     frSession.set('wb-edit-cid', Ed.sync.cid);
@@ -6045,6 +6047,44 @@ async function frOpenToday() {
   const p = addNode({ kind: 'buffer', name: TODAY, ...pos, w: 420, h: 300, buf: id });
   toast(`Created page ${TODAY}`);
   jumpNode(p, 1, () => focusEnd(p));
+}
+// ---- notes and files open as pages (noteOpen, ghostOpen). This reverses the spec's NG5/D6, where the Emacs card stayed
+// the opener of notes and files: edwind's visit-id names the id it would visit FILE under, or refuses it (the refusal
+// list, not UTF-8 text, missing) or answers read-only (outside its writable paths, over 32 MiB). Then, and while edwind is
+// down, EMACS() opens the file in an Emacs card as before. LINE > 1 puts the frame's point at the start of that line.
+async function frFileOpen(file, props, line, emacs) {
+  if (!FR.online && !FR.failed) await Promise.race([frWhenReady(), new Promise(r => setTimeout(r, 3000))]);
+  const r = FR.online ? await FR.Ed.sync.call({ cmd: 'visit-id', args: [file], ctx: {} }) : null;
+  const id = r && !r.error && r.value && !r.value.readOnly ? r.value.buf : null;
+  if (!id) return emacs();
+  const n = nodeList().find(m => m.kind === 'buffer' && m.buf === id) || addNode({ kind: 'buffer', name: clean(id.replace(/^.*\//, '').replace(/\.(md|org)$/, '')), w: 420, h: 300, ...props, buf: id });
+  const at = line > 1 ? (f, b) => { const d = new TextDoc(b.text); f.setPoint(d.line(Math.min(line, d.lines)).from); } : undefined;
+  jumpNode(n, 1, () => frFocus(n, at));
+  return n;
+}
+// ---- renames through edwind (rename-file, spec R6.1): moved{buf, to} on /edit, or POST /api/mv's answer {from, to, dir}.
+// Pages naming the old id, or an id under an old directory, take the new one and the board is saved with it; the
+// replicas follow on their own (sync.js). The records stay for noSnap(), so a tab whose only change is following a move
+// takes another tab's board that already follows it instead of raising the conflict bar.
+function frMoved(from, to, dir) {
+  if (typeof from !== 'string' || typeof to !== 'string' || from === to) return;
+  FR.moved.delete(to); FR.moved.set(from, { to, dir });
+  const map = id => (id === from ? to : dir && typeof id === 'string' && id.startsWith(from + '/') ? to + id.slice(from.length) : id);
+  let changed = false;
+  for (const n of nodeList()) if (n.kind === 'buffer' && n.buf && map(n.buf) !== n.buf) { n.buf = map(n.buf); changed = true; }
+  for (const a of Object.values(FR.localAnchors)) a.buf = map(a.buf);
+  if (changed) dirty();
+}
+// ID as it is now, after the renames this tab heard of.
+function frBufNow(id) {
+  if (typeof id !== 'string' || !FR.moved.size) return id;
+  const seen = new Set([id]);
+  for (;;) {
+    let next = null; const m = FR.moved.get(id);
+    if (m) next = m.to; else for (const [from, d] of FR.moved) if (d.dir && id.startsWith(from + '/')) { next = d.to + id.slice(from.length); break; }
+    if (next === null || seen.has(next)) return id;
+    seen.add(next); id = next;
+  }
 }
 // ---- the Editor view (Alt-4) in frames mode: a second frame on the same buffer (R9.14), no CodeMirror mirror
 function frEdLoad(n, pos) {
@@ -7844,6 +7884,12 @@ function fsIdent(n) {
     if (!d) return null; return { host, dir: fsTilde(fsNorm(d), host) };
   }
   if (n.kind === 'artifact' && n.file) { const f = fsTilde(fsNorm(n.file, '~'), ''); return { host: '', dir: fsDirname(f), path: f }; }
+  // A frames-mode page is its file on this host: buf is an id of edwind's (R6.1), notesDir-relative, ~/… or absolute.
+  if (n.kind === 'buffer' && FR.on && n.buf && !n.buf.startsWith('name:')) {
+    const abs = /^[/~]/.test(n.buf); if (!abs && !INFO?.notes) return null;
+    const f = fsTilde(abs ? n.buf : INFO.notes.replace(/\/$/, '') + '/' + n.buf, '');
+    return { host: '', dir: fsDirname(f), path: f };
+  }
   return null;
 }
 const fsFrame = (host, dir) => frameList().find(f => f.derived === 'fs' && (f.fsHost || '') === host && f.fsPath === dir);
@@ -7859,7 +7905,7 @@ function fsFrameFor(host, dir, near) {
 function mountGhost(n, L) {
   L.body.classList.add('ghost-body');
   if (n.journalDay && !n.noteId) { L.body.textContent = '▦ ' + n.name; L.body.title = 'No entry for ' + n.journalDay + ' yet. Double-click or ↗ creates it.'; L.body.ondblclick = ev => { ev.stopPropagation(); ghostOpen(n); }; return; }
-  if (n.noteId && !n.alias) { L.body.textContent = '¶ ' + n.name + (n.meta ? '  ' + n.meta : ''); L.body.title = 'A note in the index, not on the board. Double-click or ↗ opens it' + (DAEMON ? ' in Emacs.' : '.'); L.body.ondblclick = ev => { ev.stopPropagation(); ghostOpen(n); }; return; }
+  if (n.noteId && !n.alias) { L.body.textContent = '¶ ' + n.name + (n.meta ? '  ' + n.meta : ''); L.body.title = 'A note in the index, not on the board. Double-click or ↗ opens it' + (DAEMON ? (FR.on ? ' as a page.' : ' in Emacs.') : '.'); L.body.ondblclick = ev => { ev.stopPropagation(); ghostOpen(n); }; return; }
   if (n.linkTitle && !n.alias) { L.body.textContent = '[[' + n.name + ']]  ' + (n.meta || 'no page yet'); L.body.title = 'Linked, but no page or note has this title. Double-click or ↗ creates the page.'; L.body.ondblclick = ev => { ev.stopPropagation(); ghostOpen(n); }; return; }
   if (n.alias) { const r = S.nodes[n.alias]; L.body.textContent = '≡ ' + (r?.name || n.name) + '  (' + (n.meta || 'also here') + ')'; L.body.title = 'A copy: the real node sits under its first tag. Double-click or ↗ jumps to it.'; L.body.ondblclick = ev => { ev.stopPropagation(); ghostOpen(n); }; return; }
   if (n.tmuxTarget) { L.body.textContent = '⌗ ' + n.name + (n.meta ? '  ' + n.meta : ''); L.body.title = 'tmux session ' + n.tmuxTarget + ' with no card yet. Double-click or ↗ adopts it.'; L.body.ondblclick = ev => { ev.stopPropagation(); ghostOpen(n); }; return; }
@@ -7900,11 +7946,13 @@ function ghostOpen(n) {
   if (n.tmuxTarget) { const f = n.in && S.nodes[n.in]; const real = tmuxAdopt(n.tmuxTarget, n.host ? hostByUrl(n.host) : null, { in: f ? f.id : undefined, x: n.x, y: n.y }); if (real) { removeGhost(n); if (f) { renumber(f); relayout(f, true); } restack(); renderTree(); dirty(); } return real; }
   const f = n.in && S.nodes[n.in], host = n.host || '', target = n.link ? fsNorm(n.link, fsDirname(n.path)) : n.path;
   if (n.dir) { const d = fsFrameFor(host, n.link ? target : n.path, n); if (n.mount) { d.mount = true; placeFrame(d); } removeGhost(n); if (f) relayout(f, true); restack(); renderTree(); renderLinks(); dirty(); fsExpand(d); activate(d.id); return d; }
-  let real;
-  if (!DAEMON) { const file = fsGet(target.replace(/^~/, '/home/me')); real = addNode({ kind: 'buffer', name: n.name, text: file?.t === 'f' ? file.d : '# ' + n.name + '\n', in: f ? f.id : undefined, x: n.x, y: n.y, w: 460, h: 320 }); }
-  else { real = addNode({ kind: 'term', backend: 'pty', cmd: emacsCmd(target), emacs: target, name: n.name, in: f ? f.id : undefined, x: n.x, y: n.y, w: 640, h: 440, env: { TERM: 'xterm-256color', COLORTERM: 'truecolor' } }); live[real.id]?.el.classList.add('emacs'); }
-  removeGhost(n); if (f) { renumber(f); relayout(f, true); } restack(); renderTree(); perspEdgesRebuild(); renderLinks(); dirty();
-  return real;
+  const place = { in: f ? f.id : undefined, x: n.x, y: n.y };
+  const done = real => { if (!real) return null; removeGhost(n); if (f) { renumber(f); relayout(f, true); } restack(); renderTree(); perspEdgesRebuild(); renderLinks(); dirty(); return real; };
+  if (!DAEMON) { const file = fsGet(target.replace(/^~/, '/home/me')); return done(addNode({ kind: 'buffer', name: n.name, text: file?.t === 'f' ? file.d : '# ' + n.name + '\n', ...place, w: 460, h: 320 })); }
+  const emacs = () => { const real = addNode({ kind: 'term', backend: 'pty', cmd: emacsCmd(target), emacs: target, name: n.name, ...place, w: 640, h: 440, env: { TERM: 'xterm-256color', COLORTERM: 'truecolor' } }); live[real.id]?.el.classList.add('emacs'); return real; };
+  // A file on this host opens as a page when edwind edits it (frFileOpen); the /edit socket reaches this host's edwind only.
+  if (FR.on && !host) return frFileOpen(target, { ...place, w: 460, h: 320 }, 0, emacs).then(done);
+  return done(emacs());
 }
 function perspEdgesRebuild() {
   PERSP.edges = []; if (perspCur() !== 'fs') return;
@@ -7929,12 +7977,20 @@ function fsDrop(n, t) {
   const newPath = dst.replace(/\/$/, '') + '/' + fsBase(i.path);
   ask(`Move ${i.path} into ${where}? Enter = yes, Esc = no`, 'yes', async v => {
     if (!/^y/i.test(v)) return;
-    if (DAEMON) { try { const r = await hFetch(hn, '/api/mv', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ src: i.path, dst: newPath }) }); const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.status); } catch (e) { toast('mv failed: ' + (e.message || e)); return; } }
+    if (DAEMON) { try { await fsMv(hn, i.path, newPath); } catch (e) { toast('mv failed: ' + (e.message || e)); return; } }
     else { const src = fsGet(i.path.replace(/^~/, '/home/me')), dd = fsGet(dst.replace(/^~/, '/home/me')), parent = fsGet(fsDirname(i.path).replace(/^~/, '/home/me')); if (!src || !dd || dd.t !== 'd' || !parent) return toast('mv failed in the demo filesystem.'); delete parent.c[fsBase(i.path)]; dd.c[fsBase(i.path)] = src; }
     if (n.kind === 'ghost') { n.path = newPath; const L = live[n.id]; if (L) mountGhost(n, L); } else if (n.emacs) n.emacs = newPath; else if (n.file) n.file = newPath;
     settle();
     toast(`Moved to ${newPath}${hn ? ' on @' + hn.name : ''}.${n.emacs ? ' Emacs still shows the old buffer; revert it there.' : ''}`);
   });
+}
+// POST /api/mv on host HN (null: this one). Through edwind the answer names the buffer ids of both ends: pages on the file,
+// or on files under the directory, follow it (frMoved).
+async function fsMv(hn, src, dst) {
+  const r = await hFetch(hn, '/api/mv', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ src, dst }) });
+  const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.status);
+  if (!hn && FR.on) frMoved(j.from, j.to, !!j.dir);
+  return j;
 }
 PERSP.onCwd = n => {
   if (perspCur() !== 'fs' || n.emacs) return;
@@ -8197,8 +8253,9 @@ function noteOpen(r) {
   if (r.board) { edOpen(r.board, r.line > 1 ? r.line : undefined); return r.board; }
   if (!DAEMON) { toast('That note is not on the board.'); return null; }
   const f = INFO?.notes ? INFO.notes.replace(/\/$/, '') + '/' + r.path : r.path;
-  const n = newEmacs(f); if (n && r.line > 1) n.cmd = n.cmd.replace(/emacsclient -t -a '' "\$f"/, `emacsclient -t -a '' +${r.line} "$f"`).replace(/emacs -nw "\$f"/, `emacs -nw +${r.line} "$f"`);
-  return n;
+  const emacs = () => { const n = newEmacs(f); if (n && r.line > 1) n.cmd = n.cmd.replace(/emacsclient -t -a '' "\$f"/, `emacsclient -t -a '' +${r.line} "$f"`).replace(/emacs -nw "\$f"/, `emacs -nw +${r.line} "$f"`); return n; };
+  if (FR.on) { const c = viewCenterWorld(); return frFileOpen(r.path, freeSpot(c.x - 210, c.y - 150, 420, 300), r.line, emacs); }   // a page when edwind edits it
+  return emacs();
 }
 // go to an address: board nodes on the canvas, everything else in the navigator
 function goAddr(addr, push = true) {
@@ -8587,7 +8644,7 @@ AGENT_TOOLS.push(
   { name: 'host_status', description: 'Health of a host: load, memory, disk, uptime, shells, tmux sessions, unit counts (failed names). host: a name from hosts.json (empty = the serving daemon).', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
     run: async ({ host } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j = await (await hFetch(h, '/api/status')).json(); const gb = b => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}` + (j.sessions?.tmux != null ? ', tmux sessions ' + j.sessions.tmux : ''), j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
-window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
+window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, frFileOpen, fsMv, noteOpen, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 Object.assign(window.__canvas, { keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
 Object.defineProperty(window.__canvas, 'activeId', { get: () => activeId });   // Object.assign would copy a getter's value once
 Object.assign(window.__canvas, { DESK, deskGo, deskSend, deskList, deskAt, deskPin, deskDelete, deskOff, deskPinned, serialize, activate, viewKey,

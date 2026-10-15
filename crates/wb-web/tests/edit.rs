@@ -727,3 +727,86 @@ async fn a_config_with_the_old_sample_key_refuses_to_start() {
     assert!(!status.success());
     assert!(stderr.contains("editSocket"), "{stderr}");
 }
+
+/// `POST /api/mv` with `editSocket` set is edwind's `rename-file` (edwind spec R4.49, R6.1):
+/// the paths go expanded, the value comes back as the body, refusals stay 400, and while
+/// edwind is down nothing moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mv_is_forwarded_to_edwind_as_rename_file() {
+    let hub = FakeHub::start();
+    let edit = FakeEdit::start();
+    let web = web_with_edit(&hub, &edit.path);
+    wait_edit(&web, true).await;
+    let scratch = tempfile::tempdir().unwrap();
+    let src = scratch.path().join("a.md");
+    std::fs::write(&src, "A").unwrap();
+    let src = src.to_str().unwrap().to_owned();
+    let root = scratch.path().to_str().unwrap();
+
+    let value = json!({"ok": true, "src": src, "dst": format!("{root}/b.md"),
+                       "from": "~/a.md", "to": "~/b.md"});
+    edit.answer("rename-file", json!({"value": value}));
+    let (status, body) = post(
+        &web,
+        "/api/mv",
+        json!({"src": src, "dst": format!("{root}/x/../b.md")}),
+    )
+    .await;
+    assert_eq!((status, &body), (200, &value));
+    // The `..` is resolved here, as for a direct move; the file is edwind's to move.
+    let args = edit.wait_call("rename-file").await;
+    assert_eq!(args, json!([{"src": src, "dst": format!("{root}/b.md")}]));
+    assert!(Path::new(&src).exists(), "wb-web moved nothing itself");
+    if let Some(home) = std::env::var_os("HOME").filter(|h| Path::new(h).is_absolute()) {
+        let (status, _) = post(&web, "/api/mv", json!({"src": "~/a.md", "dst": "~/b.md"})).await;
+        assert_eq!(status, 200);
+        let calls = edit
+            .wait_count(2, |m| m["t"] == "call" && m["cmd"] == "rename-file")
+            .await;
+        let home = Path::new(&home);
+        assert_eq!(
+            calls[1].1["args"][0]["src"],
+            home.join("a.md").to_str().unwrap()
+        );
+    }
+
+    // Refusals, as an error or a condition, are 400 with edwind's words.
+    let refused = "refused: the destination is in or above ~/.ssh or a systemd user-unit directory";
+    edit.answer(
+        "rename-file",
+        json!({"t": "error", "code": "refused_path", "msg": refused}),
+    );
+    let (status, body) = post(&web, "/api/mv", json!({"src": src, "dst": "/x"})).await;
+    assert_eq!((status, body), (400, json!({"error": refused})));
+    edit.answer(
+        "rename-file",
+        json!({"error": {"condition": "error", "report": "destination exists"}}),
+    );
+    let (status, body) = post(&web, "/api/mv", json!({"src": src, "dst": "/x"})).await;
+    assert_eq!(
+        (status, body),
+        (400, json!({"error": "destination exists"}))
+    );
+    // A path this route cannot expand never reaches edwind.
+    let (status, body) = post(&web, "/api/mv", json!({"src": "notes/a.md", "dst": "/x"})).await;
+    assert_eq!(
+        (status, body),
+        (
+            400,
+            json!({"error": "the path must be absolute or start with ~/"})
+        )
+    );
+
+    // edwind configured but down: 503 and the file stays where it is.
+    edit.stop();
+    wait_edit(&web, false).await;
+    let (status, body) = post(
+        &web,
+        "/api/mv",
+        json!({"src": src, "dst": format!("{root}/c.md")}),
+    )
+    .await;
+    assert_eq!((status, body), (503, json!({"error": NOT_RUNNING})));
+    assert!(Path::new(&src).exists());
+    assert!(!scratch.path().join("c.md").exists());
+}

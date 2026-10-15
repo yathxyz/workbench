@@ -279,6 +279,16 @@ export class Server {
       }
       case 'list-writers': { const sb = B.get(buf || args[0]); const seen = new Map(); for (const b of sb.hist) seen.set(JSON.stringify(b.by), b.by); return { value: [...seen.values()] }; }
       case 'kill-buffer': { const sb = B.get(typeof args[0] === 'string' ? args[0] : buf); B.kill(sb); return { value: true }; }
+      /* The board's file opener asks before it makes a page card (buffers.mjs visitInfo). */
+      case 'visit-id': {
+        if (typeof args[0] !== 'string') throw new ProtoError('bad_request', 'visit-id needs a path');
+        return { value: B.visitInfo(args[0]) };
+      }
+      /* rename-file (R4.49): [{src, dst}] as POST /api/mv sends it, or [src, dst]. */
+      case 'rename-file': {
+        const p = args[0] && typeof args[0] === 'object' ? args[0] : { src: args[0], dst: args[1] };
+        return { value: await B.rename(p.src, p.dst) };
+      }
       case 'status': return { value: this.status() };
       default: {
         const fn = this.commands.get(cmd);

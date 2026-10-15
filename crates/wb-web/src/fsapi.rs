@@ -8,6 +8,8 @@
 //! `mv` never moves anything into, onto or above `~/.ssh`, `~/.config/systemd` or
 //! `~/.local/share/systemd` (W-6, SEC-7). The web unit's read-only mounts are the real
 //! boundary; this refusal is the second layer, and it answers 400 instead of `EROFS`.
+//! With `editSocket` set the move is edwind's `rename-file` instead (edwind spec R4.49,
+//! R6.1): its file authority checks both ends (R14.8), and its buffers follow the file.
 
 use std::ffi::OsString;
 use std::fs::{self, DirEntry, File};
@@ -28,6 +30,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::edit_client::{EditError, EditHandle};
 use crate::http::{ApiError, Body};
 
 /// `cat` reads this many bytes unless the request says otherwise.
@@ -109,6 +112,9 @@ async fn mv(State(app): State<AppState>, Body(body): Body) -> Response {
                 .into_response();
         }
     };
+    if let Some(edit) = &app.edit {
+        return mv_through_edit(edit, &req).await;
+    }
     let refuse = app.cfg.refuse_paths.clone();
     run(move |home| {
         let home = home.ok_or("HOME is not set")?;
@@ -122,6 +128,37 @@ async fn mv(State(app): State<AppState>, Body(body): Body) -> Response {
     .await
 }
 
+/// The move as edwind's `rename-file`, with the paths expanded here as for a direct move.
+/// edwind refuses what its authority refuses (both ends inside its writable paths and out of
+/// the refusal list) and moves its buffers with the file. While edwind is down nothing moves:
+/// a rename behind its back would leave a buffer to be saved at the old path again. Refusals
+/// keep this route's 400; a stopped edwind is 503 and a silent one 504.
+async fn mv_through_edit(edit: &EditHandle, req: &MvRequest) -> Response {
+    let home = home_dir();
+    let path = |raw: &str| -> Result<String, String> {
+        let path = expand(raw, home.as_deref())?;
+        path.to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "the path is not UTF-8".to_owned())
+    };
+    let (src, dst) = match (path(&req.src), path(&req.dst)) {
+        (Ok(src), Ok(dst)) => (src, dst),
+        (Err(e), _) | (_, Err(e)) => {
+            return ApiError::new(StatusCode::BAD_REQUEST, e).into_response();
+        }
+    };
+    match edit
+        .call("rename-file", json!([{"src": src, "dst": dst}]))
+        .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(EditError::Refused { msg, .. } | EditError::Condition { report: msg, .. }) => {
+            ApiError::new(StatusCode::BAD_REQUEST, msg).into_response()
+        }
+        Err(e) => e.into_api().into_response(),
+    }
+}
+
 fn bad_query() -> Response {
     ApiError::new(StatusCode::BAD_REQUEST, "bad query").into_response()
 }
@@ -129,10 +166,7 @@ fn bad_query() -> Response {
 /// Runs `work` with `$HOME` on the blocking pool: 200 with its value or 400 with its
 /// message.
 async fn run(work: impl FnOnce(Option<&Path>) -> FsResult + Send + 'static) -> Response {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|h| h.is_absolute())
-        .map(|h| normalize(&h));
+    let home = home_dir();
     match tokio::task::spawn_blocking(move || work(home.as_deref())).await {
         Ok(Ok(value)) => Json(value).into_response(),
         Ok(Err(message)) => ApiError::new(StatusCode::BAD_REQUEST, message).into_response(),
@@ -141,6 +175,14 @@ async fn run(work: impl FnOnce(Option<&Path>) -> FsResult + Send + 'static) -> R
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         }
     }
+}
+
+/// `$HOME`, normalised, when it is absolute.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute())
+        .map(|h| normalize(&h))
 }
 
 /// `raw` as an absolute path without `.` or `..`; `~` and `~/…` start at `home`.
