@@ -430,7 +430,7 @@ in
           # does not own before sending anything.
           rc, out = wb.execute(as_user("bob", f"socat -t2 - UNIX-CONNECT:{EDIT_SOCK} </dev/null 2>&1"))
           assert rc != 0 and "ermission denied" in out, (rc, out)
-          rc, out = wb.execute(as_user("bob", f"env HOME=/tmp wb buf ls 2>&1"))
+          rc, out = wb.execute(as_user("bob", "env HOME=/tmp wb buf ls 2>&1"))
           assert rc != 0, out
 
       with subtest("11: wb board tools from a card go to the page over web.sock"):
