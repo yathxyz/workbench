@@ -38,6 +38,13 @@ async fn next_board(rpc: &mut Ws) -> Value {
     }
 }
 
+/// Opens `/rpc` and reads past its connect snapshot, whose `board` notice names `tag`.
+async fn rpc_at(web: &Web, tag: &str) -> Ws {
+    let mut rpc = web.ws("/rpc").await;
+    assert_eq!(next_board(&mut rpc).await["etag"], tag);
+    rpc
+}
+
 async fn put(web: &Web, if_match: Option<&str>, body: &[u8]) -> common::Resp {
     let req = web.req("PUT", "/api/board").body(body);
     match if_match {
@@ -52,7 +59,7 @@ async fn put(web: &Web, if_match: Option<&str>, body: &[u8]) -> common::Resp {
 async fn a_put_must_name_the_current_board() {
     let dir = tempfile::tempdir().unwrap();
     let web = Web::start(&dir.path().join("hub.sock"));
-    let mut rpc = web.ws("/rpc").await;
+    let mut rpc = rpc_at(&web, EMPTY).await;
 
     let res = web.req("GET", "/api/board").send().await;
     assert_eq!(res.status, 200);
@@ -136,7 +143,7 @@ async fn a_put_must_name_the_current_board() {
 async fn of_ten_concurrent_puts_with_one_tag_exactly_one_wins() {
     let dir = tempfile::tempdir().unwrap();
     let web = Web::start(&dir.path().join("hub.sock"));
-    let mut rpc = web.ws("/rpc").await;
+    let mut rpc = rpc_at(&web, EMPTY).await;
     let mut tag = EMPTY.to_owned();
     // First from a fresh install ("empty"), then from an existing board.
     for round in 0..2 {
@@ -274,7 +281,7 @@ fn pre_buf() -> Value {
 async fn a_pre_buf_put_over_a_migrated_board_keeps_every_buf_and_brings_back_no_text() {
     let dir = tempfile::tempdir().unwrap();
     let web = Web::start(&dir.path().join("hub.sock"));
-    let mut rpc = web.ws("/rpc").await;
+    let mut rpc = rpc_at(&web, EMPTY).await;
 
     let res = put(&web, Some(EMPTY), migrated().to_string().as_bytes()).await;
     assert_eq!(res.status, 204);

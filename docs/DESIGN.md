@@ -786,7 +786,7 @@ Server to client:
 - `sessions{sessions}` on connect while the hub is up, and again each time the hub comes up;
 - `session{session}`;
 - `gone{sid, epoch}`;
-- `board{etag}` after every successful board PUT, to all clients;
+- `board{etag}` on connect, with the board's current tag (`"empty"` when there is none) right after `hub`, and after every successful board PUT, to all clients. The connect one covers a save between a tab's `GET /api/board` and its subscription, and one made while the tab was disconnected; the frontend handles both alike (F-A7);
 - `notes{gen}` whenever edwind reports an index change (edwind spec R11.7), to all clients.
 
 **Frontend rules:**
@@ -1061,7 +1061,7 @@ Nothing else is inherited: no `NOTIFY_SOCKET`, `INVOCATION_ID`, `JOURNAL_STREAM`
 | W-10 | Unit control (`POST /api/unit/…`) gives 403 (§3.5.5). | `host.rs` |
 | W-11 | Fixtures take the shell from `$BASH`; the harness falls back to `/run/current-system/sw/bin/bash` if that exists, then to `PATH`. The harness env names are `WB_HARNESS` and `WB_PLAYWRIGHT`. | tests |
 | W-12 | Stubs before M5 return the empty-`notesDir` shapes with `notesExists:false`. | `notes/mod.rs`, `artifacts.rs`, `host.rs` |
-| W-13 | `/rpc` sends `sessions` on connect, then `session`, `gone{sid, epoch}`, `hub{…}` and `board{etag}`. | `rpc.rs`, `hub.rs` |
+| W-13 | `/rpc` sends `hub{…}`, `board{etag}` and `sessions` on connect, then `session`, `gone{sid, epoch}`, `hub{…}` and `board{etag}`. | `rpc.rs`, `hub.rs` |
 | W-14 | `wb` drops `hosts`, `host`, `unit start\|stop\|restart`, `tmux`, `adopt` and `create_node kind=agent`. | `wb-cli` |
 | W-15 | Shutdown: axum stops tracking a connection once it is upgraded, so each WebSocket holds a guard (`App::socket()`) and `run()` waits for the count to reach 0 inside a 5 s grace. That is what lets the 1012 close frames go out. | `main.rs` |
 
@@ -1391,6 +1391,7 @@ The test runs numbered steps. The steps this design pins down:
 | N61 | (demo) With the keyboard in a shell, Ctrl held and Space pressed then auto-repeated three times: the leader is open and the shell got no NUL. Space held on the board, then a window `blur`: Space is no longer held (F-A30) |
 | N62 | (demo) A right-click on a card's name opens the palette at the pointer with Delete, Tag and Arrange and selects the card; on a folder's name, Free, Workspace and Delete the folder without the hidden reconnect and list buttons; on the canvas, New page/shell/folder here and Fit everything; inside a free folder, New page here makes a page in that folder with its top-left at the pointer. Shift+right-click on the canvas and a right-click in a text field are not prevented and open no palette. Delete from the menu removes the card on the second pick, not the first (F-A31) |
 | N63 | (demo) Right-click fixes (F-A31). In a shell card, after a right-click the keys are back in its terminal when the menu is closed by Esc, by a press outside it, or by Copy. With a canvas shell card selected and the keys in the docked terminal, the menu key opens the Terminal menu for the dock (Copy sees the dock's selection), anchored on it. After a Shift-F10 the page did not get, a right-click on the canvas opens Canvas at the pointer. A right-click on selected ink opens Selection. A right-click on the status line is not prevented and opens nothing. In the graph view, `.` with no node selected opens no palette |
+| N64 | A save between a page's `GET /api/board` and its `/rpc` subscription (the boot GET answered with the board from before another writer's PUT): the clean page takes the newer board and its tag from the connect snapshot's `board{etag}`, with no bar |
 
 ### 9.6 v1 acceptance (all must hold before the dogfood clock starts)
 1. `nix flake check` is green on a kvm-capable host: package, clippy, fmt, conformance, security, ui, adapters, module and vm.

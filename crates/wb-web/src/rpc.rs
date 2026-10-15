@@ -1,8 +1,9 @@
-//! `/rpc` (design §3.5.3), the feed so far: `hub{…}` and `sessions{…}` on connect and
-//! whenever the hub comes up, then `session`, `gone`, `board{etag}` and `notes{gen}` as
-//! they happen. Client messages are read for the cap and the keepalive; `sample`,
-//! `tool_result`, `tool_error`, `cancel` and `limits` go through [`crate::sample`],
-//! `active` and `cmd_result` go to [`Pages`], and the rest are ignored.
+//! `/rpc` (design §3.5.3), the feed so far: `hub{…}`, `board{etag}` and `sessions{…}` on
+//! connect, `hub{…}` and `sessions{…}` whenever the hub comes up, then `session`, `gone`,
+//! `board{etag}` and `notes{gen}` as they happen. Client messages are read for the cap
+//! and the keepalive; `sample`, `tool_result`, `tool_error`, `cancel` and `limits` go
+//! through [`crate::sample`], `active` and `cmd_result` go to [`Pages`], and the rest
+//! are ignored.
 //!
 //! [`Pages`] is the leader policy (design §3.3, W-4): a `wb` command from `web.sock`
 //! goes to one page as `cmd{id, tool, input}`, and only that page's `cmd_result` with
@@ -24,6 +25,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use wb_proto::limits::WS_MAX_RPC;
 
+use crate::board;
 use crate::edit_client::Delivery;
 use crate::http::{Keepalive, Tick, close, send_json, upgrade_required, ws_close, ws_too_big};
 use crate::hub::{HubStatus, with_state};
@@ -77,6 +79,18 @@ fn snapshot(app: &AppState) -> Vec<Value> {
     msgs
 }
 
+/// What a client gets on connect and after it lagged: [`snapshot`] with the board's tag
+/// after the hub status. The tag covers a save between the page's `GET /api/board` and
+/// this subscription, which no `board` notice reaches.
+async fn connect_snapshot(app: &AppState) -> Vec<Value> {
+    let mut msgs = snapshot(app);
+    match board::etag_now(app).await {
+        Ok(etag) => msgs.insert(1, json!({"t": "board", "etag": etag})),
+        Err(e) => tracing::warn!(error = %e, "cannot read the board's tag"),
+    }
+    msgs
+}
+
 async fn run(app: AppState, mut ws: WebSocket) {
     // Subscribe before the snapshot, so no change falls between the two. A change in
     // both arrives twice, and applying it again is harmless.
@@ -85,7 +99,7 @@ async fn run(app: AppState, mut ws: WebSocket) {
     // already be chosen. Dropped on every return below, which fails its open calls.
     let (to_tab, mut deliveries) = mpsc::unbounded_channel();
     let page = app.pages.register(to_tab.clone());
-    for msg in snapshot(&app) {
+    for msg in connect_snapshot(&app).await {
         if send_json(&mut ws, &msg).await.is_err() {
             return;
         }
@@ -144,7 +158,7 @@ async fn run(app: AppState, mut ws: WebSocket) {
                 Ok(FeedMsg::Board { etag }) => vec![json!({"t": "board", "etag": etag})],
                 Ok(FeedMsg::Notes { generation }) => vec![json!({"t": "notes", "gen": generation})],
                 // Missed messages: resend what can be resent.
-                Err(RecvError::Lagged(_)) => snapshot(&app),
+                Err(RecvError::Lagged(_)) => connect_snapshot(&app).await,
                 Err(RecvError::Closed) => return,
             },
             tick = keepalive.tick() => match tick {

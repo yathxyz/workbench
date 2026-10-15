@@ -155,6 +155,24 @@ fn read_board(path: &Path) -> io::Result<Option<(String, Vec<u8>)>> {
     Ok(Some((etag(&meta), body)))
 }
 
+/// The tag of the board at `path` as it is now, `"empty"` when there is none: what a
+/// GET would send, from one `stat`.
+fn current_etag(path: &Path) -> io::Result<String> {
+    match fs::metadata(path) {
+        Ok(meta) => Ok(etag(&meta)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(EMPTY.to_owned()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The board's tag now, for the `/rpc` connect snapshot.
+pub async fn etag_now(app: &AppState) -> io::Result<String> {
+    let path = board_path(app);
+    tokio::task::spawn_blocking(move || current_etag(&path))
+        .await
+        .map_err(io::Error::other)?
+}
+
 fn json_response(status: StatusCode, etag: &str, body: Vec<u8>) -> Response {
     let mut res = Response::new(ResponseBody::from(body));
     *res.status_mut() = status;
@@ -289,11 +307,6 @@ mod tests {
                 "If-Match {if_match:?} against {current}"
             );
         }
-    }
-
-    /// The tag of the board as it is now, `"empty"` when there is none.
-    fn current_etag(path: &Path) -> io::Result<String> {
-        Ok(read_board(path)?.map_or_else(|| EMPTY.to_owned(), |(tag, _)| tag))
     }
 
     fn run_guard(stored: Option<&str>, incoming: &str) -> (Value, bool) {

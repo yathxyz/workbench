@@ -250,7 +250,8 @@ function conflictBar() {
 // page's buf that only followed a rename edwind made (frMoved) counts the same way: ids compare as they are now.
 const noSnap = j => JSON.stringify(JSON.parse(j || '{}'), (k, v) => (k === 'snap' ? undefined : k === 'buf' ? frBufNow(v) : v));
 const snapOnly = (json = serialize()) => FR.on && !SAVE.paused && SAVE.lastJson != null && noSnap(json) === noSnap(SAVE.lastJson);
-// /rpc board{etag}: another tab or device saved (F-A7).
+// /rpc board{etag}: another tab or device saved (F-A7). Each (re)connect brings one with the board's tag then, which
+// catches a save made before this tab's /rpc was subscribed: after its boot GET, or while it was disconnected.
 async function boardChanged(etag) {
   if (!DAEMON || !BOOTED || etag === BOARD_ETAG) return;   // our own save
   if (SAVE.busy) { SAVE.recheck = etag; return; }          // our PUT's 204 may carry this very ETag
