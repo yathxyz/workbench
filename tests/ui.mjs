@@ -2691,16 +2691,23 @@ await section('frames', async () => {
   const migLog = []; M.on('console', m => { if (/edwin: migrated/.test(m.text())) migLog.push(m.text()); });
   await M.goto(ORIGIN + '/'); await until(() => M.evaluate(() => window.__canvas?.BOOTED)); await until(() => M.evaluate(() => window.__perf?.frame?.ready), 30000); await M.bringToFront();
   const bufs = await until(() => M.evaluate(() => { const C = window.__canvas, b = ['m1', 'm2', 'm3'].map(id => C.S.nodes[id]?.buf || null); return b.every(Boolean) ? b : null; }), 20000);
-  await settled(M); await sleep(500);
+  // The board save that carries the bufs goes out once the pages are migrated, after buf shows in the tab; settled()
+  // can come back before that PUT is sent. A fixed wait raced it, so the served board is polled until all three bufs landed.
+  const servedNow = async () => (await api('/api/board')).json();
+  const served = await until(async () => { const b = await servedNow(); return ['m1', 'm2', 'm3'].every(id => b.nodes?.[id]?.buf) ? b : null; }, 15000) || await servedNow();
+  await settled(M);
   const files = ['notes/mig-one.md', 'notes/mig-two.md', 'notes/mig-three.md'].map(readNote);
-  const served = await (await api('/api/board')).json();
   const servedPages = ['m1', 'm2', 'm3'].map(id => served.nodes[id]).map(n => n && { buf: n.buf, text: 'text' in n, anchors: 'anchors' in n });
   const preCopy = (() => { try { return fs.readFileSync(path.join(H.boardsDir, H.host + '.pre-edwind.json')); } catch (e) { return null; } })();
   const anchors = await M.evaluate(() => { const C = window.__canvas; return C.pageAnchors(C.S.nodes.m1); });
   // leader / opens the palette: the dock's shell has the keyboard after a load, and C-k is its there (F-A23)
   await M.keyboard.press('Control+Space'); await M.keyboard.press('/'); await sleep(150); await M.fill('#pal-in', 'Mig One#spot'); await sleep(250); const pal = await palLabels(M); await M.keyboard.press('Escape');
-  st = { installed, bufs, files: files.map(f => f && f.slice(0, 20)), servedPages, preCopy: !!preCopy, preSame: !!preCopy && preCopy.equals(fs.readFileSync(preFile)), preJson: !!preCopy && JSON.stringify(JSON.parse(preCopy)) === JSON.stringify(pre), anchors, pal: pal.includes('Mig One#spot'), migLog: migLog.length };
-  check('frames: a board with page texts and no buf is migrated on first load: every page gets buf notes/<slug>.md, the files hold the texts, the anchor is back at its place and the palette finds it, the served board carries no text, the original is kept as <host>.pre-edwind.json', st.installed?.event === 'board' && bufs?.join() === 'notes/mig-one.md,notes/mig-two.md,notes/mig-three.md' && files[0] === m1Text && files[1] === m2Text && files[2] === m3Text && servedPages.every((n, i) => n && n.buf === bufs[i] && !n.text && !n.anchors) && st.preCopy && st.preJson && anchors.length === 1 && anchors[0].id === 'a-m1' && anchors[0].pos === m1Text.indexOf('second') && anchors[0].label === 'spot' && st.pal && migLog.length === 3, JSON.stringify(st));
+  // R8.19 copies the board as stored when the first buf arrives. The tab may have saved it once before that (its own
+  // defaults: theme, the dock terminal), so the copy holds the installed board, every field of it, plus those, and no buf.
+  const within = (a, b) => a && typeof a === 'object' && !Array.isArray(a) ? !!b && typeof b === 'object' && Object.keys(a).every(k => within(a[k], b[k])) : JSON.stringify(a) === JSON.stringify(b);
+  const preKept = (() => { try { const c = JSON.parse(preCopy); return within(pre, c) && Object.values(c.nodes).every(n => !n.buf); } catch (e) { return false; } })();
+  st = { installed, bufs, files: files.map(f => f && f.slice(0, 20)), servedPages, preCopy: !!preCopy, preKept, anchors, pal: pal.includes('Mig One#spot'), migLog: migLog.length };
+  check('frames: a board with page texts and no buf is migrated on first load: every page gets buf notes/<slug>.md, the files hold the texts, the anchor is back at its place and the palette finds it, the served board carries no text, the board from before the first buf is kept as <host>.pre-edwind.json with every page text and anchor', st.installed?.event === 'board' && bufs?.join() === 'notes/mig-one.md,notes/mig-two.md,notes/mig-three.md' && files[0] === m1Text && files[1] === m2Text && files[2] === m3Text && servedPages.every((n, i) => n && n.buf === bufs[i] && !n.text && !n.anchors) && st.preCopy && st.preKept && anchors.length === 1 && anchors[0].id === 'a-m1' && anchors[0].pos === m1Text.indexOf('second') && anchors[0].label === 'spot' && st.pal && migLog.length === 3, JSON.stringify(st));
   // a second load migrates nothing more
   const M2 = await ctx.newPage(); watchErrors(M2); record(M2);
   const migLog2 = []; M2.on('console', m => { if (/edwin: migrated/.test(m.text())) migLog2.push(m.text()); });
@@ -2726,6 +2733,39 @@ await section('frames', async () => {
   check('frames: with 40 pages in view at reading zoom at most 24 frames are live; zoomed out below 0.45 every page is a snapshot of its first 12 lines and no frame is live; zooming back in brings the frames back', !!capBufs && st.inView >= 40 && liveN === 24 && st.live <= st.cap && st.live === 24 && st.liveEls === st.live && far.z < 0.45 && far.live === 0 && far.lod === 'block' && far.title === 'cap7' && far.snap === far.text.split('\n').slice(0, 12).join('\n') && near.z >= 0.45 && near.lod === 'none' && near.live === 24, JSON.stringify({ capBufs: !!capBufs, liveN, st, far: { ...far, snap: far.snap.slice(0, 30), text: far.text.slice(0, 30) }, near }));
   await settled(M2);
   await M2.close();
+
+  // (g) a migration whose board save never lands: this tab's PUTs to /api/board fail, as for a tab closed, asleep or
+  // offline before its save. The page is held (no frame, no edit through the replica) until that PUT's 204, so its file
+  // keeps the page text and the next load links the same file again (R8.18), not <slug>-2.md with the old text while the
+  // edited file is left unlinked. Once the next tab's save lands, the page takes edits.
+  const keep = await (await api('/api/board')).json(), keepFile = path.join(TMP, 'before-held-board.json'); fs.writeFileSync(keepFile, JSON.stringify(keep));
+  const hText = '# Held One\n\noriginal body\n', hEdited = hText + 'typed after the migration\n';
+  const hFile = path.join(TMP, 'held-board.json');
+  fs.writeFileSync(hFile, JSON.stringify({ v: 5, fs: keep.fs, views: {}, nodes: { h1: { id: 'h1', kind: 'buffer', name: 'Held One', x: 100, y: 100, w: 480, h: 340, text: hText } }, edges: [], strokes: [], shapes: [], cam: { x: 0, y: 0, z: 1 } }));
+  const hInst = await harnessCtl('board ' + hFile);
+  const R = await ctx.newPage();
+  let blocked = 0; await R.route('**/api/board', route => { if (route.request().method() === 'PUT') { blocked++; return route.abort(); } return route.continue(); });
+  await R.goto(ORIGIN + '/'); await until(() => R.evaluate(() => window.__canvas?.BOOTED)); await until(() => R.evaluate(() => window.__perf?.frame?.ready), 30000);
+  const hBuf = await until(() => R.evaluate(() => window.__canvas.S.nodes.h1?.buf || null), 20000);
+  await until(() => blocked > 0, 10000);
+  await R.evaluate(() => { const C = window.__canvas; C.frFocus(C.S.nodes.h1); C.frSchedule(); }); await sleep(500);
+  const held = await R.evaluate(() => { const C = window.__canvas; return { hold: C.FR.hold.has('h1'), frame: !!C.live.h1?.frame, edit: C.pageEdit(C.S.nodes.h1, 0, 0, 'x') }; });
+  const setOk = await R.evaluate(t => { const C = window.__canvas; return C.pageSetText(C.S.nodes.h1, t); }, hEdited);
+  const replica = await R.evaluate(() => window.__canvas.live.h1?.buf?.text ?? null);
+  await R.close({ runBeforeUnload: false });
+  const servedH = (await (await api('/api/board')).json()).nodes.h1 || {};
+  const R2 = await ctx.newPage(); watchErrors(R2);
+  const hLog = []; R2.on('console', m => { if (/edwin: migrated/.test(m.text())) hLog.push(m.text()); });
+  await R2.goto(ORIGIN + '/'); await until(() => R2.evaluate(() => window.__canvas?.BOOTED)); await until(() => R2.evaluate(() => window.__perf?.frame?.ready), 30000);
+  const hBuf2 = await until(() => R2.evaluate(() => window.__canvas.S.nodes.h1?.buf || null), 20000);
+  const servedH2 = await until(async () => (await (await api('/api/board')).json()).nodes.h1?.buf || null, 15000);
+  const shown = await until(() => R2.evaluate(() => { const t = window.__canvas.pageText('h1'); return t || null; }), 5000);
+  const setOk2 = await R2.evaluate(t => { const C = window.__canvas; return C.pageSetText(C.S.nodes.h1, t); }, hEdited);
+  const shown2 = await until(() => R2.evaluate(t => window.__canvas.pageText('h1') === t || null, hEdited), 5000);
+  st = { hInst: hInst?.event, blocked, hBuf, held, setOk, replica: replica === hText, served: { buf: servedH.buf || null, text: servedH.text === hText }, hBuf2, servedH2, shown: shown === hText, second: readNote('notes/held-one-2.md') !== null, hLog: hLog.length, setOk2, shown2: !!shown2 };
+  check('frames: a migrated page takes no frame and no edit until the board save carrying its buf lands; when that save never lands, the next load links the same file again (no -2 file), and the page takes edits once its save landed', st.hInst === 'board' && blocked > 0 && hBuf === 'notes/held-one.md' && held.hold && !held.frame && held.edit === false && setOk === false && st.replica && !st.served.buf && st.served.text && hBuf2 === hBuf && servedH2 === hBuf && st.shown && !st.second && st.hLog === 1 && setOk2 === true && st.shown2, JSON.stringify(st));
+  await settled(R2); await R2.close();
+  await harnessCtl('board ' + keepFile);   // the board as it was, for the sections after this one
 });
 
 // N59 (fix 4, F-A11, §3.3): `wb` board tools reach the tab used last. Two tabs report active{ago} on /rpc; a client
