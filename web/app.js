@@ -3019,8 +3019,12 @@ function cmd(title, run, keys = '', when = null) {
 const activeFolder = () => { const a = S.nodes[activeId]; return a ? (a.kind === 'frame' ? a : a.in && S.nodes[a.in]) : null; };
 function onCanvas(fn) { return () => { if (VIEW !== 'canvas') setView('canvas'); fn(); }; }
 let PICK = null;  // a sub-list the palette shows instead of everything (pick a folder, a page name…)
-// at {x, y}: the palette opens there as a menu (the right-click menu), clamped to the window, with no scrim
-function openPicker(prompt, items, at = null) { PICK = { prompt, items, at }; openPalette(''); $('#pal-in').placeholder = prompt; }
+// at {x, y}: the palette opens there as a menu (the right-click menu), clamped to the window, with no scrim. The menu
+// remembers what had the keys (a terminal, an Edwin frame) and closing it gives them back, unless the pick moved them
+function openPicker(prompt, items, at = null) {
+  const a = document.activeElement, ret = at && a && a !== document.body && !a.closest('#palette') ? a : null;
+  PICK = { prompt, items, at, ret }; openPalette(''); $('#pal-in').placeholder = prompt;
+}
 function palSearch(q) {
   const out = [], raw = q.trim(), ql = raw.toLowerCase();
   if (PICK) return rank(PICK.items, ql);
@@ -3079,7 +3083,14 @@ function openPalette(prefill) {
 }
 $('#palette').addEventListener('pointerdown', e => { if (e.target === e.currentTarget && e.currentTarget.classList.contains('at')) closeOverlays(); });   // a menu closes on a press outside it
 function closeOverlays() {
+  const ret = PICK?.ret;
   $$('.overlay').forEach(o => o.hidden = true); replMenu.hidden = true; PICK = null;
+  if (ret) setTimeout(() => {   // after the press that closed it (its mousedown moves focus) and after the pick's own run
+    const a = document.activeElement;
+    if (!ret.isConnected || $$('.overlay').some(o => !o.hidden) || (a && a !== document.body && a !== $('#pal-in'))) return;   // a picker or prompt the pick opened keeps them
+    const L = ret.closest('.xterm') && Object.values(live).find(L => L?.term?.element?.contains(ret));
+    L ? L.term.focus() : ret.focus({ preventScroll: true });
+  });
   const p = PLACE.at; if (p) setTimeout(() => { if (PLACE.at === p) PLACE.at = null; });   // a pick made from the closing palette runs first
 }
 function hl(text, idx) {
@@ -7459,7 +7470,8 @@ function buttonItems(btns) {
   return items;
 }
 // A card's or folder's actions: its header buttons and commands. A folder's reconnect and list buttons show only in the
-// .hdown and .d-fs states (CSS); the ✕ buttons only arm, so Delete here removes at once (as ✕ twice does).
+// .hdown and .d-fs states (CSS). The ✕ buttons stay out (they only arm); Delete here takes two picks, as ✕ takes two
+// clicks, because nothing brings a removed card back (its process is killed).
 function actionsFor(n) {
   const L = live[n.id], st = c => !!L?.el.classList.contains(c);
   const btns = L ? $$('button', L.hdr || $('.flabel', L.el)).filter(b => !b.matches('.hdel, .fdel') && !(b.matches('.fre') && !st('hdown')) && !(b.matches('.fls') && !st('d-fs'))) : [];
@@ -7467,29 +7479,43 @@ function actionsFor(n) {
   if (n.kind !== 'frame') items.push({ k: 'card', l: 'Pipe to… (pick the target with hints)', run: () => hintsOpen('pipe', n.id) });
   items.push({ k: 'card', l: 'Tag…', run: () => tagPrompt(n) }, { k: 'card', l: 'Arrange: move and resize with the keys', run: () => arrangeOpen() });
   for (const c of CMDS) if (CARD_CMDS.includes(c.l) && (!c.when || c.when())) items.push({ k: 'card', l: c.l, run: c.run });
-  items.push({ k: 'card', l: n.kind === 'frame' ? 'Delete the folder (its items move up one level)' : 'Delete', run: () => removeNode(n.id) });
+  const del = { k: 'card', l: n.kind === 'frame' ? 'Delete the folder (its items move up one level)' : 'Delete', keepOpen: true, run: () => {
+    if (del.armed) { closeOverlays(); removeNode(n.id); return; }
+    del.armed = true; del.l += ': pick again to confirm';
+    const i = $('#pal-in'); renderPalette(); i.focus();
+    palSel = Math.max(0, palItems.findIndex(x => x.l === del.l)); $$('#pal-list .pi').forEach((x, j) => x.classList.toggle('sel', j === palSel));
+  } };
+  items.push(del);
   return items;
 }
 function cardActions() {
   const scope = VIEW === 'graph' ? $('#g-card') : null, n = activeNode();
+  if (scope && (scope.hidden || !G.sel)) return toast('Select a node first: h j k l, or a click.');   // the hidden card keeps the last node's buttons
   if (!scope && !n) return toast('Select a card first: h j k l, or f for hints.');
   openPicker(scope ? 'Actions of ' + (G.N.get(G.sel)?.label || 'the node') : 'Actions of ' + n.name, scope ? buttonItems($$('button', scope)) : actionsFor(n));
 }
 // ---- right-click (F-A31): the palette at the pointer with what the item under it can do. Shift+right-click, text fields and
 // links keep the browser's menu (frames never send the event here); a terminal whose program tracks the mouse gets the
-// button itself (tmux's own menu). The menu key and Shift-F10 open it for the selected card; a touch long-press is the same
-// event, and it stops the pan the finger started.
+// button itself (tmux's own menu). The menu key and Shift-F10 open it for what has the keys (a terminal, an Edwin frame),
+// else for the selected card on the canvas; a touch long-press is the same event, and it stops the pan the finger started.
+// Where there is nothing to offer (the side pane, the other views) the browser's menu stays.
 const MENUKEY = { t: -1e9 };
-window.addEventListener('keydown', e => { if (e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey)) MENUKEY.t = e.timeStamp; }, true);
+window.addEventListener('keydown', e => { if (!e.defaultPrevented && (e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey))) MENUKEY.t = e.timeStamp; });
 function clipRead(then) {
   const no = () => toast('The browser did not let the page read the clipboard: paste with Ctrl-Shift-V or Ctrl-V.');
   try { navigator.clipboard.readText().then(t => t && then(t), no); } catch { no(); }
 }
-function menuTarget(t) {
-  const sh = t.closest('.shape[data-id]'), st = t.closest('path.stroke[data-id]');   // shapes and strokes carry data-id too
-  if ((sh && SEL.shapes.has(sh.dataset.id)) || (st && SEL.strokes.has(st.dataset.id))) return { sel: true };
+// pt: the pointer (a mouse right-click). Ink takes no pointer events, so the selected strokes are hit by their box.
+function menuTarget(t, pt) {
+  const sh = t.closest('.shape[data-id]');   // shapes carry data-id too
+  if (sh && SEL.shapes.has(sh.dataset.id)) return { sel: true };
   if (sh) { const s = S.shapes.find(x => x.id === sh.dataset.id); return s ? { shape: s } : null; }
   const ed = t.closest('[data-edge]'); if (ed) { const e = S.edges.find(x => x.id === ed.dataset.edge); return e ? { edge: e } : null; }
+  const b = pt && SEL.strokes.size && t.closest('#viewport') && inkBox([...SEL.strokes]);   // the selection wins over a card under it
+  if (b) {
+    const r = viewport.getBoundingClientRect(), w = s2w(pt.x - r.left, pt.y - r.top), pad = 6 / cam().z;
+    if (w.x >= b.x0 - pad && w.x <= b.x1 + pad && w.y >= b.y0 - pad && w.y <= b.y1 + pad) return { sel: true };
+  }
   let c = t.closest('.node[data-id], .frame[data-id], .tp-row[data-id], .deck-row[data-id]');
   if (c?.matches('.frame') && !t.closest('.flabel, .deck')) c = null;   // a folder's inside is canvas: New … here goes into it
   if (c?.dataset.id === '') return { canvas: true };   // the folder tree's "loose on the canvas"
@@ -7498,28 +7524,22 @@ function menuTarget(t) {
   return t.closest('#viewport') ? { canvas: true, inside: true } : null;
 }
 window.addEventListener('contextmenu', ev => {
-  const kb = ev.timeStamp - MENUKEY.t < 1000, t = kb ? document.activeElement : ev.target;
+  const kb = ev.timeStamp - MENUKEY.t < 1000, t = kb ? document.activeElement : ev.target; MENUKEY.t = -1e9;   // one key, one menu
   if ((ev.shiftKey && !kb) || !(t instanceof Element)) return;
   const xt = t.closest('.xterm'), TL = xt && Object.values(live).find(L => L?.term?.element === xt);
   if (!xt && t.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), a[href]') && !t.closest('.edwin-frame')) return;
-  ev.preventDefault();
-  if (TL && !kb && TL.term.modes.mouseTrackingMode !== 'none') return;   // the program gets the button (xterm's mousedown sent it)
-  ev.stopPropagation();   // also keeps xterm from moving its textarea under the pointer
+  if (TL && !kb && TL.term.modes.mouseTrackingMode !== 'none') return ev.preventDefault();   // the program gets the button (xterm's mousedown sent it)
   const pan = [...pointers.values()].find(p => p.x0 !== undefined);
-  if (pan) {   // a long-press: a finger that has moved is panning, one that rested gets the menu instead
-    if (Math.hypot(pan.x - pan.x0, pan.y - pan.y0) > 10) return;
-    for (const id of pointers.keys()) try { viewport.releasePointerCapture(id); } catch {}
-    pointers.clear(); pinch = null; viewport.classList.remove('panning'); GLIDE.ok = false;
-  }
-  const act = kb && activeNode(), from = act ? live[act.id]?.el || t : t;
+  if (pan && Math.hypot(pan.x - pan.x0, pan.y - pan.y0) > 10) { ev.preventDefault(); ev.stopPropagation(); return; }   // a long-press whose finger moved is panning
+  // the keys: what has them (a terminal, an Edwin frame, the dock's or the Editor view's too), else the selected card on the canvas
+  const fe = t.closest('.edwin-frame'), act = kb && !xt && !fe && VIEW === 'canvas' && activeNode(), from = act ? live[act.id]?.el || t : t;
   let at = { x: ev.clientX, y: ev.clientY };
-  if (kb) { const r = from.getBoundingClientRect(); at = { x: r.left + 12, y: r.top + 12 }; }
-  const tg = act ? { node: act } : menuTarget(from), n = tg?.node, items = [];
-  if (n) activate(n.id);
+  if (kb) { const r = (xt || fe || from).getBoundingClientRect(); at = { x: r.left + 12, y: r.top + 12 }; }
+  const tg = act ? { node: act } : menuTarget(from, kb ? null : at), n = tg?.node, items = [];
   const term = n ? live[n.id]?.term : TL?.term;
-  if (term) items.push({ k: 'terminal', l: 'Copy', s: term.hasSelection() ? '' : 'nothing selected', run: () => { const s = term.getSelection(); s ? copyText(s) : toast('Select some text in the terminal first.'); } },
+  if (term) items.push({ k: 'terminal', l: 'Copy', s: term.hasSelection() ? '' : 'nothing selected', run: () => { const s = term.getSelection(); s ? copyText(s) : toast('Select some text in the terminal first.'); term.focus(); } },
     { k: 'terminal', l: 'Paste', run: () => clipRead(s => { term.paste(s); term.focus(); }) });
-  const fe = t.closest('.edwin-frame'), ef = FR.ready && (n && FR.byFrame.has(live[n.id]?.frame) ? live[n.id].frame : fe && FR.Ed.E.frames.find(f => f.root === fe));
+  const ef = FR.ready && (n && FR.byFrame.has(live[n.id]?.frame) ? live[n.id].frame : fe && FR.Ed.E.frames.find(f => f.root === fe));
   if (ef) {
     const Ed = FR.Ed, here = fe && !kb ? at : null;
     items.push({ k: 'edwin', l: 'Copy the region', run: () => { ef.focus(); Ed.selectFrame(ef); Ed.feedKey('<cmd:kill-ring-save>'); } },
@@ -7538,7 +7558,7 @@ window.addEventListener('contextmenu', ev => {
     for (const ty of ['spawn', 'pipe', 'ref']) if (ty !== e.type) items.push({ k: 'edge', l: 'Make it a ' + ty + ' edge', run: () => { e.type = ty; done(); } });
     items.push({ k: 'edge', l: 'Delete the edge', run: () => { S.edges = S.edges.filter(x => x !== e); done(); } });
   } else if (tg?.shape) {
-    const s = tg.shape; selShape = s.id; renderShapes(); title = 'Shape';
+    const s = tg.shape; title = 'Shape';
     items.push({ k: 'shape', l: 'Edit the text…', run: () => editShapeText(s) }, { k: 'shape', l: 'Remove', run: () => removeShape(s.id) });
   } else if (tg?.canvas) {
     const r = viewport.getBoundingClientRect(), w = tg.inside && !kb ? s2w(at.x - r.left, at.y - r.top) : null;
@@ -7549,7 +7569,15 @@ window.addEventListener('contextmenu', ev => {
     items.push(mk('New page', () => $('#add-buffer').click()), mk('New shell', () => $('#add-shell').click()), mk('New folder', () => $('#add-frame').click()),
       mk('New sketch', () => newSketch()), mk('New browser window…', () => $('#add-web').click()), { k: 'command', l: 'Fit everything', run: () => fitAll() });
   }
-  if (items.length) openPicker(title, items, at);
+  if (!items.length) return;   // nothing here to offer (a side pane, another view): the browser's menu
+  ev.preventDefault(); ev.stopPropagation();   // stopping it also keeps xterm from moving its textarea under the pointer
+  if (pan) {   // a long-press on a finger that rested: the menu instead of the pan
+    for (const id of pointers.keys()) try { viewport.releasePointerCapture(id); } catch {}
+    pointers.clear(); pinch = null; viewport.classList.remove('panning'); GLIDE.ok = false;
+  }
+  if (n) activate(n.id);
+  if (tg?.shape) { selShape = tg.shape.id; renderShapes(); }
+  openPicker(title, items, at);
 }, true);
 // ---- arrange (m on the board): h j k l move the selected card by a grid step (in a pack or tile folder, by one place),
 // H J K L resize it; Enter keeps it, Esc puts it back. One undo step.

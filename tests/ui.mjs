@@ -311,17 +311,92 @@ check('N61: a held leader opens the leader once and sends nothing to the termina
   await p.evaluate(n => { const i = document.createElement('input'); i.id = 'rc-in'; i.style.cssText = 'position:relative;z-index:9'; window.__canvas.live[n].body.append(i); }, ids.n);
   const ip = await p.evaluate(() => { const b = document.getElementById('rc-in').getBoundingClientRect(); return { x: Math.round(b.left + 10), y: Math.round(b.top + b.height / 2) }; });
   r.input = await rc(ip);
-  await rc(pts.card); await pick('Delete'); await sleep(200);
+  await rc(pts.card); await pick('Delete'); await sleep(200);   // the first pick only asks again
+  r.armed = await p.evaluate(n => ({ kept: !!window.__canvas.S.nodes[n], open: !document.getElementById('palette').hidden,
+    sel: document.querySelector('#pal-list .pi.sel .l')?.textContent }), ids.n);
+  await pick('Delete: pick again to confirm'); await sleep(200);
   r.deleted = await p.evaluate(n => !window.__canvas.S.nodes[n], ids.n);
   await p.evaluate(({ f }) => { const C = window.__canvas; for (const k of C.kidsOf(f)) C.removeNode(k.id); C.removeNode(f); Object.assign(C.S.cam, window.__rcCam); C.applyCam(); }, ids);
   const has = (o, ...ls) => o.open && o.at && ls.every(l => o.labels.includes(l));
   const native = (o, before) => !o.open && o.cm.length === before + 1 && o.cm.at(-1) === false;
-  check('N62: right-click opens the palette at the pointer: a card\'s actions with Delete, a folder\'s without its hidden buttons, New … here on the canvas and inside a folder (into it, at the pointer); Shift+right-click and a text field keep the native menu; Delete removes the card',
+  check('N62: right-click opens the palette at the pointer: a card\'s actions with Delete, a folder\'s without its hidden buttons, New … here on the canvas and inside a folder (into it, at the pointer); Shift+right-click and a text field keep the native menu; Delete removes the card on its second pick',
     has(r.card, 'Delete', 'Tag…', 'Arrange: move and resize with the keys') && r.card.active === ids.n && Math.abs(r.card.x - pts.card.x) < 24 && Math.abs(r.card.y - pts.card.y) < 24
       && has(r.folder, 'Free', 'Workspace', 'Delete the folder (its items move up one level)') && !r.folder.labels.some(l => /unreachable|List this directory|click twice/.test(l)) && r.folder.active === ids.f
       && has(r.bg, 'New page here', 'New shell here', 'New folder here', 'Fit everything') && has(r.inside, 'New page here')
-      && !!r.made && Math.abs(r.made.dx) <= 3 && Math.abs(r.made.dy) <= 3 && native(r.shift, 0) && native(r.input, 1) && r.deleted,
+      && !!r.made && Math.abs(r.made.dx) <= 3 && Math.abs(r.made.dy) <= 3 && native(r.shift, 0) && native(r.input, 1) && r.armed.kept && r.armed.open && r.armed.sel === 'Delete: pick again to confirm' && r.deleted,
     JSON.stringify({ pts, ...r }));
+}
+// N63 (F-A31): closing the menu gives the keys back to the shell; the menu key follows the keys (the dock's terminal),
+// not the selected card; a Shift-F10 the page did not get leaves the next right-click a mouse one; selected ink is hit by
+// its box; where the menu would be empty the browser's stays; '.' in the graph with nothing selected opens nothing
+{
+  const st = () => p.evaluate(() => { const P = document.getElementById('palette'), b = P.querySelector('.pal').getBoundingClientRect();
+    return { open: !P.hidden, title: document.getElementById('pal-in').placeholder, x: Math.round(b.left), y: Math.round(b.top), w: Math.round(b.width), h: Math.round(b.height), iw: innerWidth, ih: innerHeight,
+      items: [...P.querySelectorAll('#pal-list .pi')].map(e => [e.querySelector('.l').textContent, e.querySelector('.s').textContent]), cm: window.__cm.slice() }; });
+  const ids = await p.evaluate(() => {
+    const C = window.__canvas, S = C.S; window.__rcCam = { ...S.cam };
+    const minX = Math.min(...Object.values(S.nodes).filter(n => !n.in).map(n => n.x));
+    const sh = C.addNode({ kind: 'term', backend: 'fake', name: 'rc-sh', env: {}, x: minX - 3000, y: 0, w: 440, h: 260 });
+    const mk = (x, y) => ({ id: 'rcst' + x + '-' + y, color: 'ink', size: 4, sim: 0, owner: null, pts: [[x, y, .5], [x + 80, y + 10, .5], [x + 160, y, .5]] });
+    S.strokes.push(mk(minX - 2400, 40), mk(minX - 2400, 80)); C.renderInk(null);
+    Object.assign(S.cam, { x: minX - 3450, y: -150, z: 1 }); C.applyCam(); document.activeElement?.blur();
+    return { sh: sh.id, minX };
+  });
+  await sleep(500);
+  const pts = await p.evaluate(id => { const C = window.__canvas, r = C.live[id].term.element.getBoundingClientRect(), c = C.live[id].el.getBoundingClientRect();
+    return { term: { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }, out: { x: Math.round(c.left + 40), y: Math.round(c.bottom + 80) } }; }, ids.sh);
+  const keys = () => p.evaluate(id => document.activeElement === window.__canvas.live[id].term.textarea, ids.sh);
+  const r = {};
+  await p.mouse.click(pts.term.x, pts.term.y); await sleep(150);
+  r.start = await keys();
+  await p.mouse.click(pts.term.x, pts.term.y, { button: 'right' }); await sleep(150);
+  r.menu = await st();
+  await p.keyboard.press('Escape'); await sleep(150); r.esc = await keys();
+  await p.mouse.click(pts.term.x, pts.term.y, { button: 'right' }); await sleep(150);
+  await p.mouse.click(pts.out.x, pts.out.y); await sleep(150); r.outside = { keys: await keys(), open: (await st()).open };
+  await p.mouse.click(pts.term.x, pts.term.y, { button: 'right' }); await sleep(150);
+  await p.evaluate(() => [...document.querySelectorAll('#pal-list .pi')].find(x => x.querySelector('.l').textContent === 'Copy')?.click()); await sleep(150);
+  r.copy = await keys();
+  // the menu key with the keys in the docked terminal while the canvas shell stays the selected card
+  await p.evaluate(() => { const C = window.__canvas; if (!(document.body.classList.contains('side-open') && C.S.sideTab === 'term')) C.toggleDockTerm(); });
+  await sleep(500);
+  await p.evaluate(id => { const C = window.__canvas, d = C.live.dock.term; C.live[id].term.clearSelection(); d.write('dock text\r\n'); }, ids.sh); await sleep(150);
+  r.dock = await p.evaluate(id => { const C = window.__canvas, d = C.live.dock.term; d.focus(); d.selectAll(); const b = d.element.getBoundingClientRect();
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ContextMenu', bubbles: true, cancelable: true }));
+    document.activeElement.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+    return { active: C.activeId === id, x: Math.round(b.left), y: Math.round(b.top) }; }, ids.sh);
+  r.dockMenu = await st();
+  await p.keyboard.press('Escape'); await sleep(100);
+  await p.evaluate(() => { const C = window.__canvas; if (document.body.classList.contains('side-open')) C.toggleDockTerm(); document.activeElement?.blur(); });
+  await sleep(400);
+  // a Shift-F10 something took (as xterm does, for the program): the right-click after it is the mouse's
+  await p.evaluate(() => { const d = document.createElement('div'); d.addEventListener('keydown', e => e.preventDefault()); document.body.append(d);
+    d.dispatchEvent(new KeyboardEvent('keydown', { key: 'F10', shiftKey: true, bubbles: true, cancelable: true })); d.remove(); });
+  const out2 = await p.evaluate(id => { const c = window.__canvas.live[id].el.getBoundingClientRect(); return { x: Math.round(c.left + 40), y: Math.round(c.bottom + 80) }; }, ids.sh);
+  await p.mouse.click(out2.x, out2.y, { button: 'right' }); await sleep(150);
+  r.f10 = await st();
+  await p.keyboard.press('Escape'); await sleep(100);
+  // selected ink: a right-click on it gives the selection's commands
+  const ink = await p.evaluate(({ minX }) => { const C = window.__canvas; C.pickClear(); C.pickInRect({ x: minX - 2420, y: 20 }, { x: minX - 2220, y: 110 });
+    const b = document.querySelector(`path.stroke[data-id="rcst${minX - 2400}-40"]`).getBoundingClientRect();
+    return { n: C.SEL.strokes.size, x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2) }; }, ids);
+  await p.mouse.click(ink.x, ink.y, { button: 'right' }); await sleep(150);
+  r.ink = { n: ink.n, ...(await st()) };
+  await p.keyboard.press('Escape'); await sleep(100);
+  // the status line: nothing to offer, so the browser's menu
+  const sp = await p.evaluate(() => { const b = document.getElementById('status').getBoundingClientRect(); return { x: Math.round(b.right - 6), y: Math.round(b.top + b.height / 2) }; });
+  const cm0 = (await st()).cm.length;
+  await p.mouse.click(sp.x, sp.y, { button: 'right' }); await sleep(150);
+  r.status = await st(); r.status.native = r.status.cm.length === cm0 + 1 && r.status.cm.at(-1) === false;
+  await p.evaluate(({ sh }) => { const C = window.__canvas; C.pickClear(); C.S.strokes = C.S.strokes.filter(s => !s.id.startsWith('rcst')); C.renderInk(null);
+    C.removeNode(sh); Object.assign(C.S.cam, window.__rcCam); C.applyCam(); }, ids);
+  const pal = o => o.items.map(x => x[0]), clampTo = (v, a, b) => Math.min(Math.max(v, a), b);
+  check('N63: closing the right-click menu (Esc, a press outside, Copy) gives the keys back to the shell; the menu key in the dock is the dock\'s Terminal menu at the dock, not the selected card\'s; a Shift-F10 the page did not get leaves the next right-click at the pointer; a right-click on selected ink gives the Selection menu; the status line keeps the browser\'s menu',
+    r.start && r.menu.open && r.menu.title === 'Actions of rc-sh' && r.esc && r.outside.keys && !r.outside.open && r.copy
+      && r.dock.active && r.dockMenu.open && r.dockMenu.title === 'Terminal' && r.dockMenu.items.some(([l, s]) => l === 'Copy' && s === '') && Math.abs(r.dockMenu.x - clampTo(r.dock.x + 14, 16, r.dockMenu.iw - r.dockMenu.w - 16)) < 4 && Math.abs(r.dockMenu.y - clampTo(r.dock.y + 14, 16, r.dockMenu.ih - r.dockMenu.h - 16)) < 4
+      && r.f10.open && r.f10.title === 'Canvas' && pal(r.f10).includes('New page here') && Math.abs(r.f10.x - out2.x) < 24 && Math.abs(r.f10.y - out2.y) < 24
+      && r.ink.n === 2 && r.ink.open && r.ink.title === 'Selection' && !r.status.open && r.status.native,
+    JSON.stringify(r));
 }
 await p.evaluate(() => document.activeElement.blur());
 await p.evaluate(() => { const C = window.__canvas; const f = C.wsTop()[0]; C.wsEnter(f, true); });
@@ -614,8 +689,11 @@ await p.evaluate(() => { const C = window.__canvas; C.setView('graph'); });
 await sleep(600);
 st = await p.evaluate(() => { const C = window.__canvas; const id = [...C.G.N.keys()][0]; C.graphSelect?.(id); return { sel: C.G.sel, card: !document.querySelector('#g-card').hidden, x: !!document.querySelector('#g-card .gc-x'), hint: document.querySelector('#g-card .gc-hint')?.textContent || '' }; });
 await p.keyboard.press('Escape'); await sleep(100);
-const gs = await p.evaluate(() => { const C = window.__canvas; const r = { sel: C.G.sel, card: !document.querySelector('#g-card').hidden }; C.graphSelect([...C.G.N.keys()][0]); document.querySelector('#g-card .gc-x').click(); r.afterX = C.G.sel; C.setView('canvas'); return r; });
-check('graph: a selection shows a card with ✕ and a hint; Esc clears it, so does ✕', st.sel && st.card && st.x && /Esc, ✕ or a click on empty space/.test(st.hint) && gs.sel === null && !gs.card && gs.afterX === null, JSON.stringify({ st, gs }));
+const gs = await p.evaluate(() => { const C = window.__canvas; const r = { sel: C.G.sel, card: !document.querySelector('#g-card').hidden }; C.graphSelect([...C.G.N.keys()][0]); document.querySelector('#g-card .gc-x').click(); r.afterX = C.G.sel;
+  C.cardActions(); r.pal = !document.getElementById('palette').hidden; return r; });   // N63: '.' with nothing selected lists no stale buttons
+if (gs.pal) { await p.keyboard.press('Escape'); await sleep(100); }
+await p.evaluate(() => window.__canvas.setView('canvas'));
+check('graph: a selection shows a card with ✕ and a hint; Esc clears it, so does ✕; then \'.\' opens no palette (N63)', st.sel && st.card && st.x && /Esc, ✕ or a click on empty space/.test(st.hint) && gs.sel === null && !gs.card && gs.afterX === null && !gs.pal, JSON.stringify({ st, gs }));
 
 // ---- v17 demo: spiral tiling, pane shares by dragging an edge, no ribbon ↔ tile ratchet, folder resize drives packing down to a stack
 await p.evaluate(() => window.__canvas.setView('canvas'));
