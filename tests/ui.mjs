@@ -273,6 +273,56 @@ await p.keyboard.down('Space'); v10.held = await p.evaluate(() => window.__canva
 v10.after = await p.evaluate(() => { window.dispatchEvent(new Event('blur')); return window.__canvas.spaceHeld; });
 await p.keyboard.up('Space');
 check('N61: a held leader opens the leader once and sends nothing to the terminal; a window blur lets go of Space', v10.on && v10.got === 0 && v10.held && !v10.after, JSON.stringify(v10));
+// N62 (F-A31): a right-click opens the palette at the pointer with the actions of the card, folder or canvas under it;
+// Shift+right-click and a text field keep the browser's menu (a bubble listener sees the event not prevented); Delete removes
+{
+  const rc = async (pt, shift) => {
+    if (shift) await p.keyboard.down('Shift'); await p.mouse.click(pt.x, pt.y, { button: 'right' }); if (shift) await p.keyboard.up('Shift'); await sleep(150);
+    return p.evaluate(() => { const P = document.getElementById('palette'), r = P.querySelector('.pal').getBoundingClientRect();
+      return { open: !P.hidden, at: P.classList.contains('at'), x: Math.round(r.left), y: Math.round(r.top), labels: [...P.querySelectorAll('#pal-list .pi .l')].map(e => e.textContent), cm: window.__cm.slice(), active: window.__canvas.activeId }; });
+  };
+  const close = async () => { await p.keyboard.press('Escape'); await sleep(100); };
+  const pick = l => p.evaluate(l => [...document.querySelectorAll('#pal-list .pi')].find(x => x.querySelector('.l').textContent === l)?.click(), l);
+  const ids = await p.evaluate(() => {
+    const C = window.__canvas, S = C.S; window.__rcCam = { ...S.cam };
+    window.__cm = []; window.addEventListener('contextmenu', e => window.__cm.push(e.defaultPrevented));   // bubble phase: after the board's capture listener
+    const minX = Math.min(...Object.values(S.nodes).filter(n => !n.in).map(n => n.x));
+    const n = C.addNode({ kind: 'sketch', name: 'rc-card', x: minX - 3000, y: 0, w: 360, h: 220 });
+    const f = C.addNode({ kind: 'frame', name: 'rc-folder', mode: 'free', shape: 'folder', x: minX - 2560, y: 0, w: 420, h: 300 });
+    Object.assign(S.cam, { x: minX - 3450, y: -150, z: 1 }); C.applyCam(); document.activeElement?.blur();   // clear of the folder tree on the left
+    return { n: n.id, f: f.id };
+  });
+  await sleep(300);
+  const pts = await p.evaluate(({ n, f }) => {
+    const c = r => ({ x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) });
+    const card = document.querySelector(`.node[data-id="${n}"]`).getBoundingClientRect(), fr = document.querySelector(`.frame[data-id="${f}"]`).getBoundingClientRect();
+    return { card: c(document.querySelector(`.node[data-id="${n}"] .hdr .name`).getBoundingClientRect()), folder: c(document.querySelector(`.frame[data-id="${f}"] .fname`).getBoundingClientRect()),
+      bg: { x: Math.round(card.left + 20), y: Math.round(card.bottom + 120) }, inside: { x: Math.round(fr.left + 60), y: Math.round(fr.top + 80) } };
+  }, ids);
+  const r = {};
+  r.card = await rc(pts.card); await close();
+  r.folder = await rc(pts.folder); await close();
+  r.bg = await rc(pts.bg); await close();
+  r.inside = await rc(pts.inside); await pick('New page here'); await sleep(700);
+  r.made = await p.evaluate(({ f, inside }) => { const C = window.__canvas, k = C.kidsOf(f).find(k => k.kind === 'buffer'), e = k && document.querySelector(`.node[data-id="${k.id}"]`).getBoundingClientRect();
+    return k ? { dx: Math.round(e.left - inside.x), dy: Math.round(e.top - inside.y) } : null; }, { f: ids.f, inside: pts.inside });
+  await p.evaluate(() => document.activeElement?.blur());
+  r.shift = await rc(pts.bg, true);
+  await p.evaluate(n => { const i = document.createElement('input'); i.id = 'rc-in'; i.style.cssText = 'position:relative;z-index:9'; window.__canvas.live[n].body.append(i); }, ids.n);
+  const ip = await p.evaluate(() => { const b = document.getElementById('rc-in').getBoundingClientRect(); return { x: Math.round(b.left + 10), y: Math.round(b.top + b.height / 2) }; });
+  r.input = await rc(ip);
+  await rc(pts.card); await pick('Delete'); await sleep(200);
+  r.deleted = await p.evaluate(n => !window.__canvas.S.nodes[n], ids.n);
+  await p.evaluate(({ f }) => { const C = window.__canvas; for (const k of C.kidsOf(f)) C.removeNode(k.id); C.removeNode(f); Object.assign(C.S.cam, window.__rcCam); C.applyCam(); }, ids);
+  const has = (o, ...ls) => o.open && o.at && ls.every(l => o.labels.includes(l));
+  const native = (o, before) => !o.open && o.cm.length === before + 1 && o.cm.at(-1) === false;
+  check('N62: right-click opens the palette at the pointer: a card\'s actions with Delete, a folder\'s without its hidden buttons, New … here on the canvas and inside a folder (into it, at the pointer); Shift+right-click and a text field keep the native menu; Delete removes the card',
+    has(r.card, 'Delete', 'Tag…', 'Arrange: move and resize with the keys') && r.card.active === ids.n && Math.abs(r.card.x - pts.card.x) < 24 && Math.abs(r.card.y - pts.card.y) < 24
+      && has(r.folder, 'Free', 'Workspace', 'Delete the folder (its items move up one level)') && !r.folder.labels.some(l => /unreachable|List this directory|click twice/.test(l)) && r.folder.active === ids.f
+      && has(r.bg, 'New page here', 'New shell here', 'New folder here', 'Fit everything') && has(r.inside, 'New page here')
+      && !!r.made && Math.abs(r.made.dx) <= 3 && Math.abs(r.made.dy) <= 3 && native(r.shift, 0) && native(r.input, 1) && r.deleted,
+    JSON.stringify({ pts, ...r }));
+}
 await p.evaluate(() => document.activeElement.blur());
 await p.evaluate(() => { const C = window.__canvas; const f = C.wsTop()[0]; C.wsEnter(f, true); });
 await p.keyboard.press('Control+Space'); await sleep(120); await p.keyboard.press('u'); await sleep(700);
