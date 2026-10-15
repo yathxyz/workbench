@@ -1631,9 +1631,6 @@ else {
   });
   await section('N19', async () => {
     const id = AID; await settled(AP);
-    // B must boot from a board that holds the card: SAVE can be idle here while the file still lacks it, and a save
-    // that lands before B's /rpc is subscribed never reaches B.
-    await until(() => !!boardFile()?.nodes?.[id], 10000);
     const { P: B, g } = await gatedPage();
     try {
       await until(async () => (await acpView(B, id))?.promptable, 20000);
