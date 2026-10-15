@@ -2669,16 +2669,23 @@ await section('frames', async () => {
   const migLog = []; M.on('console', m => { if (/edwin: migrated/.test(m.text())) migLog.push(m.text()); });
   await M.goto(ORIGIN + '/'); await until(() => M.evaluate(() => window.__canvas?.BOOTED)); await until(() => M.evaluate(() => window.__perf?.frame?.ready), 30000); await M.bringToFront();
   const bufs = await until(() => M.evaluate(() => { const C = window.__canvas, b = ['m1', 'm2', 'm3'].map(id => C.S.nodes[id]?.buf || null); return b.every(Boolean) ? b : null; }), 20000);
-  await settled(M); await sleep(500);
+  // The board save that carries the bufs is a dirty() like any other: it waits out the 500 ms debounce, which settled()
+  // does not see, then the PUT. A fixed wait raced the two, so the served board is polled until all three bufs landed.
+  const servedNow = async () => (await api('/api/board')).json();
+  const served = await until(async () => { const b = await servedNow(); return ['m1', 'm2', 'm3'].every(id => b.nodes?.[id]?.buf) ? b : null; }, 15000) || await servedNow();
+  await settled(M);
   const files = ['notes/mig-one.md', 'notes/mig-two.md', 'notes/mig-three.md'].map(readNote);
-  const served = await (await api('/api/board')).json();
   const servedPages = ['m1', 'm2', 'm3'].map(id => served.nodes[id]).map(n => n && { buf: n.buf, text: 'text' in n, anchors: 'anchors' in n });
   const preCopy = (() => { try { return fs.readFileSync(path.join(H.boardsDir, H.host + '.pre-edwind.json')); } catch (e) { return null; } })();
   const anchors = await M.evaluate(() => { const C = window.__canvas; return C.pageAnchors(C.S.nodes.m1); });
   // leader / opens the palette: the dock's shell has the keyboard after a load, and C-k is its there (F-A23)
   await M.keyboard.press('Control+Space'); await M.keyboard.press('/'); await sleep(150); await M.fill('#pal-in', 'Mig One#spot'); await sleep(250); const pal = await palLabels(M); await M.keyboard.press('Escape');
-  st = { installed, bufs, files: files.map(f => f && f.slice(0, 20)), servedPages, preCopy: !!preCopy, preSame: !!preCopy && preCopy.equals(fs.readFileSync(preFile)), preJson: !!preCopy && JSON.stringify(JSON.parse(preCopy)) === JSON.stringify(pre), anchors, pal: pal.includes('Mig One#spot'), migLog: migLog.length };
-  check('frames: a board with page texts and no buf is migrated on first load: every page gets buf notes/<slug>.md, the files hold the texts, the anchor is back at its place and the palette finds it, the served board carries no text, the original is kept as <host>.pre-edwind.json', st.installed?.event === 'board' && bufs?.join() === 'notes/mig-one.md,notes/mig-two.md,notes/mig-three.md' && files[0] === m1Text && files[1] === m2Text && files[2] === m3Text && servedPages.every((n, i) => n && n.buf === bufs[i] && !n.text && !n.anchors) && st.preCopy && st.preJson && anchors.length === 1 && anchors[0].id === 'a-m1' && anchors[0].pos === m1Text.indexOf('second') && anchors[0].label === 'spot' && st.pal && migLog.length === 3, JSON.stringify(st));
+  // R8.19 copies the board as stored when the first buf arrives. The tab may have saved it once before that (its own
+  // defaults: theme, the dock terminal), so the copy holds the installed board, every field of it, plus those, and no buf.
+  const within = (a, b) => a && typeof a === 'object' && !Array.isArray(a) ? !!b && typeof b === 'object' && Object.keys(a).every(k => within(a[k], b[k])) : JSON.stringify(a) === JSON.stringify(b);
+  const preKept = (() => { try { const c = JSON.parse(preCopy); return within(pre, c) && Object.values(c.nodes).every(n => !n.buf); } catch (e) { return false; } })();
+  st = { installed, bufs, files: files.map(f => f && f.slice(0, 20)), servedPages, preCopy: !!preCopy, preKept, anchors, pal: pal.includes('Mig One#spot'), migLog: migLog.length };
+  check('frames: a board with page texts and no buf is migrated on first load: every page gets buf notes/<slug>.md, the files hold the texts, the anchor is back at its place and the palette finds it, the served board carries no text, the board from before the first buf is kept as <host>.pre-edwind.json with every page text and anchor', st.installed?.event === 'board' && bufs?.join() === 'notes/mig-one.md,notes/mig-two.md,notes/mig-three.md' && files[0] === m1Text && files[1] === m2Text && files[2] === m3Text && servedPages.every((n, i) => n && n.buf === bufs[i] && !n.text && !n.anchors) && st.preCopy && st.preKept && anchors.length === 1 && anchors[0].id === 'a-m1' && anchors[0].pos === m1Text.indexOf('second') && anchors[0].label === 'spot' && st.pal && migLog.length === 3, JSON.stringify(st));
   // a second load migrates nothing more
   const M2 = await ctx.newPage(); watchErrors(M2); record(M2);
   const migLog2 = []; M2.on('console', m => { if (/edwin: migrated/.test(m.text())) migLog2.push(m.text()); });
