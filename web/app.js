@@ -451,7 +451,7 @@ function ask(label, value, cb) {
   $('#ask-label').textContent = label; const i = $('#ask-in'); i.value = value || ''; askCb = cb;
   $('#ask').hidden = false; i.focus(); i.select();
 }
-$('#ask-form').addEventListener('submit', e => { e.preventDefault(); const v = $('#ask-in').value.trim(); $('#ask').hidden = true; const cb = askCb; askCb = null; if (v && cb) cb(v); });
+$('#ask-form').addEventListener('submit', e => { e.preventDefault(); const v = $('#ask-in').value.trim(); $('#ask').hidden = true; const cb = askCb; askCb = null; if (v && cb) cb(v); PLACE.at = null; });
 function confirmDel(btn, fn) {
   if (btn.classList.contains('armed')) { fn(); return; }
   btn.classList.add('armed'); btn.title = 'Click again to delete';
@@ -2018,7 +2018,7 @@ function renderDeck(n) {
   $('.badge', top).textContent = kids[0] ? (kids[0].kind === 'frame' ? 'folder' : badgeOf(kids[0])) : '';
   const list = el('div', 'deck-list');
   for (const k of kids) {
-    const r = el('button', 'deck-row'); r.innerHTML = '<span class="g"></span><span class="nm"></span>';
+    const r = el('button', 'deck-row'); r.dataset.id = k.id; r.innerHTML = '<span class="g"></span><span class="nm"></span>';
     $('.g', r).textContent = k.kind === 'frame' ? FICON[k.mode || 'free'] : KIND_GLYPH[k.kind] || '·'; $('.nm', r).textContent = k.name;
     r.title = 'Click to spread the deck and open · drag out to take it out';
     r.addEventListener('pointerdown', ev => pullCard(ev, r, n, k));
@@ -2173,7 +2173,7 @@ function mountNode(n) {
   } else if (n.kind === 'ghost') {
     B('↗', n.alias ? 'Jump to the real node' : n.tmuxTarget ? 'Adopt: a card attached to this tmux session' : n.dir ? 'Open: this directory becomes a folder' : 'Open: make it real (a page on the file when edwind edits it, else Emacs; a page in demo mode)', () => ghostOpen(n));
   }
-  B('✕', 'Delete (click twice)', b => confirmDel(b, () => removeNode(n.id)));
+  B('✕', 'Delete (click twice)', b => confirmDel(b, () => removeNode(n.id))).classList.add('hdel');
   place(n); updateTitle(n);
   if (n.emacs) L.el.classList.add('emacs');
   if (n.kind === 'term' || n.kind === 'repl') mountTerm(n, L);
@@ -2411,12 +2411,18 @@ function addNode(n) {
   SEP.keep = n; if (n.in) relayout(S.nodes[n.in], true); else separate(null, n); SEP.keep = null;
   restack(); renderEdges(); activate(n.id); renderTree(); dirty(); return n;
 }
+// "New … here" (the right-click menu): the next newAt puts the item's top-left at this world point, in the folder under it.
+// One shot: closing the shell picker or the address prompt without making the item drops it.
+const PLACE = { at: null };
 function newAt(kind, extra = {}) {
+  const at = PLACE.at; PLACE.at = null;
+  if (at && !('in' in extra)) { const t = containerAt(at.x, at.y); extra = { in: t && t.mode !== 'stack' ? t.id : undefined, ...extra }; }
   const c = viewCenterWorld(), w = extra.w || (kind === 'frame' ? 760 : kind === 'buffer' ? 460 : 560), h = extra.h || (kind === 'frame' ? 460 : 320);
   const jitter = () => Math.round((Math.random() - .5) * 60);
   const count = Object.values(S.nodes).filter(m => m.kind === kind).length + 1;
   const names = { term: 'shell', repl: 'repl', buffer: 'page', frame: 'folder', agent: 'agent', acp: 'agent', artifact: 'artifact', web: 'web', sketch: 'sketch' };
-  return addNode({ kind, name: names[kind] + count, x: Math.round(c.x - w / 2) + jitter(), y: Math.round(c.y - h / 2) + jitter(), w, h, ...extra });
+  const x = at ? Math.round(at.x) : Math.round(c.x - w / 2) + jitter(), y = at ? Math.round(at.y) : Math.round(c.y - h / 2) + jitter();
+  return addNode({ kind, name: names[kind] + count, x, y, w, h, ...extra });
 }
 function removeNode(id) {
   PICKED.delete(id); pickChip();
@@ -2581,7 +2587,7 @@ function renderEdges() {
     g.append(rs.linearPath([[p2.x - L * Math.cos(ang - .5), p2.y - L * Math.sin(ang - .5)], [p2.x, p2.y], [p2.x - L * Math.cos(ang + .5), p2.y - L * Math.sin(ang + .5)]], o));
     els.push(g);
     const mx = .125 * p1.x + .375 * c1.x + .375 * c2.x + .125 * p2.x, my = .125 * p1.y + .375 * c1.y + .375 * c2.y + .125 * p2.y;
-    const lg = svgEl('g', { class: `elabel e-${e.type}-l`, transform: `translate(${mx},${my})` });
+    const lg = svgEl('g', { class: `elabel e-${e.type}-l`, transform: `translate(${mx},${my})`, ...(e.persp ? {} : { 'data-edge': e.id }) });
     const w = e.type.length * 7 + 14;
     lg.append(svgEl('rect', { x: -w / 2, y: -10, width: w, height: 20 }));
     const tx = svgEl('text', { 'text-anchor': 'middle', y: 4 }); tx.textContent = e.type; lg.append(tx);
@@ -2835,6 +2841,7 @@ window.addEventListener('paste', ev => { if (performance.now() - MID.at < 600) {
 viewport.addEventListener('pointerdown', ev => {
   const pen = ev.pointerType === 'pen';
   if (pen) penSeen = true;
+  if (pen && ev.button === 2) return;   // the barrel button is a right-click: the menu, not ink
   const eraserButton = pen && (ev.button === 5 || (ev.buttons & 32));
   const drawTool = tool === 'pen' || tool === 'erase';
   const onNode = ev.target.closest('.node');
@@ -2871,7 +2878,7 @@ viewport.addEventListener('pointerdown', ev => {
   if (bg && selShape) { selShape = null; renderShapes(); }
   camStop();
   viewport.setPointerCapture(ev.pointerId);
-  pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+  pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY, x0: ev.clientX, y0: ev.clientY });
   viewport.classList.add('panning');
   if (pointers.size === 1) { GLIDE.ok = ev.pointerType === 'touch'; GLIDE.trail = []; }
   if (pointers.size === 2) startPinch();
@@ -3015,7 +3022,12 @@ function cmd(title, run, keys = '', when = null) {
 const activeFolder = () => { const a = S.nodes[activeId]; return a ? (a.kind === 'frame' ? a : a.in && S.nodes[a.in]) : null; };
 function onCanvas(fn) { return () => { if (VIEW !== 'canvas') setView('canvas'); fn(); }; }
 let PICK = null;  // a sub-list the palette shows instead of everything (pick a folder, a page name…)
-function openPicker(prompt, items) { PICK = { prompt, items }; openPalette(''); $('#pal-in').placeholder = prompt; }
+// at {x, y}: the palette opens there as a menu (the right-click menu), clamped to the window, with no scrim. The menu
+// remembers what had the keys (a terminal, an Edwin frame) and closing it gives them back, unless the pick moved them
+function openPicker(prompt, items, at = null) {
+  const a = document.activeElement, ret = at && a && a !== document.body && !a.closest('#palette') ? a : null;
+  PICK = { prompt, items, at, ret }; openPalette(''); $('#pal-in').placeholder = prompt;
+}
 function palSearch(q) {
   const out = [], raw = q.trim(), ql = raw.toLowerCase();
   if (PICK) return rank(PICK.items, ql);
@@ -3066,10 +3078,24 @@ function rank(list, ql, keepOrder) {
   return scored.sort((a, b) => b.score - a.score).slice(0, 60);
 }
 function openPalette(prefill) {
-  $('#palette').hidden = false; const i = $('#pal-in'); i.value = prefill; i.placeholder = PICK ? PICK.prompt : 'Search pages, shells, folders… or > for commands';
+  const P = $('#palette'), box = $('.pal', P), at = PICK?.at;
+  P.hidden = false; const i = $('#pal-in'); i.value = prefill; i.placeholder = PICK ? PICK.prompt : 'Search pages, shells, folders… or > for commands';
   i.focus(); i.setSelectionRange(prefill.length, prefill.length); renderPalette();
+  P.classList.toggle('at', !!at); box.style.left = box.style.top = '';
+  if (at) { const r = box.getBoundingClientRect(); box.style.left = clamp(at.x + 2, 16, innerWidth - r.width - 16) + 'px'; box.style.top = clamp(at.y + 2, 16, innerHeight - r.height - 16) + 'px'; }
 }
-function closeOverlays() { $$('.overlay').forEach(o => o.hidden = true); replMenu.hidden = true; PICK = null; }
+$('#palette').addEventListener('pointerdown', e => { if (e.target === e.currentTarget && e.currentTarget.classList.contains('at')) closeOverlays(); });   // a menu closes on a press outside it
+function closeOverlays() {
+  const ret = PICK?.ret;
+  $$('.overlay').forEach(o => o.hidden = true); replMenu.hidden = true; PICK = null;
+  if (ret) setTimeout(() => {   // after the press that closed it (its mousedown moves focus) and after the pick's own run
+    const a = document.activeElement;
+    if (!ret.isConnected || $$('.overlay').some(o => !o.hidden) || (a && a !== document.body && a !== $('#pal-in'))) return;   // a picker or prompt the pick opened keeps them
+    const L = ret.closest('.xterm') && Object.values(live).find(L => L?.term?.element?.contains(ret));
+    L ? L.term.focus() : ret.focus({ preventScroll: true });
+  });
+  const p = PLACE.at; if (p) setTimeout(() => { if (PLACE.at === p) PLACE.at = null; });   // a pick made from the closing palette runs first
+}
 function hl(text, idx) {
   const f = document.createDocumentFragment(); if (!idx?.length) { f.append(text); return f; }
   const set = new Set(idx); let buf = '';
@@ -3195,6 +3221,7 @@ const VIEW_KEYFN = { ranger: e => !e.ctrlKey && !e.metaKey && !e.altKey && rgKey
 window.addEventListener('keydown', e => {
   if (LEADER.pass) return;
   const k = WBKeys.keyName(e); if (!k) return;
+  if (e.repeat && (LEADER.on || k === leaderKeyName())) { e.preventDefault(); e.stopPropagation(); return; }   // a held leader is one press: its auto-repeat would pass the key through
   if (LEADER.on) { e.preventDefault(); e.stopPropagation(); leaderKey(k, e); return; }
   if (k === leaderKeyName()) { e.preventDefault(); e.stopPropagation(); leaderOpen(); return; }
   for (const s of WBKeys.resolve(keyContext(), k)) {
@@ -3208,6 +3235,8 @@ window.addEventListener('keydown', e => {
   }
 }, true);
 window.addEventListener('keyup', e => { if (e.key === ' ') space = false; });
+// a keyup that happens in another window or tab, or inside a frame, never comes here: leaving the page lets go of Space
+window.addEventListener('blur', () => { space = false; }); document.addEventListener('visibilitychange', () => { space = false; });
 
 // ------------------------------------------------------------------ pages: outliner keys, [[links]], ((refs)), backlinks
 function outlineEnter(view) {
@@ -7438,24 +7467,126 @@ function hintsType(k) {
 }
 // ---- card actions (. on the board): the selected card's buttons and commands, in the palette
 const CARD_CMDS = ['Rename the active item…', 'Move the active item to a folder…', 'Branch the active shell, REPL or agent', 'Agent: start a new session in the active card (ends the current one)', 'Agent: end the active card\'s session (the card stays, ↻ revives)'];
-function cardActions() {
-  const scope = VIEW === 'graph' ? $('#g-card') : null, n = activeNode();
-  if (!scope && !n) return toast('Select a card first: h j k l, or f for hints.');
-  const items = [];
-  const seen = new Set();
-  for (const b of $$('button', scope || live[n.id].hdr)) {
-    if (!b.getClientRects().length || b.disabled) continue;
+function buttonItems(btns) {
+  const items = [], seen = new Set();
+  for (const b of btns) {
+    if (b.hidden || b.disabled) continue;   // hidden by its state; one only out of sight (far zoom, a deck) still counts
     const l = (b.title || b.textContent || '').trim().split(/(?<=[.:;])\s/)[0].replace(/[.:;]$/, '');   // the title's first clause
     if (!l || seen.has(l)) continue; seen.add(l);
     items.push({ k: 'button', l, s: b.title ? b.textContent.trim() : '', run: () => b.click() });
   }
-  if (n && !scope) {
-    if (n.kind !== 'frame') items.push({ k: 'card', l: 'Pipe to… (pick the target with hints)', run: () => hintsOpen('pipe', n.id) });
-    items.push({ k: 'card', l: 'Tag…', run: () => tagPrompt(n) }, { k: 'card', l: 'Arrange: move and resize with the keys', run: () => arrangeOpen() });
-    for (const c of CMDS) if (CARD_CMDS.includes(c.l) && (!c.when || c.when())) items.push({ k: 'card', l: c.l, run: c.run });
-  }
-  openPicker(scope ? 'Actions of ' + (G.N.get(G.sel)?.label || 'the node') : 'Actions of ' + n.name, items);
+  return items;
 }
+// A card's or folder's actions: its header buttons and commands. A folder's reconnect and list buttons show only in the
+// .hdown and .d-fs states (CSS). The ✕ buttons stay out (they only arm); Delete here takes two picks, as ✕ takes two
+// clicks, because nothing brings a removed card back (its process is killed).
+function actionsFor(n) {
+  const L = live[n.id], st = c => !!L?.el.classList.contains(c);
+  const btns = L ? $$('button', L.hdr || $('.flabel', L.el)).filter(b => !b.matches('.hdel, .fdel') && !(b.matches('.fre') && !st('hdown')) && !(b.matches('.fls') && !st('d-fs'))) : [];
+  const items = buttonItems(btns);
+  if (n.kind !== 'frame') items.push({ k: 'card', l: 'Pipe to… (pick the target with hints)', run: () => hintsOpen('pipe', n.id) });
+  items.push({ k: 'card', l: 'Tag…', run: () => tagPrompt(n) }, { k: 'card', l: 'Arrange: move and resize with the keys', run: () => arrangeOpen() });
+  for (const c of CMDS) if (CARD_CMDS.includes(c.l) && (!c.when || c.when())) items.push({ k: 'card', l: c.l, run: c.run });
+  const del = { k: 'card', l: n.kind === 'frame' ? 'Delete the folder (its items move up one level)' : 'Delete', keepOpen: true, run: () => {
+    if (del.armed) { closeOverlays(); removeNode(n.id); return; }
+    del.armed = true; del.l += ': pick again to confirm';
+    const i = $('#pal-in'); renderPalette(); i.focus();
+    palSel = Math.max(0, palItems.findIndex(x => x.l === del.l)); $$('#pal-list .pi').forEach((x, j) => x.classList.toggle('sel', j === palSel));
+  } };
+  items.push(del);
+  return items;
+}
+function cardActions() {
+  const scope = VIEW === 'graph' ? $('#g-card') : null, n = activeNode();
+  if (scope && (scope.hidden || !G.sel)) return toast('Select a node first: h j k l, or a click.');   // the hidden card keeps the last node's buttons
+  if (!scope && !n) return toast('Select a card first: h j k l, or f for hints.');
+  openPicker(scope ? 'Actions of ' + (G.N.get(G.sel)?.label || 'the node') : 'Actions of ' + n.name, scope ? buttonItems($$('button', scope)) : actionsFor(n));
+}
+// ---- right-click (F-A31): the palette at the pointer with what the item under it can do. Shift+right-click, text fields and
+// links keep the browser's menu (frames never send the event here); a terminal whose program tracks the mouse gets the
+// button itself (tmux's own menu). The menu key and Shift-F10 open it for what has the keys (a terminal, an Edwin frame),
+// else for the selected card on the canvas; a touch long-press is the same event, and it stops the pan the finger started.
+// Where there is nothing to offer (the side pane, the other views) the browser's menu stays.
+const MENUKEY = { t: -1e9 };
+window.addEventListener('keydown', e => { if (!e.defaultPrevented && (e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey))) MENUKEY.t = e.timeStamp; });
+function clipRead(then) {
+  const no = () => toast('The browser did not let the page read the clipboard: paste with Ctrl-Shift-V or Ctrl-V.');
+  try { navigator.clipboard.readText().then(t => t && then(t), no); } catch { no(); }
+}
+// pt: the pointer (a mouse right-click). Ink takes no pointer events, so the selected strokes are hit by their box.
+function menuTarget(t, pt) {
+  const sh = t.closest('.shape[data-id]');   // shapes carry data-id too
+  if (sh && SEL.shapes.has(sh.dataset.id)) return { sel: true };
+  if (sh) { const s = S.shapes.find(x => x.id === sh.dataset.id); return s ? { shape: s } : null; }
+  const ed = t.closest('[data-edge]'); if (ed) { const e = S.edges.find(x => x.id === ed.dataset.edge); return e ? { edge: e } : null; }
+  const b = pt && SEL.strokes.size && t.closest('#viewport') && inkBox([...SEL.strokes]);   // the selection wins over a card under it
+  if (b) {
+    const r = viewport.getBoundingClientRect(), w = s2w(pt.x - r.left, pt.y - r.top), pad = 6 / cam().z;
+    if (w.x >= b.x0 - pad && w.x <= b.x1 + pad && w.y >= b.y0 - pad && w.y <= b.y1 + pad) return { sel: true };
+  }
+  let c = t.closest('.node[data-id], .frame[data-id], .tp-row[data-id], .deck-row[data-id]');
+  if (c?.matches('.frame') && !t.closest('.flabel, .deck')) c = null;   // a folder's inside is canvas: New … here goes into it
+  if (c?.dataset.id === '') return { canvas: true };   // the folder tree's "loose on the canvas"
+  const n = c && S.nodes[c.dataset.id];
+  if (n) return PICKED.has(n.id) ? { sel: true } : { node: n };
+  return t.closest('#viewport') ? { canvas: true, inside: true } : null;
+}
+window.addEventListener('contextmenu', ev => {
+  const kb = ev.timeStamp - MENUKEY.t < 1000, t = kb ? document.activeElement : ev.target; MENUKEY.t = -1e9;   // one key, one menu
+  if ((ev.shiftKey && !kb) || !(t instanceof Element)) return;
+  const xt = t.closest('.xterm'), TL = xt && Object.values(live).find(L => L?.term?.element === xt);
+  if (!xt && t.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), a[href]') && !t.closest('.edwin-frame')) return;
+  if (TL && !kb && TL.term.modes.mouseTrackingMode !== 'none') return ev.preventDefault();   // the program gets the button (xterm's mousedown sent it)
+  const pan = [...pointers.values()].find(p => p.x0 !== undefined);
+  if (pan && Math.hypot(pan.x - pan.x0, pan.y - pan.y0) > 10) { ev.preventDefault(); ev.stopPropagation(); return; }   // a long-press whose finger moved is panning
+  // the keys: what has them (a terminal, an Edwin frame, the dock's or the Editor view's too), else the selected card on the canvas
+  const fe = t.closest('.edwin-frame'), act = kb && !xt && !fe && VIEW === 'canvas' && activeNode(), from = act ? live[act.id]?.el || t : t;
+  let at = { x: ev.clientX, y: ev.clientY };
+  if (kb) { const r = (xt || fe || from).getBoundingClientRect(); at = { x: r.left + 12, y: r.top + 12 }; }
+  const tg = act ? { node: act } : menuTarget(from, kb ? null : at), n = tg?.node, items = [];
+  const term = n ? live[n.id]?.term : TL?.term;
+  if (term) items.push({ k: 'terminal', l: 'Copy', s: term.hasSelection() ? '' : 'nothing selected', run: () => { const s = term.getSelection(); s ? copyText(s) : toast('Select some text in the terminal first.'); term.focus(); } },
+    { k: 'terminal', l: 'Paste', run: () => clipRead(s => { term.paste(s); term.focus(); }) });
+  const ef = FR.ready && (n && FR.byFrame.has(live[n.id]?.frame) ? live[n.id].frame : fe && FR.Ed.E.frames.find(f => f.root === fe));
+  if (ef) {
+    const Ed = FR.Ed, here = fe && !kb ? at : null;
+    items.push({ k: 'edwin', l: 'Copy the region', run: () => { ef.focus(); Ed.selectFrame(ef); Ed.feedKey('<cmd:kill-ring-save>'); } },
+      { k: 'edwin', l: here ? 'Paste here' : 'Paste', run: () => clipRead(s => {
+        ef.focus(); Ed.selectFrame(ef);
+        const w = here && Ed.windowAt(here.x, here.y), p = w ? Ed.posFromPoint(here.x, here.y, w) : null;   // point to the click, as a click puts it
+        if (p !== null) { if (w !== Ed.E.sel) Ed.selectWindow(w); w.buffer.pt = p; w.buffer.markActive = false; }
+        Ed.E.pasteText = s; Ed.feedKey('<cmd:clipboard-yank>');
+      }) });
+  }
+  let title = term ? 'Terminal' : ef ? 'Edwin' : 'Actions';
+  if (tg?.sel) { title = 'Selection'; for (const c of CMDS) if ((c.l.startsWith('Selection') || c.l.endsWith('the selection')) && (!c.when || c.when())) items.push({ ...c, k: 'selection' }); }
+  else if (n) { title = 'Actions of ' + n.name; items.push(...actionsFor(n)); }
+  else if (tg?.edge) {
+    const e = tg.edge, done = () => { renderEdges(); updateAllTitles(); dirty(); }; title = 'Edge (' + e.type + ')';
+    for (const ty of ['spawn', 'pipe', 'ref']) if (ty !== e.type) items.push({ k: 'edge', l: 'Make it a ' + ty + ' edge', run: () => { e.type = ty; done(); } });
+    items.push({ k: 'edge', l: 'Delete the edge', run: () => { S.edges = S.edges.filter(x => x !== e); done(); } });
+  } else if (tg?.shape) {
+    const s = tg.shape; title = 'Shape';
+    items.push({ k: 'shape', l: 'Edit the text…', run: () => editShapeText(s) }, { k: 'shape', l: 'Remove', run: () => removeShape(s.id) });
+  } else if (tg?.canvas) {
+    const r = viewport.getBoundingClientRect(), w = tg.inside && !kb ? s2w(at.x - r.left, at.y - r.top) : null;
+    const mk = (l, fn) => ({ k: 'new', l: l.replace('…', '') + (w ? ' here' : '') + (l.endsWith('…') ? '…' : ''), run: () => {
+      PLACE.at = w; fn(); if (!$$('.overlay').some(o => !o.hidden)) PLACE.at = null;   // kept only while a picker or prompt is still asking
+    } });
+    title = 'Canvas';
+    items.push(mk('New page', () => $('#add-buffer').click()), mk('New shell', () => $('#add-shell').click()), mk('New folder', () => $('#add-frame').click()),
+      mk('New sketch', () => newSketch()), mk('New browser window…', () => $('#add-web').click()), { k: 'command', l: 'Fit everything', run: () => fitAll() });
+  }
+  if (!items.length) return;   // nothing here to offer (a side pane, another view): the browser's menu
+  ev.preventDefault(); ev.stopPropagation();   // stopping it also keeps xterm from moving its textarea under the pointer
+  if (pan) {   // a long-press on a finger that rested: the menu instead of the pan
+    for (const id of pointers.keys()) try { viewport.releasePointerCapture(id); } catch {}
+    pointers.clear(); pinch = null; viewport.classList.remove('panning'); GLIDE.ok = false;
+  }
+  if (n) activate(n.id);
+  if (tg?.shape) { selShape = tg.shape.id; renderShapes(); }
+  openPicker(title, items, at);
+}, true);
 // ---- arrange (m on the board): h j k l move the selected card by a grid step (in a pack or tile folder, by one place),
 // H J K L resize it; Enter keeps it, Esc puts it back. One undo step.
 const ARR = { on: false, id: null };
@@ -8655,6 +8786,7 @@ AGENT_TOOLS.push(
 window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, frFileOpen, fsMv, noteOpen, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 Object.assign(window.__canvas, { keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
 Object.defineProperty(window.__canvas, 'activeId', { get: () => activeId });   // Object.assign would copy a getter's value once
+Object.defineProperty(window.__canvas, 'spaceHeld', { get: () => space });
 Object.assign(window.__canvas, { DESK, deskGo, deskSend, deskList, deskAt, deskPin, deskDelete, deskOff, deskPinned, serialize, activate, viewKey,
   OVL, RING, OVW, deskTile, deskPromote, deskSticky, deskLayout, deskOpenFolder, attnNext, attnBad, ovlToggle, ovlSend, ovwOpen, ringOpen, deskItems,
   deskPlace, deskBack, deskColumns, columnsShow, deskColumnOf, deskRevert, deskSaveState, deskDescribe, WIN, perspSwitch, deskSend });
