@@ -216,6 +216,70 @@ test('R6.1 rename-file of a directory: buffers under it follow, ids of files not
   a.close();
 });
 
+test('R6.1 a directory\'s moved record sends on only files that went with it: a new note under the old name is made there', async () => {
+  const a = await client();
+  fs.mkdirSync(path.join(dir.dirs.notes, 'daily'));
+  fs.writeFileSync(path.join(dir.dirs.notes, 'daily', 'old.md'), 'old\n');
+  assert.equal((await rename(a, 'daily', 'archive-daily')).value.dir, true);
+  // A file that went with the directory is sent on.
+  assert.equal((await a.open('daily/old.md')).moved, 'archive-daily/old.md');
+  // A new note while the old directory is gone: made at the old path (the directory again), not in the moved one.
+  const n1 = await a.open('daily/new1.md', { create: true });
+  assert.equal(n1.moved, null); assert.equal(n1.error, null); assert.equal(n1.meta.file, path.join(dir.dirs.notes, 'daily', 'new1.md'));
+  assert.equal(fs.existsSync(path.join(dir.dirs.notes, 'archive-daily', 'new1.md')), false);
+  // The directory is there again: nothing under it is sent on, not even a name the moved directory holds.
+  const n2 = await a.open('daily/new2.md', { create: true });
+  assert.equal(n2.moved, null); assert.equal(n2.meta.file, path.join(dir.dirs.notes, 'daily', 'new2.md'));
+  assert.equal((await a.open('daily/old.md', { create: true })).moved, null);
+  // server-edit of a new path there neither returns at once nor goes to the moved directory.
+  assert.deepEqual((await a.call('server-edit', ['daily/new3.md'], {})).value, { buf: 'daily/new3.md', exit: null });
+  a.close();
+});
+
+test('R6.1 a write that lands just before a rename is not lost: the buffer still sees the file changed', async () => {
+  const { p, id } = file('ext-a.md', 'one\n');
+  const a = await client();
+  await a.open(id);
+  await sleep(200);
+  externalWrite(p, 'two\n');
+  const r = await rename(a, id, '~/ext-b.md');   // before the watcher's 50 ms debounce
+  assert.equal(r.t, 'result', JSON.stringify(r));
+  await a.next(m => m.t === 'moved');
+  const ed = await a.next(m => m.t === 'edits' && m.buf === '~/ext-b.md', 3000);
+  assert.deepEqual(ed.by, { kind: 'disk' });
+  const now = await a.open('~/ext-b.md');
+  assert.equal(now.text, 'two\n'); assert.equal(now.meta.diskChanged, null);
+  a.close();
+});
+
+test('R6.1 an old id after a rename: server-edit waits on the moved buffer; with a new file at the old path, visit-id and kill-buffer name that file', async () => {
+  const { p, id } = file('se-a.md', 'alpha\n');
+  const a = await client(), b = await client();
+  const o = await a.open(id);
+  await a.edit(id, o.ver, [[0, '', 'UNSAVED ']]);
+  assert.equal((await rename(a, id, '~/se-b.md')).t, 'result');
+  // wb edit --wait with the old path waits for done on the buffer where the file is now.
+  const rid = b.newRid();
+  b.send({ t: 'call', rid, cmd: 'server-edit', args: [id], ctx: { wait: true } });
+  await sleep(300);
+  assert.equal(b.queue.some(m => m.rid === rid), false, 'server-edit --wait returned before done');
+  await a.call('server-edit-done', ['~/se-b.md']);
+  assert.deepEqual((await b.next(m => m.rid === rid)).value, { buf: '~/se-b.md', exit: 0 });
+  assert.equal(fs.readFileSync(path.join(dir.dirs.home, 'se-b.md'), 'utf8'), 'UNSAVED alpha\n');
+  a.seqs.set('~/se-b.md', a.seqs.get(id));   // the same buffer: its seqs go on
+  const ag = await a.edit('~/se-b.md', 1, [[0, '', 'AGAIN ']]);
+  assert.equal(ag.t, 'ack', JSON.stringify(ag));
+  // A new file at the old path, not loaded: commands naming the old id are about it, not the moved buffer.
+  fs.writeFileSync(p, 'new alpha\n');
+  const c = await client();
+  assert.deepEqual((await c.call('visit-id', [id])).value, { buf: id, readOnly: false });
+  const k = await c.call('kill-buffer', [id]);
+  assert.equal(k.t, 'error'); assert.equal(k.code, 'no_buffer');
+  const still = await c.open('~/se-b.md');
+  assert.equal(still.text, 'AGAIN UNSAVED alpha\n', 'the moved buffer and its unsaved edit stay');
+  a.close(); b.close(); c.close();
+});
+
 test('R8.1 a rename survives a restart: the mv journal line gives the id and file, the moved record still sends old ids on', async () => {
   const d2 = makeDir();
   let e2 = await startEdwind(d2);
@@ -235,5 +299,37 @@ test('R8.1 a rename survives a restart: the mv journal line gives the id and fil
     assert.equal((await c2.open('~/rs-a.md')).moved, '~/rs-b.md');
     assert.equal(fs.existsSync(p), false, 'the old path stays empty');
     c2.close();
+  } finally { await stopEdwind(e2); fs.rmSync(d2.root, { recursive: true, force: true }); }
+});
+
+test('R8.1 a rename whose mv journal line failed (a full disk) still reloads the buffer on the moved file, not at the old path', async () => {
+  const d2 = makeDir();
+  let e2 = await startEdwind(d2);
+  try {
+    const p = path.join(d2.dirs.home, 'fd-a.md'), q = path.join(d2.dirs.home, 'fd-b.md');
+    fs.writeFileSync(p, 'before\n');
+    let c = new EditClient(d2.cfg.socket); await c.connect(); await c.hello();
+    const o = await c.open('~/fd-a.md');
+    await c.edit('~/fd-a.md', o.ver, [[0, '', 'journaled ']]);
+    c.close(); await stopEdwind(e2);
+    e2 = await startEdwind(d2, { env: { EDWIND_FAULT: 'enospc-journal' } });
+    c = new EditClient(d2.cfg.socket); await c.connect(); await c.hello();
+    assert.equal((await rename(c, '~/fd-a.md', '~/fd-b.md')).t, 'result');
+    c.close(); await stopEdwind(e2);
+    e2 = await startEdwind(d2);
+    c = new EditClient(d2.cfg.socket); await c.connect(); await c.hello();
+    const n = await c.open('~/fd-b.md');
+    assert.equal(n.error, null); assert.equal(n.text, 'journaled before\n', 'the unsaved edit is on the moved buffer');
+    assert.equal(n.meta.file, q); assert.equal(n.meta.modified, true);
+    assert.equal((await c.open('~/fd-a.md')).moved, '~/fd-b.md');
+    assert.equal(fs.existsSync(p), false);
+    assert.equal((await c.request({ t: 'save', buf: '~/fd-b.md' })).value.saved, true);
+    assert.equal(fs.readFileSync(q, 'utf8'), 'journaled before\n'); assert.equal(fs.existsSync(p), false, 'no copy at the old path');
+    c.close();
+    // The mv line written at that reload holds on the next one.
+    await stopEdwind(e2); e2 = await startEdwind(d2);
+    c = new EditClient(d2.cfg.socket); await c.connect(); await c.hello();
+    assert.equal((await c.open('~/fd-b.md')).meta.file, q);
+    c.close();
   } finally { await stopEdwind(e2); fs.rmSync(d2.root, { recursive: true, force: true }); }
 });

@@ -479,6 +479,28 @@ test('moved: a file renamed on the server moves the replica to the new id; the f
   c.close();
 });
 
+test('moved onto a replica this tab holds: an open of the old id settles with that replica, which stays attached and editable', async () => {
+  const id = note('mv-old.md', 'kept\n');
+  const c = await client();
+  assert.equal((await c.call('rename-file', [{ src: id, dst: 'mv-new.md' }])).t, 'result');
+  const have = await sync.open('mv-new.md'); show(have);
+  const heard = []; const off = sync.on('moved', m => heard.push(m));
+  const n = E.buffers.length;
+  const got = await sync.open(id, { create: true });   // edwind sends the old id on to mv-new.md
+  assert.equal(got, have, 'the open settles with the replica already held');
+  assert.equal(sync.buffers.get('mv-new.md'), have); assert.equal(sync.buffers.has(id), false);
+  assert.equal(E.buffers.length, n, 'the replica made for the old id is gone');
+  assert.deepEqual(heard, [{ buf: id, to: 'mv-new.md' }]); off();
+  // Still attached: another writer's edit reaches it, and its own edits are acked.
+  const o = await c.open('mv-new.md');
+  await c.edit('mv-new.md', o.ver, [[0, '', 'theirs ']]);
+  await until(() => have.text === 'theirs kept\n', 'the remote edit');
+  await type('A, mine'); await keys('ESC');
+  await settled(have);
+  assert.equal(await serverText('mv-new.md'), 'theirs kept, mine\n');
+  c.close();
+});
+
 test('E3 H3 gap 2: Ed.sync.close kills the local replica and moves the window showing it; a reopen is a fresh replica', async () => {
   const id = note('cl.md', 'close me\n');
   const b = await sync.open(id); show(b);

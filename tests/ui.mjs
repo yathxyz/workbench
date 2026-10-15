@@ -2426,6 +2426,17 @@ await section('frames', async () => {
     check('frames: a page whose file moves through /api/mv keeps editing the same text: the node and the served board take the new id, the other tab\'s replica follows, typing lands in the moved file, no conflict bar',
       mv?.from === 'open-me.md' && mv.to === 'moved/open-me.md' && !!bufA && !!served && !!bufB && disk === '# open me\n\nsecond body line\nthird before-move after-move' && readNote('open-me.md') === null && !!textB && barsMv.every(b => b.hidden || b.key !== 'conflict'),
       JSON.stringify({ mv, bufA, served, bufB, disk, textB: textB && textB.slice(-40), barsMv }));
+    // A board saved by a tab that did not follow the move (it had no replica of the page open) names the old id: the
+    // tabs that heard of the move take that board, put the new id back on the page and save it.
+    const cur = await api('/api/board'), etag = cur.headers.get('ETag'), stale = await cur.json();
+    stale.nodes[mvPage].buf = 'open-me.md';
+    const put = await api('/api/board', { method: 'PUT', headers: { 'Content-Type': 'application/json', 'If-Match': etag }, body: JSON.stringify(stale) });
+    const healed = await until(async () => (await (await api('/api/board')).json()).nodes[mvPage]?.buf === 'moved/open-me.md' || null, 10000);
+    await settled(A2); await settled(B2);
+    const healedA = await A2.evaluate(id => window.__canvas.S.nodes[id]?.buf, mvPage);
+    const barsHeal = [await barOf(A2), await barOf(B2)];
+    check('frames: a board from a tab that did not follow a move (the page on the old id) is taken and made to follow it again, without the conflict bar',
+      put.status === 204 && !!healed && healedA === 'moved/open-me.md' && barsHeal.every(b => b.hidden || b.key !== 'conflict'), JSON.stringify({ put: put.status, healed, healedA, barsHeal }));
   }
   await A2.evaluate(ids => { for (const id of ids) if (id && window.__canvas.S.nodes[id]) window.__canvas.removeNode(id); }, [opened?.id, fromGhost?.id]);
   await settled(A2); await settled(B2);
@@ -2437,6 +2448,10 @@ await section('frames', async () => {
   const offB = await until(async () => /⚠ offline/.test(await frSync(B2, two) || ''), 10000);
   await A2.keyboard.type(' while-down');
   st = { stopped, offA, offB, notice: await frOff(A2, two), noticeB: await frOff(B2, two), text: await pageText(A2, two), sync: await frSync(A2, two), body: await A2.evaluate(() => document.body.classList.contains('edit-off')), status: (await (await api('/api/status')).json()).edit, info: (await (await api('/api/info')).json()) };
+  // A note opened while edwind is down falls back to the Emacs card at once (no wait for a connection that was up before).
+  const downOpen = await A2.evaluate(async () => { const t0 = performance.now(); const n = await window.__canvas.noteOpen({ path: 'ghost-me.md' }); return n && { id: n.id, kind: n.kind, ms: performance.now() - t0 }; });
+  if (downOpen?.id) { await until(() => A2.evaluate(id => !!window.__canvas.live[id]?.term?.element || null, downOpen.id), 5000); await sleep(500); await A2.evaluate(id => window.__canvas.removeNode(id), downOpen.id); }
+  check('frames: with edwind down a note opens in an Emacs card at once', downOpen?.kind === 'term' && downOpen.ms < 1000, JSON.stringify(downOpen));
   check('frames: with edwind down the page card shows the notice that editing is off, the mode line says offline and typing still goes into the page (unacked)', st.stopped?.event === 'stopped' && st.offA && st.offB && st.notice?.shown && !st.notice.hidden && st.notice.text === 'Editing is off: workbench-edit is not running' && st.noticeB?.shown && /while-down$/.test(st.text) && /•/.test(st.sync) && /⚠ offline/.test(st.sync) && st.body && !st.status?.up && st.info.edit === true && st.info.editUp === false, JSON.stringify({ ...st, text: st.text.slice(-30), info: { edit: st.info.edit, editUp: st.info.editUp } }));
 
   // (c) edwind back: both tabs reconnect, the unacked edit is acked, reaches the other tab and the file on disk

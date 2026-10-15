@@ -98,6 +98,32 @@ test('R16.14 rename-file refuses both ends in, on or above the refusal list, thr
   } finally { fs.rmSync(outside, { recursive: true, force: true }); c.close(); }
 });
 
+test('R16.14 rename-file keeps edwind\'s own directories when they are symlinks: neither the link nor its target moves', async () => {
+  const d = makeDir();
+  // notesDir and configDir as links into other directories (a synced notes folder, a configDir linked by home-manager).
+  const notesTarget = path.join(d.root, 'sync-notes'), cfgTarget = path.join(d.root, 'managed-config');
+  fs.mkdirSync(notesTarget, { mode: 0o700 }); fs.mkdirSync(cfgTarget, { mode: 0o700 });
+  const notesLink = path.join(d.dirs.home, 'notes'), cfgLink = path.join(d.dirs.home, '.config-edwin');
+  fs.symlinkSync(notesTarget, notesLink); fs.symlinkSync(cfgTarget, cfgLink);
+  fs.writeFileSync(path.join(notesTarget, 'n.md'), 'n\n');
+  d.cfg.notesDir = notesLink; d.cfg.configDir = cfgLink;
+  fs.writeFileSync(d.file, JSON.stringify(d.cfg));
+  const e = await startEdwind(d);
+  const c = new EditClient(d.cfg.socket); await c.connect(); await c.hello();
+  const rename = (s, t) => c.call('rename-file', [{ src: s, dst: t }]);
+  try {
+    for (const [s, t] of [['~/notes', '~/notes/old'], ['~/notes', '~/aside'], ['~/.config-edwin', '~/edwin-aside'], [notesTarget, '~/aside2'], [cfgTarget, '~/aside3']]) {
+      const r = await rename(s, t);
+      assert.equal(r.t, 'error', `${s} -> ${t}`); assert.equal(r.code, 'refused_path', `${s} -> ${t}`);
+    }
+    assert.equal(fs.readlinkSync(notesLink), notesTarget); assert.equal(fs.readlinkSync(cfgLink), cfgTarget);
+    assert.deepEqual(fs.readdirSync(notesTarget), ['n.md']);
+    // The control: a note under the linked notesDir still moves.
+    const ok = await rename('n.md', 'm.md');
+    assert.equal(ok.t, 'result', JSON.stringify(ok)); assert.deepEqual(fs.readdirSync(notesTarget), ['m.md']);
+  } finally { c.close(); await stopEdwind(e); fs.rmSync(d.root, { recursive: true, force: true }); }
+});
+
 test('visit-id: the board\'s file opener learns the canonical id and whether edwind would edit the file, without loading it', async () => {
   const c = await client();
   const home = dir.dirs.home;

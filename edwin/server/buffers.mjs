@@ -97,8 +97,12 @@ export class Buffers {
   }
   all() { return [...this.byJid.values()]; }
   /* The loaded buffer ID names, or the one it was renamed to (an edit, sel or close sent before the client
-     learnt of the move). */
-  live(id) { const sb = this.byId.get(id); if (sb) return sb; const to = this.movedTo(id); return to ? this.byId.get(to) || null : null; }
+     learnt of the move) while nothing is at the old path again, as resolve() has it. */
+  live(id) {
+    const sb = this.byId.get(id); if (sb) return sb;
+    const to = this.movedTo(id);
+    return to && !this.fileExists(id) ? this.byId.get(to) || null : null;
+  }
   byFile(real) { for (const sb of this.byJid.values()) if (sb.file === real) return sb; return null; }
   ofEd(ed) { for (const sb of this.byJid.values()) if (sb.ed === ed) return sb; return null; }
   autosaves(sb) { return !!sb.file && !sb.special && !sb.big && sb.file.startsWith(this.auth.realNotesDir() + '/'); }
@@ -116,7 +120,14 @@ export class Buffers {
     /* Unload stale saved buffers: a header-only journal and no open for 7 days (R8.6). */
     const { header, batches, mv, anchors, torn } = readJournal(jfile);
     /* The newest mv line names the current id, file and name (R8.1); compaction folds them into the header. */
-    const last = mv.length ? mv[mv.length - 1] : null;
+    let last = mv.length ? mv[mv.length - 1] : null;
+    /* A rename whose mv line never became durable (a crash right after it, or a full disk): the index, written
+       at the rename, names the moved file. It wins only when the journal's file is gone and the index's is there. */
+    const jfileOf = last && last.file !== undefined ? last.file : header.file;
+    let mvLost = false;
+    if (jfileOf && e.file && e.file !== jfileOf && typeof e.id === 'string' && !fs.existsSync(jfileOf) && fs.existsSync(e.file)) {
+      last = { id: e.id, file: e.file, name: e.name || path.basename(e.file) }; mvLost = true;
+    }
     const id = last ? last.id : header.id;
     let base = null, baseWhy = '';
     const saved = jidPath(this.stateDir, e.jid, '.saved'), snap = jidPath(this.stateDir, e.jid, '.snap');
@@ -153,6 +164,7 @@ export class Buffers {
     if (torn) this.log.warn('reload', { buf: id, truncated: 'a torn last journal line was dropped' });
     sb.journal = new Journal(jfile).open();
     sb.journal.lines = 1 + batches.length + mv.length;
+    if (mvLost) sb.journal.append({ t: 'mv', id: sb.id, file: sb.file, name: sb.name, at: Date.now() }).catch(err => this.log.error('reload', { buf: id, journal: err.code || err.message }));
     if (bad) { sb.setReadOnly(`journal replay failed: ${bad}`); this.log.error('reload', { buf: id, error: bad }); return sb; }
     sb.lastOpen = e.lastOpen || Date.now();
     /* The file may have changed while edwind was down. */
@@ -404,9 +416,11 @@ export class Buffers {
     let st;
     try { st = fs.lstatSync(srcReal); } catch (e) { throw new ProtoError('bad_request', osMessage(e)); }
     try { auth.checkWrite(srcReal); auth.checkWrite(dstReal); } catch (e) { throw new ProtoError('refused_path', e.message); }
+    /* A root, or a source, may be a symlink (notesDir linked into a synced folder, configDir linked by home-manager):
+       both spellings of each are compared, so neither the link nor its target moves. */
     for (const root of [auth.notesDir, auth.stateDir, auth.configDir]) {
       let r = root; try { r = fs.realpathSync.native(root); } catch (e) { /* not made yet */ }
-      if (under(r, srcReal)) throw new ProtoError('refused_path', `${srcReal}: holds edwind's directory ${root}`);
+      if ([root, r].some(x => under(x, srcReal) || under(x, srcAbs))) throw new ProtoError('refused_path', `${srcReal}: holds edwind's directory ${root}`);
     }
     const dir = st.isDirectory();
     if (this.all().some(sb => sb.file && under(sb.file, dstReal))) throw new ProtoError('bad_request', 'destination exists');
@@ -428,13 +442,17 @@ export class Buffers {
       this.byId.delete(sb.id); sb.id = id; sb.file = file; sb.ed.file = file; this.byId.set(id, sb);
       if (sb.ed.name !== name) sb.ed.name = this.Ed.getBuffer(name) ? globalThis.L.call('generate-new-buffer-name', [name]) : name;
       sb.name = sb.ed.name;
-      try { sb.disk = diskState(fs.statSync(file)); } catch (e) { /* not on disk yet */ }
+      /* sb.disk stays: a rename keeps the inode, mtime and size, so a write that landed just before it still
+         differs from what edwind last saw, and the check moved() queues picks it up. */
       this.watcher.moved(sb, was.file);
       this.addMoved(was.id, id, at, false);
       this.index.set(sb.indexEntry());
       moved.push({ sb, was });
     }
     if (!st.isSymbolicLink()) this.addMoved(from, to, at, dir);
+    /* The index names the new ids and files before the mv journal lines are durable (or when they fail), so a
+       crash or a full disk here still reloads the buffers on the moved files (reloadOne). */
+    try { this.index.write(); } catch (e) { this.log.error('rename', { index: e.code || e.message }); }
     for (const { sb, was } of moved) for (const c of sb.clients) c.send({ t: 'moved', buf: was.id, to: sb.id });
     this.emit('renamed', srcReal, dstReal);
     this.log.info('rename', { src: srcReal, dst: dstReal, buffers: moved.length });
@@ -450,19 +468,22 @@ export class Buffers {
     this.index.schedule();
   }
   pruneMoved() { const now = Date.now(); for (const [k, m] of this.moved) if (now - m.at >= MOVED_TTL_MS) this.moved.delete(k); }
-  /* Where ID went, following moved records younger than 24 h; null when it did not move. */
+  /* Where ID went, following moved records younger than 24 h; null when it did not move. A directory's record
+     sends on only ids of files that went with it: nothing is at the old directory again, and the file is at the
+     new place. A new note under the old name (the directory made again, or not) stays where it was asked for. */
   movedTo(id) {
     if (typeof id !== 'string' || !this.moved.size) return null;
     const now = Date.now(), seen = new Set([id]);
-    let cur = id;
+    let cur = id, viaDir = false;
     for (;;) {
       let next = null;
       const m = this.moved.get(cur);
       if (m && now - m.at < MOVED_TTL_MS) next = m.to;
-      else for (const [from, d] of this.moved) if (d.dir && now - d.at < MOVED_TTL_MS && cur.startsWith(from + '/')) { next = d.to + cur.slice(from.length); break; }
+      else for (const [from, d] of this.moved) if (d.dir && now - d.at < MOVED_TTL_MS && cur.startsWith(from + '/') && !this.fileExists(from)) { next = d.to + cur.slice(from.length); viaDir = true; break; }
       if (next === null || seen.has(next)) break;
       seen.add(next); cur = next;
     }
+    if (viaDir && !this.fileExists(cur)) return null;
     return cur === id ? null : cur;
   }
   fileExists(id) { try { const p = this.auth.parseId(id); return p.kind === 'file' && p.exists; } catch (e) { return false; } }

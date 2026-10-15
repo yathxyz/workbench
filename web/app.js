@@ -259,6 +259,9 @@ async function boardChanged(etag) {
   if (b.etag === BOARD_ETAG || b.body?.v !== 5) return;
   if (unsaved() && !snapOnly()) { SAVE.theirs = b.etag; SAVE.paused = 'conflict'; return conflictBar(); }
   boardAdopt(b.body); BOARD_ETAG = b.etag;
+  // snapOnly() took their board as one that follows the renames this tab heard of; one saved by a tab that followed
+  // fewer (only the pages it had open) is made to follow them here, and saved.
+  if (FR.on) { let moved = false; for (const n of nodeList()) if (n.kind === 'buffer' && n.buf && frBufNow(n.buf) !== n.buf) { n.buf = frBufNow(n.buf); moved = true; } if (moved) dirty(); }
 }
 // A clean tab takes another tab's board in place: nodes, links and ink. The camera and the view stay this device's: a tab
 // inside a perspective goes back to the manual layout, takes the board, and builds its perspective again over it.
@@ -5700,7 +5703,7 @@ function seedInk() {
 // viewport plus one viewport of margin at zoom >= LOD_Z (or focused), at most FR_CAP per tab (least recently drawn
 // unfocused first); otherwise the card shows the 12-line snapshot from the replica text (Q8). A replica off screen for
 // FR_CLOSE_MS is closed. Pages without buf are migrated to notes/<slug>.md through the replica (R8.17, Q3).
-const FR = { on: false, ready: false, online: false, Ed: null, L: null, booting: null, failed: null, byFrame: new WeakMap(), lastSeen: new Map(), offAt: new Map(), pending: new Map(), claimed: new Set(), anchorCache: {}, localAnchors: {}, perf: [], waiters: [], snapT: new Map(), snapMine: new Set(), moved: new Map() };
+const FR = { on: false, ready: false, online: false, tried: false, state: null, Ed: null, L: null, booting: null, failed: null, byFrame: new WeakMap(), lastSeen: new Map(), offAt: new Map(), pending: new Map(), claimed: new Set(), anchorCache: {}, localAnchors: {}, perf: [], waiters: [], snapT: new Map(), snapMine: new Set(), moved: new Map() };
 const FR_CAP = 24, FR_FONT = 13, FR_CLOSE_MS = 5 * 60 * 1000, FR_OFF_TEXT = 'Editing is off: workbench-edit is not running';
 // The runtime files in the order of edwin/index.html (host-browser first; markdown after org; ot and sync last).
 const FR_FILES = ['host-browser', 'scheme', 'runtime', 'text', 'editor-core', 'editor-prims', 'evil-core', 'pool', 'complete', 'extras', 'stack', 'ai', 'evil-ex', 'org', 'markdown', 'ot', 'sync'];
@@ -5756,6 +5759,8 @@ function frDropSourceBuffers() {
 function frWhenReady() { if (FR.ready && FR.online) return Promise.resolve(); return new Promise(r => FR.waiters.push(r)); }
 function frStateChanged(s) {
   FR.online = s === 'online';
+  if (FR.state === 'connecting' && s !== 'connecting') FR.tried = true;   // the first connection was made, or failed
+  FR.state = s;
   if (FR.online) { const w = FR.waiters.splice(0); for (const r of w) r(); }
   const hide = FR.failed ? false : !FR.ready || FR.online;
   for (const n of nodeList()) { const L = live[n.id]; if (L?.off) L.off.hidden = hide; }
@@ -5861,6 +5866,7 @@ function frOpen(n) {
   if (L.open) return L.open;
   L.open = frOpenCreate(n.buf).then(b => {
     L.open = null; L.buf = b; L.el.classList.remove('fr-error');
+    if (L.frame && L.frame.buffer !== b) frDrop(n);   // made on the early replica, which edwind's moved replaced with one this tab held
     frSnapRefresh(n); scheduleCrossRefresh(); frSchedule(); if (VIEW === 'tasks') renderTasks();
     return b;
   }, e => { L.open = null; L.buf = null; L.el.classList.add('fr-error'); L.snap.textContent = `${n.buf}: ${e?.message || e}`; console.warn('edwin open', n.buf, e); return null; });
@@ -6016,6 +6022,7 @@ function frAdopt(n) {
       if (taken.has(id) || FR.claimed.has(id)) continue;
       FR.claimed.add(id);
       b = await frOpenCreate(id);
+      if (b.id !== id) continue;   // a file renamed from this name: edwind sent the open on to it, which stays as it is
       const text = n.text || '', cur = b.text;
       if (cur === '' && text) { frReplaceAll(b, text); const r = await Ed.sync.save(b); if (r.error) console.warn('edwin save', id, r.error); }
       else if (cur !== '' && cur !== text) { FR.claimed.delete(id); try { FR.L.call('kill-buffer', [b]); } catch {} continue; }   // R8.18: another text, next suffix
@@ -6052,12 +6059,13 @@ async function frOpenToday() {
 // the opener of notes and files: edwind's visit-id names the id it would visit FILE under, or refuses it (the refusal
 // list, not UTF-8 text, missing) or answers read-only (outside its writable paths, over 32 MiB). Then, and while edwind is
 // down, EMACS() opens the file in an Emacs card as before. LINE > 1 puts the frame's point at the start of that line.
+// Only the first connection attempt is waited for (3 s at most); once it was made or failed, edwind down falls back at once.
 async function frFileOpen(file, props, line, emacs) {
-  if (!FR.online && !FR.failed) await Promise.race([frWhenReady(), new Promise(r => setTimeout(r, 3000))]);
+  if (!FR.tried && !FR.failed) await Promise.race([frWhenReady(), new Promise(r => setTimeout(r, 3000))]);
   const r = FR.online ? await FR.Ed.sync.call({ cmd: 'visit-id', args: [file], ctx: {} }) : null;
   const id = r && !r.error && r.value && !r.value.readOnly ? r.value.buf : null;
   if (!id) return emacs();
-  const n = nodeList().find(m => m.kind === 'buffer' && m.buf === id) || addNode({ kind: 'buffer', name: clean(id.replace(/^.*\//, '').replace(/\.(md|org)$/, '')), w: 420, h: 300, ...props, buf: id });
+  const n = nodeList().find(m => m.kind === 'buffer' && m.buf && frBufNow(m.buf) === id) || addNode({ kind: 'buffer', name: clean(id.replace(/^.*\//, '').replace(/\.(md|org)$/, '')), w: 420, h: 300, ...props, buf: id });
   const at = line > 1 ? (f, b) => { const d = new TextDoc(b.text); f.setPoint(d.line(Math.min(line, d.lines)).from); } : undefined;
   jumpNode(n, 1, () => frFocus(n, at));
   return n;

@@ -528,6 +528,18 @@ function rangeRects(w, from, to) {
 function onMoved(msg) {
   const b = bufOf(msg); if (!b) return;
   sync.buffers.delete(b.id);
+  /* This tab already holds a replica of the new id (an open of an old id edwind sent on): that one stays, and the
+     replica made for the old id is dropped here only. It is not shared any more, so its kill sends no close, which
+     would detach the replica that stays. Its opens settle with the one that stays. */
+  const have = sync.buffers.get(msg.to);
+  if (have && have !== b) {
+    b.shared = false; b.sync.opening = null;
+    const ws = b.sync.waiters.splice(0);
+    if (have.sync.opening || have.sver < 0) have.sync.waiters.push(...ws); else for (const w of ws) w.resolve(have);
+    if (E.buffers.includes(b)) { try { L.call('kill-buffer', [b]); } catch (e) { Ed.reportError(e); } Ed.scheduleRender(); }
+    sync.emit('moved', { buf: msg.buf, to: msg.to });
+    return;
+  }
   b.id = msg.to; b.file = msg.to; b.name = basename(msg.to);
   sync.buffers.set(b.id, b);
   b.sync.acked = new Set();

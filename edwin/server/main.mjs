@@ -242,8 +242,9 @@ export class Server {
       case 'server-edit': {
         const id = typeof args[0] === 'string' ? args[0] : (() => { throw new ProtoError('bad_request', 'server-edit needs a buffer id'); })();
         const line = Number.isInteger(args[1]) ? args[1] : null;
-        const r = B.resolve(id, true);
-        if (r.moved) return B.resolve(r.moved, true), { value: { buf: r.moved, exit: null } };
+        /* An old id of a renamed file edits the file where it is now, and waits as any other. */
+        let r = B.resolve(id, true);
+        if (r.moved) r = B.resolve(r.moved, true);
         const sb = r;
         if (!sb.serverEdit) sb.serverEdit = { waiters: [], saved: false, line };
         sb.lastOpen = Date.now();
