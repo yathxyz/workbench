@@ -3192,6 +3192,7 @@ const VIEW_KEYFN = { ranger: e => !e.ctrlKey && !e.metaKey && !e.altKey && rgKey
 window.addEventListener('keydown', e => {
   if (LEADER.pass) return;
   const k = WBKeys.keyName(e); if (!k) return;
+  if (e.repeat && (LEADER.on || k === leaderKeyName())) { e.preventDefault(); e.stopPropagation(); return; }   // a held leader is one press: its auto-repeat would pass the key through
   if (LEADER.on) { e.preventDefault(); e.stopPropagation(); leaderKey(k, e); return; }
   if (k === leaderKeyName()) { e.preventDefault(); e.stopPropagation(); leaderOpen(); return; }
   for (const s of WBKeys.resolve(keyContext(), k)) {
@@ -3205,6 +3206,8 @@ window.addEventListener('keydown', e => {
   }
 }, true);
 window.addEventListener('keyup', e => { if (e.key === ' ') space = false; });
+// a keyup that happens in another window or tab, or inside a frame, never comes here: leaving the page lets go of Space
+window.addEventListener('blur', () => { space = false; }); document.addEventListener('visibilitychange', () => { space = false; });
 
 // ------------------------------------------------------------------ pages: outliner keys, [[links]], ((refs)), backlinks
 function outlineEnter(view) {
@@ -8647,6 +8650,7 @@ AGENT_TOOLS.push(
 window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, frFileOpen, fsMv, noteOpen, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 Object.assign(window.__canvas, { keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
 Object.defineProperty(window.__canvas, 'activeId', { get: () => activeId });   // Object.assign would copy a getter's value once
+Object.defineProperty(window.__canvas, 'spaceHeld', { get: () => space });
 Object.assign(window.__canvas, { DESK, deskGo, deskSend, deskList, deskAt, deskPin, deskDelete, deskOff, deskPinned, serialize, activate, viewKey,
   OVL, RING, OVW, deskTile, deskPromote, deskSticky, deskLayout, deskOpenFolder, attnNext, attnBad, ovlToggle, ovlSend, ovwOpen, ringOpen, deskItems,
   deskPlace, deskBack, deskColumns, columnsShow, deskColumnOf, deskRevert, deskSaveState, deskDescribe, WIN, perspSwitch, deskSend });

@@ -261,6 +261,18 @@ v10 = await p.evaluate(() => ({ on: window.__canvas.LEADER.on, got: window.__got
 await p.keyboard.press('Control+Space'); await sleep(200);
 v10 = await p.evaluate(a => ({ ...a, on2: window.__canvas.LEADER.on, got2: window.__got }), v10);
 check('leader twice passes the key through and closes', v10.on && v10.got === 0 && !v10.on2 && v10.got2 === 1, JSON.stringify(v10));
+// N61 (F-A30): a held leader is one press, so its auto-repeat sends nothing to the terminal (Playwright marks a second
+// down of a key that is still down as a repeat); a keyup lost while the page is not focused does not leave Space held
+await p.evaluate(() => { window.__got = 0; });
+await p.keyboard.down('Control'); for (let i = 0; i < 4; i++) await p.keyboard.down('Space');
+await p.keyboard.up('Space'); await p.keyboard.up('Control'); await sleep(200);
+v10 = await p.evaluate(() => ({ on: window.__canvas.LEADER.on, got: window.__got }));
+await p.keyboard.press('Escape'); await sleep(100);
+await p.evaluate(() => document.activeElement?.blur());
+await p.keyboard.down('Space'); v10.held = await p.evaluate(() => window.__canvas.spaceHeld);
+v10.after = await p.evaluate(() => { window.dispatchEvent(new Event('blur')); return window.__canvas.spaceHeld; });
+await p.keyboard.up('Space');
+check('N61: a held leader opens the leader once and sends nothing to the terminal; a window blur lets go of Space', v10.on && v10.got === 0 && v10.held && !v10.after, JSON.stringify(v10));
 await p.evaluate(() => document.activeElement.blur());
 await p.evaluate(() => { const C = window.__canvas; const f = C.wsTop()[0]; C.wsEnter(f, true); });
 await p.keyboard.press('Control+Space'); await sleep(120); await p.keyboard.press('u'); await sleep(700);

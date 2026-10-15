@@ -199,7 +199,7 @@
     : (e.code === 'Space' || e.key === ' ') && e.ctrlKey && !e.metaKey && !e.shiftKey ? (e.altKey ? 'C-M-SPC' : 'C-SPC') : null;
   window.addEventListener('keydown', e => {
     const want = keys && keys.leader;
-    if (want && leaderOf(e) === want) { e.preventDefault(); e.stopPropagation(); send({ t: 'key', key: 'leader' }); }
+    if (want && leaderOf(e) === want) { e.preventDefault(); e.stopPropagation(); if (!e.repeat) send({ t: 'key', key: 'leader' }); }   // a held leader is one press
   }, true);
   window.addEventListener('message', ev => { if (ev.data && ev.data.claude === 'ping') say(); });
 })();
