@@ -74,6 +74,10 @@ def board(t, h):
             if msg.get("t") == "board":
                 return msg
 
+    note = next_board()
+    t.check("board: /rpc names the board's tag on connect, \"empty\" on a fresh install",
+            note == {"t": "board", "etag": EMPTY}, repr(note))
+
     st, hd, body = get()
     t.check("board: a fresh boardsDir gives null with ETag \"empty\"",
             (st, body, hd.get("etag"), hd.get("cache-control")) == (200, b"null", EMPTY, "no-store"),

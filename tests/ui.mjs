@@ -1139,6 +1139,31 @@ await section('N36', async () => {
   await B.close(); await settled(A);
 });
 
+// N64 (F-A7, §3.5.3): a save between a page's GET /api/board and its /rpc subscription reaches the page. Its boot GET is
+// answered with the board as it was, after another writer saved; /rpc opens only after /api/info, so no board notice
+// covers that save and only the connect snapshot's board{etag} can tell the page.
+await section('N64', async () => {
+  await settled(A);
+  const P = await ctx.newPage(); watchErrors(P); record(P);
+  let put = null;
+  await P.route('**/api/board', async r => {
+    if (r.request().method() !== 'GET' || put) return r.continue();
+    put = {};
+    const res = await r.fetch(), stale = await res.json(), board = structuredClone(stale);
+    const n = Object.values(board.nodes).find(n => n.kind === 'buffer'); n.x += 13;
+    const w = await api('/api/board', { method: 'PUT', headers: { 'Content-Type': 'application/json', 'If-Match': res.headers().etag }, body: JSON.stringify(board) });
+    Object.assign(put, { id: n.id, x: n.x, status: w.status, etag: w.headers.get('ETag'), stale: res.headers().etag });
+    await r.fulfill({ response: res, json: stale });
+  });
+  try {
+    await P.goto(ORIGIN + '/'); await until(() => P.evaluate(() => window.__canvas?.BOOTED));
+    const took = await until(() => P.evaluate(({ id, x }) => window.__canvas.S.nodes[id]?.x === x, put), 8000);
+    const st = await P.evaluate(id => ({ x: window.__canvas.S.nodes[id]?.x, etag: window.__canvas.BOARD_ETAG }), put.id), b = await barOf(P);
+    check('N64: a save between the page\'s GET /api/board and its /rpc subscription reaches the page: a clean page takes that board and its tag, with no bar',
+      put.status === 204 && put.etag !== put.stale && !!took && st.etag === put.etag && b.hidden, JSON.stringify({ put, st, b }));
+  } finally { await P.close(); await settled(A); }
+});
+
 // DELTA-1 §B.6: the new-terminal action offers /api/info.shells; the next one defaults to the last pick. The page is
 // given a second shell when the server offers fewer than two, since the picker only opens for a choice.
 await section('§B.6', async () => {
@@ -1606,9 +1631,6 @@ else {
   });
   await section('N19', async () => {
     const id = AID; await settled(AP);
-    // B must boot from a board that holds the card: SAVE can be idle here while the file still lacks it, and a save
-    // that lands before B's /rpc is subscribed never reaches B.
-    await until(() => !!boardFile()?.nodes?.[id], 10000);
     const { P: B, g } = await gatedPage();
     try {
       await until(async () => (await acpView(B, id))?.promptable, 20000);

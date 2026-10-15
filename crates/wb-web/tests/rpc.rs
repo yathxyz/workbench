@@ -61,6 +61,10 @@ async fn hub_status_and_sessions_follow_the_hub() {
         next_json(&mut rpc).await,
         json!({"t": "hub", "status": "down"})
     );
+    assert_eq!(
+        next_json(&mut rpc).await,
+        json!({"t": "board", "etag": "\"empty\""})
+    );
     let res = web.req("GET", "/api/sessions").send().await;
     assert_eq!(res.status, 503);
     assert_eq!(res.json(), json!({"error": "hub unavailable"}));
@@ -155,6 +159,7 @@ async fn a_new_rpc_client_gets_the_sessions_with_their_state() {
     web.wait_hub("up").await;
     let mut rpc = web.ws("/rpc").await;
     assert_eq!(next_json(&mut rpc).await["status"], "up");
+    assert_eq!(next_json(&mut rpc).await["t"], "board");
     assert_eq!(
         next_json(&mut rpc).await,
         json!({"t": "sessions", "sessions": [
@@ -172,8 +177,10 @@ async fn a_board_write_reaches_every_rpc_client() {
     let web = Web::start(&dir.path().join("hub.sock"));
     let mut a = web.ws("/rpc").await;
     let mut b = web.ws("/rpc").await;
-    assert_eq!(next_json(&mut a).await["t"], "hub");
-    assert_eq!(next_json(&mut b).await["t"], "hub");
+    for rpc in [&mut a, &mut b] {
+        assert_eq!(next_json(rpc).await["t"], "hub");
+        assert_eq!(next_json(rpc).await["t"], "board");
+    }
     let etag = web.req("GET", "/api/board").send().await;
     let res = web
         .req("PUT", "/api/board")
@@ -186,6 +193,41 @@ async fn a_board_write_reaches_every_rpc_client() {
     for rpc in [&mut a, &mut b] {
         assert_eq!(next_json(rpc).await, json!({"t": "board", "etag": tag}));
     }
+}
+
+/// A save between a tab's `GET /api/board` and its `/rpc` subscription reaches no feed,
+/// so the connect snapshot names the board as it is then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_rpc_client_gets_the_board_tag_on_connect() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = Web::start(&dir.path().join("hub.sock"));
+    let mut fresh = web.ws("/rpc").await;
+    assert_eq!(next_json(&mut fresh).await["t"], "hub");
+    assert_eq!(
+        next_json(&mut fresh).await,
+        json!({"t": "board", "etag": "\"empty\""})
+    );
+
+    let got = web.req("GET", "/api/board").send().await;
+    let loaded = got.header("etag").unwrap();
+    let res = web
+        .req("PUT", "/api/board")
+        .add("If-Match", loaded)
+        .body(r#"{"v":5,"nodes":{}}"#)
+        .send()
+        .await;
+    assert_eq!(res.status, 204);
+    let saved = res.header("etag").unwrap();
+    assert_ne!(saved, loaded);
+
+    let mut late = web.ws("/rpc").await;
+    assert_eq!(next_json(&mut late).await["t"], "hub");
+    assert_eq!(
+        next_json(&mut late).await,
+        json!({"t": "board", "etag": saved})
+    );
+    let now = web.req("GET", "/api/board").send().await;
+    assert_eq!(now.header("etag"), Some(saved));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
