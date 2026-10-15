@@ -18,6 +18,14 @@ let
     root = ../edwin;
     fileset = ../edwin;
   };
+  # The address suite cuts bufferAddress and friends out of web/app.js, so it sees that one file too.
+  edwinApp = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../edwin
+      ../web/app.js
+    ];
+  };
   # The edwind suites check MAX_LINE against wb-proto's (R7.2), so they see that one file of the crates.
   edwind = lib.fileset.toSource {
     root = ../.;
@@ -204,7 +212,7 @@ in
   '';
   edit-address = pkgs.runCommand "workbench-edit-address" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export NODE_PATH=${edwinDevDeps}/node_modules
-    node --test ${edwin}/test/address.test.mjs
+    node --test ${edwinApp}/edwin/test/address.test.mjs
     touch $out
   '';
 
