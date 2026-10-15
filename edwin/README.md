@@ -332,7 +332,9 @@ Migration (R8.16–R8.20, Q3): with the flag on, a page node without `buf` is mi
 `notes/<slug>.md` under notesDir (`-2`, `-3`… on a clash), its anchors re-created at their relocated
 positions, then `buf` is set and `text`/`anchors` dropped; wb-web's PUT guard keeps `buf` and strips `text`
 when an older tab writes the board, and copies the board to `<host>.pre-edwind.json` once before the first
-`buf` arrives.
+`buf` arrives. The page is held (no frame, no edit) until the board PUT carrying its `buf` is
+answered 204, so the file never differs from the text of a board that lost that save; a 412 shows the conflict
+bar rather than restarting the migration as R8.17 says.
 
 Choices E3 made where the spec left one open, and where it had to deviate:
 - **The focus tab is the enlarged card with its live frame**, not a second frame; the Editor view (Alt-4) is

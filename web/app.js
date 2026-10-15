@@ -212,7 +212,7 @@ function save() {
   SAVE.busy = true; SAVE.pending = true; clearTimeout(SAVE.retryT);
   fetch('/api/board', { method: 'PUT', redirect: 'manual', cache: 'no-store', headers: { 'Content-Type': 'application/json', 'If-Match': BOARD_ETAG }, body: json })
     .then(async r => {
-      if (r.status === 204) { BOARD_ETAG = r.headers.get('ETag'); SAVE.lastJson = json; SAVE.err = 0; SAVE.pending = SAVE.again; barClear('save'); return; }
+      if (r.status === 204) { BOARD_ETAG = r.headers.get('ETag'); SAVE.lastJson = json; SAVE.err = 0; SAVE.pending = SAVE.again; barClear('save'); if (FR.hold.size) frRelease(json); return; }
       if (r.type === 'opaqueredirect' || r.status === 401) { SAVE.paused = 'auth'; return netSet('signed_out'); }
       if (r.status === 412) {
         const theirs = (await r.json().catch(() => ({}))).etag;
@@ -2478,7 +2478,7 @@ function pipeFrom(n) {
     if (t.kind === 'buffer') {
       const ins = `\n*from ${pathOf(n.id)}:*\n\`\`\`\n${text.replace(/\s+$/, '')}\n\`\`\`\n`;
       if (L.view) { const doc = L.view.state.doc; L.view.dispatch({ changes: { from: doc.length, insert: ins }, scrollIntoView: true }); }
-      else frWhenBuf(t).then(b => b && frEdit(b, [[b.text.length, '', ins]]));
+      else frWhenWritable(t).then(b => b && frEdit(b, [[b.text.length, '', ins]]));
     } else if ((t.kind === 'agent' || t.kind === 'acp') && L.ta) {   // drafts into the composer, never sends
       L.ta.value = (L.ta.value ? L.ta.value + '\n' : '') + text; L.ta.focus();
     } else if (L.backend) {
@@ -3628,7 +3628,7 @@ const AGENT_TOOLS = [
       let n = findNode(path); if (!n) n = openPage(str(path), live[activeId] ? S.nodes[activeId] : null, true);
       if (n.kind !== 'buffer') throw new Error(path + ' is not a page');
       if (FR.on) {   // one edit batch through the replica, one undo group (R13.7)
-        const b = await frWhenBuf(n); if (!b) throw new Error(path + ': the page is not open in edwind');
+        const b = await frWhenWritable(n); if (!b) throw new Error(path + ': the page is not open in edwind');
         if (mode === 'replace') frReplaceAll(b, str(text)); else frAppend(b, str(text));
         pulse(n.id);
         return `ok, ${pathOf(n.id)} now has ${b.text.split('\n').length} lines`;
@@ -5732,8 +5732,8 @@ function seedInk() {
 // viewport plus one viewport of margin at zoom >= LOD_Z (or focused), at most FR_CAP per tab (least recently drawn
 // unfocused first); otherwise the card shows the 12-line snapshot from the replica text (Q8). A replica off screen for
 // FR_CLOSE_MS is closed. Pages without buf are migrated to notes/<slug>.md through the replica (R8.17, Q3).
-const FR = { on: false, ready: false, online: false, tried: false, state: null, Ed: null, L: null, booting: null, failed: null, byFrame: new WeakMap(), lastSeen: new Map(), offAt: new Map(), pending: new Map(), claimed: new Set(), anchorCache: {}, localAnchors: {}, perf: [], waiters: [], snapT: new Map(), snapMine: new Set(), moved: new Map() };
-const FR_CAP = 24, FR_FONT = 13, FR_CLOSE_MS = 5 * 60 * 1000, FR_OFF_TEXT = 'Editing is off: workbench-edit is not running';
+const FR = { on: false, ready: false, online: false, tried: false, state: null, Ed: null, L: null, booting: null, failed: null, byFrame: new WeakMap(), lastSeen: new Map(), offAt: new Map(), pending: new Map(), claimed: new Set(), anchorCache: {}, localAnchors: {}, perf: [], waiters: [], snapT: new Map(), snapMine: new Set(), moved: new Map(), hold: new Map() };
+const FR_CAP = 24, FR_FONT = 13, FR_CLOSE_MS = 5 * 60 * 1000, FR_HOLD_MS = 10000, FR_OFF_TEXT = 'Editing is off: workbench-edit is not running';
 // The runtime files in the order of edwin/index.html (host-browser first; markdown after org; ot and sync last).
 const FR_FILES = ['host-browser', 'scheme', 'runtime', 'text', 'editor-core', 'editor-prims', 'evil-core', 'pool', 'complete', 'extras', 'stack', 'ai', 'evil-ex', 'org', 'markdown', 'ot', 'sync'];
 const FR_SCM = ['emacs', 'evil', 'org', 'ai', 'init', 'notes-syntax', 'address', 'markdown'];
@@ -5937,7 +5937,7 @@ function frUpdate() {
 }
 // Frame creation is measured (§16.5: under 16 ms median for a 2 KB page) and exposed as window.__perf.frame.
 function frMake(n) {
-  const L = live[n.id]; if (!L || L.frame || !L.buf || !FR.ready) return null;
+  const L = live[n.id]; if (!L || L.frame || !L.buf || !FR.ready || FR.hold.has(n.id)) return null;
   const t0 = performance.now(); performance.mark('fr-frame-start');
   const f = FR.Ed.makeFrame(L.host, { buffer: L.buf, kind: 'card', fontSize: FR_FONT });
   performance.mark('fr-frame-end'); performance.measure('fr-frame', 'fr-frame-start', 'fr-frame-end');
@@ -5958,7 +5958,7 @@ function frDrop(n) {
 function frFocus(n, then) {
   const L = live[n.id]; if (!L?.host) return;
   const go = () => { const L2 = live[n.id]; if (!L2) return; if (!L2.frame && L2.buf) frMake(n); if (L2.frame) { FR.lastSeen.set(n.id, performance.now()); activate(n.id); L2.frame.focus(); if (then) then(L2.frame, L2.buf); } };
-  if (L.buf && L.buf.sver >= 0) go(); else frWhenBuf(n).then(b => { if (b) go(); });
+  if (L.buf && L.buf.sver >= 0 && !FR.hold.has(n.id)) go(); else frWhenWritable(n).then(b => { if (b) go(); });
 }
 // Leader then Esc, or (leave-frame): the keyboard goes back to the board and the card stays selected (R9.6).
 function frLeave(f) {
@@ -6029,6 +6029,7 @@ function frOverlays(id) {
 // ---- edits through the replica: one batch, one undo group of this frame (R13.7; the server tags the origin)
 function frEdit(b, ops) {
   const Ed = FR.Ed; if (!b || !b.shared || b.sver < 0) return false;
+  for (const h of FR.hold.values()) if (h.buf === b.id) return false;   // migrated, the board with its buf not saved yet
   ops = ops.filter(([, del, ins]) => (del && del.length) || (ins && ins.length)); if (!ops.length) return true;
   Ed.sync.pendingUndo = { g: ++b.sync.gCount };
   try { Ed.applyOps(b, ops, 'local'); } finally { Ed.sync.pendingUndo = null; }
@@ -6063,12 +6064,30 @@ function frAdopt(n) {
     for (const a of n.anchors || []) { const pos = relocate(text, a); FR.localAnchors[a.id] = { buf: chosen, pos, label: a.label || undefined }; Ed.sync.anchorAdd(chosen, pos, a.label || null, a.id).catch(e => console.warn('edwin anchor', a.id, e)); }
     n.buf = chosen; n.snap = text.split('\n').slice(0, 12).join('\n'); delete n.text; delete n.anchors;
     console.log(`edwin: migrated page ${n.name} -> ${chosen}`);
-    dirty(); frSnapRefresh(n); scheduleCrossRefresh(); frSchedule();
+    frHold(n, chosen); clearTimeout(saveT); saveT = null; save(); frSnapRefresh(n); scheduleCrossRefresh(); frSchedule();
     return chosen;
   })();
   FR.pending.set(n.id, p);
   p.catch(e => { console.warn('edwin migrate', n.name, e); toast(`Page ${n.name} could not be moved to edwind: ${e?.message || e}`, 6000); }).finally(() => FR.pending.delete(n.id));
   return p;
+}
+// A migrated page is held until the board PUT that carries its buf gets its 204: no frame, no edit through the replica.
+// Until then the file keeps exactly the node's text, so a migration whose board save never lands (the tab closed or
+// crashed, the PUT failing or paused, a 412 left on the conflict bar) is linked again by the next load (R8.18) instead
+// of an edited file being taken for another text and the page moved to <slug>-2.md.
+function frHold(n, buf) { let done; const p = new Promise(r => { done = r; }); FR.hold.set(n.id, { buf, p, done }); }
+function frRelease(json) {
+  const nodes = JSON.parse(json).nodes || {};
+  for (const [id, h] of FR.hold) if (nodes[id]?.buf || !S.nodes[id]) { FR.hold.delete(id); h.done(true); }   // saved with its buf, or gone
+  frSchedule();
+}
+// The replica of N for an edit: a held page waits for its board save, FR_HOLD_MS at most.
+async function frWhenWritable(n) {
+  const b = await frWhenBuf(n), h = FR.hold.get(n.id);
+  if (!b || !h) return b;
+  if (await Promise.race([h.p, new Promise(r => setTimeout(r, FR_HOLD_MS, false))])) return b;
+  toast(`${n.name} can be edited once the board is saved`);
+  return null;
 }
 // ---- the journal page through edwind (notes-journal makes journal/YYYY-MM-DD.md with its template)
 async function frOpenToday() {
@@ -6130,7 +6149,7 @@ function frEdLoad(n, pos) {
   if (ED.frame && ED.node !== n) { ED.frame.destroy(); ED.frame = null; }
   ED.node = n; S.edPage = n.id; dirty();
   const host = $('#ed-host');
-  frWhenBuf(n).then(b => {
+  frWhenWritable(n).then(b => {
     if (!b || ED.node !== n) return;
     if (!ED.frame) { const root = el('div', 'fr-ed'); host.replaceChildren(root); ED.frame = FR.Ed.makeFrame(root, { buffer: b, kind: 'card', fontSize: 14 }); }
     if (pos != null) ED.frame.setPoint(Math.min(pos, b.text.length));
@@ -6189,7 +6208,7 @@ async function pageSetText(n, text) {
   const L = live[n.id];
   if (L?.view) { L.view.dispatch({ changes: { from: 0, to: L.view.state.doc.length, insert: text } }); return true; }
   if (!n.buf) { n.text = text; dirty(); return true; }
-  const b = await frWhenBuf(n); return b ? frReplaceAll(b, text) : false;
+  const b = await frWhenWritable(n); return b ? frReplaceAll(b, text) : false;
 }
 // Exposed for the UI suite and debugging: the page's text in either mode, and the live frames count and timing.
 function pageTextById(id) { const n = S?.nodes[id]; return n ? pageText(n) : ''; }
