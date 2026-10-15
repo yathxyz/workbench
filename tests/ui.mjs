@@ -1466,6 +1466,9 @@ else {
   });
   await section('N19', async () => {
     const id = AID; await settled(AP);
+    // B must boot from a board that holds the card: SAVE can be idle here while the file still lacks it, and a save
+    // that lands before B's /rpc is subscribed never reaches B.
+    await until(() => !!boardFile()?.nodes?.[id], 10000);
     const { P: B, g } = await gatedPage();
     try {
       await until(async () => (await acpView(B, id))?.promptable, 20000);
@@ -2156,6 +2159,9 @@ await section('N56', async () => {
     check('N56: leader m 2 and leader 2 show desk 2 with only its items, the card loose out of its hidden folder; the board file keeps the Board exactly and no scratch desk',
       on.cur === 2 && on.ok && on.ain === null && (on.hid ?? true) && on.pager === '0 2*' && sameAs(pos, disk.nodes) && !(disk.desks || []).length && view?.desk === 2 && JSON.stringify(sd?.members?.[m.a]) === JSON.stringify(on.a),
       JSON.stringify({ on, sd, desks: disk.desks, diff: diffOf(pos, disk.nodes) }));
+    // The keyboard must be on the board: a page load focuses the docked terminal 60 ms after boot, which can land after
+    // the blur above, and a terminal keeps Alt-Shift-0 for itself.
+    await D.evaluate(() => document.activeElement?.blur?.());
     await D.keyboard.press('Alt+Shift+Digit0'); await sleep(400);
     const back = await geom(D), cur0 = await D.evaluate(() => window.__canvas.DESK.cur);
     await leader(D, '`');

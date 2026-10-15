@@ -24,6 +24,12 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 function fixtureDir(extra) {
   const dir = makeDir(extra);
   fs.cpSync(FIXTURES, dir.dirs.notes, { recursive: true });
+  /* cpSync keeps the source modes, and the fixtures read from the Nix store are read-only: give the copy back to
+     its owner so a test can write it. */
+  for (const e of fs.readdirSync(dir.dirs.notes, { recursive: true, withFileTypes: true })) {
+    const p = path.join(e.parentPath, e.name);
+    fs.chmodSync(p, fs.statSync(p).mode | 0o200);
+  }
   fs.mkdirSync(path.join(dir.dirs.notes, '.git'), { recursive: true });
   fs.writeFileSync(path.join(dir.dirs.notes, '.git', 'config'), '[core]\n');
   fs.mkdirSync(path.join(dir.dirs.notes, 'node_modules', 'pkg'), { recursive: true });
