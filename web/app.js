@@ -2826,11 +2826,11 @@ function glide(ev) {   // the pan's speed over its last 100 ms carries on and de
 }
 const isChrome = t => t.closest('.hdr button, .port, .rs, .flabel, .elabel, .deck');
 // middle-drag and Alt-drag pan from anywhere, also over a terminal or editor body, and never paste (Linux primary selection)
-const MID = { at: 0 };
+const MID = { at: -Infinity };   // not 0: performance.now() starts at 0, and a paste in the first 600 ms was swallowed
 // F-A31: a pen's barrel button (middle or right; the eraser end is button 5) pans like the middle button, hovering or
 // touching, and never inks. A stroke that gains a barrel button becomes a pan and drops its ink. A tip that lands
 // within 250 ms and 24 px of where a pen pan ended carries the pan on: a driver that splits barrel and tip leaves no dot.
-const PEN = { at: 0, end: 0, x: 0, y: 0 };
+const PEN = { at: -Infinity, end: -Infinity, x: 0, y: 0 };
 const barrel = ev => ev.pointerType === 'pen' && !(ev.buttons & 32) && (ev.button === 1 || ev.button === 2 || (ev.buttons & 6) !== 0);
 const penResume = ev => ev.pointerType === 'pen' && ev.button === 0 && performance.now() - PEN.end < 250 && Math.hypot(ev.clientX - PEN.x, ev.clientY - PEN.y) < 24;
 const panGrab = ev => !FOCUS.cur && ev.pointerType !== 'touch' && (ev.button === 1 || barrel(ev) || penResume(ev) || (ev.button === 0 && ev.altKey && !ev.ctrlKey && !ev.metaKey));
