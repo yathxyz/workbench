@@ -7522,7 +7522,7 @@ function cardActions() {
   if (!scope && !n) return toast('Select a card first: h j k l, or f for hints.');
   openPicker(scope ? 'Actions of ' + (G.N.get(G.sel)?.label || 'the node') : 'Actions of ' + n.name, scope ? buttonItems($$('button', scope)) : actionsFor(n));
 }
-// ---- right-click (F-A31): the palette at the pointer with what the item under it can do. Shift+right-click, text fields and
+// ---- right-click (F-A34): the palette at the pointer with what the item under it can do. Shift+right-click, text fields and
 // links keep the browser's menu (frames never send the event here); a terminal whose program tracks the mouse gets the
 // button itself (tmux's own menu). The menu key and Shift-F10 open it for what has the keys (a terminal, an Edwin frame),
 // else for the selected card on the canvas; a touch long-press is the same event, and it stops the pan the finger started.

@@ -261,7 +261,7 @@ v10 = await p.evaluate(() => ({ on: window.__canvas.LEADER.on, got: window.__got
 await p.keyboard.press('Control+Space'); await sleep(200);
 v10 = await p.evaluate(a => ({ ...a, on2: window.__canvas.LEADER.on, got2: window.__got }), v10);
 check('leader twice passes the key through and closes', v10.on && v10.got === 0 && !v10.on2 && v10.got2 === 1, JSON.stringify(v10));
-// N61 (F-A30): a held leader is one press, so its auto-repeat sends nothing to the terminal (Playwright marks a second
+// N64 (F-A33): a held leader is one press, so its auto-repeat sends nothing to the terminal (Playwright marks a second
 // down of a key that is still down as a repeat); a keyup lost while the page is not focused does not leave Space held
 await p.evaluate(() => { window.__got = 0; });
 await p.keyboard.down('Control'); for (let i = 0; i < 4; i++) await p.keyboard.down('Space');
@@ -272,8 +272,8 @@ await p.evaluate(() => document.activeElement?.blur());
 await p.keyboard.down('Space'); v10.held = await p.evaluate(() => window.__canvas.spaceHeld);
 v10.after = await p.evaluate(() => { window.dispatchEvent(new Event('blur')); return window.__canvas.spaceHeld; });
 await p.keyboard.up('Space');
-check('N61: a held leader opens the leader once and sends nothing to the terminal; a window blur lets go of Space', v10.on && v10.got === 0 && v10.held && !v10.after, JSON.stringify(v10));
-// N62 (F-A31): a right-click opens the palette at the pointer with the actions of the card, folder or canvas under it;
+check('N64: a held leader opens the leader once and sends nothing to the terminal; a window blur lets go of Space', v10.on && v10.got === 0 && v10.held && !v10.after, JSON.stringify(v10));
+// N65 (F-A34): a right-click opens the palette at the pointer with the actions of the card, folder or canvas under it;
 // Shift+right-click and a text field keep the browser's menu (a bubble listener sees the event not prevented); Delete removes
 {
   const rc = async (pt, shift) => {
@@ -319,14 +319,14 @@ check('N61: a held leader opens the leader once and sends nothing to the termina
   await p.evaluate(({ f }) => { const C = window.__canvas; for (const k of C.kidsOf(f)) C.removeNode(k.id); C.removeNode(f); Object.assign(C.S.cam, window.__rcCam); C.applyCam(); }, ids);
   const has = (o, ...ls) => o.open && o.at && ls.every(l => o.labels.includes(l));
   const native = (o, before) => !o.open && o.cm.length === before + 1 && o.cm.at(-1) === false;
-  check('N62: right-click opens the palette at the pointer: a card\'s actions with Delete, a folder\'s without its hidden buttons, New … here on the canvas and inside a folder (into it, at the pointer); Shift+right-click and a text field keep the native menu; Delete removes the card on its second pick',
+  check('N65: right-click opens the palette at the pointer: a card\'s actions with Delete, a folder\'s without its hidden buttons, New … here on the canvas and inside a folder (into it, at the pointer); Shift+right-click and a text field keep the native menu; Delete removes the card on its second pick',
     has(r.card, 'Delete', 'Tag…', 'Arrange: move and resize with the keys') && r.card.active === ids.n && Math.abs(r.card.x - pts.card.x) < 24 && Math.abs(r.card.y - pts.card.y) < 24
       && has(r.folder, 'Free', 'Workspace', 'Delete the folder (its items move up one level)') && !r.folder.labels.some(l => /unreachable|List this directory|click twice/.test(l)) && r.folder.active === ids.f
       && has(r.bg, 'New page here', 'New shell here', 'New folder here', 'Fit everything') && has(r.inside, 'New page here')
       && !!r.made && Math.abs(r.made.dx) <= 3 && Math.abs(r.made.dy) <= 3 && native(r.shift, 0) && native(r.input, 1) && r.armed.kept && r.armed.open && r.armed.sel === 'Delete: pick again to confirm' && r.deleted,
     JSON.stringify({ pts, ...r }));
 }
-// N63 (F-A31): closing the menu gives the keys back to the shell; the menu key follows the keys (the dock's terminal),
+// N66 (F-A34): closing the menu gives the keys back to the shell; the menu key follows the keys (the dock's terminal),
 // not the selected card; a Shift-F10 the page did not get leaves the next right-click a mouse one; selected ink is hit by
 // its box; where the menu would be empty the browser's stays; '.' in the graph with nothing selected opens nothing
 {
@@ -391,7 +391,7 @@ check('N61: a held leader opens the leader once and sends nothing to the termina
   await p.evaluate(({ sh }) => { const C = window.__canvas; C.pickClear(); C.S.strokes = C.S.strokes.filter(s => !s.id.startsWith('rcst')); C.renderInk(null);
     C.removeNode(sh); Object.assign(C.S.cam, window.__rcCam); C.applyCam(); }, ids);
   const pal = o => o.items.map(x => x[0]), clampTo = (v, a, b) => Math.min(Math.max(v, a), b);
-  check('N63: closing the right-click menu (Esc, a press outside, Copy) gives the keys back to the shell; the menu key in the dock is the dock\'s Terminal menu at the dock, not the selected card\'s; a Shift-F10 the page did not get leaves the next right-click at the pointer; a right-click on selected ink gives the Selection menu; the status line keeps the browser\'s menu',
+  check('N66: closing the right-click menu (Esc, a press outside, Copy) gives the keys back to the shell; the menu key in the dock is the dock\'s Terminal menu at the dock, not the selected card\'s; a Shift-F10 the page did not get leaves the next right-click at the pointer; a right-click on selected ink gives the Selection menu; the status line keeps the browser\'s menu',
     r.start && r.menu.open && r.menu.title === 'Actions of rc-sh' && r.esc && r.outside.keys && !r.outside.open && r.copy
       && r.dock.active && r.dockMenu.open && r.dockMenu.title === 'Terminal' && r.dockMenu.items.some(([l, s]) => l === 'Copy' && s === '') && Math.abs(r.dockMenu.x - clampTo(r.dock.x + 14, 16, r.dockMenu.iw - r.dockMenu.w - 16)) < 4 && Math.abs(r.dockMenu.y - clampTo(r.dock.y + 14, 16, r.dockMenu.ih - r.dockMenu.h - 16)) < 4
       && r.f10.open && r.f10.title === 'Canvas' && pal(r.f10).includes('New page here') && Math.abs(r.f10.x - out2.x) < 24 && Math.abs(r.f10.y - out2.y) < 24
@@ -690,10 +690,10 @@ await sleep(600);
 st = await p.evaluate(() => { const C = window.__canvas; const id = [...C.G.N.keys()][0]; C.graphSelect?.(id); return { sel: C.G.sel, card: !document.querySelector('#g-card').hidden, x: !!document.querySelector('#g-card .gc-x'), hint: document.querySelector('#g-card .gc-hint')?.textContent || '' }; });
 await p.keyboard.press('Escape'); await sleep(100);
 const gs = await p.evaluate(() => { const C = window.__canvas; const r = { sel: C.G.sel, card: !document.querySelector('#g-card').hidden }; C.graphSelect([...C.G.N.keys()][0]); document.querySelector('#g-card .gc-x').click(); r.afterX = C.G.sel;
-  C.cardActions(); r.pal = !document.getElementById('palette').hidden; return r; });   // N63: '.' with nothing selected lists no stale buttons
+  C.cardActions(); r.pal = !document.getElementById('palette').hidden; return r; });   // N66: '.' with nothing selected lists no stale buttons
 if (gs.pal) { await p.keyboard.press('Escape'); await sleep(100); }
 await p.evaluate(() => window.__canvas.setView('canvas'));
-check('graph: a selection shows a card with ✕ and a hint; Esc clears it, so does ✕; then \'.\' opens no palette (N63)', st.sel && st.card && st.x && /Esc, ✕ or a click on empty space/.test(st.hint) && gs.sel === null && !gs.card && gs.afterX === null && !gs.pal, JSON.stringify({ st, gs }));
+check('graph: a selection shows a card with ✕ and a hint; Esc clears it, so does ✕; then \'.\' opens no palette (N66)', st.sel && st.card && st.x && /Esc, ✕ or a click on empty space/.test(st.hint) && gs.sel === null && !gs.card && gs.afterX === null && !gs.pal, JSON.stringify({ st, gs }));
 
 // ---- v17 demo: spiral tiling, pane shares by dragging an edge, no ribbon ↔ tile ratchet, folder resize drives packing down to a stack
 await p.evaluate(() => window.__canvas.setView('canvas'));
@@ -1139,10 +1139,10 @@ await section('N36', async () => {
   await B.close(); await settled(A);
 });
 
-// N64 (F-A7, §3.5.3): a save between a page's GET /api/board and its /rpc subscription reaches the page. Its boot GET is
+// N67 (F-A7, §3.5.3): a save between a page's GET /api/board and its /rpc subscription reaches the page. Its boot GET is
 // answered with the board as it was, after another writer saved; /rpc opens only after /api/info, so no board notice
 // covers that save and only the connect snapshot's board{etag} can tell the page.
-await section('N64', async () => {
+await section('N67', async () => {
   await settled(A);
   const P = await ctx.newPage(); watchErrors(P); record(P);
   let put = null;
@@ -1159,7 +1159,7 @@ await section('N64', async () => {
     await P.goto(ORIGIN + '/'); await until(() => P.evaluate(() => window.__canvas?.BOOTED));
     const took = await until(() => P.evaluate(({ id, x }) => window.__canvas.S.nodes[id]?.x === x, put), 8000);
     const st = await P.evaluate(id => ({ x: window.__canvas.S.nodes[id]?.x, etag: window.__canvas.BOARD_ETAG }), put.id), b = await barOf(P);
-    check('N64: a save between the page\'s GET /api/board and its /rpc subscription reaches the page: a clean page takes that board and its tag, with no bar',
+    check('N67: a save between the page\'s GET /api/board and its /rpc subscription reaches the page: a clean page takes that board and its tag, with no bar',
       put.status === 204 && put.etag !== put.stale && !!took && st.etag === put.etag && b.hidden, JSON.stringify({ put, st, b }));
   } finally { await P.close(); await settled(A); }
 });
