@@ -2710,7 +2710,7 @@ function startInk(ev, erasing) {
   const r = viewport.getBoundingClientRect();
   if (erasing) {
     eraseAt(ev.clientX, ev.clientY);
-    const mv = e => { if (e.pointerId === pid) eraseAt(e.clientX, e.clientY); };
+    const mv = e => { if (e.pointerId !== pid) return; if (barrel(e)) { up(e); grabPan(e); } else eraseAt(e.clientX, e.clientY); };
     const up = e => { if (e.pointerId !== pid) return; viewport.removeEventListener('pointermove', mv); viewport.removeEventListener('pointerup', up); viewport.removeEventListener('pointercancel', up); };
     viewport.addEventListener('pointermove', mv); viewport.addEventListener('pointerup', up); viewport.addEventListener('pointercancel', up);
     return;
@@ -2722,13 +2722,14 @@ function startInk(ev, erasing) {
   const path = svgEl('path', { class: 'stroke c-' + inkColor }); inkLive.append(path);
   const mv = e => {
     if (e.pointerId !== pid) return;
+    if (barrel(e)) { off(); path.remove(); grabPan(e); return; }   // F-A31: the stroke became a pan; its ink goes
     for (const ce of (e.getCoalescedEvents?.() || []).length ? e.getCoalescedEvents() : [e]) add(ce);
     path.setAttribute('d', pathD(V.getStroke(pts, { ...strokeOpts({ size, sim }), last: false })));
   };
+  const off = () => { viewport.removeEventListener('pointermove', mv); viewport.removeEventListener('pointerup', up); viewport.removeEventListener('pointercancel', up); };
   const up = e => {
     if (e.pointerId !== pid) return;
-    viewport.removeEventListener('pointermove', mv); viewport.removeEventListener('pointerup', up); viewport.removeEventListener('pointercancel', up);
-    path.remove(); inkTrack(commitStroke(pts, sim, size));
+    off(); path.remove(); inkTrack(commitStroke(pts, sim, size));
   };
   viewport.addEventListener('pointermove', mv); viewport.addEventListener('pointerup', up); viewport.addEventListener('pointercancel', up);
 }
@@ -2820,15 +2821,28 @@ function glide(ev) {   // the pan's speed over its last 100 ms carries on and de
 const isChrome = t => t.closest('.hdr button, .port, .rs, .flabel, .elabel, .deck');
 // middle-drag and Alt-drag pan from anywhere, also over a terminal or editor body, and never paste (Linux primary selection)
 const MID = { at: 0 };
-const panGrab = ev => !FOCUS.cur && ev.pointerType !== 'touch' && (ev.button === 1 || (ev.button === 0 && ev.altKey && !ev.ctrlKey && !ev.metaKey));
+// F-A31: a pen's barrel button (middle or right; the eraser end is button 5) pans like the middle button, hovering or
+// touching, and never inks. A stroke that gains a barrel button becomes a pan and drops its ink. A tip that lands
+// within 250 ms and 24 px of where a pen pan ended carries the pan on: a driver that splits barrel and tip leaves no dot.
+const PEN = { at: 0, end: 0, x: 0, y: 0 };
+const barrel = ev => ev.pointerType === 'pen' && !(ev.buttons & 32) && (ev.button === 1 || ev.button === 2 || (ev.buttons & 6) !== 0);
+const penResume = ev => ev.pointerType === 'pen' && ev.button === 0 && performance.now() - PEN.end < 250 && Math.hypot(ev.clientX - PEN.x, ev.clientY - PEN.y) < 24;
+const panGrab = ev => !FOCUS.cur && ev.pointerType !== 'touch' && (ev.button === 1 || barrel(ev) || penResume(ev) || (ev.button === 0 && ev.altKey && !ev.ctrlKey && !ev.metaKey));
+function grabPan(ev) {   // this pointer, already captured or about to be, moves the camera until it lifts
+  MID.at = performance.now(); camStop(); GLIDE.ok = false;
+  if (ev.pointerType === 'pen') PEN.at = MID.at;
+  try { viewport.setPointerCapture(ev.pointerId); } catch {}
+  pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY }); viewport.classList.add('panning');
+}
 viewport.addEventListener('pointerdown', ev => {
   if (!panGrab(ev)) return;
-  ev.preventDefault(); ev.stopPropagation(); MID.at = performance.now(); camStop(); GLIDE.ok = false;
-  viewport.setPointerCapture(ev.pointerId); pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY }); viewport.classList.add('panning');
+  ev.preventDefault(); ev.stopPropagation(); grabPan(ev);
 }, true);
 for (const t of ['mousedown', 'mouseup', 'auxclick', 'click']) viewport.addEventListener(t, ev => { if (ev.button === 1) { ev.preventDefault(); ev.stopPropagation(); MID.at = performance.now(); } }, true);
+viewport.addEventListener('contextmenu', ev => { if (performance.now() - PEN.at < 600) ev.preventDefault(); }, true);   // a right-button barrel opens no menu
 window.addEventListener('paste', ev => { if (performance.now() - MID.at < 600) { ev.preventDefault(); ev.stopPropagation(); } }, true);
 viewport.addEventListener('pointerdown', ev => {
+  if (pointers.has(ev.pointerId) || barrel(ev)) return;   // the pan above holds it: a barrel never inks
   const pen = ev.pointerType === 'pen';
   if (pen) penSeen = true;
   const eraserButton = pen && (ev.button === 5 || (ev.buttons & 32));
@@ -2886,7 +2900,11 @@ viewport.addEventListener('pointermove', ev => {
     zoomAt(mx, my, d / pinch.d); pinch = { d, mx, my };
   }
 });
-const endPan = ev => { if (!pointers.delete(ev.pointerId)) return; pinch = null; if (!pointers.size) { viewport.classList.remove('panning'); if (GLIDE.ok) glide(ev); GLIDE.ok = false; } };
+const endPan = ev => {
+  if (!pointers.delete(ev.pointerId)) return; pinch = null;
+  if (ev.pointerType === 'pen') { PEN.at = PEN.end = performance.now(); PEN.x = ev.clientX; PEN.y = ev.clientY; }   // F-A31: for penResume
+  if (!pointers.size) { viewport.classList.remove('panning'); if (GLIDE.ok) glide(ev); GLIDE.ok = false; }
+};
 viewport.addEventListener('pointerup', endPan); viewport.addEventListener('pointercancel', endPan);
 viewport.addEventListener('wheel', e => {
   if (FOCUS.cur) return;
