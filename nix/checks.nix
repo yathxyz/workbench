@@ -230,6 +230,13 @@ in
     touch $out
   '';
 
+  # The display seam (DT0 of desktop Edwin): model frames laid out on a cell grid for a backend that is not a page,
+  # and the face and palette tables checked against index.html's, markdown-mode's and Org's stylesheets.
+  edwin-display = pkgs.runCommand "workbench-edwin-display" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    node --test ${edwin}/test/display.test.mjs
+    touch $out
+  '';
+
   # The frame runtime (E3 H1, §6.3, §7, §9.5): Edwin's core as a protocol client against a real edwind:
   # open and snap, batches and acks, transform against pending edits, undo by group, reconnect and resend,
   # image replication, server commands and ask, anchors, server-only stubs.
