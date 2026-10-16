@@ -745,6 +745,57 @@ check('N16 demo: the inlined page asks fonts.googleapis.com for nothing', !demoH
   await tc.close();
 }
 
+// ---------------- N62: a pen's barrel button (F-A31). CDP pen events: the button pressed in hover (middle as X11 Wacom
+// drivers send it, right as Windows Ink does) pans and inks nothing; the tip landing while the barrel is held, a barrel
+// pressed in the middle of a stroke, and a tip that lands where a barrel pan just ended all pan; plain strokes still ink.
+{
+  const T = await page('file://' + wrapped);
+  const cdp = await T.context().newCDPSession(T);
+  const BIT = { none: 0, left: 1, right: 2, middle: 4 };
+  const pen = (type, x, y, button = 'none', buttons = 0) => cdp.send('Input.dispatchMouseEvent', { type, x, y, button, buttons, pointerType: 'pen', clickCount: type === 'mouseMoved' ? 0 : 1 });
+  await pen('mouseMoved', 700, 400); await sleep(600);   // the first pen event turns on tablet mode
+  const pg = await T.evaluate(() => window.__canvas.addNode({ kind: 'buffer', name: 'n62-page', x: 30700, y: 30300, w: 360, h: 260, text: '# n62' }).id);
+  const home = () => T.evaluate(() => { const C = window.__canvas; Object.assign(C.S.cam, { x: 30000, y: 30000, z: 1 }); C.applyCam(); window.__n62menus ??= 0; });
+  await home(); await sleep(300);
+  await T.evaluate(() => addEventListener('contextmenu', e => { if (!e.defaultPrevented) window.__n62menus++; }));
+  const at = await T.evaluate(() => { const bare = (x, y) => ['viewport', 'world'].includes(document.elementFromPoint(x, y)?.id); for (let y = 300; y < 800; y += 20) for (let x = 400; x < 1200; x += 20) if (bare(x, y) && bare(x + 260, y)) return [x, y]; return null; });
+  const onPage = await T.evaluate(id => { const r = document.querySelector(`.node[data-id="${id}"] .body`).getBoundingClientRect(); return [r.x + 40, r.y + 60]; }, pg);
+  const run = async (from, steps) => {   // steps: ['down'|'up', button] or ['move', dx]; → strokes added, camera moved, menus opened
+    await home(); await sleep(400);
+    const st = () => T.evaluate(() => ({ n: window.__canvas.S.strokes.length, x: window.__canvas.S.cam.x, m: window.__n62menus }));
+    const a = await st(); let held = 0, [x, y] = from;
+    for (const [k, v] of steps) {
+      if (k === 'down') { held |= BIT[v]; await pen('mousePressed', x, y, v, held); }
+      else if (k === 'up') { held &= ~BIT[v]; await pen('mouseReleased', x, y, v, held); }
+      else if (k === 'wait') await sleep(v);
+      else for (let i = 0; i < 8; i++) { x += v / 8; await pen('mouseMoved', x, y, 'none', held); await sleep(10); }
+    }
+    await sleep(150); const b = await st();
+    return { ink: b.n - a.n, pan: Math.round(a.x - b.x), menus: b.m - a.m };
+  };
+  const r = {};
+  for (const t of ['select', 'pen', 'erase']) {
+    await T.evaluate(t => window.__canvas.setTool(t), t);
+    r[t] = {
+      mid: await run(at, [['down', 'middle'], ['move', 200], ['up', 'middle']]),
+      right: await run(at, [['down', 'right'], ['move', 200], ['up', 'right']]),
+      card: await run(onPage, [['down', 'middle'], ['move', 200], ['up', 'middle']]),
+      tip: await run(at, [['down', 'middle'], ['move', 20], ['down', 'left'], ['move', 200], ['up', 'left'], ['up', 'middle']]),
+      late: await run(at, [['down', 'left'], ['move', 24], ['down', 'right'], ['move', 200], ['up', 'right'], ['up', 'left']]),
+      tap: await run(at, [['down', 'middle'], ['move', 200], ['up', 'middle'], ['wait', 60], ['down', 'left'], ['up', 'left']]),
+    };
+  }
+  await T.evaluate(() => window.__canvas.setTool('pen'));
+  const stroke = await run(at, [['down', 'left'], ['move', 120], ['up', 'left']]), dot = await run(at, [['down', 'left'], ['up', 'left']]);
+  const pans = (o, d = 200) => o.ink === 0 && Math.abs(o.pan - d) < 2 && o.menus === 0;
+  check('N62: a pen\'s barrel button (middle or right) in hover pans the camera, over the canvas and over a page, with every tool, and leaves no ink or menu',
+    ['select', 'pen', 'erase'].every(t => pans(r[t].mid) && pans(r[t].right) && pans(r[t].card)), JSON.stringify(r));
+  check('N62: the tip landing while the barrel is held, a barrel pressed mid-stroke, and a tip that lands where a barrel pan just ended all pan and leave no ink',
+    ['select', 'pen', 'erase'].every(t => pans(r[t].tip, 220) && pans(r[t].late) && pans(r[t].tap)), JSON.stringify(r));
+  check('N62: a plain pen stroke and a pen tap well after a pan still ink and do not move the camera', stroke.ink === 1 && stroke.pan === 0 && dot.ink === 1 && dot.pan === 0, JSON.stringify({ stroke, dot }));
+  await T.close();
+}
+
 // ---------------- daemon phase: wb-hub, wb-web and Caddy from the harness
 const PORT = 18443, ORIGIN = `http://127.0.0.1:${PORT}`;
 const EXIT_HUB = 'the Workbench hub restarted';   // app.js EXIT_TEXT.hub_restart
