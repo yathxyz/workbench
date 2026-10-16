@@ -636,20 +636,21 @@ check('t cycles the keyword in the page; d pastes title + body into a shell tagg
 await p.keyboard.press('T'); await sleep(200);
 st = await p.evaluate(async ({ pg, sh }) => { const C = window.__canvas; const text = C.live[pg].view.state.doc.toString(); const r = await C.AGENT_TOOLS.find(x => x.name === 'set_task').run({ task: 'todo:3', keyword: 'DONE' }); const text2 = C.live[pg].view.state.doc.toString(); C.setView('canvas'); C.removeNode(pg); C.removeNode(sh); return { text, r, text2 }; }, tk);
 check('T cycles back (NEXT → TODO); set_task writes a keyword by reference', /- TODO Write the v15 tests/.test(st.text) && st.r === 'board:/todo:3 → DONE' && /- DONE Write the v15 tests/.test(st.text2), JSON.stringify(st));
-// N61 (F-A30): a long source path and a long unbroken title stay inside their column; the view picks 4, 2 or 1 columns
+// N61 (F-A30): a long source path and a long unbroken title stay inside their column; the view (window less dock) picks 4, 2 or 1 columns
 const tkFit = async () => p.evaluate(async () => { const C = window.__canvas, sl = ms => new Promise(r => setTimeout(r, ms)); C.setView('tasks'); await sl(250);
   const cols = getComputedStyle(document.querySelector('#tk-board')).gridTemplateColumns.split(' ').length, out = [];
   for (const col of document.querySelectorAll('#tk-board .tk-col')) { const cr = col.getBoundingClientRect(); for (const c of col.querySelectorAll('.tk-card, .tk-page .tl')) { const r = c.getBoundingClientRect(); if (r.left < cr.left - 0.5 || r.right > cr.right + 0.5) out.push(col.dataset.col + ':' + c.className); } }
   const card = [...document.querySelectorAll('.tk-card')].find(c => /Sequence_the_whole/.test(c.textContent)), t = card?.querySelector('.tk-t'), pg = card?.querySelector('.tk-page');
-  return { cols, out, lines: t ? Math.round(t.getBoundingClientRect().height / (parseFloat(getComputedStyle(t).lineHeight) || 18)) : 0, tail: pg?.querySelector('.tl')?.textContent, title: pg?.title, clipped: pg ? pg.querySelector('.hd').scrollWidth > pg.querySelector('.hd').clientWidth : null }; });
+  return { vw: document.querySelector('#v-tasks').clientWidth, cols, out, lines: t ? Math.round(t.getBoundingClientRect().height / (parseFloat(getComputedStyle(t).lineHeight) || 18)) : 0, tail: pg?.querySelector('.tl')?.textContent, title: pg?.title, clipped: pg ? pg.querySelector('.hd').scrollWidth > pg.querySelector('.hd').clientWidth : null }; });
 const LONGPG = '20220203010311-repeat_expansion_mediated_cytotoxicity_in_neurons';
 const longId = await p.evaluate(n => window.__canvas.addNode({ kind: 'buffer', name: n, x: 1500, y: 2100, w: 420, h: 200, text: '# ' + n + '\n\n- TODO Sequence_the_whole_' + 'x'.repeat(90) + '_genome\n' }).id, LONGPG);
 const fitW = await tkFit();
-await p.setViewportSize({ width: 900, height: 950 }); const fitM = await tkFit();
+// The dock takes its width from the view, so the middle size is set from the view's width, not the window's.
+await p.setViewportSize({ width: 1500 - fitW.vw + 760, height: 950 }); const fitM = await tkFit();
 await p.setViewportSize({ width: 500, height: 950 }); const fitS = await tkFit();
 await p.setViewportSize({ width: 1500, height: 950 });
 await p.evaluate(id => { const C = window.__canvas; C.setView('canvas'); C.removeNode(id); }, longId);
-check('tasks view (F-A30): a long source path and an unbroken title stay inside the column (title wraps, path keeps its tail, full path on hover); 4, 2 or 1 columns by the view\'s width', fitW.cols === 4 && fitM.cols === 2 && fitS.cols === 1 && [fitW, fitM, fitS].every(f => !f.out.length && f.lines >= 2 && /:\d+$/.test(f.tail || '') && f.title?.startsWith(LONGPG + ':')) && fitW.clipped, JSON.stringify({ fitW, fitM, fitS }));
+check('tasks view (F-A30): a long source path and an unbroken title stay inside the column (title wraps, path keeps its tail, full path on hover); 4, 2 or 1 columns by the view\'s width', [fitW, fitM, fitS].every(f => f.cols === (f.vw > 960 ? 4 : f.vw > 560 ? 2 : 1) && !f.out.length && f.lines >= 2 && /\d$/.test(f.tail || '') && f.title?.startsWith(LONGPG)) && fitW.cols === 4 && fitM.cols === 2 && fitS.cols === 1 && fitW.clipped, JSON.stringify({ fitW, fitM, fitS }));
 // ---- fix 1 rendering without a server (30 §1.2-§1.4, F-A19): diffs, elicitation forms, url requests, agent text as text
 st = await p.evaluate(() => {
   const C = window.__canvas, A = C.AcpBackend.prototype, rows = d => [...d.querySelectorAll('pre > div')].map(r => r.className + ':' + r.textContent);
