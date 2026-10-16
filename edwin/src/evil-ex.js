@@ -877,8 +877,11 @@ H.look = b => {
   o.showcmd = E.countStr + (E.register ? '"' + E.register : '') + E.opShow + pend;
   if (E.pendingKeys && !E.mini && !/^ESC$/.test(E.pendingKeys)) {
     const items = prefixBindings(E.pendingKeys);
-    if (items.length) o.prefixHelp = items.slice(0, 48).map(([k, d]) =>
-      `<span class="wk"><kbd>${escH(k)}</kbd>${escH(d instanceof Ed.Keymap ? '+prefix' : L.cmdName(d))}</span>`).join('');
+    if (items.length) {
+      /* As data for a frame with no page (display.js), and as the echo area's html. */
+      o.prefixItems = items.slice(0, 48).map(([k, d]) => [k, d instanceof Ed.Keymap ? '+prefix' : L.cmdName(d)]);
+      o.prefixHelp = o.prefixItems.map(([k, d]) => `<span class="wk"><kbd>${escH(k)}</kbd>${escH(d)}</span>`).join('');
+    }
   }
   return o;
 };

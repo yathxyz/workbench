@@ -12,7 +12,7 @@ first, undo undoes your own edits, and the runtime is Node.
 
 | Path | What |
 | --- | --- |
-| `src/*.js` | the editor, in the order `index.html` loads it: `scheme` `runtime` `text` `editor-core` `editor-prims` `evil-core` `pool` `complete` `extras` `stack` `ai` `evil-ex` `org` |
+| `src/*.js` | the editor, in the order `index.html` loads it: `scheme` `runtime` `text` `editor-core` `editor-prims` `evil-core` `pool` `complete` `extras` `stack` `ai` `evil-ex` `org` `markdown` `ot` `sync` `display` |
 | `scm/*.scm` | the shipped Scheme configuration (`emacs`, `evil`, `org`, `ai`, `init`), also inlined in `index.html` |
 | `index.html` | the page: styles, the Scheme blocks and the script tags. It loads `src/*.js` relative to itself, so serving this directory runs it, and a published copy keeps the `src/` paths |
 | `src/host-browser.js`, `src/host-node.js` | the host layer (R4.1): storage, the shipped Scheme, page attributes, suspend, clipboard, scheduling. The core reaches the page only through it and through frame objects |
@@ -24,6 +24,7 @@ first, undo undoes your own edits, and the runtime is Node.
 | `server/*.mjs` | edwind, the text daemon (E1; see "Step E1" below) |
 | `test/ot.test.mjs`, `test/ot-sim.mjs` | the OT properties with fast-check (`edwin-ot`; needs `NODE_PATH` at `tools/node_modules`) |
 | `test/conformance.test.mjs`, `test/crash.test.mjs`, `test/disk.test.mjs`, `test/edit-client.mjs` | the edwind gate suites (`edit-conformance`, `edit-crash`, `edit-disk`) and their client |
+| `src/display.js`, `test/display.test.mjs` | the display seam (DT0, see below): frames with no page, drawn on a cell grid for a terminal or native backend (`edwin-display`) |
 
 These files came from the published Edwin artifact (version 1791768765, 2026-10-12). From now on this directory is
 the source.
@@ -388,3 +389,45 @@ Choices E3 made where the spec left one open, and where it had to deviate:
 - **Not in E3**: K4 (Edwin keymaps in the board's conflict checker) waits for the keymaps PR; a display-text
   mechanism in the renderer (block-ref text is a DOM post-pass) and an `imenuItems` hook are left for later.
 
+## Step DT0: the display seam (in review)
+
+DT0 is the first step of desktop Edwin (the doc "Edwin on the Linux desktop", decided 2026-10-16: build through the
+GUI, DT0 then DT1 `edwin -nw` then DT2). A Rust shell will embed V8, run these same files and draw a terminal or a
+native window. For that the core must be able to draw a frame that is not a page. DT0 adds that and changes nothing
+on the page.
+
+- **Model frames.** `Ed.makeFrame(null, {backend, buffer, kind, theme})` makes a frame with no root element. The
+  backend has `size()` → `{cols, rows}`, `draw(model)` and optionally `bell()`. Each redisplay `src/display.js`
+  lays the frame out on that cell grid and calls `draw` with plain data (rows of styled segments, a face table, the
+  cursor and its shape, the window rectangles; the header of `display.js` has the format). `Ed.display.posAt(f, x, y)`
+  maps a cell back to a buffer position, the modeline or the echo area, for mouse input. `Ed.display.setTheme` and
+  `Ed.display.redraw` are for the backend's theme and size changes.
+- **Styled runs.** `renderBuffer(b, {runs: true, html: false})` gives each line its text and its spans as data
+  (`{s, e, cls}`, plus the cursor, avy labels, fold ellipsis and end-of-line region). The html of the page is byte
+  for byte what it was (a golden corpus of 54 renders was compared before and after, and the suite checks runs against html).
+- **Shared logic.** The page and the model now share `windowState`, `scrollStart`, `modelineFields`, `miniView`
+  and `echoView` in `editor-core.js`, so scrolling, the modeline, the minibuffer and the echo area cannot drift
+  apart. `evil-ex.js` gives the which-key bindings as data (`prefixItems`) besides the html, and `stack.js` says
+  when they wait (`prefixWait`).
+- **Faces as data.** `FACES` maps every class the renderer, Org and markdown-mode emit, and the modeline and echo
+  parts, to a spec in palette tokens with the page's fallback chains. `PALETTE` holds `index.html`'s light and dark
+  values. A token set with `set-face-color!` wins, as on the page. `display.test.mjs` parses `index.html`, the
+  markdown-mode and the Org stylesheets and fails when a face and its rule disagree, or when a class has no face.
+
+Choices made in DT0:
+
+- The cursor is not painted into the cells. The model reports it with its shape (box, bar, hbar, half, hollow) and
+  the Evil state's colour, so a terminal can use its own cursor.
+- Lines wrap as the page wraps them (after the last space that fits, else anywhere), tabs stop every 8 columns,
+  control characters show as `^X`, and East Asian wide characters and emoji take two cells. Truncated lines scroll
+  the whole window sideways, as the page's view does.
+- Windows share the room equally, as the page's flex layout does. Side-by-side windows get a one-cell divider. The
+  echo area takes at most half the rows. The line-number gutter is the widest number plus one cell.
+- The completion popup has a border on the page; in cells it has the menu background instead.
+- Fixed on the page too: with two or more terms in the minibuffer, only the last term was marked in the candidates
+  and the label was escaped twice. Every term is marked now.
+
+Not in DT0 (each is a later step or a known gap): the menubar of a console frame, the pulse animation, markdown block
+references drawn as their resolved text (a DOM pass in `markdown.js`), screen-line motion (`gj`/`gk` in
+visual-line-mode falls back to buffer lines in a model frame), and per-character pixel metrics for proportional
+fonts (DT2 decides).

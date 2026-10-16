@@ -389,6 +389,7 @@ function wrapLook() {
       }
     } else wkKeys = '';
     page.setAttr('which-key', wait ? 'wait' : undefined);
+    if (wait) o.prefixWait = true;
     return o;
   };
 }

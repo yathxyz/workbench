@@ -261,11 +261,13 @@ class Frame extends FrameState {
     this.kind = 'console'; this.fontSize = null; this.legacy = true; this.listeners = [];
   }
   /* The part NAME (frame, menubar, windows, echo, input, corfu, snipe, presence): given at creation, or the
-     element with that id inside the root, or the root itself. Parts made later (the popups) are found once made. */
+     element with that id inside the root, or the root itself. Parts made later (the popups) are found once made.
+     A model frame (no root, DT0) has no parts: null. */
   el(name) {
     const p = this.parts[name];
     if (p) return p;
-    const r = this.root, el = r.id === name ? r : r.querySelector('#' + name);
+    const r = this.root; if (!r) return null;
+    const el = r.id === name ? r : r.querySelector('#' + name);
     if (el) this.parts[name] = el;
     return el;
   }
@@ -289,7 +291,7 @@ class Frame extends FrameState {
   posFromPoint(x, y) { return withFrame(this, () => { const w = windowAt(x, y); return w ? posFromPoint(x, y, w) : null; }); }
   /* True while the frame's buffer has edits the server has not acknowledged (R9.15). */
   unacked() { const b = this.buffer; return !!(b && (b.inflight || (b.queue && b.queue.length))); }
-  setFontSize(px) { this.fontSize = px; this.root.style.setProperty('--text-size', px + 'px'); E.metricsGen++; scheduleRender(); }
+  setFontSize(px) { this.fontSize = px; if (this.root) this.root.style.setProperty('--text-size', px + 'px'); E.metricsGen++; scheduleRender(); }
   destroy() { deleteFrame(this); }
   __print() { return '#<frame ' + this.id + '>'; }
   get __type() { return 'frame'; }
@@ -297,9 +299,12 @@ class Frame extends FrameState {
 /* Ed.makeFrame(el, {buffer, kind: 'card' | 'console', fontSize}) builds a frame's parts inside EL: the
    windows, the echo area, the hidden input textarea and the presence layer, with a menubar for a console
    (R9.2, R9.3). The older form makeFrame(root, parts) takes a page that already holds the parts
-   (edwin/index.html). The window tree starts with one window on BUFFER (else the current buffer). */
+   (edwin/index.html). The window tree starts with one window on BUFFER (else the current buffer).
+   Ed.makeFrame(null, {backend, buffer, kind, theme}) makes a model frame (DT0): no page, no DOM; each redisplay
+   lays the frame out on backend.size()'s cell grid and hands the result to backend.draw (display.js). */
 function makeFrame(root, opts) {
   opts = opts || {};
+  if (!root) return makeModelFrame(opts);
   const built = 'kind' in opts || 'buffer' in opts || 'fontSize' in opts;
   const f = new Frame(root, built ? {} : opts);
   if (built) buildFrame(f, root, opts);
@@ -310,6 +315,19 @@ function makeFrame(root, opts) {
   if (!E.frame) selectFrame(f);
   if (built && hooks.wireFrame) hooks.wireFrame(f);
   if (built) { watchTheme(root); scheduleRender(); }
+  return f;
+}
+function makeModelFrame(opts) {
+  const be = opts.backend;
+  if (!be || typeof be.size !== 'function' || typeof be.draw !== 'function') signal('error', 'Ed.makeFrame: a frame needs an element, or a backend with size() and draw()');
+  const f = new Frame(null, {});
+  f.backend = be; f.legacy = false; f.kind = opts.kind === 'card' ? 'card' : 'console'; f.theme = opts.theme || null;
+  const b = (opts.buffer && toBuffer(opts.buffer)) || E.current || E.buffers[0];
+  f.wroot = f.sel = new Window(b); f.sel.pt = b.pt;
+  E.frames.push(f);
+  E.headless = false;
+  if (!E.frame) selectFrame(f);
+  scheduleRender();
   return f;
 }
 function buildFrame(f, root, opts) {
@@ -1121,7 +1139,7 @@ function message(s) {
     E.inhibitRO = was;
   }
 }
-function ding() { const f = E.frame && E.frame.root; if (!f) return; f.classList.remove('bell'); void f.offsetWidth; f.classList.add('bell'); }
+function ding() { if (E.frame && E.frame.backend) { if (E.frame.backend.bell) E.frame.backend.bell(); return; } const f = E.frame && E.frame.root; if (!f) return; f.classList.remove('bell'); void f.offsetWidth; f.classList.add('bell'); }
 function errorText(e) {
   if (e instanceof SchemeError) return L.errorMessage(e);
   if (e instanceof L.S.Raise) return L.errorMessage(e);
@@ -1835,7 +1853,12 @@ function vLineCount(b) { const F = foldsOf(b); if (!F) return lineCountB(b); ret
    lines it touches. Returns [{o, n, cl, html}], or one HTML string without lines.
    With o.cache (a Map from the previous render of the same window), the html of a line whose
    inputs (text, classes, flags, depths, the cursor) did not change is reused instead of being
-   built again from spans; the Map of the lines just rendered is returned as .cache. */
+   built again from spans; the Map of the lines just rendered is returned as .cache.
+   With o.runs (DT0, the display seam), each line instead carries .text (its text, no newline) and .runs,
+   the same spans as data for a backend that is not a page (display.js): {s, e, cls} with offsets from the
+   line start and the class string of the span, plus k: 'cur' (the cursor; e === s at the end of a line),
+   'avy' and 'ell' (t: the label or the fold ellipsis shown instead), 'eol' (the region past the end).
+   The two never share a cache; o.html === false skips the html. */
 let KBUF = new Uint16Array(1024);
 function renderBuffer(b, o) {
   const r = b.rope, n = r.length;
@@ -1871,10 +1894,12 @@ function renderBuffer(b, o) {
   const last = lastLineStart(r);
   const showPhantom = pt === n || n === 0;
   const out = [];
-  const cache = lines && !o.avy ? o.cache || null : null, next = lines && !o.avy ? new Map() : null;
+  const wantRuns = !!o.runs, wantHtml = o.html !== false || !wantRuns;
+  let R = null;
+  const cache = (lines || wantRuns) && !o.avy ? o.cache || null : null, next = (lines || wantRuns) && !o.avy ? new Map() : null;
   /* The cache key also names the class table (a mode's own lexer numbers its classes differently) and
      the fold ellipsis, which change a line's html without changing its text or keys. */
-  const ckPre = (o.active ? 1 : 0) + '|' + (o.cursorClass || '') + '|' + (ext ? 'x' : '') + '|' + ell + '|';
+  const ckPre = (o.active ? 1 : 0) + '|' + (o.cursorClass || '') + '|' + (ext ? 'x' : '') + '|' + ell + '|' + (wantRuns ? 'R' + (wantHtml ? 'H' : '') + '|' : '');
   let ln = lines ? lineNoB(b, ls) : 1, made = 0, vis = '';
   for (; ls <= n && made < count; ln++, made++) {
     const le = eolS(ls);
@@ -1894,16 +1919,19 @@ function renderBuffer(b, o) {
       const hit = cache ? cache.get(ck) : undefined;
       if (hit !== undefined) { next.set(ck, hit); pushLine(hit, le); continue; }
     }
+    if (wantRuns) R = [];
     const flush = end => {
       if (end <= start) return;
       const kk = kb[start - ls];
-      html += `<span class="${spanClass(names[kk >> 8], kk & 255)}" data-o="${start - rel}">${esc(t.slice(start, end))}</span>`;
+      if (R) R.push({ s: start - ls, e: end - ls, cls: spanClass(names[kk >> 8], kk & 255) });
+      if (wantHtml) html += `<span class="${spanClass(names[kk >> 8], kk & 255)}" data-o="${start - rel}">${esc(t.slice(start, end))}</span>`;
     };
     for (let k = ls; k <= le; k++) {
       if (o.avy && o.avy.has(k)) {
         flush(k);
         const lab = o.avy.get(k), w = Math.min(lab.length, Math.max(1, le - k));
-        html += `<span class="avy" data-o="${k - rel}">${esc(lab.slice(0, w))}</span>`;
+        if (R) R.push({ s: k - ls, e: k - ls + w, cls: 'avy', k: 'avy', t: lab.slice(0, w) });
+        if (wantHtml) html += `<span class="avy" data-o="${k - rel}">${esc(lab.slice(0, w))}</span>`;
         start = k + w; k += w - 1; continue;
       }
       if (k === pt) {
@@ -1911,28 +1939,34 @@ function renderBuffer(b, o) {
         const ch = t.charAt(k), atEnd = k === le;
         const kc = atEnd ? '' : cls ? CLS_NAMES[cls[k]] : ecls ? names[ecls[k - from]] || '' : '';
         const fk = flags[k - from] || 0;
-        html += `<span class="cur ${o.cursorClass || ''}${o.active ? '' : ' ghost'}${kc ? ' ' + kc : ''}${fk & FLAG.REGION ? ' rg' : ''}${fk & FLAG.PAREN ? ' pm' : ''}" data-o="${k - rel}" data-len="${atEnd ? 0 : 1}">${atEnd ? ' ' : esc(ch)}</span>`;
+        const ccls = `cur ${o.cursorClass || ''}${o.active ? '' : ' ghost'}${kc ? ' ' + kc : ''}${fk & FLAG.REGION ? ' rg' : ''}${fk & FLAG.PAREN ? ' pm' : ''}`;
+        if (R) R.push({ s: k - ls, e: atEnd ? k - ls : k - ls + 1, cls: ccls, k: 'cur' });
+        if (wantHtml) html += `<span class="${ccls}" data-o="${k - rel}" data-len="${atEnd ? 0 : 1}">${atEnd ? ' ' : esc(ch)}</span>`;
         start = atEnd ? k : k + 1;
         continue;
       }
       if (k === le) {
         flush(k);
-        if (le < n && (flags[le - from] & FLAG.REGION)) html += `<span class="rg eolsel" data-o="${le - rel}"> </span>`;
-        if (folds && foldEndingAt(folds, le)) html += ell;
+        if (le < n && (flags[le - from] & FLAG.REGION)) { if (R) R.push({ s: le - ls, e: le - ls, cls: 'rg eolsel', k: 'eol', t: ' ' }); if (wantHtml) html += `<span class="rg eolsel" data-o="${le - rel}"> </span>`; }
+        if (folds && foldEndingAt(folds, le)) { if (R) R.push({ s: le - ls, e: le - ls, cls: 'oe', k: 'ell', t: ellT }); if (wantHtml) html += ell; }
         break;
       }
       if (k > start && kb[k - ls] !== kb[start - ls]) { flush(k); start = k; }
     }
-    if (ck !== null) next.set(ck, html);
-    pushLine(html, le);
+    const val = !R ? html : wantHtml ? { html, runs: R } : R;
+    if (ck !== null) next.set(ck, val);
+    pushLine(val, le);
   }
-  function pushLine(html, le) {
+  function pushLine(val, le) {
     const num = o.numbers ? (o.numbers === 'relative' && ln !== curLine ? Math.abs(ln - curLine) : ln) : null;
-    out.push({ o: ls, n: num, cl: ln === curLine, html, pulse: o.pulse === ls });
+    if (wantRuns) {
+      const x = { o: ls, n: num, cl: ln === curLine, html: wantHtml ? val.html : undefined, pulse: o.pulse === ls, runs: wantHtml ? val.runs : val, text: seg.slice(ls - from, le - from) };
+      out.push(x);
+    } else out.push({ o: ls, n: num, cl: ln === curLine, html: val, pulse: o.pulse === ls });
     ls = le >= n ? n + 1 : le + 1;
     if (folds && ls <= n) { const f = foldAt(folds, ls); if (f) { ls = f.e + 1; if (ls > n) ls = n + 1; else ln = lineNoB(b, ls) - 1; } }
   }
-  if (lines) { out.seg = folds ? vis : seg; out.cache = next; return out; }
+  if (lines || wantRuns) { out.seg = folds ? vis : seg; out.cache = next; return out; }
   return out.map(x => x.html).join('\n');
 }
 function syncLines(view, lines) {
@@ -2080,28 +2114,25 @@ function ensureWindowDom() {
   if (root.firstChild !== top) { root.textContent = ''; root.appendChild(top); sizeChanged(); }
   while (root.children.length > 1) { root.removeChild(root.lastChild); sizeChanged(); }
 }
-function windowRows(w) { const m = metrics(w); return Math.max(1, Math.floor(m.ch0 / m.lh)); }
-function renderWindow(w) {
+function windowRows(w) { if (!w.view) return w.rows || 24; const m = metrics(w); return Math.max(1, Math.floor(m.ch0 / m.lh)); }
+/* What window W shows this redisplay, for the page and for display.js alike: whether it is the selected window
+   of the frame being drawn, its point, Evil's look, and the options its text is rendered with. */
+function windowState(w) {
   /* The selected window of a frame that is not the selected frame shows its own point (w.pt) with a ghost cursor. */
-  const b = w.buffer, view = w.view, selected = w === E.sel && FS() === (E.frame || E.implicit);
+  const b = w.buffer, selected = w === E.sel && FS() === (E.frame || E.implicit);
   const look = hooks.look ? hooks.look(b, w) : {};
   const nums = L.get('display-line-numbers');
   const numbers = nums === intern('relative') ? 'relative' : truthy(nums) && nums !== NIL ? 'absolute' : null;
-  const total = lineCountB(b);
-  /* Style and class writes only when they change: each one dirties style and layout. */
-  const gw = String(Math.max(2, String(total).length));
-  if (w._gw !== gw) { view.style.setProperty('--gw', gw); w._gw = gw; }
   const centered = truthy(localValue(b, 'centered-view-enabled'));
   const nowrap = truthy(L.get('truncate-lines')) && !truthy(localValue(b, 'visual-line-enabled'));
-  const vc = (numbers ? 'n' : '') + (nowrap ? 'w' : '') + (centered ? 'c' : '');
-  if (w._vc !== vc) { view.classList.toggle('numbers', !!numbers); view.classList.toggle('nowrap', nowrap); view.classList.toggle('centered', centered); w._vc = vc; }
-  if (w._selected !== selected) { w.el.classList.toggle('selected', selected); w._selected = selected; }
   const active = selected && !E.mini && E.focused;
-  if (view._buf !== b) { view.textContent = ''; view._buf = b; }
   const pt = selected ? b.pt : Math.min(w.pt, b.rope.length);
-  const m = metrics(w), rows = Math.max(1, Math.floor(m.ch0 / m.lh));
-  /* Line numbers here count shown lines (folds hide some); w.lastLine stays a real line number. */
-  const ptLine = vLineNo(b, pt);
+  const opts = { active, numbers, cursorClass: look.cursor || '', onChar: look.onChar, hl: look.hl, current: selected ? look.current : null, isearch: selected ? E.isearch : null, pt, avy: E.avy && E.avy.win === w ? E.avy.labels : null, pulse: selected && E.pulse && E.pulse.b === b ? E.pulse.ls : -1 };
+  return { b, selected, look, numbers, centered, nowrap, active, pt, opts };
+}
+/* The first shown line (shown-line numbers: folds hide some) of a window ROWS rows tall with point on shown
+   line PTLINE: the window's start, unless point left the window or a recenter (C-l, zz) is pending. */
+function scrollStart(w, b, ptLine, rows, selected) {
   if (w.start > b.rope.length) w.start = 0;
   w.start = bol(b.rope, w.start);
   let startLine = vLineNo(b, w.start);
@@ -2112,11 +2143,38 @@ function renderWindow(w) {
   else if (ptLine < startLine) startLine = startLine - ptLine <= 2 ? ptLine : Math.max(1, ptLine - Math.floor(rows / 2));
   else if (ptLine >= startLine + rows) startLine = ptLine - (startLine + rows) <= 1 ? ptLine - rows + 1 : Math.max(1, ptLine - Math.floor(rows / 2));
   if (selected) E.recenter = null;
-  const opts = { active, numbers, cursorClass: look.cursor || '', onChar: look.onChar, hl: look.hl, current: selected ? look.current : null, isearch: selected ? E.isearch : null, pt, avy: E.avy && E.avy.win === w ? E.avy.labels : null, pulse: selected && E.pulse && E.pulse.b === b ? E.pulse.ls : -1 };
+  return startLine;
+}
+/* The modeline's fields for window W (ST from windowState), read after the window is drawn (percent needs
+   w.lastLine): the Evil tag and its state, the modified mark, the buffer name, the position, the modes, the
+   macro note, the sync status and the pending command. */
+function modelineFields(w, st, ptLine) {
+  const { b, look, pt, selected } = st;
+  return {
+    tag: look.tag || '', state: look.state || '', mark: b.readOnly ? '%%' : b.modified ? '**' : '--', name: b.name,
+    pos: `L${foldsOf(b) ? lineNoB(b, pt) : ptLine} C${column(b.rope, pt)}  ${percent(w)}`,
+    mode: `(${MODE_NAMES[b.mode] || b.mode}${lighters(b)}${selected && E.isearch ? ' Isearch' : ''})`,
+    extra: look.extra || '', sync: hooks.modeStatus ? hooks.modeStatus(b, FS()) : '', cmd: selected ? look.showcmd || '' : '',
+  };
+}
+function renderWindow(w) {
+  const st = windowState(w), { b, selected, look, numbers, centered, nowrap, pt, opts } = st, view = w.view;
+  const total = lineCountB(b);
+  /* Style and class writes only when they change: each one dirties style and layout. */
+  const gw = String(Math.max(2, String(total).length));
+  if (w._gw !== gw) { view.style.setProperty('--gw', gw); w._gw = gw; }
+  const vc = (numbers ? 'n' : '') + (nowrap ? 'w' : '') + (centered ? 'c' : '');
+  if (w._vc !== vc) { view.classList.toggle('numbers', !!numbers); view.classList.toggle('nowrap', nowrap); view.classList.toggle('centered', centered); w._vc = vc; }
+  if (w._selected !== selected) { w.el.classList.toggle('selected', selected); w._selected = selected; }
+  if (view._buf !== b) { view.textContent = ''; view._buf = b; }
+  const m = metrics(w), rows = Math.max(1, Math.floor(m.ch0 / m.lh));
+  /* Line numbers here count shown lines (folds hide some); w.lastLine stays a real line number. */
+  const ptLine = vLineNo(b, pt);
+  let startLine = scrollStart(w, b, ptLine, rows, selected);
   let lines, fits = false;
   let cols = Math.floor((m.cw - (numbers ? (Math.max(2, String(total).length) + 2) * m.ch : 0)) / m.ch);
   /* centered-view-mode caps each line's text at --center-cols (index.html, set by extras.js). */
-  if (truthy(localValue(b, 'centered-view-enabled'))) cols = Math.min(cols, Number(host.page.getVar('center-cols')) || 100);
+  if (centered) cols = Math.min(cols, Number(host.page.getVar('center-cols')) || 100);
   // Wrapped lines take more than one row: render, measure, and move the start down until point fits.
   // When no shown line can wrap, every line is one row of m.lh and the geometry is known without layout.
   for (let tries = 0; tries < 4; tries++) {
@@ -2153,17 +2211,17 @@ function renderWindow(w) {
   view._lines = lines;
   /* The modeline fields are set only when they change: a DOM write dirties the layout even when
      the text is the same. */
-  const t = b.rope, mq = w._mq || (w._mq = {}), q = c => mq[c] || (mq[c] = w.ml.querySelector('.' + c));
+  const ml = modelineFields(w, st, ptLine), mq = w._mq || (w._mq = {}), q = c => mq[c] || (mq[c] = w.ml.querySelector('.' + c));
   const tag = q('ml-tag');
-  if (look.tag) { putText(tag, look.tag); if (tag._st !== look.state) { tag.dataset.state = look.state; tag._st = look.state; } }
-  if (tag._hid !== !look.tag) { tag.hidden = !look.tag; tag._hid = !look.tag; }
-  putText(q('ml-state'), b.readOnly ? '%%' : b.modified ? '**' : '--');
-  putText(q('ml-name'), b.name);
-  putText(q('ml-pos'), `L${foldsOf(b) ? lineNoB(b, pt) : ptLine} C${column(t, pt)}  ${percent(w)}`);
-  putText(q('ml-mode'), `(${MODE_NAMES[b.mode] || b.mode}${lighters(b)}${selected && E.isearch ? ' Isearch' : ''})`);
-  putText(q('ml-extra'), look.extra || '');
-  putText(q('ml-sync'), hooks.modeStatus ? hooks.modeStatus(b, FS()) : '');
-  putText(q('ml-cmd'), selected ? look.showcmd || '' : '');
+  if (ml.tag) { putText(tag, ml.tag); if (tag._st !== ml.state) { tag.dataset.state = ml.state; tag._st = ml.state; } }
+  if (tag._hid !== !ml.tag) { tag.hidden = !ml.tag; tag._hid = !ml.tag; }
+  putText(q('ml-state'), ml.mark);
+  putText(q('ml-name'), ml.name);
+  putText(q('ml-pos'), ml.pos);
+  putText(q('ml-mode'), ml.mode);
+  putText(q('ml-extra'), ml.extra);
+  putText(q('ml-sync'), ml.sync);
+  putText(q('ml-cmd'), ml.cmd);
   return look;
 }
 function putText(el, s) { if (el._t !== s) { el.textContent = s; el._t = s; } }
@@ -2182,22 +2240,64 @@ function echoMoved(echo) {
   const h = echo.offsetHeight;
   if (h !== echo._h) { echo._h = h; sizeChanged(); }
 }
+/* The minibuffer as data, for the page and display.js: the candidate count ("3/41", "0", null without completion),
+   the prompt, the flash, and the shown candidates (vertico-count of them around the selected one), each with its
+   label, annotation, whether it is selected, and MARKS, the [from, to) spans of the label that the input's
+   terms match. PAD is how many empty rows keep the list vertico-count tall when vertico-resize is #f. */
+function miniView() {
+  const m = E.mini, cands = m.completer ? miniCandidates() : [];
+  const label = m.opts.label || (s => s);
+  const annotate = m.opts.annotate || null;
+  const N = Math.max(3, Math.min(20, Number(L.get('vertico-count')) || 12));
+  if (m.index < m.scroll) m.scroll = Math.max(0, m.index);
+  if (m.index >= m.scroll + N) m.scroll = m.index - N + 1;
+  const terms = E.minibuf.text.trim().split(/\s+/).filter(Boolean).map(termRegex);
+  const items = cands.slice(m.scroll, m.scroll + N).map((c, i) => {
+    const lab = String(label(c));
+    return { label: lab, ann: annotate ? String(annotate(c) || '') : '', sel: i + m.scroll === m.index, marks: matchSpans(lab, terms) };
+  });
+  const pad = items.length && !truthy(L.get('vertico-resize')) ? Math.max(0, N - items.length) : 0;
+  return { count: m.completer ? (cands.length ? (m.index + 1) + '/' + cands.length : '0') : null, prompt: m.prompt, flash: E.miniFlash || '', items, pad };
+}
+/* The echo area outside the minibuffer, for the page and display.js: TEXT (a message, the isearch line, a key
+   prompt, else Evil's state line), or WHICH when a prefix key is pending and its bindings are shown instead. */
+function echoView(look) {
+  let text = E.echo || (E.depth === 0 ? look.stateEcho || '' : '');
+  const prompting = E.prompt !== null && E.prompt !== undefined;
+  if (E.isearch) { const s = E.isearch; text = `${s.failing ? 'Failing ' : ''}${s.wrapped ? 'Wrapped ' : ''}I-search${s.dir < 0 ? ' backward' : ''}: ${s.str}`; }
+  else if (prompting) text = E.prompt;
+  return { text: String(text), which: !!look.prefixHelp && !E.isearch && !prompting };
+}
+/* The spans of S that any of the regexps TERMS match, sorted and merged: [[from, to), ...]. */
+function matchSpans(s, terms) {
+  const spans = [];
+  for (const t of terms) {
+    let re; try { re = new RegExp(t.source, t.flags.includes('g') ? t.flags : t.flags + 'g'); } catch (e) { continue; }
+    for (const x of s.matchAll(re)) if (x[0]) spans.push([x.index, x.index + x[0].length]);
+  }
+  spans.sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (const sp of spans) { const last = out[out.length - 1]; if (last && sp[0] <= last[1]) last[1] = Math.max(last[1], sp[1]); else out.push(sp); }
+  return out;
+}
 /* Redisplay: every frame with page parts is drawn; a frame that is not selected is drawn only when
    what it shows changed since its last drawing. The selected frame is drawn last: the overlay hooks run
    for every frame drawn (with that frame current), and the ones that place the popups (corfu, snipe) on
    E.frame then leave them placed for the selected frame. */
 function render() {
-  const sel = E.frame, drawable = f => f.root && f.wroot && f.sel;
+  const sel = E.frame, drawable = f => (f.root || f.backend) && f.wroot && f.sel;
   for (const f of E.frames) if (f !== sel && drawable(f)) renderFrame(f);
   if (sel && drawable(sel)) renderFrame(sel);
 }
 function frameKey(f) {
-  let k = (f.mini ? 'm' : '') + f.echo + '|' + f.miniFlash + '|' + E.metricsGen + '|' + E.sizeGen + '|' + (hooks.statusKey ? hooks.statusKey() : '');
+  let k = (f.mini ? 'm' : '') + f.echo + '|' + f.miniFlash + '|' + E.metricsGen + '|' + E.sizeGen + '|' + (hooks.statusKey ? hooks.statusKey() : '') + (f.backend ? '|' + f.focused + ':' + f.theme + ':' + JSON.stringify(f.backend.size()) : '');
   for (const w of leaves(f.wroot)) { const b = w.buffer; k += `|${w.id}:${b.id}:${b.ver}:${w.pt}:${w.start}:${b.presence ? b.presence.length + ':' + (b._presTick || 0) : ''}`; }
   return k;
 }
 function renderFrame(f) {
   if (f !== E.frame) { const k = frameKey(f); if (k === f._rkey) return; f._rkey = k; }
+  /* A model frame (no page) is laid out and drawn by display.js, which sets hooks.renderModel. */
+  if (f.backend) { if (hooks.renderModel) withFrame(f, () => hooks.renderModel(f)); return; }
   withFrame(f, () => renderOne(f));
 }
 function renderOne(f) {
@@ -2207,31 +2307,19 @@ function renderOne(f) {
   let look = {};
   for (const w of windowList()) { const l = renderWindow(w); if (w === E.sel) look = l; }
   if (E.mini) {
-    const m = E.mini, cands = m.completer ? miniCandidates() : [];
-    const label = m.opts.label || (s => s);
-    const annotate = m.opts.annotate || null;
-    const N = Math.max(3, Math.min(20, Number(L.get('vertico-count')) || 12));
-    if (m.index < m.scroll) m.scroll = Math.max(0, m.index);
-    if (m.index >= m.scroll + N) m.scroll = m.index - N + 1;
-    const shown = cands.slice(m.scroll, m.scroll + N);
-    const terms = E.minibuf.text.trim().split(/\s+/).filter(Boolean).map(termRegex);
-    const hl = c => { let out = esc(c); for (const t of terms) { try { out = c.replace(new RegExp(t.source, t.flags.includes('g') ? t.flags : t.flags + 'g'), x => '\u0001' + x + '\u0002'); out = esc(out).replace(/\u0001/g, '<b>').replace(/\u0002/g, '</b>'); c = out.replace(/<\/?b>/g, ''); } catch (e) { /* keep */ } } return out; };
-    let rows = shown.map((c, i) => {
-      const k = i + m.scroll, lab = label(c), ann = annotate ? annotate(c) : '';
-      return `<div class="cand${k === m.index ? ' sel' : ''}"><span class="cl">${hl(lab)}</span>${ann ? `<span class="ca">${esc(ann)}</span>` : ''}</div>`;
-    }).join('');
-    if (rows && !truthy(L.get('vertico-resize'))) rows += '<div class="cand"> </div>'.repeat(Math.max(0, N - shown.length));
-    const count = m.completer ? `<span class="cc">${cands.length ? (m.index + 1) + '/' + cands.length : '0'}</span>` : '';
-    setEcho(echo, `<div class="miniline">${count}<span class="prompt">${esc(m.prompt)}</span><span class="mb">${renderBuffer(E.minibuf, { active: E.focused, lines: false, cursorClass: 'bar' })}</span>` +
-      (E.miniFlash ? `<span class="flash">${esc(E.miniFlash)}</span>` : '') + `</div>` + (rows ? `<div class="cands">${rows}</div>` : ''), true);
+    const v = miniView();
+    const hl = it => { let out = '', k = 0; for (const [a, z] of it.marks) { out += esc(it.label.slice(k, a)) + '<b>' + esc(it.label.slice(a, z)) + '</b>'; k = z; } return out + esc(it.label.slice(k)); };
+    let rows = v.items.map(it => `<div class="cand${it.sel ? ' sel' : ''}"><span class="cl">${hl(it)}</span>${it.ann ? `<span class="ca">${esc(it.ann)}</span>` : ''}</div>`).join('');
+    rows += '<div class="cand"> </div>'.repeat(v.pad);
+    const count = v.count !== null ? `<span class="cc">${v.count}</span>` : '';
+    setEcho(echo, `<div class="miniline">${count}<span class="prompt">${esc(v.prompt)}</span><span class="mb">${renderBuffer(E.minibuf, { active: E.focused, lines: false, cursorClass: 'bar' })}</span>` +
+      (v.flash ? `<span class="flash">${esc(v.flash)}</span>` : '') + `</div>` + (rows ? `<div class="cands">${rows}</div>` : ''), true);
     echo.classList.add('active');
   } else {
     echo.classList.remove('active');
-    let text = E.echo || (E.depth === 0 ? look.stateEcho || '' : '');
-    if (E.isearch) { const s = E.isearch; text = `${s.failing ? 'Failing ' : ''}${s.wrapped ? 'Wrapped ' : ''}I-search${s.dir < 0 ? ' backward' : ''}: ${s.str}`; }
-    else if (E.prompt !== null && E.prompt !== undefined) text = E.prompt;
-    if (look.prefixHelp && !E.isearch && (E.prompt === null || E.prompt === undefined)) setEcho(echo, `<span class="wkp">${esc(look.showcmd || '')}-</span>${look.prefixHelp}`, true);
-    else setEcho(echo, text, false);
+    const v = echoView(look);
+    if (v.which) setEcho(echo, `<span class="wkp">${esc(look.showcmd || '')}-</span>${look.prefixHelp}`, true);
+    else setEcho(echo, v.text, false);
   }
   f.root.classList.toggle('unfocused', !f.focused);
   /* Display overlays (block-ref text, the popups) for this frame: F is current (withFrame) for the duration. */
@@ -2310,7 +2398,7 @@ globalThis.Ed = {
   reportError, errorText, quietQuit, QUIET, feedKey, unreadKeys, flushReplay, nextKey, readMini, exitMini, abortMini, completeMini, historyMove,
   miniCandidates, miniMove, miniInsert, markUsed, termRegex, histories, historyFor, prescient, annotateCommand, annotateFunction, annotateVariable, annotateBuffer, annotateFile, readKeySeq, readChar, commandNames, functionNames, variableNames, bufferNames, isCommand, prefixNumeric, specArgs,
   specCodes, callInteractively, undoStep, redoStep, snap, runCommand, dispatch, commandLoop, executeKeys, isearch, render, renderBuffer,
-  posFromPoint, windowAt, lineHeight, whenIdle, frameRender, onScroll, scrollWindow, lineIndex, lineNoB, lineStartB, lineCountB, foldAt, vLineNo, vLineStart, vLineCount, windowRows, ensureWindowDom, Window, Split, windowList, selectWindow, splitWindow, deleteWindow, deleteOtherWindows, winConfig, restoreWinConfig, saveWinConfig, windowFor, popToBuffer, leaves, get queueLength() { return queue.length; },
+  posFromPoint, windowAt, lineHeight, whenIdle, frameRender, windowState, scrollStart, modelineFields, miniView, echoView, matchSpans, percent, foldsOf, onScroll, scrollWindow, lineIndex, lineNoB, lineStartB, lineCountB, foldAt, vLineNo, vLineStart, vLineCount, windowRows, ensureWindowDom, Window, Split, windowList, selectWindow, splitWindow, deleteWindow, deleteOtherWindows, winConfig, restoreWinConfig, saveWinConfig, windowFor, popToBuffer, leaves, get queueLength() { return queue.length; },
   runCallback,
 };
 })();
