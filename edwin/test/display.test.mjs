@@ -236,6 +236,28 @@ test('themes, set-face-color!, markdown and Org faces resolve to colours', async
   assert.deepEqual(D.glyphsOf({ text: '*b*', runs: [{ s: 0, e: 1, cls: 'oh' }, { s: 1, e: 2, cls: 'obb' }, { s: 2, e: 3, cls: 'oh' }] }).map(g => g.w), [0, 1, 0]);
 });
 
+test('a wrapped line taller than the window keeps the cursor row in view', async () => {
+  const long = 'x'.repeat(1500);
+  const b = await show('d13.txt', 'fundamental-mode', long + '\nend', 1490);
+  const m = draw();
+  assert.ok(m.cursor, 'the cursor is shown');
+  assert.ok(m.cursor.y < 14);
+  assert.equal(D.posAt(frame, m.cursor.x, m.cursor.y).pos, 1490);
+  b.pt = 0; assert.equal(draw().cursor.y, 0);
+});
+
+test('other writers keep their colours (sync.js gives hsl)', async () => {
+  assert.deepEqual(D.parseColor('hsl(120 100% 25%)').map(Math.round), [0, 128, 0, 1]);
+  const b = await show('d14.txt', 'text-mode', 'hello world', 0);
+  b.presence = [{ label: 'ann', color: 'hsl(200 65% 45%)', ranges: [[6, 6]] }, { label: 'bob', color: 'hsl(20 65% 45%)', ranges: [[0, 4]] }];
+  const m = draw();
+  assert.deepEqual(m.presence.map(p => [p.x, p.y, p.label]), [[6, 0, 'ann']]);
+  assert.equal(m.presence[0].color, '#288cbd');
+  assert.equal(faceAt(m, 6, 0).bg, '#288cbd');
+  assert.notEqual(faceAt(m, 1, 0).bg, faceAt(m, 8, 0).bg, 'a selection is tinted with its writer colour');
+  b.presence = null;
+});
+
 test('ding rings the backend', () => { const n = bells; Ed.ding(); assert.equal(bells, n + 1); });
 
 test('runs reproduce the html renderer: same text, same classes, and the html is unchanged by asking for runs', async () => {
