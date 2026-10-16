@@ -4749,7 +4749,8 @@ function renderTasks() {
       if (t.idx && t.tags?.length) bits.push([t.tags.map(x => '#' + x).join(' '), '']);
       for (const [txt, cls] of bits) { const sp = el('span', cls, txt); meta.append(sp); }
       if (!bits.length) meta.remove();
-      $('.tk-page', c).textContent = taskWhere(t); $('.tk-page', c).title = taskAddr(t);
+      const where = taskWhere(t), cut = Math.max(0, where.length - 14), pgb = $('.tk-page', c);
+      pgb.append(el('span', 'hd', where.slice(0, cut)), el('span', 'tl', where.slice(cut))); pgb.dataset.addr = taskAddr(t); pgb.title = where + '\n' + taskAddr(t);
       $('.tk-page', c).onclick = () => taskOpen(t);
       const mv = $('.tk-mv', c), order = ['TODO', 'NEXT', 'WAITING', 'DONE'], i = order.indexOf(k);
       if (i > 0) { const b = el('button', 'mini'); b.textContent = '←'; b.title = 'Move to ' + order[i - 1]; b.onclick = () => taskSetKw(t, order[i - 1]); mv.append(b); }
