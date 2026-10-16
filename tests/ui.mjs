@@ -618,7 +618,7 @@ st = await p.evaluate(async () => { const C = window.__canvas, S = C.S, sl = ms 
   const pg = C.addNode({ kind: 'buffer', name: 'todo', x: 1500, y: 1500, w: 420, h: 300, text: '# todo\n\n- TODO Write the v15 tests [#A]\n  SCHEDULED: <2026-10-01 Wed>\n  cover the four columns\n- NEXT Ship version 30\n  DEADLINE: <2099-01-01 Fri>\n- HOLD Wait for the build host\n- CANCELLED Old idea\n' });
   const sh = C.addNode({ kind: 'term', backend: 'fake', name: 'agentsh', env: {}, x: 2000, y: 1500, w: 440, h: 300 }); C.setTags(sh, ['agent']); await sl(300);
   C.setView('tasks'); await sl(200);
-  const cols = [...document.querySelectorAll('#tk-board .tk-col')].map(c => c.dataset.col + ':' + [...c.querySelectorAll('.tk-card')].filter(x => x.querySelector('.tk-page').title.startsWith('board:/todo:')).length);
+  const cols = [...document.querySelectorAll('#tk-board .tk-col')].map(c => c.dataset.col + ':' + [...c.querySelectorAll('.tk-card')].filter(x => x.querySelector('.tk-page').dataset.addr.startsWith('board:/todo:')).length);
   const card = [...document.querySelectorAll('.tk-card')].find(c => /Write the v15 tests/.test(c.textContent)), meta = card?.querySelector('.tk-meta')?.textContent, over = !!card?.querySelector('.tk-meta .over');
   const hold = [...document.querySelectorAll('.tk-card')].find(c => /Wait for the build host/.test(c.textContent)), holdCol = hold?.closest('.tk-col').dataset.col, holdTitle = hold?.querySelector('.tk-t').textContent;
   const t = C.allTasks().find(x => x.text.startsWith('Write the v15')); const ttext = C.taskText(t), found = C.findTask('todo:3')?.line === 3 && C.findTask('board:/todo:3')?.node === t.node;
@@ -630,12 +630,26 @@ check('tasks view: four columns over the keyword set, priority and dates as meta
 await p.keyboard.press('t'); await sleep(200);
 const pgText1 = await p.evaluate(id => window.__canvas.live[id].view.state.doc.toString(), tk.pg);
 await p.keyboard.press('d'); await sleep(900);
-st = await p.evaluate(({ pg, sh }) => { const C = window.__canvas; const text = C.live[pg].view.state.doc.toString(); const m = text.match(/session:: board:(\S+)/), target = m && (C.findNode(m[1]) || C.findNode(m[1].replace(/^\//, ''))), term = target ? C.termLines(C.live[target.id], 20).join('|') : '', agentTag = target && C.tagsOf(target).includes('agent'); const cols = [...document.querySelectorAll('#tk-board .tk-col')].map(c => c.dataset.col + ':' + [...c.querySelectorAll('.tk-card')].filter(x => x.querySelector('.tk-page').title.startsWith('board:/todo:')).length); const sess = [...document.querySelectorAll('.tk-card .tk-meta .sess')].map(x => x.textContent); return { text, term, agentTag, cols, sess }; }, tk);
+st = await p.evaluate(({ pg, sh }) => { const C = window.__canvas; const text = C.live[pg].view.state.doc.toString(); const m = text.match(/session:: board:(\S+)/), target = m && (C.findNode(m[1]) || C.findNode(m[1].replace(/^\//, ''))), term = target ? C.termLines(C.live[target.id], 20).join('|') : '', agentTag = target && C.tagsOf(target).includes('agent'); const cols = [...document.querySelectorAll('#tk-board .tk-col')].map(c => c.dataset.col + ':' + [...c.querySelectorAll('.tk-card')].filter(x => x.querySelector('.tk-page').dataset.addr.startsWith('board:/todo:')).length); const sess = [...document.querySelectorAll('.tk-card .tk-meta .sess')].map(x => x.textContent); return { text, term, agentTag, cols, sess }; }, tk);
 // st.term joins the terminal's rows with |, and a narrow card wraps the pasted line.
 check('t cycles the keyword in the page; d pastes title + body into a shell tagged #agent and writes session:: / dispatched:: under the task', /- NEXT Write the v15 tests \[#A\]/.test(pgText1) && st.agentTag && /Write the v15 tests cover the four columns/.test(st.term.replaceAll('|', '')) && /\n  session:: board:\/\S+\n  dispatched:: 20\d\d-\d\d-\d\dT\d\d:\d\d\n  SCHEDULED: <2026-10-01 Wed>/.test(st.text) && st.cols.join() === 'TODO:0,NEXT:2,WAITING:1,DONE:1' && st.sess.some(x => /^⇢ board:\//.test(x)), JSON.stringify({ pgText1, st }));
 await p.keyboard.press('T'); await sleep(200);
 st = await p.evaluate(async ({ pg, sh }) => { const C = window.__canvas; const text = C.live[pg].view.state.doc.toString(); const r = await C.AGENT_TOOLS.find(x => x.name === 'set_task').run({ task: 'todo:3', keyword: 'DONE' }); const text2 = C.live[pg].view.state.doc.toString(); C.setView('canvas'); C.removeNode(pg); C.removeNode(sh); return { text, r, text2 }; }, tk);
 check('T cycles back (NEXT → TODO); set_task writes a keyword by reference', /- TODO Write the v15 tests/.test(st.text) && st.r === 'board:/todo:3 → DONE' && /- DONE Write the v15 tests/.test(st.text2), JSON.stringify(st));
+// N61 (F-A30): a long source path and a long unbroken title stay inside their column; the view picks 4, 2 or 1 columns
+const tkFit = async () => p.evaluate(async () => { const C = window.__canvas, sl = ms => new Promise(r => setTimeout(r, ms)); C.setView('tasks'); await sl(250);
+  const cols = getComputedStyle(document.querySelector('#tk-board')).gridTemplateColumns.split(' ').length, out = [];
+  for (const col of document.querySelectorAll('#tk-board .tk-col')) { const cr = col.getBoundingClientRect(); for (const c of col.querySelectorAll('.tk-card, .tk-page .tl')) { const r = c.getBoundingClientRect(); if (r.left < cr.left - 0.5 || r.right > cr.right + 0.5) out.push(col.dataset.col + ':' + c.className); } }
+  const card = [...document.querySelectorAll('.tk-card')].find(c => /Sequence_the_whole/.test(c.textContent)), t = card?.querySelector('.tk-t'), pg = card?.querySelector('.tk-page');
+  return { cols, out, lines: t ? Math.round(t.getBoundingClientRect().height / (parseFloat(getComputedStyle(t).lineHeight) || 18)) : 0, tail: pg?.querySelector('.tl')?.textContent, title: pg?.title, clipped: pg ? pg.querySelector('.hd').scrollWidth > pg.querySelector('.hd').clientWidth : null }; });
+const LONGPG = '20220203010311-repeat_expansion_mediated_cytotoxicity_in_neurons';
+const longId = await p.evaluate(n => window.__canvas.addNode({ kind: 'buffer', name: n, x: 1500, y: 2100, w: 420, h: 200, text: '# ' + n + '\n\n- TODO Sequence_the_whole_' + 'x'.repeat(90) + '_genome\n' }).id, LONGPG);
+const fitW = await tkFit();
+await p.setViewportSize({ width: 900, height: 950 }); const fitM = await tkFit();
+await p.setViewportSize({ width: 500, height: 950 }); const fitS = await tkFit();
+await p.setViewportSize({ width: 1500, height: 950 });
+await p.evaluate(id => { const C = window.__canvas; C.setView('canvas'); C.removeNode(id); }, longId);
+check('tasks view (F-A30): a long source path and an unbroken title stay inside the column (title wraps, path keeps its tail, full path on hover); 4, 2 or 1 columns by the view\'s width', fitW.cols === 4 && fitM.cols === 2 && fitS.cols === 1 && [fitW, fitM, fitS].every(f => !f.out.length && f.lines >= 2 && /:\d+$/.test(f.tail || '') && f.title?.startsWith(LONGPG + ':')) && fitW.clipped, JSON.stringify({ fitW, fitM, fitS }));
 // ---- fix 1 rendering without a server (30 §1.2-§1.4, F-A19): diffs, elicitation forms, url requests, agent text as text
 st = await p.evaluate(() => {
   const C = window.__canvas, A = C.AcpBackend.prototype, rows = d => [...d.querySelectorAll('pre > div')].map(r => r.className + ':' + r.textContent);
