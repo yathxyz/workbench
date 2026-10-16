@@ -6380,11 +6380,16 @@ async function imageOpen(n) {
   if (n.blob && imgUrl(n)) { window.open(imgUrl(n), '_blank', 'noopener'); return; }
   try { const u = URL.createObjectURL(await imageBlobOf(n)); window.open(u, '_blank', 'noopener'); setTimeout(() => URL.revokeObjectURL(u), 60000); } catch (e) { toast('Cannot open the image: ' + (e?.message || e)); }
 }
-// the image itself on the system clipboard, as PNG (the one image type every browser writes), for another program
+// the image itself on the system clipboard, as PNG (the one image type every browser writes), for another program, with
+// its URL as the text side; the board remembers the card under that text, so a paste back here is the same card (clipRecall)
+const imgClipText = n => n.blob ? location.origin + '/blob/' + n.blob : n.name;
 function imageCopy(n, quiet) {
   if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') { if (!quiet) toast('This browser cannot put images on the clipboard; ↗ opens the image to copy it from there.', 5000); return Promise.resolve(false); }
+  const text = imgClipText(n), c = { id: n.id, kind: 'image', name: n.name, x: n.x, y: n.y, w: n.w, h: n.h };
+  for (const k of COPY_FIELDS.image) if (n[k] !== undefined) c[k] = n[k];
+  clipRemember(text, { v: 1, cards: [c], strokes: [], shapes: [], edges: [] });
   const png = imageBlobOf(n).then(b => b.type === 'image/png' ? b : imgRedraw(b).then(r => r.data));
-  return navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]).then(
+  return navigator.clipboard.write([new ClipboardItem({ 'image/png': png, 'text/plain': new Blob([text], { type: 'text/plain' }) })]).then(
     () => { toast(`${n.name}: the image is on the clipboard (PNG). Paste it into another program, or here.`); return true; },
     e => { if (!quiet) toast('Could not copy the image: ' + (e?.message || e)); return false; });
 }
@@ -6408,6 +6413,12 @@ viewport.addEventListener('drop', e => {
 const WB_MIME = 'application/x-workbench-items';
 // kinds a copy duplicates, and the fields each keeps; a live card (shell, agent, artifact) or a folder is not copied
 const COPY_FIELDS = { image: ['blob', 'src', 'mime', 'iw', 'ih'], sketch: [], web: ['url'], ref: ['text', 'src', 'srcLabel'], buffer: ['text'] };
+// The last copy, by its text side, for the clipboards that carry no board items: the async clipboard (the palette's paste)
+// and the system clipboard after an image copy, which holds the PNG and the text only. Per device, so another tab of
+// this browser pastes it too; a text that matches nothing pastes as text.
+const clipKey = () => 'wb-clip-' + (INFO?.host || location.host);
+function clipRemember(text, items) { if (text) store.set(clipKey(), JSON.stringify({ text, items })); }
+function clipRecall(text) { if (!text) return null; try { const c = JSON.parse(store.get(clipKey())); return c && c.text === text ? c.items : null; } catch { return null; } }
 function canvasClipOk() {
   if (!S || !BOOTED || VIEW !== 'canvas') return false;
   const c = keyContext(); return !c.transient && (!c.interior || c.interior === 'control');
@@ -6426,7 +6437,7 @@ function copyItems() {
     for (const k of keep) if (n[k] !== undefined) c[k] = JSON.parse(JSON.stringify(n[k]));
     if (n.kind === 'buffer') { const t = live[n.id]?.view ? live[n.id].view.state.doc.toString() : FR.on && n.buf ? frBufOf(n)?.text : n.text; if (t == null) { skipped.push(n); continue; } c.text = t; }
     cards.push(c); ok.add(id);
-    texts.push(n.kind === 'image' ? (n.blob ? location.origin + '/blob/' + n.blob : n.name) : n.kind === 'web' ? n.url || '' : n.kind === 'buffer' || n.kind === 'ref' ? c.text || '' : n.name);
+    texts.push(n.kind === 'image' ? imgClipText(n) : n.kind === 'web' ? n.url || '' : n.kind === 'buffer' || n.kind === 'ref' ? c.text || '' : n.name);
   }
   // ink: the copied cards' own (not ink anchored to a page's lines), and the selected loose ink in board coordinates
   const ink = [];
@@ -6459,7 +6470,7 @@ function clipCopy(ev, cut) {
   if (!got.items) { toast('Nothing to copy.' + clipNote(got.skipped)); return; }
   const it = got.items;
   ev.clipboardData.setData(WB_MIME, JSON.stringify(it, (k, v) => k.startsWith('_') ? undefined : v));
-  ev.clipboardData.setData('text/plain', got.text);
+  ev.clipboardData.setData('text/plain', got.text); clipRemember(got.text, it);
   const parts = []; if (it.cards.length) parts.push(it.cards.length + (it.cards.length === 1 ? ' card' : ' cards')); if (it.strokes.length) parts.push(it.strokes.length + ' strokes'); if (it.shapes.length) parts.push(it.shapes.length + (it.shapes.length === 1 ? ' shape' : ' shapes'));
   if (cut) {
     const gone = new Set(it.strokes.map(x => x.id)), owners = new Set(S.strokes.filter(x => gone.has(x.id)).map(x => x.owner || null));
@@ -6480,9 +6491,10 @@ document.addEventListener('paste', ev => { if (canvasClipOk() && ev.clipboardDat
 function pasteData(dt, at = pastePoint()) {
   const items = dt.getData(WB_MIME);
   if (items) { try { if (pasteItems(JSON.parse(items), at)) return true; } catch {} }
+  const text = dt.getData('text/plain'), mine = clipRecall(text);
+  if (mine && pasteItems(mine, at)) return true;
   const files = [...(dt.files || [])].filter(f => /^image\//.test(f.type));
   if (files.length) { imagesOnCanvas(files, at); return true; }
-  const text = dt.getData('text/plain');
   if (text && text.trim()) { pasteText(text, at); return true; }
   return false;
 }
@@ -6552,10 +6564,11 @@ function pasteItems(p, at = pastePoint()) {
 // the palette's way in (a touch screen has no Ctrl-V, and Safari fires no paste on the board): the async clipboard
 async function pasteFromClipboard() {
   if (!navigator.clipboard?.read) {
-    try { const t = await navigator.clipboard.readText(); if (t.trim()) return pasteText(t); } catch {}
+    try { const t = await navigator.clipboard.readText(), mine = clipRecall(t); if (mine && pasteItems(mine)) return; if (t.trim()) return pasteText(t); } catch {}
     return toast('This browser does not let the page read the clipboard. Press Ctrl-V (⌘V) on the board instead.', 5000);
   }
   let items; try { items = await navigator.clipboard.read(); } catch { return toast('Clipboard read is not allowed here. Press Ctrl-V (⌘V) on the board instead.', 5000); }
+  for (const it of items) if (it.types.includes('text/plain')) { const mine = clipRecall(await (await it.getType('text/plain')).text()); if (mine && pasteItems(mine)) return; }
   const files = [];
   for (const it of items) { const t = it.types.find(x => /^image\//.test(x)); if (t) files.push(new File([await it.getType(t)], 'image', { type: t })); }
   if (files.length) return imagesOnCanvas(files);
@@ -8901,7 +8914,7 @@ AGENT_TOOLS.push(
   { name: 'host_status', description: 'Health of a host: load, memory, disk, uptime, shells, tmux sessions, unit counts (failed names). host: a name from hosts.json (empty = the serving daemon).', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
     run: async ({ host } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j = await (await hFetch(h, '/api/status')).json(); const gb = b => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}` + (j.sessions?.tmux != null ? ', tmux sessions ' + j.sessions.tmux : ''), j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
-window.__canvas = { s2w, pasteData, pasteItems, pasteText, imagesOnCanvas, copyItems, imgUrl, typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
+window.__canvas = { s2w, clipRecall, pasteData, pasteItems, pasteText, imagesOnCanvas, copyItems, imgUrl, typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 Object.assign(window.__canvas, { keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
 Object.defineProperty(window.__canvas, 'activeId', { get: () => activeId });   // Object.assign would copy a getter's value once
 Object.assign(window.__canvas, { DESK, deskGo, deskSend, deskList, deskAt, deskPin, deskDelete, deskOff, deskPinned, serialize, activate, viewKey,
