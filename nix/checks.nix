@@ -159,6 +159,12 @@ in
     touch $out
   '';
 
+  # The intrinsics lockdown every thread of edwind runs in place of --frozen-intrinsics (R14.11, R16.16).
+  edit-lockdown = pkgs.runCommand "workbench-edit-lockdown" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    node --test ${edwind}/edwin/test/lockdown.test.mjs
+    touch $out
+  '';
+
   # A real edwind in a temp directory, under bin/edwind's Node flags, over every §7 message and error code,
   # the limits, chunking, resend, replay, the E1 server commands and the socket checks (R14.3, R16.12, R16.16, R16.17).
   edit-conformance = pkgs.runCommand "workbench-edit-conformance" { nativeBuildInputs = [ pkgs.nodejs ]; } ''

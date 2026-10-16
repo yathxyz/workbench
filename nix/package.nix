@@ -74,13 +74,14 @@ rustPlatform.buildRustPackage {
     # R14.11. R14.12's permission model is not among them: Node disables fsync under it, which the journal
     # and atomic save need (R8.3, R8.7); edwind guards child_process in-process instead (edwin/README.md, E1).
     # No --stack-size: main.mjs runs the server on a worker thread whose stack it sizes for the Scheme cap.
+    # No --frozen-intrinsics: it slowed the Scheme evaluator 2.3 times; each thread runs lockdown.mjs instead.
     mkdir -p $out/share/edwin
     cp -r edwin/src edwin/scm edwin/server $out/share/edwin/
     cat > $out/bin/edwind <<EOF
     #!${stdenv.shell}
     : "\''${EDWIND_MEMORY_MIB:=1024}"
     export WB_EDIT_BUILD=$WB_EDIT_BUILD
-    exec ${nodejs}/bin/node --disallow-code-generation-from-strings --frozen-intrinsics \
+    exec ${nodejs}/bin/node --disallow-code-generation-from-strings \
       --no-warnings=ExperimentalWarning --max-old-space-size="\$EDWIND_MEMORY_MIB" \
       $out/share/edwin/server/main.mjs "\$@"
     EOF

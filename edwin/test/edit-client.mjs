@@ -28,9 +28,10 @@ export function makeDir(extra = {}) {
    so the gate suites test edwind as the unit runs it. Node's permission model (`--permission`, R14.12) is not
    among them: Node 22 and 24 disable fsync and fdatasync under it, which R8.3 and R8.7 need; edwind guards
    child_process in-process instead (main.mjs guardProcesses). No --stack-size: the server runs on a worker
-   thread whose stack main.mjs sizes for the Scheme cap of 10,000 frames (R4.34). */
+   thread whose stack main.mjs sizes for the Scheme cap of 10,000 frames (R4.34). No --frozen-intrinsics: it made
+   the Scheme evaluator 2.3 times slower; every thread of edwind runs lockdown.mjs instead. */
 export function nodeFlags() {
-  return ['--disallow-code-generation-from-strings', '--frozen-intrinsics', '--no-warnings=ExperimentalWarning'];
+  return ['--disallow-code-generation-from-strings', '--no-warnings=ExperimentalWarning'];
 }
 
 /* Every edwind this process started dies with it, whatever the test did. */

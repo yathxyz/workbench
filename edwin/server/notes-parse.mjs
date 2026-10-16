@@ -7,6 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { isMainThread, parentPort, workerData } from 'node:worker_threads';
+import { lockdown } from './lockdown.mjs';
 
 export const MAX_FILE_BYTES = 4 * 1024 * 1024;
 export const NOTE_EXT = /\.(md|org)$/i;
@@ -374,6 +375,7 @@ function parseItem(item, G) {
 }
 
 if (!isMainThread && workerData && workerData.notesWorker) {
+  lockdown();
   let G = compileGrammar(workerData.grammar);
   const { syncPort, signal } = workerData;
   /* A grep job over MSG.files (live text or a file to read): the hits, at most MSG.max. */

@@ -1,5 +1,5 @@
 // The worker pool on the Node host (R4.47, R15.3): `node --test edwin/test/pool.test.mjs`, plain and under
-// edwind's flags (`node --disallow-code-generation-from-strings --frozen-intrinsics --test ...`).
+// edwind's flag (`node --disallow-code-generation-from-strings --test ...`).
 //
 // Edwin boots headless as edwind does (host-node.js), with threads from edwin/server/worker.mjs running the
 // named jobs of edwin/server/jobs.mjs and the Scheme futures of pool.js. One Edwin per process, so the cases

@@ -85,11 +85,20 @@ Running edwind by hand: `edwind --config edit.json` where `edit.json` has at lea
 
 Choices E1 made where the spec left one open, and where it had to deviate:
 - **No `--permission` (R14.12).** Node 22 and 24 disable `fsync` and `fdatasync` under the permission model, and the
-  journal and atomic save need both (R8.3, R8.7). `bin/edwind` runs with `--disallow-code-generation-from-strings`,
-  `--frozen-intrinsics`, `--max-old-space-size` and `--stack-size`; `main.mjs` replaces every function of
+  journal and atomic save need both (R8.3, R8.7). `bin/edwind` runs with `--disallow-code-generation-from-strings`
+  and `--max-old-space-size` (the intrinsics lockdown is in-process, next item); `main.mjs` replaces every function of
   `child_process` before anything else runs (`guardProcesses`, R4.45), and the Authority in `paths.mjs` is the
   one check on file writes, with the unit's `ProtectSystem=strict` and `ReadWritePaths` behind it. The
   conformance suite checks the flags in effect and the guard (R16.16).
+- **No `--frozen-intrinsics` (R14.11), since 2026-10-16.** The flag made the Scheme evaluator 2.3 times slower
+  (gen mode, geometric mean of the server bench: 131 ms against 59): V8 leaves its fast paths for every
+  object once any property of `Array.prototype` or `Object.prototype` is read-only. `server/lockdown.mjs`
+  does the flag's work with Node's own lists, in every thread of edwind (`main()`, `worker.mjs`, the notes
+  thread), except that those two prototypes are sealed, not frozen: they take no new keys and lose none (the
+  prototype-pollution case), but an assignment over one of their existing methods is no longer refused. The
+  functions they hold are frozen. Iterator and generator prototypes keep read-only data properties instead
+  of the flag's override accessors, which cost every for-of loop and generator step. The server thread logs
+  `"lockdown":"locked"` on its `listen` line; `test/lockdown.test.mjs` is the suite.
 - **Stack size.** The Scheme cap of 10,000 frames (R4.34) needs about 7 MiB of JS stack in direct mode (about
   8.4 MiB in E2's generator mode); Node's default reaches about 1,500. E1 sized `--stack-size` from `ulimit -s`;
   since E2 `main.mjs` runs the server on a worker thread whose stack it sizes itself (`runInThread`, 32 MiB,

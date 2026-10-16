@@ -13,6 +13,9 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import * as jobs from './jobs.mjs';
+import { lockdown } from './lockdown.mjs';
+
+lockdown(); // before the core files load, as --frozen-intrinsics was (lockdown.mjs)
 
 const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src');
 const load = f => { const p = path.join(SRC, f); vm.runInThisContext(fs.readFileSync(p, 'utf8'), { filename: p }); };

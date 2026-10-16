@@ -307,7 +307,7 @@ class Harness:
         node = shutil.which("node")
         if not node or not os.path.exists(main):
             raise RuntimeError(f"edwind not found (use --bin-dir or PATH), and no node for {main}")
-        return [node, "--disallow-code-generation-from-strings", "--frozen-intrinsics",
+        return [node, "--disallow-code-generation-from-strings",
                 "--no-warnings=ExperimentalWarning", main, "--config", self.edit_json]
 
     def start_edit(self):

@@ -458,9 +458,13 @@ test('R16.17 limits: 500 open buffers, a flood of edits and a deep recursion lea
   a.close(); b.close();
 });
 
-test('R16.16 the Node flags of bin/edwind are in effect: no eval, frozen intrinsics, a sized stack, no child processes', async () => {
+test('R16.16 the Node flags of bin/edwind are in effect: no eval, locked intrinsics, a sized stack, no child processes', async () => {
   const cmd = fs.readFileSync(`/proc/${child.pid}/cmdline`, 'utf8').split('\0');
-  for (const f of ['--disallow-code-generation-from-strings', '--frozen-intrinsics']) assert.ok(cmd.includes(f), f);
+  assert.ok(cmd.includes('--disallow-code-generation-from-strings'), '--disallow-code-generation-from-strings');
+  /* The intrinsics are locked in-process (lockdown.mjs, its own suite), not by --frozen-intrinsics, which made
+     the evaluator 2.3 times slower; the server thread reports its state when it listens. */
+  assert.ok(!cmd.includes('--frozen-intrinsics'), 'no --frozen-intrinsics');
+  assert.match(child.logs, /info listen \{[^\n]*"lockdown":"locked"/, 'the server thread is locked down');
   /* The stack is the server thread's own (main.mjs runInThread), not a flag that depends on `ulimit -s`: the
      Scheme cap of 10,000 frames (R4.34) holds whatever the soft limit is. */
   assert.ok(!cmd.some(f => f.startsWith('--stack-size=')), 'no --stack-size flag');
