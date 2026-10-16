@@ -2743,6 +2743,10 @@ await section('N63', async () => {
       const n0 = images().length; paste(cp);
       const c = await until(() => images().length > n0 && images().find(n => n.id !== a.id && n.blob === a.blob && !before.has(n.id) && n.id !== b?.id && n.id !== d?.id));
       out.dup = c && { same: c.blob === a.blob, other: c.id !== a.id };
+      // the system clipboard after an image copy holds a PNG and the text only: the board recalls the card by the text
+      const n1 = images().length; dt = new DataTransfer(); dt.items.add(await png(7, 7)); dt.setData('text/plain', out.copy.text); paste(dt);
+      const r = await until(() => images().length > n1 && images().find(n => !before.has(n.id) && ![a.id, b?.id, d?.id, c?.id].includes(n.id)));
+      out.recall = r && { same: r.blob === a.blob, iw: r.iw, stored: !!C.clipRecall(out.copy.text) };
       // text: a label, a web card, a page
       const shapes0 = S.shapes.length, nodes0 = Object.keys(S.nodes).length;
       dt = new DataTransfer(); dt.setData('text/plain', 'n62 label'); paste(dt);
@@ -2774,8 +2778,8 @@ await section('N63', async () => {
     check('N63: the board file keeps the hash, not the bytes; an SVG is redrawn as a 20 × 10 PNG; wb-web refuses SVG bytes (415); a dropped image is an image card too',
       board.includes(st.a?.blob) && !board.includes('data:image') && st.svg?.mime === 'image/png' && st.svg.iw === 20 && st.svg.ih === 10 && svg.status === 415
       && !!st.drop, JSON.stringify({ svg: st.svg, status: svg.status, drop: st.drop }));
-    check('N63: Ctrl-C on a picked image card puts the board\'s items and its /blob/ URL on the clipboard; pasting them makes a second card on the same bytes; text pastes as a label, a URL as a web card, lines as a page; cut removes the label and carries its text',
-      st.copy.taken && st.copy.items && st.copy.text.endsWith('/blob/' + st.a.blob) && st.dup?.same && st.dup.other && st.label && st.text.web && pageOk && st.cut.gone && st.cut.text === 'n62 label', JSON.stringify({ copy: st.copy, dup: st.dup, label: st.label, text: st.text, pageOk, cut: st.cut }));
+    check('N63: Ctrl-C on a picked image card puts the board\'s items and its /blob/ URL on the clipboard; pasting them makes a second card on the same bytes, and so does a paste holding another PNG with the copied text (the system clipboard after an image copy); text pastes as a label, a URL as a web card, lines as a page; cut removes the label and carries its text',
+      st.copy.taken && st.copy.items && st.copy.text.endsWith('/blob/' + st.a.blob) && st.dup?.same && st.dup.other && st.recall?.same && st.recall.iw === 40 && st.recall.stored && st.label && st.text.web && pageOk && st.cut.gone && st.cut.text === 'n62 label', JSON.stringify({ copy: st.copy, dup: st.dup, recall: st.recall, label: st.label, text: st.text, pageOk, cut: st.cut }));
     await D.evaluate(ids => { for (const id of ids) if (window.__canvas.S.nodes[id]) window.__canvas.removeNode(id); window.__canvas.pickClear(); }, st.made);
     await settled(D);
   } finally { await D?.close(); }
