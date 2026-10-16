@@ -753,6 +753,15 @@ body[data-mode="phone"] .rv-face { font-size: 22px; }
 .node.k-web.dragging .web-frame, body.panning .web-frame { pointer-events: none; }
 .k-sketch .body { background: var(--buf-bg); background-image: radial-gradient(var(--line) 1px, transparent 1px); background-size: 20px 20px; }
 .k-sketch .sk-hint { position: absolute; left: 8px; bottom: 6px; font-size: 11px; color: var(--muted); pointer-events: none; }
+/* images (F-A31): the picture whole inside the card; the pen draws over it, a drag moves the card, never the picture */
+.k-image .body { display: flex; align-items: center; justify-content: center; background: var(--buf-bg); }
+.k-image .img-card { width: 100%; height: 100%; object-fit: contain; display: block; user-select: none; -webkit-user-drag: none; pointer-events: none; }
+.k-image .img-note { position: absolute; inset: auto 8px 8px 8px; font-size: 11px; color: var(--muted); }
+/* far out the picture is the card: its name on a strip over it, no snapshot text */
+#world.far .k-image .body { visibility: visible; }
+.k-image .lod { background: transparent; padding: 0; }
+.k-image .lod b { display: inline-block; max-width: 100%; margin: 0; padding: 4px 12px; background: var(--panel); border-radius: var(--radius) 0 var(--radius) 0; }
+.k-image .lod pre { display: none; }
 .k-term.emacs .hdr .name::before { content: "ε "; color: var(--muted); }
 
 /* ---- v9: tags, filter */

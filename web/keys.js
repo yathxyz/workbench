@@ -94,6 +94,10 @@
       ['c', 'compact', 'compact (the selection, or everything)'], ['C', 'optimise.board', 'optimise the board'], ['#', 'tag', 'tag the card'],
       ['DEL', 'selection.remove', 'remove the selection'], ['<deletechar>', 'selection.remove', 'remove the selection'],
       ['C-z', 'undo.layout', 'undo a layout change or a removal'], ['s-z', 'undo.layout', 'undo a layout change or a removal'],
+      // copy, cut and paste: the command gives the key back, so the browser's own events carry the clipboard (F-A31)
+      ['C-c', 'clip.copy', 'copy the selection (cards, ink, shapes)'], ['s-c', 'clip.copy', 'copy the selection (cards, ink, shapes)'],
+      ['C-x', 'clip.cut', 'cut the selection'], ['s-x', 'clip.cut', 'cut the selection'],
+      ['C-v', 'clip.paste', 'paste: an image, text or copied cards'], ['s-v', 'clip.paste', 'paste: an image, text or copied cards'],
       ['SPC', 'pan.hold', 'hold and drag to pan'],
       ['v', 'tool.select', 'tool: select', 'v r d o a s p t e'], ['r', 'tool.rect', 'tool: rectangle', 'v r d o a s p t e'], ['d', 'tool.diamond', 'tool: diamond', 'v r d o a s p t e'],
       ['o', 'tool.ellipse', 'tool: ellipse', 'v r d o a s p t e'], ['a', 'tool.arrow', 'tool: arrow', 'v r d o a s p t e'], ['s', 'tool.area', 'tool: select an area', 'v r d o a s p t e'],
