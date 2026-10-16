@@ -487,19 +487,27 @@ body.side-open #side { transform: none; visibility: visible; transition: transfo
 
 /* tasks */
 #v-tasks { overflow: auto; }
-#tk-board { display: grid; grid-template-columns: repeat(4, minmax(200px, 1fr)); gap: 14px; padding: 18px 20px 40px; max-width: 1400px; margin: 0 auto; align-items: start; }
-@media (max-width: 760px) { #tk-board { grid-template-columns: minmax(0, 1fr); padding: 12px 16px 40px; } }
-.tk-col { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; display: grid; gap: 8px; transition: border-color .15s; }
+/* Columns share the view's width; the view (not the window) picks 4, 2 or 1 of them, so the dock narrows it too.
+   Every grid inside a column has a minmax(0, 1fr) track: an implicit auto track grows to its content's min-content
+   width, and a long unbroken source path then stretched a card out of its column (F-A30). */
+#v-tasks { container-type: inline-size; }
+#tk-board { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; padding: 18px 20px 40px; max-width: 1400px; margin: 0 auto; align-items: start; }
+@container (max-width: 960px) { #tk-board { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@container (max-width: 560px) { #tk-board { grid-template-columns: minmax(0, 1fr); padding: 12px 16px 40px; } }
+.tk-col { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; transition: border-color .15s; }
 .tk-col.over { border-color: var(--accent); background: var(--accent-soft); }
 .tk-col h3 { margin: 2px 4px; font: 600 14px var(--mono); display: flex; justify-content: space-between; }
 .tk-n { font: 500 12px var(--mono); color: var(--muted); }
-.tk-cards { display: grid; gap: 8px; }
-.tk-card { background: var(--panel); border: 1px solid var(--stroke); border-radius: var(--radius); padding: 8px 10px; display: grid; gap: 6px; cursor: grab; }
+.tk-cards { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.tk-card { background: var(--panel); border: 1px solid var(--stroke); border-radius: var(--radius); padding: 8px 10px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; cursor: grab; }
 .tk-card.dragging { opacity: .4; }
 .tk-card.done .tk-t { text-decoration: line-through; color: var(--muted); }
 .tk-t { font-size: 13.5px; overflow-wrap: anywhere; }
 .tk-src { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-.tk-page { border: 0; background: transparent; padding: 0; font: 11px var(--mono); color: var(--link); cursor: pointer; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+/* The source path stays on one line and loses its middle: the head ellipsizes, the tail (file end and line) stays. */
+.tk-page { border: 0; background: transparent; padding: 0; font: 11px var(--mono); color: var(--link); cursor: pointer; text-align: left; display: flex; overflow: hidden; white-space: nowrap; min-width: 0; }
+.tk-page .hd { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.tk-page .tl { flex: none; }
 .tk-page:hover { text-decoration: underline; }
 .tk-mv { display: flex; gap: 4px; flex: none; }
 #tk-in { width: 100%; box-sizing: border-box; font: 13px var(--mono); border: 1px dashed var(--line); border-radius: var(--radius); padding: 7px 9px; background: var(--panel); color: var(--fg); }
@@ -757,6 +765,15 @@ body[data-mode="phone"] .rv-face { font-size: 22px; }
 .node.k-web.dragging .web-frame, body.panning .web-frame { pointer-events: none; }
 .k-sketch .body { background: var(--buf-bg); background-image: radial-gradient(var(--line) 1px, transparent 1px); background-size: 20px 20px; }
 .k-sketch .sk-hint { position: absolute; left: 8px; bottom: 6px; font-size: 11px; color: var(--muted); pointer-events: none; }
+/* images (F-A32): the picture whole inside the card; the pen draws over it, a drag moves the card, never the picture */
+.k-image .body { display: flex; align-items: center; justify-content: center; background: var(--buf-bg); }
+.k-image .img-card { width: 100%; height: 100%; object-fit: contain; display: block; user-select: none; -webkit-user-drag: none; pointer-events: none; }
+.k-image .img-note { position: absolute; inset: auto 8px 8px 8px; font-size: 11px; color: var(--muted); }
+/* far out the picture is the card: its name on a strip over it, no snapshot text */
+#world.far .k-image .body { visibility: visible; }
+.k-image .lod { background: transparent; padding: 0; }
+.k-image .lod b { display: inline-block; max-width: 100%; margin: 0; padding: 4px 12px; background: var(--panel); border-radius: var(--radius) 0 var(--radius) 0; }
+.k-image .lod pre { display: none; }
 .k-term.emacs .hdr .name::before { content: "ε "; color: var(--muted); }
 
 /* ---- v9: tags, filter */
@@ -845,6 +862,7 @@ body.tree-open[data-view="canvas"] #which-key { left: calc(50% + var(--tree-w, 2
 /* v15: tasks */
 .tk-card.on { outline: 2px solid var(--accent); outline-offset: 1px; }
 .tk-meta { display: flex; flex-wrap: wrap; gap: 8px; font: 11.5px var(--mono); color: var(--muted); }
+.tk-meta > span { min-width: 0; overflow-wrap: anywhere; }
 .tk-meta .over { color: var(--err); font-weight: 600; }
 .tk-meta .prio { color: var(--accent); }
 .tk-meta .sess { color: var(--fg); }

@@ -5,6 +5,7 @@
 
 mod artifacts;
 mod auth;
+mod blobs;
 mod board;
 mod config;
 mod edit_client;

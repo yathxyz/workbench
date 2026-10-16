@@ -758,7 +758,7 @@ st = await p.evaluate(async () => { const C = window.__canvas, S = C.S, sl = ms 
   const pg = C.addNode({ kind: 'buffer', name: 'todo', x: 1500, y: 1500, w: 420, h: 300, text: '# todo\n\n- TODO Write the v15 tests [#A]\n  SCHEDULED: <2026-10-01 Wed>\n  cover the four columns\n- NEXT Ship version 30\n  DEADLINE: <2099-01-01 Fri>\n- HOLD Wait for the build host\n- CANCELLED Old idea\n' });
   const sh = C.addNode({ kind: 'term', backend: 'fake', name: 'agentsh', env: {}, x: 2000, y: 1500, w: 440, h: 300 }); C.setTags(sh, ['agent']); await sl(300);
   C.setView('tasks'); await sl(200);
-  const cols = [...document.querySelectorAll('#tk-board .tk-col')].map(c => c.dataset.col + ':' + [...c.querySelectorAll('.tk-card')].filter(x => x.querySelector('.tk-page').title.startsWith('board:/todo:')).length);
+  const cols = [...document.querySelectorAll('#tk-board .tk-col')].map(c => c.dataset.col + ':' + [...c.querySelectorAll('.tk-card')].filter(x => x.querySelector('.tk-page').dataset.addr.startsWith('board:/todo:')).length);
   const card = [...document.querySelectorAll('.tk-card')].find(c => /Write the v15 tests/.test(c.textContent)), meta = card?.querySelector('.tk-meta')?.textContent, over = !!card?.querySelector('.tk-meta .over');
   const hold = [...document.querySelectorAll('.tk-card')].find(c => /Wait for the build host/.test(c.textContent)), holdCol = hold?.closest('.tk-col').dataset.col, holdTitle = hold?.querySelector('.tk-t').textContent;
   const t = C.allTasks().find(x => x.text.startsWith('Write the v15')); const ttext = C.taskText(t), found = C.findTask('todo:3')?.line === 3 && C.findTask('board:/todo:3')?.node === t.node;
@@ -770,12 +770,27 @@ check('tasks view: four columns over the keyword set, priority and dates as meta
 await p.keyboard.press('t'); await sleep(200);
 const pgText1 = await p.evaluate(id => window.__canvas.live[id].view.state.doc.toString(), tk.pg);
 await p.keyboard.press('d'); await sleep(900);
-st = await p.evaluate(({ pg, sh }) => { const C = window.__canvas; const text = C.live[pg].view.state.doc.toString(); const m = text.match(/session:: board:(\S+)/), target = m && (C.findNode(m[1]) || C.findNode(m[1].replace(/^\//, ''))), term = target ? C.termLines(C.live[target.id], 20).join('|') : '', agentTag = target && C.tagsOf(target).includes('agent'); const cols = [...document.querySelectorAll('#tk-board .tk-col')].map(c => c.dataset.col + ':' + [...c.querySelectorAll('.tk-card')].filter(x => x.querySelector('.tk-page').title.startsWith('board:/todo:')).length); const sess = [...document.querySelectorAll('.tk-card .tk-meta .sess')].map(x => x.textContent); return { text, term, agentTag, cols, sess }; }, tk);
+st = await p.evaluate(({ pg, sh }) => { const C = window.__canvas; const text = C.live[pg].view.state.doc.toString(); const m = text.match(/session:: board:(\S+)/), target = m && (C.findNode(m[1]) || C.findNode(m[1].replace(/^\//, ''))), term = target ? C.termLines(C.live[target.id], 20).join('|') : '', agentTag = target && C.tagsOf(target).includes('agent'); const cols = [...document.querySelectorAll('#tk-board .tk-col')].map(c => c.dataset.col + ':' + [...c.querySelectorAll('.tk-card')].filter(x => x.querySelector('.tk-page').dataset.addr.startsWith('board:/todo:')).length); const sess = [...document.querySelectorAll('.tk-card .tk-meta .sess')].map(x => x.textContent); return { text, term, agentTag, cols, sess }; }, tk);
 // st.term joins the terminal's rows with |, and a narrow card wraps the pasted line.
 check('t cycles the keyword in the page; d pastes title + body into a shell tagged #agent and writes session:: / dispatched:: under the task', /- NEXT Write the v15 tests \[#A\]/.test(pgText1) && st.agentTag && /Write the v15 tests cover the four columns/.test(st.term.replaceAll('|', '')) && /\n  session:: board:\/\S+\n  dispatched:: 20\d\d-\d\d-\d\dT\d\d:\d\d\n  SCHEDULED: <2026-10-01 Wed>/.test(st.text) && st.cols.join() === 'TODO:0,NEXT:2,WAITING:1,DONE:1' && st.sess.some(x => /^⇢ board:\//.test(x)), JSON.stringify({ pgText1, st }));
 await p.keyboard.press('T'); await sleep(200);
 st = await p.evaluate(async ({ pg, sh }) => { const C = window.__canvas; const text = C.live[pg].view.state.doc.toString(); const r = await C.AGENT_TOOLS.find(x => x.name === 'set_task').run({ task: 'todo:3', keyword: 'DONE' }); const text2 = C.live[pg].view.state.doc.toString(); C.setView('canvas'); C.removeNode(pg); C.removeNode(sh); return { text, r, text2 }; }, tk);
 check('T cycles back (NEXT → TODO); set_task writes a keyword by reference', /- TODO Write the v15 tests/.test(st.text) && st.r === 'board:/todo:3 → DONE' && /- DONE Write the v15 tests/.test(st.text2), JSON.stringify(st));
+// N61 (F-A30): a long source path and a long unbroken title stay inside their column; the view (window less dock) picks 4, 2 or 1 columns
+const tkFit = async () => p.evaluate(async () => { const C = window.__canvas, sl = ms => new Promise(r => setTimeout(r, ms)); C.setView('tasks'); await sl(250);
+  const cols = getComputedStyle(document.querySelector('#tk-board')).gridTemplateColumns.split(' ').length, out = [];
+  for (const col of document.querySelectorAll('#tk-board .tk-col')) { const cr = col.getBoundingClientRect(); for (const c of col.querySelectorAll('.tk-card, .tk-page .tl')) { const r = c.getBoundingClientRect(); if (r.left < cr.left - 0.5 || r.right > cr.right + 0.5) out.push(col.dataset.col + ':' + c.className); } }
+  const card = [...document.querySelectorAll('.tk-card')].find(c => /Sequence_the_whole/.test(c.textContent)), t = card?.querySelector('.tk-t'), pg = card?.querySelector('.tk-page');
+  return { vw: document.querySelector('#v-tasks').clientWidth, cols, out, lines: t ? Math.round(t.getBoundingClientRect().height / (parseFloat(getComputedStyle(t).lineHeight) || 18)) : 0, tail: pg?.querySelector('.tl')?.textContent, title: pg?.title, clipped: pg ? pg.querySelector('.hd').scrollWidth > pg.querySelector('.hd').clientWidth : null }; });
+const LONGPG = '20220203010311-repeat_expansion_mediated_cytotoxicity_in_neurons';
+const longId = await p.evaluate(n => window.__canvas.addNode({ kind: 'buffer', name: n, x: 1500, y: 2100, w: 420, h: 200, text: '# ' + n + '\n\n- TODO Sequence_the_whole_' + 'x'.repeat(90) + '_genome\n' }).id, LONGPG);
+const fitW = await tkFit();
+// The dock takes its width from the view, so the middle size is set from the view's width, not the window's.
+await p.setViewportSize({ width: 1500 - fitW.vw + 760, height: 950 }); const fitM = await tkFit();
+await p.setViewportSize({ width: 500, height: 950 }); const fitS = await tkFit();
+await p.setViewportSize({ width: 1500, height: 950 });
+await p.evaluate(id => { const C = window.__canvas; C.setView('canvas'); C.removeNode(id); }, longId);
+check('tasks view (F-A30): a long source path and an unbroken title stay inside the column (title wraps, path keeps its tail, full path on hover); 4, 2 or 1 columns by the view\'s width', [fitW, fitM, fitS].every(f => f.cols === (f.vw > 960 ? 4 : f.vw > 560 ? 2 : 1) && !f.out.length && f.lines >= 2 && /\d$/.test(f.tail || '') && f.title?.startsWith(LONGPG)) && fitW.cols === 4 && fitM.cols === 2 && fitS.cols === 1 && fitW.clipped, JSON.stringify({ fitW, fitM, fitS }));
 // ---- fix 1 rendering without a server (30 §1.2-§1.4, F-A19): diffs, elicitation forms, url requests, agent text as text
 st = await p.evaluate(() => {
   const C = window.__canvas, A = C.AcpBackend.prototype, rows = d => [...d.querySelectorAll('pre > div')].map(r => r.className + ':' + r.textContent);
@@ -868,6 +883,57 @@ check('N16 demo: the inlined page asks fonts.googleapis.com for nothing', !demoH
   const kept = await T.evaluate(() => ({ same: document.querySelector('.redge[data-edge="n56-pc"]') === window.__n56 && !!window.__n56, ab: !!document.querySelector('.redge[data-edge="n56-ab"]') }));
   check('N57: dragging a card redraws its own edges and keeps the drawing of the others', kept.same && kept.ab, JSON.stringify(kept));
   await tc.close();
+}
+
+// ---------------- N62: a pen's barrel button (F-A31). CDP pen events: the button pressed in hover (middle as X11 Wacom
+// drivers send it, right as Windows Ink does) pans and inks nothing; the tip landing while the barrel is held, a barrel
+// pressed in the middle of a stroke, and a tip that lands where a barrel pan just ended all pan; plain strokes still ink.
+{
+  const T = await page('file://' + wrapped);
+  const cdp = await T.context().newCDPSession(T);
+  const BIT = { none: 0, left: 1, right: 2, middle: 4 };
+  const pen = (type, x, y, button = 'none', buttons = 0) => cdp.send('Input.dispatchMouseEvent', { type, x, y, button, buttons, pointerType: 'pen', clickCount: type === 'mouseMoved' ? 0 : 1 });
+  await pen('mouseMoved', 700, 400); await sleep(600);   // the first pen event turns on tablet mode
+  const pg = await T.evaluate(() => window.__canvas.addNode({ kind: 'buffer', name: 'n62-page', x: 30700, y: 30300, w: 360, h: 260, text: '# n62' }).id);
+  const home = () => T.evaluate(() => { const C = window.__canvas; Object.assign(C.S.cam, { x: 30000, y: 30000, z: 1 }); C.applyCam(); window.__n62menus ??= 0; });
+  await home(); await sleep(300);
+  await T.evaluate(() => addEventListener('contextmenu', e => { if (!e.defaultPrevented) window.__n62menus++; }));
+  const at = await T.evaluate(() => { const bare = (x, y) => ['viewport', 'world'].includes(document.elementFromPoint(x, y)?.id); for (let y = 300; y < 800; y += 20) for (let x = 400; x < 1200; x += 20) if (bare(x, y) && bare(x + 260, y)) return [x, y]; return null; });
+  const onPage = await T.evaluate(id => { const r = document.querySelector(`.node[data-id="${id}"] .body`).getBoundingClientRect(); return [r.x + 40, r.y + 60]; }, pg);
+  const run = async (from, steps) => {   // steps: ['down'|'up', button] or ['move', dx]; → strokes added, camera moved, menus opened
+    await home(); await sleep(400);
+    const st = () => T.evaluate(() => ({ n: window.__canvas.S.strokes.length, x: window.__canvas.S.cam.x, m: window.__n62menus + !document.getElementById('palette').hidden }));
+    const a = await st(); let held = 0, [x, y] = from;
+    for (const [k, v] of steps) {
+      if (k === 'down') { held |= BIT[v]; await pen('mousePressed', x, y, v, held); }
+      else if (k === 'up') { held &= ~BIT[v]; await pen('mouseReleased', x, y, v, held); }
+      else if (k === 'wait') await sleep(v);
+      else for (let i = 0; i < 8; i++) { x += v / 8; await pen('mouseMoved', x, y, 'none', held); await sleep(10); }
+    }
+    await sleep(150); const b = await st();
+    return { ink: b.n - a.n, pan: Math.round(a.x - b.x), menus: b.m - a.m };
+  };
+  const r = {};
+  for (const t of ['select', 'pen', 'erase']) {
+    await T.evaluate(t => window.__canvas.setTool(t), t);
+    r[t] = {
+      mid: await run(at, [['down', 'middle'], ['move', 200], ['up', 'middle']]),
+      right: await run(at, [['down', 'right'], ['move', 200], ['up', 'right']]),
+      card: await run(onPage, [['down', 'middle'], ['move', 200], ['up', 'middle']]),
+      tip: await run(at, [['down', 'middle'], ['move', 20], ['down', 'left'], ['move', 200], ['up', 'left'], ['up', 'middle']]),
+      late: await run(at, [['down', 'left'], ['move', 24], ['down', 'right'], ['move', 200], ['up', 'right'], ['up', 'left']]),
+      tap: await run(at, [['down', 'middle'], ['move', 200], ['up', 'middle'], ['wait', 60], ['down', 'left'], ['up', 'left']]),
+    };
+  }
+  await T.evaluate(() => window.__canvas.setTool('pen'));
+  const stroke = await run(at, [['down', 'left'], ['move', 120], ['up', 'left']]), dot = await run(at, [['down', 'left'], ['up', 'left']]);
+  const pans = (o, d = 200) => o.ink === 0 && Math.abs(o.pan - d) < 2 && o.menus === 0;
+  check('N62: a pen\'s barrel button (middle or right) in hover pans the camera, over the canvas and over a page, with every tool, and leaves no ink or menu',
+    ['select', 'pen', 'erase'].every(t => pans(r[t].mid) && pans(r[t].right) && pans(r[t].card)), JSON.stringify(r));
+  check('N62: the tip landing while the barrel is held, a barrel pressed mid-stroke, and a tip that lands where a barrel pan just ended all pan and leave no ink',
+    ['select', 'pen', 'erase'].every(t => pans(r[t].tip, 220) && pans(r[t].late) && pans(r[t].tap)), JSON.stringify(r));
+  check('N62: a plain pen stroke and a pen tap well after a pan still ink and do not move the camera', stroke.ink === 1 && stroke.pan === 0 && dot.ink === 1 && dot.pan === 0, JSON.stringify({ stroke, dot }));
+  await T.close();
 }
 
 // ---------------- daemon phase: wb-hub, wb-web and Caddy from the harness
@@ -2893,6 +2959,112 @@ await section('N60', async () => {
     await D.evaluate(() => { const C = window.__canvas; for (const k of [3, 4]) if (C.deskAt(k)) { C.deskGo(k, true); C.deskDelete(); } C.deskGo(0, true); C.pickClear(); });
     await settled(D);
   } finally { await E?.close().catch(() => {}); await D?.close(); }
+});
+
+// N63 (F-A32): images and the clipboard on the board. A PNG pasted on the board is an image card whose bytes went to
+// /api/blob (the board keeps the hash); an SVG is redrawn as a PNG; a dropped file lands where it is dropped; a paste
+// into a text field is the field's; Ctrl-C on a card puts the board's items and text on the clipboard and a paste of
+// them is a new card on the same bytes; text pastes as a label, a web card or a page; cut takes the item away.
+await section('N63', async () => {
+  let D;
+  try {
+    D = await dpage(); await settled(D);
+    const st = await D.evaluate(async () => {
+      const C = window.__canvas, S = C.S, out = {};
+      if (C.WS.cur) C.wsLeave(); if (C.DESK.cur) C.deskGo(0, true); C.pickClear(); document.activeElement?.blur?.();
+      const png = (w, h) => new Promise(r => { const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d'); g.fillStyle = '#c03'; g.fillRect(0, 0, w, h); c.toBlob(b => r(new File([b], 'red.png', { type: 'image/png' })), 'image/png'); });
+      const paste = (dt, target = document.body) => { const e = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }); target.dispatchEvent(e); return e.defaultPrevented; };
+      const images = () => Object.values(S.nodes).filter(n => n.kind === 'image');
+      const until = async f => { for (let i = 0; i < 100; i++) { const v = f(); if (v) return v; await new Promise(r => setTimeout(r, 100)); } return null; };
+      const before = new Set(images().map(n => n.id)), fresh = () => images().filter(n => !before.has(n.id));
+      // Ctrl-V on the board is a keymap row that leaves the key to the browser
+      const kd = new KeyboardEvent('keydown', { key: 'v', code: 'KeyV', ctrlKey: true, bubbles: true, cancelable: true }); document.body.dispatchEvent(kd);
+      out.keyKept = !kd.defaultPrevented && window.WBKeys.resolve(C.keyContext(), 'C-v')[0]?.cmd === 'clip.paste';
+      // a paste into a text field is the field's
+      const inp = document.createElement('input'); document.body.append(inp); inp.focus();
+      let dt = new DataTransfer(); dt.items.add(await png(40, 30));
+      out.fieldTook = paste(dt, inp); inp.remove(); document.activeElement?.blur?.();
+      await new Promise(r => setTimeout(r, 300)); out.fieldMade = fresh().length;
+      // on the board: an image card from the bytes' hash
+      dt = new DataTransfer(); dt.items.add(await png(40, 30));
+      out.boardTook = paste(dt);
+      const a = await until(() => fresh()[0]);
+      out.a = a && { blob: a.blob, iw: a.iw, ih: a.ih, src: 'src' in a, mime: a.mime, picked: C.PICKED.has(a.id) };
+      const img = a && C.live[a.id].img; await until(() => img?.complete && img.naturalWidth);
+      out.shown = img && { w: img.naturalWidth, src: img.getAttribute('src') };
+      // an SVG becomes a PNG on the way in
+      dt = new DataTransfer(); dt.items.add(new File(['<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="blue"/></svg>'], 'pic.svg', { type: 'image/svg+xml' }));
+      paste(dt);
+      const b = await until(() => fresh().find(n => n.name === 'pic'));
+      out.svg = b && { mime: b.mime, iw: b.iw, ih: b.ih };
+      // a dropped file lands at the drop point
+      const vp = document.querySelector('#viewport').getBoundingClientRect(), cx = vp.left + vp.width / 2 + 100, cy = vp.top + vp.height / 2 + 80;
+      dt = new DataTransfer(); dt.items.add(await png(50, 50));
+      document.querySelector('#viewport').dispatchEvent(new DragEvent('drop', { dataTransfer: dt, clientX: cx, clientY: cy, bubbles: true, cancelable: true }));
+      const d = await until(() => fresh().find(n => n.iw === 50));
+      const at = C.s2w ? C.s2w(cx - vp.left, cy - vp.top) : null;
+      out.drop = d && { mid: [d.x + d.w / 2, d.y + d.h / 2], at: at && [at.x, at.y] };
+      // copy the first card, paste it: a second card on the same bytes
+      C.pickClear(); C.pickToggle(a.id, true); document.activeElement?.blur?.();
+      const cp = new DataTransfer(), ce = new ClipboardEvent('copy', { clipboardData: cp, bubbles: true, cancelable: true }); document.body.dispatchEvent(ce);
+      out.copy = { taken: ce.defaultPrevented, items: !!cp.getData('application/x-workbench-items'), text: cp.getData('text/plain') };
+      const n0 = images().length; paste(cp);
+      const c = await until(() => images().length > n0 && images().find(n => n.id !== a.id && n.blob === a.blob && !before.has(n.id) && n.id !== b?.id && n.id !== d?.id));
+      out.dup = c && { same: c.blob === a.blob, other: c.id !== a.id };
+      // the system clipboard after an image copy holds a PNG and the text only: the board recalls the card by the text
+      const n1 = images().length; dt = new DataTransfer(); dt.items.add(await png(7, 7)); dt.setData('text/plain', out.copy.text); paste(dt);
+      const r = await until(() => images().length > n1 && images().find(n => !before.has(n.id) && ![a.id, b?.id, d?.id, c?.id].includes(n.id)));
+      out.recall = r && { same: r.blob === a.blob, iw: r.iw, stored: !!C.clipRecall(out.copy.text) };
+      // text: a label, a web card, a page
+      const shapes0 = S.shapes.length, nodes0 = Object.keys(S.nodes).length;
+      dt = new DataTransfer(); dt.setData('text/plain', 'n62 label'); paste(dt);
+      out.label = S.shapes.length === shapes0 + 1 && S.shapes[S.shapes.length - 1].type === 'text' && S.shapes[S.shapes.length - 1].text === 'n62 label';
+      const label = S.shapes[S.shapes.length - 1];
+      dt = new DataTransfer(); dt.setData('text/plain', 'https://example.org/n62'); paste(dt);
+      const web = Object.values(S.nodes).find(n => n.kind === 'web' && n.url === 'https://example.org/n62');
+      dt = new DataTransfer(); dt.setData('text/plain', '# n62 notes\n\nfirst line\nsecond line'); paste(dt);
+      const pg = Object.values(S.nodes).find(n => n.kind === 'buffer' && n.name === 'n62 notes');
+      out.text = { web: !!web, page: pg && pg.id, nodes: Object.keys(S.nodes).length - nodes0 };
+      // cut the label: gone, and on the clipboard
+      C.pickClear(); C.SEL.shapes.add(label.id); document.activeElement?.blur?.();
+      const ct = new DataTransfer(); document.body.dispatchEvent(new ClipboardEvent('cut', { clipboardData: ct, bubbles: true, cancelable: true }));
+      out.cut = { gone: !S.shapes.some(s => s.id === label.id), text: ct.getData('text/plain') };
+      // an arrow between two copied cards comes along unpicked; a pasted shape leaves the folder it was in (Codex on #17)
+      let bound = null;
+      if (web && pg) {
+        const arrow = C.addShape({ type: 'arrow', x1: 0, y1: 0, x2: 0, y2: 0, a: { id: web.id, dx: 0, dy: 0 }, b: { id: pg.id, dx: 0, dy: 0 } });
+        const box = C.addShape({ type: 'rect', x: web.x, y: web.y - 80, w: 60, h: 40, in: 'n63-folder' });
+        C.pickClear(); C.pickToggle(web.id, true); C.pickToggle(pg.id, true); C.SEL.shapes.add(box.id);
+        const got = C.copyItems(), had = new Set(S.shapes.map(x => x.id)), nodesHad = new Set(Object.keys(S.nodes));
+        C.pasteItems(got.items);
+        const newShapes = S.shapes.filter(x => !had.has(x.id)), newIds = Object.keys(S.nodes).filter(id => !nodesHad.has(id));
+        const a2 = newShapes.find(x => x.type === 'arrow'), r2 = newShapes.find(x => x.type === 'rect');
+        bound = { copied: got.items.shapes.some(x => x.id === arrow.id), rebound: !!a2 && newIds.includes(a2.a?.id) && newIds.includes(a2.b?.id), loose: !!r2 && !('in' in r2) };
+        out.extra = newIds; C.pickClear();
+      }
+      out.bound = bound;
+      out.made = [...fresh().map(n => n.id), web?.id, pg?.id, ...(out.extra || [])].filter(Boolean);
+      return out;
+    });
+    const pageOk = st.text.page && /second line/.test(await pageText(D, st.text.page));
+    await settled(D);
+    // the save is debounced: wait for the board file to name the image
+    const boardNow = async () => (await api('/api/board')).text();
+    const board = await until(async () => { const t = await boardNow(); return st.a?.blob && t.includes(st.a.blob) ? t : null; }, 8000) || await boardNow();
+    const blob = st.a?.blob && await api('/blob/' + st.a.blob);
+    const served = blob && { status: blob.status, type: blob.headers.get('content-type'), cache: blob.headers.get('cache-control') };
+    const svg = await api('/api/blob', { method: 'POST', headers: { 'Content-Type': 'image/png' }, body: '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>' });
+    check('N63: Ctrl-V on the board leaves the key to the browser; a PNG pasted into a text field is the field\'s; on the board it is an image card holding the sha256 of its bytes, picked, shown from /blob/<hash>, which serves it as image/png for good',
+      st.keyKept && !st.fieldTook && st.fieldMade === 0 && st.boardTook && st.a && /^[0-9a-f]{64}$/.test(st.a.blob) && !st.a.src && st.a.mime === 'image/png' && st.a.iw === 40 && st.a.ih === 30 && st.a.picked
+      && st.shown?.w === 40 && st.shown.src === '/blob/' + st.a.blob && served?.status === 200 && served.type === 'image/png' && /immutable/.test(served.cache || ''), JSON.stringify({ st, served }));
+    check('N63: the board file keeps the hash, not the bytes; an SVG is redrawn as a 20 × 10 PNG; wb-web refuses SVG bytes (415); a dropped image is an image card too',
+      board.includes(st.a?.blob) && !board.includes('data:image') && st.svg?.mime === 'image/png' && st.svg.iw === 20 && st.svg.ih === 10 && svg.status === 415
+      && !!st.drop, JSON.stringify({ svg: st.svg, status: svg.status, drop: st.drop }));
+    check('N63: Ctrl-C on a picked image card puts the board\'s items and its /blob/ URL on the clipboard; pasting them makes a second card on the same bytes, and so does a paste holding another PNG with the copied text (the system clipboard after an image copy); text pastes as a label, a URL as a web card, lines as a page; cut removes the label and carries its text; an arrow between two copied cards comes along unpicked and a pasted shape leaves its folder',
+      st.copy.taken && st.copy.items && st.copy.text.endsWith('/blob/' + st.a.blob) && st.dup?.same && st.dup.other && st.recall?.same && st.recall.iw === 40 && st.recall.stored && st.label && st.text.web && pageOk && st.cut.gone && st.cut.text === 'n62 label' && st.bound?.copied && st.bound.rebound && st.bound.loose, JSON.stringify({ copy: st.copy, dup: st.dup, recall: st.recall, label: st.label, text: st.text, pageOk, cut: st.cut, bound: st.bound }));
+    await D.evaluate(ids => { for (const id of ids) if (window.__canvas.S.nodes[id]) window.__canvas.removeNode(id); window.__canvas.pickClear(); }, st.made);
+    await settled(D);
+  } finally { await D?.close(); }
 });
 
 // N11: over the whole daemon phase's request log
