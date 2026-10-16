@@ -123,7 +123,7 @@ const FACES = {
 const NAMED = { black: '#000000', white: '#ffffff', red: '#ff0000', green: '#008000', blue: '#0000ff', yellow: '#ffff00', cyan: '#00ffff', magenta: '#ff00ff',
   gray: '#808080', grey: '#808080', orange: '#ffa500', purple: '#800080', pink: '#ffc0cb', brown: '#a52a2a' };
 const hex2 = n => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0');
-/* A colour as [r, g, b, a], or null: '#rgb', '#rrggbb', 'rgb(r g b / a)', 'rgb(r, g, b)', 'rgba(...)', a few names. */
+/* A colour as [r, g, b, a], or null: '#rgb', '#rrggbb', 'rgb(r g b / a)', 'rgb(r, g, b)', 'rgba(...)', 'hsl(h s% l%)', a few names. */
 function parseColor(s) {
   s = String(s).trim().toLowerCase();
   if (NAMED[s]) s = NAMED[s];
@@ -131,8 +131,17 @@ function parseColor(s) {
   if (m) return [...m[1]].map(c => parseInt(c + c, 16)).concat(1);
   m = /^#([0-9a-f]{6})$/.exec(s);
   if (m) return [0, 2, 4].map(i => parseInt(m[1].slice(i, i + 2), 16)).concat(1);
+  const alpha = v => v === undefined ? 1 : v.endsWith('%') ? parseFloat(v) / 100 : parseFloat(v);
   m = /^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)\s*(?:[/,]\s*([\d.]+%?)\s*)?\)$/.exec(s);
-  if (m) { const a = m[4] === undefined ? 1 : m[4].endsWith('%') ? parseFloat(m[4]) / 100 : parseFloat(m[4]); return [+m[1], +m[2], +m[3], a]; }
+  if (m) return [+m[1], +m[2], +m[3], alpha(m[4])];
+  /* hsl(h s% l%), as sync.js gives each writer (writerColor) */
+  m = /^hsla?\(\s*([\d.]+)(?:deg)?[\s,]+([\d.]+)%[\s,]+([\d.]+)%\s*(?:[/,]\s*([\d.]+%?)\s*)?\)$/.exec(s);
+  if (m) {
+    const h = (+m[1] % 360) / 360, sat = +m[2] / 100, l = +m[3] / 100;
+    const q = l < 0.5 ? l * (1 + sat) : l + sat - l * sat, p = 2 * l - q;
+    const ch = t => { t = (t + 1) % 1; return 255 * (t < 1 / 6 ? p + (q - p) * 6 * t : t < 1 / 2 ? q : t < 2 / 3 ? p + (q - p) * (2 / 3 - t) * 6 : p); };
+    return [ch(h + 1 / 3), ch(h), ch(h - 1 / 3), alpha(m[4])];
+  }
   return null;
 }
 /* The value of one token in THEME: a set-face-color! override (a page variable), else the palette's. */
@@ -359,6 +368,9 @@ function drawWindow(g, r, st) {
     for (const x of laid) { let c = 0; for (const y of x.gl) { if (y.cur) { if (c < hs || c >= hs + cols) hs = Math.max(0, c - Math.floor(cols / 2)); break; } c += y.w; } }
     w._hs = hs;
   }
+  /* A wrapped line taller than the window (or one the scroll loop could not bring up) keeps the cursor's row in
+     view: the rows above it are skipped. */
+  let skip = textRows > 0 && curRow >= textRows ? curRow - textRows + 1 : 0;
   r.map = []; r.textX = x0; r.textW = cols;
   let y = r.y, shownLines = 0, cursor = null;
   for (const x of laid) {
@@ -366,6 +378,7 @@ function drawWindow(g, r, st) {
     const l = x.line, rowBase = l.cl && selected ? 'default cl' : 'default';
     shownLines++;
     x.rows.forEach((rw, i) => {
+      if (skip > 0) { skip--; return; }
       if (y >= r.y + textRows) return;
       g.fill(r.x, y, r.w, 'default');
       if (gw && i === 0 && l.n !== null && l.n !== undefined) g.text(r.x + gw - 1 - String(l.n).length, y, String(l.n), l.cl && selected ? 'default ln cl' : 'default ln', r.x + gw);
@@ -509,7 +522,7 @@ function presenceOf(g, rects, out) {
     if (!b.presence || !b.presence.length) continue;
     for (const p of b.presence) {
       if (p.agent) { const left = AGENT_FADE_MS - (now - p.at); if (left <= 0) continue; fadeDue = fadeDue ? Math.min(fadeDue, left) : left; }
-      const col = parseColor(p.color) ? p.color : '#888888';
+      const pc = parseColor(p.color), col = pc ? toHex(pc) : '#888888';   // a class token cannot hold spaces: hex
       for (const [from, to] of p.ranges) {
         if (from === to) {
           for (const row of r.map) {
