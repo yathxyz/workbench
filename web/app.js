@@ -1573,7 +1573,7 @@ function placeFrame(n) {
 //         stack = the folder collapses into a deck; items keep their places for when it is spread out again.
 const PAD = 28, GAP = 24, LABEL_H = 32, DECK = { w: 300, h: 230 };
 const FSHAPES = ['folder', 'box', 'round'], FICON = { free: '◻', pack: '▦', tile: '⊞', stack: '❐' };   // v18.1: ribbon (PaperWM row) removed; old boards' ribbon folders load as tile
-const KIND_GLYPH = { term: '$', repl: '›', buffer: '¶', agent: '✦', acp: '✦', ref: '❝', frame: '▭', artifact: '◧', web: '⌾', sketch: '✎', ghost: '◌' };
+const KIND_GLYPH = { term: '$', repl: '›', buffer: '¶', agent: '✦', acp: '✦', ref: '❝', frame: '▭', artifact: '◧', web: '⌾', sketch: '✎', image: '▣', ghost: '◌' };
 const kidsOf = fid => Object.values(S.nodes).filter(m => m.in === fid);
 const byOrder = (a, b) => (a.order ?? 0) - (b.order ?? 0) || a.y - b.y || a.x - b.x;
 function descendants(fid, out = []) { for (const k of kidsOf(fid)) { out.push(k); if (k.kind === 'frame') descendants(k.id, out); } return out; }
@@ -2166,6 +2166,10 @@ function mountNode(n) {
   } else if (n.kind === 'sketch') {
     B('Aa', 'Turn the ink on this card into a page (needs a model that reads images)', () => sketchToPage(n));
     B('⌫', 'Clear the ink on this card', () => sketchClear(n));
+  } else if (n.kind === 'image') {
+    B('↗', 'Open the image in a browser tab', () => imageOpen(n));
+    B('⧉', 'Copy the image to the clipboard, for another program (PNG)', () => imageCopy(n));
+    B('1:1', 'Natural size: the card shows the image at its own size', () => imageNatural(n));
   } else if (n.kind === 'ghost') {
     B('↗', n.alias ? 'Jump to the real node' : n.tmuxTarget ? 'Adopt: a card attached to this tmux session' : n.dir ? 'Open: this directory becomes a folder' : 'Open: make it real (Emacs on the file; a page in demo mode)', () => ghostOpen(n));
   }
@@ -2180,6 +2184,7 @@ function mountNode(n) {
   else if (n.kind === 'artifact') mountArtifact(n, L);
   else if (n.kind === 'web') mountWeb(n, L);
   else if (n.kind === 'sketch') mountSketch(n, L);
+  else if (n.kind === 'image') mountImage(n, L);
   else if (n.kind === 'ghost') mountGhost(n, L);
   wireNode(n, L, port, rs);
   renderInk(n.id);
@@ -2411,7 +2416,7 @@ function newAt(kind, extra = {}) {
   const c = viewCenterWorld(), w = extra.w || (kind === 'frame' ? 760 : kind === 'buffer' ? 460 : 560), h = extra.h || (kind === 'frame' ? 460 : 320);
   const jitter = () => Math.round((Math.random() - .5) * 60);
   const count = Object.values(S.nodes).filter(m => m.kind === kind).length + 1;
-  const names = { term: 'shell', repl: 'repl', buffer: 'page', frame: 'folder', agent: 'agent', acp: 'agent', artifact: 'artifact', web: 'web', sketch: 'sketch' };
+  const names = { term: 'shell', repl: 'repl', buffer: 'page', frame: 'folder', agent: 'agent', acp: 'agent', artifact: 'artifact', web: 'web', sketch: 'sketch', image: 'image' };
   return addNode({ kind, name: names[kind] + count, x: Math.round(c.x - w / 2) + jitter(), y: Math.round(c.y - h / 2) + jitter(), w, h, ...extra });
 }
 function removeNode(id) {
@@ -2753,6 +2758,7 @@ function snapshotText(n, max = 12) {
   if (n.kind === 'agent') return (n.log || []).filter(m => m.text).slice(-6).map(m => (m.t === 'user' ? '› ' : '') + m.text).join('\n');
   if (n.kind === 'web') return n.url || '';
   if (n.kind === 'sketch') return `${S.strokes.filter(x => x.owner === n.id).length} strokes`;
+  if (n.kind === 'image') return `image · ${n.iw || '?'} × ${n.ih || '?'}`;
   if (n.kind === 'artifact') return `artifact · ${Object.keys(n.capabilities || {}).join(', ') || 'no capabilities'}\nversion ${String(n.head || '').slice(0, 8) || '(none)'}`;
   return n.text || '';
 }
@@ -2989,6 +2995,7 @@ async function toJsonCanvas() {
     const base = { id: n.id, x: Math.round(n.x), y: Math.round(n.y), width: Math.round(n.w), height: Math.round(n.h) };
     if (n.kind === 'frame') nodes.push({ ...base, type: 'group', label: n.name });
     else if (n.kind === 'buffer') nodes.push({ ...base, type: 'text', text: await pageTextFull(n) });
+    else if (n.kind === 'image' && n.blob) nodes.push({ ...base, type: 'link', url: location.origin + imgUrl(n) });
     else if (n.kind === 'ref') nodes.push({ ...base, type: 'text', text: `> from ${n.srcLabel}\n\n\`\`\`\n${n.text}\n\`\`\``, color: '6' });
     else nodes.push({ ...base, type: 'text', text: `**${pathOf(n.id)}** · ${badgeOf(n)}\n\n\`\`\`\n${snapshotText(n, 30)}\n\`\`\``, color: '4' });
   }
@@ -3157,6 +3164,8 @@ cmd('New agent card…', onCanvas(() => newAgentCard()), '', () => DAEMON && (IN
 }
 cmd('New browser window…', onCanvas(() => $('#add-web').click()));
 cmd('New sketch (write on it with the pen)', onCanvas(() => newSketch()));
+cmd('Paste onto the canvas: an image, text or copied cards', onCanvas(() => pasteFromClipboard()), '@clip.paste');
+cmd('New image from a file…', onCanvas(() => imageFromFile()));
 cmd('New shell', onCanvas(() => $('#add-shell').click()));
 cmd('New JavaScript REPL', onCanvas(() => newAt('repl', { lang: 'js', history: [] })));
 cmd('New Python REPL', onCanvas(() => newAt('repl', { lang: 'cmd', backend: 'pty', cmd: 'python3 -q', name: 'py' + (nodeList().length + 1) })), '', () => DAEMON);
@@ -6274,6 +6283,290 @@ async function sketchToPage(n) {
     toast('Page ' + page.name + ' written from the ink.');
   } catch (e) { toast('Could not read the ink: ' + (e?.message || e), 6000); }
 }
+// ================================================================ images and the clipboard on the canvas (F-A32)
+// An image pasted or dropped on the canvas is an `image` card. Served by wb-web, the bytes go to POST /api/blob and the
+// card keeps only their sha256 (`blob`), shown from /blob/<hash>; in demo mode the card keeps a data: URL (`src`). PNG,
+// JPEG, GIF, WebP and AVIF go as they are; any other image the browser can draw (BMP, SVG, TIFF on Safari) is redrawn
+// as a PNG first, so the server only ever holds raster bytes.
+const IMG_RAW = /^image\/(png|jpeg|gif|webp|avif)$/, IMG_MAX = 32 << 20, IMG_DEMO_MAX = 2 << 20;
+const imgUrl = n => typeof n.blob === 'string' && /^[0-9a-f]{64}$/.test(n.blob) ? '/blob/' + n.blob
+  : typeof n.src === 'string' && /^data:image\/(png|jpeg|gif|webp|avif);base64,[A-Za-z0-9+/=]+$/.test(n.src) ? n.src : '';
+function imgLoad(url) { return new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('the browser cannot read this image')); i.src = url; }); }
+async function imgRedraw(blob, type = 'image/png') {
+  const url = URL.createObjectURL(blob);
+  try {
+    const i = await imgLoad(url), w = i.naturalWidth || 800, h = i.naturalHeight || 600, cv = document.createElement('canvas');
+    cv.width = w; cv.height = h; cv.getContext('2d').drawImage(i, 0, 0, w, h);
+    const out = await new Promise(r => cv.toBlob(r, type));
+    if (!out) throw new Error('could not redraw the image');
+    return { data: out, iw: w, ih: h };
+  } finally { URL.revokeObjectURL(url); }
+}
+async function imgPrepare(file) {
+  if (!IMG_RAW.test(file.type)) { const r = await imgRedraw(file); return { ...r, type: 'image/png' }; }
+  const url = URL.createObjectURL(file);
+  try { const i = await imgLoad(url); return { data: file, type: file.type, iw: i.naturalWidth, ih: i.naturalHeight }; } finally { URL.revokeObjectURL(url); }
+}
+async function imgStore(p) {
+  if (p.data.size > IMG_MAX) throw new Error(`too large (${Math.round(p.data.size / 1048576)} MB, the limit is 32 MB)`);
+  if (!DAEMON) {
+    if (p.data.size > IMG_DEMO_MAX) throw new Error('too large for demo mode (2 MB); wb-web takes up to 32 MB');
+    return { src: await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(p.data); }) };
+  }
+  const r = await fetch('/api/blob', { method: 'POST', redirect: 'manual', cache: 'no-store', headers: { 'Content-Type': p.type }, body: p.data });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || 'upload failed (HTTP ' + r.status + ')');
+  return { blob: j.hash, mime: j.type };
+}
+// a card that shows the image whole: at most 640 × 480 on the board, never narrower than 160
+function imgSize(iw, ih) {
+  iw = iw || 480; ih = ih || 360;
+  const k = Math.min(1, 640 / iw, 480 / ih), w = Math.max(160, Math.round(iw * k));
+  return { w, h: clamp(Math.round(w * ih / iw), 60, 640) + HDR };
+}
+function uniqueName(base, kind) {
+  const taken = new Set(Object.values(S.nodes).filter(m => m.kind === kind).map(m => m.name));
+  let name = clean(base), i = 2; while (taken.has(name)) name = clean(base) + '-' + i++;
+  return name;
+}
+// where a paste lands: under the pointer while it is over the canvas, else the middle of the view
+const POINTER = { x: 0, y: 0, in: false };
+viewport.addEventListener('pointermove', e => { POINTER.x = e.clientX; POINTER.y = e.clientY; POINTER.in = true; }, { passive: true });
+viewport.addEventListener('pointerleave', () => { POINTER.in = false; });
+function pastePoint() {
+  if (!POINTER.in) return viewCenterWorld();
+  const r = viewport.getBoundingClientRect(); return s2w(POINTER.x - r.left, POINTER.y - r.top);
+}
+async function imagesOnCanvas(files, at = pastePoint()) {
+  const list = [...files].filter(f => f && /^image\//.test(f.type));
+  if (!list.length) return [];
+  if (VIEW !== 'canvas') setView('canvas');
+  if (DAEMON) toast(list.length === 1 ? 'Adding the image…' : `Adding ${list.length} images…`);
+  const made = [], failed = [];
+  for (const [i, f] of list.entries()) {
+    try {
+      const p = await imgPrepare(f), stored = await imgStore(p), sz = imgSize(p.iw, p.ih);
+      const base = String(f.name || '').replace(/\.[A-Za-z0-9]+$/, '');
+      const name = uniqueName(base && !/^image$/i.test(base) ? base : 'image' + (Object.values(S.nodes).filter(m => m.kind === 'image').length + 1), 'image');
+      made.push(addNode({ kind: 'image', name, ...stored, iw: p.iw, ih: p.ih, x: Math.round(at.x - sz.w / 2 + i * 24), y: Math.round(at.y - sz.h / 2 + i * 24), w: sz.w, h: sz.h }));
+    } catch (e) { failed.push((f.name || 'image') + ': ' + (e?.message || e)); }
+  }
+  if (made.length) { pickClear(); for (const n of made) pickToggle(n.id, true); activate(made[made.length - 1].id); }
+  if (failed.length) toast('Not added: ' + failed.join('; '), 6000);
+  else toast(made.length === 1 ? `${made[0].name}: an image card. The pen draws on it; Ctrl-C copies it.` : `${made.length} image cards.`);
+  return made;
+}
+function mountImage(n, L) {
+  const img = el('img', 'img-card'), note = el('div', 'img-note');
+  img.alt = n.name; img.draggable = false; img.decoding = 'async'; note.hidden = true;
+  img.onerror = () => { note.hidden = false; note.textContent = n.blob ? 'The image is not on this server (' + String(n.blob).slice(0, 12) + '…).' : 'No image.'; };
+  img.onload = () => { note.hidden = true; if (!n.iw && img.naturalWidth) { n.iw = img.naturalWidth; n.ih = img.naturalHeight; dirty(); } };
+  L.body.append(img, note); L.img = img;
+  const u = imgUrl(n); if (u) img.src = u; else img.onerror();
+  // the picture has no inside to click into, so with the select tool it is a handle like the header
+  L.body.addEventListener('pointerdown', ev => {
+    if (tool !== 'select' || ev.button !== 0 || ev.shiftKey) return;
+    ev.preventDefault(); activate(n.id);
+    const moved = { x: n.x, y: n.y };
+    dragWith(ev, L.body, [n], e => { place(n); renderLinks(); hoverDrop(e, n); }, e => { if (n.x !== moved.x || n.y !== moved.y) { dropInto(n, e); deskColumnsAfter(n); } else clearDrop(); });
+  });
+}
+async function imageBlobOf(n) {
+  const u = imgUrl(n); if (!u) throw new Error('no image');
+  const r = await fetch(u); if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.blob();
+}
+async function imageOpen(n) {
+  if (n.blob && imgUrl(n)) { window.open(imgUrl(n), '_blank', 'noopener'); return; }
+  try { const u = URL.createObjectURL(await imageBlobOf(n)); window.open(u, '_blank', 'noopener'); setTimeout(() => URL.revokeObjectURL(u), 60000); } catch (e) { toast('Cannot open the image: ' + (e?.message || e)); }
+}
+// the image itself on the system clipboard, as PNG (the one image type every browser writes), for another program
+function imageCopy(n, quiet) {
+  if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') { if (!quiet) toast('This browser cannot put images on the clipboard; ↗ opens the image to copy it from there.', 5000); return Promise.resolve(false); }
+  const png = imageBlobOf(n).then(b => b.type === 'image/png' ? b : imgRedraw(b).then(r => r.data));
+  return navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]).then(
+    () => { toast(`${n.name}: the image is on the clipboard (PNG). Paste it into another program, or here.`); return true; },
+    e => { if (!quiet) toast('Could not copy the image: ' + (e?.message || e)); return false; });
+}
+function imageNatural(n) {
+  if (!n.iw || !n.ih) return toast('The image has not loaded yet.');
+  n.w = n.iw; n.h = n.ih + HDR; place(n); if (n.in && S.nodes[n.in]) relayout(S.nodes[n.in], true); renderEdges(); dirty();
+}
+// drop image files on the canvas; any other file is refused here, not opened by the browser in place of the board
+viewport.addEventListener('dragover', e => { if (VIEW === 'canvas' && [...(e.dataTransfer?.types || [])].includes('Files')) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } });
+viewport.addEventListener('drop', e => {
+  if (VIEW !== 'canvas' || ![...(e.dataTransfer?.types || [])].includes('Files')) return;
+  e.preventDefault();
+  const files = [...e.dataTransfer.files].filter(f => /^image\//.test(f.type));
+  if (!files.length) return toast('Only images can be dropped on the canvas.');
+  const r = viewport.getBoundingClientRect(); imagesOnCanvas(files, s2w(e.clientX - r.left, e.clientY - r.top));
+});
+
+// Copy, cut and paste on the board. Ctrl-C/V/X (Cmd on a Mac) are canvas keymap rows whose commands give the key back
+// to the browser, so its copy, cut and paste events come here. They are the board's only when the keyboard is on the
+// board: a shell, a page, a text field or a frame keeps its own clipboard.
+const WB_MIME = 'application/x-workbench-items';
+// kinds a copy duplicates, and the fields each keeps; a live card (shell, agent, artifact) or a folder is not copied
+const COPY_FIELDS = { image: ['blob', 'src', 'mime', 'iw', 'ih'], sketch: [], web: ['url'], ref: ['text', 'src', 'srcLabel'], buffer: ['text'] };
+function canvasClipOk() {
+  if (!S || !BOOTED || VIEW !== 'canvas') return false;
+  const c = keyContext(); return !c.transient && (!c.interior || c.interior === 'control');
+}
+function shapeBox(s) { return s.type === 'arrow' ? (({ x1, y1, x2, y2 }) => [Math.min(x1, x2), Math.min(y1, y2), Math.max(x1, x2), Math.max(y1, y2)])(arrowEnds(s)) : [s.x, s.y, s.x + s.w, s.y + s.h]; }
+function copyItems() {
+  let ids = [...PICKED].filter(id => S.nodes[id]);
+  const strokes = S.strokes.filter(x => SEL.strokes.has(x.id)), shapes = S.shapes.filter(x => SEL.shapes.has(x.id));
+  if (!ids.length && !strokes.length && !shapes.length) { const a = activeNode(); if (!a) return null; ids = [a.id]; }
+  const cards = [], skipped = [], texts = [], ok = new Set();
+  for (const id of ids) {
+    const n = S.nodes[id], keep = COPY_FIELDS[n.kind];
+    if (!keep) { skipped.push(n); continue; }
+    const c = { id: n.id, kind: n.kind, name: n.name, x: n.x, y: n.y, w: n.w, h: n.h };
+    if (Array.isArray(n.tags)) c.tags = n.tags.slice();
+    for (const k of keep) if (n[k] !== undefined) c[k] = JSON.parse(JSON.stringify(n[k]));
+    if (n.kind === 'buffer') { const t = live[n.id]?.view ? live[n.id].view.state.doc.toString() : FR.on && n.buf ? frBufOf(n)?.text : n.text; if (t == null) { skipped.push(n); continue; } c.text = t; }
+    cards.push(c); ok.add(id);
+    texts.push(n.kind === 'image' ? (n.blob ? location.origin + '/blob/' + n.blob : n.name) : n.kind === 'web' ? n.url || '' : n.kind === 'buffer' || n.kind === 'ref' ? c.text || '' : n.name);
+  }
+  // ink: the copied cards' own (not ink anchored to a page's lines), and the selected loose ink in board coordinates
+  const ink = [];
+  for (const x of S.strokes) if (x.owner && ok.has(x.owner) && !x.aid) ink.push({ ...x });
+  for (const x of strokes) if (!(x.owner && ok.has(x.owner)) && !x.aid) ink.push({ ...x, owner: null, pts: strokeWorldPts(x) });
+  const shapeIds = new Set(shapes.map(s => s.id)), sh = [];
+  for (const s of shapes) {
+    const c = JSON.parse(JSON.stringify(s));
+    if (s.type === 'arrow') {   // an end bound to something not copied stays where it is drawn now
+      const e = arrowEnds(s);
+      if (c.a && !ok.has(c.a.id) && !shapeIds.has(c.a.id)) { c.x1 = e.x1; c.y1 = e.y1; delete c.a; }
+      if (c.b && !ok.has(c.b.id) && !shapeIds.has(c.b.id)) { c.x2 = e.x2; c.y2 = e.y2; delete c.b; }
+    }
+    sh.push(c); if (s.text) texts.push(s.text);
+  }
+  const edges = S.edges.filter(e => ok.has(e.from) && ok.has(e.to)).map(e => ({ ...e }));
+  if (!cards.length && !ink.length && !sh.length) return { skipped };
+  return { items: { v: 1, cards, strokes: ink, shapes: sh, edges }, text: texts.filter(Boolean).join('\n\n'), skipped, ids: [...ok] };
+}
+function clipNote(skipped) {
+  if (!skipped.length) return '';
+  const kinds = [...new Set(skipped.map(n => n.kind === 'frame' ? 'folders' : n.kind === 'buffer' ? 'pages not loaded yet' : n.kind === 'artifact' ? 'artifacts' : 'live sessions (⑂ branches one)'))];
+  return ` Not copied: ${skipped.length} (${kinds.join(', ')}).`;
+}
+function clipCopy(ev, cut) {
+  if (!canvasClipOk() || !ev.clipboardData) return;
+  const sel = getSelection(); if (sel && !sel.isCollapsed && String(sel).trim()) return;   // selected text copies as text
+  const got = copyItems(); if (!got) return;
+  ev.preventDefault();
+  if (!got.items) { toast('Nothing to copy.' + clipNote(got.skipped)); return; }
+  const it = got.items;
+  ev.clipboardData.setData(WB_MIME, JSON.stringify(it, (k, v) => k.startsWith('_') ? undefined : v));
+  ev.clipboardData.setData('text/plain', got.text);
+  const parts = []; if (it.cards.length) parts.push(it.cards.length + (it.cards.length === 1 ? ' card' : ' cards')); if (it.strokes.length) parts.push(it.strokes.length + ' strokes'); if (it.shapes.length) parts.push(it.shapes.length + (it.shapes.length === 1 ? ' shape' : ' shapes'));
+  if (cut) {
+    const gone = new Set(it.strokes.map(x => x.id)), owners = new Set(S.strokes.filter(x => gone.has(x.id)).map(x => x.owner || null));
+    S.strokes = S.strokes.filter(x => !gone.has(x.id)); owners.forEach(o => renderInk(o));
+    for (const s of it.shapes) removeShape(s.id);
+    for (const id of got.ids) if (S.nodes[id]) removeNode(id);
+    pickClear(); dirty();
+  }
+  // one image with nothing drawn on it also goes on the system clipboard as the image, for another program
+  const one = it.cards.length === 1 && !it.strokes.length && !it.shapes.length && it.cards[0].kind === 'image' ? it.cards[0] : null;
+  if (one && !cut) imageCopy(one, true).then(done => { if (!done) toast(`Copied ${parts.join(', ')}.${clipNote(got.skipped)}`); });
+  else toast(`${cut ? 'Cut' : 'Copied'} ${parts.join(', ')}.${clipNote(got.skipped)}`, got.skipped.length ? 5000 : 2600);
+}
+document.addEventListener('copy', ev => clipCopy(ev, false));
+document.addEventListener('cut', ev => clipCopy(ev, true));
+document.addEventListener('paste', ev => { if (canvasClipOk() && ev.clipboardData && pasteData(ev.clipboardData)) ev.preventDefault(); });
+// what a paste holds, in order: cards copied on a board, image files, then text
+function pasteData(dt, at = pastePoint()) {
+  const items = dt.getData(WB_MIME);
+  if (items) { try { if (pasteItems(JSON.parse(items), at)) return true; } catch {} }
+  const files = [...(dt.files || [])].filter(f => /^image\//.test(f.type));
+  if (files.length) { imagesOnCanvas(files, at); return true; }
+  const text = dt.getData('text/plain');
+  if (text && text.trim()) { pasteText(text, at); return true; }
+  return false;
+}
+// a lone http(s) URL becomes a web card, one short line a text label, anything longer a page
+function pasteText(text, at = pastePoint()) {
+  const t = text.replace(/\r\n?/g, '\n').trim();
+  if (VIEW !== 'canvas') setView('canvas');
+  if (/^https?:\/\/\S+$/.test(t) && webUrlOk(t)) {
+    const n = addNode({ kind: 'web', url: t, name: t.replace(/^https?:\/\//, '').split('/')[0], x: Math.round(at.x - 360), y: Math.round(at.y - 260), w: 720, h: 520 });
+    toast(`${n.name}: a web card.`); return n;
+  }
+  if (!t.includes('\n') && t.length <= 120) {
+    const s = addShape({ type: 'text', x: 0, y: Math.round(at.y - 14), text: t }); s.x = Math.round(at.x - s.w / 2); renderShapes(); dirty();
+    pickClear(); SEL.shapes.add(s.id); renderPicked(); pickChip(); return s;
+  }
+  const first = t.split('\n').find(l => l.trim()).replace(/^#+\s*/, '').trim().slice(0, 40);
+  const n = addNode({ kind: 'buffer', name: uniqueName(first || 'pasted', 'buffer'), text: t + '\n', x: Math.round(at.x - 230), y: Math.round(at.y - 160), w: 460, h: 320 });
+  toast(`${n.name}: a page with the pasted text.`); return n;
+}
+const finite = v => typeof v === 'number' && Number.isFinite(v);
+function pasteItems(p, at = pastePoint()) {
+  if (!p || p.v !== 1) return null;
+  const cards = (Array.isArray(p.cards) ? p.cards : []).filter(c => c && COPY_FIELDS[c.kind] && [c.x, c.y, c.w, c.h].every(finite));
+  const okPts = x => x && Array.isArray(x.pts) && x.pts.length && x.pts.every(q => Array.isArray(q) && finite(q[0]) && finite(q[1]));
+  const ink = (Array.isArray(p.strokes) ? p.strokes : []).filter(okPts);
+  const shapes = (Array.isArray(p.shapes) ? p.shapes : []).filter(s => s && SHAPE_TOOLS.has(s.type) && (s.type === 'arrow' ? [s.x1, s.y1, s.x2, s.y2] : [s.x, s.y, s.w, s.h]).every(finite));
+  const boxes = [...cards.map(c => [c.x, c.y, c.x + c.w, c.y + c.h]),
+    ...shapes.map(s => s.type === 'arrow' ? [Math.min(s.x1, s.x2), Math.min(s.y1, s.y2), Math.max(s.x1, s.x2), Math.max(s.y1, s.y2)] : [s.x, s.y, s.x + s.w, s.y + s.h]),
+    ...ink.filter(x => !x.owner || !cards.some(c => c.id === x.owner)).map(x => { const xs = x.pts.map(q => q[0]), ys = x.pts.map(q => q[1]); return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)]; })];
+  if (!boxes.length) return null;
+  if (VIEW !== 'canvas') setView('canvas');
+  const x0 = Math.min(...boxes.map(b => b[0])), y0 = Math.min(...boxes.map(b => b[1])), x1 = Math.max(...boxes.map(b => b[2])), y1 = Math.max(...boxes.map(b => b[3]));
+  const dx = Math.round(at.x - (x0 + x1) / 2), dy = Math.round(at.y - (y0 + y1) / 2), map = new Map();
+  pickClear();
+  for (const c of cards) {
+    const n = { kind: c.kind, name: uniqueName(String(c.name || c.kind), c.kind), x: Math.round(c.x + dx), y: Math.round(c.y + dy), w: clamp(Math.round(c.w), 60, 8000), h: clamp(Math.round(c.h), 40, 8000) };
+    if (Array.isArray(c.tags)) n.tags = c.tags.filter(t => typeof t === 'string');
+    for (const k of COPY_FIELDS[c.kind]) if (c[k] !== undefined) n[k] = c[k];
+    if (n.kind === 'image' && !imgUrl(n)) continue;
+    if (n.kind === 'web' && !webUrlOk(n.url)) n.url = '';
+    if ((n.kind === 'buffer' || n.kind === 'ref') && typeof n.text !== 'string') n.text = '';
+    addNode(n); map.set(c.id, n.id); pickToggle(n.id, true);
+  }
+  const owners = new Set();
+  for (const x of ink) {
+    const owner = x.owner ? map.get(x.owner) : null;
+    if (x.owner && !owner) continue;
+    const s = { id: uid('s'), color: typeof x.color === 'string' ? x.color : inkColor, size: finite(x.size) ? x.size : undefined, sim: !!x.sim, owner,
+      pts: x.pts.map(q => owner ? [q[0], q[1], finite(q[2]) ? q[2] : 0.5] : [q[0] + dx, q[1] + dy, finite(q[2]) ? q[2] : 0.5]) };
+    S.strokes.push(s); owners.add(owner); if (!owner) SEL.strokes.add(s.id);
+  }
+  const shapeMap = new Map(shapes.map(s => [s.id, uid('sh')]));
+  for (const s of shapes) {
+    const c = { ...s, id: shapeMap.get(s.id) }; c.seed = hashSeed(c.id);
+    if (s.type === 'arrow') {
+      Object.assign(c, { x1: s.x1 + dx, y1: s.y1 + dy, x2: s.x2 + dx, y2: s.y2 + dy });
+      for (const e of ['a', 'b']) { const to = s[e] && (map.get(s[e].id) || shapeMap.get(s[e].id)); if (to) c[e] = { ...s[e], id: to }; else delete c[e]; }
+    } else Object.assign(c, { x: s.x + dx, y: s.y + dy });
+    S.shapes.push(c); SEL.shapes.add(c.id);
+  }
+  for (const e of Array.isArray(p.edges) ? p.edges : []) if (map.has(e.from) && map.has(e.to)) S.edges.push({ id: uid('e'), from: map.get(e.from), to: map.get(e.to), type: e.type });
+  owners.forEach(o => renderInk(o)); renderShapes(); renderEdges(); renderPicked(); pickChip(); dirty();
+  const parts = []; if (map.size) parts.push(map.size + (map.size === 1 ? ' card' : ' cards')); if (ink.length) parts.push(ink.length + ' strokes'); if (shapes.length) parts.push(shapes.length + (shapes.length === 1 ? ' shape' : ' shapes'));
+  toast('Pasted ' + parts.join(', ') + '.');
+  return { cards: [...map.values()], shapes: [...shapeMap.values()] };
+}
+// the palette's way in (a touch screen has no Ctrl-V, and Safari fires no paste on the board): the async clipboard
+async function pasteFromClipboard() {
+  if (!navigator.clipboard?.read) {
+    try { const t = await navigator.clipboard.readText(); if (t.trim()) return pasteText(t); } catch {}
+    return toast('This browser does not let the page read the clipboard. Press Ctrl-V (⌘V) on the board instead.', 5000);
+  }
+  let items; try { items = await navigator.clipboard.read(); } catch { return toast('Clipboard read is not allowed here. Press Ctrl-V (⌘V) on the board instead.', 5000); }
+  const files = [];
+  for (const it of items) { const t = it.types.find(x => /^image\//.test(x)); if (t) files.push(new File([await it.getType(t)], 'image', { type: t })); }
+  if (files.length) return imagesOnCanvas(files);
+  for (const it of items) if (it.types.includes('text/plain')) { const t = await (await it.getType('text/plain')).text(); if (t.trim()) return pasteText(t); }
+  toast('The clipboard holds no image or text.');
+}
+function imageFromFile() {
+  const inp = Object.assign(el('input'), { type: 'file', accept: 'image/*', multiple: true });
+  inp.onchange = () => { if (inp.files.length) imagesOnCanvas(inp.files, viewCenterWorld()); };
+  inp.click();
+}
 // File-backed artifact: the HTML file is the source of truth; any agent (claude code, oh-my-pi, a script) writes it and the node republishes and reloads.
 async function artFromFile(n, L) {
   const st = await (await fetch(`/api/stat?path=${encodeURIComponent(n.file)}`)).json();
@@ -7509,6 +7802,8 @@ const KC = {
   'arrange.done': () => arrangeDone(false), 'arrange.cancel': () => arrangeDone(true), arrange: () => arrangeOpen(),
   hints: (e, k, via) => { if (via === 'leader') leaveCard(LEADER.target); hintsOpen('pick'); },
   'hints.letter': (e, k) => hintsType(k), 'hints.back': () => { HINTS.typed = HINTS.typed.slice(0, -1); for (const it of HINTS.items) it.el.hidden = !it.label.startsWith(HINTS.typed); }, 'hints.cancel': () => hintsClose(),
+  // the browser keeps these keys: its copy, cut and paste events reach the board's handlers (F-A32)
+  'clip.copy': () => false, 'clip.cut': () => false, 'clip.paste': () => false,
   'card.actions': () => cardActions(), 'graph.actions': () => cardActions(), 'graph.open': () => graphOpen(),
   'card.enter': () => { const n = activeNode(); if (!n) return false; n.kind === 'frame' ? wsEnter(n) : typeInto(n); },
   'card.tab': () => { const n = activeNode(); if (!n) return false; focusOpen(n); },
@@ -8606,7 +8901,7 @@ AGENT_TOOLS.push(
   { name: 'host_status', description: 'Health of a host: load, memory, disk, uptime, shells, tmux sessions, unit counts (failed names). host: a name from hosts.json (empty = the serving daemon).', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
     run: async ({ host } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j = await (await hFetch(h, '/api/status')).json(); const gb = b => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}` + (j.sessions?.tmux != null ? ', tmux sessions ' + j.sessions.tmux : ''), j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
-window.__canvas = { typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
+window.__canvas = { s2w, pasteData, pasteItems, pasteText, imagesOnCanvas, copyItems, imgUrl, typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, get RG() { return RG; }, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, WS, FOCUS, LEADER, setLeader, isLeader, wsEnter, wsLeave, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, RG, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, collectTasks, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 Object.assign(window.__canvas, { keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
 Object.defineProperty(window.__canvas, 'activeId', { get: () => activeId });   // Object.assign would copy a getter's value once
 Object.assign(window.__canvas, { DESK, deskGo, deskSend, deskList, deskAt, deskPin, deskDelete, deskOff, deskPinned, serialize, activate, viewKey,
