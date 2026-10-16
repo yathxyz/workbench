@@ -385,7 +385,8 @@ in
           assert wb.succeed(f"stat -c %U /run/workbench-edit {EDIT_SOCK}").split() == ["alice", "alice"]
           edit_pid = main_pid("workbench-edit")
           wb.succeed(f"grep -qa -- --disallow-code-generation-from-strings /proc/{edit_pid}/cmdline")
-          wb.succeed(f"grep -qa -- --frozen-intrinsics /proc/{edit_pid}/cmdline")
+          wb.fail(f"grep -qa -- --frozen-intrinsics /proc/{edit_pid}/cmdline")
+          wb.succeed("journalctl -u workbench-edit.service -o cat | grep -q 'listen .*\"lockdown\":\"locked\"'")
 
           def wb_cli(cmd, stdin=None):
               pipe = f"printf %s {shlex.quote(stdin)} | " if stdin is not None else ""

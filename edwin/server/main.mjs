@@ -29,6 +29,7 @@ import * as hubModule from './hub.mjs';
 import * as processModule from './process.mjs';
 import * as wbModule from './wb.mjs';
 import * as anchorsModule from './anchors.mjs';
+import { lockdown, lockdownState } from './lockdown.mjs';
 
 const require = createRequire(import.meta.url);
 /* The E2 modules, installed in this order after the buffers are loaded; each exports install(server) and
@@ -169,7 +170,7 @@ export class Server {
           if ((st.mode & 0o777) !== 0o600) throw new Error(`${sock} has mode ${(st.mode & 0o777).toString(8)}, not 600`);
         } catch (e) { server.close(); reject(e); return; }
         this.net = server;
-        this.log.info('listen', { socket: sock, build: this.build, boot: this.boot });
+        this.log.info('listen', { socket: sock, build: this.build, boot: this.boot, lockdown: lockdownState() });
         fs.writeSync(2, `listening on ${sock}\n`);
         resolve(server);
       });
@@ -365,6 +366,7 @@ export function guardProcesses() {
 }
 
 export async function main(argv) {
+  lockdown();
   guardProcesses();
   const args = [...argv];
   let config = null, mode = 'run', exportDir = null;
