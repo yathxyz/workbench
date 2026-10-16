@@ -6453,6 +6453,8 @@ function copyItems() {
     }
     sh.push(c); if (s.text) texts.push(s.text);
   }
+  // an arrow drawn between two copied cards comes along like an edge, picked or not
+  for (const s of S.shapes) if (s.type === 'arrow' && !shapeIds.has(s.id) && s.a && s.b && ok.has(s.a.id) && ok.has(s.b.id)) { sh.push(JSON.parse(JSON.stringify(s))); shapeIds.add(s.id); if (s.text) texts.push(s.text); }
   const edges = S.edges.filter(e => ok.has(e.from) && ok.has(e.to)).map(e => ({ ...e }));
   if (!cards.length && !ink.length && !sh.length) return { skipped };
   return { items: { v: 1, cards, strokes: ink, shapes: sh, edges }, text: texts.filter(Boolean).join('\n\n'), skipped, ids: [...ok] };
@@ -6548,7 +6550,7 @@ function pasteItems(p, at = pastePoint()) {
   }
   const shapeMap = new Map(shapes.map(s => [s.id, uid('sh')]));
   for (const s of shapes) {
-    const c = { ...s, id: shapeMap.get(s.id) }; c.seed = hashSeed(c.id);
+    const c = { ...s, id: shapeMap.get(s.id) }; c.seed = hashSeed(c.id); delete c.in;   // folders are not copied: a pasted shape stands loose
     if (s.type === 'arrow') {
       Object.assign(c, { x1: s.x1 + dx, y1: s.y1 + dy, x2: s.x2 + dx, y2: s.y2 + dy });
       for (const e of ['a', 'b']) { const to = s[e] && (map.get(s[e].id) || shapeMap.get(s[e].id)); if (to) c[e] = { ...s[e], id: to }; else delete c[e]; }

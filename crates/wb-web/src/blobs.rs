@@ -8,9 +8,11 @@
 //! origin when opened in a tab. The type is read from the bytes, on the way in and on
 //! the way out; the request's `Content-Type` is not trusted.
 
-use std::fs;
-use std::io;
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::Body as ResponseBody;
 use axum::extract::{DefaultBodyLimit, State};
@@ -24,7 +26,6 @@ use sha2::{Digest, Sha256};
 
 use crate::AppState;
 use crate::http::{ApiError, Body, Param};
-use crate::util::atomic_write;
 
 /// The largest image taken, in bytes.
 pub const BLOB_MAX: usize = 32 << 20;
@@ -101,7 +102,7 @@ async fn put_blob(State(app): State<AppState>, Body(body): Body) -> Response {
             return Ok(());
         }
         fs::create_dir_all(&dir)?;
-        atomic_write(&path, &body).map(|_| ())
+        install_blob(&dir, &name, &body)
     })
     .await;
     match wrote {
@@ -109,6 +110,35 @@ async fn put_blob(State(app): State<AppState>, Body(body): Body) -> Response {
         Ok(Err(e)) => io_failure("cannot store the image", &e),
         Err(e) => io_failure("cannot store the image", &e),
     }
+}
+
+/// Writes `body` to `dir/name` without a window where the name holds part of it. Each
+/// call writes its own temporary file and links it in with no clobber, so two uploads
+/// of the same new image at once neither unlink each other's temporary nor fail: the
+/// second link finds the name taken by the same bytes.
+fn install_blob(dir: &Path, name: &str, body: &[u8]) -> io::Result<()> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = dir.join(format!(
+        ".{name}.{}.{}.wbtmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let linked = (|| -> io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(body)?;
+        f.sync_all()?;
+        match fs::hard_link(&tmp, dir.join(name)) {
+            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => Err(e),
+            _ => Ok(()),
+        }
+    })();
+    let _ = fs::remove_file(&tmp);
+    linked?;
+    File::open(dir)?.sync_all()
 }
 
 async fn get_blob(State(app): State<AppState>, Param(hash): Param<String>) -> Response {
@@ -166,6 +196,22 @@ mod tests {
         ] {
             assert_eq!(sniff(no), None, "{no:?}");
         }
+    }
+
+    #[test]
+    fn same_blob_installed_at_once_is_whole_and_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
+        std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| install_blob(dir.path(), "h", &body)))
+                .collect();
+            for h in hs {
+                h.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(fs::read(dir.path().join("h")).unwrap(), body);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

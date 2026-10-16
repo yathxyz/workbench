@@ -2761,7 +2761,21 @@ await section('N63', async () => {
       C.pickClear(); C.SEL.shapes.add(label.id); document.activeElement?.blur?.();
       const ct = new DataTransfer(); document.body.dispatchEvent(new ClipboardEvent('cut', { clipboardData: ct, bubbles: true, cancelable: true }));
       out.cut = { gone: !S.shapes.some(s => s.id === label.id), text: ct.getData('text/plain') };
-      out.made = [...fresh().map(n => n.id), web?.id, pg?.id].filter(Boolean);
+      // an arrow between two copied cards comes along unpicked; a pasted shape leaves the folder it was in (Codex on #17)
+      let bound = null;
+      if (web && pg) {
+        const arrow = C.addShape({ type: 'arrow', x1: 0, y1: 0, x2: 0, y2: 0, a: { id: web.id, dx: 0, dy: 0 }, b: { id: pg.id, dx: 0, dy: 0 } });
+        const box = C.addShape({ type: 'rect', x: web.x, y: web.y - 80, w: 60, h: 40, in: 'n63-folder' });
+        C.pickClear(); C.pickToggle(web.id, true); C.pickToggle(pg.id, true); C.SEL.shapes.add(box.id);
+        const got = C.copyItems(), had = new Set(S.shapes.map(x => x.id)), nodesHad = new Set(Object.keys(S.nodes));
+        C.pasteItems(got.items);
+        const newShapes = S.shapes.filter(x => !had.has(x.id)), newIds = Object.keys(S.nodes).filter(id => !nodesHad.has(id));
+        const a2 = newShapes.find(x => x.type === 'arrow'), r2 = newShapes.find(x => x.type === 'rect');
+        bound = { copied: got.items.shapes.some(x => x.id === arrow.id), rebound: !!a2 && newIds.includes(a2.a?.id) && newIds.includes(a2.b?.id), loose: !!r2 && !('in' in r2) };
+        out.extra = newIds; C.pickClear();
+      }
+      out.bound = bound;
+      out.made = [...fresh().map(n => n.id), web?.id, pg?.id, ...(out.extra || [])].filter(Boolean);
       return out;
     });
     const pageOk = st.text.page && /second line/.test(await pageText(D, st.text.page));
@@ -2778,8 +2792,8 @@ await section('N63', async () => {
     check('N63: the board file keeps the hash, not the bytes; an SVG is redrawn as a 20 × 10 PNG; wb-web refuses SVG bytes (415); a dropped image is an image card too',
       board.includes(st.a?.blob) && !board.includes('data:image') && st.svg?.mime === 'image/png' && st.svg.iw === 20 && st.svg.ih === 10 && svg.status === 415
       && !!st.drop, JSON.stringify({ svg: st.svg, status: svg.status, drop: st.drop }));
-    check('N63: Ctrl-C on a picked image card puts the board\'s items and its /blob/ URL on the clipboard; pasting them makes a second card on the same bytes, and so does a paste holding another PNG with the copied text (the system clipboard after an image copy); text pastes as a label, a URL as a web card, lines as a page; cut removes the label and carries its text',
-      st.copy.taken && st.copy.items && st.copy.text.endsWith('/blob/' + st.a.blob) && st.dup?.same && st.dup.other && st.recall?.same && st.recall.iw === 40 && st.recall.stored && st.label && st.text.web && pageOk && st.cut.gone && st.cut.text === 'n62 label', JSON.stringify({ copy: st.copy, dup: st.dup, recall: st.recall, label: st.label, text: st.text, pageOk, cut: st.cut }));
+    check('N63: Ctrl-C on a picked image card puts the board\'s items and its /blob/ URL on the clipboard; pasting them makes a second card on the same bytes, and so does a paste holding another PNG with the copied text (the system clipboard after an image copy); text pastes as a label, a URL as a web card, lines as a page; cut removes the label and carries its text; an arrow between two copied cards comes along unpicked and a pasted shape leaves its folder',
+      st.copy.taken && st.copy.items && st.copy.text.endsWith('/blob/' + st.a.blob) && st.dup?.same && st.dup.other && st.recall?.same && st.recall.iw === 40 && st.recall.stored && st.label && st.text.web && pageOk && st.cut.gone && st.cut.text === 'n62 label' && st.bound?.copied && st.bound.rebound && st.bound.loose, JSON.stringify({ copy: st.copy, dup: st.dup, recall: st.recall, label: st.label, text: st.text, pageOk, cut: st.cut, bound: st.bound }));
     await D.evaluate(ids => { for (const id of ids) if (window.__canvas.S.nodes[id]) window.__canvas.removeNode(id); window.__canvas.pickClear(); }, st.made);
     await settled(D);
   } finally { await D?.close(); }
