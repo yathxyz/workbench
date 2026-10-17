@@ -43,6 +43,8 @@ pub struct Text {
     /// The baseline's distance from the top of a cell.
     pub baseline: f32,
     shaped: HashMap<(String, u8), Vec<Glyph>>,
+    /// The system has no fonts at all (cosmic-text would panic shaping): the window does not open.
+    pub empty: bool,
 }
 
 const PREFERRED: &[&str] = &[
@@ -91,8 +93,12 @@ impl Text {
             cell_h: 1,
             baseline: 0.0,
             shaped: HashMap::new(),
+            empty: false,
         };
-        t.measure();
+        t.empty = t.fs.db().faces().next().is_none();
+        if !t.empty {
+            t.measure();
+        }
         t
     }
 

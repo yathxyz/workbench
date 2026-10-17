@@ -10,7 +10,7 @@
 { pkgs, agents }:
 let
   inherit (pkgs) lib;
-  workbench = pkgs.callPackage ./package.nix { };
+  workbench = pkgs.callPackage ./package.nix { edwind = pkgs.callPackage ./edwind.nix { }; };
   tests = lib.fileset.toSource {
     root = ../tests;
     fileset = lib.fileset.unions [

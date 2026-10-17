@@ -346,6 +346,41 @@ in
 
   vm = pkgs.testers.runNixOSTest (import ./vm.nix { inherit self; });
 
+  # programs.edwin (nix/edwin-module.nix) evaluates into a system: the user unit runs `edwin --fg-daemon` from the
+  # package, EDITOR is edwin. Evaluation only, so the edwin package itself is not built here.
+  edwin-module =
+    let
+      sys = pkgs.nixos {
+        imports = [ self.nixosModules.edwin ];
+        system.stateVersion = lib.trivial.release;
+        boot.isContainer = true; # no root file system or boot loader to declare
+        programs.edwin = {
+          enable = true;
+          daemon.enable = true;
+          defaultEditor = true;
+        };
+      };
+      unit = sys.config.systemd.user.services.edwind;
+      edwin = self.packages.${pkgs.stdenv.hostPlatform.system}.edwin;
+      show = v: builtins.unsafeDiscardStringContext (builtins.toJSON v);
+      got = show {
+        exec = unit.serviceConfig.ExecStart;
+        notes = unit.environment.EDWIN_NOTES_DIR;
+        wanted = unit.wantedBy;
+        editor = sys.config.environment.variables.EDITOR;
+        system = builtins.seq sys.config.system.build.toplevel.drvPath true;
+      };
+      want = show {
+        exec = "${edwin}/bin/edwin --fg-daemon";
+        notes = "%h/notes";
+        wanted = [ "default.target" ];
+        editor = "edwin";
+        system = true;
+      };
+    in
+    assert lib.assertMsg (got == want) "programs.edwin evaluated to ${got}, expected ${want}";
+    pkgs.runCommand "workbench-edwin-module" { } "touch $out";
+
   # The module's assertions refuse what wb-hub would refuse at its next start, so a bad name
   # fails the evaluation instead of the first hub restart after a deploy.
   module =

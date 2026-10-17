@@ -8,7 +8,10 @@
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
-      workbench = pkgs.callPackage ./nix/package.nix { };
+      edwind = pkgs.callPackage ./nix/edwind.nix { };
+      workbench = pkgs.callPackage ./nix/package.nix { inherit edwind; };
+      # Edwin on the desktop: edwin (terminal and window), edwin --daemon and edwind (nix/edwin.nix).
+      edwin = pkgs.callPackage ./nix/edwin.nix { inherit edwind; };
       vendor = pkgs.callPackage ./nix/vendor.nix { };
       workbench-web = pkgs.callPackage ./nix/web.nix { inherit vendor; };
       # What a release profile holds (N-12): the binaries, the web root and the commit they came from.
@@ -28,9 +31,23 @@
           workbench-web
           vendor
           release
+          edwin
+          edwind
           ;
         # The scripted ACP agent the VM, ui and conformance checks register as `stub`.
         fake-acp = workbench.fake;
+      };
+
+      # nix run .#edwin -- FILE (-g for a window, --daemon for the user's edwind); nix run .#edwind -- --config F.
+      apps.${system} = {
+        edwin = {
+          type = "app";
+          program = "${edwin}/bin/edwin";
+        };
+        edwind = {
+          type = "app";
+          program = "${edwind}/bin/edwind";
+        };
       };
 
       # lib.adapterCheck { pkgs, agents }: a check that runs real ACP adapters against a real
@@ -39,6 +56,8 @@
 
       nixosModules.workbench = import ./nix/module.nix self;
       nixosModules.default = self.nixosModules.workbench;
+      # programs.edwin: the edwin package, edwind as a user service, EDITOR=edwin (nix/edwin-module.nix).
+      nixosModules.edwin = import ./nix/edwin-module.nix self;
 
       checks.${system} = import ./nix/checks.nix {
         inherit

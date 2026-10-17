@@ -22,6 +22,8 @@ Edit FILEs in Edwin, in this terminal or in a window.
   -R, --read-only    visit the files read-only
   --standalone       never attach to edwind
   --socket PATH      attach to the edwind listening on PATH
+  --daemon           start your own edwind in the background (--fg-daemon: in the foreground); each edwin
+                     then attaches to it, as emacsclient does to emacs --daemon
   +LINE, +           start on line LINE of the first file (+ alone: its last line)
   -                  edit what arrives on standard input
   -h, --help         show this text;  --version  show the version
@@ -97,7 +99,8 @@ if (!gui) { out(enc.enter()); N.ttyFlush(); }
 function edwindSocket() {
   if (N.env('EDWIN_NO_ATTACH')) return null;
   if (opts.standalone) return null;
-  const cands = opts.socket ? [opts.socket] : [envOf('EDWIN_SOCKET'), '/run/workbench-edit/edit.sock'].filter(Boolean);
+  const user = envOf('XDG_RUNTIME_DIR') ? envOf('XDG_RUNTIME_DIR') + '/edwin/edit.sock' : '';   // edwin --daemon's
+  const cands = opts.socket ? [opts.socket] : [envOf('EDWIN_SOCKET'), user, '/run/workbench-edit/edit.sock'].filter(Boolean);
   for (const p of cands) {
     try { const id = N.sockOpen(p); N.sockClose(id); return p; } catch (e) { if (opts.socket) throw new Error(`cannot attach to edwind at ${p}: ${e.message}`); }
   }
@@ -122,7 +125,15 @@ function leaveTerminal() { if (gui) return; out(enc.leave()); N.ttyFlush(); N.tt
 async function quit(code) {
   if (quitting) return;
   quitting = true;
+  const saving = attached ? [...Ed.sync.buffers.values()].filter(b => b.saving) : [];
   if (attached) await drain();
+  /* A save edwind refused (a full disk, a lost file) keeps the program open, as Vim stays when :wq cannot write. */
+  const refused = saving.filter(b => b.saveError);
+  if (refused.length) {
+    quitting = false;
+    Ed.message(`${refused[0].name}: ${refused[0].saveError}; not quitting`); Ed.scheduleRender();
+    return;
+  }
   try { host.suspend(); } catch (e) { console.error(e); }
   leaveTerminal();
   if (attached && attached.unconfirmed) N.eprint(`edwin: edwind had not confirmed ${attached.unconfirmed} edit(s) when edwin quit\n`);
