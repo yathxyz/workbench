@@ -5,10 +5,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeDir, startEdwind, stopEdwind, EditClient } from './edit-client.mts';
+import type { TestDir, EdwindChild, ClientOptions } from './edit-client.mts';
 import { FakeHub } from './fake-hub.mts';
+import type { AcpSession } from './fake-hub.mts';
 import { Wb } from '../server/wb.mts';
 
-let dir, child, hub, boardsDir;
+let dir: TestDir, child: EdwindChild, hub: FakeHub, boardsDir: string;
 before(async () => {
   dir = makeDir();
   boardsDir = path.join(dir.root, 'boards'); fs.mkdirSync(boardsDir, { mode: 0o700 });
@@ -25,14 +27,14 @@ before(async () => {
     { seq: 3, ts: 3, e: 'update', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'user' } } },
     { seq: 4, ts: 4, e: 'turn_end', stopReason: 'end_turn' },
   ]);
-  hub.sessions.get('n_agent1').summary.acp.headSeq = 4; hub.sessions.get('n_agent1').summary.acp.seenSeq = 4;
+  (hub.sessions.get('n_agent1') as AcpSession).summary.acp.headSeq = 4; (hub.sessions.get('n_agent1') as AcpSession).summary.acp.seenSeq = 4;
   child = await startEdwind(dir);
 });
 after(async () => { await stopEdwind(child); await hub.stop(); fs.rmSync(dir.root, { recursive: true, force: true }); });
-const client = async (opts) => { const c = new EditClient(dir.cfg.socket, opts); await c.connect(); const w = await c.hello(); assert.equal(w.t, 'welcome'); return c; };
-const value = async (c, form) => { const r = await c.form(form); assert.equal(r.error, undefined, JSON.stringify(r.error)); return r.value; };
-const until = async (fn, what, ms = 10000) => { const end = Date.now() + ms; for (;;) { const v = await fn(); if (v) return v; if (Date.now() > end) throw new Error('timeout waiting for ' + what); await new Promise(r => setTimeout(r, 25)); } };
-const hubUp = c => until(async () => (await value(c, '(hub-status)')) === 'up', 'the hub to be up');
+const client = async (opts?: ClientOptions) => { const c = new EditClient(dir.cfg.socket, opts); await c.connect(); const w = await c.hello(); assert.equal(w.t, 'welcome'); return c; };
+const value = async (c: EditClient, form: string) => { const r = await c.form(form); assert.equal(r.error, undefined, JSON.stringify(r.error)); return r.value; };
+const until = async (fn: () => unknown, what: string, ms = 10000) => { const end = Date.now() + ms; for (;;) { const v = await fn(); if (v) return v; if (Date.now() > end) throw new Error('timeout waiting for ' + what); await new Promise(r => setTimeout(r, 25)); } };
+const hubUp = (c: EditClient) => until(async () => (await value(c, '(hub-status)')) === 'up', 'the hub to be up');
 
 test('unit: the Org transcript of an ACP replay', () => {
   const t = Wb.transcript([{ e: 'prompt', prompt: [{ type: 'text', text: 'hi' }] }, { e: 'update', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hello ' } } }, { e: 'update', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'there' } } }, { e: 'turn_end', stopReason: 'end_turn' }]);
@@ -74,7 +76,7 @@ test('R5.3 card-send, card-read, card-interrupt and card-kill on PTY and agent s
   const [cap] = await hub.waitFor(r => r.t === 'pty.capture' && r.sid === 'n_shell1');
   assert.equal(cap.lines, 200);
   assert.equal(await value(c, '(card-read "n_shell1" :lines 1)'), '"green"');
-  await until(() => hub.sessions.get('n_agent1').summary.acp.activity === 'none' && hub.sessions.get('n_agent1').summary.acp.headSeq > 4, 'the fake turn');
+  await until(() => (hub.sessions.get('n_agent1') as AcpSession).summary.acp.activity === 'none' && (hub.sessions.get('n_agent1') as AcpSession).summary.acp.headSeq > 4, 'the fake turn');
   const t = await value(c, '(card-read "n_agent1")');
   assert.equal(JSON.parse(t), '* User\n\nhello agent\n\n* Agent\n\nhello user\n\n* User\n\ndo it\n\n* Agent\n\nYou said: do it\n', 'the Org transcript of the replay');
   await hub.waitFor(r => r.t === 'acp.detach' && r.sid === 'n_agent1');
@@ -94,7 +96,7 @@ test('R5.3 card-send, card-read, card-interrupt and card-kill on PTY and agent s
 
 test('R5.3 acp-prompt blocks until the turn ends and returns the message; acp-prompt-async gives a mailbox; the turn-end hook fires', async () => {
   const c = await client(); await hubUp(c);
-  const head = hub.sessions.get('n_agent1').summary.acp.headSeq;
+  const head = (hub.sessions.get('n_agent1') as AcpSession).summary.acp.headSeq;
   assert.equal(await value(c, "(define turns '()) (add-hook! 'wb-acp-turn-end-functions (lambda (s outcome) (set! turns (cons (list (session-id s) outcome) turns)))) (acp-prompt (session-get \"n_agent1\") \"ping\")"), '"You said: ping"');
   const opens = hub.requests.filter(r => r.t === 'acp.open' && r.sid === 'n_agent1');
   const last = opens[opens.length - 1];
@@ -158,7 +160,7 @@ test('§5 card events come from diffing saves of the board file, with no leader'
   const c = await client(); await hubUp(c);
   assert.equal(await value(c, "(define cards '()) (define (note kind) (lambda (id node) (set! cards (cons (list kind id (cdr (assq 'kind node))) cards)))) (add-hook! 'wb-card-created-functions (note 'created)) (add-hook! 'wb-card-deleted-functions (note 'deleted)) (add-hook! 'wb-card-moved-functions (note 'moved)) 'ok"), 'ok');
   const file = path.join(boardsDir, 'test.json'), tmp = file + '.tmp';
-  const write = nodes => { fs.writeFileSync(tmp, JSON.stringify({ nodes, edges: [] })); fs.renameSync(tmp, file); };
+  const write = (nodes: Record<string, unknown>) => { fs.writeFileSync(tmp, JSON.stringify({ nodes, edges: [] })); fs.renameSync(tmp, file); };
   write({ n_shell1: { id: 'n_shell1', kind: 'term', x: 10, y: 0 }, n_page: { id: 'n_page', kind: 'buffer', x: 1, y: 1 } });
   await until(async () => (await value(c, '(length cards)')) === '2', 'created and moved', 5000);
   assert.equal(await value(c, "(list (assq 'created cards) (assq 'moved cards))"), '((created "n_page" "buffer") (moved "n_shell1" "term"))');

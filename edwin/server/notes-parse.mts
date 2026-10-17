@@ -7,6 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { isMainThread, parentPort, workerData } from 'node:worker_threads';
+import type { MessagePort } from 'node:worker_threads';
 import { lockdown } from './lockdown.mts';
 
 export const MAX_FILE_BYTES = 4 * 1024 * 1024;
@@ -14,14 +15,30 @@ export const NOTE_EXT = /\.(md|org)$/i;
 
 /* ---------- the grammar ---------- */
 
-const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/* The grammar alist of notes-grammar as a plain object: name -> regexp source string or list of strings. */
+export type RawGrammar = Record<string, unknown>;
+/* The compiled grammar (a type alias, so it is also a RawGrammar and compileGrammar takes either). */
+export type Grammar = {
+  compiled: true; source: RawGrammar;
+  kws: string[]; done: Set<string>;
+  task: RegExp;
+  wiki: RegExp; ref: RegExp; inline: RegExp;
+  anchor: RegExp; field: RegExp; priority: RegExp; planning: RegExp;
+  mdHeading: RegExp; orgHeading: RegExp; setext: RegExp; listItem: RegExp;
+  orgKeyword: RegExp; drawerBegin: RegExp; drawerEnd: RegExp; orgProperty: RegExp; orgTags: RegExp;
+  inlineTag: RegExp; frontMatter: RegExp; frontKeys: Set<string>;
+  fence: RegExp; cardField: string; cardKinds: Set<string>; cloze: RegExp;
+  journalPath: RegExp; url: RegExp;
+};
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /* Compile the grammar alist (as a plain object name -> source string or list) into RegExp objects. */
-export function compileGrammar(g) {
-  if (g && g.compiled) return g;
-  const src = (name) => { const s = g[name]; if (typeof s !== 'string') throw new Error(`notes grammar: ${name} is not a regexp source`); return s; };
-  const re = (name, flags = '') => new RegExp(src(name), flags);
-  const list = (name) => { const l = g[name]; if (!Array.isArray(l) || !l.every(x => typeof x === 'string')) throw new Error(`notes grammar: ${name} is not a list of strings`); return l; };
+export function compileGrammar(g: RawGrammar): Grammar {
+  if (g && g.compiled) return g as Grammar;
+  const src = (name: string) => { const s = g[name]; if (typeof s !== 'string') throw new Error(`notes grammar: ${name} is not a regexp source`); return s; };
+  const re = (name: string, flags = '') => new RegExp(src(name), flags);
+  const list = (name: string): string[] => { const l = g[name]; if (!Array.isArray(l) || !l.every(x => typeof x === 'string')) throw new Error(`notes grammar: ${name} is not a list of strings`); return l; };
   const kws = list('task-keywords');
   return {
     compiled: true, source: g,
@@ -40,25 +57,57 @@ export function compileGrammar(g) {
 
 /* ---------- small helpers ---------- */
 
-const indentOf = l => l.match(/^\s*/)[0].length;
-const stripAnchor = (s, G) => s.replace(G.anchor, '').trimEnd();
+const indentOf = (l: string) => l.match(/^\s*/)![0].length;
+const stripAnchor = (s: string, G: Grammar) => s.replace(G.anchor, '').trimEnd();
 /* Values of a YAML-ish list: `[a, "b c"]`, `a, b`, `a b`. */
-function splitList(s) {
+function splitList(s: string): string[] {
   const body = String(s).trim().replace(/^\[|\]$/g, '');
-  if (/["']/.test(body)) { const out = []; const re = /"([^"]*)"|'([^']*)'|([^,\s][^,]*)/g; let m; while ((m = re.exec(body))) out.push((m[1] ?? m[2] ?? m[3]).trim()); return out.filter(Boolean); }
+  if (/["']/.test(body)) { const out: string[] = []; const re = /"([^"]*)"|'([^']*)'|([^,\s][^,]*)/g; let m; while ((m = re.exec(body))) out.push((m[1] ?? m[2] ?? m[3]).trim()); return out.filter(Boolean); }
   return body.split(body.includes(',') ? ',' : /\s+/).map(x => x.trim()).filter(Boolean);
 }
 /* Org :ROAM_ALIASES: value: words, or quoted strings with spaces. */
-function splitAliases(s) {
-  const out = []; const re = /"([^"]*)"|'([^']*)'|(\S+)/g; let m;
+function splitAliases(s: string): string[] {
+  const out: string[] = []; const re = /"([^"]*)"|'([^']*)'|(\S+)/g; let m;
   while ((m = re.exec(s))) out.push(m[1] ?? m[2] ?? m[3]);
   return out;
 }
-const pushUniq = (arr, x) => { if (x && !arr.includes(x)) arr.push(x); };
-const trimBlank = lines => { const out = lines.slice(); while (out.length && !out[out.length - 1].trim()) out.pop(); while (out.length && !out[0].trim()) out.shift(); return out; };
+const pushUniq = <T,>(arr: T[], x: T) => { if (x && !arr.includes(x)) arr.push(x); };
+const trimBlank = (lines: string[]) => { const out = lines.slice(); while (out.length && !out[out.length - 1].trim()) out.pop(); while (out.length && !out[0].trim()) out.shift(); return out; };
+
+/* ---------- the records (R11.2) ---------- */
+
+export interface FileRec {
+  id: string; path: string; title: string | null; kind: 'file'; tags: string[]; aliases: string[];
+  props: Record<string, string>; body: string; mtime: number | null; line: number; orgId: string | null;
+}
+export interface HeadingRec {
+  id: string; title: string; level: number; kind: 'heading'; tags: string[]; body: string; line: number; path: string; orgId: string | null;
+}
+export interface BlockRec { id: string; title: string; kind: 'block'; line: number; path: string }
+export type LinkKind = 'wiki' | 'title' | 'file' | 'url' | 'ref';
+export interface LinkRec {
+  src: string; srcFile: string; dst: string; dstFile: string | null; kind: LinkKind; label: string | null; line: number; path: string;
+}
+/* The planning keys of a task line (the grammar's planning regexp names them; group 1, lowercased). */
+export type PlanningKey = 'scheduled' | 'deadline' | 'closed';
+export interface TaskRec {
+  id: string; node: string; kw: string; title: string; priority: string | null;
+  scheduled: string | null; deadline: string | null; closed: string | null;
+  tags: string[]; session: string | null; dispatched: string | null; target: string | null; prompt: string;
+  path: string; line: number; endLine: number; fields: Record<string, string>;
+}
+interface CardCommon {
+  deck: string | null; title: string; props: Record<string, string>; body: string; status: string; src: string;
+  file: string; path: string; line: number;
+}
+/* A basic or reverse card, or one of another card kind of the grammar. */
+export interface FrontBackCard extends CardCommon { id: string; kind: string; front: string; back: string; extra: string }
+export interface ClozeCard extends CardCommon { id: string; kind: 'cloze'; text: string; cloze: number; extra: string }
+export type CardRec = FrontBackCard | ClozeCard;
+export interface ParseResult { file: FileRec; headings: HeadingRec[]; blocks: BlockRec[]; links: LinkRec[]; tasks: TaskRec[]; cards: CardRec[] }
 
 /* Classify a link target as the index knows it (R11.2): wiki, title (an id: link), file, url. */
-function linkKind(target, G) {
+function linkKind(target: string, G: Grammar): LinkKind {
   if (/^id:/i.test(target)) return 'title';
   if (/^file:/i.test(target)) return 'file';
   if (G.url.test(target)) return 'url';
@@ -70,19 +119,19 @@ function linkKind(target, G) {
 
 /* Parse TEXT of the note ID (its notesDir-relative path) under GRAMMAR (compiled or raw). The result is
    {file, headings, blocks, links, tasks, cards}; every id is built from ID as R11.2 says. */
-export function parseFile(id, text, grammar) {
+export function parseFile(id: string, text: string, grammar: RawGrammar): ParseResult {
   const G = compileGrammar(grammar);
   const isOrg = /\.org$/i.test(id);
   const lines = text.split('\n');
   const n = lines.length;
   const base = path.basename(id).replace(/\.[^.]+$/, '');
-  const file = { id, path: id, title: null, kind: 'file', tags: [], aliases: [], props: {}, body: trimBlank(lines.slice(0, 12)).join('\n'), mtime: null, line: 1, orgId: null };
-  const headings = [], blocks = [], links = [], tasks = [], cards = [];
-  const fenced = new Set();
-  let inFront = false, inFence = false, inDrawer = false, cur = null, firstHeadingTitle = null;
+  const file: FileRec = { id, path: id, title: null, kind: 'file', tags: [], aliases: [], props: {}, body: trimBlank(lines.slice(0, 12)).join('\n'), mtime: null, line: 1, orgId: null };
+  const headings: HeadingRec[] = [], blocks: BlockRec[] = [], links: LinkRec[] = [], tasks: TaskRec[] = [], cards: CardRec[] = [];
+  const fenced = new Set<number>();
+  let inFront = false, inFence = false, inDrawer = false, cur: HeadingRec | null = null, firstHeadingTitle: string | null = null;
   let taskUntil = -1;   // the last line (index) of the task whose continuation we are inside
 
-  const headingOf = (line, i) => {
+  const headingOf = (line: string, i: number): { level: number; text: string; setext: boolean } | null => {
     let m;
     if (isOrg) { m = G.orgHeading.exec(line); return m ? { level: m[1].length, text: m[2], setext: false } : null; }
     m = G.mdHeading.exec(line);
@@ -91,30 +140,30 @@ export function parseFile(id, text, grammar) {
     if (i + 1 < n && line.trim() && !G.listItem.test(line) && !G.field.test(line) && G.setext.test(lines[i + 1]) && lines[i + 1].trim().length >= 3 && !/^\s/.test(line)) return { level: lines[i + 1].trim()[0] === '=' ? 1 : 2, text: line.trim(), setext: true };
     return null;
   };
-  const isHeadingLine = (line, i) => !!headingOf(line, i);
-  const addTag = (owner, t) => pushUniq(owner.tags, t);
+  const isHeadingLine = (line: string, i: number) => !!headingOf(line, i);
+  const addTag = (owner: { tags: string[] }, t: string) => pushUniq(owner.tags, t);
   /* Inline #tags: every one is a tag of the file; on a heading or task line also of that record. */
-  const inlineTags = (s, owner) => { G.inlineTag.lastIndex = 0; let m; while ((m = G.inlineTag.exec(s))) { addTag(file, m[1]); if (owner && owner !== file) addTag(owner, m[1]); } };
+  const inlineTags = (s: string, owner: { tags: string[] } | null) => { G.inlineTag.lastIndex = 0; let m; while ((m = G.inlineTag.exec(s))) { addTag(file, m[1]); if (owner && owner !== file) addTag(owner, m[1]); } };
 
   /* The task at line I with head match M; scans its continuation. */
-  const makeTask = (i, m, node, headingTags) => {
+  const makeTask = (i: number, m: RegExpExecArray, node: string, headingTags: string[] | null): TaskRec => {
     const ln = i + 1, indent = m[1].length, isBullet = !(isOrg && /^\*+\s/.test(m[2])) && /^(?:[-*+]|\d+[.)])\s/.test(m[2]);
     let rest = m[4];
     let priority = null, pm = G.priority.exec(rest);
     if (pm) { priority = pm[1]; rest = (rest.slice(0, pm.index) + rest.slice(pm.index + pm[0].length)).trim(); }
     const tm = G.orgTags.exec(rest); if (tm) rest = rest.slice(0, tm.index);
     rest = stripAnchor(rest, G).trim();
-    const t = { id: `${id}:${ln}`, node, kw: m[3], title: rest, priority, scheduled: null, deadline: null, closed: null, tags: [], session: null, dispatched: null, target: null, prompt: '', path: id, line: ln, endLine: ln, fields: {} };
+    const t: TaskRec = { id: `${id}:${ln}`, node, kw: m[3], title: rest, priority, scheduled: null, deadline: null, closed: null, tags: [], session: null, dispatched: null, target: null, prompt: '', path: id, line: ln, endLine: ln, fields: {} };
     for (const x of headingTags || []) addTag(t, x);
     if (tm) for (const x of tm[1].split(':').filter(Boolean)) addTag(t, x);
     inlineTags(m[4], t);
-    const body = [];
+    const body: string[] = [];
     for (let j = i + 1; j < n; j++) {
       const l = lines[j];
       if (!l.trim() || fenced.has(j) || isHeadingLine(l, j) || G.task.test(l)) break;
       if (isBullet && indentOf(l) <= indent) break;
       let pm2; G.planning.lastIndex = 0; let planned = false;
-      while ((pm2 = G.planning.exec(l))) { t[pm2[1].toLowerCase()] = pm2[2]; planned = true; }
+      while ((pm2 = G.planning.exec(l))) { t[pm2[1].toLowerCase() as PlanningKey] = pm2[2]; planned = true; }
       if (planned) { t.endLine = j + 1; continue; }
       if (isOrg && (G.drawerBegin.test(l) || G.drawerEnd.test(l))) { t.endLine = j + 1; continue; }
       let fm;
@@ -177,10 +226,10 @@ export function parseFile(id, text, grammar) {
     const h = headingOf(line, i);
     let srcId = cur ? cur.id : id;
     if (h) {
-      let text = h.text, tags = [];
+      let text = h.text, tags: string[] = [];
       const tm = G.orgTags.exec(text); if (tm) { tags = tm[1].split(':').filter(Boolean); text = text.slice(0, tm.index); }
       text = stripAnchor(text, G).trim();
-      const rec = { id: `${id}#${ln}`, title: text, level: h.level, kind: 'heading', tags, body: trimBlank(lines.slice(i + (h.setext ? 2 : 1), i + (h.setext ? 2 : 1) + 5)).join('\n'), line: ln, path: id, orgId: null };
+      const rec: HeadingRec = { id: `${id}#${ln}`, title: text, level: h.level, kind: 'heading', tags, body: trimBlank(lines.slice(i + (h.setext ? 2 : 1), i + (h.setext ? 2 : 1) + 5)).join('\n'), line: ln, path: id, orgId: null };
       inlineTags(h.text, rec);
       headings.push(rec); cur = rec; srcId = rec.id;
       if (firstHeadingTitle === null) firstHeadingTitle = text.replace(new RegExp(`^(?:${G.kws.map(escapeRe).join('|')})\\s+`), '') || text;
@@ -194,8 +243,8 @@ export function parseFile(id, text, grammar) {
       blocks.push({ id: srcId, title: text, kind: 'block', line: ln, path: id });
     }
     if ((m = G.task.exec(line))) {
-      const node = anchor ? `${id}#^${anchor}` : h ? cur.id : (cur ? cur.id : id);
-      const t = makeTask(i, m, node, h ? cur.tags : null);
+      const node = anchor ? `${id}#^${anchor}` : h ? cur!.id : (cur ? cur.id : id);
+      const t = makeTask(i, m, node, h ? cur!.tags : null);
       tasks.push(t);
       taskUntil = Math.max(taskUntil, t.endLine - 1);
     } else if (!h && (m = G.field.exec(line))) {
@@ -237,7 +286,7 @@ export function parseFile(id, text, grammar) {
     const head = lines[j], hh = headingOf(head, j), lm = hh ? null : G.listItem.exec(head), headIndent = indentOf(head);
     let end = j + 1;
     while (end < n && lines[end].trim() && !fenced.has(end) && !isHeadingLine(lines[end], end) && (!lm || indentOf(lines[end]) > headIndent)) end++;
-    const props = {}, body = [];
+    const props: Record<string, string> = {}, body: string[] = [];
     for (let k = j + 1; k < end; k++) { const f = G.field.exec(lines[k]); if (f) props[f[1].toLowerCase()] = f[2]; else body.push(lines[k].trim()); }
     let title = hh ? hh.text : lm ? lm[3] : head.trim();
     const tm = G.orgTags.exec(title); if (tm) title = title.slice(0, tm.index);
@@ -253,7 +302,7 @@ export function parseFile(id, text, grammar) {
       cards.push({ ...common, id: baseId + '#rev', kind: 'reverse', front: props.back ?? '', back: title, extra: bodyText });
     } else if (kind === 'cloze') {
       const text = body.join(' ').replace(/\s+/g, ' ').trim();
-      const nums = []; G.cloze.lastIndex = 0; let cm;
+      const nums: number[] = []; G.cloze.lastIndex = 0; let cm;
       while ((cm = G.cloze.exec(text))) pushUniq(nums, Number(cm[1]));
       nums.sort((a, b) => a - b);
       if (!nums.length) nums.push(1);
@@ -269,7 +318,12 @@ export function parseFile(id, text, grammar) {
 const decoder = new TextDecoder('utf-8', { fatal: true });
 
 /* Read a note: {text, mtimeMs, size} or {skipped: 'big' | 'missing' | 'not_text' | 'error'}. */
-export function readNote(abs) {
+export type SkipReason = 'big' | 'missing' | 'not_text' | 'error';
+export type NoteRead =
+  | { text: string; mtimeMs: number; size: number; skipped?: undefined }
+  | { skipped: 'missing' | 'error' }
+  | { skipped: 'big' | 'not_text'; mtimeMs: number; size: number };
+export function readNote(abs: string): NoteRead {
   let st;
   try { st = fs.statSync(abs); } catch (e) { return { skipped: 'missing' }; }
   if (!st.isFile()) return { skipped: 'missing' };
@@ -285,8 +339,9 @@ export function readNote(abs) {
 
 /* An ignore pattern of notes-index-ignore as a test on a relative path: `dir/` names a directory anywhere,
    `*` matches inside a segment, a pattern without / matches any segment. */
-export function ignoreMatcher(patterns) {
-  const tests = [];
+export type IgnoreTest = (rel: string, isDir?: boolean) => boolean;
+export function ignoreMatcher(patterns: readonly unknown[] | null | undefined): IgnoreTest {
+  const tests: Array<(rel: string, isDir: boolean) => boolean> = [];
   for (const p of patterns || []) {
     if (typeof p !== 'string' || !p) continue;
     const dirOnly = p.endsWith('/');
@@ -300,13 +355,14 @@ export function ignoreMatcher(patterns) {
 
 /* Every *.md and *.org under ROOT (R11.1): no dot-directories, no symlinks out of ROOT, no file over 4 MiB,
    nothing matching IGNORE. Returns [{id, mtimeMs, size}] with notesDir-relative ids. */
-export function scanTree(root, ignorePatterns) {
+export interface ScanEntry { id: string; mtimeMs: number; size: number }
+export function scanTree(root: string, ignorePatterns: readonly unknown[] | null | undefined): ScanEntry[] {
   const ignored = ignoreMatcher(ignorePatterns);
   let realRoot;
   try { realRoot = fs.realpathSync.native(root); } catch (e) { return []; }
-  const out = [], seen = new Set([realRoot]), stack = [{ dir: root, rel: '' }];
+  const out: ScanEntry[] = [], seen = new Set([realRoot]), stack = [{ dir: root, rel: '' }];
   while (stack.length) {
-    const { dir, rel } = stack.pop();
+    const { dir, rel } = stack.pop()!;
     let entries;
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { continue; }
     for (const ent of entries) {
@@ -336,18 +392,20 @@ export function scanTree(root, ignorePatterns) {
 
 /* Grep TEXT of note ID with RE (global): hits as [path, line, column, text]. With EXCLUDELINKS, matches inside
    [[...]] and ((...)) do not count (unlinked mentions). */
-export function grepText(id, text, re, { excludeLinks = false, wiki = null, ref = null, max = Infinity } = {}, out = []) {
+export type GrepHit = [path: string, line: number, column: number, text: string];
+export interface GrepOptions { excludeLinks?: boolean; wiki?: RegExp | null; ref?: RegExp | null; max?: number }
+export function grepText(id: string, text: string, re: RegExp, { excludeLinks = false, wiki = null, ref = null, max = Infinity }: GrepOptions = {}, out: GrepHit[] = []): GrepHit[] {
   const lines = text.split('\n');
   for (let i = 0; i < lines.length && out.length < max; i++) {
     const line = lines[i];
     re.lastIndex = 0;
-    let m;
-    let spans = null;
+    let m: RegExpExecArray | null;
+    let spans: Array<[number, number]> | null = null;
     while ((m = re.exec(line))) {
       if (m[0] === '') { re.lastIndex++; continue; }
       if (excludeLinks && wiki) {
         if (!spans) { spans = []; for (const rx of [wiki, ref]) { if (!rx) continue; rx.lastIndex = 0; let w; while ((w = rx.exec(line))) spans.push([w.index, w.index + w[0].length]); } }
-        if (spans.some(([a, b]) => m.index >= a && m.index < b)) continue;
+        if (spans.some(([a, b]) => m!.index >= a && m!.index < b)) continue;
       }
       out.push([id, i + 1, m.index, line]);
       if (out.length >= max) break;
@@ -359,14 +417,20 @@ export function grepText(id, text, re, { excludeLinks = false, wiki = null, ref 
 /* ---------- the worker ---------- */
 
 /* The parse of one job item: {id, file} (read from disk) or {id, text} (a buffer's text). */
-function parseItem(item, G) {
+export interface ParseItem { id: string; file?: string; text?: string; mtimeMs?: number }
+export interface ParsedFile { id: string; mtimeMs: number; size: number; rec: ParseResult; fromBuffer?: boolean; skipped?: undefined; error?: undefined }
+export type ParseOutcome =
+  | ParsedFile
+  | { id: string; skipped: SkipReason; error?: undefined }
+  | { id: string; error: string; skipped?: undefined };
+function parseItem(item: ParseItem, G: Grammar): ParseOutcome {
   try {
     if (typeof item.text === 'string') {
       const rec = parseFile(item.id, item.text, G);
       rec.file.mtime = item.mtimeMs ?? null;
       return { id: item.id, mtimeMs: item.mtimeMs ?? -1, size: item.text.length, rec, fromBuffer: true };
     }
-    const r = readNote(item.file);
+    const r = readNote(item.file!);
     if (r.skipped) return { id: item.id, skipped: r.skipped };
     const rec = parseFile(item.id, r.text, G);
     rec.file.mtime = r.mtimeMs;
@@ -374,39 +438,54 @@ function parseItem(item, G) {
   } catch (e) { return { id: item.id, error: e.message }; }
 }
 
+/* The jobs the main thread posts (with a jobId) and the replies (notes.mts; the grammar job is not used there). */
+export interface GrepFile { id: string; text?: string; file?: string }
+export interface ParseJob { t: 'parse'; items: ParseItem[] }
+export interface ScanJob { t: 'scan'; root: string; ignore: unknown[] }
+export interface GrepJob { t: 'grep'; files: GrepFile[]; source: string; flags: string; excludeLinks: boolean; max: number }
+export interface GrammarJob { t: 'grammar'; grammar: RawGrammar }
+export type WorkerJob = (ParseJob | ScanJob | GrepJob | GrammarJob) & { jobId: number };
+export interface ParsedReply { t: 'parsed'; jobId: number; results: ParseOutcome[] }
+export interface ScannedReply { t: 'scanned'; jobId: number; files: ScanEntry[] }
+export interface GreppedReply { t: 'grepped'; jobId: number; hits: GrepHit[] }
+export interface ErrorReply { t: 'error'; jobId: number; error: string }
+export type WorkerReply = ParsedReply | ScannedReply | GreppedReply | ErrorReply;
+/* The one reply on the synchronous channel. */
+export type SyncReply = { jobId: number; hits: GrepHit[]; error?: undefined } | { jobId: number; error: string; hits?: undefined };
+
 if (!isMainThread && workerData && workerData.notesWorker) {
   lockdown();
   let G = compileGrammar(workerData.grammar);
-  const { syncPort, signal } = workerData;
+  const { syncPort, signal }: { syncPort?: MessagePort; signal: Int32Array } = workerData;
   /* A grep job over MSG.files (live text or a file to read): the hits, at most MSG.max. */
-  const grepJob = msg => {
+  const grepJob = (msg: GrepJob) => {
     const re = new RegExp(msg.source, msg.flags.includes('g') ? msg.flags : msg.flags + 'g');
-    const out = [];
+    const out: GrepHit[] = [];
     for (const f of msg.files) {
       if (out.length >= msg.max) break;
-      const text = typeof f.text === 'string' ? f.text : (() => { const r = readNote(f.file); return r.skipped ? null : r.text; })();
+      const text = typeof f.text === 'string' ? f.text : (() => { const r = readNote(f.file!); return r.skipped ? null : r.text; })();
       if (text === null) continue;
       grepText(f.id, text, re, { excludeLinks: msg.excludeLinks, wiki: G.wiki, ref: G.ref, max: msg.max }, out);
     }
     return out;
   };
-  parentPort.on('message', msg => {
+  parentPort!.on('message', (msg: WorkerJob) => {
     try {
       switch (msg.t) {
-        case 'grammar': G = compileGrammar(msg.grammar); parentPort.postMessage({ t: 'grammar', ok: true }); break;
-        case 'parse': parentPort.postMessage({ t: 'parsed', jobId: msg.jobId, results: msg.items.map(it => parseItem(it, G)) }); break;
-        case 'scan': parentPort.postMessage({ t: 'scanned', jobId: msg.jobId, files: scanTree(msg.root, msg.ignore) }); break;
-        case 'grep': parentPort.postMessage({ t: 'grepped', jobId: msg.jobId, hits: grepJob(msg) }); break; // a thread waits (R4.42)
-        default: parentPort.postMessage({ t: 'error', jobId: msg.jobId, error: `unknown job ${msg.t}` });
+        case 'grammar': G = compileGrammar(msg.grammar); parentPort!.postMessage({ t: 'grammar', ok: true }); break;
+        case 'parse': parentPort!.postMessage({ t: 'parsed', jobId: msg.jobId, results: msg.items.map(it => parseItem(it, G)) }); break;
+        case 'scan': parentPort!.postMessage({ t: 'scanned', jobId: msg.jobId, files: scanTree(msg.root, msg.ignore) }); break;
+        case 'grep': parentPort!.postMessage({ t: 'grepped', jobId: msg.jobId, hits: grepJob(msg) }); break; // a thread waits (R4.42)
+        default: parentPort!.postMessage({ t: 'error', jobId: (msg as { jobId: number }).jobId, error: `unknown job ${(msg as { t: string }).t}` });
       }
-    } catch (e) { parentPort.postMessage({ t: 'error', jobId: msg.jobId, error: e.message }); }
+    } catch (e) { parentPort!.postMessage({ t: 'error', jobId: msg.jobId, error: e.message }); }
   });
   /* The synchronous channel (callers outside a thread): the main thread posts a job, waits on SIGNAL and
      reads the one reply. */
-  if (syncPort) syncPort.on('message', msg => {
-    let reply;
+  if (syncPort) syncPort.on('message', (msg: { t: string; jobId: number } & Partial<GrepJob>) => {
+    let reply: SyncReply;
     try {
-      if (msg.t === 'grep') reply = { jobId: msg.jobId, hits: grepJob(msg) };
+      if (msg.t === 'grep') reply = { jobId: msg.jobId, hits: grepJob(msg as GrepJob) };
       else reply = { jobId: msg.jobId, error: `unknown sync job ${msg.t}` };
     } catch (e) { reply = { jobId: msg.jobId, error: e.message }; }
     syncPort.postMessage(reply);

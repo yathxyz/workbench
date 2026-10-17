@@ -6,19 +6,31 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
+import type { AddressInfo } from 'node:net';
 import { makeDir, startEdwind, stopEdwind, EditClient } from './edit-client.mts';
+import type { Msg, TestDir, EdwindChild, ClientOptions } from './edit-client.mts';
+
+type Release = (value?: unknown) => void;
+/* What the backend saw of one request; the body is the request's JSON. */
+interface BackendRequest { method: string | undefined; path: string | undefined; headers: http.IncomingHttpHeaders; body: any } // any: request JSON
+/* The loopback Messages API backend and its controls; origin and other are set once it listens. */
+interface Backend {
+  requests: BackendRequest[]; sawKey: number; failNext: boolean; holds: Release[]; slow: Release[]; holdOff: boolean; aborted: number;
+  origin: string | null; other: Other | null; server: http.Server;
+}
+interface Other { requests: { path: string | undefined; hasKey: boolean; keyValue: boolean }[]; origin?: string; server: http.Server }
 
 /* Distinctive key bytes: the whole run is scanned for them at the end (R16.19). */
 const KEY = 'sk-test-' + randomBytes(12).toString('hex');
 const KEY2 = 'sk-spare-' + randomBytes(12).toString('hex');
 const TIERS = { default: 'tier-default', quick: 'tier-quick' };
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 /* ---------- the loopback test backend: the Messages API shape and a few plain routes ---------- */
-function listen(server) { return new Promise(r => server.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${server.address().port}`))); }
-function body(req) { return new Promise(r => { let s = ''; req.setEncoding('utf8'); req.on('data', d => { s += d; }); req.on('end', () => r(s)); }); }
+function listen(server: http.Server) { return new Promise<string>(r => server.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${(server.address() as AddressInfo).port}`))); }
+function body(req: http.IncomingMessage) { return new Promise<string>(r => { let s = ''; req.setEncoding('utf8'); req.on('data', d => { s += d; }); req.on('end', () => r(s)); }); }
 function makeBackend() {
-  const A = { requests: [], sawKey: 0, failNext: false, holds: [], slow: [], holdOff: false, aborted: 0, origin: null, other: null };
+  const A: Omit<Backend, 'server'> & { server?: http.Server } = { requests: [], sawKey: 0, failNext: false, holds: [], slow: [], holdOff: false, aborted: 0, origin: null, other: null };
   A.server = http.createServer(async (req, res) => {
     const text = await body(req);
     const rec = { method: req.method, path: req.url, headers: req.headers, body: text ? JSON.parse(text) : null };
@@ -26,16 +38,16 @@ function makeBackend() {
     let closed = false;
     res.on('close', () => { closed = true; if (!res.writableFinished) A.aborted++; });
     if (req.headers['x-api-key'] === KEY) A.sawKey++;
-    const json = (code, obj, extra = {}) => { res.writeHead(code, { 'content-type': 'application/json', ...extra }); res.end(JSON.stringify(obj)); };
-    const u = new URL(req.url, 'http://x');
+    const json = (code: number, obj: unknown, extra: Record<string, string> = {}) => { res.writeHead(code, { 'content-type': 'application/json', ...extra }); res.end(JSON.stringify(obj)); };
+    const u = new URL(req.url!, 'http://x');
     if (u.pathname === '/echo') return json(200, { auth: 'x-api-key' in req.headers, authValue: req.headers['x-api-key'] === KEY, bearer: req.headers.authorization === 'Bearer ' + KEY2, path: u.pathname });
     if (u.pathname === '/redir-same') { res.writeHead(302, { location: '/echo' }); return res.end(); }
-    if (u.pathname === '/redir-cross') { res.writeHead(302, { location: A.other.origin + '/echo' }); return res.end(); }
+    if (u.pathname === '/redir-cross') { res.writeHead(302, { location: A.other!.origin + '/echo' }); return res.end(); }
     if (u.pathname === '/fail-next') { A.failNext = true; return json(200, { ok: true }); }
     if (u.pathname === '/release') { A.holdOff = true; for (const h of [...A.holds.splice(0), ...A.slow.splice(0)]) h(); return json(200, { ok: true }); }
     if (u.pathname === '/v1/chat/completions') {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
-      const ev = o => res.write('data: ' + JSON.stringify(o) + '\n\n');
+      const ev = (o: unknown) => res.write('data: ' + JSON.stringify(o) + '\n\n');
       ev({ choices: [{ index: 0, delta: { role: 'assistant', content: 'Loc' } }] });
       ev({ choices: [{ index: 0, delta: { content: 'al' }, finish_reason: 'stop' }] });
       ev({ choices: [], usage: { prompt_tokens: 5, completion_tokens: 2 } });
@@ -46,11 +58,11 @@ function makeBackend() {
     if (A.failNext) { A.failNext = false; return json(429, { type: 'error', error: { type: 'rate_limit_error', message: 'slow down' } }, { 'retry-after': '0' }); }
     const b = rec.body;
     const last = b.messages[b.messages.length - 1];
-    const lastText = typeof last.content === 'string' ? last.content : last.content.map(p => p.text || '').join('');
-    const toolResult = Array.isArray(last.content) ? last.content.find(p => p.type === 'tool_result') : null;
+    const lastText = typeof last.content === 'string' ? last.content : last.content.map((p: Msg) => p.text || '').join('');
+    const toolResult = Array.isArray(last.content) ? last.content.find((p: Msg) => p.type === 'tool_result') : null;
     if (lastText.includes('hold') && !A.holdOff) await new Promise(r => A.holds.push(r));
     res.writeHead(200, { 'content-type': 'text/event-stream' });
-    const ev = (type, o) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...o })}\n\n`);
+    const ev = (type: string, o: object) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...o })}\n\n`);
     ev('message_start', { message: { id: 'msg_1', role: 'assistant', usage: { input_tokens: 7, output_tokens: 0 } } });
     if (b.tools && b.tools.length && !toolResult) {
       ev('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'toolu_1', name: b.tools[0].name, input: {} } });
@@ -72,21 +84,21 @@ function makeBackend() {
     ev('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 3 } });
     ev('message_stop', {}); res.end();
   });
-  return A;
+  return A as Backend;
 }
 /* Another origin (another loopback port): it must never see the key. */
 function makeOther() {
-  const B = { requests: [] };
+  const B: Omit<Other, 'server'> & { server?: http.Server } = { requests: [] };
   B.server = http.createServer(async (req, res) => {
     await body(req);
     B.requests.push({ path: req.url, hasKey: 'x-api-key' in req.headers || 'authorization' in req.headers, keyValue: req.headers['x-api-key'] === KEY });
     res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ other: true }));
   });
-  return B;
+  return B as Other;
 }
 
-let dir, child, A, B, creds;
-const received = [];                                     // every message edwind sent to any client of this run
+let dir: TestDir, child: EdwindChild, A: Backend, B: Other, creds: string;
+const received: string[] = [];                                     // every message edwind sent to any client of this run
 before(async () => {
   A = makeBackend(); B = makeOther();
   A.origin = await listen(A.server); B.origin = await listen(B.server); A.other = B;
@@ -99,17 +111,17 @@ before(async () => {
 });
 after(async () => {
   await stopEdwind(child);
-  await new Promise(r => A.server.close(() => r())); await new Promise(r => B.server.close(() => r()));
+  await new Promise<void>(r => A.server.close(() => r())); await new Promise<void>(r => B.server.close(() => r()));
   fs.rmSync(dir.root, { recursive: true, force: true });
 });
-const client = async (opts, d = dir) => {
+const client = async (opts?: ClientOptions, d = dir) => {
   const c = new EditClient(d.cfg.socket, opts); await c.connect();
-  const push = c.push.bind(c); c.push = m => { received.push(JSON.stringify(m)); push(m); };
+  const push = c.push.bind(c); c.push = (m: Msg) => { received.push(JSON.stringify(m)); push(m); };
   const w = await c.hello(); assert.equal(w.t, 'welcome'); return c;
 };
-const value = async (c, form) => { const r = await c.form(form); assert.equal(r.error, undefined, JSON.stringify(r.error)); return r.value; };
-const failure = async (c, form) => { const r = await c.form(form); assert.ok(r.error, `expected a condition from ${form}, got ${r.value}`); return r.error; };
-const note = (name, text) => { fs.writeFileSync(path.join(dir.dirs.notes, name), text); return name; };
+const value = async (c: EditClient, form: string) => { const r = await c.form(form); assert.equal(r.error, undefined, JSON.stringify(r.error)); return r.value; };
+const failure = async (c: EditClient, form: string) => { const r = await c.form(form); assert.ok(r.error, `expected a condition from ${form}, got ${r.value}`); return r.error; };
+const note = (name: string, text: string) => { fs.writeFileSync(path.join(dir.dirs.notes, name), text); return name; };
 
 test('R12.3, R12.4, R15.11: the default backend comes from edit.json models; status reports sample and the tiers', async () => {
   const c = await client();
@@ -222,7 +234,7 @@ test('§12.2 sample: the stream of a web client in the shape edit_client.rs rout
   const tool = await web.next(m => m.t === 'sample.tool');
   assert.deepEqual(tool, { t: 'sample.tool', sid: 's1', callId: 'toolu_1', name: 'read_node', input: { id: 'x' } });
   web.send({ t: 'tool_result', sid: 's1', callId: 'toolu_1', result: 'the node' });
-  const texts = [];
+  const texts: string[] = [];
   for (;;) { const m = await web.next(m => m.sid === 's1' && (m.t === 'sample.text' || m.t === 'sample.done' || m.t === 'sample.error')); if (m.t === 'sample.text') texts.push(m.text); else { assert.equal(m.t, 'sample.done', JSON.stringify(m)); assert.deepEqual(m, { t: 'sample.done', sid: 's1', text: 'Tool said: the node', truncated: false, modelTierApplied: 'quick', modelApplied: 'tier-quick' }); break; } }
   assert.ok(texts.length >= 1 && texts[texts.length - 1] === 'Tool said: the node', JSON.stringify(texts));
   const reqs = A.requests.filter(r => r.path === '/v1/messages').slice(-2);
@@ -280,7 +292,7 @@ test('R12.8, R12.13: cancel aborts the HTTP request; rate limits are retried; fo
   assert.equal(A.holds.length, 4); assert.equal(A.requests.filter(r => r.path === '/v1/messages').length, before + 4);
   const st = (await web.call('status')).value; assert.equal(st.modelRequests, 4); assert.equal(st.modelQueued, 1);
   await fetch(A.origin + '/release');
-  const dones = [];
+  const dones: Msg[] = [];
   for (let i = 1; i <= 5; i++) dones.push(await web.next(m => m.sid === 'h' + i && (m.t === 'sample.done' || m.t === 'sample.error')));
   assert.ok(dones.every(d => d.t === 'sample.done' && d.text === 'Hello'), JSON.stringify(dones));
   A.holdOff = false;
@@ -294,8 +306,8 @@ test('R12.9, R12.14: gptel-send streams into the buffer as the agent gptel:<back
   await w.open(id);
   const r = await f.request({ t: 'call', cmd: 'gptel-send', args: [], ctx: { point: 7 }, buf: id });
   assert.equal(r.error, undefined, JSON.stringify(r.error)); assert.match(r.msg || '', /asking workbench/);
-  let text = 'Say hi'; const bys = [];
-  const apply = (t, ops) => { for (const [pos, del, ins] of ops) t = t.slice(0, pos) + ins + t.slice(pos + del.length); return t; };
+  let text = 'Say hi'; const bys: Msg[] = [];
+  const apply = (t: string, ops: [number, string, string][]) => { for (const [pos, del, ins] of ops) t = t.slice(0, pos) + ins + t.slice(pos + del.length); return t; };
   for (let i = 0; i < 40 && !text.endsWith('Hello'); i++) { const e = await w.next(m => m.t === 'edits' && m.buf === id); text = apply(text, e.ops); bys.push(e.by); }
   assert.equal(text, 'Say hi\n\nHello');
   assert.ok(bys.some(b => b.kind === 'frame' && b.via === 'server'), 'the separator comes from the command thread for the frame');
@@ -303,7 +315,7 @@ test('R12.9, R12.14: gptel-send streams into the buffer as the agent gptel:<back
   assert.equal((await w.request({ t: 'call', form: '(buffer-string)', ctx: {}, buf: id })).value, '"Say hi\\n\\nHello"');
   /* The agent is a writer of the buffer (R6.21: undo-writer picks it once thread batches carry undo groups). */
   const writers = (await w.call('list-writers', [], {}, id)).value;
-  assert.ok(writers.some(b => b.kind === 'agent' && b.agent === 'gptel:workbench'), JSON.stringify(writers));
+  assert.ok(writers.some((b: Msg) => b.kind === 'agent' && b.agent === 'gptel:workbench'), JSON.stringify(writers));
   /* Nothing to send; a request per buffer. */
   assert.equal((await w.request({ t: 'call', form: '(with-current-buffer (get-buffer-create "*empty*") (gptel-send))', ctx: {} })).error.condition, 'user-error');
   for (let i = 0; i < 50 && await value(w, '(null? gptel--running)') !== '#t'; i++) await sleep(20);
@@ -350,8 +362,8 @@ test('R16.19: the key appears in no log line, journal, image entry, usage line o
   await value(c, '(credential "anthropic-api-key")');
   c.close();
   await sleep(100);
-  const files = [];
-  const walk = d => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else if (e.isFile()) files.push(p); } };
+  const files: string[] = [];
+  const walk = (d: string) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else if (e.isFile()) files.push(p); } };
   walk(dir.dirs.state); walk(dir.dirs.notes); walk(dir.dirs.config);
   assert.ok(files.some(f => f.endsWith('image.jsonl')) && files.some(f => f.endsWith('usage.jsonl')) && files.some(f => f.includes('/buffers/')), files.join(','));
   for (const f of files) { const t = fs.readFileSync(f, 'latin1'); assert.ok(!t.includes(KEY) && !t.includes(KEY2), `${f} holds key bytes`); }

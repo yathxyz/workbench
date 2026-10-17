@@ -9,14 +9,14 @@ import { fileURLToPath } from 'node:url';
 
 const LOCKDOWN = fileURLToPath(new URL('../server/lockdown.mts', import.meta.url));
 
-function inChild(body, flags = []) {
+function inChild(body: string, flags: string[] = []) {
   const src = `'use strict'; import { lockdown, lockdownState } from ${JSON.stringify(LOCKDOWN)};
     const out = {}; const tryIt = (k, f) => { try { out[k] = f(); } catch (e) { out[k] = 'threw ' + e.constructor.name; } };
     ${body}
     console.log(JSON.stringify(out));`;
   const r = spawnSync(process.execPath, [...flags, '--input-type=module', '-e', src], { encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
-  return JSON.parse(r.stdout.trim().split('\n').pop());
+  return JSON.parse(r.stdout.trim().split('\n').pop()!);
 }
 
 test('before and after: open, then locked; a second call changes nothing', () => {

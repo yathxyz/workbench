@@ -9,19 +9,26 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { makeDir, startEdwind, stopEdwind, EditClient, MAIN, EDWIN } from './edit-client.mts';
+import type { Msg, TestDir, EdwindChild, ClientOptions } from './edit-client.mts';
+import type { OTModule } from './ot-sim.mts';
+
+/* A client after hello, with the welcome kept on it. */
+type WelcomedClient = EditClient & { welcome: Msg };
+/* What a child edwind or probe printed, and how it exited. */
+interface RunResult { code: number | null; out: string }
 
 const require = createRequire(import.meta.url);
-const OT = require('../src/ot.js');
+const OT = require('../src/ot.js') as OTModule;
 const { MAX_LINE, CODES } = await import('../server/proto.mts');
 
-let dir, child;
+let dir: TestDir, child: EdwindChild;
 before(async () => { dir = makeDir(); child = await startEdwind(dir); });
 after(async () => { await stopEdwind(child); fs.rmSync(dir.root, { recursive: true, force: true }); });
 
-const client = async (opts) => { const c = new EditClient(dir.cfg.socket, opts); await c.connect(); const w = await c.hello(); assert.equal(w.t, 'welcome'); c.welcome = w; return c; };
-const note = (name, text) => { fs.writeFileSync(path.join(dir.dirs.notes, name), text); return name; };
+const client = async (opts?: ClientOptions): Promise<WelcomedClient> => { const c = new EditClient(dir.cfg.socket, opts) as WelcomedClient; await c.connect(); const w = await c.hello(); assert.equal(w.t, 'welcome'); c.welcome = w; return c; };
+const note = (name: string, text: string) => { fs.writeFileSync(path.join(dir.dirs.notes, name), text); return name; };
 /* Wait until edwind has dispatched everything C sent so far (one connection's messages are handled in order). */
-const sync = async c => { const rid = c.newRid(); c.send({ t: 'ping', rid }); await c.next(m => m.t === 'pong' && m.rid === rid); };
+const sync = async (c: EditClient) => { const rid = c.newRid(); c.send({ t: 'ping', rid }); await c.next(m => m.t === 'pong' && m.rid === rid); };
 
 test('R7.2 MAX_LINE equals wb_proto::limits::MAX_LINE', () => {
   const rs = fs.readFileSync(path.join(EDWIN, '../crates/wb-proto/src/limits.rs'), 'utf8');
@@ -66,7 +73,7 @@ test('§7.3 open, snap, edit, ack, edits to others, close; every op kind', async
   const a = await client(), b = await client();
   const oa = await a.open(id), ob = await b.open(id);
   assert.equal(oa.text, 'hello\nworld\n'); assert.equal(oa.ver, 0); assert.equal(ob.ver, 0);
-  assert.equal(oa.meta.mode, 'markdown-mode'); assert.equal(oa.meta.eol, 'lf'); assert.equal(oa.meta.modified, false);
+  assert.equal(oa.meta!.mode, 'markdown-mode'); assert.equal(oa.meta!.eol, 'lf'); assert.equal(oa.meta!.modified, false);
   const ack = await a.edit(id, 0, [[0, 'hello', 'HELLO'], [6, '', '😀 '], [9, 'world', '']], { g: 1 });
   assert.deepEqual(ack, { t: 'ack', buf: id, seq: 1, ver: 1 });
   const ed = await b.next(m => m.t === 'edits' && m.buf === id);
@@ -147,21 +154,21 @@ test('R7.16 reconnect with the same cid and open{since}: own batches come back a
 test('R7.3 rid rules and §7.8 bad_id, no_buffer, read_only, refused_path, not_text', async () => {
   const a = await client();
   for (const id of ['../x', 'a//b', '', 'name:', '/etc/../x']) { const o = await a.open(id); assert.equal(o.error && o.error.code, 'bad_id', id); }
-  assert.equal((await a.open('absent.md')).error.code, 'no_buffer');
+  assert.equal((await a.open('absent.md')).error!.code, 'no_buffer');
   const ro = await a.open('name:*Messages*');
-  assert.equal(ro.error, null); assert.equal(ro.meta.readOnly, 'server special buffer');
-  const e = await a.edit('name:*Messages*', ro.ver, [[0, '', 'x']]); assert.equal(e.code, 'read_only');
+  assert.equal(ro.error, null); assert.equal(ro.meta!.readOnly, 'server special buffer');
+  const e = await a.edit('name:*Messages*', ro.ver!, [[0, '', 'x']]); assert.equal(e.code, 'read_only');
   fs.mkdirSync(path.join(dir.dirs.home, '.ssh'), { recursive: true });
   fs.writeFileSync(path.join(dir.dirs.home, '.ssh/authorized_keys'), 'k\n');
-  assert.equal((await a.open(path.join(dir.dirs.home, '.ssh/authorized_keys'))).error.code, 'refused_path');
-  assert.equal((await a.open(path.join(dir.dirs.home, '.ssh/new'), { create: true })).error.code, 'refused_path');
+  assert.equal((await a.open(path.join(dir.dirs.home, '.ssh/authorized_keys'))).error!.code, 'refused_path');
+  assert.equal((await a.open(path.join(dir.dirs.home, '.ssh/new'), { create: true })).error!.code, 'refused_path');
   fs.writeFileSync(path.join(dir.dirs.notes, 'bin.dat'), Buffer.from([0xff, 0xfe, 0x00, 0x41]));
-  assert.equal((await a.open('bin.dat')).error.code, 'not_text');
+  assert.equal((await a.open('bin.dat')).error!.code, 'not_text');
   // Outside the writable paths: opens read-only with the reason.
   const outside = fs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'edwind-out-'));
   fs.writeFileSync(path.join(outside, 'f.txt'), 'x\n');
   const o = await a.open(path.join(outside, 'f.txt'));
-  assert.equal(o.meta.readOnly, 'outside the writable paths');
+  assert.equal(o.meta!.readOnly, 'outside the writable paths');
   fs.rmSync(outside, { recursive: true, force: true });
   // A long rid is bad_request.
   a.send({ t: 'open', rid: 'r'.repeat(65), buf: 'x' });
@@ -176,18 +183,18 @@ test('R6.1 ids: notesDir-relative, ~/, absolute; a symlink and its target name o
   const o1 = await a.open(abs);
   assert.equal(o1.error, null);
   const list = (await a.call('buffer-list')).value;
-  assert.ok(list.some(b => b.id === 'ids.md'), 'the canonical id is notesDir-relative');
+  assert.ok(list.some((b: Msg) => b.id === 'ids.md'), 'the canonical id is notesDir-relative');
   fs.symlinkSync(abs, path.join(dir.dirs.home, 'link.md'));
   const o2 = await a.open(path.join(dir.dirs.home, 'link.md'));
   assert.equal(o2.error, null);
-  assert.equal((await a.call('buffer-list')).value.filter(b => b.file === abs).length, 1);
+  assert.equal((await a.call('buffer-list')).value.filter((b: Msg) => b.file === abs).length, 1);
   fs.writeFileSync(path.join(dir.dirs.home, 'h.md'), 'h\n');
   const o3 = await a.open('~/h.md');
   assert.equal(o3.error, null);
-  assert.ok((await a.call('buffer-list')).value.some(b => b.id === '~/h.md'));
+  assert.ok((await a.call('buffer-list')).value.some((b: Msg) => b.id === '~/h.md'));
   // Every message about the buffer carries the canonical id, whatever spelling the client used; edit, save
   // and revert accept any spelling.
-  const ack = await a.edit(abs, o1.ver, [[0, '', 'I ']]);
+  const ack = await a.edit(abs, o1.ver!, [[0, '', 'I ']]);
   assert.equal(ack.t, 'ack'); assert.equal(ack.buf, 'ids.md');
   const saved = await a.request({ t: 'save', buf: path.join(dir.dirs.home, 'link.md') });
   assert.deepEqual(saved.value, { buf: 'ids.md', ver: ack.ver, saved: true });
@@ -210,7 +217,7 @@ test('R14.14 a client that stops reading is disconnected with slow_client; the o
   slow.sock.resume(); // a paused socket cannot see the close; reading again, it does
   await closed;
   for (let i = 0; i < n; i++) assert.equal((await other.next(m => m.t === 'edits' && m.buf === id, 30000)).ops[0][2].length, chunk.length);
-  assert.equal((await fast.open(id)).text.length, n * chunk.length);
+  assert.equal((await fast.open(id)).text!.length, n * chunk.length);
   fast.close(); other.close();
 });
 
@@ -330,11 +337,11 @@ test('§13.1 buffer-list and kill-buffer; killed reaches attached clients', asyn
   const id = note('k.md', 'k\n');
   const a = await client(), b = await client(); await a.open(id); await b.open(id);
   const list = (await a.call('buffer-list')).value;
-  const e = list.find(x => x.id === id);
+  const e = list.find((x: Msg) => x.id === id);
   assert.equal(e.name, 'k.md'); assert.equal(e.mode, 'markdown-mode'); assert.equal(e.modified, false); assert.equal(e.writers.length, 2);
   await a.call('kill-buffer', [id]);
   assert.equal((await b.next(m => m.t === 'killed')).buf, id);
-  assert.equal((await a.call('buffer-list')).value.some(x => x.id === id), false);
+  assert.equal((await a.call('buffer-list')).value.some((x: Msg) => x.id === id), false);
   // A Scheme kill-buffer kills everywhere too (R6.3).
   const id2 = note('k2.md', 'k\n'); await b.open(id2);
   await a.form(`(kill-buffer "k2.md")`);
@@ -428,7 +435,7 @@ test('R15.12 edwind --check verifies the journals; --export writes the buffers',
   const id = note('chk.md', 'c\n');
   const a = await client(); await a.open(id); await a.edit(id, 0, [[0, '', 'C ']]); a.close();
   await new Promise(r => setTimeout(r, 100));
-  const run = (args) => new Promise(resolve => { const p = spawn(process.execPath, [MAIN, '--config', dir.file, ...args], { env: { ...process.env, HOME: dir.dirs.home } }); let out = ''; p.stdout.on('data', d => { out += d; }); p.stderr.on('data', d => { out += d; }); p.on('exit', code => resolve({ code, out })); });
+  const run = (args: string[]) => new Promise<RunResult>(resolve => { const p = spawn(process.execPath, [MAIN, '--config', dir.file, ...args], { env: { ...process.env, HOME: dir.dirs.home } }); let out = ''; p.stdout.on('data', d => { out += d; }); p.stderr.on('data', d => { out += d; }); p.on('exit', code => resolve({ code, out })); });
   const r = await run(['--check']);
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /chk\.md: ok, 1 batches, version 1/);
@@ -438,7 +445,7 @@ test('R15.12 edwind --check verifies the journals; --export writes the buffers',
   assert.equal(ex.code, 0, ex.out);
   const files = fs.readdirSync(dirOut);
   assert.ok(files.some(f => f.endsWith('chk.md')));
-  assert.equal(fs.readFileSync(path.join(dirOut, files.find(f => f.endsWith('chk.md'))), 'utf8'), 'C c\n');
+  assert.equal(fs.readFileSync(path.join(dirOut, files.find(f => f.endsWith('chk.md'))!), 'utf8'), 'C c\n');
 });
 
 test('R16.17 limits: 500 open buffers, a flood of edits and a deep recursion leave edwind serving', async () => {
@@ -446,7 +453,7 @@ test('R16.17 limits: 500 open buffers, a flood of edits and a deep recursion lea
   for (let i = 0; i < 500; i++) assert.equal((await a.open(`name:flood-${i}`, { create: true })).error, null);
   const id = 'name:flood-0';
   let ver = 0;
-  const acks = [];
+  const acks: Msg[] = [];
   for (let i = 0; i < 300; i++) { a.send({ t: 'edit', buf: id, base: ver, seq: i + 1, ops: [[0, '', 'x']] }); ver++; }
   for (let i = 0; i < 300; i++) acks.push(await a.next(m => m.t === 'ack' && m.seq === i + 1));
   assert.equal(acks[299].ver, 300);
@@ -454,7 +461,7 @@ test('R16.17 limits: 500 open buffers, a flood of edits and a deep recursion lea
   assert.equal(r.error.condition, 'recursion-depth');
   assert.equal((await a.form('(+ 1 1)')).value, '2');
   const b = await client();
-  assert.equal((await b.open(id)).text.length, 300);
+  assert.equal((await b.open(id)).text!.length, 300);
   a.close(); b.close();
 });
 
@@ -478,9 +485,9 @@ test('R16.16 the Node flags of bin/edwind are in effect: no eval, locked intrins
     guardProcesses(); const out = [];
     for (const f of [() => spawnSync('true'), () => cp.execSync('true'), () => cp.spawn('true'), () => cp.fork('x')]) { try { f(); out.push('ran'); } catch (e) { out.push(e.message); } }
     console.log(JSON.stringify(out));`;
-  const r = await new Promise(resolve => { const p = spawn(process.execPath, ['--input-type=module', '-e', probe], { env: process.env }); let out = ''; p.stdout.on('data', d => { out += d; }); p.stderr.on('data', d => { out += d; }); p.on('exit', code => resolve({ code, out })); });
+  const r = await new Promise<RunResult>(resolve => { const p = spawn(process.execPath, ['--input-type=module', '-e', probe], { env: process.env }); let out = ''; p.stdout.on('data', d => { out += d; }); p.stderr.on('data', d => { out += d; }); p.on('exit', code => resolve({ code, out })); });
   assert.equal(r.code, 0, r.out);
-  const msgs = JSON.parse(r.out.trim().split('\n').pop());
+  const msgs: string[] = JSON.parse(r.out.trim().split('\n').pop()!);
   assert.equal(msgs.length, 4); for (const m of msgs) assert.match(m, /edwind never starts processes/);
 });
 
@@ -496,7 +503,7 @@ test('open{create} of a notesDir-relative id makes the missing directories insid
   assert.deepEqual(saved.value, { buf: 'deep/er/new.md', ver: ack.ver, saved: true });
   assert.equal(fs.readFileSync(path.join(dir.dirs.notes, 'deep/er/new.md'), 'utf8'), 'new\n');
   /* Without create a missing directory is still no_buffer, and nothing is made. */
-  assert.equal((await a.open('deep/none/y.md')).error.code, 'no_buffer');
+  assert.equal((await a.open('deep/none/y.md')).error!.code, 'no_buffer');
   assert.equal(fs.existsSync(path.join(dir.dirs.notes, 'deep/none')), false);
   /* A symlink out of notesDir on the way: refused, and nothing is created at its target. */
   const outside = fs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'edwind-linkout-'));
@@ -511,7 +518,7 @@ test('open{create} of a notesDir-relative id makes the missing directories insid
   assert.ok(d.error && ['bad_request', 'refused_path'].includes(d.error.code), JSON.stringify(d.error));
   assert.equal(fs.existsSync(path.join(dir.dirs.notes, 'nowhere')), false);
   /* Outside notesDir the behaviour is unchanged: a missing directory is no_buffer even with create. */
-  assert.equal((await a.open(path.join(dir.dirs.home, 'nodir/z.md'), { create: true })).error.code, 'no_buffer');
+  assert.equal((await a.open(path.join(dir.dirs.home, 'nodir/z.md'), { create: true })).error!.code, 'no_buffer');
   assert.equal(fs.existsSync(path.join(dir.dirs.home, 'nodir')), false);
   a.close();
 });

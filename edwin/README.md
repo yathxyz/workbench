@@ -8,6 +8,24 @@ The design and the decisions are in the doc "Edwin as Workbench's text daemon" (
 replaces the notes index and `sample` of M5 (M5-W1, M5-W2), pages are files in `notesDir`, markdown-mode comes
 first, undo undoes your own edits, and the runtime is Node.
 
+## TypeScript
+
+edwind (`server/*.mts`) and the suites (`test/*.mts`) are TypeScript that Node 24 runs as it is: Node strips
+the types at load, and `tsc -p edwin` (flake check `typecheck`, `--strict`) checks them. The rules that keep
+that working:
+- **Erasable syntax only** (`erasableSyntaxOnly`): no `enum`, `namespace`, parameter properties or `import =`.
+  Stripping then leaves every line and column where it was, so stack traces and `defAt` locations match the source.
+- **Class fields are `declare`d** (`declare x: T;`). A plain `x: T;` defines the field at construction and changes
+  behaviour.
+- **Relative imports name the `.mts` file** (`allowImportingTsExtensions`); type-only imports use `import type`.
+- **`any` is marked**: every one carries `// any: <reason>`. Most are the aliases in `main.mts` (`Ed`, `Lisp`,
+  `EdBuffer`, `SchemeValue`) for the core in `edwin/src`, which is still JavaScript loaded through `vm`.
+- The unit sets `NODE_COMPILE_CACHE` (`CacheDirectory=workbench-edit`), so only the first start after a deploy
+  pays for stripping (about 240 ms).
+
+`edwin/src` and `web/` follow in later steps: classic scripts as `NAME.ts`, stripped at build time into `NAME.js`
+at the same path.
+
 ## Layout
 
 | Path | What |

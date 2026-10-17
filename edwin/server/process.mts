@@ -19,6 +19,31 @@ import { fileURLToPath } from 'node:url';
 import { sha256 } from './files.mts';
 import { HubError, PTY_INPUT_FRAME, KILL_TIMEOUT_MS, REPLY_TIMEOUT_MS } from './hub.mts';
 import { jsonToScheme } from './threads.mts';
+import type { Server, Log, Lisp, Ed as Edwin, EdBuffer, SchemeValue } from './main.mts';
+import type { Hub, HubMessage, HubRequest, PtyOpenReply, Summary } from './hub.mts';
+import type { Scheduler, SchemeGen } from './threads.mts';
+import type { SBuf } from './buffers.mts';
+import type { By } from './proto.mts';
+
+type Scheme = Lisp['S'];
+/* How a process ended, as pty.exit, a pty.open reply or a Summary has it. */
+export interface ExitInfo { code?: number | null; signal?: number | null; reason?: string }
+/* pty.exit as the hub sends it (HubMessage types `code` as an err's string code). */
+export interface PtyExitMsg { t?: string; sid?: string; code?: number | null; signal?: number | null; reason?: string }
+export type ProcessStatus = 'starting' | 'run' | 'exit' | 'signal' | 'failed' | 'deleted';
+/* What spawnG opens: command null for an interactive shell; who names the primitive in errors. */
+export interface SpawnOptions {
+  name: string; command: string | null; shell?: string | null; cwd?: string | null; env?: Record<string, string> | null;
+  cols: number; rows: number; buffer?: EdBuffer | null; filter?: SchemeValue | null; sentinel?: SchemeValue | null;
+  card?: boolean; noquery?: boolean; collect?: boolean; who: string;
+}
+export interface ProcessInit extends Omit<SpawnOptions, 'shell'> { sid: string; argv: string[]; shell: string }
+/* The spawn of pty.open (wb_proto::hub::SpawnPty). */
+interface SpawnPty { argv: string[]; shell: string; cwd?: string; env?: Record<string, string> }
+/* A callback thread waiting in a process's queue; done resolves the exit promise in order. */
+type QueueItem = { kind: 'out' | 'exit'; job: (self: Processes) => SchemeGen } | { kind: 'done'; job: () => void };
+/* accept-process-output waiting for output from one of PROCS. */
+interface OutWaiter { procs: Process[]; resolve: (v: boolean) => void }
 
 export const name = 'process';
 export const DEFAULT_COLS = 120;
@@ -33,10 +58,10 @@ export const LIST_BUFFER_ID = 'name:' + LIST_BUFFER;
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCM_FILE = path.join(HERE, '..', 'scm', 'process.scm');
 const BASE32 = 'abcdefghijklmnopqrstuvwxyz234567';
-const SERVER_BY = { kind: 'server' };
+const SERVER_BY: By = { kind: 'server' };
 
 /* A fresh sid: `ed-` and 16 base32 characters (80 random bits), matching ^[A-Za-z0-9_-]{1,64}$ (R4.43). */
-export function newSid() {
+export function newSid(): string {
   const bytes = randomBytes(10); let bits = 0, acc = 0, out = '';
   for (const b of bytes) { acc = (acc << 8) | b; bits += 8; while (bits >= 5) { bits -= 5; out += BASE32[(acc >> bits) & 31]; } }
   return SID_PREFIX + out;
@@ -46,12 +71,12 @@ export function newSid() {
    are removed, as are the other C0 controls except tab and newline; CRLF becomes LF and a bare CR is
    dropped (the hub's children write to a terminal). */
 const ANSI_RE = /\x1b\[[0-?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1bP[^\x1b]*(?:\x1b\\)?|\x1b[ -\/]*[0-~]?|[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]/g;
-export function stripAnsi(text) {
+export function stripAnsi(text: unknown): string {
   return String(text).replace(ANSI_RE, '').replace(/\r\n/g, '\n').replace(/\r/g, '');
 }
 
 /* Emacs's sentinel event string for an exit (code, signal, reason). */
-export function exitEvent(code, signal, reason) {
+export function exitEvent(code: number | null | undefined, signal: number | null | undefined, reason: string | null | undefined): string {
   if (reason === 'spawn_failed') return 'failed\n';
   if (reason === 'hub_restart') return 'exited abnormally with code 255 (hub restart)\n';
   if (signal !== null && signal !== undefined) return signal === 2 ? 'interrupt\n' : signal === 15 ? 'terminated\n' : signal === 1 ? 'hangup\n' : 'killed\n';
@@ -60,7 +85,17 @@ export function exitEvent(code, signal, reason) {
 }
 
 export class Process {
-  constructor(o) {
+  declare name: string; declare sid: string; declare command: string | null; declare argv: string[]; declare shell: string;
+  declare cwd: string | null; declare env: Record<string, string> | null; declare cols: number; declare rows: number; declare card: boolean;
+  declare buffer: EdBuffer | null; declare mark: SchemeValue | null; // an Edwin marker (edwin/src)
+  declare filter: SchemeValue | null; declare sentinel: SchemeValue | null; declare plist: Map<string, SchemeValue>; declare queryOnExit: boolean;
+  declare pid: number | null; declare epoch: number | null; declare stream: number | null; declare out: number; declare startedAt: number;
+  declare status: ProcessStatus;
+  declare exitCode: number | null; declare exitSignal: number | null; declare exitReason: string | null; declare alive: boolean; declare exited: boolean;
+  declare collect: string | null; declare unseen: number;
+  declare queue: QueueItem[]; declare busy: boolean; declare deleted: boolean;
+  declare exitPromise: Promise<number | null>; declare resolveExit: (v: number | null) => void;
+  constructor(o: ProcessInit) {
     this.name = o.name; this.sid = o.sid; this.command = o.command; this.argv = o.argv; this.shell = o.shell; this.cwd = o.cwd || null; this.env = o.env || null;
     this.cols = o.cols; this.rows = o.rows; this.card = !!o.card; this.buffer = null; this.mark = null;
     this.filter = o.filter || null; this.sentinel = o.sentinel || null; this.plist = new Map(); this.queryOnExit = !o.noquery;
@@ -74,47 +109,50 @@ export class Process {
     this.exitPromise.catch(() => {});
     if (o.buffer) this.setBuffer(o.buffer);
   }
-  setBuffer(b) {
+  setBuffer(b: EdBuffer | null): void {
     if (this.mark) this.mark.release();
     this.buffer = b || null;
     this.mark = b ? b.marker(b.rope.length, 'after') : null;
   }
-  __print() { return `#<process ${this.name}>`; }
-  toString() { return this.__print(); }
-  get __type() { return 'process'; }
+  __print(): string { return `#<process ${this.name}>`; }
+  toString(): string { return this.__print(); }
+  get __type(): string { return 'process'; }
 }
 
 export class Processes {
-  constructor(server) {
+  declare server: Server; declare log: Log; declare L: Lisp; declare S: Scheme; declare Ed: Edwin; declare E: SchemeValue; // E: Edwin's editor state (edwin/src)
+  declare byId: Map<string, Process>; declare outWaiters: OutWaiter[];
+  declare onCard: ((p: Process) => void) | null; declare listTimer: NodeJS.Timeout | null;
+  constructor(server: Server) {
     this.server = server; this.log = server.log; this.L = server.L; this.S = server.L.S; this.Ed = server.Ed; this.E = server.Ed.E;
     this.byId = new Map();                                 // sid -> Process
     this.outWaiters = [];                                  // accept-process-output: {procs, resolve}
     this.onCard = null;                                    // hook point for :card t once the board family exists (EW-M4)
     this.listTimer = null;
   }
-  get hub() { return this.server.hub; }
-  get threads() { return this.server.threads; }
-  all() { return [...this.byId.values()]; }
-  byName(nm) { for (const p of this.byId.values()) if (p.name === nm) return p; return null; }
-  byBuffer(b) { for (const p of this.byId.values()) if (p.buffer === b) return p; return null; }
-  hubErr(e, who) { return this.hub.toCondition(e, who); }
+  get hub(): Hub { return this.server.hub; }
+  get threads(): Scheduler { return this.server.threads; }
+  all(): Process[] { return [...this.byId.values()]; }
+  byName(nm: string): Process | null { for (const p of this.byId.values()) if (p.name === nm) return p; return null; }
+  byBuffer(b: EdBuffer): Process | null { for (const p of this.byId.values()) if (p.buffer === b) return p; return null; }
+  hubErr(e: unknown, who: string): SchemeValue { return this.hub.toCondition(e, who); }
 
   /* ---------- spawning (R4.43) ---------- */
   /* Open a hub PTY for O = {name, command (null for an interactive shell), shell, cwd, env, cols, rows,
      buffer, filter, sentinel, card, collect, who}; a generator: waits for the hub's reply. */
-  *spawnG(o) {
+  *spawnG(o: SpawnOptions): SchemeGen {
     const S = this.S, hub = this.hub;
     if (!hub.up) throw new S.SchemeError('hub-error', `${o.who}: hub unreachable`, []);
     const shell = o.shell || hub.defaultShell();
     const argv = o.command === null || o.command === undefined ? [shell] : [shell, '-c', o.command];
     const sid = newSid();
     const p = new Process({ ...o, sid, argv, shell });
-    const spawn = { argv, shell };
+    const spawn: SpawnPty = { argv, shell };
     if (o.cwd) spawn.cwd = o.cwd;
     if (o.env) spawn.env = o.env;
     this.byId.set(sid, p);                                 // registered first, so an event arriving with the reply finds it
     this.log.info('process', { event: 'spawn', sid, shell, card: p.card });
-    let reply;
+    let reply: PtyOpenReply;
     try { reply = yield new S.Block(hub.request({ t: 'pty.open', sid, cols: p.cols, rows: p.rows, spawn }), 'the hub'); }
     catch (e) {
       this.byId.delete(sid); p.status = 'failed'; p.exited = true; p.resolveExit(null);
@@ -132,41 +170,41 @@ export class Processes {
   }
 
   /* ---------- hub events ---------- */
-  onOut(msg) {
-    const p = this.byId.get(msg.sid); if (!p) return;
+  onOut(msg: HubMessage): void {
+    const p = this.byId.get(msg.sid!); if (!p) return;
     p.out = typeof msg.out === 'number' ? msg.out : p.out;
     this.deliver(p, msg.d);
   }
-  deliver(p, d) {
+  deliver(p: Process, d: string | undefined): void {
     if (typeof d !== 'string' || !d) return;
     if (p.collect !== null) p.collect += d;
     this.server.hub.emit('process.out', p, d);           // wb.mts: wb-session-output-functions for our own sessions
-    if (p.filter) this.enqueue(p, 'out', function* (self) { yield* self.S.applyG(p.filter, [p, d]); });
-    else if (p.buffer) this.enqueue(p, 'out', function* (self) { self.insertAtMark(p, d); });
+    if (p.filter) this.enqueue(p, 'out', function* (self: Processes): SchemeGen { yield* self.S.applyG(p.filter, [p, d]); });
+    else if (p.buffer) this.enqueue(p, 'out', function* (self: Processes): SchemeGen { self.insertAtMark(p, d); });
     else this.wakeOut(p);
   }
-  onExit(msg) {
-    const p = this.byId.get(msg.sid); if (!p || p.exited) return;
+  onExit(msg: PtyExitMsg): void {
+    const p = this.byId.get(msg.sid!); if (!p || p.exited) return;
     this.finish(p, { code: msg.code === undefined ? null : msg.code, signal: msg.signal === undefined ? null : msg.signal, reason: msg.reason || 'exited' });
   }
   /* The Summary of one of our sessions changed: an exit we did not see as pty.exit (disconnected then) counts. */
-  onSession(s) {
+  onSession(s: Summary): void {
     const p = this.byId.get(s.sid); if (!p) return;
     if (p.alive && s.alive === false && !p.exited) { const ex = s.pty && s.pty.exit; this.finish(p, ex ? { code: ex.code, signal: ex.signal, reason: ex.reason } : { code: null, signal: null, reason: 'unknown' }); }
     this.scheduleList();
   }
-  onGone(msg) {
-    const p = this.byId.get(msg.sid); if (!p) return;
+  onGone(msg: HubMessage): void {
+    const p = this.byId.get(msg.sid!); if (!p) return;
     if (!p.exited) this.finish(p, { code: null, signal: null, reason: 'deleted' });
-    this.byId.delete(msg.sid); p.deleted = true; p.status = 'deleted';
+    this.byId.delete(msg.sid!); p.deleted = true; p.status = 'deleted';
     this.scheduleList();
   }
   /* The hub came back: re-attach to every live process, resuming its stream where we left it. */
-  onUp() {
+  onUp(): void {
     const S = this.S;
     for (const p of this.byId.values()) {
       if (!p.alive || p.exited) continue;
-      const req = { t: 'pty.open', sid: p.sid, cols: p.cols, rows: p.rows };
+      const req: HubRequest & { t: 'pty.open'; resume?: { stream: number; out: number } } = { t: 'pty.open', sid: p.sid, cols: p.cols, rows: p.rows };
       if (p.stream !== null) req.resume = { stream: p.stream, out: p.out };
       this.hub.request(req).then(r => {
         if (p.exited) return;
@@ -180,24 +218,26 @@ export class Processes {
       });
     }
   }
-  finish(p, ex) {
+  finish(p: Process, ex: ExitInfo): void {
     if (p.exited) return;
     p.exited = true; p.alive = false; p.exitCode = ex.code === undefined ? null : ex.code; p.exitSignal = ex.signal === undefined ? null : ex.signal; p.exitReason = ex.reason || 'exited';
     p.status = ex.reason === 'spawn_failed' ? 'failed' : p.exitSignal !== null ? 'signal' : 'exit';
     this.log.info('process', { event: 'exit', sid: p.sid, code: p.exitCode, signal: p.exitSignal, reason: p.exitReason });
     const event = exitEvent(p.exitCode, p.exitSignal, p.exitReason);
     this.server.hub.emit('process.exit', p, event);
-    if (p.sentinel) this.enqueue(p, 'exit', function* (self) { yield* self.S.applyG(p.sentinel, [p, event]); });
-    else if (p.buffer) this.enqueue(p, 'exit', function* (self) { self.insertAtMark(p, `\nProcess ${p.name} ${event}`); });
+    if (p.sentinel) this.enqueue(p, 'exit', function* (self: Processes): SchemeGen { yield* self.S.applyG(p.sentinel, [p, event]); });
+    else if (p.buffer) this.enqueue(p, 'exit', function* (self: Processes): SchemeGen { self.insertAtMark(p, `\nProcess ${p.name} ${event}`); });
     this.enqueue(p, 'done', () => p.resolveExit(p.status === 'signal' ? p.exitSignal : p.exitCode));
     this.scheduleList();
   }
 
   /* ---------- the per-process queue of callback threads ---------- */
-  enqueue(p, kind, job) { p.queue.push({ kind, job }); this.pump(p); }
-  pump(p) {
+  enqueue(p: Process, kind: 'done', job: () => void): void;
+  enqueue(p: Process, kind: 'out' | 'exit', job: (self: Processes) => SchemeGen): void;
+  enqueue(p: Process, kind: QueueItem['kind'], job: QueueItem['job']): void { p.queue.push({ kind, job } as QueueItem); this.pump(p); }
+  pump(p: Process): void {
     if (p.busy || !p.queue.length) return;
-    const { kind, job } = p.queue.shift();
+    const { kind, job } = p.queue.shift()!;
     if (kind === 'done') { job(); this.pump(p); return; }
     p.busy = true;
     const self = this;
@@ -206,7 +246,7 @@ export class Processes {
   }
   /* Output in the process buffer at the process mark (an after marker, so it advances); point follows as
      Edwin's point does for any insertion at it. No read-only check, as Emacs binds inhibit-read-only. */
-  insertAtMark(p, text) {
+  insertAtMark(p: Process, text: string): void {
     const b = p.buffer;
     if (!b || !this.E.buffers.includes(b) || !text) return;
     if (!p.mark || p.mark.buffer !== b || p.mark.pos === null) p.setBuffer(b);
@@ -217,10 +257,10 @@ export class Processes {
     try { this.Ed.editText(b, pos, 0, text); b.modified = true; }
     finally { this.E.current = saved; }
   }
-  wakeOut(p) { p.unseen++; const rest = []; for (const w of this.outWaiters) { if (w.procs.includes(p)) { w.resolve(true); for (const q of w.procs) q.unseen = 0; } else rest.push(w); } this.outWaiters = rest; }
+  wakeOut(p: Process): void { p.unseen++; const rest: OutWaiter[] = []; for (const w of this.outWaiters) { if (w.procs.includes(p)) { w.resolve(true); for (const q of w.procs) q.unseen = 0; } else rest.push(w); } this.outWaiters = rest; }
 
   /* ---------- status from the Summary (R4.43) ---------- */
-  statusOf(p) {
+  statusOf(p: Process): ProcessStatus {
     const s = this.hub.sessions.get(p.sid);
     if (s && !p.deleted) {
       if (s.alive) return p.exited ? p.status : 'run';
@@ -230,17 +270,17 @@ export class Processes {
     }
     return p.status;
   }
-  exitStatusOf(p) {
+  exitStatusOf(p: Process): number {
     const s = this.hub.sessions.get(p.sid);
     const ex = s && !s.alive && s.pty ? s.pty.exit : null;
     if (ex) return ex.signal !== null && ex.signal !== undefined ? ex.signal : (ex.code === null || ex.code === undefined ? 0 : ex.code);
     if (!p.exited) return 0;
     return p.exitSignal !== null ? p.exitSignal : (p.exitCode === null ? 0 : p.exitCode);
   }
-  live(p) { return !p.exited && !p.deleted && this.statusOf(p) === 'run'; }
+  live(p: Process): boolean { return !p.exited && !p.deleted && this.statusOf(p) === 'run'; }
 
   /* ---------- *Process List* (R9.22: card-less processes are listed here) ---------- */
-  render() {
+  render(): string {
     const rows = [['Process', 'PID', 'Status', 'Buffer', 'Shell', 'Session', 'Card', 'Command']];
     for (const p of this.all()) {
       const st = this.statusOf(p); const ex = p.exited ? this.exitStatusOf(p) : null;
@@ -253,42 +293,42 @@ export class Processes {
       rows.push(['(earlier run)', s.pty && s.pty.pid !== undefined ? String(s.pty.pid) : '--', s.alive ? 'run' : ex ? `exit ${ex.signal !== null && ex.signal !== undefined ? ex.signal : ex.code}` : 'exit', '(none)', s.pty && s.pty.argv ? path.basename(s.pty.argv[0] || '') : '?', s.sid, 'no', s.pty && s.pty.argv ? s.pty.argv.slice(1).join(' ') : '']);
     }
     const widths = rows[0].map((_, i) => Math.max(...rows.map(r => (i === rows[0].length - 1 ? 0 : [...r[i]].length))));
-    const line = r => r.map((c, i) => (i === r.length - 1 ? c : c.padEnd(widths[i]))).join('  ').trimEnd();
+    const line = (r: string[]) => r.map((c, i) => (i === r.length - 1 ? c : c.padEnd(widths[i]))).join('  ').trimEnd();
     return rows.map(line).join('\n') + '\n';
   }
-  listBuffer() {
+  listBuffer(): SBuf {
     const { Ed, buffers } = this.server;
     let sb = buffers.byId.get(LIST_BUFFER_ID);
     if (sb) return sb;
     const ed = Ed.getBufferCreate(LIST_BUFFER); ed.mode = 'special-mode'; ed.readOnly = true;
-    sb = buffers.resolve(LIST_BUFFER_ID, false);
+    sb = buffers.resolve(LIST_BUFFER_ID, false) as SBuf;
     sb.readOnly = 'server special buffer';
     return sb;
   }
-  async refreshList(create) {
+  async refreshList(create?: boolean): Promise<SBuf | null> {
     const sb = create ? this.listBuffer() : this.server.buffers.byId.get(LIST_BUFFER_ID);
     if (!sb) return null;
     await this.server.buffers.replaceText(sb, this.render(), SERVER_BY);
     sb.savedText = sb.text; sb.savedHash = sha256(sb.savedText);
     return sb;
   }
-  scheduleList() {
+  scheduleList(): void {
     if (this.listTimer || !this.server.buffers || !this.server.buffers.byId.has(LIST_BUFFER_ID)) return;
     this.listTimer = setTimeout(() => { this.listTimer = null; this.refreshList(false).catch(e => this.log.warn('process', { event: 'list', error: e.message })); }, 50);
     this.listTimer.unref();
   }
 
-  shutdown() { if (this.listTimer) clearTimeout(this.listTimer); for (const w of this.outWaiters) w.resolve(false); this.outWaiters = []; }
+  shutdown(): void { if (this.listTimer) clearTimeout(this.listTimer); for (const w of this.outWaiters) w.resolve(false); this.outWaiters = []; }
 }
 
 /* ---------- the module ---------- */
-export async function install(server) {
+export async function install(server: Server): Promise<void> {
   const { L, Ed } = server, S = L.S, E = Ed.E;
   const P = new Processes(server);
   server.processes = P;
   const hub = server.hub;
   hub.on('pty.out', m => P.onOut(m));
-  hub.on('pty.exit', m => P.onExit(m));
+  hub.on('pty.exit', m => P.onExit(m as unknown as PtyExitMsg));
   hub.on('session', s => P.onSession(s));
   hub.on('gone', m => P.onGone(m));
   hub.on('up', () => P.onUp());
@@ -297,13 +337,13 @@ export async function install(server) {
      discarded (insertAtMark checks), as Emacs discards output to a killed buffer. */
   server.buffers.on('killed', sb => { for (const p of P.byId.values()) if (p.buffer === sb.ed) p.setBuffer(null); });
 
-  const D = (nm, args, doc, fn, gen) => { const f = L.D(nm, args, doc, fn); f.where = 'server'; if (gen) f.gen = gen; return f; };
-  const blocking = (nm, args, doc, gen) => D(nm, args, doc, () => { throw new S.SchemeError('cannot-block', `${nm}: cannot wait here`, []); }, gen);
-  const sleep = ms => new Promise(r => { const h = setTimeout(r, ms); h.unref(); });
-  const isKw = x => x instanceof S.Sym && x.name.length > 1 && x.name[0] === ':';
+  const D = (nm: string, args: string, doc: string, fn: (args: SchemeValue[]) => SchemeValue, gen?: (args: SchemeValue[]) => SchemeGen) => { const f = L.D(nm, args, doc, fn); f.where = 'server'; if (gen) f.gen = gen; return f; };
+  const blocking = (nm: string, args: string, doc: string, gen: (args: SchemeValue[]) => SchemeGen) => D(nm, args, doc, () => { throw new S.SchemeError('cannot-block', `${nm}: cannot wait here`, []); }, gen);
+  const sleep = (ms: number) => new Promise(r => { const h = setTimeout(r, ms); h.unref(); });
+  const isKw = (x: SchemeValue): boolean => x instanceof S.Sym && x.name.length > 1 && x.name[0] === ':';
   /* Keyword arguments as an object of raw Scheme values. */
-  const kw = (args, who) => {
-    const o = {};
+  const kw = (args: SchemeValue[], who: string): Record<string, SchemeValue> => {
+    const o: Record<string, SchemeValue> = {};
     for (let i = 0; i < args.length; i += 2) {
       if (!isKw(args[i])) throw new S.SchemeError('wrong-type-argument', `${who}: expected a keyword, got ${S.write(args[i])}`, [args[i]]);
       if (i + 1 >= args.length) throw new S.SchemeError('wrong-number-of-arguments', `${who}: ${args[i].name} needs a value`, []);
@@ -311,42 +351,42 @@ export async function install(server) {
     }
     return o;
   };
-  const proc = (x, who) => { if (!(x instanceof Process)) throw S.typeErr('process', x, who); return x; };
-  const absent = x => x === undefined || x === false;
-  const optStr = (x, k, who) => { if (absent(x)) return null; if (typeof x !== 'string') throw S.typeErr('string', x, `${who} ${k}`); return x; };
-  const optProc = (x, k, who) => { if (absent(x)) return null; if (typeof x !== 'function') throw S.typeErr('procedure', x, `${who} ${k}`); return x; };
-  const bufferArg = (x, who) => {
+  const proc = (x: SchemeValue, who: string): Process => { if (!(x instanceof Process)) throw S.typeErr('process', x, who); return x; };
+  const absent = (x: SchemeValue): boolean => x === undefined || x === false;
+  const optStr = (x: SchemeValue, k: string, who: string): string | null => { if (absent(x)) return null; if (typeof x !== 'string') throw S.typeErr('string', x, `${who} ${k}`); return x; };
+  const optProc = (x: SchemeValue, k: string, who: string): SchemeValue | null => { if (absent(x)) return null; if (typeof x !== 'function') throw S.typeErr('procedure', x, `${who} ${k}`); return x; };
+  const bufferArg = (x: SchemeValue, who: string): EdBuffer | null => {
     if (absent(x)) return null;
     if (x === true) return E.current;
     if (x instanceof Ed.Buffer) return x;
     if (typeof x === 'string') return Ed.getBufferCreate(x);
     throw S.typeErr('buffer, buffer name or #t', x, `${who} :buffer`);
   };
-  const envArg = (x, who) => {
+  const envArg = (x: SchemeValue, who: string): Record<string, string> | null => {
     if (absent(x)) return null;
-    const out = {};
-    const put = (k, v) => { out[k instanceof S.Sym ? k.name : String(k)] = String(v); };
+    const out: Record<string, string> = {};
+    const put = (k: SchemeValue, v: SchemeValue) => { out[k instanceof S.Sym ? k.name : String(k)] = String(v); };
     if (x instanceof Map) for (const [k, v] of x) put(k, v);
     else for (const e of S.arr(x)) { if (e instanceof S.Pair) put(e.car, e.cdr); else if (typeof e === 'string' && e.includes('=')) { const i = e.indexOf('='); put(e.slice(0, i), e.slice(i + 1)); } else throw new S.SchemeError('wrong-type-argument', `${who} :env: an alist of names to values`, [e]); }
     if (Object.keys(out).length > ENV_MAX) throw new S.SchemeError('error', `${who} :env: at most ${ENV_MAX} entries`, []);
     return out;
   };
-  const sizeArg = (x, who) => {
+  const sizeArg = (x: SchemeValue, who: string): [number, number] => {
     if (absent(x)) return [DEFAULT_COLS, DEFAULT_ROWS];
-    let cols, rows;
+    let cols: SchemeValue, rows: SchemeValue;
     if (x instanceof S.Pair) { cols = x.car; rows = x.cdr instanceof S.Pair ? x.cdr.car : x.cdr; }
     else if (Array.isArray(x)) [cols, rows] = x;
     else throw S.typeErr('(cols . rows)', x, `${who} :size`);
     return [S.int(cols, who), S.int(rows, who)];
   };
-  const cwdArg = (x, who) => { const s = optStr(x, ':cwd', who); if (s !== null && !path.isAbsolute(s)) throw new S.SchemeError('error', `${who} :cwd must be an absolute path`, [s]); return s; };
+  const cwdArg = (x: SchemeValue, who: string): string | null => { const s = optStr(x, ':cwd', who); if (s !== null && !path.isAbsolute(s)) throw new S.SchemeError('error', `${who} :cwd must be an absolute path`, [s]); return s; };
   /* Options common to make-process, call-process and shell-run. */
-  const spawnOpts = (o, who) => {
+  const spawnOpts = (o: Record<string, SchemeValue>, who: string) => {
     const [cols, rows] = sizeArg(o.size, who);
     return { shell: optStr(o.shell, ':shell', who), cwd: cwdArg(o.cwd, who), env: envArg(o.env, who), cols, rows, who };
   };
-  const requireHub = who => { if (!hub.up) throw new S.SchemeError('hub-error', `${who}: hub unreachable`, []); };
-  const secs = (x, who) => { const n = S.num(x, who); if (!(n >= 0)) throw new S.SchemeError('range-error', `${who}: seconds must be non-negative`, [x]); return n; };
+  const requireHub = (who: string): void => { if (!hub.up) throw new S.SchemeError('hub-error', `${who}: hub unreachable`, []); };
+  const secs = (x: SchemeValue, who: string): number => { const n = S.num(x, who); if (!(n >= 0)) throw new S.SchemeError('range-error', `${who}: seconds must be non-negative`, [x]); return n; };
 
   blocking('make-process', '&rest :name :command :shell :cwd :env :size :buffer :filter :sentinel :card :noquery', 'Start COMMAND (a string in SHELL\'s syntax) as a hub PTY session (R4.43) and return the process.', function* (args) {
     const who = 'make-process', o = kw(args, who);
@@ -365,9 +405,9 @@ export async function install(server) {
     requireHub(who);
     const shell = so.shell || hub.defaultShell();
     const cmd = POSIX_SHELLS.includes(shell) ? TERM_PREFIX + command : command;
-    const p = yield* P.spawnG({ ...so, shell, name: 'call-process', command: cmd, buffer: null, filter: null, sentinel: null, card: false, collect: true });
+    const p: Process = yield* P.spawnG({ ...so, shell, name: 'call-process', command: cmd, buffer: null, filter: null, sentinel: null, card: false, collect: true });
     const timeout = absent(o.timeout) ? null : secs(o.timeout, who);
-    let r = p.exitPromise.then(v => ({ ok: true, v }));
+    let r: Promise<{ ok?: boolean; v?: number | null; timeout?: boolean }> = p.exitPromise.then(v => ({ ok: true, v }));
     if (timeout !== null) r = Promise.race([r, sleep(timeout * 1000).then(() => ({ timeout: true }))]);
     const got = yield new S.Block(r, `process ${p.sid}`);
     if (got.timeout) {
@@ -418,7 +458,7 @@ export async function install(server) {
   });
   D('process-send-eof', 'process', 'Send end of input (C-d) to PROCESS.', ([p]) => { const q = proc(p, 'process-send-eof'); try { hub.ptyInput(q.sid, '\x04'); } catch (e) { throw P.hubErr(e, 'process-send-eof'); } return q; });
   D('interrupt-process', 'process', 'Send C-c to PROCESS (R4.43).', ([p]) => { const q = proc(p, 'interrupt-process'); try { hub.ptyInput(q.sid, '\x03'); } catch (e) { throw P.hubErr(e, 'interrupt-process'); } return q; });
-  const killG = (who, forgetOf) => function* ([p]) {
+  const killG = (who: string, forgetOf: (q: Process) => boolean) => function* ([p]: SchemeValue[]): SchemeGen {
     const q = proc(p, who);
     if (q.deleted) return q;
     const forget = forgetOf(q);
@@ -440,7 +480,7 @@ export async function install(server) {
   });
   blocking('process-wait', 'process [seconds]', 'Wait until PROCESS exits; its exit status, or the timeout condition after SECONDS.', function* ([p, s]) {
     const q = proc(p, 'process-wait');
-    let r = q.exitPromise.then(v => ({ v }));
+    let r: Promise<{ v?: number | null; timeout?: boolean }> = q.exitPromise.then(v => ({ v }));
     if (!absent(s)) r = Promise.race([r, sleep(secs(s, 'process-wait') * 1000).then(() => ({ timeout: true }))]);
     const got = yield new S.Block(r, `process ${q.sid}`);
     if (got.timeout) throw new S.SchemeError('timeout', `process-wait: ${q.name} did not exit in ${s} s`, [q]);
@@ -455,4 +495,4 @@ export async function install(server) {
   L.evalText(fs.readFileSync(SCM_FILE, 'utf8'));
 }
 
-export async function shutdown(server) { if (server.processes) server.processes.shutdown(); }
+export async function shutdown(server: Server): Promise<void> { if (server.processes) server.processes.shutdown(); }

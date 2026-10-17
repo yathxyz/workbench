@@ -14,12 +14,26 @@ import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import * as jobs from './jobs.mts';
 import { lockdown } from './lockdown.mts';
+import type { TransferListItem } from 'node:worker_threads';
+
+/* What the core files (text.js, scheme.js, runtime.js, pool.js) leave on the thread's global object. */
+type CoreGlobal = typeof globalThis & Record<string, any>; // any: edwin/src is untyped JavaScript
+/* The browser worker's self, as workerMain (pool.js) uses it. */
+interface WorkerSelf {
+  Scheme: unknown;
+  L: unknown;
+  Rope: unknown;
+  JOBS: Record<string, Function>;
+  onmessage: ((ev: { data: unknown }) => void) | null;
+  postMessage(m: unknown, transfer?: readonly TransferListItem[]): void;
+  importScripts(): never;
+}
 
 lockdown(); // before the core files load, as --frozen-intrinsics was (lockdown.mts)
 
 const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src');
-const load = f => { const p = path.join(SRC, f); vm.runInThisContext(fs.readFileSync(p, 'utf8'), { filename: p }); };
-const { withScheme, lexSource, limits } = workerData;
+const load = (f: string) => { const p = path.join(SRC, f); vm.runInThisContext(fs.readFileSync(p, 'utf8'), { filename: p }); };
+const { withScheme, lexSource, limits } = workerData as { k: number; withScheme: boolean; lexSource: string | null; limits: unknown };
 
 load('text.js');
 if (withScheme) { load('scheme.js'); load('runtime.js'); }
@@ -28,20 +42,20 @@ if (withScheme) { load('scheme.js'); load('runtime.js'); }
    not evaluated as a string by the engine. */
 if (lexSource) vm.runInThisContext(lexSource, { filename: path.join(SRC, 'editor-core.js') + ':lex' });
 load('pool.js');
-const { codecModule, workerPrims, workerMain } = globalThis.EdPoolWorker;
+const { codecModule, workerPrims, workerMain } = (globalThis as CoreGlobal).EdPoolWorker;
 
 /* What workerMain expects of its realm: the browser worker's self, as a plain object. */
-const self = {
-  Scheme: withScheme ? globalThis.Scheme : null,
-  L: withScheme ? globalThis.L : null,
-  Rope: globalThis.Rope,
+const self: WorkerSelf = {
+  Scheme: withScheme ? (globalThis as CoreGlobal).Scheme : null,
+  L: withScheme ? (globalThis as CoreGlobal).L : null,
+  Rope: (globalThis as CoreGlobal).Rope,
   JOBS: Object.create(null),
   onmessage: null,
-  postMessage: (m, transfer) => parentPort.postMessage(m, transfer),
+  postMessage: (m, transfer) => parentPort!.postMessage(m, transfer),
   importScripts() { throw new Error('a thread of edwind loads its jobs from jobs.mts, not from a URL'); },
 };
 for (const [name, fn] of Object.entries(jobs)) if (typeof fn === 'function') self.JOBS[name] = fn;
 codecModule(self);
 if (withScheme) workerPrims(self);
 workerMain(self, limits);
-parentPort.on('message', data => self.onmessage({ data }));
+parentPort!.on('message', data => self.onmessage!({ data }));

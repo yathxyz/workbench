@@ -13,6 +13,14 @@ import { Sequencer } from './sequencer.mts';
 import { Watcher, diffOps, merge3 } from './watch.mts';
 import { restore as restoreAnchors, record as anchorsRecord, publicAnchors } from './anchors.mts';
 import { ensureNoteDir } from './notes.mts';
+import type { Ed as Edwin, EdBuffer, Lisp, Log, SchemeValue } from './main.mts';
+import type { Authority, ParsedId } from './paths.mts';
+import type { Client } from './session.mts';
+import type { Hold } from './threads.mts';
+import type { By, Meta, Op, Undo } from './proto.mts';
+import type { DiskState, Eol, TextFile } from './files.mts';
+import type { IndexEntry, MovedRecord } from './journal.mts';
+import type { Anchor } from './anchors.mts';
 
 const require = createRequire(import.meta.url);
 const OT = require('../src/ot.js');
@@ -20,17 +28,40 @@ const OT = require('../src/ot.js');
 export const AUTOSAVE_MS = 2000;
 export const MOVED_TTL_MS = 24 * 3600 * 1000;
 export const UNLOAD_AFTER_MS = 7 * 24 * 3600 * 1000;
-const DISK_BY = { kind: 'disk' };
-const SERVER_BY = { kind: 'server' };
+const DISK_BY: By = { kind: 'disk' };
+const SERVER_BY: By = { kind: 'server' };
 /* The refusal of a destination in, on or above a refused path: the words of wb-web's POST /api/mv (fsapi.rs), which
    forwards its moves here. */
 export const REFUSED_DST = 'refused: the destination is in or above ~/.ssh or a systemd user-unit directory';
 /* An fs error as the message of a refusal: its code and text, without the paths Node appends. */
-const osMessage = e => (e && e.code ? String(e.message).replace(/, \w+ '.*$/, '') : String(e && e.message || e));
+const osMessage = (e: NodeJS.ErrnoException): string => (e && e.code ? String(e.message).replace(/, \w+ '.*$/, '') : String(e && e.message || e));
+
+/* An undo tag (R6.19): the group, and for an undo batch the group it undoes (of) and that group's writer (ofCid). */
+export interface UndoTag extends Undo { ofCid?: string | null }
+/* One sequenced batch in sb.hist (sequencer.mts); anchorsBefore, recipients and pending live until it is committed. */
+export interface HistEntry {
+  ver: number; cid: string | null; seq: number | null; by: By; ops: Op[]; undo?: UndoTag; at: number; len: number; bytes: number;
+  anchorsBefore?: Anchor[]; recipients?: Client[]; pending?: Promise<void>;
+}
+/* What the file on disk did that edwind has not taken in (R8.13, R8.15). */
+export type DiskChange = 'conflict' | 'deleted' | null;
+/* A server-edit waiting on the buffer (§13.1): each waiter gets the exit code. */
+export interface ServerEdit { waiters: ((exit: number) => void)[]; saved: boolean; line: number | null }
+/* The result of resolve() for an id whose file was renamed. */
+export interface Moved { moved: string }
+export interface SBufInit { id: string; jid: string; name: string; file: string | null; ed: EdBuffer }
 
 /* One shared buffer as edwind keeps it (§6.2). */
 export class SBuf {
-  constructor(owner, { id, jid, name, file, ed }) {
+  declare owner: Buffers; declare id: string; declare jid: string; declare name: string; declare file: string | null; declare ed: EdBuffer;
+  declare ver: number; declare hist: HistEntry[]; declare histBytes: number; declare seqIndex: Map<string, Map<number, number>>;
+  declare savedText: string; declare savedHash: string | null; declare savedVer: number;
+  declare eol: Eol; declare readOnly: string | false; declare diskChanged: DiskChange; declare disk: DiskState | null; declare big: boolean;
+  declare clients: Set<Client>; declare journal: Journal | null; declare autosave: NodeJS.Timeout | null; declare lastOpen: number;
+  declare special: boolean; declare writers: By[]; declare serverEdit: ServerEdit | null;
+  declare anchors: Anchor[]; declare anchorsDirty: boolean;
+  declare hold?: Hold | null; declare heldQueue?: (() => void)[] | null;
+  constructor(owner: Buffers, { id, jid, name, file, ed }: SBufInit) {
     this.owner = owner; this.id = id; this.jid = jid; this.name = name; this.file = file; this.ed = ed;
     this.ver = 0; this.hist = []; this.histBytes = 0; this.seqIndex = new Map();
     this.savedText = ''; this.savedHash = sha256(''); this.savedVer = 0;
@@ -40,23 +71,23 @@ export class SBuf {
     /* Shared anchors (R9.12, anchors.mts): [{id, pos, label?, quote, prefix}], moved by the sequencer. */
     this.anchors = []; this.anchorsDirty = false;
   }
-  get text() { return this.ed.rope.toString(); }
-  get modified() { return this.ed.rope.length !== this.savedText.length || this.text !== this.savedText; }
+  get text(): string { return this.ed.rope.toString(); }
+  get modified(): boolean { return this.ed.rope.length !== this.savedText.length || this.text !== this.savedText; }
   /* The buffer-list's notion of who is attached. */
-  attached() { return [...this.clients].map(c => c.by()); }
-  setReadOnly(reason) { this.readOnly = reason; this.ed.readOnly = !!reason; this.owner.sendMeta(this); }
-  setDiskChanged(v) { if (this.diskChanged !== v) { this.diskChanged = v; this.owner.sendMeta(this); } }
+  attached(): By[] { return [...this.clients].map(c => c.by()); }
+  setReadOnly(reason: string | false): void { this.readOnly = reason; this.ed.readOnly = !!reason; this.owner.sendMeta(this); }
+  setDiskChanged(v: DiskChange): void { if (this.diskChanged !== v) { this.diskChanged = v; this.owner.sendMeta(this); } }
   /* After every batch: modified may have changed, autosave may be due. */
-  touched() {
+  touched(): void {
     this.owner.index.set(this.indexEntry());
     if (this.owner.autosaves(this)) {
       if (this.autosave) clearTimeout(this.autosave);
       this.autosave = setTimeout(() => { this.autosave = null; if (this.modified && !this.readOnly) this.owner.save(this).catch(e => this.owner.log.warn('autosave', { buf: this.id, error: e.code || e.message })); }, AUTOSAVE_MS);
     }
   }
-  indexEntry() { return { jid: this.jid, id: this.id, name: this.name, file: this.file, mode: this.ed.mode, ver: this.ver, modified: this.modified, lastOpen: this.lastOpen }; }
+  indexEntry(): IndexEntry { return { jid: this.jid, id: this.id, name: this.name, file: this.file, mode: this.ed.mode, ver: this.ver, modified: this.modified, lastOpen: this.lastOpen }; }
   /* meta (§7.3). */
-  meta() {
+  meta(): Meta {
     return {
       file: this.file, mode: this.ed.mode, modified: this.modified, readOnly: this.readOnly, saved: this.savedVer,
       diskChanged: this.diskChanged, eol: this.eol, anchors: publicAnchors(this), locals: {}, ver: this.ver,
@@ -64,8 +95,32 @@ export class SBuf {
   }
 }
 
+/* The events of Buffers, by name, with their listeners' arguments. */
+export interface BufferEvents {
+  afterBatch: [sb: SBuf, entry: HistEntry];
+  killed: [sb: SBuf];
+  created: [sb: SBuf];
+  saved: [sb: SBuf];
+  renamed: [fromReal: string, toReal: string];
+}
+type Listener = (...args: any[]) => void; // any: one map holds the listeners of every event
+export interface BufferHooks { killed: ((sb: SBuf) => void) | null; afterBatch: ((sb: SBuf, entry: HistEntry) => void) | null }
+export interface BuffersInit { Ed: Edwin; auth: Authority; stateDir: string; log: Log }
+export interface CreateInit { id: string; jid: string; name: string; file: string | null; text: string; eol?: Eol; special?: boolean }
+/* buffer-list (§13.1). */
+export interface BufferListEntry { id: string; name: string; mode: string; modified: boolean; readOnly: string | false; ver: number; file: string | null; writers: By[] }
+export interface OpenOptions { rid?: string; since?: number; create?: boolean }
+export interface VisitInfo { buf: string; readOnly: string | false }
+export interface RenameResult { ok: true; src: string; dst: string; from: string; to: string; dir?: true }
+export interface UndoResult { ver: number; partial: boolean; of: string | number; by: By }
+
 export class Buffers {
-  constructor({ Ed, auth, stateDir, log }) {
+  declare Ed: Edwin; declare auth: Authority; declare stateDir: string; declare log: Log;
+  declare byId: Map<string, SBuf>; declare byJid: Map<string, SBuf>;
+  declare index: Index; declare seq: Sequencer; declare watcher: Watcher;
+  declare moved: Map<string, MovedRecord>; declare compacting: Set<SBuf>;
+  declare hooks: BufferHooks; declare listeners: Map<keyof BufferEvents, Listener[]>;
+  constructor({ Ed, auth, stateDir, log }: BuffersInit) {
     this.Ed = Ed; this.auth = auth; this.stateDir = stateDir; this.log = log;
     this.byId = new Map(); this.byJid = new Map();
     fs.mkdirSync(path.join(stateDir, 'buffers'), { recursive: true, mode: 0o700 });
@@ -82,10 +137,10 @@ export class Buffers {
        on('created', sb => …), on('saved', sb => …), on('renamed', (fromReal, toReal) => …). */
     this.listeners = new Map();
     /* Edwin's own kill-buffer must reach us: wrap it so a Scheme (kill-buffer) kills everywhere (R6.3). */
-    const L = globalThis.L;
+    const L = (globalThis as unknown as { L: Lisp }).L;
     const orig = L.get('kill-buffer');
     const self = this;
-    const wrapped = function killBuffer(args) {
+    const wrapped = function killBuffer(args: SchemeValue[]): SchemeValue {
       const b = args.length && args[0] !== false && args[0] !== undefined ? Ed.toBuffer(args[0]) : Ed.E.current;
       const sb = self.ofEd(b);
       const r = orig(args);
@@ -95,32 +150,32 @@ export class Buffers {
     Object.assign(wrapped, { procName: orig.procName, doc: orig.doc, interactive: orig.interactive, arity: orig.arity, rest: orig.rest, optional: orig.optional, params: orig.params, props: orig.props });
     L.set('kill-buffer', wrapped);
   }
-  all() { return [...this.byJid.values()]; }
+  all(): SBuf[] { return [...this.byJid.values()]; }
   /* The loaded buffer ID names, or the one it was renamed to (an edit, sel or close sent before the client
      learnt of the move) while nothing is at the old path again, as resolve() has it. */
-  live(id) {
+  live(id: string): SBuf | null {
     const sb = this.byId.get(id); if (sb) return sb;
     const to = this.movedTo(id);
     return to && !this.fileExists(id) ? this.byId.get(to) || null : null;
   }
-  byFile(real) { for (const sb of this.byJid.values()) if (sb.file === real) return sb; return null; }
-  ofEd(ed) { for (const sb of this.byJid.values()) if (sb.ed === ed) return sb; return null; }
-  autosaves(sb) { return !!sb.file && !sb.special && !sb.big && sb.file.startsWith(this.auth.realNotesDir() + '/'); }
+  byFile(real: string): SBuf | null { for (const sb of this.byJid.values()) if (sb.file === real) return sb; return null; }
+  ofEd(ed: EdBuffer): SBuf | null { for (const sb of this.byJid.values()) if (sb.ed === ed) return sb; return null; }
+  autosaves(sb: SBuf): boolean { return !!sb.file && !sb.special && !sb.big && sb.file.startsWith(this.auth.realNotesDir() + '/'); }
 
   /* ---------- start: reload what the index names (R8.4, R8.6) ---------- */
-  reload() {
+  reload(): void {
     for (const e of [...this.index.buffers.values()]) {
       try { this.reloadOne(e); }
       catch (err) { this.log.error('reload', { jid: e.jid, id: e.id, error: err.message }); }
     }
   }
-  reloadOne(e) {
+  reloadOne(e: IndexEntry): SBuf | undefined {
     const jfile = jidPath(this.stateDir, e.jid, '.jsonl');
     if (!fs.existsSync(jfile)) { this.index.delete(e.jid); return; }
     /* Unload stale saved buffers: a header-only journal and no open for 7 days (R8.6). */
     const { header, batches, mv, anchors, torn } = readJournal(jfile);
     /* The newest mv line names the current id, file and name (R8.1); compaction folds them into the header. */
-    let last = mv.length ? mv[mv.length - 1] : null;
+    let last: { id: string; file?: string | null; name?: string } | null = mv.length ? mv[mv.length - 1] : null;
     /* A rename whose mv line never became durable (a crash right after it, or a full disk): the index, written
        at the rename, names the moved file. It wins only when the journal's file is gone and the index's is there. */
     const jfileOf = last && last.file !== undefined ? last.file : header.file;
@@ -129,7 +184,7 @@ export class Buffers {
       last = { id: e.id, file: e.file, name: e.name || path.basename(e.file) }; mvLost = true;
     }
     const id = last ? last.id : header.id;
-    let base = null, baseWhy = '';
+    let base: string | null = null, baseWhy = '';
     const saved = jidPath(this.stateDir, e.jid, '.saved'), snap = jidPath(this.stateDir, e.jid, '.snap');
     for (const f of [snap, saved]) {
       if (!fs.existsSync(f)) continue;
@@ -137,7 +192,7 @@ export class Buffers {
       if (sha256(t) === header.base.sha256) { base = t; break; }
       baseWhy = `${path.basename(f)} does not match the journal base`;
     }
-    let file = last && last.file !== undefined ? last.file : header.file, eol = 'lf', disk = null, savedText = null;
+    let file: string | null = last && last.file !== undefined ? last.file : header.file, eol: Eol = 'lf', disk: DiskState | null = null, savedText: string | null = null;
     if (file) {
       try { const r = readText(file); eol = r.eol; disk = diskState(r.stat); savedText = r.text; if (base === null && sha256(r.text) === header.base.sha256) base = r.text; }
       catch (err) { if (err.code !== 'no_buffer') baseWhy = `${file}: ${err.message}`; }
@@ -153,7 +208,7 @@ export class Buffers {
       return sb;
     }
     sb.ver = header.base.ver;
-    let bad = null, applied = 0;
+    let bad: string | null = null, applied = 0;
     for (const b of batches) {
       if (b.ver !== sb.ver + 1) { bad = `version ${b.ver} after ${sb.ver}`; break; }
       try { this.seq.applyBatch(sb, b.ops, b.by || SERVER_BY, { cid: b.cid ?? null, seq: b.seq ?? null, undo: b.undo || null }); }
@@ -175,11 +230,11 @@ export class Buffers {
 
   /* ---------- creation ---------- */
   /* Make the Edwin buffer and the wrapper; the text is set directly (no batch). */
-  create({ id, jid, name, file, text, eol = 'lf', special = false }) {
+  create({ id, jid, name, file, text, eol = 'lf', special = false }: CreateInit): SBuf {
     const Ed = this.Ed;
     let ed = special ? Ed.getBuffer(name) : null;
     if (!ed) {
-      const uniq = Ed.getBuffer(name) ? globalThis.L.call('generate-new-buffer-name', [name]) : name;
+      const uniq = Ed.getBuffer(name) ? (globalThis as unknown as { L: Lisp }).L.call('generate-new-buffer-name', [name]) : name;
       ed = Ed.getBufferCreate(uniq);
       ed.file = file; ed.mode = Ed.modeFor(file ? path.basename(file) : name);
       Ed.withOrigin('disk', () => { ed.text = text; });
@@ -194,17 +249,17 @@ export class Buffers {
     return sb;
   }
   /* A fresh journal for SB, based on its current text at its current version. */
-  startJournal(sb) {
+  startJournal(sb: SBuf): void {
     const jfile = jidPath(this.stateDir, sb.jid, '.jsonl');
     sb.journal = Journal.create(jfile, journalHeader({ jid: sb.jid, id: sb.id, name: sb.name, file: sb.file, mode: sb.ed.mode, baseVer: sb.ver, baseText: sb.text }), []);
     writeAtomic(jidPath(this.stateDir, sb.jid, '.snap'), sb.text);
     this.writeSaved(sb);
     this.index.set(sb.indexEntry());
   }
-  writeSaved(sb) { writeAtomic(jidPath(this.stateDir, sb.jid, '.saved'), sb.savedText); }
+  writeSaved(sb: SBuf): void { writeAtomic(jidPath(this.stateDir, sb.jid, '.saved'), sb.savedText); }
 
   /* Find or load the buffer for ID; CREATE makes a missing file buffer. Throws ProtoError. */
-  resolve(id, create) {
+  resolve(id: string, create?: boolean): SBuf | Moved {
     const existing = this.byId.get(id);
     if (existing) return existing;
     /* A renamed file's old id names where it went, unless a file is at the old path again. */
@@ -214,7 +269,7 @@ export class Buffers {
        inside notesDir with the walk notes-append uses; elsewhere a missing directory stays no_buffer. */
     if (create && typeof id === 'string' && id.includes('/') && !/^(\/|~|name:)/.test(id) && !id.includes('\0') && !id.split('/').some(s => s === '' || s === '.' || s === '..'))
       ensureNoteDir(id, this.auth.realNotesDir(), this.auth);
-    let p;
+    let p: ParsedId;
     try { p = this.auth.parseId(id); } catch (e) { if (e instanceof PathError) throw new ProtoError(e.code, e.message); throw e; }
     if (p.kind === 'name') {
       const ed = this.Ed.getBuffer(p.name);
@@ -247,7 +302,7 @@ export class Buffers {
       this.log.info('create', { buf: canon, file: true });
       return nb;
     }
-    let r;
+    let r: TextFile;
     try { r = readText(p.real); } catch (e) { if (e instanceof FileError) throw new ProtoError(e.code, e.message); throw e; }
     const nb = this.create({ id: canon, jid: randomId(), name: path.basename(p.real), file: p.real, text: r.text, eol: r.eol });
     nb.disk = diskState(r.stat);
@@ -260,10 +315,10 @@ export class Buffers {
   }
 
   /* ---------- open / close (§7.3) ---------- */
-  open(client, msg, { rid, since, create }) {
+  open(client: Client, msg: { buf: string }, { rid, since, create }: OpenOptions): void {
     const r = this.resolve(msg.buf, create);
-    if (r.moved) { client.send({ t: 'moved', buf: msg.buf, to: r.moved }); return; }
-    const sb = r;
+    if ((r as Moved).moved) { client.send({ t: 'moved', buf: msg.buf, to: (r as Moved).moved }); return; }
+    const sb = r as SBuf;
     sb.clients.add(client); client.buffers.add(sb);
     sb.lastOpen = Date.now();
     if (since !== undefined && since <= sb.ver && this.seq.inHistory(sb, since)) {
@@ -275,18 +330,18 @@ export class Buffers {
     this.index.set(sb.indexEntry());
   }
   /* snap, in 1 MiB pieces (R14.14). */
-  snapshot(client, sb, rid) {
+  snapshot(client: Client, sb: SBuf, rid?: string): void {
     const text = sb.text;
     if (text.length <= CHUNK) { client.sendBulk({ t: 'snap', rid, buf: sb.id, ver: sb.ver, text, meta: sb.meta() }); return; }
-    const pieces = [];
+    const pieces: string[] = [];
     for (let i = 0; i < text.length;) { let j = Math.min(text.length, i + CHUNK); if (OT.splitsPair(text, j)) j--; pieces.push(text.slice(i, j)); i = j; }
     client.sendBulk({ t: 'snap', rid, buf: sb.id, ver: sb.ver, text: pieces[0], meta: sb.meta(), more: true });
     for (let k = 1; k < pieces.length; k++) client.sendBulk({ t: 'chunk', rid, buf: sb.id, text: pieces[k], more: k < pieces.length - 1 });
   }
-  close(client, sb) { sb.clients.delete(client); client.buffers.delete(sb); }
-  detachAll(client) { for (const sb of client.buffers) sb.clients.delete(client); client.buffers.clear(); }
+  close(client: Client, sb: SBuf): void { sb.clients.delete(client); client.buffers.delete(sb); }
+  detachAll(client: Client): void { for (const sb of client.buffers) sb.clients.delete(client); client.buffers.clear(); }
   /* A loaded buffer by id, else no_buffer. */
-  get(id) {
+  get(id: string): SBuf {
     const sb = this.live(id);
     if (!sb) {
       /* An id in another spelling of the same file. */
@@ -296,19 +351,19 @@ export class Buffers {
     return sb;
   }
 
-  sendMeta(sb) { const m = { t: 'meta', buf: sb.id, ...sb.meta() }; for (const c of sb.clients) c.send(m); }
-  afterBatch(sb, entry) { if (this.hooks.afterBatch) this.hooks.afterBatch(sb, entry); this.emit('afterBatch', sb, entry); }
-  on(event, fn) { let l = this.listeners.get(event); if (!l) { l = []; this.listeners.set(event, l); } l.push(fn); return () => { const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); }; }
-  emit(event, ...args) { const l = this.listeners.get(event); if (l) for (const fn of l) { try { fn(...args); } catch (e) { this.log.error('listener', { event, error: e.stack || e.message }); } } }
-  compactSoon(sb) { if (this.compacting.has(sb)) return; this.compacting.add(sb); setTimeout(() => { this.compacting.delete(sb); this.compact(sb).catch(e => this.log.error('compact', { buf: sb.id, error: e.message })); }, 0); }
+  sendMeta(sb: SBuf): void { const m = { t: 'meta', buf: sb.id, ...sb.meta() }; for (const c of sb.clients) c.send(m); }
+  afterBatch(sb: SBuf, entry: HistEntry): void { if (this.hooks.afterBatch) this.hooks.afterBatch(sb, entry); this.emit('afterBatch', sb, entry); }
+  on<K extends keyof BufferEvents>(event: K, fn: (...args: BufferEvents[K]) => void): () => void { let l = this.listeners.get(event); if (!l) { l = []; this.listeners.set(event, l); } l.push(fn); return () => { const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); }; }
+  emit<K extends keyof BufferEvents>(event: K, ...args: BufferEvents[K]): void { const l = this.listeners.get(event); if (l) for (const fn of l) { try { fn(...args); } catch (e) { this.log.error('listener', { event, error: e.stack || e.message }); } } }
+  compactSoon(sb: SBuf): void { if (this.compacting.has(sb)) return; this.compacting.add(sb); setTimeout(() => { this.compacting.delete(sb); this.compact(sb).catch(e => this.log.error('compact', { buf: sb.id, error: e.message })); }, 0); }
 
   /* ---------- save / revert (§8.3) ---------- */
-  async save(sb) {
+  async save(sb: SBuf): Promise<{ buf: string; ver: number; saved: true }> {
     if (!sb.file) throw new ProtoError('bad_request', `${sb.id} visits no file`);
-    if (sb.big) throw new ProtoError('read_only', sb.readOnly);
+    if (sb.big) throw new ProtoError('read_only', sb.readOnly as string);
     try { this.auth.checkWrite(sb.file); } catch (e) { throw new ProtoError('refused_path', e.message); }
     const text = sb.text, ver = sb.ver;
-    let r;
+    let r: ReturnType<typeof saveAtomic>;
     try { r = saveAtomic(sb.file, text, { eol: sb.eol }); }
     catch (e) { this.log.error('save', { buf: sb.id, error: e.code || e.message }); throw new ProtoError('refused_path', `save failed: ${e.code || e.message}`); }
     sb.savedText = text; sb.savedHash = r.hash; sb.savedVer = ver; sb.disk = diskState(r.stat);
@@ -323,9 +378,9 @@ export class Buffers {
     return { buf: sb.id, ver, saved: true };
   }
   /* Reload the file as one batch by disk (R6.23). */
-  async revert(sb) {
+  async revert(sb: SBuf): Promise<{ buf: string; ver: number; saved: true }> {
     if (!sb.file) throw new ProtoError('bad_request', `${sb.id} visits no file`);
-    let r;
+    let r: TextFile;
     try { r = readText(sb.file); } catch (e) { throw new ProtoError(e.code === 'no_buffer' ? 'no_buffer' : e.code, e.message); }
     sb.disk = diskState(r.stat); sb.eol = r.eol;
     await this.replaceText(sb, r.text, DISK_BY);
@@ -336,7 +391,7 @@ export class Buffers {
     return { buf: sb.id, ver: sb.ver, saved: true };
   }
   /* Make the text NEW as one sequenced batch by BY (a line-then-character diff, R8.12). */
-  async replaceText(sb, newText, by) {
+  async replaceText(sb: SBuf, newText: string, by: By): Promise<HistEntry | null> {
     const ops = diffOps(sb.text, newText);
     if (!ops.length) return null;
     const entry = this.seq.applyBatch(sb, ops, by);
@@ -345,7 +400,7 @@ export class Buffers {
   }
 
   /* ---------- disk changes (R8.12–R8.14) ---------- */
-  diskChanged(sb, text, eol, hash) {
+  diskChanged(sb: SBuf, text: string, eol: Eol, hash: string): void {
     if (sb.readOnly && sb.readOnly !== 'outside the writable paths') return;
     sb.eol = eol;
     if (!sb.modified) {
@@ -357,7 +412,7 @@ export class Buffers {
     }
     const m = merge3(sb.savedText, sb.text, text);
     if (m.conflict) { sb.setDiskChanged('conflict'); this.log.info('disk', { buf: sb.id, change: 'conflict' }); return; }
-    this.replaceText(sb, m.text, DISK_BY).then(() => {
+    this.replaceText(sb, m.text!, DISK_BY).then(() => {
       sb.savedText = text; sb.savedHash = hash; this.writeSaved(sb); sb.setDiskChanged(null); this.sendMeta(sb);
       this.log.info('disk', { buf: sb.id, change: 'merged', ver: sb.ver });
     }).catch(e => this.log.error('disk', { buf: sb.id, error: e.message }));
@@ -367,16 +422,16 @@ export class Buffers {
   /* The id a frame would open the file ID (any id form of R6.1) under, and whether edwind would edit it, without
      loading it: {buf, readOnly}, readOnly false or the reason a frame would show. Throws ProtoError as open does
      (bad_id, refused_path, no_buffer, not_text), so the board keeps the list of what edwind refuses here. */
-  visitInfo(id) {
+  visitInfo(id: string): VisitInfo {
     const live = this.live(id);
     if (live) return { buf: live.id, readOnly: live.readOnly || false };
-    let p;
+    let p: ParsedId;
     try { p = this.auth.parseId(id); } catch (e) { if (e instanceof PathError) throw new ProtoError(e.code, e.message); throw e; }
     if (p.kind === 'name') throw new ProtoError('bad_request', `${id} names no file`);
     const loaded = this.byFile(p.real);
     if (loaded) return { buf: loaded.id, readOnly: loaded.readOnly || false };
     try { this.auth.checkRead(p.real); } catch (e) { throw new ProtoError('refused_path', e.message); }
-    let st;
+    let st: fs.Stats;
     try { st = fs.statSync(p.real); } catch (e) { throw new ProtoError('no_buffer', `no file ${p.real}`); }
     if (!st.isFile()) throw new ProtoError('not_text', `${p.real}: not a regular file`);
     const buf = this.auth.idOf(p.real);
@@ -395,16 +450,16 @@ export class Buffers {
      journal line each, a moved record kept 24 h, and moved{buf, to} to every attached client, who stays attached.
      Returns {ok, src, dst, from, to, dir?}: the expanded paths and the ids of both ends, so a caller holding ids of
      buffers that are not loaded can follow too. Throws ProtoError. */
-  async rename(src, dst) {
+  async rename(src: unknown, dst: unknown): Promise<RenameResult> {
     const auth = this.auth;
-    const lexical = p => {
+    const lexical = (p: unknown): string => {
       if (typeof p !== 'string' || !p || p.includes('\0')) throw new ProtoError('bad_request', 'src and dst must be non-empty paths');
       if (p === '~' || p.startsWith('~/') || p.startsWith('/')) return path.resolve(expandHome(p));
       if (p.startsWith('name:') || p.split('/').some(x => x === '' || x === '.' || x === '..')) throw new ProtoError('bad_request', `bad path ${JSON.stringify(p)}`);
       return path.join(auth.notesDir, p);
     };
     /* The parent resolved by the kernel and the last component left alone: what a rename moves (a symlink itself). */
-    const real = p => { try { return path.join(fs.realpathSync.native(path.dirname(p)), path.basename(p)); } catch (e) { throw new ProtoError('bad_request', osMessage(e)); } };
+    const real = (p: string): string => { try { return path.join(fs.realpathSync.native(path.dirname(p)), path.basename(p)); } catch (e) { throw new ProtoError('bad_request', osMessage(e)); } };
     const srcAbs = lexical(src);
     let dstAbs = lexical(dst);
     if (srcAbs === '/') throw new ProtoError('bad_request', 'cannot move /');
@@ -413,7 +468,7 @@ export class Buffers {
     const dstReal = real(dstAbs);
     if (auth.refused(dstReal)) throw new ProtoError('refused_path', REFUSED_DST);
     const srcReal = real(srcAbs);
-    let st;
+    let st: fs.Stats;
     try { st = fs.lstatSync(srcReal); } catch (e) { throw new ProtoError('bad_request', osMessage(e)); }
     try { auth.checkWrite(srcReal); auth.checkWrite(dstReal); } catch (e) { throw new ProtoError('refused_path', e.message); }
     /* A root, or a source, may be a symlink (notesDir linked into a synced folder, configDir linked by home-manager):
@@ -434,13 +489,13 @@ export class Buffers {
     if (path.dirname(srcReal) !== path.dirname(dstReal)) fsyncDir(path.dirname(srcReal));
     /* From here to the first await the buffers follow, so the watcher never sees their files missing (R8.15). */
     const from = auth.idOf(srcReal), to = auth.idOf(dstReal), at = Date.now();
-    const moved = [];
+    const moved: { sb: SBuf; was: { id: string; file: string } }[] = [];
     for (const sb of this.all()) {
       if (!sb.file || !under(sb.file, srcReal)) continue;
       const was = { id: sb.id, file: sb.file };
       const file = dstReal + sb.file.slice(srcReal.length), id = auth.idOf(file), name = path.basename(file);
       this.byId.delete(sb.id); sb.id = id; sb.file = file; sb.ed.file = file; this.byId.set(id, sb);
-      if (sb.ed.name !== name) sb.ed.name = this.Ed.getBuffer(name) ? globalThis.L.call('generate-new-buffer-name', [name]) : name;
+      if (sb.ed.name !== name) sb.ed.name = this.Ed.getBuffer(name) ? (globalThis as unknown as { L: Lisp }).L.call('generate-new-buffer-name', [name]) : name;
       sb.name = sb.ed.name;
       /* sb.disk stays: a rename keeps the inode, mtime and size, so a write that landed just before it still
          differs from what edwind last saw, and the check moved() queues picks it up. */
@@ -460,23 +515,23 @@ export class Buffers {
       .catch(e => this.log.error('rename', { buf: sb.id, journal: e.code || e.message }))));
     return { ok: true, src: srcAbs, dst: dstAbs, from, to, ...(dir ? { dir: true } : {}) };
   }
-  addMoved(from, to, at, dir) {
+  addMoved(from: string, to: string, at: number, dir: boolean): void {
     if (from === to) return;
     this.moved.delete(to);   // a record from the new id would send its opens away from the file now there
     this.moved.set(from, { to, at, dir });
     this.pruneMoved();
     this.index.schedule();
   }
-  pruneMoved() { const now = Date.now(); for (const [k, m] of this.moved) if (now - m.at >= MOVED_TTL_MS) this.moved.delete(k); }
+  pruneMoved(): void { const now = Date.now(); for (const [k, m] of this.moved) if (now - m.at >= MOVED_TTL_MS) this.moved.delete(k); }
   /* Where ID went, following moved records younger than 24 h; null when it did not move. A directory's record
      sends on only ids of files that went with it: nothing is at the old directory again, and the file is at the
      new place. A new note under the old name (the directory made again, or not) stays where it was asked for. */
-  movedTo(id) {
+  movedTo(id: unknown): string | null {
     if (typeof id !== 'string' || !this.moved.size) return null;
     const now = Date.now(), seen = new Set([id]);
     let cur = id, viaDir = false;
     for (;;) {
-      let next = null;
+      let next: string | null = null;
       const m = this.moved.get(cur);
       if (m && now - m.at < MOVED_TTL_MS) next = m.to;
       else for (const [from, d] of this.moved) if (d.dir && now - d.at < MOVED_TTL_MS && cur.startsWith(from + '/') && !this.fileExists(from)) { next = d.to + cur.slice(from.length); viaDir = true; break; }
@@ -486,10 +541,10 @@ export class Buffers {
     if (viaDir && !this.fileExists(cur)) return null;
     return cur === id ? null : cur;
   }
-  fileExists(id) { try { const p = this.auth.parseId(id); return p.kind === 'file' && p.exists; } catch (e) { return false; } }
+  fileExists(id: string): boolean { try { const p = this.auth.parseId(id); return p.kind === 'file' && p.exists; } catch (e) { return false; } }
 
   /* ---------- journal compaction (R8.5) ---------- */
-  async compact(sb) {
+  async compact(sb: SBuf): Promise<void> {
     if (!sb.journal || sb.big) return;
     await sb.journal.drain();
     const text = sb.text;
@@ -499,17 +554,17 @@ export class Buffers {
     writeAtomic(jidPath(this.stateDir, sb.jid, '.snap'), baseText);
     sb.journal.close();
     sb.journal = Journal.create(sb.journal.file, journalHeader({ jid: sb.jid, id: sb.id, name: sb.name, file: sb.file, mode: sb.ed.mode, baseVer, baseText }),
-      [...sb.hist.map(b => ({ t: 'b', ver: b.ver, cid: b.cid, seq: b.seq, by: b.by, ops: b.ops, undo: b.undo, at: b.at })), ...(sb.anchors.length ? [anchorsRecord(sb)] : [])]);
+      [...sb.hist.map(b => ({ t: 'b' as const, ver: b.ver, cid: b.cid, seq: b.seq, by: b.by, ops: b.ops, undo: b.undo, at: b.at })), ...(sb.anchors.length ? [anchorsRecord(sb)] : [])]);
     this.index.set(sb.indexEntry());
   }
 
   /* ---------- kill (R6.3) ---------- */
-  kill(sb) {
-    const L = globalThis.L;
+  kill(sb: SBuf): void {
+    const L = (globalThis as unknown as { L: Lisp }).L;
     if (this.Ed.E.buffers.includes(sb.ed)) L.call('kill-buffer', [sb.ed]); else this.forget(sb);
   }
   /* The Edwin buffer is gone: tell the clients, drop the journal. */
-  forget(sb) {
+  forget(sb: SBuf): void {
     for (const c of sb.clients) { c.send({ t: 'killed', buf: sb.id }); c.buffers.delete(sb); }
     sb.clients.clear();
     if (sb.autosave) clearTimeout(sb.autosave);
@@ -522,27 +577,27 @@ export class Buffers {
   }
 
   /* ---------- buffer-list (§13.1) ---------- */
-  list() {
+  list(): BufferListEntry[] {
     return this.all().map(sb => ({ id: sb.id, name: sb.name, mode: sb.ed.mode, modified: sb.modified, readOnly: sb.readOnly, ver: sb.ver, file: sb.file, writers: sb.attached() }));
   }
 
   /* ---------- undo (R6.19–R6.21) ---------- */
   /* Undo the newest group of SB matching PICK(batch); returns {ver, partial} or null. */
-  async undoWhere(sb, pick, by, { cid = null, seq = null } = {}) {
-    const undone = new Set(sb.hist.filter(b => b.undo && b.undo.of !== undefined).map(b => `${b.undo.ofCid || b.cid}:${b.undo.of}`));
+  async undoWhere(sb: SBuf, pick: (b: HistEntry) => unknown, by: By, { cid = null, seq = null }: { cid?: string | null; seq?: number | null } = {}): Promise<UndoResult | null> {
+    const undone = new Set(sb.hist.filter(b => b.undo && b.undo.of !== undefined).map(b => `${b.undo!.ofCid || b.cid}:${b.undo!.of}`));
     const groups = sb.hist.filter(b => b.undo && b.undo.of === undefined && pick(b) && !undone.has(`${b.cid}:${b.undo.g}`));
     if (!groups.length) return null;
     const g = groups[groups.length - 1];
-    const r = this.seq.undoOps(sb, { cid: g.cid, g: g.undo.g });
+    const r = this.seq.undoOps(sb, { cid: g.cid, g: g.undo!.g });
     if (!r) return null;
     /* The undo batch names the group and its writer (undo.ofCid), so the pair cancels in later undo
        computations whoever asked for it. */
-    const entry = this.seq.applyBatch(sb, r.ops, by, { cid, seq, undo: { g: 'undo-' + sb.ver + '-' + randomId(4), of: g.undo.g, ofCid: g.cid } });
+    const entry = this.seq.applyBatch(sb, r.ops, by, { cid, seq, undo: { g: 'undo-' + sb.ver + '-' + randomId(4), of: g.undo!.g, ofCid: g.cid } });
     await this.seq.commit(sb, entry, null);
-    return { ver: entry.ver, partial: r.partial, of: g.undo.g, by: g.by };
+    return { ver: entry.ver, partial: r.partial, of: g.undo!.g, by: g.by };
   }
 
-  async shutdown() {
+  async shutdown(): Promise<void> {
     this.watcher.close();
     for (const sb of this.all()) { if (sb.autosave) { clearTimeout(sb.autosave); sb.autosave = null; } if (sb.journal) { await sb.journal.drain(); sb.journal.close(); } }
     this.index.write();

@@ -7,12 +7,57 @@
 import net from 'node:net';
 import fs from 'node:fs';
 
+/* A line of the hub protocol (crates/wb-proto/src/hub.rs). */
+export type HubMsg = Record<string, any>; // any: wire JSON
+export interface PtyExit { code: number | null; signal: number | null; reason: string; at: number }
+export interface PtyFg { comm: string; pgid: number; leader: boolean }
+/* A live PTY has pid and fg, an exited one exit. */
+export interface PtyInfo { argv: string[]; pid?: number; fg?: PtyFg; exit?: PtyExit }
+export interface AcpLast { seq: number; ts: number; outcome: string; error: string | null }
+export interface AcpInfo {
+  agent: string; agentSessionId: string; revivable: boolean; activity: string; pending: unknown[];
+  last: AcpLast | null; headSeq: number; seenSeq: number; title: string; modeId: string;
+}
+interface SummaryBase { sid: string; host: string; createdAt: number; updatedAt?: number; alive: boolean; viewers: number; cwd: string; fault: null }
+export interface PtySummary extends SummaryBase { kind: 'pty'; pty: PtyInfo }
+export interface AcpSummary extends SummaryBase { kind: 'acp'; acp: AcpInfo }
+export type SessionSummary = PtySummary | AcpSummary;
+/* A PTY session: its output ring, its byte count and stream epoch, the input it got, and the program reading it. */
+export interface PtySession {
+  summary: PtySummary;
+  ring: string; out: number; stream: number; inputs: string[]; program: null; inputFn: ((d: string) => void) | null;
+  pendingInputs?: string[]; lastCode?: number; spawn?: HubMsg; shell?: string; cols?: number; rows?: number;
+}
+export interface AcpSession { summary: AcpSummary }
+export type HubSession = PtySession | AcpSession;
+/* One event of an ACP session's journal. */
+export interface AcpEvent { seq: number; ts?: number; e?: string; [field: string]: unknown }
+/* What a scripted program gets: write output, read input, wait. */
+export interface ProgramIO { write(d: string): void; input(fn: (d: string) => void): void; delay(ms: number): Promise<void>; sess: PtySession }
+export type Program = (io: ProgramIO, sess: PtySession, command: string) => Promise<number | void> | number | void;
+/* A programs entry under 'refuse:COMMAND': the hub refuses the spawn with this error. */
+export interface Refusal { code: string; message: string }
+export interface HubConn { sock: net.Socket; watching: boolean; attached: Set<string>; hello: boolean; client?: unknown }
+/* A request as the hub recorded it: the line, and the index of its connection. */
+export type HubRequest = HubMsg & { conn: number };
+interface HubWaiter { pred: (r: HubRequest) => boolean; n: number; resolve: () => void }
+export interface FakeHubOptions { shells?: string[]; defaultShell?: string; proto?: number; sessions?: Map<string, HubSession> | null; host?: string }
+export interface AddPtyOptions { alive?: boolean; viewers?: number; cwd?: string; argv?: string[]; leader?: boolean; exit?: PtyExit | null; env?: Record<string, string> }
+export interface AddAcpOptions { alive?: boolean; agent?: string; title?: string; cwd?: string; headSeq?: number }
+
 const SID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const stripAnsi = s => s.replace(/\x1b\[[0-?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[ -\/]*[0-~]?/g, '').replace(/\r\n/g, '\n').replace(/\r/g, '');
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[ -\/]*[0-~]?/g, '').replace(/\r\n/g, '\n').replace(/\r/g, '');
 
 export class FakeHub {
-  constructor(path, { shells = ['bash', 'nu'], defaultShell = 'bash', proto = 1, sessions = null, host = 'testhost' } = {}) {
+  declare path: string; declare shells: string[]; declare defaultShell: string; declare proto: number; declare host: string;
+  declare sessions: Map<string, HubSession>;
+  declare conns: HubConn[]; declare requests: HubRequest[]; declare waiters: HubWaiter[]; declare pid: number;
+  declare programs: Map<string, Program | Refusal>;
+  declare acpReplies: Map<string, (prompt: string) => string>;
+  declare acpReplays: Map<string, AcpEvent[]>;
+  declare server: net.Server | null;
+  constructor(path: string, { shells = ['bash', 'nu'], defaultShell = 'bash', proto = 1, sessions = null, host = 'testhost' }: FakeHubOptions = {}) {
     this.path = path; this.shells = shells; this.defaultShell = defaultShell; this.proto = proto; this.host = host;
     this.sessions = sessions || new Map();                  // sid -> {summary, ring, out, stream, program, acp}
     this.conns = []; this.requests = []; this.waiters = []; this.pid = 4000;
@@ -22,73 +67,73 @@ export class FakeHub {
     this.acpReplays = new Map();                            // sid -> [journal events]
     this.server = null;
   }
-  start() {
+  start(): Promise<this> {
     try { fs.unlinkSync(this.path); } catch (e) { /* none */ }
     this.server = net.createServer(sock => this.serve(sock));
-    return new Promise((resolve, reject) => { this.server.once('error', reject); this.server.listen(this.path, () => { fs.chmodSync(this.path, 0o600); resolve(this); }); });
+    return new Promise((resolve, reject) => { this.server!.once('error', reject); this.server!.listen(this.path, () => { fs.chmodSync(this.path, 0o600); resolve(this); }); });
   }
-  stop() {
+  stop(): Promise<void> {
     return new Promise(resolve => { for (const c of this.conns) c.sock.destroy(); this.conns = []; if (!this.server) return resolve(); this.server.close(() => resolve()); this.server = null; });
   }
   /* The requests so far matching PRED; waits until N have arrived. */
-  waitFor(pred, n = 1, timeout = 10000) {
+  waitFor(pred: (r: HubRequest) => boolean, n = 1, timeout = 10000): Promise<HubRequest[]> {
     const matching = () => this.requests.filter(pred);
     if (matching().length >= n) return Promise.resolve(matching());
     return new Promise((resolve, reject) => {
-      const w = { pred, n, resolve: () => resolve(matching()) };
+      const w: HubWaiter = { pred, n, resolve: () => resolve(matching()) };
       this.waiters.push(w);
       setTimeout(() => { const i = this.waiters.indexOf(w); if (i >= 0) { this.waiters.splice(i, 1); reject(new Error(`fake hub: waited for ${n} request(s) matching ${pred.toString().slice(0, 80)}; have ${JSON.stringify(this.requests.slice(-5))}`)); } }, timeout).unref();
     });
   }
-  record(conn, req) {
+  record(conn: HubConn, req: HubMsg): void {
     this.requests.push({ conn: this.conns.indexOf(conn), ...req });
     const rest = []; for (const w of this.waiters) { if (this.requests.filter(w.pred).length >= w.n) w.resolve(); else rest.push(w); } this.waiters = rest;
   }
-  line(conn, msg) { if (!conn.sock.destroyed) conn.sock.write(JSON.stringify(msg) + '\n'); }
-  publish(sess) { sess.summary.updatedAt = Date.now(); for (const c of this.conns) if (c.watching) this.line(c, { t: 'session', session: sess.summary }); }
-  toAttached(sid, msg) { for (const c of this.conns) if (c.attached.has(sid)) this.line(c, msg); }
-  gone(sid, epoch) { for (const c of this.conns) if (c.watching || c.attached.has(sid)) { this.line(c, { t: 'gone', sid, epoch }); c.attached.delete(sid); } }
+  line(conn: HubConn, msg: HubMsg): void { if (!conn.sock.destroyed) conn.sock.write(JSON.stringify(msg) + '\n'); }
+  publish(sess: HubSession): void { sess.summary.updatedAt = Date.now(); for (const c of this.conns) if (c.watching) this.line(c, { t: 'session', session: sess.summary }); }
+  toAttached(sid: string, msg: HubMsg): void { for (const c of this.conns) if (c.attached.has(sid)) this.line(c, msg); }
+  gone(sid: string, epoch: number): void { for (const c of this.conns) if (c.watching || c.attached.has(sid)) { this.line(c, { t: 'gone', sid, epoch }); c.attached.delete(sid); } }
 
   /* A PTY session the test seeds (one edwind did not spawn), alive with VIEWERS viewers. */
-  addPty(sid, { alive = true, viewers = 1, cwd = '/home/test', argv = ['/bin/bash'], leader = true, exit = null, env = {} } = {}) {
+  addPty(sid: string, { alive = true, viewers = 1, cwd = '/home/test', argv = ['/bin/bash'], leader = true, exit = null, env = {} }: AddPtyOptions = {}): PtySession {
     const pid = ++this.pid;
-    const sess = { ring: '', out: 0, stream: Date.now(), inputs: [], program: null, inputFn: null, summary: { sid, kind: 'pty', host: this.host, createdAt: Date.now(), updatedAt: Date.now(), alive, viewers, cwd, fault: null, pty: { argv, ...(alive ? { pid, fg: { comm: 'bash', pgid: pid, leader } } : { exit: exit || { code: 0, signal: null, reason: 'exited', at: Date.now() } }) } } };
+    const sess: PtySession = { ring: '', out: 0, stream: Date.now(), inputs: [], program: null, inputFn: null, summary: { sid, kind: 'pty', host: this.host, createdAt: Date.now(), updatedAt: Date.now(), alive, viewers, cwd, fault: null, pty: { argv, ...(alive ? { pid, fg: { comm: 'bash', pgid: pid, leader } } : { exit: exit || { code: 0, signal: null, reason: 'exited', at: Date.now() } }) } } };
     this.sessions.set(sid, sess); this.publish(sess);
     return sess;
   }
-  addAcp(sid, { alive = true, agent = 'agent', title = 'Fix flaky test', cwd = '/home/test', headSeq = 0 } = {}) {
-    const sess = { summary: { sid, kind: 'acp', host: this.host, createdAt: Date.now(), updatedAt: Date.now(), alive, viewers: 1, cwd, fault: null, acp: { agent, agentSessionId: 'c0ffee', revivable: true, activity: 'none', pending: [], last: null, headSeq, seenSeq: headSeq, title, modeId: 'default' } } };
+  addAcp(sid: string, { alive = true, agent = 'agent', title = 'Fix flaky test', cwd = '/home/test', headSeq = 0 }: AddAcpOptions = {}): AcpSession {
+    const sess: AcpSession = { summary: { sid, kind: 'acp', host: this.host, createdAt: Date.now(), updatedAt: Date.now(), alive, viewers: 1, cwd, fault: null, acp: { agent, agentSessionId: 'c0ffee', revivable: true, activity: 'none', pending: [], last: null, headSeq, seenSeq: headSeq, title, modeId: 'default' } } };
     this.sessions.set(sid, sess); this.publish(sess);
     return sess;
   }
   /* Output for SID's attached connections, as the real hub emits it. */
-  emitOut(sid, d) { const s = this.sessions.get(sid); if (!s) return; s.ring += d; s.out += Buffer.byteLength(d); this.toAttached(sid, { t: 'pty.out', sid, d, out: s.out }); }
-  exitSession(sid, { code = 0, signal = null, reason = 'exited' } = {}) {
-    const s = this.sessions.get(sid); if (!s || !s.summary.alive) return;
+  emitOut(sid: string, d: string): void { const s = this.sessions.get(sid) as PtySession | undefined; if (!s) return; s.ring += d; s.out += Buffer.byteLength(d); this.toAttached(sid, { t: 'pty.out', sid, d, out: s.out }); }
+  exitSession(sid: string, { code = 0, signal = null, reason = 'exited' }: { code?: number | null; signal?: number | null; reason?: string } = {}): void {
+    const s = this.sessions.get(sid) as PtySession | undefined; if (!s || !s.summary.alive) return;
     s.summary.alive = false; s.summary.pty = { argv: s.summary.pty.argv, exit: { code, signal, reason, at: Date.now() } };
     s.program = null; s.inputFn = null;
     this.toAttached(sid, { t: 'pty.exit', sid, code, signal, reason });
     this.publish(s);
   }
-  setLeader(sid, leader) { const s = this.sessions.get(sid); if (!s || !s.summary.alive) return; s.summary.pty.fg = { comm: leader ? 'bash' : 'make', pgid: leader ? s.summary.pty.pid : s.summary.pty.pid + 1, leader }; this.publish(s); }
+  setLeader(sid: string, leader: boolean): void { const s = this.sessions.get(sid) as PtySession | undefined; if (!s || !s.summary.alive) return; s.summary.pty.fg = { comm: leader ? 'bash' : 'make', pgid: leader ? s.summary.pty.pid! : s.summary.pty.pid! + 1, leader }; this.publish(s); }
 
   /* ---------- programs ---------- */
   /* Run COMMAND for SESS: the scripted program, or the built-in echo/exit/sleep/false/not-found behaviour. */
-  async run(sess, command, { interactive = false } = {}) {
+  async run(sess: PtySession, command: string, { interactive = false }: { interactive?: boolean } = {}): Promise<number> {
     const sid = sess.summary.sid;
     /* A program that reads input gets what arrived before it asked, as a real child reads the PTY's queue. */
-    const io = { write: d => this.emitOut(sid, d), input: fn => { sess.inputFn = fn; for (const d of (sess.pendingInputs || []).splice(0)) fn(d); }, delay: ms => sleep(ms), sess };
-    let code = 0;
+    const io: ProgramIO = { write: d => this.emitOut(sid, d), input: fn => { sess.inputFn = fn; for (const d of (sess.pendingInputs || []).splice(0)) fn(d); }, delay: ms => sleep(ms), sess };
+    let code: number | void = 0;
     const prog = this.programs.get(command) || this.programs.get(command.replace(/^export TERM=dumb NO_COLOR=1; /, ''));
     try {
-      if (prog) code = await prog(io, sess, command);
+      if (prog) code = await (prog as Program)(io, sess, command);
       else {
         const bare = command.replace(/^export TERM=dumb NO_COLOR=1; /, '');
         let m;
         if ((m = /^echo (.*)$/.exec(bare))) { io.write(m[1].replace(/^'|'$/g, '') + '\r\n'); code = 0; }
         else if ((m = /^exit (\d+)$/.exec(bare))) code = Number(m[1]);
         else if ((m = /^sleep (\d+(?:\.\d+)?)$/.exec(bare))) { await sleep(Number(m[1]) * 1000); code = 0; }
-        else if (bare === 'cat') { code = await new Promise(resolve => { io.input(d => { if (d === '\x04') resolve(0); else if (d === '\x03') resolve(130); else io.write(d.replace(/\n/g, '\r\n')); }); }); }
+        else if (bare === 'cat') { code = await new Promise<number>(resolve => { io.input(d => { if (d === '\x04') resolve(0); else if (d === '\x03') resolve(130); else io.write(d.replace(/\n/g, '\r\n')); }); }); }
         else if (bare === 'true') code = 0;
         else { io.write(`bash: ${bare.split(' ')[0]}: command not found\r\n`); code = 127; }
       }
@@ -98,7 +143,7 @@ export class FakeHub {
     return code;
   }
   /* The interactive shell: echoes input, runs each line, flips fg.leader around it. */
-  startShell(sess) {
+  startShell(sess: PtySession): void {
     const sid = sess.summary.sid;
     let line = '';
     sess.inputFn = async d => {
@@ -121,8 +166,8 @@ export class FakeHub {
   }
 
   /* ---------- a connection ---------- */
-  serve(sock) {
-    const conn = { sock, watching: false, attached: new Set(), hello: false };
+  serve(sock: net.Socket): void {
+    const conn: HubConn = { sock, watching: false, attached: new Set(), hello: false };
     this.conns.push(conn);
     sock.setEncoding('utf8');
     this.line(conn, { t: 'hello', proto: this.proto, server: 'wb-hub', version: '0.1.0', host: this.host, pid: 1, startedAt: 1700000000000, agents: [{ name: 'agent', label: 'Agent' }], shells: this.shells, defaultShell: this.defaultShell });
@@ -131,8 +176,8 @@ export class FakeHub {
     sock.on('error', () => {});
     sock.on('close', () => { const i = this.conns.indexOf(conn); if (i >= 0) this.conns.splice(i, 1); for (const sid of conn.attached) { const s = this.sessions.get(sid); if (s && s.summary.viewers > 0) { s.summary.viewers--; this.publish(s); } } });
   }
-  err(conn, rid, code, message, sid) { const m = { t: 'err', code, message }; if (rid !== undefined && rid !== null) m.rid = rid; if (sid) m.sid = sid; this.line(conn, m); }
-  dispatch(conn, req) {
+  err(conn: HubConn, rid: unknown, code: string, message: string, sid?: string): void { const m: HubMsg = { t: 'err', code, message }; if (rid !== undefined && rid !== null) m.rid = rid; if (sid) m.sid = sid; this.line(conn, m); }
+  dispatch(conn: HubConn, req: HubMsg): void {
     if (!conn.hello) {
       conn.hello = true;
       if (req.t !== 'hello') { this.err(conn, null, 'bad_request', 'expected hello'); conn.sock.destroy(); return; }
@@ -142,7 +187,7 @@ export class FakeHub {
     this.record(conn, req);
     const { rid, sid } = req;
     const summaries = () => [...this.sessions.values()].map(s => s.summary);
-    const ok = result => this.line(conn, { t: 'ok', rid, ...result });
+    const ok = (result: HubMsg) => this.line(conn, { t: 'ok', rid, ...result });
     const sess = sid ? this.sessions.get(sid) : null;
     switch (req.t) {
       case 'list': return ok({ sessions: summaries() });
@@ -157,9 +202,9 @@ export class FakeHub {
           if (!this.shells.includes(shell)) return this.err(conn, rid, 'bad_request', `shell ${shell} not available`);
           if (sp.env && Object.keys(sp.env).length > 32) return this.err(conn, rid, 'bad_request', 'env has more than 32 entries');
           const refuse = this.programs.get('refuse:' + (sp.argv[2] || ''));
-          if (refuse) return this.err(conn, rid, refuse.code, refuse.message);
+          if (refuse) return this.err(conn, rid, (refuse as Refusal).code, (refuse as Refusal).message);
           const pid = ++this.pid, now = Date.now();
-          const s = sess || { ring: '', out: 0, stream: now, inputs: [], program: null, inputFn: null, summary: { sid, kind: 'pty', host: this.host, createdAt: now, alive: true, viewers: 0, cwd: sp.cwd || '/home/test', fault: null, pty: {} } };
+          const s: PtySession = (sess as PtySession | null | undefined) || { ring: '', out: 0, stream: now, inputs: [], program: null, inputFn: null, summary: { sid, kind: 'pty', host: this.host, createdAt: now, alive: true, viewers: 0, cwd: sp.cwd || '/home/test', fault: null, pty: {} as PtyInfo } };
           s.summary.alive = true; s.summary.pty = { argv: ['/bin/' + shell, ...sp.argv.slice(1)], pid, fg: { comm: shell, pgid: pid, leader: true } }; s.summary.cwd = sp.cwd || s.summary.cwd; s.spawn = sp; s.shell = shell; s.cols = req.cols; s.rows = req.rows;
           s.summary.viewers++; conn.attached.add(sid);
           this.sessions.set(sid, s);
@@ -171,10 +216,10 @@ export class FakeHub {
           return;
         }
         if (!sess) return this.err(conn, rid, 'not_found', `no session ${sid}`);
-        const resumed = !!(req.resume && req.resume.stream === sess.stream && req.resume.out <= sess.out);
-        const replay = resumed ? sess.ring.slice(Buffer.byteLength(sess.ring) - (sess.out - req.resume.out)) : sess.ring;
+        const resumed = !!(req.resume && req.resume.stream === (sess as PtySession).stream && req.resume.out <= (sess as PtySession).out);
+        const replay = resumed ? (sess as PtySession).ring.slice(Buffer.byteLength((sess as PtySession).ring) - ((sess as PtySession).out - req.resume.out)) : (sess as PtySession).ring;
         conn.attached.add(sid); sess.summary.viewers++;
-        ok({ new: false, ...(sess.summary.pty.pid ? { pid: sess.summary.pty.pid } : {}), cwd: sess.summary.cwd, ...(sess.summary.pty.exit ? { exit: sess.summary.pty.exit } : {}), epoch: sess.summary.createdAt, stream: sess.stream, out: sess.out, resumed, replay });
+        ok({ new: false, ...((sess as PtySession).summary.pty.pid ? { pid: (sess as PtySession).summary.pty.pid } : {}), cwd: sess.summary.cwd, ...((sess as PtySession).summary.pty.exit ? { exit: (sess as PtySession).summary.pty.exit } : {}), epoch: sess.summary.createdAt, stream: (sess as PtySession).stream, out: (sess as PtySession).out, resumed, replay });
         this.publish(sess);
         return;
       }
@@ -182,8 +227,8 @@ export class FakeHub {
       case 'pty.input': {
         if (Buffer.byteLength(req.d) > (1 << 20)) return this.err(conn, null, 'bad_request', 'pty.input is limited to 1048576 bytes', sid);
         if (!sess || !sess.summary.alive) return;
-        sess.inputs.push(req.d);
-        if (sess.inputFn) sess.inputFn(req.d); else (sess.pendingInputs || (sess.pendingInputs = [])).push(req.d);
+        (sess as PtySession).inputs.push(req.d);
+        if ((sess as PtySession).inputFn) (sess as PtySession).inputFn!(req.d); else ((sess as PtySession).pendingInputs || ((sess as PtySession).pendingInputs = [])).push(req.d);
         return;
       }
       case 'pty.resize': return;
@@ -195,7 +240,7 @@ export class FakeHub {
       }
       case 'pty.capture': {
         if (!sess) return this.err(conn, rid, 'not_found', `no session ${sid}`);
-        const lines = stripAnsi(sess.ring).split('\n').map(l => l.trimEnd()); while (lines.length && !lines[lines.length - 1]) lines.pop();
+        const lines = stripAnsi((sess as PtySession).ring).split('\n').map(l => l.trimEnd()); while (lines.length && !lines[lines.length - 1]) lines.pop();
         return ok({ text: lines.slice(-Math.min(req.lines || 200, 1000)).join('\n') });
       }
       case 'acp.open': {
@@ -214,9 +259,9 @@ export class FakeHub {
         if (!sess) return this.err(conn, rid, 'not_found', `no session ${sid}`);
         if (!sess.summary.alive) return this.err(conn, rid, 'not_alive', 'the agent is not running');
         ok({});
-        const a = sess.summary.acp; const text = (req.prompt || []).map(b => b.text || '').join('');
+        const a = (sess.summary as AcpSummary).acp; const text = (req.prompt || []).map((b: { text?: string }) => b.text || '').join('');
         const reply = (this.acpReplies.get(sid) || (t => `You said: ${t}`))(text);
-        const ev = body => { a.headSeq++; const e = { seq: a.headSeq, ts: Date.now(), ...body }; (this.acpReplays.get(sid) || this.acpReplays.set(sid, []).get(sid)).push(e); this.toAttached(sid, { t: 'acp.ev', sid, ev: e }); };
+        const ev = (body: HubMsg) => { a.headSeq++; const e: AcpEvent = { seq: a.headSeq, ts: Date.now(), ...body }; (this.acpReplays.get(sid) || this.acpReplays.set(sid, []).get(sid)!).push(e); this.toAttached(sid, { t: 'acp.ev', sid, ev: e }); };
         a.activity = 'turn'; this.publish(sess);
         ev({ e: 'prompt', prompt: req.prompt });
         setTimeout(() => {
@@ -229,7 +274,7 @@ export class FakeHub {
         return;
       }
       case 'acp.cancel': return ok({});
-      case 'acp.kill': { if (!sess) return this.err(conn, rid, 'not_found', `no session ${sid}`); sess.summary.alive = false; sess.summary.acp.activity = 'none'; this.publish(sess); return ok({}); }
+      case 'acp.kill': { if (!sess) return this.err(conn, rid, 'not_found', `no session ${sid}`); sess.summary.alive = false; (sess.summary as AcpSummary).acp.activity = 'none'; this.publish(sess); return ok({}); }
       default: return this.err(conn, rid, 'unknown_type', `unknown request ${JSON.stringify(req.t)}`);
     }
   }

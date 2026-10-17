@@ -7,6 +7,11 @@ import { createRequire } from 'node:module';
 import { ProtoError } from './proto.mts';
 import { randomId } from './journal.mts';
 import { afterOps as anchorsAfterOps, snapshot as anchorsSnapshot } from './anchors.mts';
+import type { By, EditsMsg, Op, Undo } from './proto.mts';
+import type { HistEntry, SBuf, UndoTag } from './buffers.mts';
+import type { Client } from './session.mts';
+import type { Thread } from './threads.mts';
+import type { Ed, Log } from './main.mts';
 
 const require = createRequire(import.meta.url);
 const OT = require('../src/ot.js');
@@ -18,26 +23,37 @@ export const HIST_MAX_BYTES = 32 * 1024 * 1024;
 /* Every HASH_EVERY versions ack and edits carry the text hash (R7.14). */
 export const HASH_EVERY = 50;
 
-const originOf = by => (by.kind === 'disk' ? 'disk' : by.kind === 'server' ? 'server' : by.kind === 'agent' ? 'agent' : 'remote');
+/* An edit as the session checked it (R7.11). */
+export interface EditRequest { base: number; seq: number; ops: Op[]; undo: Undo | undefined }
+export interface BatchOpts { cid?: string | null; seq?: number | null; undo?: UndoTag | null }
+/* An undo group (R6.19). */
+export interface UndoGroup { cid: string | null; g: string | number }
+
+const originOf = (by: By) => (by.kind === 'disk' ? 'disk' : by.kind === 'server' ? 'server' : by.kind === 'agent' ? 'agent' : 'remote');
 
 export class Sequencer {
-  constructor(Ed, log) { this.Ed = Ed; this.log = log; }
+  declare Ed: Ed;
+  declare log: Log;
+  /* Installed by threads.mts (R4.41). */
+  declare holdOf: ((sb: SBuf) => Thread | null) | undefined;
+  declare flushHold: ((sb: SBuf) => void) | undefined;
+  constructor(Ed: Ed, log: Log) { this.Ed = Ed; this.log = log; }
 
   /* The length of the text at version VER of SB, from its history. */
-  lenAt(sb, ver) {
+  lenAt(sb: SBuf, ver: number): number {
     const b = sb.hist.find(x => x.ver === ver + 1);
     return b ? b.len : sb.ed.rope.length;
   }
   /* Is BASE still inside the retained history? */
-  inHistory(sb, base) { return base === sb.ver || (sb.hist.length > 0 && base >= sb.hist[0].ver - 1); }
+  inHistory(sb: SBuf, base: number): boolean { return base === sb.ver || (sb.hist.length > 0 && base >= sb.hist[0].ver - 1); }
 
   /* Rebase OPS made against version BASE to the current text and check them: the ops as they apply now.
      Throws ProtoError stale_base or bad_edit. */
-  rebase(sb, ops, base) {
+  rebase(sb: SBuf, ops: Op[], base: number): Op[] {
     if (base > sb.ver) throw new ProtoError('bad_request', `base ${base} is ahead of the buffer (version ${sb.ver})`);
     if (!this.inHistory(sb, base)) throw new ProtoError('stale_base', `base ${base} is older than the retained history`);
     const later = sb.hist.filter(b => b.ver > base);
-    let applied;
+    let applied: Op[];
     try {
       /* The ops are checked against the text the client saw (R7.7, R7.8); a rebase alone would silently
          take the deleted text from the current buffer. */
@@ -51,7 +67,7 @@ export class Sequencer {
   /* Check and apply OPS (already against the current text) to SB as one sequenced batch by BY.
      Returns the history entry. Throws ProtoError bad_edit with nothing applied (every op is checked
      against a string copy before the rope changes). */
-  applyBatch(sb, ops, by, { cid = null, seq = null, undo = null } = {}) {
+  applyBatch(sb: SBuf, ops: Op[], by: By, { cid = null, seq = null, undo = null }: BatchOpts = {}): HistEntry {
     const Ed = this.Ed;
     /* A thread holding SB (R4.41) has its pending edits sequenced first, so the history stays in rope order. */
     if (sb.hold && this.flushHold) this.flushHold(sb);
@@ -65,7 +81,7 @@ export class Sequencer {
       finally { Ed.E.inhibitRO = save; }
     });
     sb.ver++;
-    const entry = { ver: sb.ver, cid, seq, by, ops, undo: undo || undefined, at: Date.now(), len, bytes: JSON.stringify(ops).length };
+    const entry: HistEntry = { ver: sb.ver, cid, seq, by, ops, undo: undo || undefined, at: Date.now(), len, bytes: JSON.stringify(ops).length };
     /* The shared anchors follow the batch (R9.12); the copy lets a failed journal line roll them back. */
     if (anchorsBefore) { entry.anchorsBefore = anchorsBefore; anchorsAfterOps(sb, ops, by); }
     /* The clients attached now get this batch as edits once it is journaled; one that opens in between gets
@@ -80,7 +96,7 @@ export class Sequencer {
 
   /* Record OPS, already applied to SB's rope by a thread (R4.41), as one sequenced batch by BY: the history
      entry, with the text length before the batch computed from the ops. Returns the entry. */
-  recordApplied(sb, ops, by) {
+  recordApplied(sb: SBuf, ops: Op[], by: By): HistEntry {
     /* The thread's edits, one log entry each, in normal form: adjacent inserts merge, an insert next to a
        delete goes first (OT.fromOps), so the batch is as small as a client's. */
     const after = sb.ed.rope.toString();
@@ -90,7 +106,7 @@ export class Sequencer {
     const anchorsBefore = anchorsSnapshot(sb);
     sb.ver++;
     /* One undo group per flush, so undo, undo-global and undo-writer can take a thread's batch back (R6.19). */
-    const entry = { ver: sb.ver, cid: by.cid || null, seq: null, by, ops, undo: { g: 'thread-' + sb.ver + '-' + randomId(4) }, at: Date.now(), len, bytes: JSON.stringify(ops).length };
+    const entry: HistEntry = { ver: sb.ver, cid: by.cid || null, seq: null, by, ops, undo: { g: 'thread-' + sb.ver + '-' + randomId(4) }, at: Date.now(), len, bytes: JSON.stringify(ops).length };
     if (anchorsBefore) { entry.anchorsBefore = anchorsBefore; anchorsAfterOps(sb, ops, by); }
     entry.recipients = [...sb.clients];
     sb.hist.push(entry); sb.histBytes += entry.bytes;
@@ -99,29 +115,29 @@ export class Sequencer {
     return entry;
   }
   /* Client edits wait while a thread holds SB; drainHeld lets them go on, in arrival order. */
-  async waitHeld(sb) { while (sb.hold) await new Promise(r => { (sb.heldQueue || (sb.heldQueue = [])).push(r); }); }
-  drainHeld(sb) { const q = sb.heldQueue; if (!q) return; sb.heldQueue = null; for (const r of q) r(); }
+  async waitHeld(sb: SBuf): Promise<void> { while (sb.hold) await new Promise<void>(r => { (sb.heldQueue || (sb.heldQueue = [])).push(r); }); }
+  drainHeld(sb: SBuf): void { const q = sb.heldQueue; if (!q) return; sb.heldQueue = null; for (const r of q) r(); }
 
   /* Drop history past the retention rule (R7.17). */
-  trim(sb) {
+  trim(sb: SBuf): void {
     const now = Date.now();
     while (sb.hist.length && (sb.histBytes > HIST_MAX_BYTES || (sb.hist.length > HIST_MIN_BATCHES && now - sb.hist[0].at > HIST_MIN_MS))) {
-      const b = sb.hist.shift(); sb.histBytes -= b.bytes;
-      if (b.cid !== null) { const m = sb.seqIndex.get(b.cid); if (m) { m.delete(b.seq); if (!m.size) sb.seqIndex.delete(b.cid); } }
+      const b = sb.hist.shift()!; sb.histBytes -= b.bytes;
+      if (b.cid !== null) { const m = sb.seqIndex.get(b.cid); if (m) { m.delete(b.seq as number); if (!m.size) sb.seqIndex.delete(b.cid); } }
     }
   }
 
-  hashIf(sb) { return sb.ver % HASH_EVERY === 0 ? OT.hash(sb.ed.rope) : undefined; }
+  hashIf(sb: SBuf): number | undefined { return sb.ver % HASH_EVERY === 0 ? OT.hash(sb.ed.rope) : undefined; }
 
   /* One `edit` from CLIENT (R7.11, R7.15). Resolves after the ack is queued. */
-  async edit(client, sb, msg) {
+  async edit(client: Client, sb: SBuf, msg: EditRequest): Promise<void> {
     const { base, seq, ops, undo } = msg;
-    const known = sb.seqIndex.get(client.cid);
+    const known = sb.seqIndex.get(client.cid!);
     if (known && known.has(seq)) { // a resend: the original ack, once the batch is on disk (R7.15, R8.3)
-      const ver = known.get(seq);
+      const ver = known.get(seq)!;
       const entry = sb.hist.find(b => b.ver === ver);
       if (entry && entry.pending) { try { await entry.pending; } catch (e) { /* reported below */ } }
-      if (!sb.seqIndex.get(client.cid) || !sb.seqIndex.get(client.cid).has(seq)) throw new ProtoError('read_only', typeof sb.readOnly === 'string' ? sb.readOnly : 'the batch was not journaled', { buf: sb.id, seq });
+      if (!sb.seqIndex.get(client.cid!) || !sb.seqIndex.get(client.cid!)!.has(seq)) throw new ProtoError('read_only', typeof sb.readOnly === 'string' ? sb.readOnly : 'the batch was not journaled', { buf: sb.id, seq });
       client.send({ t: 'ack', buf: sb.id, seq, ver });
       return;
     }
@@ -134,7 +150,7 @@ export class Sequencer {
 
   /* Undo ENTRY, the newest batch of SB, in place: the inverse ops applied as the server, the history entry and
      its (cid, seq) forgotten, the version stepped back. Nothing has been sent about it yet. */
-  rollback(sb, entry) {
+  rollback(sb: SBuf, entry: HistEntry): void {
     const Ed = this.Ed;
     if (sb.hist[sb.hist.length - 1] !== entry) throw new Error('rollback of a batch that is not the newest');
     Ed.withOrigin('server', () => {
@@ -151,15 +167,15 @@ export class Sequencer {
   /* Roll back ENTRY and every newer batch of SB, newest first. The batches of one failed group commit reject
      in order, so the first continuation undoes the whole group and the later ones find theirs gone (false).
      Any batch newer than a failed one is unjournaled too: the journal refuses appends after a failure. */
-  rollbackThrough(sb, entry) {
+  rollbackThrough(sb: SBuf, entry: HistEntry): boolean {
     if (!sb.hist.includes(entry)) return false;
-    for (;;) { const last = sb.hist[sb.hist.length - 1]; this.rollback(sb, last); if (last === entry) return true; }
+    for (;;) { const last = sb.hist[sb.hist.length - 1]!; this.rollback(sb, last); if (last === entry) return true; }
   }
 
   /* Journal ENTRY, wait for the sync, then ack SENDER (if any) and send edits to the others. */
-  async commit(sb, entry, sender) {
+  async commit(sb: SBuf, entry: HistEntry, sender: Client | null): Promise<void> {
     const h = this.hashIf(sb);
-    const recipients = entry.recipients; delete entry.recipients;
+    const recipients = entry.recipients!; delete entry.recipients;
     if (sb.journal) {
       try { entry.pending = sb.journal.append({ t: 'b', ver: entry.ver, cid: entry.cid, seq: entry.seq, by: entry.by, ops: entry.ops, undo: entry.undo, at: entry.at }); await entry.pending; delete entry.pending; }
       catch (e) {
@@ -176,14 +192,14 @@ export class Sequencer {
     }
     delete entry.anchorsBefore;
     if (sender) sender.send(h === undefined ? { t: 'ack', buf: sb.id, seq: entry.seq, ver: entry.ver } : { t: 'ack', buf: sb.id, seq: entry.seq, ver: entry.ver, h });
-    const edits = { t: 'edits', buf: sb.id, ver: entry.ver, ops: entry.ops, by: entry.by };
+    const edits: EditsMsg = { t: 'edits', buf: sb.id, ver: entry.ver, ops: entry.ops, by: entry.by };
     if (h !== undefined) edits.h = h;
     for (const c of recipients) if (c !== sender) c.sendBulkish(edits);
     sb.owner.afterBatch(sb, entry);
   }
 
   /* Replay for open{since}: own batches as ack, others as edits (R7.16). */
-  replay(client, sb, since) {
+  replay(client: Client, sb: SBuf, since: number): void {
     for (const b of sb.hist) {
       if (b.ver <= since) continue;
       const h = b.ver % HASH_EVERY === 0 && b.ver === sb.ver ? OT.hash(sb.ed.rope) : undefined;
@@ -194,7 +210,7 @@ export class Sequencer {
 
   /* The ops that undo GROUP ({cid, g}) of SB through its retained history (R6.19): {ops, partial}, or
      null when the group is not in the retained history. */
-  undoOps(sb, group) {
+  undoOps(sb: SBuf, group: UndoGroup): { ops: Op[]; partial: boolean } | null {
     const first = sb.hist.findIndex(b => b.cid === group.cid && b.undo && b.undo.g === group.g);
     if (first < 0) return null;
     const history = sb.hist.slice(first).map(b => ({ ver: b.ver, ops: b.ops, cid: b.cid, undo: b.undo || { g: 'v' + b.ver } }));

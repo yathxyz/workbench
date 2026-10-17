@@ -3,6 +3,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { startEdwin } from './headless.mts';
+import type { Edwin } from './headless.mts';
+
+type Globals = typeof globalThis & { EvilCore: Edwin };
+declare const document: unknown, window: unknown;
 
 const ed = await startEdwin();
 let n = 0;
@@ -10,7 +14,7 @@ async function fresh(ext = 'txt') { await ed.type(`:e t${++n}.${ext}\n`); assert
 
 test('boots into *scratch* in Normal state with the shipped config loaded', () => {
   assert.equal(ed.E.current.name, '*scratch*');
-  assert.equal(globalThis.EvilCore.stateOf(ed.E.current), 'normal');
+  assert.equal((globalThis as Globals).EvilCore.stateOf(ed.E.current), 'normal');
   for (const b of ['emacs.scm', 'evil.scm', 'init.scm']) assert.ok(ed.Ed.getBuffer(b), b);
 });
 
@@ -18,7 +22,7 @@ test('Insert, Normal, operators, undo and redo', async () => {
   await fresh();
   await ed.type('ihello world foo'); await ed.keys('ESC');
   assert.equal(ed.text(), 'hello world foo');
-  assert.equal(globalThis.EvilCore.stateOf(ed.E.current), 'normal');
+  assert.equal((globalThis as Globals).EvilCore.stateOf(ed.E.current), 'normal');
   await ed.type('0wdw'); assert.equal(ed.text(), 'hello foo');
   await ed.type('u'); assert.equal(ed.text(), 'hello world foo');
   await ed.keys('C-r'); assert.equal(ed.text(), 'hello foo');
@@ -57,7 +61,7 @@ test('every edit lands in the delta log that edwind will send', async () => {
   await fresh();
   const b = ed.E.current, v0 = b.ver;
   await ed.type('iab'); await ed.keys('ESC'); await ed.type('x');
-  const log = b.log.filter(e => e.v > v0);
+  const log = b.log.filter((e: Edwin) => e.v > v0);
   assert.ok(log.length >= 2);
   // Replaying the log on the empty text gives the buffer's text.
   let t = '';
@@ -118,5 +122,5 @@ test('the shipped Scheme in scm/ is what index.html carries', async () => {
 test('persistent tables flush through the host when the process suspends', async () => {
   await ed.type(':e flush.txt\n');
   ed.host.suspend();
-  assert.ok(ed.host.storage.keys().some(k => k === 'edwin:savehist'));
+  assert.ok(ed.host.storage.keys().some((k: string) => k === 'edwin:savehist'));
 });

@@ -27,14 +27,28 @@
    browser's workers and for the main thread; pool.test.mts checks that a thread and the main thread agree.
    Keep the two in step. */
 
+/* What a job gets besides its arguments (see above); A is the type of the shared args of a map. */
+export interface JobCtx<A = unknown> {
+  buffer(id: string): string;
+  rope(id: string): unknown;
+  version(id: string): number;
+  args: A;
+  state: Map<string, unknown>;
+  worker: number;
+  progress(x: unknown): void;
+  scheme: { S: unknown; L: unknown } | null;
+  transfer(ab: ArrayBuffer): void;
+}
+export interface WordIndex { n: number; words: string; lower: string; off: Int32Array; loff: Int32Array }
+
 /* Word index of text T: the distinct words (SRC repeated 3 or more times, as scanWords does, in text
    order up to CAP words), sorted by their lowercase form. Kept as two joined strings with offsets
    so it crosses threads as three flat objects instead of 50,000 strings. */
-function wordIndex(t, src, cap) {
-  const rx = new RegExp(src + '{3,}', 'gu'), set = new Set();
-  let m;
+function wordIndex(t: string, src: string, cap: number): WordIndex {
+  const rx = new RegExp(src + '{3,}', 'gu'), set = new Set<string>();
+  let m: RegExpExecArray | null;
   while ((m = rx.exec(t)) && set.size < cap) set.add(m[0]);
-  const arr = [];
+  const arr: [string, string][] = [];
   for (const w of set) arr.push([w.toLowerCase(), w]);
   arr.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   const n = arr.length, off = new Int32Array(n + 1), loff = new Int32Array(n + 1);
@@ -43,34 +57,41 @@ function wordIndex(t, src, cap) {
   return { n, words, lower, off, loff };
 }
 /* Indices of the items that match every term ([source, flags] pairs). */
-function filterItems(items, terms) {
-  const res = terms.map(([s, f]) => new RegExp(s, f)), out = [];
+function filterItems(items: string[], terms: [string, string][]): Int32Array {
+  const res = terms.map(([s, f]) => new RegExp(s, f)), out: number[] = [];
   for (let i = 0; i < items.length; i++) { let ok = true; for (const r of res) if (!r.test(items[i])) { ok = false; break; } if (ok) out.push(i); }
   return Int32Array.from(out);
 }
 
 /* The word index of buffer A.id (words of the character class A.src, at most A.cap of them). */
-export function words(a, ctx) { return wordIndex(ctx.buffer(a.id), a.src, a.cap); }
+export function words(a: { id: string; src: string; cap: number }, ctx: JobCtx): WordIndex { return wordIndex(ctx.buffer(a.id), a.src, a.cap); }
 /* Keep the candidate list A.items on this thread under A.key, for filter. */
-export function list(a, ctx) { ctx.state.set('list:' + a.key, a.items); return true; }
+export function list(a: { key: string; items: string[] }, ctx: JobCtx): boolean { ctx.state.set('list:' + a.key, a.items); return true; }
 /* Forget the candidate list A.key. */
-export function unlist(a, ctx) { ctx.state.delete('list:' + a.key); return true; }
+export function unlist(a: { key: string }, ctx: JobCtx): boolean { ctx.state.delete('list:' + a.key); return true; }
 /* Indices of the items of list A.key matching every term of A.terms ([source, flags] pairs). */
-export function filter(a, ctx) { return filterItems(ctx.state.get('list:' + a.key) || [], a.terms); }
+export function filter(a: { key: string; terms: [string, string][] }, ctx: JobCtx): Int32Array { return filterItems((ctx.state.get('list:' + a.key) as string[] | undefined) || [], a.terms); }
 /* Syntax classes and paren depths of the Lisp buffer A.id. The lexer (lex, markDocstrings, parenDepths)
    is editor-core.js's, which worker.mts installs in the thread's global scope from Ed.LEX_SOURCE; the
    main thread runs pool.js's own version of this job against Ed.lex. */
-export function lex(a, ctx) {
-  const g = globalThis;
+/* The lexer's functions as worker.mts installs them in the thread's global scope. */
+interface LexRealm {
+  markDocstrings?: (t: string, cls: unknown) => unknown;
+  lex?: (t: string) => unknown;
+  parenDepths?: (t: string, cls: unknown, from: number, to: number, depth: number) => unknown;
+}
+export function lex(a: { id: string }, ctx: JobCtx): { cls: unknown; d: unknown } {
+  const g = globalThis as typeof globalThis & LexRealm;
   if (typeof g.markDocstrings !== 'function' || typeof g.lex !== 'function' || typeof g.parenDepths !== 'function') throw new Error('lex: the lexer is not loaded in this thread');
   const t = ctx.buffer(a.id), cls = g.markDocstrings(t, g.lex(t));
   return { cls, d: g.parenDepths(t, cls, 0, t.length, 0) };
 }
 /* Matches of a regexp (ctx.args: source, flags, max) in a buffer, a shard of one, or a text: five numbers
    per hit (index, line, column, line start, line end). */
-export function grep(it, ctx) {
-  const t = it.text !== undefined ? it.text : ctx.buffer(it.id), re = new RegExp(ctx.args.source, ctx.args.flags.includes('g') ? ctx.args.flags : ctx.args.flags + 'g');
-  const hits = []; let m, n = 0, line = 1, nlPos = 0;
+export interface GrepArgs { source: string; flags: string; max: number }
+export function grep(it: { text?: string; id?: string; from?: number; to?: number }, ctx: JobCtx<GrepArgs>): { hits: Int32Array; truncated: boolean } {
+  const t = it.text !== undefined ? it.text : ctx.buffer(it.id!), re = new RegExp(ctx.args.source, ctx.args.flags.includes('g') ? ctx.args.flags : ctx.args.flags + 'g');
+  const hits: number[] = []; let m: RegExpExecArray | null, n = 0, line = 1, nlPos = 0;
   re.lastIndex = it.from || 0; const end = it.to === undefined ? t.length : it.to;
   while ((m = re.exec(t)) && m.index < end && n < ctx.args.max) {
     for (let k = t.indexOf('\n', nlPos); k >= 0 && k < m.index; k = t.indexOf('\n', nlPos)) { line++; nlPos = k + 1; }

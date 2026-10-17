@@ -22,6 +22,56 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ProtoError } from './proto.mts';
 import { DEADLINE_FRAME_MS, DEADLINE_CLI_MS } from './session.mts';
+import type { AskMsg, By, CallCtx, CallResult, Condition, Op, WireMessage } from './proto.mts';
+import type { Client } from './session.mts';
+import type { SBuf } from './buffers.mts';
+import type { Ed as Edwin, EdBuffer, Lisp, Log, SchemeValue, Server } from './main.mts';
+
+/* The evaluator S of edwin/src (scheme.js), untyped JavaScript like the rest of L. */
+type Scheme = Lisp['S'];
+/* A generator the scheduler drives: it yields S.Block, S.Suspend or S.PREEMPT and is resumed with a value. */
+export type SchemeGen = Generator<SchemeValue, SchemeValue, SchemeValue>;
+export type ThreadBody = (t: Thread) => SchemeGen;
+export type ThreadKind = 'command' | 'background';
+export type ThreadStateName = 'new' | 'runnable' | 'running' | 'blocked' | 'suspended' | 'done';
+/* What the scheduler keeps per thread beside the evaluator's state: the current buffer, the echo area, inhibit-read-only. */
+export interface ThreadData { current: EdBuffer | null; echo: string; inhibitRO: boolean }
+/* A restart of scheme.js (S.Restart). */
+export interface Restart { name: SchemeSymbol | false; report: SchemeValue; interactive: SchemeValue; fn: SchemeValue; tag: object; js: boolean }
+export interface SchemeSymbol { name: string }
+/* scheme.js ThreadState: the fields the scheduler and the debugger touch. */
+export interface ThreadState {
+  name: string | null;
+  data: ThreadData | null;
+  sliceEnd: number;
+  deadlineAt: number;
+  canSuspend: boolean;
+  restarts: { r: Restart; next: ThreadState['restarts'] } | null;
+}
+/* How a thread goes on at its next step: a value for its yield, or something thrown there. */
+export interface Resume { value?: SchemeValue; throw?: SchemeValue }
+export interface ThreadOptions {
+  name?: string;
+  kind?: ThreadKind;
+  client?: Client | null;
+  rid?: string | null;
+  by?: By;
+  buffer?: EdBuffer | null;
+  deadlineMs?: number | null;
+  debugOnError?: boolean;
+}
+export interface PendingAsk { resolve: (v: unknown) => void; reject: (e: unknown) => void; kind: string }
+/* A wait queue entry of a mutex or mailbox (install's awaitTurn). */
+export interface Waiter { wake: ((v: true) => void) | null }
+export interface MutexLike { name: string | null; owner: Thread | null; waiters: Waiter[] }
+/* A buffer held by a thread (R4.41): edits past FROM are its own, sequenced at release. */
+export interface Hold { thread: Thread; from: number }
+export interface ThreadInfo { id: number; name: string; kind: ThreadKind; state: ThreadStateName; waiting: string | null; client: string | null; rid: string | null; runnableMs: number; remainingMs: number | null; held: string[]; startedAt: number }
+export interface Timer { id: symbol; fn: SchemeValue; args: SchemeValue[]; repeat: number | boolean | null | undefined; idle: boolean; handle: NodeJS.Timeout | null; fired: boolean; label: string; secs?: number; __print(): string }
+export interface TimerObject { __print(): string; id: symbol; timer: Timer }
+export interface TimerOptions { at: number; repeat: number | boolean | null; idle?: boolean; label?: string }
+export interface EvalOptions { buf?: string; ctx?: CallCtx; deadlineMs?: number | null; name?: string }
+export type SchedulerStatus = { loopLagP95Ms: number | null; ackP95Ms: number | null; threads: number; threadsSuspended: number };
 
 export const name = 'threads';
 export const SLICE_MS = 5;
@@ -38,7 +88,41 @@ export class Aborted extends Error { constructor() { super('Aborted'); } }
 let nextId = 1;
 
 export class Thread {
-  constructor(sched, opts) {
+  declare sched: Scheduler;
+  declare id: number;
+  declare name: string;
+  declare kind: ThreadKind;
+  declare client: Client | null;
+  declare rid: string | null;
+  declare by: By;
+  declare ts: ThreadState;
+  declare state: ThreadStateName;
+  declare waiting: string | null;
+  declare gen: SchemeGen | null;
+  declare resume: Resume | null;
+  declare waitToken: number;
+  declare remainingMs: number;
+  declare runnableMs: number;
+  declare startedAt: number;
+  declare held: Set<SBuf>;
+  declare holdSince: number;
+  declare owned: Set<MutexLike>;
+  declare suspend: SchemeValue | null; // the S.Suspend yielded: {condition, continuable}
+  declare result: SchemeValue;
+  declare error: unknown;
+  declare debugOnError: boolean;
+  declare done: Promise<SchemeValue>;
+  declare resolveDone: (v: SchemeValue) => void;
+  declare rejectDone: (e: unknown) => void;
+  declare ask: PendingAsk | null;
+  /* Set by Scheduler.spawn. */
+  declare abortTag: object;
+  declare abortRestart: Restart;
+  /* Set while the thread runs or waits: */
+  declare pendingThrow: SchemeValue | null | undefined;
+  declare flushes: Promise<unknown>[] | null | undefined;
+  declare prefix: SchemeValue;
+  constructor(sched: Scheduler, opts: ThreadOptions) {
     this.sched = sched;
     this.id = nextId++;
     this.name = opts.name || ('thread-' + this.id);
@@ -65,7 +149,7 @@ export class Thread {
   __print() { return this.toString(); }
   get alive() { return this.state !== 'done'; }
   /* Deliver condition C to the thread at its next step (quit, timeout, thread-cancelled). */
-  interrupt(c) {
+  interrupt(c: SchemeValue): boolean {
     if (!this.alive) return false;
     if (this.state === 'blocked' || this.state === 'suspended') {
       if (this.state === 'suspended' && this.sched.onUnsuspend) this.sched.onUnsuspend(this);
@@ -74,19 +158,38 @@ export class Thread {
     return true;
   }
   /* Kill: invoke the thread's abort restart (R4.37). */
-  kill() {
+  kill(): boolean {
     if (!this.alive) return false;
     const S = this.sched.S;
     return this.interrupt(new S.Unwind(this.abortTag, this.abortRestart, []));
   }
-  info() {
+  info(): ThreadInfo {
     return { id: this.id, name: this.name, kind: this.kind, state: this.state, waiting: this.waiting, client: this.client ? this.client.cid : null, rid: this.rid,
       runnableMs: Math.round(this.runnableMs), remainingMs: this.remainingMs === Infinity ? null : Math.round(this.remainingMs), held: [...this.held].map(sb => sb.id), startedAt: this.startedAt };
   }
 }
 
 export class Scheduler {
-  constructor(server) {
+  declare server: Server;
+  declare log: Log;
+  declare L: Lisp;
+  declare S: Scheme;
+  declare Ed: Edwin;
+  declare threads: Map<number, Thread>;
+  declare queue: Thread[];
+  declare current: Thread | null;
+  declare scheduled: boolean;
+  declare main: ThreadState;
+  declare lag: ReturnType<typeof monitorEventLoopDelay>;
+  declare acks: number[];
+  declare timers: Map<symbol, Timer>;
+  declare idleTimers: Set<Timer>;
+  declare lastInputAt: number;
+  declare stopping: boolean;
+  /* Set by debug.mts: a thread stopped at a condition (S.Suspend), and a suspended thread resumed by other means. */
+  declare onSuspend: ((t: Thread, y: SchemeValue) => unknown) | undefined;
+  declare onUnsuspend: ((t: Thread) => void) | undefined;
+  constructor(server: Server) {
     this.server = server; this.log = server.log; this.L = server.L; this.S = server.L.S; this.Ed = server.Ed;
     this.threads = new Map(); this.queue = []; this.current = null; this.scheduled = false;
     this.main = this.S.threadState;
@@ -99,9 +202,9 @@ export class Scheduler {
 
   /* ---------- threads ---------- */
   /* Start a thread running BODY, a generator function of the thread, under an abort restart. */
-  spawn(body, opts = {}) {
+  spawn(body: ThreadBody, opts: ThreadOptions = {}): Thread {
     const S = this.S, t = new Thread(this, opts);
-    const tag = {};
+    const tag: object = {};
     t.abortTag = tag;
     t.abortRestart = new S.Restart(S.intern('abort'), opts.kind === 'command' ? 'Abort the command.' : 'Abort the thread.', null, () => ABORTED, tag, true);
     const self = this;
@@ -116,22 +219,22 @@ export class Scheduler {
   }
   /* Queue T. A command thread whose event-loop break is over goes first (FRONT: nothing else runs while a
      command runs, R4.39); a thread resuming from a blocking point queues behind the runnable ones. */
-  ready(t, front = false) {
+  ready(t: Thread, front: boolean = false): void {
     if (t.state === 'done') return;
     t.state = 'runnable';
     if (front) { let i = 0; while (i < this.queue.length && this.queue[i].kind === 'command') i++; this.queue.splice(i, 0, t); }
     else this.queue.push(t);
     this.schedule();
   }
-  schedule() { if (this.scheduled || this.stopping) return; this.scheduled = true; setImmediate(() => { this.scheduled = false; this.pump(); }); }
-  pump() {
+  schedule(): void { if (this.scheduled || this.stopping) return; this.scheduled = true; setImmediate(() => { this.scheduled = false; this.pump(); }); }
+  pump(): void {
     const t = this.queue.shift();
     if (!t) return;
     if (t.state !== 'runnable') { this.schedule(); return; }
     this.step(t);
     if (this.queue.length) this.schedule();
   }
-  step(t) {
+  step(t: Thread): void {
     const S = this.S;
     const now = performance.now();
     const slice = t.kind === 'command' ? COMMAND_BREAK_MS : SLICE_MS;
@@ -141,12 +244,12 @@ export class Scheduler {
     t.ts.deadlineAt = budget === Infinity ? Infinity : now + budget;
     t.ts.canSuspend = true;
     t.state = 'running'; this.current = t;
-    let r, threw = null;
+    let r: IteratorResult<SchemeValue, SchemeValue> | undefined, threw: unknown = null;
     let how = t.resume; t.resume = null;
     if (t.pendingThrow) { how = { throw: t.pendingThrow }; t.pendingThrow = null; }
     this.L.resetOps();
     S.switchTo(t.ts);
-    try { r = how && how.throw !== undefined ? t.gen.throw(how.throw) : t.gen.next(how ? how.value : undefined); }
+    try { r = how && how.throw !== undefined ? t.gen!.throw(how.throw) : t.gen!.next(how ? how.value : undefined); }
     catch (e) { threw = e; }
     const end = performance.now();
     t.runnableMs += end - now;
@@ -154,33 +257,33 @@ export class Scheduler {
     if (S.threadState !== this.main) S.switchTo(this.main);
     this.current = null;
     if (threw !== null) { this.finish(t, threw, undefined); return; }
-    if (r.done) { this.finish(t, null, r.value); return; }
-    const y = r.value;
+    if (r!.done) { this.finish(t, null, r!.value); return; }
+    const y = r!.value;
     if (y === S.PREEMPT) { this.ready(t, t.kind === 'command'); return; }
     if (y instanceof S.Block) {
       t.state = 'blocked'; t.waiting = y.what || 'a promise';
       this.release(t);
       const token = ++t.waitToken;
       Promise.resolve(y.promise).then(
-        v => { if (t.waitToken === token && t.state === 'blocked') { t.resume = { value: v }; t.waiting = null; this.ready(t); } },
-        e => { if (t.waitToken === token && t.state === 'blocked') { t.resume = { throw: e }; t.waiting = null; this.ready(t); } });
+        (v: SchemeValue) => { if (t.waitToken === token && t.state === 'blocked') { t.resume = { value: v }; t.waiting = null; this.ready(t); } },
+        (e: unknown) => { if (t.waitToken === token && t.state === 'blocked') { t.resume = { throw: e }; t.waiting = null; this.ready(t); } });
       return;
     }
     if (y instanceof S.Suspend) {
       t.state = 'suspended'; t.waiting = 'the debugger'; t.suspend = y;
       this.release(t);
-      if (this.onSuspend) { try { this.onSuspend(t, y); } catch (e) { this.log.error('debugger', { error: e.stack || String(e) }); t.resumeFromDebugger({ throw: y.condition }); } }
-      else t.resumeFromDebugger({ value: undefined });
+      if (this.onSuspend) { try { this.onSuspend(t, y); } catch (e) { this.log.error('debugger', { error: e.stack || String(e) }); (t as Thread & { resumeFromDebugger(how: Resume): void }).resumeFromDebugger({ throw: y.condition }); } }
+      else (t as Thread & { resumeFromDebugger(how: Resume): void }).resumeFromDebugger({ value: undefined });
       return;
     }
     /* Anything else yielded is a bug in a primitive: treat it as a value. */
     t.resume = { value: y }; this.ready(t);
   }
-  finish(t, error, value) {
+  finish(t: Thread, error: unknown, value: SchemeValue): void {
     t.state = 'done'; t.waiting = null; t.suspend = null;
     this.release(t);
     /* A mutex a finished thread still holds is released, so a forgotten mutex-unlock! blocks nobody for good. */
-    for (const m of t.owned) { m.owner = null; const w = m.waiters.shift(); if (w) w(true); }
+    for (const m of t.owned) { m.owner = null; const w = m.waiters.shift(); if (w) (w as unknown as (ok: boolean) => void)(true); }
     t.owned.clear();
     this.threads.delete(t.id);
     const settle = () => {
@@ -193,7 +296,7 @@ export class Scheduler {
     if (flushes && flushes.length) Promise.all(flushes).then(errs => { const bad = errs.find(e => e); if (bad && error === null) error = bad; settle(); });
     else settle();
   }
-  reportBackground(t, e) {
+  reportBackground(t: Thread, e: SchemeValue): void {
     const S = this.S;
     if (e instanceof S.Unwind || e instanceof Aborted) return; // aborted
     const report = e instanceof S.SchemeError ? S.errorMessage(e) : e instanceof S.Raise ? 'raised ' + S.write(e.obj) : (e && e.message) || String(e);
@@ -202,34 +305,34 @@ export class Scheduler {
   }
   /* The debugger (or anything holding a suspended thread) lets it go on: {value} continues a continuable
      condition, {throw} delivers a condition or an Unwind to a restart. */
-  resumeThread(t, how) {
+  resumeThread(t: Thread, how: Resume): boolean {
     if (t.state !== 'suspended') return false;
     t.suspend = null; t.waiting = null; t.resume = how; this.ready(t); return true;
   }
 
   /* ---------- held buffers (R4.41) ---------- */
-  hold(t, sb, from = sb.ed.ver) {
+  hold(t: Thread, sb: SBuf, from: number = sb.ed.ver): void {
     if (sb.hold && sb.hold.thread !== t) this.flush(sb);
     if (!sb.hold) { sb.hold = { thread: t, from }; }
     if (!t.held.has(sb)) { if (!t.held.size) t.holdSince = t.runnableMs; t.held.add(sb); }
   }
   /* Sequence the holder's pending edits of SB as one batch (nothing if there are none). */
-  flush(sb) {
+  flush(sb: SBuf): Promise<unknown> | null {
     const h = sb.hold; if (!h) return null;
-    const b = sb.ed, ops = [];
+    const b = sb.ed, ops: Op[] = [];
     for (const e of b.log) if (e.v > h.from && e.o === 'local') ops.push([e.pos, e.del, e.ins]);
     h.from = b.ver;
     if (!ops.length) return null;
     const seq = this.server.buffers.seq;
     const entry = seq.recordApplied(sb, ops, h.thread.by);
     /* The promise settles when the batch is on disk (or rolled back): null, or the commit's error. */
-    const p = seq.commit(sb, entry, null).then(() => null, e => { this.log.error('hold', { buf: sb.id, error: e.message }); return e; });
+    const p = seq.commit(sb, entry, null).then(() => null, (e: Error) => { this.log.error('hold', { buf: sb.id, error: e.message }); return e; });
     (h.thread.flushes || (h.thread.flushes = [])).push(p);
     return p;
   }
   /* A blocking point or the end of thread T: its edits are sequenced, the buffers released and the
      waiting client edits applied in order. */
-  release(t) {
+  release(t: Thread): void {
     if (!t.held.size) return;
     const held = [...t.held]; t.held.clear();
     for (const sb of held) {
@@ -241,23 +344,23 @@ export class Scheduler {
   }
 
   /* ---------- running Scheme for clients ---------- */
-  deadlineFor(client) { return client ? (client.kind === 'cli' ? DEADLINE_CLI_MS : DEADLINE_FRAME_MS) : null; }
-  byFor(client, t) {
+  deadlineFor(client: Client | null | undefined): number | null { return client ? (client.kind === 'cli' ? DEADLINE_CLI_MS : DEADLINE_FRAME_MS) : null; }
+  byFor(client: Client | null | undefined, t?: Thread): By {
     if (!client) return { kind: 'server', thread: t ? t.name : 'server' };
-    const by = client.by(); by.via = 'server'; return by;
+    const by: By & { via?: string } = client.by(); by.via = 'server'; return by;
   }
   /* The buffer a call runs in: ctx/buf names a shared buffer, else the server's own current buffer. */
-  bufferFor(buf) {
+  bufferFor(buf: unknown): EdBuffer | null {
     if (typeof buf === 'string') { const sb = this.server.buffers.byId.get(buf); if (sb) return sb.ed; }
     return null;
   }
   /* Evaluate the forms of TEXT in the image for CLIENT: a command thread; the result object of §7.4. */
-  evalForms(client, text, { buf, ctx = {}, deadlineMs, name: nm } = {}) {
+  evalForms(client: Client, text: string, { buf, ctx = {}, deadlineMs, name: nm }: EvalOptions = {}): Promise<CallResult> {
     const { L, S, Ed } = this;
     let forms;
     try { forms = L.readAll(text); } catch (e) { return Promise.resolve(this.errorResult(e, null, [], '', client)); }
-    const outParts = [];
-    const port = S.makeOutputPort(s => outParts.push(s), 'call');
+    const outParts: string[] = [];
+    const port = S.makeOutputPort((s: string) => outParts.push(s), 'call');
     const self = this;
     const t = this.spawn(function* (thread) {
       const undo = S.bindDyn(S.currentOutputPort, port);
@@ -267,24 +370,24 @@ export class Scheduler {
     this.applyCtx(t, ctx);
     this.holdCurrent(t);
     return t.done.then(v => {
-      const msg = t.ts.data.echo;
+      const msg = t.ts.data!.echo;
       const note = this.server.image.record(client, forms);
-      const r = { value: S.write(v) };
+      const r: CallResult = { value: S.write(v) };
       const out = outParts.join('');
       if (out) r.out = out;
       const m = [msg, note].filter(Boolean).join('\n'); if (m) r.msg = m;
       return r;
-    }, e => this.errorResult(e, t, outParts, t.ts.data.echo, client));
+    }, e => this.errorResult(e, t, outParts, t.ts.data!.echo, client));
   }
-  isServerCommand(cmd) { const f = this.L.fnOrNull(this.S.intern(cmd)); return !!f && f.interactive !== undefined && (f.where === 'server' || f.where === 'both'); }
+  isServerCommand(cmd: string): boolean { const f = this.L.fnOrNull(this.S.intern(cmd)); return !!f && f.interactive !== undefined && (f.where === 'server' || f.where === 'both'); }
   /* Run the server command named CMD (a Scheme command declared :where 'server) for CLIENT. */
-  runCommand(client, cmd, args, ctx, buf) {
+  runCommand(client: Client, cmd: string, args: unknown, ctx: CallCtx, buf: string | undefined): Promise<CallResult> {
     const { L, S } = this;
     const f = L.fnOrNull(S.intern(cmd));
     if (!f || !this.isServerCommand(cmd)) throw new ProtoError('bad_request', `unknown command ${cmd}`);
     const self = this;
-    const outParts = [];
-    const port = S.makeOutputPort(s => outParts.push(s), 'call');
+    const outParts: string[] = [];
+    const port = S.makeOutputPort((s: string) => outParts.push(s), 'call');
     const sargs = (Array.isArray(args) ? args : []).map(a => jsonToScheme(S, a));
     const t = this.spawn(function* (thread) {
       const undo = S.bindDyn(S.currentOutputPort, port);
@@ -296,33 +399,33 @@ export class Scheduler {
     this.applyCtx(t, ctx);
     this.holdCurrent(t);
     return t.done.then(v => {
-      const r = { value: S.write(v) };
+      const r: CallResult = { value: S.write(v) };
       const out = outParts.join(''); if (out) r.out = out;
-      const msg = t.ts.data.echo; if (msg) r.msg = msg;
+      const msg = t.ts.data!.echo; if (msg) r.msg = msg;
       return r;
-    }, e => this.errorResult(e, t, outParts, t.ts.data.echo, client));
+    }, e => this.errorResult(e, t, outParts, t.ts.data!.echo, client));
   }
   /* A thread's current buffer is held from the moment it is made current (R4.41). */
-  holdCurrent(t) {
-    const b = t === this.current ? this.Ed.E.current : t.ts.data.current;
+  holdCurrent(t: Thread): void {
+    const b = t === this.current ? this.Ed.E.current : t.ts.data!.current;
     if (!b) return;
     const sb = this.server.buffers.ofEd(b);
     if (sb && !sb.special) this.hold(t, sb);
   }
   /* The caller's point, mark and prefix (§7.4 ctx) land in the thread's current buffer. */
-  applyCtx(t, ctx) {
-    const b = t.ts.data.current;
+  applyCtx(t: Thread, ctx: CallCtx | undefined): void {
+    const b = t.ts.data!.current;
     if (!b || !ctx) return;
-    if (Number.isInteger(ctx.point)) b.pt = Math.max(0, Math.min(b.rope.length, ctx.point - 1));
-    if (Number.isInteger(ctx.mark)) { b.mark = Math.max(0, Math.min(b.rope.length, ctx.mark - 1)); b.markActive = true; }
+    if (Number.isInteger(ctx.point)) b.pt = Math.max(0, Math.min(b.rope.length, (ctx.point as number) - 1));
+    if (Number.isInteger(ctx.mark)) { b.mark = Math.max(0, Math.min(b.rope.length, (ctx.mark as number) - 1)); b.markActive = true; }
     if (ctx.prefix !== undefined && ctx.prefix !== null) t.prefix = ctx.prefix;
   }
-  errorResult(e, t, outParts, msg, client) {
+  errorResult(e: unknown, t: Thread | null, outParts: string[], msg: string, client: Client | null): CallResult {
     const { S } = this;
-    const error = this.server.conditionOf(e);
+    const error: Condition & { thread?: number } = this.server.conditionOf(e);
     if (e instanceof Aborted || (t && e instanceof S.Unwind)) { error.condition = 'aborted'; error.report = 'Aborted'; error.backtrace = []; }
     if (t) error.thread = t.id;
-    const r = { error };
+    const r: CallResult = { error };
     const out = outParts.join(''); if (out) r.out = out;
     if (msg) r.msg = msg;
     this.log.info('call', { kind: client ? client.kind : 'server', condition: error.condition });
@@ -331,13 +434,13 @@ export class Scheduler {
 
   /* ---------- ask (R4.29, §7.4) ---------- */
   /* Ask the frame of thread T for input; the thread blocks until answer{rid, value|quit}. */
-  *askG(t, kind, prompt, init, table) {
+  *askG(t: Thread | null, kind: string, prompt: string, init?: unknown, table?: string[] | null): SchemeGen {
     const S = this.S;
     if (!t) throw new S.SchemeError('user-error', `Cannot read input here: ${prompt}`, []);
     if (!t.client || t.client.kind !== 'frame') throw new S.SchemeError('user-error', `No frame to ask: ${prompt}`, []);
     if (t.rid === null) throw new S.SchemeError('user-error', `No call to ask through: ${prompt}`, []);
     if (t.ask) throw new S.SchemeError('error', 'Command attempted to use minibuffer while in minibuffer', []);
-    const msg = { t: 'ask', rid: t.rid, kind, prompt };
+    const msg: AskMsg = { t: 'ask', rid: t.rid, kind, prompt };
     if (init !== undefined && init !== false && init !== null) msg.init = init;
     if (table !== undefined && table !== null) msg.table = table;
     const p = new Promise((resolve, reject) => { t.ask = { resolve, reject, kind }; });
@@ -345,7 +448,7 @@ export class Scheduler {
     try { return yield new S.Block(p, 'an answer'); }
     finally { t.ask = null; }
   }
-  onAnswer(client, msg) {
+  onAnswer(client: Client, msg: WireMessage): void {
     const S = this.S;
     const t = this.threadOfCall(client, msg.rid);
     if (!t || !t.ask) return;
@@ -353,19 +456,19 @@ export class Scheduler {
     if (msg.quit === true) { a.reject(new S.SchemeError('quit', 'Quit', [])); return; }
     a.resolve(msg.value === undefined ? false : msg.value);
   }
-  onInterrupt(client, msg) {
+  onInterrupt(client: Client, msg: WireMessage): void {
     const S = this.S;
     const quit = () => new S.SchemeError('quit', 'Quit', []);
     if (typeof msg.rid === 'string') { const t = this.threadOfCall(client, msg.rid); if (t) t.interrupt(quit()); return; }
     for (const t of this.threads.values()) if (t.client === client && t.kind === 'command') t.interrupt(quit());
   }
-  threadOfCall(client, rid) { for (const t of this.threads.values()) if (t.client === client && t.rid === rid) return t; return null; }
+  threadOfCall(client: Client, rid: unknown): Thread | null { for (const t of this.threads.values()) if (t.client === client && t.rid === rid) return t; return null; }
   /* call-interactively for a server command: the interactive spec's readers go through ask. */
-  *callInteractivelyG(f) {
+  *callInteractivelyG(f: SchemeValue): SchemeGen {
     const { L, S, Ed } = this;
     let spec = f.interactive;
     if (spec === undefined) throw new S.SchemeError('wrong-type-argument', `${f.procName || 'procedure'} is not a command`, []);
-    let args;
+    let args: SchemeValue[];
     if (typeof spec === 'function' && !spec.jsSpec) spec = yield* S.applyG(spec, []);
     if (typeof spec === 'string') args = yield* this.specArgsG(spec);
     else if (spec === false || spec === undefined || spec === S.UNSPEC) args = [];
@@ -373,12 +476,12 @@ export class Scheduler {
     else args = S.arr(spec);
     return yield* S.applyG(f, args);
   }
-  *specArgsG(spec) {
+  *specArgsG(spec: string): Generator<SchemeValue, SchemeValue[], SchemeValue> {
     const { L, S, Ed } = this, E = Ed.E, t = this.current;
-    const out = [];
+    const out: SchemeValue[] = [];
     const items = spec.split('\n').filter(x => x).map(x => x.replace(/^[*^@]+/, ''));
-    const str = (kind, prompt, init, table) => this.askG(t, kind, prompt, init, table);
-    const names = f => { try { return S.arr(f()).map(x => x instanceof S.Sym ? x.name : String(x)); } catch (e) { return undefined; } };
+    const str = (kind: string, prompt: string, init: string, table?: string[]) => this.askG(t, kind, prompt, init, table);
+    const names = (f: () => SchemeValue): string[] | undefined => { try { return S.arr(f()).map((x: SchemeValue) => x instanceof S.Sym ? x.name : String(x)); } catch (e) { return undefined; } };
     for (const item of items) {
       if (!item) continue;
       const code = item[0], prompt = item.slice(1);
@@ -407,10 +510,10 @@ export class Scheduler {
   }
 
   /* ---------- timers (R4.46) ---------- */
-  noteInput() { this.lastInputAt = Date.now(); for (const tm of this.idleTimers) { tm.fired = false; this.armIdle(tm); } }
-  makeTimer(fn, args, { at, repeat, idle, label }) {
+  noteInput(): void { this.lastInputAt = Date.now(); for (const tm of this.idleTimers) { tm.fired = false; this.armIdle(tm); } }
+  makeTimer(fn: SchemeValue, args: SchemeValue[], { at, repeat, idle, label }: TimerOptions): TimerObject {
     const id = Symbol('timer');
-    const tm = { id, fn, args, repeat, idle: !!idle, handle: null, fired: false, label: label || 'timer', __print: () => '#<timer>' };
+    const tm: Timer = { id, fn, args, repeat, idle: !!idle, handle: null, fired: false, label: label || 'timer', __print: () => '#<timer>' };
     const obj = { __print: () => `#<timer ${tm.label}>`, id, timer: tm };
     this.timers.set(id, tm);
     if (idle) { tm.secs = at; this.idleTimers.add(tm); this.armIdle(tm); }
@@ -424,24 +527,24 @@ export class Scheduler {
     }
     return obj;
   }
-  armIdle(tm) {
+  armIdle(tm: Timer): void {
     if (tm.handle) clearTimeout(tm.handle);
     if (tm.fired && !tm.repeat) return;
-    const wait = Math.max(0, tm.secs * 1000 - (Date.now() - this.lastInputAt));
+    const wait = Math.max(0, tm.secs! * 1000 - (Date.now() - this.lastInputAt));
     tm.handle = setTimeout(() => {
       if (!this.timers.has(tm.id)) return;
-      if (Date.now() - this.lastInputAt < tm.secs * 1000) { this.armIdle(tm); return; }
+      if (Date.now() - this.lastInputAt < tm.secs! * 1000) { this.armIdle(tm); return; }
       tm.fired = true; this.fireTimer(tm);
       if (!tm.repeat) { this.timers.delete(tm.id); this.idleTimers.delete(tm); }
     }, wait);
     tm.handle.unref();
   }
-  fireTimer(tm) {
+  fireTimer(tm: Timer): void {
     const S = this.S;
     this.spawn(function* () { return yield* S.applyG(tm.fn, tm.args); }, { kind: 'background', name: tm.label, debugOnError: false });
   }
-  cancelTimer(obj) {
-    const tm = obj && obj.timer ? obj.timer : (obj && obj.id ? this.timers.get(obj.id) : null);
+  cancelTimer(obj: SchemeValue): boolean {
+    const tm: Timer | null | undefined = obj && obj.timer ? obj.timer : (obj && obj.id ? this.timers.get(obj.id) : null);
     if (!tm) return false;
     if (tm.handle) clearTimeout(tm.handle);
     this.timers.delete(tm.id); this.idleTimers.delete(tm);
@@ -449,13 +552,13 @@ export class Scheduler {
   }
 
   /* ---------- status (R15.11) ---------- */
-  noteAck(ms) { this.acks.push(ms); if (this.acks.length > 500) this.acks.splice(0, this.acks.length - 500); }
-  p95(xs) { if (!xs.length) return null; const a = [...xs].sort((x, y) => x - y); return Math.round(a[Math.min(a.length - 1, Math.floor(a.length * 0.95))] * 100) / 100; }
-  status() {
+  noteAck(ms: number): void { this.acks.push(ms); if (this.acks.length > 500) this.acks.splice(0, this.acks.length - 500); }
+  p95(xs: number[]): number | null { if (!xs.length) return null; const a = [...xs].sort((x, y) => x - y); return Math.round(a[Math.min(a.length - 1, Math.floor(a.length * 0.95))] * 100) / 100; }
+  status(): SchedulerStatus {
     const lag = this.lag.count ? Math.round(this.lag.percentile(95) / 1e4) / 100 : null;
     return { loopLagP95Ms: lag, ackP95Ms: this.p95(this.acks), threads: this.threads.size, threadsSuspended: [...this.threads.values()].filter(t => t.state === 'suspended').length };
   }
-  shutdown() {
+  shutdown(): void {
     this.stopping = true;
     for (const tm of this.timers.values()) if (tm.handle) clearTimeout(tm.handle);
     this.timers.clear(); this.idleTimers.clear();
@@ -466,14 +569,14 @@ export class Scheduler {
 }
 
 /* JSON from the wire as Scheme values: objects become alists with symbol keys, arrays lists. */
-export function jsonToScheme(S, v) {
+export function jsonToScheme(S: Scheme, v: unknown): SchemeValue {
   if (v === null || v === undefined) return false;
   if (Array.isArray(v)) return S.listOf(v.map(x => jsonToScheme(S, x)));
   if (typeof v === 'object') return S.listOf(Object.entries(v).map(([k, x]) => S.cons(S.intern(k), jsonToScheme(S, x))));
   return v;
 }
 /* Scheme values as JSON for the wire: symbols as strings, alists with symbol keys as objects, other lists as arrays. */
-export function schemeToJson(S, v, depth = 0) {
+export function schemeToJson(S: Scheme, v: SchemeValue, depth: number = 0): unknown {
   if (depth > 64) return null;
   if (v === S.NIL) return [];
   if (v === S.UNSPEC || v === undefined) return null;
@@ -482,33 +585,33 @@ export function schemeToJson(S, v, depth = 0) {
   if (typeof v === 'bigint') return v.toString();
   if (v instanceof S.Pair) {
     const items = S.arr(v);
-    if (items.length && items.every(p => p instanceof S.Pair && p.car instanceof S.Sym)) { const o = {}; for (const p of items) o[p.car.name] = schemeToJson(S, p.cdr, depth + 1); return o; }
-    return items.map(x => schemeToJson(S, x, depth + 1));
+    if (items.length && items.every((p: SchemeValue) => p instanceof S.Pair && p.car instanceof S.Sym)) { const o: Record<string, unknown> = {}; for (const p of items) o[p.car.name] = schemeToJson(S, p.cdr, depth + 1); return o; }
+    return items.map((x: SchemeValue) => schemeToJson(S, x, depth + 1));
   }
   if (Array.isArray(v)) return v.map(x => schemeToJson(S, x, depth + 1));
-  if (v instanceof Map) { const o = {}; for (const [k, x] of v) o[typeof k === 'string' ? k : S.write(k)] = schemeToJson(S, x, depth + 1); return o; }
+  if (v instanceof Map) { const o: Record<string, unknown> = {}; for (const [k, x] of v) o[typeof k === 'string' ? k : S.write(k)] = schemeToJson(S, x, depth + 1); return o; }
   if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v;
   return S.write(v);
 }
 
 /* ---------- the module ---------- */
-export async function install(server) {
+export async function install(server: Server): Promise<void> {
   const { L, Ed } = server, S = L.S, E = Ed.E;
   const sched = new Scheduler(server);
   server.threads = sched;
   S.watchdog.limitMs = Infinity;                       // deadlines replace the frame watchdog (R14.13)
 
   /* Thread state the evaluator does not own: the current buffer, the echo area, inhibit-read-only. */
-  S.hooks.threadSwitch = (prev, next) => {
+  S.hooks.threadSwitch = (prev: ThreadState, next: ThreadState) => {
     prev.data = { current: E.current, echo: E.echo, inhibitRO: E.inhibitRO };
-    const d = next.data || sched.main.data;
+    const d = (next.data || sched.main.data)!;
     if (d.current && (E.buffers.includes(d.current) || d.current === E.minibuf)) E.current = d.current;
     else if (!E.buffers.includes(E.current)) E.current = E.buffers[0] || E.current;
     E.echo = d.echo || ''; E.inhibitRO = !!d.inhibitRO;
   };
   /* Held buffers: a local edit from a thread, or making a shared buffer current, holds it. */
   const prevEdited = Ed.hooks.edited;
-  Ed.hooks.edited = b => {
+  Ed.hooks.edited = (b: EdBuffer) => {
     if (prevEdited) prevEdited(b);
     const t = sched.current;
     if (!t || E.editOrigin !== 'local') return;
@@ -516,15 +619,15 @@ export async function install(server) {
     if (sb && !sb.special) sched.hold(t, sb, b.ver - 1); // the edit is logged already
   };
   const prevFloor = Ed.hooks.logFloor;
-  Ed.hooks.logFloor = b => { const own = prevFloor ? prevFloor(b) : Infinity; const sb = server.buffers.ofEd(b); return sb && sb.hold ? Math.min(own, sb.hold.from) : own; };
+  Ed.hooks.logFloor = (b: EdBuffer) => { const own = prevFloor ? prevFloor(b) : Infinity; const sb = server.buffers.ofEd(b); return sb && sb.hold ? Math.min(own, sb.hold.from) : own; };
   const holdCurrent = () => { const t = sched.current; if (t) sched.holdCurrent(t); };
-  for (const nm of ['set-buffer', 'switch-to-buffer']) { const f = L.fnOrNull(S.intern(nm)); if (f) { const inner = f; const wrapped = args => { const r = inner(args); holdCurrent(); return r; }; Object.assign(wrapped, { procName: inner.procName, doc: inner.doc, params: inner.params, interactive: inner.interactive, where: inner.where }); S.gdef(nm, wrapped); } }
+  for (const nm of ['set-buffer', 'switch-to-buffer']) { const f = L.fnOrNull(S.intern(nm)); if (f) { const inner = f; const wrapped = (args: SchemeValue[]) => { const r = inner(args); holdCurrent(); return r; }; Object.assign(wrapped, { procName: inner.procName, doc: inner.doc, params: inner.params, interactive: inner.interactive, where: inner.where }); S.gdef(nm, wrapped); } }
   const wcb = L.fnOrNull(S.intern('%with-current-buffer'));
-  if (wcb && wcb.gen) { const g = wcb.gen; wcb.gen = function* (args) { const saved = E.current; E.current = Ed.toBuffer(args[0]); holdCurrent(); E.current = saved; return yield* g(args); }; }
+  if (wcb && wcb.gen) { const g = wcb.gen; wcb.gen = function* (args: SchemeValue[]): SchemeGen { const saved = E.current; E.current = Ed.toBuffer(args[0]); holdCurrent(); E.current = saved; return yield* g(args); }; }
   /* Edits to held buffers wait; server batches flush the holder first; acks are timed (R15.11). */
   const seq = server.buffers.seq;
-  seq.holdOf = sb => (sb.hold ? sb.hold.thread : null);
-  seq.flushHold = sb => sched.flush(sb);
+  seq.holdOf = (sb: SBuf) => (sb.hold ? sb.hold.thread : null);
+  seq.flushHold = (sb: SBuf) => sched.flush(sb);
   const edit0 = seq.edit.bind(seq);
   seq.edit = async (client, sb, msg) => { const t0 = performance.now(); const r = await edit0(client, sb, msg); sched.noteAck(performance.now() - t0); return r; };
   server.statusProviders.push(() => sched.status());
@@ -533,11 +636,11 @@ export async function install(server) {
   server.onInput = () => sched.noteInput();
 
   /* ---------- primitives (all server-only, R4.49) ---------- */
-  const D = (nm, args, doc, fn, gen) => { const f = L.D(nm, args, doc, fn); f.where = 'server'; if (gen) f.gen = gen; return f; };
-  const blocking = (nm, args, doc, gen) => D(nm, args, doc, () => { throw new S.SchemeError('cannot-block', `${nm}: cannot wait here`, []); }, gen);
-  const thr = (x, who) => { if (!(x instanceof Thread)) throw S.typeErr('thread', x, who); return x; };
-  const secs = (x, who) => { const n = S.num(x, who); if (!(n >= 0)) throw new S.SchemeError('range-error', `${who}: seconds must be non-negative`, [x]); return n; };
-  const sleep = ms => new Promise(r => { const h = setTimeout(r, ms); h.unref(); });
+  const D = (nm: string, args: string, doc: string, fn: (args: SchemeValue[]) => SchemeValue, gen?: (args: SchemeValue[]) => SchemeGen) => { const f = L.D(nm, args, doc, fn); f.where = 'server'; if (gen) f.gen = gen; return f; };
+  const blocking = (nm: string, args: string, doc: string, gen: (args: SchemeValue[]) => SchemeGen) => D(nm, args, doc, () => { throw new S.SchemeError('cannot-block', `${nm}: cannot wait here`, []); }, gen);
+  const thr = (x: SchemeValue, who: string): Thread => { if (!(x instanceof Thread)) throw S.typeErr('thread', x, who); return x; };
+  const secs = (x: SchemeValue, who: string): number => { const n = S.num(x, who); if (!(n >= 0)) throw new S.SchemeError('range-error', `${who}: seconds must be non-negative`, [x]); return n; };
+  const sleep = (ms: number) => new Promise(r => { const h = setTimeout(r, ms); h.unref(); });
   const cur = () => sched.current;
 
   D('current-thread', '', 'The running thread.', () => cur() || false);
@@ -557,7 +660,7 @@ export async function install(server) {
   blocking('thread-join', 'thread [timeout]', 'Wait for THREAD to finish and return its value; its condition is re-signalled here; TIMEOUT seconds give the timeout condition.', function* ([t, to]) {
     thr(t, 'thread-join');
     if (t === cur()) throw new S.SchemeError('error', 'thread-join: a thread cannot join itself', []);
-    let p = t.done.then(v => ({ ok: true, v }), e => ({ ok: false, e }));
+    let p = t.done.then((v: SchemeValue) => ({ ok: true, v }), (e: unknown) => ({ ok: false, e }));
     if (to !== undefined && to !== false) p = Promise.race([p, sleep(secs(to, 'thread-join') * 1000).then(() => ({ timeout: true }))]);
     const r = yield new S.Block(p, 'thread ' + t.name);
     if (r.timeout) throw new S.SchemeError('timeout', `thread-join: ${t.name} did not finish in time`, [t]);
@@ -567,7 +670,7 @@ export async function install(server) {
     throw new S.SchemeError('thread-died', `Thread ${t.name}: ${r.e && r.e.message ? r.e.message : String(r.e)}`, [t]);
   });
   blocking('thread-yield', '', 'Let other threads and waiting edits run; a blocking point (R4.41).', function* () { return yield new S.Block(Promise.resolve(S.UNSPEC), 'thread-yield'); });
-  const sleepG = who => function* ([s]) { yield new S.Block(sleep(secs(s, who) * 1000), `${who} ${s}`); return S.UNSPEC; };
+  const sleepG = (who: string) => function* ([s]: SchemeValue[]): SchemeGen { yield new S.Block(sleep(secs(s, who) * 1000), `${who} ${s}`); return S.UNSPEC; };
   blocking('thread-sleep!', 'seconds', 'Suspend the thread for SECONDS.', sleepG('thread-sleep!'));
   blocking('sleep-for', 'seconds', 'Suspend the thread for SECONDS (a blocking point).', sleepG('sleep-for'));
   blocking('sit-for', 'seconds', 'Suspend the thread for SECONDS; #t.', function* ([s]) { yield new S.Block(sleep(secs(s, 'sit-for') * 1000), `sit-for ${s}`); return true; });
@@ -575,13 +678,13 @@ export async function install(server) {
   /* A wait queue entry is {wake}; the waiter leaves the queue when it stops waiting for any reason (the timeout,
      an interrupt, a kill), so a stale entry never swallows the wake meant for a live waiter. A waiter that was
      woken but saw its timeout first passes the wake on. */
-  const wakeOne = q => { const w = q.shift(); if (w) w.wake(true); };
-  function* awaitTurn(q, to, who, what) {
-    const w = { wake: null };
+  const wakeOne = (q: Waiter[]) => { const w = q.shift(); if (w) w.wake!(true); };
+  function* awaitTurn(q: Waiter[], to: SchemeValue, who: string, what: string): SchemeGen {
+    const w: Waiter = { wake: null };
     let p = new Promise(r => { w.wake = r; });
     q.push(w);
     if (to !== undefined && to !== false) p = Promise.race([p, sleep(secs(to, who) * 1000).then(() => 'timeout')]);
-    let r;
+    let r: SchemeValue;
     try { r = yield new S.Block(p, what); }
     finally {
       const i = q.indexOf(w);
@@ -590,8 +693,8 @@ export async function install(server) {
     }
     return r;
   }
-  class Mutex { constructor(nm) { this.name = nm || null; this.owner = null; this.waiters = []; } __print() { return `#<mutex${this.name ? ' ' + this.name : ''}>`; } }
-  class Mailbox { constructor(nm) { this.name = nm || null; this.items = []; this.waiters = []; } __print() { return `#<mailbox${this.name ? ' ' + this.name : ''}>`; } }
+  class Mutex { declare name: string | null; declare owner: Thread | null; declare waiters: Waiter[]; constructor(nm?: string | null) { this.name = nm || null; this.owner = null; this.waiters = []; } __print() { return `#<mutex${this.name ? ' ' + this.name : ''}>`; } }
+  class Mailbox { declare name: string | null; declare items: SchemeValue[]; declare waiters: Waiter[]; constructor(nm?: string | null) { this.name = nm || null; this.items = []; this.waiters = []; } __print() { return `#<mailbox${this.name ? ' ' + this.name : ''}>`; } }
   D('make-mutex', '[name]', 'A mutex.', ([nm]) => new Mutex(nm === undefined || nm === false ? null : String(nm)));
   D('mutex?', 'x', '#t if X is a mutex.', ([x]) => x instanceof Mutex);
   D('mutex-owner', 'mutex', 'The thread holding MUTEX, or #f.', ([m]) => { if (!(m instanceof Mutex)) throw S.typeErr('mutex', m, 'mutex-owner'); return m.owner || false; });
@@ -632,17 +735,17 @@ export async function install(server) {
   blocking('%block-on', 'promise', 'Wait for a JS promise (for primitives written in Scheme over JS objects).', function* ([p]) { return yield new S.Block(p, 'a promise'); });
 
   /* Timers (R4.46): each firing is a background thread. */
-  const timeArg = (x, who) => {
+  const timeArg = (x: SchemeValue, who: string): number => {
     if (typeof x === 'number') return Math.max(0, x) * 1000;
     if (typeof x === 'string') {
       let m = /^\s*(\d+(?:\.\d+)?)\s*(sec|secs|second|seconds|min|mins|minute|minutes|hour|hours|hr)?\s*$/.exec(x);
       if (m) return Number(m[1]) * (/^min/.test(m[2] || '') ? 60000 : /^(hour|hr)/.test(m[2] || '') ? 3600000 : 1000);
       m = /^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$/.exec(x);
-      if (m) { const d = new Date(); const at = new Date(d.getFullYear(), d.getMonth(), d.getDate(), +m[1], +m[2], +(m[3] || 0)); let ms = at - d; if (ms < 0) ms += 86400000; return ms; }
+      if (m) { const d = new Date(); const at = new Date(d.getFullYear(), d.getMonth(), d.getDate(), +m[1], +m[2], +(m[3] || 0)); let ms = (at as unknown as number) - (d as unknown as number); if (ms < 0) ms += 86400000; return ms; }
     }
     throw new S.SchemeError('wrong-type-argument', `${who}: a time is a number of seconds or a string like "5 min" or "14:30"`, [x]);
   };
-  const timerFn = (f, who) => { if (typeof f !== 'function' && !(f instanceof S.Sym)) throw S.typeErr('procedure', f, who); return f; };
+  const timerFn = (f: SchemeValue, who: string) => { if (typeof f !== 'function' && !(f instanceof S.Sym)) throw S.typeErr('procedure', f, who); return f; };
   D('run-at-time', 'time repeat function . args', 'Call FUNCTION at TIME (seconds from now, or "N sec", "N min", "HH:MM"), then every REPEAT seconds; a timer.', ([at, rep, f, ...a]) => sched.makeTimer(timerFn(f, 'run-at-time'), a, { at: timeArg(at, 'run-at-time'), repeat: typeof rep === 'number' && rep > 0 ? rep : null, label: S.write(f) }));
   D('run-with-timer', 'secs repeat function . args', 'Call FUNCTION after SECS seconds, then every REPEAT seconds; a timer. Each call runs as a background thread.', ([s, rep, f, ...a]) => sched.makeTimer(timerFn(f, 'run-with-timer'), a, { at: secs(s, 'run-with-timer') * 1000, repeat: typeof rep === 'number' && rep > 0 ? rep : null, label: S.write(f) }));
   D('run-with-idle-timer', 'secs repeat function . args', 'Call FUNCTION once no client has sent input for SECS seconds; with REPEAT true, once per idle period.', ([s, rep, f, ...a]) => sched.makeTimer(timerFn(f, 'run-with-idle-timer'), a, { at: secs(s, 'run-with-idle-timer'), repeat: S.truthy(rep), idle: true, label: S.write(f) }));
@@ -651,11 +754,11 @@ export async function install(server) {
   D('timerp', 'x', '#t if X is a timer.', ([x]) => !!(x && x.timer));
 
   /* Minibuffer input from a server command goes to the calling frame as ask (R4.29). */
-  const askStr = (kind) => function* ([prompt, init, ...rest]) {
-    let table;
+  const askStr = (kind: string) => function* ([prompt, init, ...rest]: SchemeValue[]): SchemeGen {
+    let table: SchemeValue;
     if (kind === 'completing') { table = init; init = rest[2]; }
     const t = cur();
-    const tab = table === undefined ? undefined : table instanceof Map ? [...table.keys()].map(k => String(k)) : S.arr(table).map(x => x instanceof S.Pair ? (x.car instanceof S.Sym ? x.car.name : String(x.car)) : x instanceof S.Sym ? x.name : String(x));
+    const tab = table === undefined ? undefined : table instanceof Map ? [...table.keys()].map(k => String(k)) : S.arr(table).map((x: SchemeValue) => x instanceof S.Pair ? (x.car instanceof S.Sym ? x.car.name : String(x.car)) : x instanceof S.Sym ? x.name : String(x));
     const v = yield* sched.askG(t, kind, S.str(prompt, 'read'), typeof init === 'string' ? init : undefined, tab);
     return v === null ? false : v;
   };
@@ -666,14 +769,14 @@ export async function install(server) {
     const v = yield* sched.askG(cur(), 'number', S.str(prompt, 'read-number'), d === undefined || d === false ? undefined : String(d));
     const n = Number(v); if (v === '' || v === null || isNaN(n)) throw new S.SchemeError('error', 'Please enter a number.', []); return n;
   });
-  const yn = (kind) => function* ([prompt]) { const v = yield* sched.askG(cur(), kind, S.str(prompt, kind)); return v === true || v === 'y' || v === 'yes'; };
+  const yn = (kind: string) => function* ([prompt]: SchemeValue[]): SchemeGen { const v = yield* sched.askG(cur(), kind, S.str(prompt, kind)); return v === true || v === 'y' || v === 'yes'; };
   blocking('y-or-n-p', 'prompt', 'Ask y or n in the calling frame (ask); #t for yes.', yn('y-or-n'));
   blocking('yes-or-no-p', 'prompt', 'Ask for yes or no in the calling frame (ask); #t for yes.', yn('yes-or-no'));
   blocking('read-char', '[prompt]', 'Read one character in the calling frame (ask).', function* ([prompt]) { const v = yield* sched.askG(cur(), 'char', prompt === undefined ? '' : S.str(prompt, 'read-char')); return typeof v === 'string' && v.length ? S.mkchar(v.codePointAt(0)) : false; });
   blocking('read-key', '[prompt]', 'Read one key in the calling frame (ask).', function* ([prompt]) { return yield* sched.askG(cur(), 'char', prompt === undefined ? '' : S.str(prompt, 'read-key')); });
   /* call-interactively on the server reads through ask. */
   const ci = L.fnOrNull(S.intern('call-interactively'));
-  if (ci) ci.gen = function* ([c]) { return yield* sched.callInteractivelyG(L.toFn(c)); };
+  if (ci) ci.gen = function* ([c]: SchemeValue[]): SchemeGen { return yield* sched.callInteractivelyG(L.toFn(c)); };
 
   /* Introspection of the scheduler for list-threads and the inspector. */
   D('%thread-info', 'thread', 'An alist describing THREAD.', ([t]) => jsonToScheme(S, thr(t, '%thread-info').info()));
@@ -684,4 +787,4 @@ export async function install(server) {
   L.evalText(fs.readFileSync(SCM_FILE, 'utf8'));
 }
 
-export async function shutdown(server) { if (server.threads) server.threads.shutdown(); }
+export async function shutdown(server: Server): Promise<void> { if (server.threads) server.threads.shutdown(); }

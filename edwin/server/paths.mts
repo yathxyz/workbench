@@ -6,27 +6,33 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
+/* The codes a PathError carries; each is an error code of the protocol (§7.8). */
+export type PathErrorCode = 'no_buffer' | 'refused_path' | 'bad_id';
+
 export class PathError extends Error {
-  constructor(code, msg) { super(msg); this.code = code; }
+  declare code: PathErrorCode;
+  constructor(code: PathErrorCode, msg: string) { super(msg); this.code = code; }
 }
 
 const HOME = process.env.HOME || os.homedir();
 /* Expand a leading ~ to the service user's home. */
-export const expandHome = p => (p === '~' ? HOME : p.startsWith('~/') ? path.join(HOME, p.slice(2)) : p);
-export const home = () => HOME;
+export const expandHome = (p: string): string => (p === '~' ? HOME : p.startsWith('~/') ? path.join(HOME, p.slice(2)) : p);
+export const home = (): string => HOME;
 
 /* True when P equals ROOT or lies under it (both absolute, normalised). */
-export const under = (p, root) => p === root || p.startsWith(root.endsWith('/') ? root : root + '/');
+export const under = (p: string, root: string): boolean => p === root || p.startsWith(root.endsWith('/') ? root : root + '/');
 
 /* The real path of P: its parent resolved by the kernel, the last component resolved if it exists and
    is a symlink (a symlink and its target name one buffer, R6.1). A missing parent is an error. */
-export function realPath(p) {
+/* A real path: REAL, whether it exists, whether the last component was a symlink, and its lstat when known. */
+export interface RealPath { real: string; exists: boolean; symlink: boolean; stat?: fs.Stats | null }
+export function realPath(p: string): RealPath {
   const abs = path.resolve(expandHome(p));
   const parent = path.dirname(abs), base = path.basename(abs);
-  let realParent;
+  let realParent: string;
   try { realParent = fs.realpathSync.native(parent); } catch (e) { throw new PathError(e.code === 'ENOENT' || e.code === 'ENOTDIR' ? 'no_buffer' : 'refused_path', `${parent}: ${e.code}`); }
   const full = path.join(realParent, base);
-  let st = null;
+  let st: fs.Stats | null = null;
   try { st = fs.lstatSync(full); } catch (e) { if (e.code !== 'ENOENT') throw new PathError('refused_path', `${full}: ${e.code}`); }
   if (st && st.isSymbolicLink()) {
     try { return { real: fs.realpathSync.native(full), exists: true, symlink: true }; }
@@ -36,9 +42,21 @@ export function realPath(p) {
 }
 
 /* The authority: constructed once from edit.json. */
+/* What the authority takes of edit.json. */
+export interface AuthorityConfig { notesDir: string; stateDir: string; configDir: string; writablePaths?: string[]; refusePaths?: string[] }
+/* A parsed buffer id (R6.1). */
+export type ParsedId = { kind: 'name'; name: string } | { kind: 'file'; real: string; exists: boolean; stat?: fs.Stats | null };
+
 export class Authority {
-  constructor({ notesDir, stateDir, configDir, writablePaths = [], refusePaths = [] }) {
-    const norm = p => path.resolve(expandHome(p));
+  declare notesDir: string;
+  declare stateDir: string;
+  declare configDir: string;
+  declare writeRoots: string[];
+  declare refuse: string[];
+  declare realWriteRoots: string[];
+  declare realRefuse: string[];
+  constructor({ notesDir, stateDir, configDir, writablePaths = [], refusePaths = [] }: AuthorityConfig) {
+    const norm = (p: string) => path.resolve(expandHome(p));
     this.notesDir = norm(notesDir); this.stateDir = norm(stateDir); this.configDir = norm(configDir);
     this.writeRoots = [...new Set([...writablePaths.map(norm), this.notesDir, this.stateDir, this.configDir])];
     this.refuse = refusePaths.map(norm);
@@ -47,26 +65,26 @@ export class Authority {
     this.realRefuse = this.refuse.map(r => { try { return fs.realpathSync.native(r); } catch (e) { return r; } });
   }
   /* Nothing in, on or above a refused path (the rule of POST /api/mv). */
-  refused(real) { return this.realRefuse.some(r => under(real, r) || under(r, real)) || this.refuse.some(r => under(real, r) || under(r, real)); }
+  refused(real: string): boolean { return this.realRefuse.some(r => under(real, r) || under(r, real)) || this.refuse.some(r => under(real, r) || under(r, real)); }
   /* A read of REAL: anywhere but the refusal list. Throws PathError refused_path. */
-  checkRead(real) { if (this.refused(real)) throw new PathError('refused_path', `${real}: refused`); return real; }
+  checkRead(real: string): string { if (this.refused(real)) throw new PathError('refused_path', `${real}: refused`); return real; }
   /* A write of REAL (save, create, rename, delete). Throws PathError refused_path. */
-  checkWrite(real) {
+  checkWrite(real: string): string {
     if (this.refused(real)) throw new PathError('refused_path', `${real}: refused`);
     if (!this.realWriteRoots.some(r => under(real, r)) && !this.writeRoots.some(r => under(real, r))) throw new PathError('refused_path', `${real}: outside the writable paths`);
     return real;
   }
   /* The write roots for the Node permission flags (R14.12). */
-  writeRootsForFlags() { return [...new Set([...this.writeRoots, ...this.realWriteRoots])]; }
+  writeRootsForFlags(): string[] { return [...new Set([...this.writeRoots, ...this.realWriteRoots])]; }
 
   /* ---------- buffer ids (R6.1) ---------- */
 
   /* Parse an id: {kind: 'name', name} or {kind: 'file', real, exists}. Throws PathError bad_id. */
-  parseId(id) {
+  parseId(id: unknown): ParsedId {
     if (typeof id !== 'string' || !id) throw new PathError('bad_id', 'buffer id must be a non-empty string');
     if (id.startsWith('name:')) { const name = id.slice(5); if (!name) throw new PathError('bad_id', 'empty buffer name'); return { kind: 'name', name }; }
     if (id.includes('\0')) throw new PathError('bad_id', 'buffer id contains NUL');
-    let p;
+    let p: string;
     if (id.startsWith('/')) p = id;
     else if (id === '~' || id.startsWith('~/')) p = expandHome(id);
     else {
@@ -81,9 +99,9 @@ export class Authority {
     if (!id.startsWith('/') && !id.startsWith('~') && !under(r.real, this.realNotesDir())) throw new PathError('bad_id', `${JSON.stringify(id)} escapes the notes directory`);
     return { kind: 'file', real: r.real, exists: r.exists, stat: r.stat };
   }
-  realNotesDir() { try { return fs.realpathSync.native(this.notesDir); } catch (e) { return this.notesDir; } }
+  realNotesDir(): string { try { return fs.realpathSync.native(this.notesDir); } catch (e) { return this.notesDir; } }
   /* The id of a real file path: notesDir-relative, ~/…, or absolute. */
-  idOf(real) {
+  idOf(real: string): string {
     const nd = this.realNotesDir();
     if (under(real, nd) && real !== nd) return real.slice(nd.length + 1);
     const h = (() => { try { return fs.realpathSync.native(HOME); } catch (e) { return HOME; } })();

@@ -8,30 +8,34 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { makeDir, startEdwind, stopEdwind, EditClient, MAIN } from './edit-client.mts';
 import { rng, randOp, Client as SimClient } from './ot-sim.mts';
+import type { Msg } from './edit-client.mts';
+import type { OTModule, Server, SimMsg } from './ot-sim.mts';
 
 const require = createRequire(import.meta.url);
-const OT = require('../src/ot.js');
-const { check, loadConfig, makeLog } = await import(MAIN);
+const OT = require('../src/ot.js') as OTModule;
+const { check, loadConfig, makeLog } = await import(MAIN) as typeof import('../server/main.mts');
 const ROUNDS = Number(process.env.CRASH_ROUNDS || 1000);
 const SEED = Number(process.env.CRASH_SEED || 7);
 const quiet = makeLog('error');
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const checkOk = cfg => { const lines = []; const ok = check(loadConfig(cfg), s => lines.push(s)); return { ok, lines }; };
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const checkOk = (cfg: string) => { const lines: string[] = []; const ok = check(loadConfig(cfg), s => lines.push(s)); return { ok, lines }; };
 
 /* A client of the real edwind with the replica logic of ot-sim's Client: local edits, inflight + queue,
    transformation of remote batches. The transport is the socket; reconnect() replays with open{since}. */
 class LiveClient extends SimClient {
-  constructor(cid, buf, text, ver, sock) {
-    super(cid, { text, ver, out: new Map() }, []);
+  declare buf: string; declare sockPath: string; declare conn: EditClient | null; declare versions: number[];
+  declare trace?: string[]; declare replaying?: boolean; declare pumping?: Promise<void>; declare failure?: Error;
+  constructor(cid: string, buf: string, text: string, ver: number, sock: string) {
+    super(cid, { text, ver, out: new Map() } as Server, []);
     this.buf = buf; this.sockPath = sock; this.conn = null; this.versions = [];
   }
-  send() { if (this.conn) this.conn.send({ t: 'edit', buf: this.buf, base: this.inflight.base, seq: this.inflight.seq, ops: this.inflight.ops, undo: this.inflight.undo }); }
-  take(m) {
+  send() { if (this.conn) this.conn.send({ t: 'edit', buf: this.buf, base: this.inflight!.base, seq: this.inflight!.seq, ops: this.inflight!.ops, undo: this.inflight!.undo }); }
+  take(m: Msg) {
     (this.trace ||= []).push(`${m.t}@${m.ver}${m.t === 'ack' ? ' seq ' + m.seq : ' by ' + (m.by && (m.by.cid || m.by.kind))}${this.replaying ? ' (replay)' : ''}`); if (this.trace.length > 30) this.trace.shift();
     if (m.t === 'ack' && this.acks.has(m.seq)) return;
     if (m.t === 'ack' && (!this.inflight || m.seq !== this.inflight.seq)) return; // an ack of a batch replay already delivered
     this.versions.push(m.ver);
-    this.recv(m);
+    this.recv(m as SimMsg);
   }
   async connect() {
     const c = new EditClient(this.sockPath, { cid: this.cid, kind: 'frame' });
@@ -72,7 +76,7 @@ test('R16.5 SIGKILL at random points under a three-client load: acked batches su
       // SIGKILL edwind now, mid-flight.
       child.kill('SIGKILL'); await stopEdwind(child); kills++;
       for (const c of clients) c.drop();
-      assert.equal(checkOk(dir.file).ok, true, 'edwind --check after the kill');
+      { const after = checkOk(dir.file); assert.equal(after.ok, true, `edwind --check after the kill (round ${round}, state ${dir.root}):\n${after.lines.join('\n')}`); }
       child = await startEdwind(dir);
       for (const c of clients) await c.connect();
       // Let everything in flight settle, then compare.
@@ -107,7 +111,7 @@ test('R16.6 a journal truncated at every byte offset of its last line recovers t
   for (let i = 1; i <= 6; i++) { const ack = await a.edit('torn.md', i - 1, [[0, '', `b${i} 😀 `]]); assert.equal(ack.t, 'ack'); texts.push(`b${i} 😀 ` + texts[i - 1]); }
   a.close(); await stopEdwind(child);
   const jdir = path.join(dir.dirs.state, 'buffers');
-  const jfile = path.join(jdir, fs.readdirSync(jdir).find(f => f.endsWith('.jsonl')));
+  const jfile = path.join(jdir, fs.readdirSync(jdir).find(f => f.endsWith('.jsonl'))!);
   const pristine = fs.readFileSync(jfile);
   const lines = pristine.toString('utf8').split('\n'); assert.equal(lines.pop(), '');
   const lastStart = pristine.length - Buffer.byteLength(lines[lines.length - 1] + '\n');
@@ -125,7 +129,7 @@ test('R16.6 a journal truncated at every byte offset of its last line recovers t
       const b = new EditClient(dir.cfg.socket); await b.connect(); await b.hello();
       const o = await b.open('torn.md');
       assert.equal(o.text, texts[5]); assert.equal(o.ver, 5);
-      assert.equal(o.meta.readOnly, false);
+      assert.equal(o.meta!.readOnly, false);
       // A client that had the sixth batch acked... cannot exist: the ack came after the sync. One that sent it
       // and lost the ack resends, and the batch is applied afresh at version 6.
       const ack = await b.edit('torn.md', 5, [[0, '', 'b6 😀 ']]);
@@ -155,7 +159,7 @@ test('R16.7 a full disk during save: the client gets an error, the file keeps it
   assert.equal(r.t, 'error'); assert.match(r.msg, /ENOSPC/);
   assert.equal(fs.readFileSync(file, 'utf8'), 'old\n');
   assert.deepEqual(fs.readdirSync(dir.dirs.home).filter(f => f.includes('edwind-')), [], 'the temp file is removed');
-  const list = (await a.call('buffer-list')).value.find(b => b.file === file);
+  const list = (await a.call('buffer-list')).value.find((b: Msg) => b.file === file);
   assert.equal(list.modified, true, 'the buffer stays modified');
   assert.equal((await a.open(id)).text, 'new old\n', 'nothing acked is lost');
   a.close(); await stopEdwind(child);
@@ -204,8 +208,8 @@ test('R16.7 a full disk during journal append: the edit is refused and rolled ba
   child = await startEdwind(dir);
   assert.equal(checkOk(dir.file).ok, true);
   const d = new EditClient(dir.cfg.socket); await d.connect(); await d.hello();
-  const o2 = await d.open('j.md'); assert.equal(o2.text, 'ok text\n'); assert.equal(o2.meta.readOnly, false);
-  assert.equal((await d.edit('j.md', o2.ver, [[0, '', 'again ']])).t, 'ack');
+  const o2 = await d.open('j.md'); assert.equal(o2.text, 'ok text\n'); assert.equal(o2.meta!.readOnly, false);
+  assert.equal((await d.edit('j.md', o2.ver!, [[0, '', 'again ']])).t, 'ack');
   d.close(); await stopEdwind(child);
   fs.rmSync(dir.root, { recursive: true, force: true });
 });
@@ -219,7 +223,7 @@ test('R16.7 a journal write that fails after its bytes landed is truncated, so a
   assert.equal((await a.edit('p.md', 0, [[0, '', 'kept ']])).t, 'ack');
   a.close(); await stopEdwind(child);
   const jdir = path.join(dir.dirs.state, 'buffers');
-  const jfile = path.join(jdir, fs.readdirSync(jdir).find(f => f.endsWith('.jsonl')));
+  const jfile = path.join(jdir, fs.readdirSync(jdir).find(f => f.endsWith('.jsonl'))!);
   const before = fs.statSync(jfile).size;
   child = await startEdwind(dir, { env: { EDWIND_FAULT: 'enospc-journal-partial' } });
   const b = new EditClient(dir.cfg.socket); await b.connect(); await b.hello();
@@ -233,7 +237,7 @@ test('R16.7 a journal write that fails after its bytes landed is truncated, so a
   child = await startEdwind(dir);
   const c = new EditClient(dir.cfg.socket); await c.connect(); await c.hello();
   const o = await c.open('p.md');
-  assert.equal(o.text, 'kept text\n'); assert.equal(o.ver, 1); assert.equal(o.meta.readOnly, false);
+  assert.equal(o.text, 'kept text\n'); assert.equal(o.ver, 1); assert.equal(o.meta!.readOnly, false);
   c.close(); await stopEdwind(child);
   fs.rmSync(dir.root, { recursive: true, force: true });
 });

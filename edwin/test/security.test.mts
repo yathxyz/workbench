@@ -9,16 +9,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { makeDir, startEdwind, stopEdwind, EditClient } from './edit-client.mts';
+import type { Msg, TestDir, EdwindChild, ClientOptions } from './edit-client.mts';
 
-let dir, child;
+let dir: TestDir, child: EdwindChild;
 before(async () => { dir = makeDir(); child = await startEdwind(dir); });
 after(async () => { await stopEdwind(child); fs.rmSync(dir.root, { recursive: true, force: true }); });
-const client = async (opts) => { const c = new EditClient(dir.cfg.socket, opts); await c.connect(); const w = await c.hello(); assert.equal(w.t, 'welcome'); return c; };
+const client = async (opts?: ClientOptions) => { const c = new EditClient(dir.cfg.socket, opts); await c.connect(); const w = await c.hello(); assert.equal(w.t, 'welcome'); return c; };
 
 test('R16.15 the primitive registry has no JavaScript escape hatch, and the host globals are not bound', async () => {
   const c = await client();
   const prims = (await c.call('primitives')).value;
-  const names = prims.map(p => p.name);
+  const names: string[] = prims.map((p: Msg) => p.name);
   for (const n of names) assert.doesNotMatch(n, /^js|js-eval|javascript|->js$|^js->|eval-js|new-function|^globalthis$|^process$/i, n);
   for (const sym of ['js-eval', 'globalThis', 'process', 'Function', 'eval-js', 'import', 'window', 'document', 'Reflect', 'Proxy', 'WebAssembly']) {
     const r = await c.form(`(${sym})`);
@@ -41,8 +42,8 @@ test('R16.15 procedures, records and host objects print as handles, never as Jav
   /* The inspector shows parts of a procedure (name, parameters, documentation), not its JavaScript. */
   await c.form('(inspect car)');
   const o = await c.open('name:*Inspector*');
-  assert.match(o.text, /Inspecting the procedure car/);
-  assert.doesNotMatch(o.text, /function|=>|\[native code\]/);
+  assert.match(o.text!, /Inspecting the procedure car/);
+  assert.doesNotMatch(o.text!, /function|=>|\[native code\]/);
   c.close();
 });
 
@@ -61,14 +62,14 @@ test('R16.15 a procedure\'s properties cannot be reached or changed from Scheme'
 
 test('R16.14 rename-file refuses both ends in, on or above the refusal list, through symlinks and .. paths, outside the writable paths and on edwind\'s own directories', async () => {
   const c = await client();
-  const home = dir.dirs.home, at = p => path.join(home, p);
+  const home = dir.dirs.home, at = (p: string) => path.join(home, p);
   for (const d of ['.ssh', '.config/systemd/user', '.local/share/systemd', 'mv']) fs.mkdirSync(at(d), { recursive: true });
   fs.symlinkSync(at('.ssh'), at('sshlink')); fs.symlinkSync(at('.config'), at('cfglink'));
   fs.writeFileSync(at('.ssh/authorized_keys'), 'key\n');
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'edwind-outside-'));
   fs.writeFileSync(path.join(outside, 'o.md'), 'o\n');
   const src = () => { const p = at('mv/k-' + Math.random().toString(16).slice(2)); fs.writeFileSync(p, 'k\n'); return p; };
-  const rename = (s, d) => c.call('rename-file', [{ src: s, dst: d }]);
+  const rename = (s: string, d: string) => c.call('rename-file', [{ src: s, dst: d }]);
   try {
     const dsts = ['~/.ssh/authorized_keys2', '~/.ssh', '~/.config/systemd/user/x.service', '~/.local/share/systemd/x', '~/mv/../.ssh/k', at('sshlink/k'), at('sshlink'), at('cfglink/systemd/x')];
     for (const d of dsts) {
@@ -110,7 +111,7 @@ test('R16.14 rename-file keeps edwind\'s own directories when they are symlinks:
   fs.writeFileSync(d.file, JSON.stringify(d.cfg));
   const e = await startEdwind(d);
   const c = new EditClient(d.cfg.socket); await c.connect(); await c.hello();
-  const rename = (s, t) => c.call('rename-file', [{ src: s, dst: t }]);
+  const rename = (s: string, t: string) => c.call('rename-file', [{ src: s, dst: t }]);
   try {
     for (const [s, t] of [['~/notes', '~/notes/old'], ['~/notes', '~/aside'], ['~/.config-edwin', '~/edwin-aside'], [notesTarget, '~/aside2'], [cfgTarget, '~/aside3']]) {
       const r = await rename(s, t);
@@ -134,7 +135,7 @@ test('visit-id: the board\'s file opener learns the canonical id and whether edw
   fs.writeFileSync(path.join(home, 'bin.dat'), Buffer.from([0xff, 0xfe, 0x00, 0x80]));
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'edwind-visit-'));
   fs.writeFileSync(path.join(outside, 'ro.md'), 'ro\n');
-  const visit = p => c.call('visit-id', [p]);
+  const visit = (p: string) => c.call('visit-id', [p]);
   try {
     assert.deepEqual((await visit(path.join(dir.dirs.notes, 'vi.md'))).value, { buf: 'vi.md', readOnly: false }, 'an absolute path under notesDir is the relative id');
     assert.deepEqual((await visit('~/vi-link.md')).value, { buf: 'vi.md', readOnly: false }, 'a symlink and its target are one buffer');
@@ -145,7 +146,7 @@ test('visit-id: the board\'s file opener learns the canonical id and whether edw
     fs.mkdirSync(path.join(home, 'vdir'));
     assert.equal((await visit('~/vdir')).code, 'not_text', 'a directory is not a page');
     assert.equal((await visit('../x.md')).code, 'bad_id');
-    const listed = (await c.call('buffer-list')).value.map(b => b.id);
+    const listed: string[] = (await c.call('buffer-list')).value.map((b: Msg) => b.id);
     assert.ok(!listed.includes('vi.md') && !listed.some(id => id.endsWith('ro.md')), 'nothing was loaded');
   } finally { fs.rmSync(outside, { recursive: true, force: true }); c.close(); }
 });

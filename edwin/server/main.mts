@@ -30,11 +30,59 @@ import * as processModule from './process.mts';
 import * as wbModule from './wb.mts';
 import * as anchorsModule from './anchors.mts';
 import { lockdown, lockdownState } from './lockdown.mts';
+import type { By, CallCtx, CallResult, Condition, WireMessage } from './proto.mts';
+import type { HistEntry, Moved, SBuf } from './buffers.mts';
+import type { Scheduler } from './threads.mts';
+import type { Debugger } from './debug.mts';
+import type { Notes } from './notes.mts';
+import type { Models } from './models.mts';
+import type { Hub } from './hub.mts';
+import type { Processes } from './process.mts';
+import type { Wb } from './wb.mts';
+import type { Anchors } from './anchors.mts';
+
+/* edwin/src, loaded through host-node.js, is untyped JavaScript: these name what the server holds of it. */
+export type Ed = any; // any: the Edwin core (edwin/src) is untyped JavaScript
+export type Lisp = any; // any: globalThis.L, the Scheme runtime of edwin/src, is untyped JavaScript
+export type EdBuffer = any; // any: an Edwin buffer object of edwin/src (rope, mode, markers)
+export type SchemeValue = any; // any: a value of the evaluator (edwin/src), of any Scheme type
+
+/* The log (R15.10): one line per event with its fields. */
+export type LogFields = Record<string, unknown>;
+export type LogFn = (ev: string, fields?: LogFields) => void;
+export interface Log { error: LogFn; warn: LogFn; info: LogFn; debug: LogFn }
+export type LogLevel = 'error' | 'warn' | 'info' | 'debug';
+
+/* edit.json as loadConfig returns it (R15.4). */
+export interface ModelBackendConfig { baseUrl?: string; credential?: string; [k: string]: unknown }
+export type ModelsConfig = Record<string, ModelBackendConfig> & { tiers?: Record<string, string>; credentials?: Record<string, { origin: string }> };
+export interface Config {
+  socket: string;
+  hubSocket: string | undefined;
+  webSocket: string | undefined;
+  stateDir: string;
+  notesDir: string;
+  boardsDir: string | undefined;
+  configDir: string;
+  host: string;
+  logLevel: string;
+  writablePaths: string[];
+  refusePaths: string[];
+  models: ModelsConfig;
+}
+
+/* A server command (§4.6): the result object, a promise of one, or undefined for a delayed result. */
+export type CommandFn = (client: Client, args: unknown[], ctx: CallCtx, buf: string | undefined) => CallResult | undefined | Promise<CallResult | undefined>;
+/* A handler of a message type the session does not know (sample, tool_result, answer, …). */
+export type MessageHandler = (client: Client, msg: WireMessage) => unknown;
+export type StatusProvider = () => Record<string, unknown>;
+/* An E2 module as main.mts installs it. */
+export interface ServerModule { install(server: Server): Promise<void>; shutdown?(server: Server): Promise<void>; name?: string }
 
 const require = createRequire(import.meta.url);
 /* The E2 modules, installed in this order after the buffers are loaded; each exports install(server) and
    may export shutdown(server) and name. */
-const MODULES = [imageModule, notesModule, threadsModule, debugModule, modelsModule, hubModule, processModule, wbModule, anchorsModule];
+const MODULES: ServerModule[] = [imageModule, notesModule, threadsModule, debugModule, modelsModule, hubModule, processModule, wbModule, anchorsModule];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EDWIN = path.join(HERE, '..');
 export const BUILD = process.env.WB_EDIT_BUILD || 'dev';
@@ -44,26 +92,26 @@ const MIN_NODE = [22, 13];
 const STACK_MB = Math.max(8, Number(process.env.EDWIND_STACK_MIB) || 32);
 
 /* ---------- log (R15.10): one line per event, never buffer text ---------- */
-const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
-export function makeLog(level = 'info') {
+const LEVELS: Record<string, number> = { error: 0, warn: 1, info: 2, debug: 3 };
+export function makeLog(level: string = 'info'): Log {
   const max = LEVELS[level] ?? 2;
   /* Written synchronously: the server runs on a worker thread, whose process.stderr is an asynchronous relay
      that can lose the last lines at exit. */
-  const out = (lvl, ev, fields) => { if (LEVELS[lvl] > max) return; fs.writeSync(2, `${lvl} ${ev} ${JSON.stringify(fields || {})}\n`); };
+  const out = (lvl: LogLevel, ev: string, fields?: LogFields) => { if (LEVELS[lvl] > max) return; fs.writeSync(2, `${lvl} ${ev} ${JSON.stringify(fields || {})}\n`); };
   return { error: (e, f) => out('error', e, f), warn: (e, f) => out('warn', e, f), info: (e, f) => out('info', e, f), debug: (e, f) => out('debug', e, f) };
 }
 
 /* ---------- config (R15.4): edit.json, unknown fields refused ---------- */
 const FIELDS = new Set(['socket', 'hubSocket', 'webSocket', 'stateDir', 'notesDir', 'boardsDir', 'configDir', 'writablePaths', 'refusePaths', 'models', 'host', 'logLevel']);
-export function loadConfig(file) {
-  let cfg;
+export function loadConfig(file: string): Config {
+  let cfg: any; // any: edit.json as parsed, checked field by field below
   try { cfg = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { throw new Error(`cannot read ${file}: ${e.message}`); }
   if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) throw new Error(`${file}: not an object`);
   for (const k of Object.keys(cfg)) if (!FIELDS.has(k)) throw new Error(`${file}: unknown field ${JSON.stringify(k)}`);
-  const str = (k, req, dflt) => { const v = cfg[k]; if (v === undefined || v === null) { if (req) throw new Error(`${file}: ${k} is required`); return dflt; } if (typeof v !== 'string' || !v) throw new Error(`${file}: ${k} must be a string`); return v; };
-  const abs = (k, v) => { if (v !== undefined && !path.isAbsolute(expandHome(v))) throw new Error(`${file}: ${k} must be an absolute path`); return v === undefined ? v : expandHome(v); };
+  const str = <D extends string | undefined>(k: string, req: boolean, dflt?: D): string | D => { const v = cfg[k]; if (v === undefined || v === null) { if (req) throw new Error(`${file}: ${k} is required`); return dflt as D; } if (typeof v !== 'string' || !v) throw new Error(`${file}: ${k} must be a string`); return v; };
+  const abs = <V extends string | undefined>(k: string, v: V): V => { if (v !== undefined && !path.isAbsolute(expandHome(v))) throw new Error(`${file}: ${k} must be an absolute path`); return (v === undefined ? v : expandHome(v)) as V; };
   const home = process.env.HOME || os.homedir();
-  const out = {
+  const out: Config = {
     socket: abs('socket', str('socket', false, '/run/workbench-edit/edit.sock')),
     hubSocket: abs('hubSocket', str('hubSocket', false, undefined)),
     webSocket: abs('webSocket', str('webSocket', false, undefined)),
@@ -75,20 +123,20 @@ export function loadConfig(file) {
     logLevel: str('logLevel', false, 'info'),
     writablePaths: [], refusePaths: [], models: cfg.models || {},
   };
-  for (const k of ['writablePaths', 'refusePaths']) {
+  for (const k of ['writablePaths', 'refusePaths'] as const) {
     const v = cfg[k] === undefined ? [] : cfg[k];
     if (!Array.isArray(v) || v.some(x => typeof x !== 'string')) throw new Error(`${file}: ${k} must be a list of paths`);
-    out[k] = v.map(x => abs(k, x));
+    out[k] = v.map((x: string) => abs(k, x));
   }
-  for (const k of ['socket', 'hubSocket', 'webSocket']) if (out[k] && Buffer.byteLength(out[k]) >= 108) throw new Error(`${file}: ${k} is too long for a socket path (108 bytes)`);
+  for (const k of ['socket', 'hubSocket', 'webSocket'] as const) if (out[k] && Buffer.byteLength(out[k]!) >= 108) throw new Error(`${file}: ${k} is too long for a socket path (108 bytes)`);
   /* models (§15.2, R15.4): backends `anthropic` and `openai` ({baseUrl, credential}), `tiers` (tier -> model) and
      `credentials` (name -> {origin}); a plain http URL only to loopback (R14.4). */
-  const checkUrl = (k, v) => { let u; try { u = new URL(v); } catch (e) { throw new Error(`${file}: ${k} is not a URL`); } if (u.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(u.hostname)) throw new Error(`${file}: ${k}: plain http only to loopback`); if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error(`${file}: ${k} must be http or https`); };
+  const checkUrl = (k: string, v: string) => { let u; try { u = new URL(v); } catch (e) { throw new Error(`${file}: ${k} is not a URL`); } if (u.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(u.hostname)) throw new Error(`${file}: ${k}: plain http only to loopback`); if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error(`${file}: ${k} must be http or https`); };
   if (!out.models || typeof out.models !== 'object' || Array.isArray(out.models)) throw new Error(`${file}: models must be an object`);
-  for (const [name, m] of Object.entries(out.models)) {
+  for (const [name, m] of Object.entries(out.models as Record<string, any>)) { // any: edit.json's models, checked here
     if (!m || typeof m !== 'object' || Array.isArray(m)) throw new Error(`${file}: models.${name} must be an object`);
     if (name === 'tiers') { for (const [t, v] of Object.entries(m)) if (typeof v !== 'string' || !v) throw new Error(`${file}: models.tiers.${t} must be a model name`); continue; }
-    if (name === 'credentials') { for (const [c, e] of Object.entries(m)) { if (!/^[a-z0-9-]{1,32}$/.test(c)) throw new Error(`${file}: models.credentials: ${JSON.stringify(c)} is not a credential name`); if (!e || typeof e.origin !== 'string') throw new Error(`${file}: models.credentials.${c}.origin is required`); checkUrl(`models.credentials.${c}.origin`, e.origin); } continue; }
+    if (name === 'credentials') { for (const [c, e] of Object.entries<any>(m)) { if (!/^[a-z0-9-]{1,32}$/.test(c)) throw new Error(`${file}: models.credentials: ${JSON.stringify(c)} is not a credential name`); if (!e || typeof e.origin !== 'string') throw new Error(`${file}: models.credentials.${c}.origin is required`); checkUrl(`models.credentials.${c}.origin`, e.origin); } continue; } // any: the credentials of edit.json, checked here
     if (m.baseUrl !== undefined) { if (typeof m.baseUrl !== 'string') throw new Error(`${file}: models.${name}.baseUrl must be a string`); checkUrl(`models.${name}.baseUrl`, m.baseUrl); }
     if (m.credential !== undefined && (typeof m.credential !== 'string' || !/^[a-z0-9-]{1,32}$/.test(m.credential))) throw new Error(`${file}: models.${name}.credential must be a credential name`);
   }
@@ -97,7 +145,36 @@ export function loadConfig(file) {
 
 /* ---------- the server ---------- */
 export class Server {
-  constructor(cfg, log) {
+  declare cfg: Config;
+  declare log: Log;
+  declare build: string;
+  declare boot: string;
+  declare clients: Set<Client>;
+  declare stopping: boolean;
+  declare auth: Authority;
+  declare commands: Map<string, CommandFn>;
+  declare handlers: Map<string, MessageHandler>;
+  declare modules: ServerModule[];
+  declare statusProviders: StatusProvider[];
+  declare started: number;
+  declare image: ImageLog;
+  /* Set by start(). */
+  declare Ed: Ed;
+  declare L: Lisp;
+  declare buffers: Buffers;
+  /* Set by listen(). */
+  declare net: net.Server | undefined;
+  /* Installed by the E2 modules in start(), in MODULES order. */
+  declare threads: Scheduler;
+  declare onInput: ((client: Client) => void) | undefined;
+  declare debugger: Debugger;
+  declare notes: Notes | null;
+  declare models: Models;
+  declare hub: Hub;
+  declare processes: Processes;
+  declare wb: Wb;
+  declare anchors: Anchors | null;
+  constructor(cfg: Config, log: Log) {
     this.cfg = cfg; this.log = log; this.build = BUILD; this.boot = randomId(8); this.clients = new Set(); this.stopping = false;
     this.auth = new Authority(cfg);
     /* Extension points for the E2 modules (notes, models, hub, image, threads): server commands by name
@@ -118,7 +195,7 @@ export class Server {
     const storageFile = path.join(this.cfg.stateDir, 'storage.json');
     const host = createHost({ scmDir: path.join(EDWIN, 'scm'), configDir: this.cfg.configDir, storage: fileStorage(storageFile, this.log) });
     this.Ed = loadEdwin(host, { mode: 'gen' });
-    this.L = globalThis.L;
+    this.L = (globalThis as any).L; // any: the core sets globalThis.L
     this.Ed.boot({ host });
     await this.Ed.whenIdle();
     this.buffers = new Buffers({ Ed: this.Ed, auth: this.auth, stateDir: this.cfg.stateDir, log: this.log });
@@ -130,16 +207,16 @@ export class Server {
   }
   /* A server command: FN(client, args, ctx, buf) returns the result object ({value, msg?, out?} or {error}),
      a promise of one, or undefined for a delayed result. */
-  defineCommand(name, fn) { this.commands.set(name, fn); }
+  defineCommand(name: string, fn: CommandFn) { this.commands.set(name, fn); }
   /* A handler for message type T from any client: FN(client, msg), may return a promise. */
-  onMessage(t, fn) { this.handlers.set(t, fn); }
+  onMessage(t: string, fn: MessageHandler) { this.handlers.set(t, fn); }
   /* The `status` command (R15.11): what wb-web shows under /api/status.edit and reads for /api/info.
      Modules add fields through statusProviders (notes: notesExists, notesGen; models: sample, models;
      threads: loopLagP95Ms, ackP95Ms). */
   status() {
     let journalBytes = 0;
     for (const sb of this.buffers.all()) if (sb.journal) journalBytes += sb.journal.bytes;
-    const out = { version: this.build, build: this.build, boot: this.boot, uptimeMs: Date.now() - this.started, clients: this.clients.size, buffers: this.buffers.all().length, journalBytes, imageGen: this.image.gen, imageEpoch: this.image.epoch, loopLagP95Ms: null, ackP95Ms: null, notesExists: false, notesGen: 0, sample: false, models: {} };
+    const out: Record<string, unknown> & { loopLagP95Ms: number | null; ackP95Ms: number | null } = { version: this.build, build: this.build, boot: this.boot, uptimeMs: Date.now() - this.started, clients: this.clients.size, buffers: this.buffers.all().length, journalBytes, imageGen: this.image.gen, imageEpoch: this.image.epoch, loopLagP95Ms: null, ackP95Ms: null, notesExists: false, notesGen: 0, sample: false, models: {} };
     for (const p of this.statusProviders) { try { Object.assign(out, p()); } catch (e) { this.log.warn('status', { error: e.message }); } }
     return out;
   }
@@ -147,19 +224,19 @@ export class Server {
   /* ---------- the socket (R14.3) ---------- */
   listen() {
     const sock = this.cfg.socket, dir = path.dirname(sock);
-    const euid = process.geteuid();
-    let dst;
+    const euid = process.geteuid!();
+    let dst: fs.Stats;
     try { dst = fs.lstatSync(dir); } catch (e) { throw new Error(`${dir}: ${e.code}`); }
     if (!dst.isDirectory() || dst.isSymbolicLink()) throw new Error(`${dir} is not a directory`);
     if (dst.uid !== euid) throw new Error(`${dir} is owned by uid ${dst.uid}, not ${euid}`);
     if ((dst.mode & 0o777) !== 0o700) throw new Error(`${dir} has mode ${(dst.mode & 0o777).toString(8)}, not 700`);
     try { const st = fs.lstatSync(sock); if (st.isSymbolicLink() || !st.isSocket()) throw new Error(`${sock} exists and is not a socket`); fs.unlinkSync(sock); }
-    catch (e) { if (e.code !== 'ENOENT') { if (e instanceof Error && !e.code) throw e; throw new Error(`${sock}: ${e.code}`); } }
+    catch (e) { if (e.code !== 'ENOENT') { if (e instanceof Error && !(e as NodeJS.ErrnoException).code) throw e; throw new Error(`${sock}: ${e.code}`); } }
     const server = net.createServer({ allowHalfOpen: false }, socket => {
       const c = new Client(this, socket);
       this.clients.add(c);
     });
-    return new Promise((resolve, reject) => {
+    return new Promise<net.Server>((resolve, reject) => {
       server.once('error', reject);
       server.listen(sock, () => {
         try {
@@ -180,7 +257,7 @@ export class Server {
     if (this.stopping) return;
     this.stopping = true;
     this.log.info('stop', {});
-    const closed = this.net ? new Promise(r => this.net.close(() => r())) : null;
+    const closed = this.net ? new Promise<void>(r => this.net!.close(() => r())) : null;
     for (const c of [...this.clients]) { c.send({ t: 'error', code: 'shutting_down', msg: 'edwind is stopping' }); c.destroy(); }
     if (closed) await closed;
     for (const m of [...this.modules].reverse()) if (m.shutdown) { try { await m.shutdown(this); } catch (e) { this.log.error('shutdown', { module: m.name || '?', error: e.message }); } }
@@ -192,22 +269,22 @@ export class Server {
   /* ---------- evaluation (§7.4, R14.13, R4.15) ---------- */
   /* The forms of FORM run on a command thread for CLIENT (threads.mts); before the module is installed
      (image replay, tests of the bare server) they run directly. Resolves to the result object of §7.4. */
-  evalForm(client, form, ctx = {}, buf) {
+  evalForm(client: Client, form: string, ctx: CallCtx = {}, buf?: string): Promise<CallResult> {
     if (this.threads) return this.threads.evalForms(client, form, { ctx, buf });
     return Promise.resolve(this.evalFormDirect(client, form));
   }
-  evalFormDirect(client, form) {
+  evalFormDirect(client: Client, form: string): CallResult {
     const { L, Ed } = this;
     const S = L.S;
-    const outParts = [];
-    const port = S.makeOutputPort(s => outParts.push(s), 'call');
+    const outParts: string[] = [];
+    const port = S.makeOutputPort((s: string) => outParts.push(s), 'call');
     const saveEcho = Ed.E.echo; Ed.E.echo = '';
     const limit = S.watchdog.limitMs; S.watchdog.limitMs = client.deadlineMs();
-    let value, error = null;
+    let value: SchemeValue, error: Condition | null = null;
     try {
       L.resetOps();
       const forms = L.readAll(form);
-      value = S.withOutputTo(port, () => { let v; for (const f of forms) v = L.ev(f); return v; });
+      value = S.withOutputTo(port, () => { let v: SchemeValue; for (const f of forms) v = L.ev(f); return v; });
       /* Definitional forms enter the image log and reach every frame (R4.14, R4.15; image.mts). */
       const note = this.image.record(client, forms); if (note) Ed.E.echo = Ed.E.echo ? Ed.E.echo + '\n' + note : note;
     } catch (e) {
@@ -215,13 +292,13 @@ export class Server {
     } finally { S.watchdog.limitMs = limit; L.resetOps(); S.resetStack(); }
     const msg = Ed.E.echo; Ed.E.echo = saveEcho;
     const out = outParts.join('');
-    if (error) { const r = { error }; if (out) r.out = out; if (msg) r.msg = msg; this.log.info('call', { kind: client.kind, condition: error.condition }); return r; }
-    const r = { value: S.write(value) };
+    if (error) { const r: CallResult = { error }; if (out) r.out = out; if (msg) r.msg = msg; this.log.info('call', { kind: client.kind, condition: error.condition }); return r; }
+    const r: CallResult = { value: S.write(value) };
     if (out) r.out = out; if (msg) r.msg = msg;
     return r;
   }
   /* error of result (§7.4): {condition, report, restarts, backtrace}. */
-  conditionOf(e) {
+  conditionOf(e: any): Condition { // any: whatever the evaluator threw
     const { L, Ed } = this;
     const S = L.S;
     let condition = 'error';
@@ -230,32 +307,32 @@ export class Server {
     else if (e instanceof RangeError) condition = 'recursion-depth';
     else if (L.isQuit && L.isQuit(e)) condition = 'quit';
     const report = Ed.errorText(e);
-    let backtrace = [];
-    try { const bt = S.conditionBacktrace(e); if (bt) backtrace = bt.slice(0, 40).map(f => (f.proc && f.proc.procName ? f.proc.procName : 'anonymous') + (f.loc ? ` (${f.loc.file || ''}:${f.loc.line})` : '')); } catch (x) { /* no backtrace */ }
+    let backtrace: string[] = [];
+    try { const bt = S.conditionBacktrace(e); if (bt) backtrace = bt.slice(0, 40).map((f: SchemeValue) => (f.proc && f.proc.procName ? f.proc.procName : 'anonymous') + (f.loc ? ` (${f.loc.file || ''}:${f.loc.line})` : '')); } catch (x) { /* no backtrace */ }
     return { condition, report, restarts: [], backtrace };
   }
 
   /* ---------- the E1 server commands (§4.6, §6.5, §13.1) ---------- */
-  async command(client, cmd, args, ctx, buf) {
+  async command(client: Client, cmd: string, args: unknown[], ctx: CallCtx, buf: string | undefined): Promise<CallResult | undefined> {
     const B = this.buffers;
     switch (cmd) {
       case 'buffer-list': return { value: B.list() };
       case 'server-edit': {
         const id = typeof args[0] === 'string' ? args[0] : (() => { throw new ProtoError('bad_request', 'server-edit needs a buffer id'); })();
-        const line = Number.isInteger(args[1]) ? args[1] : null;
+        const line = Number.isInteger(args[1]) ? args[1] as number : null;
         /* An old id of a renamed file edits the file where it is now, and waits as any other. */
         let r = B.resolve(id, true);
-        if (r.moved) r = B.resolve(r.moved, true);
-        const sb = r;
+        if ((r as Moved).moved) r = B.resolve((r as Moved).moved, true);
+        const sb = r as SBuf;
         if (!sb.serverEdit) sb.serverEdit = { waiters: [], saved: false, line };
         sb.lastOpen = Date.now();
         this.log.info('server-edit', { buf: sb.id, wait: !!ctx.wait, line });
         if (!ctx.wait) return { value: { buf: sb.id, exit: null } };
-        const exit = await new Promise(resolve => sb.serverEdit.waiters.push(resolve));
+        const exit = await new Promise<number>(resolve => sb.serverEdit!.waiters.push(resolve));
         return { value: { buf: sb.id, exit } };
       }
       case 'server-edit-done': case 'server-edit-abort': {
-        const sb = B.get(typeof args[0] === 'string' ? args[0] : buf);
+        const sb = B.get((typeof args[0] === 'string' ? args[0] : buf) as string);
         const se = sb.serverEdit;
         if (!se) return { value: { buf: sb.id, waiting: false } };
         let exit;
@@ -265,11 +342,11 @@ export class Server {
         return { value: { buf: sb.id, exit } };
       }
       case 'undo': case 'undo-global': case 'undo-writer': {
-        const sb = B.get(buf || args[0]);
+        const sb = B.get((buf || args[0]) as string);
         if (sb.readOnly) throw new ProtoError('read_only', String(sb.readOnly));
         const me = client.by();
-        const same = (a, b) => a.kind === b.kind && (a.device || null) === (b.device || null) && (a.cid || null) === (b.cid || null);
-        let pick;
+        const same = (a: By, b: By) => a.kind === b.kind && (a.device || null) === (b.device || null) && (a.cid || null) === (b.cid || null);
+        let pick: (b: HistEntry) => unknown;
         if (cmd === 'undo') pick = b => b.by && (b.by.device ? b.by.device === me.device : same(b.by, me));
         else if (cmd === 'undo-global') pick = b => b.by && b.by.kind !== 'disk';
         else { const w = args[0] && typeof args[0] === 'object' ? args[0] : null; if (!w) throw new ProtoError('bad_request', 'undo-writer needs a writer (a by value)'); pick = b => b.by && JSON.stringify(b.by) === JSON.stringify(w); }
@@ -279,8 +356,8 @@ export class Server {
         for (const c of sb.clients) if (c !== client) c.sendBulkish({ t: 'msg', text: msg, level: 'info' });
         return { value: { buf: sb.id, ver: r.ver, partial: r.partial }, msg };
       }
-      case 'list-writers': { const sb = B.get(buf || args[0]); const seen = new Map(); for (const b of sb.hist) seen.set(JSON.stringify(b.by), b.by); return { value: [...seen.values()] }; }
-      case 'kill-buffer': { const sb = B.get(typeof args[0] === 'string' ? args[0] : buf); B.kill(sb); return { value: true }; }
+      case 'list-writers': { const sb = B.get((buf || args[0]) as string); const seen = new Map(); for (const b of sb.hist) seen.set(JSON.stringify(b.by), b.by); return { value: [...seen.values()] }; }
+      case 'kill-buffer': { const sb = B.get((typeof args[0] === 'string' ? args[0] : buf) as string); B.kill(sb); return { value: true }; }
       /* The board's file opener asks before it makes a page card (buffers.mts visitInfo). */
       case 'visit-id': {
         if (typeof args[0] !== 'string') throw new ProtoError('bad_request', 'visit-id needs a path');
@@ -288,7 +365,7 @@ export class Server {
       }
       /* rename-file (R4.49): [{src, dst}] as POST /api/mv sends it, or [src, dst]. */
       case 'rename-file': {
-        const p = args[0] && typeof args[0] === 'object' ? args[0] : { src: args[0], dst: args[1] };
+        const p = (args[0] && typeof args[0] === 'object' ? args[0] : { src: args[0], dst: args[1] }) as { src?: unknown; dst?: unknown };
         return { value: await B.rename(p.src, p.dst) };
       }
       case 'status': return { value: this.status() };
@@ -304,17 +381,17 @@ export class Server {
 }
 
 /* Edwin's key-value store, kept as one JSON file in stateDir (settings and recentf; buffers are not in it). */
-function fileStorage(file, log) {
-  let map = new Map();
+function fileStorage(file: string, log: Log) {
+  let map = new Map<string, string>();
   try { map = new Map(Object.entries(JSON.parse(fs.readFileSync(file, 'utf8')))); } catch (e) { if (e.code !== 'ENOENT') log.warn('storage', { error: e.message }); }
-  let timer = null;
+  let timer: NodeJS.Timeout | null = null;
   const flush = () => { timer = null; try { fs.writeFileSync(file, JSON.stringify(Object.fromEntries(map)), { mode: 0o600 }); } catch (e) { log.warn('storage', { error: e.message }); } };
   const schedule = () => { if (!timer) timer = setTimeout(flush, 500); };
-  return { get: k => (map.has(k) ? map.get(k) : null), set: (k, v) => { map.set(k, String(v)); schedule(); return true; }, remove: k => { map.delete(k); schedule(); }, keys: () => [...map.keys()], flush };
+  return { get: (k: string) => (map.has(k) ? map.get(k) : null), set: (k: string, v: unknown) => { map.set(k, String(v)); schedule(); return true; }, remove: (k: string) => { map.delete(k); schedule(); }, keys: () => [...map.keys()], flush };
 }
 
 /* ---------- --check and --export (R15.12) ---------- */
-export function check(cfg, out = s => process.stdout.write(s + '\n')) {
+export function check(cfg: Config, out = (s: string): unknown => process.stdout.write(s + '\n')) {
   const dir = path.join(cfg.stateDir, 'buffers');
   let bad = 0, n = 0;
   const OT = require(path.join(EDWIN, 'src/ot.js'));
@@ -339,7 +416,7 @@ export function check(cfg, out = s => process.stdout.write(s + '\n')) {
   out(`${n} journals, ${bad} with problems`);
   return bad === 0;
 }
-export async function exportAll(cfg, dir, log) {
+export async function exportAll(cfg: Config, dir: string, log: Log): Promise<number> {
   const server = new Server(cfg, log);
   await server.start();
   fs.mkdirSync(dir, { recursive: true });
@@ -365,11 +442,11 @@ export function guardProcesses() {
   syncBuiltinESMExports();
 }
 
-export async function main(argv) {
+export async function main(argv: string[]): Promise<number | undefined> {
   lockdown();
   guardProcesses();
   const args = [...argv];
-  let config = null, mode = 'run', exportDir = null;
+  let config: string | null | undefined = null, mode = 'run', exportDir: string | null | undefined = null;
   while (args.length) {
     const a = args.shift();
     if (a === '--config') config = args.shift();
@@ -382,12 +459,12 @@ export async function main(argv) {
   if (!config || (mode === 'export' && !exportDir)) return usage();
   const [maj, min] = process.versions.node.split('.').map(Number);
   if (maj < MIN_NODE[0] || (maj === MIN_NODE[0] && min < MIN_NODE[1])) { process.stderr.write(`edwind needs Node ${MIN_NODE.join('.')} or newer (R15.2); this is ${process.versions.node}\n`); return 1; }
-  let cfg;
+  let cfg: Config;
   try { cfg = loadConfig(config); } catch (e) { process.stderr.write(`edwind: ${e.message}\n`); return 1; }
   const log = makeLog(cfg.logLevel);
   if (mode === 'roots') { const a = new Authority(cfg); for (const r of [...a.writeRootsForFlags(), path.dirname(cfg.socket)]) process.stdout.write(r + '\n'); return 0; }
   if (mode === 'check') return check(cfg) ? 0 : 1;
-  if (mode === 'export') { const n = await exportAll(cfg, exportDir, log); process.stdout.write(`${n} buffers exported to ${exportDir}\n`); return 0; }
+  if (mode === 'export') { const n = await exportAll(cfg, exportDir!, log); process.stdout.write(`${n} buffers exported to ${exportDir}\n`); return 0; }
   if (mode === 'primitives') {
     /* The registry (R4.48) needs the image with every module installed; nothing listens. */
     const server = new Server(cfg, makeLog('error'));
@@ -400,12 +477,12 @@ export async function main(argv) {
   const server = new Server(cfg, log);
   try { await server.start(); await server.listen(); }
   catch (e) { process.stderr.write(`edwind: ${e.message}\n`); log.error('start', { error: e.message }); return 1; }
-  let stopping = null;
-  const stop = sig => { if (stopping) return; log.info('signal', { sig }); stopping = server.stop().then(() => process.exit(0), e => { log.error('stop', { error: e.message }); process.exit(1); }); };
+  let stopping: Promise<void> | null = null;
+  const stop = (sig: string) => { if (stopping) return; log.info('signal', { sig }); stopping = server.stop().then(() => process.exit(0), e => { log.error('stop', { error: e.message }); process.exit(1); }); };
   if (isMainThread) { process.on('SIGTERM', () => stop('SIGTERM')); process.on('SIGINT', () => stop('SIGINT')); }
-  else parentPort.on('message', m => { if (m && m.t === 'stop') stop(m.sig); });
+  else parentPort!.on('message', m => { if (m && m.t === 'stop') stop(m.sig); });
   process.on('uncaughtException', e => { log.error('uncaught', { error: e.stack || String(e) }); });
-  process.on('unhandledRejection', e => { log.error('unhandled', { error: (e && e.stack) || String(e) }); });
+  process.on('unhandledRejection', (e: any) => { log.error('unhandled', { error: (e && e.stack) || String(e) }); }); // any: whatever was rejected
   return new Promise(() => {});
 }
 
@@ -413,12 +490,12 @@ export async function main(argv) {
    gets about 1,500 Scheme frames from its default stack and `ulimit -s` belongs to the operator, while a
    worker's stack is the process's own choice. The main thread only relays SIGTERM and SIGINT to the server
    and exits with its code. EDWIND_NO_THREAD=1 runs the server on the main thread (debugging, benchmarks). */
-function runInThread(argv, log) {
+function runInThread(argv: string[], log: Log): Promise<number> {
   return new Promise(resolve => {
-    const resourceLimits = { stackSizeMb: STACK_MB };
+    const resourceLimits: import('node:worker_threads').ResourceLimits = { stackSizeMb: STACK_MB };
     if (Number(process.env.EDWIND_MEMORY_MIB) > 0) resourceLimits.maxOldGenerationSizeMb = Number(process.env.EDWIND_MEMORY_MIB);
     const w = new Worker(fileURLToPath(import.meta.url), { argv, resourceLimits });
-    const stop = sig => w.postMessage({ t: 'stop', sig });
+    const stop = (sig: string) => w.postMessage({ t: 'stop', sig });
     process.on('SIGTERM', () => stop('SIGTERM')); process.on('SIGINT', () => stop('SIGINT'));
     w.on('error', e => { log.error('thread', { error: e.stack || String(e) }); });
     w.on('exit', code => resolve(code));

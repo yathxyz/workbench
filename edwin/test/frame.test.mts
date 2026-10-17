@@ -8,55 +8,70 @@ import net from 'node:net';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { makeDir, startEdwind, stopEdwind, EditClient, EDWIN } from './edit-client.mts';
+import type { Msg, TestDir, EdwindChild, ClientOptions } from './edit-client.mts';
 import { rng, randOp } from './ot-sim.mts';
+import type { EditOp, OTModule } from './ot-sim.mts';
+
+type EdwinCore = any; // any: Edwin's core (edwin/src) is untyped JavaScript
+type Batch = { seq: number; base: number; ops: EditOp[] };
 
 const require = createRequire(import.meta.url);
 const { createHost, loadEdwin, memoryStorage } = require('../src/host-node.js');
-const OT = require('../src/ot.js');
+const OT = require('../src/ot.js') as OTModule;
 
-let dir, child, Ed, E, L, sync;
-const note = (name, text) => { fs.writeFileSync(path.join(dir.dirs.notes, name), text); return name; };
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-async function until(pred, what = 'condition', ms = 8000) { const t0 = Date.now(); while (!pred()) { if (Date.now() - t0 > ms) throw new Error(`timeout waiting for ${what}`); await sleep(10); } }
-const settled = b => until(() => !b.inflight && !b.queue.length && !b.sync.opening, `${b.name} settled`);
+let dir: TestDir, child: EdwindChild, Ed: EdwinCore, E: EdwinCore, L: EdwinCore, sync: EdwinCore;
+const note = (name: string, text: string) => { fs.writeFileSync(path.join(dir.dirs.notes, name), text); return name; };
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+async function until(pred: () => unknown, what = 'condition', ms = 8000) { const t0 = Date.now(); while (!pred()) { if (Date.now() - t0 > ms) throw new Error(`timeout waiting for ${what}`); await sleep(10); } }
+const settled = (b: EdwinCore) => until(() => !b.inflight && !b.queue.length && !b.sync.opening, `${b.name} settled`);
 /* A WebSocket-like object over the unix socket: onopen/onmessage/onclose/onerror, send(text), close(). */
-function transport(sockPath) {
+interface FakeSocket {
+  onopen: (() => void) | null;
+  onmessage: ((e: { data: string }) => void) | null;
+  onclose: (() => void) | null;
+  onerror: ((e: Error) => void) | null;
+  send(str: string): void;
+  close(): void;
+}
+function transport(sockPath: string) {
   return () => {
     const s = net.connect(sockPath); s.setEncoding('utf8');
-    const ws = { onopen: null, onmessage: null, onclose: null, onerror: null, send: str => { s.write(str + '\n'); }, close: () => s.destroy() };
+    const ws: FakeSocket = { onopen: null, onmessage: null, onclose: null, onerror: null, send: str => { s.write(str + '\n'); }, close: () => s.destroy() };
     let buf = '';
     s.on('connect', () => ws.onopen && ws.onopen());
-    s.on('data', d => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 1); if (line && ws.onmessage) ws.onmessage({ data: line }); } });
+    s.on('data', d => { buf += d; let i: number; while ((i = buf.indexOf('\n')) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 1); if (line && ws.onmessage) ws.onmessage({ data: line }); } });
     s.on('close', () => ws.onclose && ws.onclose());
     s.on('error', e => ws.onerror && ws.onerror(e));
     return ws;
   };
 }
-async function client(opts) { const c = new EditClient(dir.cfg.socket, opts); await c.connect(); const w = await c.hello(); assert.equal(w.t, 'welcome'); return c; }
-const feed = async keys => { for (const k of keys) Ed.feedKey(k); await Ed.whenIdle(); };
-const keys = s => feed(Ed.kbd(s).split(' '));
-const type = s => feed([...s].map(ch => (ch === ' ' ? 'SPC' : ch === '\n' ? 'RET' : ch)));
-const show = b => { Ed.setWindowBuffer(b); E.current = b; };
+async function client(opts?: ClientOptions) { const c = new EditClient(dir.cfg.socket, opts); await c.connect(); const w = await c.hello(); assert.equal(w.t, 'welcome'); return c; }
+const feed = async (keys: string[]) => { for (const k of keys) Ed.feedKey(k); await Ed.whenIdle(); };
+const keys = (s: string) => feed(Ed.kbd(s).split(' '));
+const type = (s: string) => feed([...s].map(ch => (ch === ' ' ? 'SPC' : ch === '\n' ? 'RET' : ch)));
+const show = (b: EdwinCore) => { Ed.setWindowBuffer(b); E.current = b; };
 const messages = () => Ed.getBuffer('*Messages*').text;
-async function serverText(id) { const c = await client(); const o = await c.open(id); c.close(); return o.text; }
+async function serverText(id: string) { const c = await client(); const o = await c.open(id); c.close(); return o.text; }
 
 /* A second writer whose replica follows R7.12 (the ot-sim Client over a real socket). */
 class Writer {
-  constructor(c, id) { this.c = c; this.id = id; this.inflight = null; this.queue = []; this.seq = 0; this.acks = new Set(); this.gen = 0; }
-  async open() { const o = await this.c.open(this.id); this.text = this.sverText = o.text; this.sver = o.ver; this.pump(); return this; }
-  pump() { this.loop = (async () => { for (;;) { let m; try { m = await this.c.next(x => x.buf === this.id && (x.t === 'edits' || x.t === 'ack'), 1e9); } catch (e) { return; } this.recv(m); } })(); }
-  local(ops) {
+  declare c: EditClient; declare id: string; declare inflight: Batch | null; declare queue: { ops: EditOp[] }[]; declare seq: number; declare acks: Set<number>; declare gen: number;
+  declare text: string; declare sverText: string; declare sver: number; declare loop: Promise<void>;
+  constructor(c: EditClient, id: string) { this.c = c; this.id = id; this.inflight = null; this.queue = []; this.seq = 0; this.acks = new Set(); this.gen = 0; }
+  async open() { const o = await this.c.open(this.id); this.text = this.sverText = o.text!; this.sver = o.ver!; this.pump(); return this; }
+  pump() { this.loop = (async () => { for (;;) { let m: Msg; try { m = await this.c.next(x => x.buf === this.id && (x.t === 'edits' || x.t === 'ack'), 1e9); } catch (e) { return; } this.recv(m); } })(); }
+  local(ops: EditOp[]) {
     this.text = OT.apply(this.text, ops);
     if (!this.inflight) { this.inflight = { seq: ++this.seq, base: this.sver, ops }; this.send(); } else this.queue.push({ ops });
   }
-  send() { this.c.send({ t: 'edit', buf: this.id, base: this.inflight.base, seq: this.inflight.seq, ops: this.inflight.ops, undo: { g: 'w' + (++this.gen) } }); }
-  recv(msg) {
+  send() { this.c.send({ t: 'edit', buf: this.id, base: this.inflight!.base, seq: this.inflight!.seq, ops: this.inflight!.ops, undo: { g: 'w' + (++this.gen) } }); }
+  recv(msg: Msg) {
     if (msg.t === 'ack') {
       if (this.acks.has(msg.seq)) return;
-      assert.equal(msg.seq, this.inflight.seq, 'ack for the wrong batch');
+      assert.equal(msg.seq, this.inflight!.seq, 'ack for the wrong batch');
       this.acks.add(msg.seq);
-      this.sverText = OT.apply(this.sverText, this.inflight.ops); this.sver = msg.ver; this.inflight = null;
-      if (this.queue.length) { const q = this.queue.shift(); this.inflight = { seq: ++this.seq, base: this.sver, ops: q.ops }; this.send(); }
+      this.sverText = OT.apply(this.sverText, this.inflight!.ops); this.sver = msg.ver; this.inflight = null;
+      if (this.queue.length) { const q = this.queue.shift()!; this.inflight = { seq: ++this.seq, base: this.sver, ops: q.ops }; this.send(); }
       return;
     }
     assert.equal(msg.ver, this.sver + 1, 'edits out of order');
@@ -82,75 +97,100 @@ class Writer {
    id and data attributes, inline style, listeners, innerHTML parsed for the simple markup the core writes,
    the selectors the core and the overlay hooks use (.c, #i, tag.c, .c[data-x="v"], lists), and a fixed
    geometry: a monospace grid of 8 x 21 px in a 600 x 400 view, each .ln at its index. */
-class FakeNode { constructor(doc, type, name) { this.ownerDocument = doc; this.nodeType = type; this.nodeName = name; this.parentNode = null; this.childNodes = []; } get parentElement() { return this.parentNode && this.parentNode.nodeType === 1 ? this.parentNode : null; } }
-class FakeText extends FakeNode { constructor(doc, s) { super(doc, 3, '#text'); this.nodeValue = s; } get textContent() { return this.nodeValue; } }
-const kebab = k => k.replace(/[A-Z]/g, c => '-' + c.toLowerCase());
-const ENT = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
-const decode = s => s.replace(/&(#x[0-9a-fA-F]+|#\d+|[a-zA-Z]+);/g, (m, e) => (e[0] === '#' ? String.fromCodePoint(e[1] === 'x' ? parseInt(e.slice(2), 16) : Number(e.slice(1))) : ENT[e] !== undefined ? ENT[e] : m));
-function parseSelector(sel) {
+interface FakeEvent { type: string; target: FakeElement; defaultPrevented: boolean; preventDefault(): void; [k: string]: unknown }
+type Handler = (e: FakeEvent) => void;
+type FakeChild = FakeElement | FakeText;
+interface Query { tag: string | null; classes: string[]; id: string | null; attrs: { name: string; value: string | null }[] }
+interface Rect { left: number; top: number; width: number; height: number; right: number; bottom: number }
+interface FakeDocument {
+  nodeType: 9; listeners: [string, Handler][]; hit: FakeElement | null;
+  createElement(tag: string): FakeElement; createTextNode(s: string): FakeText;
+  documentElement: FakeElement; body: FakeElement; activeElement: FakeElement;
+  getElementById(id: string): FakeElement | null;
+  addEventListener(t: string, fn: Handler): void; removeEventListener(): void;
+  elementFromPoint(): FakeElement | null;
+  caretPositionFromPoint(): { offsetNode: FakeElement; offset: number } | null;
+  defaultView: {
+    document: FakeDocument;
+    getComputedStyle(): { lineHeight: string; paddingTop: string; paddingLeft: string; paddingRight: string };
+    addEventListener(t: string, fn: Handler): void; removeEventListener(): void; getSelection(): null;
+  };
+}
+class FakeNode {
+  declare ownerDocument: FakeDocument; declare nodeType: number; declare nodeName: string; declare parentNode: FakeElement | null; declare childNodes: FakeChild[];
+  constructor(doc: FakeDocument, type: number, name: string) { this.ownerDocument = doc; this.nodeType = type; this.nodeName = name; this.parentNode = null; this.childNodes = []; } get parentElement() { return this.parentNode && this.parentNode.nodeType === 1 ? this.parentNode : null; } }
+class FakeText extends FakeNode { declare nodeType: 3; declare nodeValue: string; constructor(doc: FakeDocument, s: string) { super(doc, 3, '#text'); this.nodeValue = s; } get textContent() { return this.nodeValue; } }
+const kebab = (k: string) => k.replace(/[A-Z]/g, c => '-' + c.toLowerCase());
+const ENT: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+const decode = (s: string) => s.replace(/&(#x[0-9a-fA-F]+|#\d+|[a-zA-Z]+);/g, (m, e) => (e[0] === '#' ? String.fromCodePoint(e[1] === 'x' ? parseInt(e.slice(2), 16) : Number(e.slice(1))) : ENT[e] !== undefined ? ENT[e] : m));
+function parseSelector(sel: unknown): Query[] {
   return String(sel).split(',').map(part => {
     const m = /^\s*([a-zA-Z0-9-]+)?((?:[.#][-\w]+|\[[-\w]+(?:="[^"]*")?\])*)\s*$/.exec(part);
     if (!m) throw new Error('fake DOM: unsupported selector ' + sel);
-    const q = { tag: m[1] ? m[1].toLowerCase() : null, classes: [], id: null, attrs: [] };
+    const q: Query = { tag: m[1] ? m[1].toLowerCase() : null, classes: [], id: null, attrs: [] };
     for (const t of m[2].match(/[.#][-\w]+|\[[^\]]*\]/g) || []) {
       if (t[0] === '.') q.classes.push(t.slice(1));
       else if (t[0] === '#') q.id = t.slice(1);
-      else { const a = /^\[([-\w]+)(?:="([^"]*)")?\]$/.exec(t); q.attrs.push({ name: a[1], value: a[2] === undefined ? null : a[2] }); }
+      else { const a = /^\[([-\w]+)(?:="([^"]*)")?\]$/.exec(t)!; q.attrs.push({ name: a[1], value: a[2] === undefined ? null : a[2] }); }
     }
     return q;
   });
 }
-function matches(el, q) {
+function matches(el: FakeElement, q: Query) {
   if (q.tag && el.localName !== q.tag) return false;
   if (q.id !== null && el.id !== q.id) return false;
   for (const c of q.classes) if (!el.classList.contains(c)) return false;
   for (const a of q.attrs) { if (!el.attrs.has(a.name)) return false; if (a.value !== null && el.attrs.get(a.name) !== a.value) return false; }
   return true;
 }
-function walk(n, fn) { fn(n); for (const c of n.childNodes) walk(c, fn); }
+function walk(n: FakeChild, fn: (n: FakeChild) => void) { fn(n); for (const c of n.childNodes) walk(c, fn); }
 class FakeElement extends FakeNode {
-  constructor(doc, tag) {
+  declare nodeType: 1; declare tagName: string; declare localName: string; declare attrs: Map<string, string>; declare listeners: [string, Handler, unknown][]; declare value: string; declare _html: string;
+  declare style: { cssText: string; setProperty(k: string, v: unknown): void; getPropertyValue(k: string): string };
+  declare classList: { contains(c: string): boolean; add(...cs: string[]): void; remove(...cs: string[]): void; toggle(c: string, force?: unknown): boolean };
+  declare dataset: Record<string, string | undefined>;
+  constructor(doc: FakeDocument, tag: string) {
     super(doc, 1, tag.toUpperCase());
     this.tagName = tag.toUpperCase(); this.localName = tag.toLowerCase(); this.attrs = new Map(); this.listeners = []; this.value = ''; this._html = '';
     const props = new Map();
     this.style = { cssText: '', setProperty: (k, v) => { props.set(k, String(v)); }, getPropertyValue: k => props.get(k) || '' };
-    const el = this, classes = () => (el.attrs.get('class') || '').split(/\s+/).filter(Boolean), setClasses = cs => { el.attrs.set('class', cs.join(' ')); };
+    const el = this, classes = () => (el.attrs.get('class') || '').split(/\s+/).filter(Boolean), setClasses = (cs: string[]) => { el.attrs.set('class', cs.join(' ')); };
     this.classList = {
       contains: c => classes().includes(c),
       add: (...cs) => { const l = classes(); for (const c of cs) if (!l.includes(c)) l.push(c); setClasses(l); },
       remove: (...cs) => setClasses(classes().filter(c => !cs.includes(c))),
       toggle: (c, force) => { const on = force === undefined ? !classes().includes(c) : !!force; if (on) el.classList.add(c); else el.classList.remove(c); return on; },
     };
-    this.dataset = new Proxy({}, {
+    this.dataset = new Proxy({} as Record<string, string | undefined>, {
       get: (t, k) => (typeof k === 'string' ? el.attrs.get('data-' + kebab(k)) : undefined),
-      set: (t, k, v) => { el.attrs.set('data-' + kebab(k), String(v)); return true; },
-      deleteProperty: (t, k) => { el.attrs.delete('data-' + kebab(k)); return true; },
-      has: (t, k) => el.attrs.has('data-' + kebab(k)),
+      set: (t, k, v) => { el.attrs.set('data-' + kebab(k as string), String(v)); return true; },
+      deleteProperty: (t, k) => { el.attrs.delete('data-' + kebab(k as string)); return true; },
+      has: (t, k) => el.attrs.has('data-' + kebab(k as string)),
     });
   }
   get id() { return this.attrs.get('id') || ''; } set id(v) { this.attrs.set('id', String(v)); }
   get className() { return this.attrs.get('class') || ''; } set className(v) { this.attrs.set('class', String(v)); }
   get hidden() { return this.attrs.has('hidden'); } set hidden(v) { if (v) this.attrs.set('hidden', ''); else this.attrs.delete('hidden'); }
   get title() { return this.attrs.get('title') || ''; } set title(v) { this.attrs.set('title', String(v)); }
-  getAttribute(n) { return this.attrs.has(n) ? this.attrs.get(n) : null; } setAttribute(n, v) { this.attrs.set(n, String(v)); } removeAttribute(n) { this.attrs.delete(n); } hasAttribute(n) { return this.attrs.has(n); }
+  getAttribute(n: string) { return this.attrs.has(n) ? this.attrs.get(n) : null; } setAttribute(n: string, v: unknown) { this.attrs.set(n, String(v)); } removeAttribute(n: string) { this.attrs.delete(n); } hasAttribute(n: string) { return this.attrs.has(n); }
   /* Live, as HTMLCollection is: the core reads length and indexes while it adds and removes. */
-  get children() { const el = this, now = () => el.childNodes.filter(c => c.nodeType === 1); return new Proxy([], { get(t, k) { const c = now(); const v = c[k]; return typeof v === 'function' ? v.bind(c) : v; }, has(t, k) { return k in now(); } }); }
+  get children() { const el = this, now = () => el.childNodes.filter((c): c is FakeElement => c.nodeType === 1); return new Proxy([] as FakeElement[], { get(t, k) { const c = now(); const v = (c as unknown as Record<string | symbol, unknown>)[k]; return typeof v === 'function' ? v.bind(c) : v; }, has(t, k) { return k in now(); } }); }
   get firstChild() { return this.childNodes[0] || null; } get lastChild() { return this.childNodes[this.childNodes.length - 1] || null; }
-  get isConnected() { let n = this; while (n.parentNode) n = n.parentNode; return n === this.ownerDocument.documentElement; }
-  appendChild(c) { if (c.parentNode) c.parentNode.removeChild(c); c.parentNode = this; this.childNodes.push(c); return c; }
-  insertBefore(c, ref) { if (!ref) return this.appendChild(c); if (c.parentNode) c.parentNode.removeChild(c); const i = this.childNodes.indexOf(ref); if (i < 0) throw new Error('fake DOM: insertBefore of a non-child'); c.parentNode = this; this.childNodes.splice(i, 0, c); return c; }
-  removeChild(c) { const i = this.childNodes.indexOf(c); if (i < 0) throw new Error('fake DOM: removeChild of a non-child'); this.childNodes.splice(i, 1); c.parentNode = null; return c; }
-  contains(n) { for (; n; n = n.parentNode) if (n === this) return true; return false; }
-  get textContent() { return this.childNodes.map(c => c.textContent).join(''); }
-  set textContent(s) { for (const c of this.childNodes) c.parentNode = null; this.childNodes = []; this._html = ''; if (s !== '' && s !== null && s !== undefined) this.appendChild(new FakeText(this.ownerDocument, String(s))); }
+  get isConnected() { let n: FakeElement = this; while (n.parentNode) n = n.parentNode; return n === this.ownerDocument.documentElement; }
+  appendChild(c: FakeChild) { if (c.parentNode) c.parentNode.removeChild(c); c.parentNode = this; this.childNodes.push(c); return c; }
+  insertBefore(c: FakeChild, ref: FakeChild | null) { if (!ref) return this.appendChild(c); if (c.parentNode) c.parentNode.removeChild(c); const i = this.childNodes.indexOf(ref); if (i < 0) throw new Error('fake DOM: insertBefore of a non-child'); c.parentNode = this; this.childNodes.splice(i, 0, c); return c; }
+  removeChild(c: FakeChild) { const i = this.childNodes.indexOf(c); if (i < 0) throw new Error('fake DOM: removeChild of a non-child'); this.childNodes.splice(i, 1); c.parentNode = null; return c; }
+  contains(n: FakeChild | null) { for (; n; n = n.parentNode) if (n === this) return true; return false; }
+  get textContent(): string { return this.childNodes.map(c => c.textContent).join(''); }
+  set textContent(s: string | null | undefined) { for (const c of this.childNodes) c.parentNode = null; this.childNodes = []; this._html = ''; if (s !== '' && s !== null && s !== undefined) this.appendChild(new FakeText(this.ownerDocument, String(s))); }
   get innerHTML() { return this._html; }
   set innerHTML(s) {
     this.textContent = ''; this._html = String(s);
     const re = /<\/([a-zA-Z0-9-]+)\s*>|<([a-zA-Z0-9-]+)((?:\s+[a-zA-Z_:][-\w:.]*(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]+))?)*)\s*(\/?)>|([^<]+)|(<)/g;
     const voids = new Set(['br', 'hr', 'img', 'input', 'wbr']);
-    let cur = this, m;
+    let cur: FakeElement = this, m: RegExpExecArray | null;
     while ((m = re.exec(this._html))) {
-      if (m[1]) { if (cur !== this) cur = cur.parentNode; }
+      if (m[1]) { if (cur !== this) cur = cur.parentNode!; }
       else if (m[2]) {
         const el = this.ownerDocument.createElement(m[2]);
         for (const a of m[3].matchAll(/([a-zA-Z_:][-\w:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g)) el.attrs.set(a[1], decode(a[2] ?? a[3] ?? a[4] ?? ''));
@@ -159,29 +199,29 @@ class FakeElement extends FakeNode {
       } else cur.appendChild(new FakeText(this.ownerDocument, m[5] !== undefined ? decode(m[5]) : '<'));
     }
   }
-  querySelectorAll(sel) { const qs = parseSelector(sel), out = []; walk(this, n => { if (n !== this && n.nodeType === 1 && qs.some(q => matches(n, q))) out.push(n); }); return out; }
-  querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
-  closest(sel) { const qs = parseSelector(sel); for (let n = this; n && n.nodeType === 1; n = n.parentNode) if (qs.some(q => matches(n, q))) return n; return null; }
-  addEventListener(t, fn, o) { this.listeners.push([t, fn, o]); } removeEventListener(t, fn) { this.listeners = this.listeners.filter(l => !(l[0] === t && l[1] === fn)); }
+  querySelectorAll(sel: string) { const qs = parseSelector(sel), out: FakeElement[] = []; walk(this, n => { if (n !== this && n.nodeType === 1 && qs.some(q => matches(n, q))) out.push(n); }); return out; }
+  querySelector(sel: string) { return this.querySelectorAll(sel)[0] || null; }
+  closest(sel: string) { const qs = parseSelector(sel); for (let n: FakeElement | null = this; n && n.nodeType === 1; n = n.parentNode) if (qs.some(q => matches(n, q))) return n; return null; }
+  addEventListener(t: string, fn: Handler, o?: unknown) { this.listeners.push([t, fn, o]); } removeEventListener(t: string, fn: Handler) { this.listeners = this.listeners.filter(l => !(l[0] === t && l[1] === fn)); }
   /* Dispatch TYPE from this element up through its ancestors; returns the event. */
-  dispatch(type, init) { const e = { type, target: this, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...init }; for (let n = this; n; n = n.parentNode) for (const [t, fn] of n.listeners || []) if (t === type) fn(e); return e; }
+  dispatch(type: string, init?: Record<string, unknown>): FakeEvent { const e: FakeEvent = { type, target: this, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...init }; for (let n: FakeElement | null = this; n; n = n.parentNode) for (const [t, fn] of n.listeners || []) if (t === type) fn(e); return e; }
   focus() { this.ownerDocument.activeElement = this; } blur() { if (this.ownerDocument.activeElement === this) this.ownerDocument.activeElement = this.ownerDocument.body; }
   getBoundingClientRect() {
-    const rect = (left, top, width, height) => ({ left, top, width, height, right: left + width, bottom: top + height });
+    const rect = (left: number, top: number, width: number, height: number): Rect => ({ left, top, width, height, right: left + width, bottom: top + height });
     const p = this.parentNode;
     if (this.localName === 'span' && p && p.nodeType === 1 && p.classList.contains('text')) return rect(0, 0, this.textContent.length * 8, 21);   // the metrics probe
-    if (this.classList.contains('ln')) return rect(0, p.children.indexOf(this) * 21, 600, 21);
+    if (this.classList.contains('ln')) return rect(0, p!.children.indexOf(this) * 21, 600, 21);
     return rect(0, 0, 600, 400);
   }
   get clientWidth() { return 600; } get clientHeight() { return 400; } get offsetWidth() { return 600; } get offsetHeight() { return this.classList.contains('ln') ? 21 : 400; } get clientTop() { return 0; }
 }
 function makeDocument() {
-  const doc = { nodeType: 9, listeners: [], hit: null };
+  const doc = { nodeType: 9, listeners: [], hit: null } as unknown as FakeDocument;
   doc.createElement = tag => new FakeElement(doc, tag);
   doc.createTextNode = s => new FakeText(doc, s);
   doc.documentElement = doc.createElement('html'); doc.body = doc.createElement('body'); doc.documentElement.appendChild(doc.body);
   doc.activeElement = doc.body;
-  doc.getElementById = id => { let r = null; walk(doc.documentElement, n => { if (!r && n.nodeType === 1 && n.id === id) r = n; }); return r; };
+  doc.getElementById = id => { let r: FakeElement | null = null; walk(doc.documentElement, n => { if (!r && n.nodeType === 1 && n.id === id) r = n; }); return r; };
   doc.addEventListener = (t, fn) => { doc.listeners.push([t, fn]); }; doc.removeEventListener = () => {};
   /* The element and caret under a point: whatever the test put in doc.hit (the view), so posFromPoint
      falls back to the line rectangles. */
@@ -195,7 +235,7 @@ before(async () => {
   dir = makeDir();
   child = await startEdwind(dir);
   const host = createHost({ storage: memoryStorage(), workers: false });
-  Ed = loadEdwin(host); E = Ed.E; L = globalThis.L;
+  Ed = loadEdwin(host); E = Ed.E; L = (globalThis as unknown as { L: EdwinCore }).L;
   sync = await Ed.bootServed({ transport: transport(dir.cfg.socket), device: 'frame-test' });
   await Ed.whenIdle();
 });
@@ -213,7 +253,7 @@ test('R4.11 served boot: no frame, the shipped Scheme loaded, nothing read from 
 });
 
 test('E3 H3 gap 4: served boot evaluates the shipped Scheme without buffers; the buffer list is *scratch* and *Messages*', () => {
-  assert.deepEqual(E.buffers.map(b => b.name).sort(), ['*Messages*', '*scratch*']);
+  assert.deepEqual(E.buffers.map((b: EdwinCore) => b.name).sort(), ['*Messages*', '*scratch*']);
   assert.equal(Number(L.evalText('(length (buffer-list))')), 2);
   /* The sources were evaluated all the same: emacs.scm, evil.scm, org.scm, markdown.scm (through org's require) and init.scm. */
   for (const f of ['emacs', 'evil', 'org', 'markdown', 'notes-syntax', 'address', 'ai', 'init']) assert.equal(L.truthy(L.evalText(`(featurep '${f})`)), true, `(provide '${f})`);
@@ -319,7 +359,7 @@ test('R7.16 reconnect after edwind restarts: the unacknowledged batch is resent 
   const b = await sync.open(id); show(b);
   await type('i1'); await keys('ESC'); await settled(b);
   assert.equal(await serverText(id), '1keep\n');
-  const states = []; const off = sync.on('state', s => states.push(s));
+  const states: string[] = []; const off = sync.on('state', (s: string) => states.push(s));
   await stopEdwind(child);
   await until(() => sync.state !== 'online', 'offline');
   /* Offline edits queue up: the mode line shows the dot. */
@@ -402,7 +442,7 @@ test('R7.14, R7.17 bad_edit and stale_base recover: the buffer reopens and match
   Ed.applyOps(b, [[0, '', 'pending'], ], 'local');
   sync.sock.onmessage({ data: JSON.stringify({ t: 'error', code: 'stale_base', buf: id, seq: b.inflight.seq, msg: 'base 0 is older than the retained history' }) });
   await until(() => /version edwind no longer has/.test(messages()), 'stale_base reported');
-  assert.ok(E.buffers.some(x => /~offline-/.test(x.name) && x.text === 'pendingsafe\n'), 'the unsent edit is kept in an offline copy');
+  assert.ok(E.buffers.some((x: EdwinCore) => /~offline-/.test(x.name) && x.text === 'pendingsafe\n'), 'the unsent edit is kept in an offline copy');
   await settled(b);
   assert.equal(b.text, await serverText(id));
   await type('iok'); await keys('ESC'); await settled(b);
@@ -464,7 +504,7 @@ test('killed and moved: a buffer killed on the server leaves the frame; a messag
 test('moved: a file renamed on the server moves the replica to the new id; the frame keeps editing it and the page hears of it', async () => {
   const id = note('mv-frame.md', 'move me\n');
   const b = await sync.open(id); show(b);
-  const heard = []; const off = sync.on('moved', m => heard.push(m));
+  const heard: Msg[] = []; const off = sync.on('moved', (m: Msg) => heard.push(m));
   const c = await client();
   const r = await c.call('rename-file', [{ src: id, dst: 'mv-framed.md' }]);
   assert.equal(r.value.to, 'mv-framed.md');
@@ -484,7 +524,7 @@ test('moved onto a replica this tab holds: an open of the old id settles with th
   const c = await client();
   assert.equal((await c.call('rename-file', [{ src: id, dst: 'mv-new.md' }])).t, 'result');
   const have = await sync.open('mv-new.md'); show(have);
-  const heard = []; const off = sync.on('moved', m => heard.push(m));
+  const heard: Msg[] = []; const off = sync.on('moved', (m: Msg) => heard.push(m));
   const n = E.buffers.length;
   const got = await sync.open(id, { create: true });   // edwind sends the old id on to mv-new.md
   assert.equal(got, have, 'the open settles with the replica already held');
@@ -493,7 +533,7 @@ test('moved onto a replica this tab holds: an open of the old id settles with th
   assert.deepEqual(heard, [{ buf: id, to: 'mv-new.md' }]); off();
   // Still attached: another writer's edit reaches it, and its own edits are acked.
   const o = await c.open('mv-new.md');
-  await c.edit('mv-new.md', o.ver, [[0, '', 'theirs ']]);
+  await c.edit('mv-new.md', o.ver!, [[0, '', 'theirs ']]);
   await until(() => have.text === 'theirs kept\n', 'the remote edit');
   await type('A, mine'); await keys('ESC');
   await settled(have);
@@ -523,8 +563,8 @@ test('E3 H3 gap 2: Ed.sync.close kills the local replica and moves the window sh
   /* An open still on its way settles with an error when closed. */
   const p = sync.open(note('cl2.md', 'x\n'));
   sync.close('cl2.md');
-  await assert.rejects(p, e => e.code === 'closed');
-  assert.equal(E.buffers.some(x => x.id === 'cl2.md'), false);
+  await assert.rejects(p, (e: Error & { code?: string }) => e.code === 'closed');
+  assert.equal(E.buffers.some((x: EdwinCore) => x.id === 'cl2.md'), false);
 });
 
 test('E3 H3 gap 3: hooks.renderOverlay runs for every frame drawn, with that frame current, the selected frame last', async () => {
@@ -535,8 +575,8 @@ test('E3 H3 gap 3: hooks.renderOverlay runs for every frame drawn, with that fra
   assert.equal(E.frame, f1); assert.equal(E.frames.length, 2);
   assert.ok(el1.classList.contains('edwin-frame') && el1.dataset.kind === 'card' && f1.el('input') && f1.el('windows') && f1.el('echo'));
   /* Frames and windows are compared by identity only: a deep comparison would walk the whole window tree. */
-  const calls = [], prev = Ed.hooks.renderOverlay, order = () => calls.map(c => c.arg && c.arg.id);
-  Ed.hooks.renderOverlay = f => { calls.push({ arg: f, sel: E.sel, root: E.root, frame: E.frame }); if (prev) prev(f); };
+  const calls: { arg: EdwinCore; sel: EdwinCore; root: EdwinCore; frame: EdwinCore }[] = [], prev = Ed.hooks.renderOverlay, order = () => calls.map(c => c.arg && c.arg.id);
+  Ed.hooks.renderOverlay = (f: EdwinCore) => { calls.push({ arg: f, sel: E.sel, root: E.root, frame: E.frame }); if (prev) prev(f); };
   try {
     Ed.render();
     assert.deepEqual(order(), [f2.id, f1.id], 'both frames, the selected one last');
@@ -572,8 +612,8 @@ test('E3 H3 gap 5: hooks.mouseDown gets the event as third argument; readFile fa
   const f = Ed.makeFrame(el, { buffer: b, kind: 'card' });
   Ed.render();
   doc.hit = f.sel.view;
-  const seen = [], prev = Ed.hooks.mouseDown;
-  Ed.hooks.mouseDown = (bb, p, ev) => { seen.push({ bb, p, ev }); if (prev) prev(bb, p, ev); };
+  const seen: { bb: EdwinCore; p: number; ev: FakeEvent }[] = [], prev = Ed.hooks.mouseDown;
+  Ed.hooks.mouseDown = (bb: EdwinCore, p: number, ev: FakeEvent) => { seen.push({ bb, p, ev }); if (prev) prev(bb, p, ev); };
   try {
     const ev = f.el('windows').dispatch('mousedown', { button: 0, shiftKey: false, clientX: 20, clientY: 30 });
     assert.equal(ev.defaultPrevented, true);
@@ -583,7 +623,7 @@ test('E3 H3 gap 5: hooks.mouseDown gets the event as third argument; readFile fa
     assert.equal(seen[0].ev, ev, 'the event is the third argument');
     assert.ok(b.pt === text.indexOf('\n', 9) || b.pt === text.indexOf('\n', 9) - 1, 'the default handler (through the chained hooks) moved point; Normal state keeps it off the newline');
     /* A two-argument hook keeps working. */
-    Ed.hooks.mouseDown = (bb, p) => { bb.pt = p; };
+    Ed.hooks.mouseDown = (bb: EdwinCore, p: number) => { bb.pt = p; };
     f.el('windows').dispatch('mousedown', { button: 0, shiftKey: false, clientX: 0, clientY: 5 });
     assert.ok(b.pt === text.indexOf('\n') || b.pt === text.indexOf('\n') - 1, 'the first line');
   } finally { Ed.hooks.mouseDown = prev; f.destroy(); sync.close(b); }

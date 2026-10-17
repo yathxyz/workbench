@@ -6,6 +6,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startEdwin } from './headless.mts';
+import type { SchemeValue } from './scheme-load.mts';
 
 // A user config directory: init.scm runs after the shipped files (R4.11).
 const configDir = mkdtempSync(join(tmpdir(), 'edwin-config-'));
@@ -17,8 +18,8 @@ writeFileSync(join(configDir, 'init.scm'), `
 `);
 writeFileSync(join(configDir, 'lisp', 'greet.scm'), `(define (greet who) (string-append "hello " who)) (provide 'greet)`);
 const ed = await startEdwin({ configDir });
-const ev = src => ed.eval(src);
-const sym = v => (v && v.name !== undefined ? v.name : v);
+const ev = (src: string) => ed.eval(src);
+const sym = (v: SchemeValue) => (v && v.name !== undefined ? v.name : v);
 let n = 0;
 async function fresh(text = '') {
   await ed.type(`:e s${++n}.txt\n`);
@@ -107,7 +108,7 @@ test('change hooks run for undo, see edit-origin, and a failing one is removed (
       (add-hook! 'after-change-functions broken)`);
   await ed.type('x');
   assert.equal(ed.text(), 'bc');
-  assert.ok(!ed.L.arr(ev('after-change-functions')).some(f => f.procName === 'broken'), 'broken was removed');
+  assert.ok(!ed.L.arr(ev('after-change-functions')).some((f: SchemeValue) => f.procName === 'broken'), 'broken was removed');
   await ed.type('u');
   assert.equal(ed.text(), 'abc');
   ed.Ed.withOrigin('remote', () => ev('(goto-char 1) (insert "r")'));

@@ -17,11 +17,24 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { writeAtomic, sha256 } from './files.mts';
 import { ProtoError } from './proto.mts';
+import type { By, ImageMsg, VarMsg, EchoMsg } from './proto.mts';
+import type { Server, Lisp, SchemeValue } from './main.mts';
+import type { Client } from './session.mts';
+import type { SBuf } from './buffers.mts';
+
+type Scheme = Lisp['S'];
+/* One {t:"form"} line of image.jsonl; `failed` is set in memory by a replay failure and never written. */
+export interface ImageEntry { t: 'form'; gen: number; at: number; by: By; form: string; failed?: { error: string; at: number } }
+/* A shared variable as var{name, value} sends it. */
+export interface SharedValue { name: string; value: unknown }
+/* The result of an image server command. */
+export interface ImageResult { value: unknown; msg?: string }
+export type ImageCommand = (image: ImageLog, client: Client | null, args: unknown[]) => ImageResult | Promise<ImageResult>;
 
 export const name = 'image';
 
 /* Limits (R4.21); the environment lowers them for the gate suite. */
-const envNum = (k, dflt) => { const v = Number(process.env[k]); return Number.isFinite(v) && v > 0 ? v : dflt; };
+const envNum = (k: string, dflt: number) => { const v = Number(process.env[k]); return Number.isFinite(v) && v > 0 ? v : dflt; };
 export const ENTRY_MAX = envNum('EDWIND_IMAGE_ENTRY_BYTES', 1 << 20);
 export const COMPACT_ENTRIES = envNum('EDWIND_IMAGE_COMPACT_ENTRIES', 10000);
 export const COMPACT_BYTES = envNum('EDWIND_IMAGE_COMPACT_BYTES', 16 << 20);
@@ -38,27 +51,27 @@ const NAMED = new Set(['define', 'define-command', 'define-record-type', 'define
 
 export const randomEpoch = () => randomBytes(8).toString('hex');
 /* The origin shown in image-log and the Q2 banner. */
-export const originOf = by => {
+export const originOf = (by: By | null | undefined): string => {
   if (!by || !by.kind) return 'server';
   if (by.kind === 'cli') return by.session ? 'cli:' + by.session : 'cli@' + (by.device || '?');
   if (by.kind === 'frame' || by.kind === 'web') return by.kind + '@' + (by.device || by.cid || '?');
   return by.kind;
 };
-const stamp = ms => new Date(ms).toISOString().replace('T', ' ').slice(0, 19);
-const SERVER_BY = { kind: 'server' };
+const stamp = (ms: number) => new Date(ms).toISOString().replace('T', ' ').slice(0, 19);
+const SERVER_BY: By = { kind: 'server' };
 
 /* A Scheme value as JSON for var{name, value} (R4.18): booleans, numbers, strings, proper lists and vectors
    (both arrays), hash tables with string keys (objects). Anything else is refused by name. */
-export function toJSON(S, v, name) {
-  const bad = what => new S.SchemeError('error', `${name}: a shared variable holds JSON-serialisable values only; ${what}`, []);
-  const conv = x => {
+export function toJSON(S: Scheme, v: SchemeValue, name: string): unknown {
+  const bad = (what: string) => new S.SchemeError('error', `${name}: a shared variable holds JSON-serialisable values only; ${what}`, []);
+  const conv = (x: SchemeValue): unknown => {
     if (x === true || x === false || typeof x === 'string') return x;
     if (typeof x === 'number') { if (!Number.isFinite(x)) throw bad(`${x} is not finite`); return x; }
     if (typeof x === 'bigint') { if (x > BigInt(Number.MAX_SAFE_INTEGER) || x < -BigInt(Number.MAX_SAFE_INTEGER)) throw bad(`${x} is beyond 2^53`); return Number(x); }
     if (x === S.NIL) return [];
-    if (x instanceof S.Pair) { const out = []; let p = x; while (p instanceof S.Pair) { out.push(conv(p.car)); p = p.cdr; } if (p !== S.NIL) throw bad('an improper list'); return out; }
+    if (x instanceof S.Pair) { const out: unknown[] = []; let p = x; while (p instanceof S.Pair) { out.push(conv(p.car)); p = p.cdr; } if (p !== S.NIL) throw bad('an improper list'); return out; }
     if (Array.isArray(x)) return x.map(conv);
-    if (x instanceof Map) { const o = {}; for (const [k, val] of x) { if (typeof k !== 'string') throw bad('a hash table key that is not a string'); o[k] = conv(val); } return o; }
+    if (x instanceof Map) { const o: Record<string, unknown> = {}; for (const [k, val] of x) { if (typeof k !== 'string') throw bad('a hash table key that is not a string'); o[k] = conv(val); } return o; }
     if (x instanceof S.Sym) throw bad(`the symbol ${x.name} (use a string)`);
     if (x === undefined) throw bad('an unbound value');
     throw bad(`${S.write(x)} has no JSON form`);
@@ -69,7 +82,7 @@ export function toJSON(S, v, name) {
   return json;
 }
 /* JSON back to a Scheme value (the inverse of toJSON): arrays become lists, objects hash tables. */
-export function fromJSON(S, j) {
+export function fromJSON(S: Scheme, j: unknown): SchemeValue {
   if (j === null || j === undefined) return false;
   if (Array.isArray(j)) return S.listOf(j.map(x => fromJSON(S, x)));
   if (typeof j === 'object') { const m = new Map(); for (const [k, v] of Object.entries(j)) m.set(k, fromJSON(S, v)); return m; }
@@ -77,7 +90,7 @@ export function fromJSON(S, j) {
   return j;
 }
 /* A server command's JSON result as a Scheme value for %image-command: objects become alists. */
-function resultToScheme(S, j) {
+function resultToScheme(S: Scheme, j: unknown): SchemeValue {
   if (j === null || j === undefined) return false;
   if (Array.isArray(j)) return S.listOf(j.map(x => resultToScheme(S, x)));
   if (typeof j === 'object') return S.listOf(Object.entries(j).map(([k, v]) => S.cons(S.intern(k), resultToScheme(S, v))));
@@ -85,17 +98,29 @@ function resultToScheme(S, j) {
   return j;
 }
 /* A Scheme argument of %image-command as JSON (symbols become strings, alists stay lists). */
-function argToJSON(S, x) {
+function argToJSON(S: Scheme, x: SchemeValue): unknown {
   if (x instanceof S.Sym) return x.name;
   if (typeof x === 'bigint') return Number(x);
   if (x === S.NIL) return [];
-  if (x instanceof S.Pair) return S.arr(x).map(y => argToJSON(S, y));
+  if (x instanceof S.Pair) return S.arr(x).map((y: SchemeValue) => argToJSON(S, y));
   if (x === undefined) return null;
   return x;
 }
 
 export class ImageLog {
-  constructor(file) {
+  declare file: string;
+  declare gen: number;
+  declare entries: ImageEntry[];
+  declare epoch: string | null;
+  /* The bytes of the form lines (the epoch line not counted). */
+  declare bytes: number;
+  declare heads: Set<string>;
+  declare shared: Map<string, { doc: string | null }>;
+  declare server: Server | null;
+  declare refreshTimer: NodeJS.Timeout | null;
+  declare epochTimer: NodeJS.Timeout | null;
+  declare autoFloor: { entries: number; bytes: number };
+  constructor(file: string) {
     this.file = file; this.gen = 0; this.entries = []; this.epoch = null; this.bytes = 0;
     this.heads = new Set(HEADS); this.shared = new Map();
     this.server = null; this.refreshTimer = null; this.epochTimer = null;
@@ -108,28 +133,28 @@ export class ImageLog {
     try { text = fs.readFileSync(this.file, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
     for (const line of text.split('\n')) {
       if (!line) continue;
-      let o; try { o = JSON.parse(line); } catch (e) { continue; } // a torn last line
+      let o: any; try { o = JSON.parse(line); } catch (e) { continue; } // a torn last line; any: a parsed line, checked field by field
       if (o.t === 'epoch') { this.epoch = o.epoch; continue; }
       if (o.t === 'form' && Number.isInteger(o.gen) && typeof o.form === 'string') { this.entries.push(o); this.gen = Math.max(this.gen, o.gen); this.bytes += line.length + 1; }
     }
   }
   /* The epoch changes only when the image is reset, compacted or an entry is reverted (R4.20); a fresh log gets one. */
-  ensureEpoch(make = randomEpoch) {
+  ensureEpoch(make: () => string = randomEpoch): string {
     if (this.epoch) return this.epoch;
     this.epoch = make();
     fs.appendFileSync(this.file, JSON.stringify({ t: 'epoch', epoch: this.epoch, at: Date.now() }) + '\n', { mode: 0o600 });
     return this.epoch;
   }
   /* Append a definitional form with the next generation; the line is on disk (fdatasync) when this returns. */
-  append(form, by) {
-    const entry = { t: 'form', gen: this.gen + 1, at: Date.now(), by, form };
+  append(form: string, by: By): ImageEntry {
+    const entry: ImageEntry = { t: 'form', gen: this.gen + 1, at: Date.now(), by, form };
     const line = JSON.stringify(entry) + '\n';
     const fd = fs.openSync(this.file, 'a', 0o600);
     try { fs.writeSync(fd, line); fs.fdatasyncSync(fd); } finally { fs.closeSync(fd); }
     this.entries.push(entry); this.gen = entry.gen; this.bytes += line.length;
     return entry;
   }
-  after(gen) { return this.entries.filter(e => e.gen > gen); }
+  after(gen: number): ImageEntry[] { return this.entries.filter(e => e.gen > gen); }
   /* Write the whole log fresh: the epoch line, then the entries (reset, compaction, revert). */
   rewrite() {
     const lines = [JSON.stringify({ t: 'epoch', epoch: this.epoch, at: Date.now() })];
@@ -141,24 +166,24 @@ export class ImageLog {
 
   /* ---------- the server side ---------- */
   /* Bind to the server once Edwin is loaded: the primitives of the Scheme side (emacs.scm, "image log"). */
-  attach(server) {
+  attach(server: Server) {
     if (this.server) return;
     this.server = server;
     const { L } = server, S = L.S;
-    const serverOnly = fn => { fn.where = 'server'; return fn; };
+    const serverOnly = (fn: SchemeValue) => { fn.where = 'server'; return fn; };
     serverOnly(L.D('%image-server?', '', '#t in the server image. Frames have no such primitive; emacs.scm tests for it.', () => true));
-    serverOnly(L.D('%declare-definitional', 'symbol', 'Make forms whose head is SYMBOL definitional (R4.14): logged and replicated.', ([h]) => { this.heads.add(S.sym(h, 'declare-definitional').name); return S.intern(S.sym(h).name); }));
-    serverOnly(L.D('%share-variable', 'symbol [doc]', 'Replicate the global SYMBOL: every assignment broadcasts var{name, value} (R4.18).', ([n, doc]) => this.shareVariable(S.sym(n, 'defvar-shared').name, typeof doc === 'string' ? doc : null)));
-    serverOnly(L.D('%image-command', 'name . args', 'Run the image server command NAME (image-log, image-compact, image-reset, image-save-to-init, image-problems, image-revert-entry, image-entries) as the server.', ([n, ...args]) => {
-      const cmd = typeof n === 'string' ? n : S.sym(n, '%image-command').name;
+    serverOnly(L.D('%declare-definitional', 'symbol', 'Make forms whose head is SYMBOL definitional (R4.14): logged and replicated.', ([h]: SchemeValue[]) => { this.heads.add(S.sym(h, 'declare-definitional').name); return S.intern(S.sym(h).name); }));
+    serverOnly(L.D('%share-variable', 'symbol [doc]', 'Replicate the global SYMBOL: every assignment broadcasts var{name, value} (R4.18).', ([n, doc]: SchemeValue[]) => this.shareVariable(S.sym(n, 'defvar-shared').name, typeof doc === 'string' ? doc : null)));
+    serverOnly(L.D('%image-command', 'name . args', 'Run the image server command NAME (image-log, image-compact, image-reset, image-save-to-init, image-problems, image-revert-entry, image-entries) as the server.', ([n, ...args]: SchemeValue[]) => {
+      const cmd: string = typeof n === 'string' ? n : S.sym(n, '%image-command').name;
       if (!COMMANDS[cmd]) throw new S.SchemeError('error', `%image-command: unknown command ${cmd}`, []);
       const r = COMMANDS[cmd](this, null, args.map(a => argToJSON(S, a)));
-      if (r && typeof r.then === 'function') { r.catch(e => server.log.warn('image', { cmd, error: e.message })); return S.intern(cmd); }
-      return resultToScheme(S, r.value);
+      if (r && typeof (r as Promise<ImageResult>).then === 'function') { (r as Promise<ImageResult>).catch(e => server.log.warn('image', { cmd, error: e.message })); return S.intern(cmd); }
+      return resultToScheme(S, (r as ImageResult).value);
     }));
   }
   /* Replay the log after the boot files (R4.19, R15.9): a failing form is kept, marked and never stops the start. */
-  replay(server) {
+  replay(server: Server) {
     this.attach(server);
     const { L, Ed, log } = server;
     let failed = 0;
@@ -170,8 +195,8 @@ export class ImageLog {
     log.info('image', { event: 'replay', entries: this.entries.length, failed, epoch: this.epoch, gen: this.gen });
   }
   /* Is FORM (a read datum) definitional (R4.14)? begin and progn of only such forms count. */
-  isDefinitional(form) {
-    const S = this.server.L.S;
+  isDefinitional(form: SchemeValue): boolean {
+    const S = this.server!.L.S;
     if (!(form instanceof S.Pair) || !(form.car instanceof S.Sym)) return false;
     const head = form.car.name;
     if (head === 'begin' || head === 'progn') { let p = form.cdr, n = 0; while (p instanceof S.Pair) { if (!this.isDefinitional(p.car)) return false; p = p.cdr; n++; } return p === S.NIL && n > 0; }
@@ -181,8 +206,8 @@ export class ImageLog {
   }
   /* The compaction key of a form text (R4.20, R4.21): "head name" for the heads that name a definition, else
      the form itself. A begin of definitions is keyed as a whole. */
-  keyOf(text) {
-    const S = this.server.L.S;
+  keyOf(text: string): string {
+    const S = this.server!.L.S;
     try {
       const f = S.read(text);
       if (f instanceof S.Pair && f.car instanceof S.Sym && NAMED.has(f.car.name) && f.cdr instanceof S.Pair) {
@@ -194,16 +219,16 @@ export class ImageLog {
     return text;
   }
   /* The name a form defines, for the Q2 banner; null for an effect. */
-  nameOf(text) { const k = this.keyOf(text); return k === text ? null : k.slice(k.indexOf(' ') + 1); }
+  nameOf(text: string): string | null { const k = this.keyOf(text); return k === text ? null : k.slice(k.indexOf(' ') + 1); }
 
   /* After evalForm evaluated FORMS (read data) for CLIENT without a condition: log and broadcast the
      definitional ones (R4.15). Returns a note for the echo area, or null. */
-  record(client, forms) {
-    const { L, log } = this.server, S = L.S;
-    const notes = [], texts = [], gens = [];
+  record(client: Client, forms: SchemeValue[]): string | null {
+    const { L, log } = this.server!, S = L.S;
+    const notes: string[] = [], texts: string[] = [], gens: number[] = [];
     for (const f of forms) {
       if (!this.isDefinitional(f)) continue;
-      const text = S.write(f);
+      const text: string = S.write(f);
       const bytes = Buffer.byteLength(text);
       if (bytes > ENTRY_MAX) { notes.push(`Not logged to the image: a form of ${bytes} bytes is over the ${ENTRY_MAX >> 10} KiB limit (R4.21)`); log.warn('image', { event: 'too_large', bytes, by: client.kind }); continue; }
       const entry = this.append(text, client.by());
@@ -223,12 +248,12 @@ export class ImageLog {
     return notes.length ? notes.join('\n') : null;
   }
   /* To every frame and web client (never cli): image, var and msg (R4.15, R4.18). */
-  broadcast(obj, bulkish = false) {
-    for (const c of this.server.clients) if (c.hello && !c.closed && (c.kind === 'frame' || c.kind === 'web')) { if (bulkish) c.sendBulkish(obj); else c.sendBulk(obj); }
+  broadcast(obj: ImageMsg | VarMsg | EchoMsg, bulkish = false) {
+    for (const c of this.server!.clients) if (c.hello && !c.closed && (c.kind === 'frame' || c.kind === 'web')) { if (bulkish) c.sendBulkish(obj); else c.sendBulk(obj); }
   }
   /* image?{from} (§7.4): the entries after FROM as image messages of at most 100 forms, then the current
      value of every shared variable (an assignment made inside a procedure is not a logged form). */
-  sendAfter(client, from) {
+  sendAfter(client: Client, from: number): { gen: number } {
     const entries = this.after(from);
     for (let i = 0; i < entries.length; i += 100) { const slice = entries.slice(i, i + 100); client.sendBulk({ t: 'image', gen: slice[slice.length - 1].gen, forms: slice.map(e => e.form) }); }
     if (client.kind !== 'cli') for (const v of this.sharedValues()) client.sendBulk({ t: 'var', ...v });
@@ -236,21 +261,21 @@ export class ImageLog {
   }
 
   /* ---------- shared variables (R4.18) ---------- */
-  shareVariable(name, doc) {
-    const { L } = this.server, S = L.S;
+  shareVariable(name: string, doc: string | null): SchemeValue {
+    const { L } = this.server!, S = L.S;
     const box = S.gbox(name);
     const desc = Object.getOwnPropertyDescriptor(box, 'value');
-    let cur = desc && desc.get ? desc.get.call(box) : box.value;
+    let cur: SchemeValue = desc && desc.get ? desc.get.call(box) : box.value;
     if (cur !== undefined) toJSON(S, cur, name); // the initial value must be shareable too
     this.shared.set(name, { doc });
-    L.magic(name, () => cur, v => { const json = toJSON(S, v, name); cur = v; this.broadcast({ t: 'var', name, value: json }); }, doc || undefined);
+    L.magic(name, () => cur, (v: SchemeValue) => { const json = toJSON(S, v, name); cur = v; this.broadcast({ t: 'var', name, value: json }); }, doc || undefined);
     if (cur !== undefined) this.broadcast({ t: 'var', name, value: toJSON(S, cur, name) });
     return S.intern(name);
   }
   /* The current values, for a client that (re)connects. */
-  sharedValues() {
-    const { L } = this.server, S = L.S, out = [];
-    for (const name of this.shared.keys()) { let v; try { v = L.get(name); } catch (e) { continue; } if (v !== undefined) { try { out.push({ name, value: toJSON(S, v, name) }); } catch (e) { /* not shareable now */ } } }
+  sharedValues(): SharedValue[] {
+    const { L } = this.server!, S = L.S, out: SharedValue[] = [];
+    for (const name of this.shared.keys()) { let v: SchemeValue; try { v = L.get(name); } catch (e) { continue; } if (v !== undefined) { try { out.push({ name, value: toJSON(S, v, name) }); } catch (e) { /* not shareable now */ } } }
     return out;
   }
 
@@ -258,24 +283,24 @@ export class ImageLog {
   /* A new epoch after the log changed shape: the file is rewritten under it, and every frame and web client is
      told and disconnected, so its reconnect sees welcome.imageEpoch differ and starts a fresh runtime (R7.19).
      The disconnect is deferred so the caller's result goes out first. */
-  changeEpoch(reason) {
+  changeEpoch(reason: string): string {
     this.epoch = randomEpoch();
     this.rewrite();
-    this.server.log.info('image', { event: 'epoch', reason, epoch: this.epoch, entries: this.entries.length, gen: this.gen });
+    this.server!.log.info('image', { event: 'epoch', reason, epoch: this.epoch, entries: this.entries.length, gen: this.gen });
     this.scheduleRefresh();
     if (this.epochTimer) clearTimeout(this.epochTimer);
     this.epochTimer = setTimeout(() => {
       this.epochTimer = null;
-      for (const c of [...this.server.clients]) if (c.hello && !c.closed && (c.kind === 'frame' || c.kind === 'web')) { c.send({ t: 'msg', text: `Image ${reason}: the frame runtime restarts`, level: 'info' }); c.destroy(); }
+      for (const c of [...this.server!.clients]) if (c.hello && !c.closed && (c.kind === 'frame' || c.kind === 'web')) { c.send({ t: 'msg', text: `Image ${reason}: the frame runtime restarts`, level: 'info' }); c.destroy(); }
     }, 20);
     this.epochTimer.unref();
     return this.epoch;
   }
-  overLimit() {
+  overLimit(): boolean {
     return (this.entries.length > COMPACT_ENTRIES && this.entries.length >= this.autoFloor.entries) || (this.bytes > COMPACT_BYTES && this.bytes >= this.autoFloor.bytes);
   }
   /* Keep the last definition per name (R4.20); effects keyed by their text are deduplicated the same way. */
-  compact({ auto = false } = {}) {
+  compact({ auto = false }: { auto?: boolean } = {}) {
     const last = new Map();
     for (const e of this.entries) last.set(this.keyOf(e.form), e.gen);
     const before = this.entries.length;
@@ -294,7 +319,7 @@ export class ImageLog {
     return { archived, gen: 0, epoch: this.epoch };
   }
   /* Append the live entries to <configDir>/init.scm, then reset (R4.20). Failed entries go in as comments. */
-  saveToInit(configDir) {
+  saveToInit(configDir: string) {
     const file = path.join(configDir, 'init.scm');
     const lines = [`\n;;; image log saved ${stamp(Date.now())} (${this.entries.length} entries)`];
     let saved = 0;
@@ -310,18 +335,18 @@ export class ImageLog {
   }
   /* Q2: remove one entry. A definition cannot be undone in place, so the epoch changes and every frame
      rebuilds from the log without it; the server image keeps the definition until its next start. */
-  revertEntry(gen) {
+  revertEntry(gen: number) {
     const i = this.entries.findIndex(e => e.gen === gen);
     if (i < 0) return null;
     const [e] = this.entries.splice(i, 1);
     this.changeEpoch(`entry ${gen} reverted`);
     return { gen: e.gen, form: e.form, by: e.by, epoch: this.epoch };
   }
-  problems() { return this.entries.filter(e => e.failed).map(e => ({ gen: e.gen, at: e.at, by: e.by, origin: originOf(e.by), form: e.form, error: e.failed.error })); }
+  problems() { return this.entries.filter(e => e.failed).map(e => ({ gen: e.gen, at: e.at, by: e.by, origin: originOf(e.by), form: e.form, error: e.failed!.error })); }
   list() { return this.entries.map(e => ({ gen: e.gen, at: e.at, by: e.by, origin: originOf(e.by), form: e.form, failed: e.failed ? e.failed.error : undefined })); }
 
   /* ---------- the *image-log* buffer (R4.20) ---------- */
-  render() {
+  render(): string {
     const out = [`Image log: ${this.entries.length} entries, generation ${this.gen}, epoch ${this.epoch}`, `(${this.file})`, ''];
     for (const e of this.entries) {
       out.push(`#${e.gen}  ${stamp(e.at)}  ${originOf(e.by)}${e.failed ? '  FAILED AT REPLAY: ' + e.failed.error : ''}`);
@@ -330,34 +355,34 @@ export class ImageLog {
     return out.join('\n');
   }
   /* The shared buffer for the log, made on demand: Edwin's read-only special buffer, shared as name:*image-log*. */
-  logBuffer(create) {
-    const { Ed, buffers } = this.server;
+  logBuffer(create: boolean): SBuf | null {
+    const { Ed, buffers } = this.server!;
     let sb = buffers.byId.get(LOG_BUFFER_ID);
     if (sb || !create) return sb || null;
     const ed = Ed.getBufferCreate(LOG_BUFFER); ed.mode = 'special-mode'; ed.readOnly = true;
-    sb = buffers.resolve(LOG_BUFFER_ID, false);
+    sb = buffers.resolve(LOG_BUFFER_ID, false) as SBuf;
     sb.readOnly = 'server special buffer';
     return sb;
   }
   /* Put the current rendering in the buffer as one server batch, so attached clients see it (R6.4). */
-  async refresh(create = false) {
+  async refresh(create = false): Promise<SBuf | null> {
     const sb = this.logBuffer(create);
     if (!sb) return null;
-    await this.server.buffers.replaceText(sb, this.render(), SERVER_BY);
+    await this.server!.buffers.replaceText(sb, this.render(), SERVER_BY);
     sb.savedText = sb.text; sb.savedHash = sha256(sb.savedText); // a rendering is never "modified"
     return sb;
   }
   scheduleRefresh() {
     if (this.refreshTimer || !this.server || !this.server.buffers || !this.server.buffers.byId.has(LOG_BUFFER_ID)) return;
-    this.refreshTimer = setTimeout(() => { this.refreshTimer = null; this.refresh().catch(e => this.server.log.warn('image', { event: 'refresh', error: e.message })); }, 0);
+    this.refreshTimer = setTimeout(() => { this.refreshTimer = null; this.refresh().catch(e => this.server!.log.warn('image', { event: 'refresh', error: e.message })); }, 0);
   }
 }
 
 /* The server commands: (image, client or null, args) -> result. */
-const needForce = (args, cmd) => { const a = args[0]; if (a === true || (a && typeof a === 'object' && a.force === true)) return; throw new ProtoError('bad_request', `${cmd} needs {force: true}: the caller confirms`); };
-const COMMANDS = {
+const needForce = (args: unknown[], cmd: string) => { const a = args[0]; if (a === true || (a && typeof a === 'object' && (a as { force?: unknown }).force === true)) return; throw new ProtoError('bad_request', `${cmd} needs {force: true}: the caller confirms`); };
+const COMMANDS: Record<string, ImageCommand> = {
   'image-log': async (image, client) => {
-    const sb = await image.refresh(true);
+    const sb = (await image.refresh(true))!;
     if (client) client.send({ t: 'display', buf: sb.id, how: 'other-window' });
     return { value: { buf: sb.id, entries: image.entries.length, gen: image.gen }, msg: `Image log: ${image.entries.length} entries` };
   },
@@ -365,9 +390,9 @@ const COMMANDS = {
   'image-problems': image => { const p = image.problems(); return { value: p, msg: p.length ? `${p.length} image entr${p.length === 1 ? 'y' : 'ies'} failed at replay` : 'Every image entry replayed' }; },
   'image-compact': image => { const r = image.compact(); return { value: r, msg: `Image compacted: ${r.dropped} superseded entr${r.dropped === 1 ? 'y' : 'ies'} dropped, ${r.kept} kept` }; },
   'image-reset': (image, client, args) => { needForce(args, 'image-reset'); const r = image.reset(); return { value: r, msg: `Image reset; the old log is ${path.basename(r.archived)}` }; },
-  'image-save-to-init': (image, client, args) => { needForce(args, 'image-save-to-init'); const r = image.saveToInit(image.server.cfg.configDir); return { value: r, msg: `${r.saved} entr${r.saved === 1 ? 'y' : 'ies'} appended to ${r.file}; image reset` }; },
+  'image-save-to-init': (image, client, args) => { needForce(args, 'image-save-to-init'); const r = image.saveToInit(image.server!.cfg.configDir); return { value: r, msg: `${r.saved} entr${r.saved === 1 ? 'y' : 'ies'} appended to ${r.file}; image reset` }; },
   'image-revert-entry': (image, client, args) => {
-    const a = args[0], gen = Number.isInteger(a) ? a : (a && typeof a === 'object' && Number.isInteger(a.gen) ? a.gen : null);
+    const a = args[0], gen = Number.isInteger(a) ? a as number : (a && typeof a === 'object' && Number.isInteger((a as { gen?: unknown }).gen) ? (a as { gen: number }).gen : null);
     if (gen === null) throw new ProtoError('bad_request', 'image-revert-entry needs {gen}');
     const r = image.revertEntry(gen);
     if (!r) throw new ProtoError('bad_request', `no image entry with generation ${gen}`);
@@ -375,13 +400,13 @@ const COMMANDS = {
   },
 };
 
-export async function install(server) {
+export async function install(server: Server) {
   const image = server.image;
   image.attach(server);
   for (const [cmd, fn] of Object.entries(COMMANDS)) server.defineCommand(cmd, (client, args) => fn(image, client, args || []));
   server.statusProviders.push(() => ({ imageGen: image.gen, imageEpoch: image.epoch, imageEntries: image.entries.length, imageBytes: image.bytes, imageProblems: image.problems().length }));
 }
-export async function shutdown(server) {
+export async function shutdown(server: Server) {
   const image = server.image;
   if (image.refreshTimer) { clearTimeout(image.refreshTimer); image.refreshTimer = null; }
   if (image.epochTimer) { clearTimeout(image.epochTimer); image.epochTimer = null; }
