@@ -301,11 +301,17 @@ test('gui.js: window events reach display.input as the page names them; the back
     key('Shift', 'ShiftLeft', { shiftKey: true });
     key('Escape', 'Escape');
     key('Enter', 'Enter');
+    key('@', 'KeyQ', { ctrlKey: true, altKey: true, altGraph: true });
     G.handle(JSON.stringify({ type: 'text', text: 'é a\n' }), frame, on);
     G.handle(JSON.stringify({ type: 'mouse', action: 'down', x: 1, y: 1, button: 0 }), frame, on);
     G.handle(JSON.stringify({ type: 'close' }), frame, on);
     G.handle(JSON.stringify({ type: 'drop', path: '/w/d.txt' }), frame, on);
     G.handle('not json', frame, on);
   } finally { D.input = input; delete G0.__n; }
-  assert.deepEqual(seen, ['x', 'C-x', 'M-x', 'ESC', 'RET', 'é', 'SPC', 'a', 'RET', 'mouse', 'close', 'drop /w/d.txt']);
+  assert.deepEqual(seen, ['x', 'C-x', 'M-x', 'ESC', 'RET', '@', 'é', 'SPC', 'a', 'RET', 'mouse', 'close', 'drop /w/d.txt']);
+
+  // Segments past U+02FF carry display.js's widths, so the window cannot count a character otherwise.
+  const m = G.withWidths({ lines: [[{ x: 0, w: 3, text: 'abc', f: 0 }, { x: 3, w: 4, text: 'a漢\u0627\u0670', f: 0 }]] });
+  assert.equal(m.lines[0][0].cw, undefined);
+  assert.deepEqual(m.lines[0][1].cw, [1, 2, 1, 0]);
 });

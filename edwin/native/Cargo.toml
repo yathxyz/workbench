@@ -16,7 +16,7 @@ path = "src/main.rs"
 [features]
 default = ["gui"]
 # The window (DT2). Without it the binary is the terminal program alone, with no graphics libraries.
-gui = ["dep:winit", "dep:wgpu", "dep:cosmic-text", "dep:arboard", "dep:serde", "dep:serde_json", "dep:bytemuck", "dep:pollster"]
+gui = ["dep:winit", "dep:wgpu", "dep:cosmic-text", "dep:arboard", "dep:serde", "dep:serde_json", "dep:bytemuck", "dep:pollster", "dep:unicode-width"]
 
 [dependencies]
 v8 = "=130.0.1"
@@ -29,6 +29,7 @@ serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
 bytemuck = { version = "1", optional = true, features = ["derive"] }
 pollster = { version = "0.4", optional = true }
+unicode-width = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # The window tests send the window manager's close message (WM_DELETE_WINDOW), as a close button does.

@@ -27,6 +27,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 use winit::window::{Theme, Window, WindowId};
 
@@ -229,10 +230,21 @@ impl App {
             }
             return;
         }
+        // AltGr on Windows-style layouts reports Control and Alt with the character they make (AltGr+Q is @ on a
+        // German layout): a character other than the key's own is typed, as the page's AltGraph does. With Shift
+        // held the key's own character cannot be told from the shifted one, so it stays a C-M- key.
+        let alt_graph = m.control_key()
+            && m.alt_key()
+            && !m.shift_key()
+            && match (&ev.logical_key, ev.key_without_modifiers()) {
+                (Key::Character(s), Key::Character(own)) => s.to_lowercase() != own.to_lowercase(),
+                _ => false,
+            };
         self.key_at.get_or_insert_with(Instant::now);
         self.push(json!({
             "type": "key", "key": key, "code": code, "repeat": ev.repeat,
             "ctrlKey": m.control_key(), "altKey": m.alt_key(), "shiftKey": m.shift_key(), "metaKey": m.super_key(),
+            "altGraph": alt_graph,
         }));
     }
 
@@ -462,7 +474,7 @@ fn latency(d: Duration) {
 /// Wakes the pump when the signal pipe or a socket has something: a thread that polls the descriptors it is
 /// handed (arm) until main.rs takes them back (disarm), so the two never read the same descriptor at once.
 struct Waker {
-    arm: mpsc::Sender<Vec<RawFd>>,
+    arm: mpsc::Sender<Vec<(RawFd, i16)>>,
     done: mpsc::Receiver<()>,
     ctl: [RawFd; 2],
 }
@@ -472,7 +484,7 @@ impl Waker {
         let mut ctl = [-1; 2];
         // SAFETY: pipe(2) fills the two descriptors.
         unsafe { libc::pipe(ctl.as_mut_ptr()) };
-        let (arm, rx) = mpsc::channel::<Vec<RawFd>>();
+        let (arm, rx) = mpsc::channel::<Vec<(RawFd, i16)>>();
         let (tx_done, done) = mpsc::channel();
         let ctl_r = ctl[0];
         std::thread::Builder::new()
@@ -481,10 +493,10 @@ impl Waker {
                 while let Ok(fds) = rx.recv() {
                     let mut p: Vec<libc::pollfd> = fds
                         .iter()
-                        .chain(std::iter::once(&ctl_r))
-                        .map(|&fd| libc::pollfd {
+                        .chain(std::iter::once(&(ctl_r, libc::POLLIN)))
+                        .map(|&(fd, events)| libc::pollfd {
                             fd,
-                            events: libc::POLLIN,
+                            events,
                             revents: 0,
                         })
                         .collect();
@@ -506,7 +518,7 @@ impl Waker {
             .expect("start the wake thread");
         Waker { arm, done, ctl }
     }
-    fn arm(&self, fds: Vec<RawFd>) {
+    fn arm(&self, fds: Vec<(RawFd, i16)>) {
         let _ = self.arm.send(fds);
     }
     fn disarm(&self) {
@@ -612,7 +624,7 @@ impl Gui {
     }
 
     /// Waits up to TIMEOUT (None: until something happens) for window events or FDS, and handles the window's.
-    pub fn pump(&mut self, timeout: Option<Duration>, fds: Vec<RawFd>) {
+    pub fn pump(&mut self, timeout: Option<Duration>, fds: Vec<(RawFd, i16)>) {
         self.waker.arm(fds);
         let status = self.event_loop.pump_app_events(timeout, &mut self.app);
         self.waker.disarm();
@@ -748,17 +760,31 @@ mod tests {
     #[test]
     fn wide_characters_and_combining_marks_take_their_cells() {
         use super::model::{cells, Seg};
+        // The widths as gui.js gives them (display.js's charWidth); U+0670 is one of the marks a table could miss.
         let seg = Seg {
             x: 0,
-            w: 6,
-            text: "a漢e\u{301}🙂".into(),
+            w: 7,
+            text: "a漢e\u{301}🙂\u{627}\u{670}".into(),
             f: 0,
+            cw: vec![1, 2, 1, 0, 2, 1, 0],
         };
         let c: Vec<(u32, String, u32)> = cells(&seg);
         assert_eq!(
             c.iter().map(|x| (x.0, x.2)).collect::<Vec<_>>(),
-            vec![(0, 1), (1, 2), (3, 1), (4, 2)]
+            vec![(0, 1), (1, 2), (3, 1), (4, 2), (6, 1)]
         );
         assert_eq!(c[2].1, "e\u{301}");
+        assert_eq!(c[4].1, "\u{627}\u{670}");
+        // Widths that do not add up to the segment's lay one character per cell.
+        let odd = Seg {
+            w: 3,
+            text: "abc".into(),
+            cw: vec![2, 2, 2],
+            ..seg
+        };
+        assert_eq!(
+            cells(&odd).iter().map(|x| (x.0, x.2)).collect::<Vec<_>>(),
+            vec![(0, 1), (1, 1), (2, 1)]
+        );
     }
 }
