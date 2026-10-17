@@ -2,7 +2,7 @@
 name = "edwin"
 version = "0.1.0"
 edition = "2021"
-description = "Edwin in a terminal: the Edwin core on embedded V8, drawn as a model frame (DT1)"
+description = "Edwin on the desktop: the Edwin core on embedded V8, drawn as a model frame in a terminal (DT1) or a window (DT2)"
 license = "MIT"
 publish = false
 
@@ -13,9 +13,26 @@ publish = false
 name = "edwin"
 path = "src/main.rs"
 
+[features]
+default = ["gui"]
+# The window (DT2). Without it the binary is the terminal program alone, with no graphics libraries.
+gui = ["dep:winit", "dep:wgpu", "dep:cosmic-text", "dep:arboard", "dep:serde", "dep:serde_json", "dep:bytemuck", "dep:pollster"]
+
 [dependencies]
 v8 = "=130.0.1"
 libc = "0.2"
+winit = { version = "0.30", optional = true }
+wgpu = { version = "30", optional = true }
+cosmic-text = { version = "0.19", optional = true }
+arboard = { version = "3", optional = true, default-features = false, features = ["wayland-data-control"] }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+pollster = { version = "0.4", optional = true }
+
+[dev-dependencies]
+# The window tests send the window manager's close message (WM_DELETE_WINDOW), as a close button does.
+x11rb = "0.13"
 
 [build-dependencies]
 v8 = "=130.0.1"

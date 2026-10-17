@@ -43,7 +43,7 @@ at the same path.
 | `test/ot.test.mts`, `test/ot-sim.mts` | the OT properties with fast-check (`edwin-ot`; needs `NODE_PATH` at `tools/node_modules`) |
 | `test/conformance.test.mts`, `test/crash.test.mts`, `test/disk.test.mts`, `test/edit-client.mts` | the edwind gate suites (`edit-conformance`, `edit-crash`, `edit-disk`) and their client |
 | `src/display.js`, `test/display.test.mts` | the display seam (DT0, see below): frames with no page, drawn on a cell grid for a terminal or native backend (`edwin-display`) |
-| `native/` | `edwin`, the desktop program (DT1, see below): a Rust crate with its own Cargo workspace that embeds V8 and these files; `native/js/` is its JavaScript (prelude, host, terminal, startup), `native/tests/` its pseudo-terminal suite (`cargo test`) |
+| `native/` | `edwin`, the desktop program (DT1 and DT2, see below): a Rust crate with its own Cargo workspace that embeds V8 and these files; `native/js/` is its JavaScript (prelude, host, terminal, window, startup), `native/src/gui/` the window, `native/tests/` its pseudo-terminal and virtual-display suites (`cargo test`) |
 | `test/term.test.mts`, `test/native.test.mts` | the terminal encoder and decoder, and the core's seams for the program: files on a disk, exit statuses, input events (`edwin-native`) |
 
 These files came from the published Edwin artifact (version 1791768765, 2026-10-12). From now on this directory is
@@ -291,7 +291,7 @@ Choices E2 made where the spec left one open, and where it had to deviate:
   backend defined in `init.scm` runs before the module loads (define it after, or on feature `models`).
   Thread batches carry an undo group (`undo: {g: "thread-…"}`) so gptel output undoes like any writer's.
 
-## Step E3: frames in the browser (in review)
+## Step E3: frames in the browser (done)
 
 E3 puts Edwin into the page cards (spec §9, §10, R8.16–R8.20, R13.7): with `edit.frames` on, every page card
 is an Edwin frame on a shared buffer served by edwind, the buffer the agent tools, the notes index and the
@@ -409,7 +409,68 @@ Choices E3 made where the spec left one open, and where it had to deviate:
 - **Not in E3**: K4 (Edwin keymaps in the board's conflict checker) waits for the keymaps PR; a display-text
   mechanism in the renderer (block-ref text is a DOM post-pass) and an `imenuItems` hook are left for later.
 
-## Step DT1: `edwin` in a terminal (in review)
+## Step DT2: `edwin --gui`, a window (in review)
+
+`edwin -g FILE` (or `--gui`) opens Edwin in a window of its own on the Linux desktop. It is the same program, the
+same core and the same model frame as `edwin -nw`; only the backend differs. The terminal stays the default, so
+`$EDITOR=edwin` in a terminal is unchanged; `EDITOR="edwin -g"` gives a window that blocks until it closes, as
+`gvim -f` does. Without a display, or without the system libraries the window needs, `edwin -g` says why and runs
+in the terminal; with no terminal either it exits with status 1.
+
+- **The window.** Rust opens it (winit 0.30, X11 and Wayland) before V8 starts. Each redisplay `native/js/gui.js`
+  hands the model (DT0's format) to Rust as JSON; `src/gui/` draws it with wgpu (Vulkan, else GL) as one instanced
+  pass of rectangles and glyphs from an atlas, the glyphs shaped and rasterized by cosmic-text. Text sits on the
+  model's cell grid: the cell is the font's advance wide and 1.5 times its size high (the page's line height,
+  `EDWIN_LINE_HEIGHT`). The font is `EDWIN_FONT` ("Iosevka 12", "Iosevka" or "12"), else the first of JetBrains Mono
+  (the page's), its Nerd Font build, DejaVu Sans Mono and Liberation Mono, at 10.5 points; characters the font lacks
+  fall back to the system's fonts (CJK, emoji in colour). `--geometry=COLSxROWS` sets the first size (100x36).
+- **Events.** Keys arrive as the page's keydown does (key, code, modifiers) and are named by the core's own
+  `Ed.keyName`, so a key means in the window what it means on the page. An input method's preedit is drawn at the
+  cursor and its commit inserted as typed text. Mouse, wheel, focus and resize are `Ed.display.input` events, as in
+  the terminal. Kills and yanks go to the system clipboard; `C-S-v` pastes from it. The close button runs
+  `save-buffers-kill-terminal` (it asks about changed files); a file dropped on the window is visited. The title is
+  the buffer's name; the bell asks for attention when the window is not focused; `C-z` iconifies.
+- **One loop.** The window's events, edwind's socket and signals share one thread: winit's loop is pumped with the
+  next timer as its timeout, and a helper thread wakes it when a descriptor becomes readable.
+
+The parity checklist against the browser frame (DT2's gate), each item with how it was checked:
+
+| Browser frame | Window | Checked by |
+|---|---|---|
+| Faces: fg, bg, bold, italic, underline, strike, box | yes | `a_model_draws_its_faces_text_and_cursor` (offscreen render of a model dumped from the core) |
+| Wide characters, combining marks, emoji | yes | `wide_characters_and_combining_marks_take_their_cells`; screenshot |
+| Splits, dividers, a modeline per window, active and inactive | yes | the dumped model (a vertical split); screenshot of `C-x 2` |
+| Minibuffer, echo area, multi-line prompts | yes | screenshot of the close button's save prompt |
+| Vertico (`M-x`), Corfu (completion at point) | yes | screenshots |
+| Cursor per Evil state (box, bar, hbar, half); hollow when unfocused and in other windows | yes | offscreen render (bar); screenshots |
+| Region and Visual selection | yes | screenshot of a mouse drag |
+| Presence cursors with the writer's name (edwind) | yes | `another_writer_is_a_bar_and_a_name_tag` |
+| Keys named as on the page, `C-`, `M-`, Shift | yes | `native.test.mts` (gui.js); `keys_and_clicks_edit_and_wq_leaves_zero` (xdotool on Xvfb) |
+| Mouse: click, drag, wheel | yes | the same test (click); by hand (drag, wheel) |
+| Clipboard both ways | yes | by hand, with xclip |
+| Resize; HiDPI | yes | by hand (`xdotool windowsize`; `WINIT_X11_SCALE_FACTOR=2`) |
+| Leaving: `:wq`, `:q!`, the close button asks about changes | yes | `keys_and_clicks_edit_and_wq_leaves_zero`, `the_close_button_asks_about_changes` |
+| Input methods | drawn and inserted | not checked against a real input method (none in the test machine) |
+| Wayland | built | only X11 was run (Xvfb) |
+
+The latency budget, fixed for DT2: from a key's arrival in the window to the frame's present, on a 200x50 window of
+source text, **p50 at most 10 ms and p99 at most 25 ms** on Mesa's software renderer (lavapipe), the slowest GPU
+the window will meet. `cargo test --release -- --ignored latency` measures it (`EDWIN_GUI_LATENCY_LOG=FILE` logs
+each key in microseconds). Measured on 2026-10-17 (121 keys: moving, typing, `C-d`): p50 8.3 ms, p99 17.4 ms. Of
+one key: the command, redisplay and the model as JSON 2 to 4 ms; parsing 0.1 ms; building the scene 1 to 2 ms; the
+software renderer's present 3 to 4 ms (a hardware GPU removes most of that). The compositor's frame comes after.
+
+Build and test: `cargo build --release` builds the window in (the `gui` feature; `--no-default-features` builds the
+terminal program alone). It needs, at run time, libxkbcommon, and on X11 libX11, libX11-xcb and libxkbcommon-x11
+(winit loads them; `edwin -g` checks for them first), a Vulkan or GL driver, and fontconfig's fonts. `cargo test
+--release` runs the window's tests on their own Xvfb when `Xvfb` and `xdotool` are installed, and skips them
+otherwise. The binary is 48.6 MB (37.6 without the window). The window opens in about 100 ms on the software
+renderer before the snapshot restores, so the first frame is drawn at about 146 ms (40 ms in a terminal).
+
+Not in DT2: ligatures (each cell is shaped alone, as the grid needs), proportional fonts, the pulse animation,
+images, a menubar, smooth scrolling, opening the window while the snapshot restores, and Nix packaging (DT4).
+
+## Step DT1: `edwin` in a terminal (done)
 
 `edwin [-nw] [-R] [--standalone | --socket PATH] [+LINE] [FILE]...` is Edwin as a terminal program, meant to stand
 in for Vim or Neovim, `$EDITOR` included. `edwin/native` is a Rust crate (its own Cargo workspace, so V8 stays out
