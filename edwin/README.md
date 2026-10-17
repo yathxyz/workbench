@@ -90,7 +90,7 @@ Choices E0 made where the spec left one open:
 `edwin/server/` is edwind: a Node process that loads the core headless, keeps every shared buffer as an Edwin
 buffer, sequences edits from any number of clients over `edit.sock`, journals them, saves atomically and watches
 the files on disk. `crates/wb-cli` is `wb buf`, `wb eval`, `wb edit` and `wb repl` over the same socket.
-`nix/package.nix` installs `share/edwin/{src,scm,server}` and `bin/edwind`; `nix/module.nix` has
+`nix/edwind.nix` installs `share/edwin/{src,scm,server}` and `bin/edwind` (the workbench package links them); `nix/module.nix` has
 `services.workbench.edit.*` and `workbench-edit.service`; `nix/checks.nix` has `edwin-ot`, `edit-conformance`,
 `edit-crash` (about thirteen minutes: 1,000 kills) and `edit-disk`; `nix/vm.nix` step 10 covers R16.18's E1 part.
 
@@ -409,7 +409,33 @@ Choices E3 made where the spec left one open, and where it had to deviate:
 - **Not in E3**: K4 (Edwin keymaps in the board's conflict checker) waits for the keymaps PR; a display-text
   mechanism in the renderer (block-ref text is a DOM post-pass) and an `imenuItems` hook are left for later.
 
-## Step DT2: `edwin --gui`, a window (in review)
+## Step DT4: Edwin from the flake (in review)
+
+The flake builds Edwin on its own, as Emacs ships `emacs`, `emacs --daemon` and `emacsclient`:
+
+| Output | What |
+|---|---|
+| `packages.edwin` (`nix run .#edwin -- FILE`) | `bin/edwin` (terminal, `-g` window), `bin/edwin-daemon`, `bin/edwind` (`nix/edwin.nix`) |
+| `packages.edwind` (`nix run .#edwind -- --config F`) | edwind alone (`nix/edwind.nix`); the workbench package links it for `services.workbench.edit` |
+| `nixosModules.edwin` | `programs.edwin.enable`, `.daemon.enable` (edwind as a systemd user service), `.daemon.notesDir`, `.defaultEditor` |
+
+- **The daemon.** `edwin --daemon` starts the user's edwind in the background (`--fg-daemon` in the foreground,
+  which the user service runs) on `$XDG_RUNTIME_DIR/edwin/edit.sock`. Its config is `EDWIND_CONFIG` when set,
+  else one written at each start: notes in `EDWIN_NOTES_DIR` (`~/notes`), state in `~/.local/state/edwin/edwind`,
+  the user's Scheme in `~/.config/edwin`, the log (background start) in `~/.local/state/edwin/edwind.log`.
+- **The client.** There is no separate client: every `edwin` and `edwin -g` attaches to the first edwind that
+  answers on `--socket`, `$EDWIN_SOCKET`, `$XDG_RUNTIME_DIR/edwin/edit.sock` or `/run/workbench-edit/edit.sock`
+  (Workbench's), so notes are shared between frames and with the browser. Files outside the notes directory stay
+  the program's own (DT1). `--standalone` never attaches.
+- **The build.** The prebuilt V8 (`librusty_v8` 130.0.1) is a fixed-output fetch handed to the `v8` crate as
+  `RUSTY_V8_ARCHIVE`, so the build runs offline. The window's libraries (libxkbcommon, Wayland, Vulkan, libGL, X11)
+  are added to the binary's RPATH, as winit and wgpu open them at run time. The check phase runs the
+  pseudo-terminal suite; the window's tests skip in the sandbox (no display). The flake check `edwin-module`
+  evaluates a system with `programs.edwin` (the user unit, `EDITOR`); it does not boot one.
+- **The window from Nix** needs the system's GPU drivers where wgpu looks for them: `hardware.graphics.enable` on
+  NixOS (`/run/opengl-driver`); elsewhere, Nix's Mesa through `VK_ICD_FILENAMES` or nixGL.
+
+## Step DT2: `edwin --gui`, a window (done)
 
 `edwin -g FILE` (or `--gui`) opens Edwin in a window of its own on the Linux desktop. It is the same program, the
 same core and the same model frame as `edwin -nw`; only the backend differs. The terminal stays the default, so
@@ -468,7 +494,7 @@ otherwise. The binary is 48.6 MB (37.6 without the window). The window opens in 
 renderer before the snapshot restores, so the first frame is drawn at about 146 ms (40 ms in a terminal).
 
 Not in DT2: ligatures (each cell is shaped alone, as the grid needs), proportional fonts, the pulse animation,
-images, a menubar, smooth scrolling, opening the window while the snapshot restores, and Nix packaging (DT4).
+images, a menubar, smooth scrolling, opening the window while the snapshot restores, and Nix packaging (DT4, above).
 
 ## Step DT1: `edwin` in a terminal (done)
 
@@ -479,7 +505,7 @@ source it runs: the unchanged core in `src/`, the shipped Scheme in `scm/`, and 
 floor: files, `/dev/tty` in raw mode, signals through a self-pipe, edwind's socket and one `poll(2)` loop. Edwin is
 a model frame (DT0) drawn by `native/js/term.js`.
 
-Build and run (the prebuilt V8 is downloaded by the `v8` crate's build script, or named by `RUSTY_V8_ARCHIVE`):
+Build and run (the prebuilt V8 is downloaded by the `v8` crate's build script, or named by `RUSTY_V8_ARCHIVE`; `nix build .#edwin` does it all, see DT4):
 
     cd edwin/native && cargo build --release && ./target/release/edwin FILE
     cargo test --release        # the pseudo-terminal suite (the edwind case needs node)

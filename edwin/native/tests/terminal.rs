@@ -582,7 +582,10 @@ fn attached_notes_go_through_edwind_and_other_files_stay_local() {
     t.pump(500);
     t.keys("Gotyped in the terminal").esc().keys(":w\r");
     t.pump(500);
-    t.keys(":e local.txt\r").keys("Aedited").esc().keys(":wq\r");
+    t.keys(":e local.txt\r").keys("Aedited").esc().keys(":w\r");
+    t.pump(300);
+    // :wq on the note: edwind's save answers later, and the quit still goes through once it has.
+    t.keys(":b a.md\r").keys("Goand quit").esc().keys(":wq\r");
     assert_eq!(t.exit(), 0);
     assert_eq!(read(d.join("local.txt")), "localedited\n");
     writeln!(node.stdin.as_mut().unwrap(), "done").unwrap();
@@ -590,6 +593,6 @@ fn attached_notes_go_through_edwind_and_other_files_stay_local() {
     let _ = node.wait();
     assert_eq!(
         after,
-        r##"{"server":"# Shared page\ntyped in the terminal\n","disk":"# Shared page\ntyped in the terminal\n"}"##
+        r##"{"server":"# Shared page\ntyped in the terminal\nand quit\n","disk":"# Shared page\ntyped in the terminal\nand quit\n"}"##
     );
 }
