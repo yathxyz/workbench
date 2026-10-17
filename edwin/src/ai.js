@@ -73,6 +73,7 @@ function setKey(name, key) {
 }
 /* Move keys saved as gptel/keys/<backend> files by older versions out of the file Store. */
 function migrateKeys() {
+  if (Ed.host.files) return;   // a file system never held them
   for (const n of Ed.Store.list()) if (n.startsWith(KEY_PFX)) { const v = Ed.Store.get(n); if (v && !getKey(n.slice(KEY_PFX.length))) setKey(n.slice(KEY_PFX.length), v); Ed.Store.del(n); }
 }
 try { migrateKeys(); } catch (e) { console.error(e); }

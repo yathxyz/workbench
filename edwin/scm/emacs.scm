@@ -310,11 +310,6 @@ of a line, swap the two characters before point."
   (interactive "*")
   (insert (format-time-string "%F")))
 
-(define-command (save-buffers-kill-terminal)
-  "Explain how to leave: Edwin lives in this page."
-  (interactive)
-  (message "Edwin runs inside this page; close the tab to quit. Unsaved buffers are lost."))
-
 ;;;; Key bindings
 
 (for-each

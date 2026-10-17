@@ -30,12 +30,19 @@ const later = (f, ms) => {
   call.flush = () => { if (h) run(); };
   return call;
 };
+/* The tables are read when this file loads, and read again by Ed.reloadPersistent() on a host whose storage
+   was not there yet when the core loaded (the desktop shell's startup snapshot, DT1). A reader replaces what
+   it reads into, so reading twice changes nothing. */
+const readers = [];
+const persistent = f => { readers.push(f); f(); };
+Ed.reloadPersistent = () => { for (const f of readers) { try { f(); } catch (e) { console.error(e); } } };
 const flushAll = () => { for (const run of [...pending]) { try { run(); } catch (e) { console.error(e); } } };
 host.onSuspend(flushAll);
 const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
 L.defvar('savehist-mode', true, 'Non-#f keeps the minibuffer histories (M-x, files, buffers, ex, search) across reloads.');
 L.defvar('save-place-mode', true, 'Non-#f puts point back where it was the last time a file was visited.');
+L.defvar('save-place-ignore-files-regexp', '(^|/)(COMMIT_EDITMSG|MERGE_MSG|TAG_EDITMSG|EDIT_DESCRIPTION|git-rebase-todo|addp-hunk-edit\\.diff|svn-commit\\.tmp)$', 'Files whose place is not restored or kept (a regexp on the file name): the messages git and others hand to $EDITOR start at the top, as in Emacs and Vim.');
 L.defvar('save-place-limit', 600, 'How many files save-place remembers; the least recently visited go first.');
 L.defvar('savehist-additional-variables', listOf([intern('kill-ring'), intern('search-ring')]), 'What savehist keeps besides the minibuffer histories: kill-ring (the last 40 kills) and search-ring.');
 L.defvar('recentf-mode', true, 'Non-#f orders find-file and consult-recent-file by last visit.');
@@ -51,15 +58,17 @@ L.defvar('evil-snipe-repeat-scope', intern('whole-visible'), '; and , repeat a s
 /* ---------- savehist: minibuffer histories survive a reload ---------- */
 function extra(name) { try { return arr(L.get('savehist-additional-variables')).some(x => x instanceof Sym && x.name === name); } catch (e) { return false; } }
 {
-  const saved = Meta.get('savehist', null);
   const strings = a => (Array.isArray(a) ? a.filter(s => typeof s === 'string') : []);
-  if (saved && typeof saved === 'object') {
-    for (const [k, v] of Object.entries(saved.kinds || {})) Ed.historyFor(k).push(...strings(v));
-    E.history.push(...strings(saved.mini));
-    if (E.exHistory) E.exHistory.push(...strings(saved.ex));
-    if (E.searchHistory && extra('search-ring')) E.searchHistory.push(...strings(saved.search));
+  const fill = (a, v) => { a.length = 0; a.push(...strings(v)); };
+  persistent(() => {
+    const saved = Meta.get('savehist', null);
+    if (!saved || typeof saved !== 'object') return;
+    for (const [k, v] of Object.entries(saved.kinds || {})) fill(Ed.historyFor(k), v);
+    fill(E.history, saved.mini);
+    if (E.exHistory) fill(E.exHistory, saved.ex);
+    if (E.searchHistory && extra('search-ring')) fill(E.searchHistory, saved.search);
     if (extra('kill-ring') && !E.killRing.length) E.killRing.push(...strings(saved.kills));
-  }
+  });
   const write = () => {
     if (!truthy(L.get('savehist-mode'))) return;
     const kinds = {};
@@ -76,27 +85,40 @@ function extra(name) { try { return arr(L.get('savehist-additional-variables')).
 
 /* ---------- prescient-persist-mode: the frequency table behind M-x, buffers and files ---------- */
 {
-  const saved = Meta.get('prescient', null);
-  /* Prototype-free copies, as the tables in editor-core.js are, so __proto__ is a candidate like any other. */
-  if (saved && saved.kinds && typeof saved.kinds === 'object') {
-    const kinds = Object.create(null);
-    for (const [k, t] of Object.entries(saved.kinds)) if (t && typeof t === 'object') kinds[k] = Object.assign(Object.create(null), t);
-    Ed.prescient.kinds = kinds; Ed.prescient.tick = Number(saved.tick) || 0;
-  }
+  persistent(() => {
+    const saved = Meta.get('prescient', null);
+    /* Prototype-free copies, as the tables in editor-core.js are, so __proto__ is a candidate like any other. */
+    if (saved && saved.kinds && typeof saved.kinds === 'object') {
+      const kinds = Object.create(null);
+      for (const [k, t] of Object.entries(saved.kinds)) if (t && typeof t === 'object') kinds[k] = Object.assign(Object.create(null), t);
+      Ed.prescient.kinds = kinds; Ed.prescient.tick = Number(saved.tick) || 0;
+    }
+  });
   Ed.prescient.save = later(() => { if (truthy(L.get('prescient-persist-mode'))) Meta.set('prescient', { tick: Ed.prescient.tick, kinds: Ed.prescient.kinds }); }, 500);
 }
 D('prescient-forget!', '', 'Empty the prescient frequency table.', () => { Ed.prescient.kinds = Object.create(null); Ed.prescient.tick = 0; Meta.set('prescient', null); return false; });
 
 /* ---------- save-place and recentf ---------- */
 /* File -> point, the least recently visited first (a file moves to the end when visited). */
-const places = Object.assign(Object.create(null), Meta.get('places', {}));
-let recent = (Meta.get('recentf', []) || []).filter(s => typeof s === 'string');
+/* With a file system (host.files) the keys are absolute paths, and a file is offered by its label (relative
+   to the working directory, or under ~), which visit resolves again. */
+const places = Object.create(null);
+let recent = [];
+persistent(() => {
+  for (const k of Object.keys(places)) delete places[k];
+  Object.assign(places, Meta.get('places', {}));
+  recent = (Meta.get('recentf', []) || []).filter(s => typeof s === 'string');
+});
+const fsys = () => host.files || null;
+const label = f => (fsys() && fsys().label ? fsys().label(f) : f);
 function placeOf(name, pt) { delete places[name]; places[name] = pt; }
 /* Keep save-place-limit files, dropping those deleted from the store and not open in a buffer. */
 const savePlaces = later(() => {
-  const all = new Set(Ed.Store.list());
-  for (const b of E.buffers) if (b.file) all.add(b.file);
-  for (const f of Object.keys(places)) if (!all.has(f)) delete places[f];
+  if (!fsys()) {
+    const all = new Set(Ed.Store.list());
+    for (const b of E.buffers) if (b.file) all.add(b.file);
+    for (const f of Object.keys(places)) if (!all.has(f)) delete places[f];
+  }
   const keys = Object.keys(places), max = Math.max(0, Number(L.get('save-place-limit')) || 0);
   for (const f of keys.slice(0, Math.max(0, keys.length - max))) delete places[f];
   Meta.set('places', places);
@@ -111,26 +133,35 @@ function touchRecent(name) {
   if (recent.length > max) recent.length = max;
   saveRecent();
 }
+const placeIgnored = name => { const re = L.get('save-place-ignore-files-regexp'); try { return typeof re === 'string' && re !== '' && new RegExp(re).test(name); } catch (e) { return false; } };
 H.visited = (b, name, fresh) => {
   touchRecent(name);
-  if (fresh && truthy(L.get('save-place-mode')) && own(places, name) && typeof places[name] === 'number') { b.pt = Math.max(0, Math.min(b.rope.length, places[name])); placeOf(name, places[name]); }
+  if (fresh && truthy(L.get('save-place-mode')) && !placeIgnored(name) && own(places, name) && typeof places[name] === 'number') { b.pt = Math.max(0, Math.min(b.rope.length, places[name])); placeOf(name, places[name]); }
 };
 H.wrote = (b, name) => touchRecent(name);
 /* Saved files, the most recently visited first and the rest by name. */
 H.recentFiles = () => {
   const all = Ed.Store.list(), left = new Set(all), out = [];
-  for (const f of recent) if (left.has(f)) { out.push(f); left.delete(f); }
+  for (const f of recent) {
+    const l = label(f);
+    if (left.has(l)) { out.push(l); left.delete(l); }
+    else if (fsys() && fsys().exists && !out.includes(l) && fsys().exists(f)) out.push(l);
+  }
   for (const f of all) if (left.has(f)) out.push(f);
   return out;
 };
 D('recentf-list', '', 'The recently visited files, most recent first.', () => listOf(H.recentFiles()));
-CMD('recentf-cleanup', '', '', 'Forget recent files that no longer exist.', () => { const all = new Set(Ed.Store.list()); recent = recent.filter(f => all.has(f)); saveRecent(); return false; });
+CMD('recentf-cleanup', '', '', 'Forget recent files that no longer exist.', () => {
+  if (fsys() && fsys().exists) recent = recent.filter(f => fsys().exists(f));
+  else { const all = new Set(Ed.Store.list()); recent = recent.filter(f => all.has(f)); }
+  saveRecent(); return false;
+});
 {
   const prev = H.postCommand;
   H.postCommand = (def, b, failed) => {
     if (prev) prev(def, b, failed);
     const c = E.current;
-    if (c.file && !E.mini && places[c.file] !== c.pt) { placeOf(c.file, c.pt); savePlaces(); }
+    if (c.file && !E.mini && places[c.file] !== c.pt && !placeIgnored(c.file)) { placeOf(c.file, c.pt); savePlaces(); }
   };
 }
 
@@ -268,7 +299,7 @@ function applyTheme(name) {
   E.metricsGen++;
 }
 ownTheme = hostTheme;
-{ const saved = Meta.get('theme', null); if (saved && THEMES[saved]) setThemeAttr(THEMES[saved]); }
+persistent(() => { const saved = Meta.get('theme', null); if (saved && THEMES[saved]) setThemeAttr(THEMES[saved]); });
 const currentTheme = () => (L.call('theme-dark?', []) ? 'modus-vivendi-tinted' : 'modus-operandi-tinted');
 const themeCompleter = extra => () => [...Object.keys(THEMES), ...extra];
 const themeAnnotate = n => (n === 'auto' ? 'follow the page (prefers-color-scheme or data-theme)' : THEMES[n] === 'light' ? 'light, warm background' : 'dark, blue-black background');

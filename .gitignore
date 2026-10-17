@@ -3,3 +3,4 @@
 /result-*
 __pycache__/
 /tools/node_modules/
+/edwin/native/target/

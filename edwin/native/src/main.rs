@@ -1,0 +1,185 @@
+//! edwin: Edwin's JavaScript core on embedded V8, in a terminal (DT1).
+//!
+//! The Rust side is the host's floor: the files, the terminal, signals, edwind's socket and the event loop.
+//! Everything Edwin is runs as JavaScript: native/js/prelude.js, host-native.js, term.js and main.js, which
+//! loads the unchanged core from edwin/src. All of it is compiled into the binary, with the shipped Scheme.
+//!
+//! The loop: poll the terminal, the signal pipe and the sockets; hand what arrived to JS; run due timers;
+//! run microtasks; write what JS drew; sleep until the next input or timer.
+
+mod natives;
+mod snapshot;
+mod sources;
+mod sys;
+
+use std::time::Instant;
+
+/// ICU's data, for V8's \p{...} classes and Unicode case folding (build.rs finds it).
+#[repr(C, align(16))]
+struct Aligned<T: ?Sized>(T);
+static ICU_DATA: &Aligned<[u8]> =
+    &Aligned(*include_bytes!(concat!(env!("OUT_DIR"), "/icudtl.dat")));
+/// The startup snapshot build.rs made: the core loaded and booted with the shipped Scheme.
+static SNAPSHOT: &Aligned<[u8]> =
+    &Aligned(*include_bytes!(concat!(env!("OUT_DIR"), "/snapshot.bin")));
+
+fn main() {
+    // V8 runs on a thread whose stack holds the Scheme evaluator's depth cap (R4.34; edwind sizes it alike).
+    let code = std::thread::Builder::new()
+        .name("edwin".into())
+        .stack_size(96 << 20)
+        .spawn(run)
+        .expect("start the V8 thread")
+        .join()
+        .unwrap_or(70);
+    std::process::exit(code);
+}
+
+/// Whether main.js will attach to edwind, whose boot (Ed.bootServed) the snapshot cannot hold: the same
+/// choice main.js makes (--standalone, --socket, EDWIN_NO_ATTACH, EDWIN_SOCKET, the service's socket).
+fn will_attach() -> bool {
+    let args: Vec<String> = std::env::args().skip(1).take_while(|a| a != "--").collect();
+    if args
+        .iter()
+        .any(|a| a == "--standalone" || a == "--help" || a == "-h" || a == "--version")
+        || std::env::var_os("EDWIN_NO_ATTACH").is_some()
+    {
+        return false;
+    }
+    if args
+        .iter()
+        .any(|a| a == "--socket" || a.starts_with("--socket="))
+    {
+        return true;
+    }
+    let mut cands: Vec<String> = std::env::var("EDWIN_SOCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .into_iter()
+        .collect();
+    cands.push("/run/workbench-edit/edit.sock".into());
+    cands
+        .iter()
+        .any(|p| std::os::unix::net::UnixStream::connect(p).is_ok())
+}
+
+fn run() -> i32 {
+    snapshot::init_v8(&ICU_DATA.0);
+    natives::start_clock(Instant::now());
+    sys::install_signals();
+    let restore = std::env::var_os("EDWIN_NO_SNAPSHOT").is_none() && !will_attach();
+    let mut params = v8::CreateParams::default().external_references(&**natives::external_refs());
+    if restore {
+        params = params.snapshot_blob(&SNAPSHOT.0[..]);
+    }
+    let isolate = &mut v8::Isolate::new(params);
+    let scope = &mut v8::HandleScope::new(isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let fresh: &[&str] = &[
+        "native/prelude",
+        "native/host-native",
+        "native/term",
+        "native/main",
+    ];
+    let names = if restore {
+        &fresh[3..]
+    } else {
+        natives::install(scope, context);
+        fresh
+    };
+    for name in names {
+        if !natives::run_source(scope, name) {
+            sys::tty_close();
+            return 70;
+        }
+        scope.perform_microtask_checkpoint();
+        if let Some(code) = natives::exit_code() {
+            sys::tty_close();
+            return code;
+        }
+    }
+    let code = event_loop(scope, context);
+    sys::tty_close();
+    code
+}
+
+fn global_fn<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    obj: v8::Local<v8::Object>,
+    name: &str,
+) -> v8::Local<'s, v8::Function> {
+    let k = v8::String::new(scope, name).unwrap();
+    v8::Local::<v8::Function>::try_from(obj.get(scope, k.into()).unwrap())
+        .unwrap_or_else(|_| panic!("__native.{name} is not a function"))
+}
+
+fn event_loop(scope: &mut v8::HandleScope, context: v8::Local<v8::Context>) -> i32 {
+    let g = context.global(scope);
+    let k = v8::String::new(scope, "__native").unwrap();
+    let nat = g.get(scope, k.into()).unwrap().to_object(scope).unwrap();
+    let (tick, next, input) = (
+        global_fn(scope, nat, "tick"),
+        global_fn(scope, nat, "next"),
+        global_fn(scope, nat, "input"),
+    );
+    let (signal, sock) = (
+        global_fn(scope, nat, "signal"),
+        global_fn(scope, nat, "sock"),
+    );
+    let recv: v8::Local<v8::Value> = nat.into();
+    let mut next_ms: f64 = 0.0;
+    loop {
+        sys::flush_out();
+        if let Some(code) = natives::exit_code() {
+            return code;
+        }
+        let timeout = if next_ms < 0.0 {
+            -1
+        } else {
+            next_ms.ceil().min(i32::MAX as f64) as i32
+        };
+        let ready = sys::wait(timeout);
+        for sig in ready.signals {
+            let s = v8::String::new(scope, sig).unwrap();
+            let tc = &mut v8::TryCatch::new(scope);
+            signal.call(tc, recv, &[s.into()]);
+            tc.perform_microtask_checkpoint();
+        }
+        if let Some(text) = ready.input {
+            let s = v8::String::new(scope, &text).unwrap();
+            let tc = &mut v8::TryCatch::new(scope);
+            input.call(tc, recv, &[s.into()]);
+            tc.perform_microtask_checkpoint();
+        }
+        if ready.tty_gone {
+            // The terminal hung up without a SIGHUP reaching us (a closed pty): the same path.
+            let s = v8::String::new(scope, "HUP").unwrap();
+            signal.call(scope, recv, &[s.into()]);
+        }
+        for (id, line) in ready.socket_lines {
+            let a0 = v8::Integer::new(scope, id as i32).into();
+            let a1 = match line {
+                Some(l) => v8::String::new(scope, &l).unwrap().into(),
+                None => v8::null(scope).into(),
+            };
+            let tc = &mut v8::TryCatch::new(scope);
+            sock.call(tc, recv, &[a0, a1]);
+            tc.perform_microtask_checkpoint();
+        }
+        if natives::exit_code().is_some() {
+            continue;
+        }
+        let tc = &mut v8::TryCatch::new(scope);
+        tick.call(tc, recv, &[]);
+        tc.perform_microtask_checkpoint();
+        next_ms = next
+            .call(tc, recv, &[])
+            .and_then(|v| v.number_value(tc))
+            .unwrap_or(-1.0);
+        if natives::idle_without_work() && next_ms < 0.0 {
+            // No terminal, no socket, no timer: nothing can happen any more.
+            return natives::exit_code().unwrap_or(0);
+        }
+    }
+}

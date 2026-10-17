@@ -16,7 +16,8 @@ let
   };
   edwin = lib.fileset.toSource {
     root = ../edwin;
-    fileset = ../edwin;
+    # An in-tree build of the desktop program (edwin/native) leaves its target/ beside the sources.
+    fileset = lib.fileset.difference ../edwin (lib.fileset.maybeMissing ../edwin/native/target);
   };
   # The address suite cuts bufferAddress and friends out of web/app.js, so it sees that one file too.
   edwinApp = lib.fileset.toSource {
@@ -234,6 +235,14 @@ in
   # and the face and palette tables checked against index.html's, markdown-mode's and Org's stylesheets.
   edwin-display = pkgs.runCommand "workbench-edwin-display" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     node --test ${edwin}/test/display.test.mjs
+    touch $out
+  '';
+
+  # The desktop program's JavaScript (DT1): the terminal encoder and decoder (native/js/term.js), and the
+  # core's seams it uses (files on a disk, leaving with an exit status, input events). The program itself is
+  # tested in a pseudo-terminal by edwin/native/tests (cargo test).
+  edwin-native = pkgs.runCommand "workbench-edwin-native" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    node --test ${edwin}/test/term.test.mjs ${edwin}/test/native.test.mjs
     touch $out
   '';
 

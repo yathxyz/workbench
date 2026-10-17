@@ -629,5 +629,59 @@ function posAt(f, x, y) {
 function redraw(f) { if (f && f.backend) { f._rkey = null; Ed.scheduleRender(); } }
 function setTheme(f, theme) { f.theme = theme === 'dark' ? 'dark' : theme === 'light' ? 'light' : null; redraw(f); }
 
-Ed.display = { PALETTE, FACES, resolveFace, parseColor, charWidth, strWidth, glyphsOf, wrap, frameModel, posAt, redraw, setTheme };
+/* ---------- input: what a backend reports, as the page's frame wiring does it (wire in editor-prims) ----------
+   input(f, ev) takes one event in cell terms:
+     {type: 'key', key}                     an Emacs key description ("C-x", "M-f", "<up>", "a")
+     {type: 'paste', text}                  pasted text (bracketed paste), yanked as one insertion
+     {type: 'focus', focused}               the window system's focus came or went
+     {type: 'mouse', action, x, y, button}  action down, drag, up or wheel (dy: +1 down, -1 up), button 0 = left
+     {type: 'resize'}                       backend.size() changed */
+const WHEEL_LINES = 3;
+function input(f, ev) {
+  if (!f || !f.backend || !ev) return;
+  const take = () => { if (E.frames.includes(f) && E.frame !== f) Ed.selectFrame(f); };
+  const hook = name => { try { L.resetOps(); L.runHook(name); } catch (e) { Ed.reportError(e); } };
+  switch (ev.type) {
+    case 'key': take(); Ed.feedKey(ev.key); return;
+    case 'paste': if (!ev.text) return; take(); E.pasteText = ev.text; Ed.feedKey('<cmd:clipboard-yank>'); return;
+    case 'focus': {
+      f.focused = !!ev.focused;
+      if (f.focused) take();
+      hook(f.focused ? 'focus-in-hook' : 'focus-out-hook'); Ed.frameEvent(f.focused ? 'focus' : 'blur', f); redraw(f); return;
+    }
+    case 'resize': redraw(f); return;
+    case 'mouse': mouse(f, ev, take); return;
+  }
+}
+function mouse(f, ev, take) {
+  const st = f._mouse || (f._mouse = { from: null, win: null });
+  if (ev.action === 'up') { st.from = null; st.win = null; return; }
+  const at = posAt(f, ev.x, ev.y);
+  if (ev.action === 'wheel') {
+    const w = at && at.window; if (!w || !ev.dy) return;
+    Ed.scrollWindow(w, ev.dy * WHEEL_LINES);
+    const sel = f.sel === w, b = w.buffer, l = Ed.lineNoB(b, sel ? b.pt : w.pt), l1 = Ed.lineNoB(b, w.start), l2 = l1 + (w.rows || 20) - 1;
+    if (sel && !E.mini && (l < l1 || l > l2)) { b.pt = Ed.lineStartB(b, l < l1 ? l1 : l2); if (H.clampPoint) H.clampPoint(b); }
+    Ed.frameRender(); return;
+  }
+  if (ev.action === 'drag') {
+    if (st.from === null || !at || at.window !== st.win || at.area !== 'text' || E.frame !== f) return;
+    const b = st.win.buffer;
+    if (H.mouseDrag) H.mouseDrag(b, st.from, at.pos);
+    else { b.mark = st.from; b.pt = at.pos; b.markActive = at.pos !== st.from; }
+    Ed.render(); return;
+  }
+  if (ev.action !== 'down' || (ev.button || 0) !== 0) return;
+  take();
+  if (E.mini || !at || !at.window) return;
+  if (at.window !== f.sel) Ed.selectWindow(at.window);
+  if (at.area !== 'text') { Ed.render(); return; }
+  const b = at.window.buffer;
+  if (E.isearch) E.isearch = null;
+  if (H.mouseDown) H.mouseDown(b, at.pos, { button: 0, shiftKey: !!ev.shift, ctrlKey: !!ev.ctrl, altKey: !!ev.meta });
+  else { b.pt = at.pos; b.markActive = false; }
+  st.from = at.pos; st.win = at.window; Ed.frameEvent('point', f, b); Ed.render();
+}
+
+Ed.display = { PALETTE, FACES, resolveFace, parseColor, charWidth, strWidth, glyphsOf, wrap, frameModel, posAt, redraw, setTheme, input };
 })();

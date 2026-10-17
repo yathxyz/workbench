@@ -1,0 +1,31 @@
+[package]
+name = "edwin"
+version = "0.1.0"
+edition = "2021"
+description = "Edwin in a terminal: the Edwin core on embedded V8, drawn as a model frame (DT1)"
+license = "MIT"
+publish = false
+
+# Its own workspace: the V8 dependency stays out of the Workbench crates and their Nix build.
+[workspace]
+
+[[bin]]
+name = "edwin"
+path = "src/main.rs"
+
+[dependencies]
+v8 = "=130.0.1"
+libc = "0.2"
+
+[build-dependencies]
+v8 = "=130.0.1"
+libc = "0.2"
+
+[profile.release.build-override]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+panic = "abort"
