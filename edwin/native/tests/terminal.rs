@@ -507,7 +507,7 @@ fn the_user_init_runs_and_settings_persist() {
     assert_eq!(read(d.join("p.txt")), "a\nb\nd\n");
 }
 
-/// Attaching to edwind needs Node and edwind's test harness (edwin/test/edit-client.mjs); skipped without node.
+/// Attaching to edwind needs Node and edwind's test harness (edwin/test/edit-client.mts); skipped without node.
 #[test]
 fn attached_notes_go_through_edwind_and_other_files_stay_local() {
     if std::process::Command::new("node")
@@ -519,7 +519,7 @@ fn attached_notes_go_through_edwind_and_other_files_stay_local() {
         return;
     }
     use std::io::{BufRead, Write};
-    let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/edwind-up.mjs");
+    let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/edwind-up.mts");
     let mut node = std::process::Command::new("node")
         .arg(&helper)
         .stdin(std::process::Stdio::piped())

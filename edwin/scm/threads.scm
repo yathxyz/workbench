@@ -1,6 +1,6 @@
 ;;; threads.scm --- Scheme side of the server image's threads (spec §4.8)  -*- scheme -*-
 ;;
-;; Loaded by edwin/server/threads.mjs into the server image only; the primitives it wraps are
+;; Loaded by edwin/server/threads.mts into the server image only; the primitives it wraps are
 ;; server-only (R4.49). with-timeout and with-mutex are the usual macros over the primitives.
 
 (define-syntax with-timeout

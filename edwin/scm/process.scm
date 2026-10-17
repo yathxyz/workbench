@@ -1,6 +1,6 @@
 ;;; process.scm --- Scheme side of processes through the hub (spec §4.8: R4.43, R4.44)  -*- scheme -*-
 ;;
-;; Loaded by edwin/server/process.mjs into the server image only. The primitives (make-process,
+;; Loaded by edwin/server/process.mts into the server image only. The primitives (make-process,
 ;; process-send-string, kill-process, %call-process, ...) are server-only (R4.49); this file adds the
 ;; Emacs-shaped conveniences over them and the list-processes command.
 

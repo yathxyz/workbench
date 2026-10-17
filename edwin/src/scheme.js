@@ -13,7 +13,7 @@
 (function () {
 function schemeModule(g) {
 'use strict';
-/* Read once at load: false compiles the shadow stack out (scheme-bench.mjs measures its cost). */
+/* Read once at load: false compiles the shadow stack out (scheme-bench.mts measures its cost). */
 const SHADOW = g.SCHEME_SHADOW_STACK !== false;
 /* Generator mode (R4.38): set at load with g.SCHEME_MODE = 'gen', or later with Scheme.setMode. */
 let GEN = g.SCHEME_MODE === 'gen';

@@ -4,7 +4,7 @@
    wrapping, widths, the line height. A model frame (Ed.makeFrame(null, {backend})) has no page. Each redisplay
    this file lays it out on a grid of character cells, backend.size() = {cols, rows}, and hands the result to
    backend.draw(model). A terminal (DT1) and a native window (DT2) are such backends; so is the fake backend of
-   test/display.test.mjs. The core, the modes and the Scheme image are the same as in the browser.
+   test/display.test.mts. The core, the modes and the Scheme image are the same as in the browser.
 
    The model is plain data, so a backend in another language can take it as JSON:
      cols, rows, theme ('light' | 'dark'), focused, title
@@ -19,7 +19,7 @@
    Faces are data here too: FACES gives each class the renderer emits (renderBuffer's runs, Org and markdown-mode
    classes, the modeline and echo parts) a spec in palette tokens, and PALETTE gives the tokens the values of
    edwin/index.html in its light and dark themes. A token set with set-face-color! (host.page vars) wins, as it
-   does on the page. test/display.test.mjs checks both tables against the stylesheets they mirror.
+   does on the page. test/display.test.mts checks both tables against the stylesheets they mirror.
 
    What a model frame does not show yet: snipe boxes and the pulse are cell faces or nothing (no animation), the
    display text of markdown block references (a DOM pass in markdown.js) shows the reference, and the menubar of a

@@ -250,7 +250,7 @@ in
   # core's seams it uses (files on a disk, leaving with an exit status, input events). The program itself is
   # tested in a pseudo-terminal by edwin/native/tests (cargo test).
   edwin-native = pkgs.runCommand "workbench-edwin-native" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --test ${edwin}/test/term.test.mjs ${edwin}/test/native.test.mjs
+    node --test ${edwin}/test/term.test.mts ${edwin}/test/native.test.mts
     touch $out
   '';
 

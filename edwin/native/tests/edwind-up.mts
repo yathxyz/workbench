@@ -2,7 +2,7 @@
 // line from stdin, prints a.md as edwind and the disk have it, stops edwind and exits.
 import fs from 'node:fs';
 import path from 'node:path';
-const { makeDir, startEdwind, stopEdwind, EditClient } = await import(new URL('../../test/edit-client.mjs', import.meta.url));
+import { makeDir, startEdwind, stopEdwind, EditClient } from '../../test/edit-client.mts';
 const dir = makeDir();
 fs.writeFileSync(path.join(dir.dirs.notes, 'a.md'), '# Shared page\n');
 const child = await startEdwind(dir);

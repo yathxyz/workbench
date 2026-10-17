@@ -645,7 +645,7 @@ of a line, swap the two characters before point."
 ;; The image log (spec 4.4): a definitional form evaluated in the server image is logged with a
 ;; generation and evaluated by every frame runtime in order, so one image spans many runtimes and
 ;; survives restarts.  The primitives %image-server?, %declare-definitional, %share-variable and
-;; %image-command exist in the server image only (server/image.mjs); a frame has none of them, which
+;; %image-command exist in the server image only (server/image.mts); a frame has none of them, which
 ;; is how a form learns where it runs.  The commands below run in the server image.
 
 (define (image-server?)
@@ -2752,7 +2752,7 @@ FILES    Files are kept in this browser's storage.  emacs.scm, evil.scm
 <script type="text/x-scheme" id="notes-syntax-scm">
 ;;; notes-syntax.scm: the one grammar of notes (spec R10.2, R11.2)
 ;;;
-;;; Everything that reads a note agrees here: the notes index (edwin/server/notes-parse.mjs), markdown-mode's
+;;; Everything that reads a note agrees here: the notes index (edwin/server/notes-parse.mts), markdown-mode's
 ;;; font-lock (E3) and the tests. The grammar is data: regular-expression source strings in the JavaScript
 ;;; dialect (no flags; the reader adds them) and lists of keywords. (notes-grammar) returns it as an alist of
 ;;; name -> value, which the index reads once at install and ships to its parser worker.
@@ -2906,7 +2906,7 @@ FILES    Files are kept in this browser's storage.  emacs.scm, evil.scm
 ;; A pure Scheme port of bufferAddress, fmtAddr and resolveBufferAddress in web/app.js (the
 ;; "addresses" section).  An address names a place in a Markdown buffer by its heading path, the
 ;; paragraph number under the innermost heading and a short quote of the words at point, so it
-;; reads aloud and survives line shifts.  The golden test edwin/test/address.test.mjs checks every
+;; reads aloud and survives line shifts.  The golden test edwin/test/address.test.mts checks every
 ;; procedure here against the JavaScript over generated cases, so the regexps and the order of
 ;; the steps below follow app.js exactly, including its corners (a quote may keep a trailing
 ;; space when the line ends in whitespace, an empty name resolves to the first buffer, and so on).

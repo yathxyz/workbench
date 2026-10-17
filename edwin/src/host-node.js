@@ -35,8 +35,8 @@ const readText = p => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { r
    pool.js runs the same code on a Web Worker in the browser and on a worker_threads Worker here; the
    differences of the two APIs are absorbed by PoolThread, which looks like a Web Worker to the pool:
    onmessage and onerror properties, postMessage(value, transferList), terminate(). Every thread is the
-   file server/worker.mjs (never code built from a string), which imports the Edwin sources and the named
-   jobs of server/jobs.mjs. ref/unref are Node's: the pool holds a thread only while work is outstanding,
+   file server/worker.mts (never code built from a string), which imports the Edwin sources and the named
+   jobs of server/jobs.mts. ref/unref are Node's: the pool holds a thread only while work is outstanding,
    so a process whose main thread is done (a test, --check, --export) ends without terminating them. */
 const workerCount = () => Math.min(6, Math.max(1, (os.availableParallelism ? os.availableParallelism() : os.cpus().length) - 1));
 /* A thread's stack must hold what --stack-size tells V8 it may use (edwind sizes it for the Scheme depth
@@ -63,8 +63,8 @@ class PoolThread {
   ref() { this.thread.ref(); }
   unref() { this.thread.unref(); }
 }
-/* The named jobs of server/jobs.mjs, for the main thread: the functions by name (the fallback when the
-   pool is off, and what EdPool.define may name) and the names jobs.mjs keeps on the main thread. The
+/* The named jobs of server/jobs.mts, for the main thread: the functions by name (the fallback when the
+   pool is off, and what EdPool.define may name) and the names jobs.mts keeps on the main thread. The
    module is loaded synchronously (require of an ES module, Node 22.12 and later); where that is not
    possible the pool runs with no threads, as before. */
 function loadJobs() {
@@ -108,8 +108,8 @@ function createHost(opts = {}) {
     onCspViolation() {},
     idle: f => setTimeout(f, 0),
     nextFrame: f => setTimeout(f, 0),
-    /* The worker pool (R4.47): threads from server/worker.mjs, min(6, CPUs - 1) of them, the named jobs of
-       server/jobs.mjs; workers is false when the pool must stay off (then every job runs on the main thread). */
+    /* The worker pool (R4.47): threads from server/worker.mts, min(6, CPUs - 1) of them, the named jobs of
+       server/jobs.mts; workers is false when the pool must stay off (then every job runs on the main thread). */
     workers: opts.workers !== false && !!jobs,
     workersUnavailable: jobsError,
     workerCount: workerCount(),

@@ -1,6 +1,6 @@
 ;;; notes-syntax.scm: the one grammar of notes (spec R10.2, R11.2)
 ;;;
-;;; Everything that reads a note agrees here: the notes index (edwin/server/notes-parse.mjs), markdown-mode's
+;;; Everything that reads a note agrees here: the notes index (edwin/server/notes-parse.mts), markdown-mode's
 ;;; font-lock (E3) and the tests. The grammar is data: regular-expression source strings in the JavaScript
 ;;; dialect (no flags; the reader adds them) and lists of keywords. (notes-grammar) returns it as an alist of
 ;;; name -> value, which the index reads once at install and ships to its parser worker.

@@ -3,7 +3,7 @@
 ;; A pure Scheme port of bufferAddress, fmtAddr and resolveBufferAddress in web/app.js (the
 ;; "addresses" section).  An address names a place in a Markdown buffer by its heading path, the
 ;; paragraph number under the innermost heading and a short quote of the words at point, so it
-;; reads aloud and survives line shifts.  The golden test edwin/test/address.test.mjs checks every
+;; reads aloud and survives line shifts.  The golden test edwin/test/address.test.mts checks every
 ;; procedure here against the JavaScript over generated cases, so the regexps and the order of
 ;; the steps below follow app.js exactly, including its corners (a quote may keep a trailing
 ;; space when the line ends in whitespace, an empty name resolves to the first buffer, and so on).
