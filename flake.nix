@@ -11,11 +11,24 @@
       workbench = pkgs.callPackage ./nix/package.nix { };
       vendor = pkgs.callPackage ./nix/vendor.nix { };
       workbench-web = pkgs.callPackage ./nix/web.nix { inherit vendor; };
+      # What a release profile holds (N-12): the binaries, the web root and the commit they came from.
+      release = pkgs.runCommand "workbench-release" { } ''
+        mkdir $out
+        ln -s ${workbench}/bin $out/bin
+        ln -s ${workbench-web} $out/web
+        echo ${self.rev or self.dirtyRev or "unknown"} > $out/rev
+        echo ${toString self.lastModified} > $out/lastModified
+      '';
     in
     {
       packages.${system} = {
         default = workbench;
-        inherit workbench workbench-web vendor;
+        inherit
+          workbench
+          workbench-web
+          vendor
+          release
+          ;
         # The scripted ACP agent the VM, ui and conformance checks register as `stub`.
         fake-acp = workbench.fake;
       };

@@ -15,6 +15,9 @@ let
     types
     ;
   system = pkgs.stdenv.hostPlatform.system;
+  # wb-web and edwind run from the release profile when there is one; the hub always runs `package` (N-12).
+  frontBin = if cfg.releaseProfile != null then "${cfg.releaseProfile}/bin" else "${cfg.package}/bin";
+  pinnedRelease = self.packages.${system}.release;
   userCfg = config.users.users.${cfg.user};
   home = userCfg.home;
   json = pkgs.formats.json { };
@@ -102,7 +105,7 @@ let
       socket = "/run/workbench-web/web.sock";
       hubSocket = "/run/workbench-hub/hub.sock";
       stateDir = "${home}/.local/state/workbench/web";
-      webRoot = "${cfg.webPackage}";
+      webRoot = if cfg.releaseProfile != null then "${cfg.releaseProfile}/web" else "${cfg.webPackage}";
       # The same list edit.json carries (R14.8); wb-web's /api/mv reads it instead of its built-in copy.
       refusePaths = readOnlyUserPaths;
     }
@@ -211,6 +214,19 @@ in
       default = self.packages.${system}.workbench-web;
       defaultText = lib.literalExpression "workbench.packages.\${system}.workbench-web";
       description = "The web root served by wb-web.";
+    };
+
+    releaseProfile = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/nix/var/nix/profiles/workbench";
+      description = ''
+        A Nix profile holding the flake's `release` output (N-12). When set, wb-web and edwind run from
+        it and serve its web root, so a release reaches them by switching the profile and restarting
+        those two units; the hub stays on `package`, since restarting it ends every session. The module
+        resets the profile to this flake's own release whenever the profile is older, so the web is never
+        older than the hub. `package` and `webPackage` must then be the flake's defaults.
+      '';
     };
 
     user = mkOption {
@@ -475,6 +491,15 @@ in
         message = "services.workbench.firewall needs firewall.interface and an IPv4 trustedProxy.";
       }
       {
+        assertion =
+          cfg.releaseProfile == null
+          || (
+            cfg.package == self.packages.${system}.workbench
+            && cfg.webPackage == self.packages.${system}.workbench-web
+          );
+        message = "services.workbench.releaseProfile pins the hub with this flake's release, so package and webPackage must keep their defaults.";
+      }
+      {
         assertion = lib.all isName (lib.attrNames cfg.agents);
         message = "services.workbench.agents: names must match ^[a-z0-9-]{1,32}$.";
       }
@@ -581,6 +606,37 @@ in
       };
     };
 
+    # N-12: the release profile is never older than the release this module pins, which is the hub's
+    # build after its next restart. Runs before wb-web and edwind at boot and again at every switch that
+    # changes the pin; --no-block, because both units are ordered after this one.
+    systemd.services.workbench-release-profile = mkIf (cfg.releaseProfile != null) {
+      description = "Workbench release profile no older than the pinned release";
+      wantedBy = [
+        "multi-user.target"
+        "workbench-web.service"
+      ]
+      ++ lib.optional edit.enable "workbench-edit.service";
+      before = [
+        "workbench-web.service"
+        "workbench-edit.service"
+      ];
+      path = [
+        config.nix.package
+        config.systemd.package
+      ];
+      script = ''
+        current=$(cat ${cfg.releaseProfile}/lastModified 2>/dev/null || echo 0)
+        if [ "$current" -lt "$(cat ${pinnedRelease}/lastModified)" ]; then
+          nix-env -p ${cfg.releaseProfile} --set ${pinnedRelease}
+          systemctl try-restart --no-block workbench-web.service workbench-edit.service
+        fi
+      '';
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+    };
+
     systemd.services.workbench-hub = {
       description = "Workbench hub (PTYs and ACP agents)";
       wantedBy = [ "multi-user.target" ];
@@ -649,7 +705,7 @@ in
       environment.RUST_LOG = cfg.logLevel;
       serviceConfig = {
         Type = "exec";
-        ExecStart = "${cfg.package}/bin/wb-web --config /etc/workbench/web.json";
+        ExecStart = "${frontBin}/wb-web --config /etc/workbench/web.json";
         User = cfg.user;
         Group = userCfg.group;
         Slice = "workbench.slice";
@@ -707,7 +763,7 @@ in
       environment.EDWIND_MEMORY_MIB = toString edit.memoryMiB;
       serviceConfig = {
         Type = "exec";
-        ExecStart = "${cfg.package}/bin/edwind --config /etc/workbench/edit.json";
+        ExecStart = "${frontBin}/edwind --config /etc/workbench/edit.json";
         User = cfg.user;
         Group = userCfg.group;
         Slice = "workbench.slice";
