@@ -275,7 +275,7 @@ export function parseFile(id: string, text: string, grammar: RawGrammar): ParseR
   }
   if (!file.title) file.title = (!isOrg && firstHeadingTitle) || base;
 
-  /* Flashcards: a block whose fields hold `card:: kind` (the deck syntax of web/app.js). */
+  /* Flashcards: a block whose fields hold `card:: kind` (the deck syntax of web/app.ts). */
   for (let i = 0; i < n; i++) {
     if (fenced.has(i)) continue;
     const fm = G.field.exec(lines[i]);

@@ -173,7 +173,7 @@ in
     touch $out
   '';
 
-  # The board's key contexts (DESIGN §6.4) over the shipped web/keys.js: one command per key in every context
+  # The board's key contexts (DESIGN §6.4) over the shipped keys.js (stripped from web/keys.ts): one command per key in every context
   # stack, every card keeps the keys it needs, the leader's Esc leaves any card.
   web-keys = pkgs.runCommand "workbench-web-keys" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     WB_KEYS=${workbench-web}/keys.js node --test ${tests}/keys.test.mts

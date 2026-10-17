@@ -1,6 +1,6 @@
 ;;; address.scm --- buffer addresses: `Name › Heading ¶N "quote"`
 ;;
-;; A pure Scheme port of bufferAddress, fmtAddr and resolveBufferAddress in web/app.js (the
+;; A pure Scheme port of bufferAddress, fmtAddr and resolveBufferAddress in web/app.ts (the
 ;; "addresses" section).  An address names a place in a Markdown buffer by its heading path, the
 ;; paragraph number under the innermost heading and a short quote of the words at point, so it
 ;; reads aloud and survives line shifts.  The golden test edwin/test/address.test.mts checks every

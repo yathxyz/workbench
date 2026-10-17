@@ -59,7 +59,7 @@ forwards to edwind, has the authority it has in production), and the same host a
 editSocket points at it. `edwind` comes from --bin-dir
 or PATH when present; otherwise the harness runs edwin/server/main.mts from this checkout with node
 and the flags of the package wrapper ($EDWIND_MAIN names another main.mts). --frames writes
-`frames: true` into web.json (ui.mjs and perf.mjs pass it when WB_FRAMES=1); without it the key is
+`frames: true` into web.json (ui.mts and perf.mts pass it when WB_FRAMES=1); without it the key is
 absent, so a wb-web that does not know it still starts.
 """
 
