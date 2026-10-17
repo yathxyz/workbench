@@ -160,7 +160,7 @@ test('an error on a thread comes back as the condition, with its kind', async ()
 
 test('define: an exported name is accepted, a LOCAL_ONLY name runs on the main thread, any other raises (R15.3)', async () => {
   P.define('words', (a: Edwin, ctx: Edwin) => P.wordIndex(ctx.buffer(a.id), a.src, a.cap));
-  assert.throws(() => P.define('not-a-job', (a: unknown) => a), /not shipped to a thread.*jobs\.mjs/);
+  assert.throws(() => P.define('not-a-job', (a: unknown) => a), /not shipped to a thread.*jobs\.mts/);
   assert.throws(() => P.define('not-a-job', (a: unknown) => a, []), /export the job as "not-a-job"/);
   assert.ok(!P.stats().defs.includes('not-a-job'));
   P.define('subst', (it: { x: number }) => ({ out: 'main thread ' + it.x }));

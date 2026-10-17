@@ -7,11 +7,11 @@
    come back as promises for JS callers and as futures for Scheme, whose handlers run on the main
    thread at a safe point of the command loop. When workers are not available every job still runs
    on the main thread, only without parallelism. In edwind (R4.47, R15.3) the Node host makes each
-   thread from the file server/worker.mjs, which loads the same modules from their files and the named
-   jobs from server/jobs.mjs; the pool's own code is the same on both hosts. */
+   thread from the file server/worker.mts, which loads the same modules from their files and the named
+   jobs from server/jobs.mts; the pool's own code is the same on both hosts. */
 (function () {
 'use strict';
-/* A thread of edwind (server/worker.mjs) runs this file in a realm with no editor to take the codec, the
+/* A thread of edwind (server/worker.mts) runs this file in a realm with no editor to take the codec, the
    thread primitives and the message loop below from the file, since it may not build them from source
    text as the browser's blob does: the file stops here for it. */
 if (!globalThis.Ed) { globalThis.EdPoolWorker = { codecModule, workerPrims, workerMain }; return; }
@@ -311,7 +311,7 @@ const canWorkers = nodeHost ? nodeHost.workers !== false && !!nodeHost.jobs && !
   : typeof Worker === 'function' && typeof Blob === 'function' && !!globalThis.ropeSource && !!Ed.LEX_SOURCE;
 const hasScheme = nodeHost ? true : !!(globalThis.schemeSource && globalThis.runtimeSource);
 const registry = new Map();         // job name -> { name, fn, src, depsSrc, localOnly }
-/* Every job of server/jobs.mjs is known from the start: a server module runs its own without a define call. */
+/* Every job of server/jobs.mts is known from the start: a server module runs its own without a define call. */
 if (nodeHost && nodeHost.jobs) for (const [name, fn] of nodeHost.jobs.fns) registry.set(name, { name, fn, src: null, depsSrc: null, localOnly: false });
 /* The thread of slot S: the host's (a file) or a blob built from the module sources. */
 function makeWorker(s) {
@@ -690,16 +690,16 @@ function progress(job, x) {
 }
 
 /* ---------- JS API ---------- */
-/* edwind (R15.3): a thread is the file server/worker.mjs, which imports server/jobs.mjs, so a job runs on a
+/* edwind (R15.3): a thread is the file server/worker.mts, which imports server/jobs.mts, so a job runs on a
    thread only under a name exported there; FN is then the main-thread version (what runs when the pool
-   is off). A name jobs.mjs lists in LOCAL_ONLY (jobs the core's browser files define by source) runs on
+   is off). A name jobs.mts lists in LOCAL_ONLY (jobs the core's browser files define by source) runs on
    the main thread. Any other name would need FN's source shipped to a thread: refused. */
 function defineNode(name, fn) {
   if (typeof fn !== 'function') throw new Error('EdPool.define(' + name + '): expected a function');
   const jobs = nodeHost.jobs;
   if (!jobs || jobs.localOnly.has(name)) { registry.set(name, { name, fn, src: null, depsSrc: null, localOnly: true }); return; }
   if (jobs.fns.has(name)) { registry.set(name, { name, fn, src: null, depsSrc: null, localOnly: false }); return; }
-  throw new Error('EdPool.define(' + name + '): a function is not shipped to a thread in edwind; export the job as ' + JSON.stringify(name) + ' from edwin/server/jobs.mjs');
+  throw new Error('EdPool.define(' + name + '): a function is not shipped to a thread in edwind; export the job as ' + JSON.stringify(name) + ' from edwin/server/jobs.mts');
 }
 function define(name, fn, deps) {
   if (nodeHost) return defineNode(name, fn);

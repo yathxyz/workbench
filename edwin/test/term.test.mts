@@ -3,8 +3,18 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
-const T = createRequire(import.meta.url)('../native/js/term.js');
-const keys = evs => evs.filter(e => e.type === 'key').map(e => e.key);
+/* native/js/term.js is still JavaScript: the shape the suite uses. */
+interface TermEvent { type: string; key?: string; text?: string; focused?: boolean; kind?: string; value?: unknown; action?: string; x?: number; y?: number; dy?: number }
+interface Decoder { feed(text: string): TermEvent[]; pending(): boolean; flush(): TermEvent[] }
+interface Face { fg: string; bg: string; weight: number; italic?: boolean }
+interface Model { cols: number; rows: number; faces: Face[]; lines: { x: number; w: number; text: string; f: number }[][]; cursor: { x: number; y: number; shape: string } | null }
+interface Encoder { draw(m: Model): string; invalidate(): void; enter(): string; leave(): string; clipboard(text: string): string }
+interface Term {
+  decoder(): Decoder; encoder(opts?: { color?: string; defaultColors?: boolean }): Encoder;
+  colorMode(env: Record<string, string>): string; to256(rgb: number[]): number; to16(rgb: number[]): number; b64(s: string): string;
+}
+const T = createRequire(import.meta.url)('../native/js/term.js') as Term;
+const keys = (evs: TermEvent[]) => evs.filter(e => e.type === 'key').map(e => e.key);
 
 test('plain bytes decode to Edwin key names', () => {
   const d = T.decoder();
@@ -72,7 +82,8 @@ test('colour depth from the environment, and the 256 and 16 colour mappings', ()
   assert.equal(T.b64('é!'), 'w6kh');
 });
 
-const model = (rows, cursor) => ({
+type Run = [x: number, text: string, f: number];
+const model = (rows: Run[][], cursor: Model['cursor']): Model => ({
   cols: 10, rows: rows.length, faces: [{ fg: '#000000', bg: '#ffffff', weight: 400 }, { fg: '#ff0000', bg: '#ffffff', weight: 700, italic: true }],
   lines: rows.map(r => r.map(([x, text, f]) => ({ x, w: text.length, text, f }))), cursor,
 });

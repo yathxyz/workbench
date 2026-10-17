@@ -5,7 +5,7 @@
    b.sver (the last server version applied), b.inflight (the one unacknowledged batch), b.queue (later local
    batches, rebased on inflight), b.hist (sequenced batches since open), b.meta (file, mode, anchors, ...)
    and b.presence (other writers' cursors). The transform is edwin/src/ot.js, used exactly as the test
-   model edwin/test/ot-sim.mjs Client does. Every text change goes through Ed.applyOps (R6.8): local
+   model edwin/test/ot-sim.mts Client does. Every text change goes through Ed.applyOps (R6.8): local
    commands reach this file through hooks.applied, remote batches are applied with it.
 
    Loaded after ot.js in both runtimes; it does nothing until Ed.sync.start or Ed.bootServed is called,

@@ -1,6 +1,6 @@
 ;;; models.scm --- gptel in the server image: backends, requests and streaming (spec §12.3)  -*- scheme -*-
 ;;
-;; Loaded by edwin/server/models.mjs into the server image only. The primitives it wraps are server-only
+;; Loaded by edwin/server/models.mts into the server image only. The primitives it wraps are server-only
 ;; (R4.49): credential, http-request, %make-backend, %model-request, %model-stream, %model-usage.
 ;;
 ;; Backends are objects (R12.1). The module defines `workbench` from edit.json `models` (R12.3); init.scm may

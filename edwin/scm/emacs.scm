@@ -413,7 +413,7 @@ of a line, swap the two characters before point."
 ;; The image log (spec 4.4): a definitional form evaluated in the server image is logged with a
 ;; generation and evaluated by every frame runtime in order, so one image spans many runtimes and
 ;; survives restarts.  The primitives %image-server?, %declare-definitional, %share-variable and
-;; %image-command exist in the server image only (server/image.mjs); a frame has none of them, which
+;; %image-command exist in the server image only (server/image.mts); a frame has none of them, which
 ;; is how a form learns where it runs.  The commands below run in the server image.
 
 (define (image-server?)

@@ -5,39 +5,47 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
-import { FILES, createHost, loadEdwin } from './headless.mjs';
+import { FILES, createHost, loadEdwin } from './headless.mts';
+import type { Edwin, NodeHost } from './headless.mts';
 
-const host = createHost({ workers: false });
+type Globals = typeof globalThis & { L: Edwin };
+/* host.files, as host-native.js shapes it (the Node host has none of its own). */
+interface HostFiles {
+  resolve(n: string): string; label(p: string): string; read(n: string): string | null; write(n: string, t: string): void; remove(n: string): void;
+  list(): string[]; exists(n: string): boolean; truename(n: string): string;
+}
+
+const host = createHost({ workers: false }) as NodeHost & { files?: HostFiles };
 const Ed = loadEdwin(host);
 Ed.boot({ host });
 await Ed.whenIdle();
-const E = Ed.E, L = globalThis.L;
-const feed = async keys => { for (const k of keys) Ed.feedKey(k); await Ed.whenIdle(); };
-const keys = s => feed(Ed.kbd(s).split(' '));
-const type = s => feed([...s].map(ch => (ch === ' ' ? 'SPC' : ch === '\n' ? 'RET' : ch)));
-const ev = src => { L.resetOps(); return L.evalText(src); };
+const E = Ed.E, L = (globalThis as Globals).L;
+const feed = async (keys: string[]) => { for (const k of keys) Ed.feedKey(k); await Ed.whenIdle(); };
+const keys = (s: string) => feed(Ed.kbd(s).split(' '));
+const type = (s: string) => feed([...s].map(ch => (ch === ' ' ? 'SPC' : ch === '\n' ? 'RET' : ch)));
+const ev = (src: string) => { L.resetOps(); return L.evalText(src); };
 ev('(set! display-line-numbers #f)');
 
 /* A file system in memory, rooted at /w, as host-native.js shapes host.files. */
-const disk = new Map(), links = new Map();   // links: a symbolic link's path -> its target's
+const disk = new Map<string, string>(), links = new Map<string, string>();   // links: a symbolic link's path -> its target's
 let failWrites = false;
 host.files = {
-  resolve: n => (n.startsWith('/') ? n : '/w/' + n),
-  label: p => (p.startsWith('/w/') ? p.slice(3) : p),
-  read(n) { const p = this.resolve(n); return disk.has(p) ? disk.get(p) : null; },
-  write(n, t) { if (failWrites) throw new Error('Permission denied'); disk.set(this.resolve(n), t); },
-  remove(n) { disk.delete(this.resolve(n)); },
+  resolve: (n: string) => (n.startsWith('/') ? n : '/w/' + n),
+  label: (p: string) => (p.startsWith('/w/') ? p.slice(3) : p),
+  read(n: string) { const p = this.resolve(n); return disk.has(p) ? disk.get(p)! : null; },
+  write(n: string, t: string) { if (failWrites) throw new Error('Permission denied'); disk.set(this.resolve(n), t); },
+  remove(n: string) { disk.delete(this.resolve(n)); },
   list: () => [...disk.keys()].filter(p => p.startsWith('/w/')).map(p => p.slice(3)),
-  exists(n) { return disk.has(this.resolve(n)); },
-  truename(n) { const p = this.resolve(n); return links.get(p) || p; },
+  exists(n: string) { return disk.has(this.resolve(n)); },
+  truename(n: string) { const p = this.resolve(n); return links.get(p) || p; },
 };
-const exits = [];
+const exits: number[] = [];
 let suspended = 0;
-Ed.hooks.killEmacs = code => exits.push(code);
+Ed.hooks.killEmacs = (code: number) => exits.push(code);
 Ed.hooks.suspendFrame = () => { suspended++; };
 
-let size = { cols: 60, rows: 16 }, model = null;
-const frame = Ed.makeFrame(null, { backend: { tty: true, size: () => size, draw: m => { model = m; } } });
+let size = { cols: 60, rows: 16 }, model: Edwin = null; // any: the display model is built by the untyped core
+const frame = Ed.makeFrame(null, { backend: { tty: true, size: () => size, draw: (m: Edwin) => { model = m; } } });
 frame.focused = true;
 const fresh = async () => {
   await keys('ESC'); if (E.mini) Ed.abortMini();
@@ -49,7 +57,7 @@ const fresh = async () => {
 test('boot.js loads the core files in host-node.js\'s order', () => {
   const src = readFileSync(new URL('../native/js/boot.js', import.meta.url), 'utf8');
   const m = /const FILES = (\[[^\]]*\])/.exec(src);
-  assert.deepEqual(JSON.parse(m[1].replace(/'/g, '"')), FILES);
+  assert.deepEqual(JSON.parse(m![1].replace(/'/g, '"')), FILES);
 });
 
 test('with host.files a file is a path: visit reads it, the buffer keeps the absolute name, save writes it', async () => {
@@ -74,12 +82,12 @@ test('a file under a second name (a symbolic link) is the buffer already open', 
   const b = E.current;
   await type(':e alias.txt\n');
   assert.equal(E.current, b);
-  assert.equal(E.buffers.filter(x => x.file).length, 1);
+  assert.equal(E.buffers.filter((x: Edwin) => x.file).length, 1);
 });
 
 test('host-native.js: foo, ./foo and bar/../foo are one path; ~ is the home directory', () => {
   const src = readFileSync(new URL('../native/js/host-native.js', import.meta.url), 'utf8');
-  const N = { env: k => ({ HOME: '/home/u' })[k], cwd: () => '/w', realpath: p => (p === '/w/l' ? '/w/t' : null) };
+  const N = { env: (k: string) => ({ HOME: '/home/u' } as Record<string, string>)[k], cwd: () => '/w', realpath: (p: string) => (p === '/w/l' ? '/w/t' : null) };
   const ctx = vm.createContext({ __n: N });
   vm.runInContext(src, ctx);
   const H = ctx.EdNativeHost;
@@ -249,7 +257,7 @@ test('Ed.reloadPersistent reads the tables again, replacing what it read before'
 });
 
 test('save-place leaves commit messages at the top, as Vim and Emacs do', async () => {
-  for (const [name, kept] of [['.git/COMMIT_EDITMSG', false], ['kept.txt', true]]) {
+  for (const [name, kept] of [['.git/COMMIT_EDITMSG', false], ['kept.txt', true]] as [string, boolean][]) {
     await fresh();
     disk.set('/w/' + name, 'a\nb\nc\n');
     await type(`:e ${name}\n`);

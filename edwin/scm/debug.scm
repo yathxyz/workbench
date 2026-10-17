@@ -1,6 +1,6 @@
 ;;; debug.scm --- the debugger, the inspector and introspection commands of the server image  -*- scheme -*-
 ;;
-;; Loaded by edwin/server/debug.mjs into the server image. The modes and their keys are defined here so
+;; Loaded by edwin/server/debug.mts into the server image. The modes and their keys are defined here so
 ;; the frames that display these server special buffers (E3 loads this file in frames too) know them.
 ;; Every command is (:where 'server): a frame sends call{cmd} with the point of its *Backtrace* line.
 

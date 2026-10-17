@@ -1,6 +1,6 @@
 ;;; wb.scm --- Workbench as Lisp objects: the session family and the events (spec §5)  -*- scheme -*-
 ;;
-;; Loaded by edwin/server/wb.mjs into the server image only. The primitives (session-list, session-get,
+;; Loaded by edwin/server/wb.mts into the server image only. The primitives (session-list, session-get,
 ;; %card-send, %card-read, card-interrupt, %card-kill, acp-prompt, acp-prompt-async, %shell-run) are
 ;; server-only (R4.49); this file adds the keyword-taking wrappers and the confirmation rule of R5.4.
 ;;
