@@ -71,6 +71,7 @@ let
     fi
     if [ -n "$fg" ]; then exec ${edwind}/bin/edwind --config "$cfg"; fi
     log=''${XDG_STATE_HOME:-''${HOME:?}/.local/state}/edwin/edwind.log
+    mkdir -p "''${log%/*}"
     setsid -f ${edwind}/bin/edwind --config "$cfg" </dev/null >>"$log" 2>&1
     echo "edwin: edwind started (log: $log)" >&2
   '';
