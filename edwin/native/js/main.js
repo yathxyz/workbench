@@ -125,11 +125,18 @@ function leaveTerminal() { if (gui) return; out(enc.leave()); N.ttyFlush(); N.tt
 async function quit(code) {
   if (quitting) return;
   quitting = true;
+  const saving = attached ? [...Ed.sync.buffers.values()].filter(b => b.saving) : [];
   if (attached) await drain();
+  /* A save edwind refused (a full disk, a lost file) keeps the program open, as Vim stays when :wq cannot write. */
+  const refused = saving.filter(b => b.saveError);
+  if (refused.length) {
+    quitting = false;
+    Ed.message(`${refused[0].name}: ${refused[0].saveError}; not quitting`); Ed.scheduleRender();
+    return;
+  }
   try { host.suspend(); } catch (e) { console.error(e); }
   leaveTerminal();
   if (attached && attached.unconfirmed) N.eprint(`edwin: edwind had not confirmed ${attached.unconfirmed} edit(s) when edwin quit\n`);
-  if (attached) for (const b of Ed.sync.buffers.values()) if (b.saveError) N.eprint(`edwin: ${b.name} was not saved: ${b.saveError}\n`);
   N.exit(code);
 }
 Ed.hooks.killEmacs = code => { quit(code); };

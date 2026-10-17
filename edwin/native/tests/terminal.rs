@@ -551,13 +551,23 @@ fn attached_notes_go_through_edwind_and_other_files_stay_local() {
     }
     use std::io::{BufRead, Write};
     let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/edwind-up.mts");
-    let mut node = std::process::Command::new("node")
-        .arg(&helper)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut lines = std::io::BufReader::new(node.stdout.take().unwrap()).lines();
+    // Killed when dropped, so a failing assertion does not leave edwind running (and the test hanging).
+    struct Helper(std::process::Child);
+    impl Drop for Helper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut node = Helper(
+        std::process::Command::new("node")
+            .arg(&helper)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut lines = std::io::BufReader::new(node.0.stdout.take().unwrap()).lines();
     let info = lines.next().unwrap().unwrap();
     let field = |k: &str| {
         info.split(&format!("\"{k}\":\""))
@@ -588,9 +598,34 @@ fn attached_notes_go_through_edwind_and_other_files_stay_local() {
     t.keys(":b a.md\r").keys("Goand quit").esc().keys(":wq\r");
     assert_eq!(t.exit(), 0);
     assert_eq!(read(d.join("local.txt")), "localedited\n");
-    writeln!(node.stdin.as_mut().unwrap(), "done").unwrap();
+    // A save edwind refuses keeps the program open, as Vim stays when :wq cannot write; :q! still leaves.
+    let b = Path::new(&notes).join("b.md");
+    std::fs::write(&b, "b\n").unwrap();
+    let mut t = Pty::spawn(
+        &d,
+        &["--socket", &socket, "./notes-link/b.md"],
+        &[("EDWIN_NO_ATTACH", "")],
+    );
+    t.ready();
+    t.pump(500);
+    t.keys("Gonot written").esc();
+    t.pump(300);
+    std::fs::remove_file(&b).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    t.keys(":wq\r");
+    t.pump(1500);
+    t.reap(false);
+    assert!(t.status.is_none(), "edwin quit after a refused save");
+    assert!(
+        contains(&t.out, b"not quitting"),
+        "screen tail: {:?}",
+        tail(&t.out)
+    );
+    t.keys(":q!\r");
+    assert_eq!(t.exit(), 0);
+    writeln!(node.0.stdin.as_mut().unwrap(), "done").unwrap();
     let after = lines.next().unwrap().unwrap();
-    let _ = node.wait();
+    let _ = node.0.wait();
     assert_eq!(
         after,
         r##"{"server":"# Shared page\ntyped in the terminal\nand quit\n","disk":"# Shared page\ntyped in the terminal\nand quit\n"}"##

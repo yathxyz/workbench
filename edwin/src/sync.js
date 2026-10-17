@@ -716,12 +716,14 @@ function visit(name) {
 function save(b) { b = typeof b === 'string' ? sync.buffers.get(b) : b; if (!b) return Promise.resolve({ error: { condition: 'error', report: 'no such buffer' } }); const rid = newRid(); return new Promise(resolve => { sync.calls.set(rid, { resolve, frame: E.frame, at: Date.now(), rid }); send({ t: 'save', rid, buf: b.id }); }); }
 function revert(b) { b = typeof b === 'string' ? sync.buffers.get(b) : b; if (!b) return Promise.resolve({ error: { condition: 'error', report: 'no such buffer' } }); const rid = newRid(); return new Promise(resolve => { sync.calls.set(rid, { resolve, frame: E.frame, at: Date.now(), rid }); send({ t: 'revert', rid, buf: b.id }); }); }
 /* The save goes out behind every edit already sent, so with none queued it covers the whole buffer: the buffer
-   counts as saved at once, which lets :wq go on to quit (a quitting frame waits for the answer). A refusal
-   marks it modified again and keeps the reason in b.saveError. */
+   counts as saved at once, which lets :wq go on to quit. A quitting frame waits for the answer while b.saving,
+   and stays when it is a refusal, which marks the buffer modified again and keeps the reason in b.saveError. */
 function saveShared(b) {
   if (!b.queue.length) b.modified = false;
+  b.saving = true; b.saveError = null;
   spin(save(b)).then(r => {
-    if (r.error) { b.modified = true; b.saveError = r.error.report; } else b.saveError = null;
+    b.saving = false;
+    if (r.error) { b.modified = true; b.saveError = r.error.report; }
     Ed.message(r.error ? `${b.name}: ${r.error.report}` : `Wrote ${b.file || b.id}`); Ed.scheduleRender();
   });
   return false;
