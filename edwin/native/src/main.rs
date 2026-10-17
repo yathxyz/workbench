@@ -124,8 +124,15 @@ fn open_window() -> Result<Window, i32> {
 }
 
 fn fallback(why: &str) -> Result<Window, i32> {
-    // SAFETY: isatty on the standard descriptors.
-    let tty = unsafe { libc::isatty(0) == 1 || libc::isatty(1) == 1 };
+    // The terminal program draws on /dev/tty, whatever the standard descriptors are, so that decides.
+    // SAFETY: open and close of a constant path.
+    let tty = unsafe {
+        let fd = libc::open(
+            c"/dev/tty".as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        );
+        fd >= 0 && libc::close(fd) == 0
+    };
     eprintln!(
         "edwin: cannot open a window: {why}{}",
         if tty { "; using the terminal" } else { "" }

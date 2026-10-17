@@ -9,12 +9,21 @@
 'use strict';
 const N = globalThis.__n;
 
+/* Each segment's character widths as display.js counts them (charWidth), so the window lays characters out as the
+   model did; a segment of characters below U+0300 needs none (each takes one cell). */
+const NARROW = /^[\u0000-\u02ff]*$/;
+function withWidths(m) {
+  const cw = globalThis.Ed.display.charWidth;
+  for (const row of m.lines || []) for (const s of row) if (!NARROW.test(s.text)) s.cw = Array.from(s.text, ch => cw(ch.codePointAt(0)));
+  return m;
+}
+
 function screen() {
   return {
     backend: {
       tty: false, gui: true,
       size: () => { const s = N.guiSize(); return s ? { cols: Math.max(8, s.cols), rows: Math.max(3, s.rows) } : { cols: 80, rows: 24 }; },
-      draw: m => N.guiDraw(JSON.stringify(m)),
+      draw: m => N.guiDraw(JSON.stringify(withWidths(m))),
       bell: () => N.guiAction('bell'),
     },
     theme: () => { const s = N.guiSize(); return s && s.theme ? s.theme : null; },
@@ -23,11 +32,12 @@ function screen() {
   };
 }
 
-/* A keydown as the page's frame gets it, for Ed.keyName. */
+/* A keydown as the page's frame gets it, for Ed.keyName. altGraph: the window found that Control and Alt made the
+   character (AltGr on Windows-style layouts), so the key is the character, as on the page. */
 const keydown = ev => ({
   key: String(ev.key), code: String(ev.code || ''), isComposing: false,
   ctrlKey: !!ev.ctrlKey, altKey: !!ev.altKey, shiftKey: !!ev.shiftKey, metaKey: !!ev.metaKey,
-  getModifierState: () => false,
+  getModifierState: m => m === 'AltGraph' && !!ev.altGraph,
 });
 const charKey = ch => (ch === ' ' ? 'SPC' : ch === '\n' || ch === '\r' ? 'RET' : ch === '\t' ? 'TAB' : ch);
 
@@ -46,6 +56,6 @@ function handle(json, frame, on) {
   }
 }
 
-globalThis.EdGui = { screen, handle, keydown };
+globalThis.EdGui = { screen, handle, keydown, withWidths };
 if (typeof module !== 'undefined') module.exports = globalThis.EdGui;
 })();

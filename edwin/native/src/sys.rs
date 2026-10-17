@@ -312,13 +312,19 @@ pub fn sock_count() -> usize {
     ST.with(|st| st.borrow().socks.len())
 }
 
-/// The descriptors wait() reads besides the terminal: the signal pipe and the sockets (the window's loop has
-/// another thread watch them while it waits on the display).
+/// The descriptors wait() watches besides the terminal, with the events it waits for: the signal pipe and the
+/// sockets, writable too while output is queued (the window's loop has another thread watch them while it waits on
+/// the display).
 #[allow(dead_code)]
-pub fn poll_fds() -> Vec<RawFd> {
+pub fn poll_fds() -> Vec<(RawFd, i16)> {
     // SAFETY: reading a static set once at startup.
-    let mut fds = vec![unsafe { SIG_PIPE[0] }];
-    ST.with(|st| fds.extend(st.borrow().socks.values().map(|s| s.stream.as_raw_fd())));
+    let mut fds = vec![(unsafe { SIG_PIPE[0] }, libc::POLLIN)];
+    ST.with(|st| {
+        fds.extend(st.borrow().socks.values().map(|s| {
+            let out = if s.outq.is_empty() { 0 } else { libc::POLLOUT };
+            (s.stream.as_raw_fd(), libc::POLLIN | out)
+        }))
+    });
     fds
 }
 

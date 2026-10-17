@@ -501,7 +501,7 @@ impl Renderer {
             // The input method's composition, at the cursor, underlined.
             let pre = self.preedit.clone();
             let chars: Vec<char> = pre.chars().collect();
-            let n: u32 = chars.iter().map(|&c| model::char_width(c).max(1)).sum();
+            let n: u32 = chars.iter().map(|&c| preedit_width(c)).sum();
             let (x, y) = at(c.x as f32, c.y as f32);
             top.push(rect(self, x, y, n as f32 * cw, ch, def_bg));
             top.push(rect(
@@ -527,7 +527,7 @@ impl Renderer {
                         });
                     }
                 }
-                dx += model::char_width(chr).max(1) as f32 * cw;
+                dx += preedit_width(chr) as f32 * cw;
             }
         }
         let mut all = under;
@@ -714,4 +714,12 @@ pub fn render_rgba(m: &Model, text: &mut Text, w: u32, h: u32) -> Result<Vec<u8>
         out.extend_from_slice(&data[s..s + (4 * w) as usize]);
     }
     Ok(out)
+}
+
+/// The cells a character of an input method's composition takes (it is not in the model, so display.js has not
+/// counted it): Unicode's East Asian width, at least one.
+fn preedit_width(c: char) -> u32 {
+    unicode_width::UnicodeWidthChar::width(c)
+        .unwrap_or(1)
+        .max(1) as u32
 }

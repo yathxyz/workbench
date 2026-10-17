@@ -506,6 +506,7 @@ dependencies = [
  "pollster",
  "serde",
  "serde_json",
+ "unicode-width",
  "v8",
  "wgpu",
  "winit",

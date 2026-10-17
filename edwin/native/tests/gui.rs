@@ -294,7 +294,7 @@ fn the_close_button_asks_about_changes() {
 
 /// The budget (edwin/README.md, step DT2): from a key's arrival to the frame's present, on a 200x50 window full of
 /// source text, p50 at most 10 ms and p99 at most 25 ms, on the software renderer. Timing on a shared machine is
-/// noisy, so this runs on request: cargo test --release -- --ignored latency
+/// noisy, so this runs on request and alone: cargo test --release -- --ignored latency
 #[test]
 #[ignore]
 fn keystroke_to_screen_latency_budget() {
@@ -327,7 +327,8 @@ fn keystroke_to_screen_latency_budget() {
         .filter_map(|l| l.trim().parse().ok())
         .collect();
     us.sort_unstable();
-    assert!(us.len() > 100, "{} keys measured", us.len());
+    // Keys that arrive before one present share it, so there are fewer measurements than keys.
+    assert!(us.len() > 50, "{} presents measured", us.len());
     let at = |q: f64| us[((us.len() as f64 * q) as usize).min(us.len() - 1)];
     let (p50, p99) = (at(0.5), at(0.99));
     eprintln!(

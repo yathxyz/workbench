@@ -403,14 +403,20 @@ fn a_window_without_a_display_is_the_terminal() {
         tail(&t.out)
     );
     assert_eq!(read(d.join("a.txt")), "onetwo\n");
-    // With no terminal either there is nothing to draw on.
-    let o = std::process::Command::new(BIN)
-        .args(["--gui", "a.txt"])
+    // With no terminal either (a new session has no controlling terminal) there is nothing to draw on.
+    let mut cmd = std::process::Command::new(BIN);
+    cmd.args(["--gui", "a.txt"])
         .current_dir(&d)
         .env_remove("DISPLAY")
-        .env_remove("WAYLAND_DISPLAY")
-        .output()
-        .unwrap();
+        .env_remove("WAYLAND_DISPLAY");
+    // SAFETY: setsid is async-signal-safe.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let o = cmd.output().unwrap();
     assert_eq!(o.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&o.stderr).contains("cannot open a window: no display"));
 }
