@@ -2842,7 +2842,7 @@ FILES    Files are kept in this browser's storage.  emacs.scm, evil.scm
 (define notes-front-matter-keys '("title" "tags" "aliases" "alias" "id"))
 ;; Fenced code: nothing inside is a heading, a task or a link.
 (define notes-fence-regexp "^\\s*(```|~~~)")
-;; Flashcards (the deck syntax of web/app.js): a block whose fields hold `card:: kind`, with deck::, back::
+;; Flashcards (the deck syntax of web/app.ts): a block whose fields hold `card:: kind`, with deck::, back::
 ;; and status::, and `{{c1::text}}` clozes in the body. Kinds: basic, reverse, cloze, type, pen, voice.
 (define notes-card-field "card")
 (define notes-card-kinds '("basic" "reverse" "cloze" "type" "pen" "voice"))
@@ -2903,7 +2903,7 @@ FILES    Files are kept in this browser's storage.  emacs.scm, evil.scm
 <script type="text/x-scheme" id="address-scm">
 ;;; address.scm --- buffer addresses: `Name › Heading ¶N "quote"`
 ;;
-;; A pure Scheme port of bufferAddress, fmtAddr and resolveBufferAddress in web/app.js (the
+;; A pure Scheme port of bufferAddress, fmtAddr and resolveBufferAddress in web/app.ts (the
 ;; "addresses" section).  An address names a place in a Markdown buffer by its heading path, the
 ;; paragraph number under the innermost heading and a short quote of the words at point, so it
 ;; reads aloud and survives line shifts.  The golden test edwin/test/address.test.mts checks every

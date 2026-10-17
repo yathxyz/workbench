@@ -296,7 +296,7 @@ Choices E2 made where the spec left one open, and where it had to deviate:
 E3 puts Edwin into the page cards (spec §9, §10, R8.16–R8.20, R13.7): with `edit.frames` on, every page card
 is an Edwin frame on a shared buffer served by edwind, the buffer the agent tools, the notes index and the
 `wb` CLI already share. Nothing moves until the flag is on; with it off the CodeMirror page is as before and
-the whole browser suite passes in both modes (`node tests/ui.mjs <root>` and `WB_FRAMES=1 node tests/ui.mjs
+the whole browser suite passes in both modes (`node tests/ui.mts <root>` and `WB_FRAMES=1 node tests/ui.mts
 <root>`). `nix/checks.nix` gains `edit-anchors`, `edwin-markdown` and `edit-frame`; `ui` and `ui-frames` run the
 browser suite in each mode, and the VM test turns `edit.frames` on.
 
@@ -304,7 +304,7 @@ Layout added in E3: `src/sync.js` (the replica client: `Ed.sync`, `Ed.bootServed
 `src/editor-core.js` (`Frame`, `Ed.makeFrame`, one text-change path `applyOps`) and `src/editor-prims.js`
 (frame commands, `Ed.setLeaderKey`, served boot), `src/markdown.js` and `scm/markdown.scm` (markdown-mode),
 `server/anchors.mts` (shared anchors and the frame commands), `console/index.html` (the `/edwin/` console),
-`web/app.js`'s frames block (lazy frames, keys, migration, R13.7 tools), and in wb-web `relay_edit.rs` (the
+`web/app.ts`'s frames block (lazy frames, keys, migration, R13.7 tools), and in wb-web `relay_edit.rs` (the
 `/edit` relay), the `frames` key, `/api/info` `edit`/`editUp`, `/edwin/` static files and the board guard.
 
 The wire (§7, R9.16–R9.17): each tab opens one WebSocket to `/edit`; wb-web opens one Unix connection to
