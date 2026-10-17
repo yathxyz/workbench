@@ -220,13 +220,14 @@ async function start() {
   if (sock) {
     await Ed.bootServed({ transport: transport(sock), device: 'terminal' });
     attached = { socket: sock, unconfirmed: 0 };
-    const served = Ed.hooks.visit, root = String(L.get('notes-directory') || '');
-    const under = (p, r) => r && (p === r || p.startsWith(r.endsWith('/') ? r : r + '/'));
+    const served = Ed.hooks.visit, dir = String(L.get('notes-directory') || '');
+    /* Compared by true name, so ./notes/a.md, a link into the notes and a linked notes directory all count. */
+    const root = dir ? H.truename(dir).replace(/\/$/, '') : '';
     /* Notes go through edwind; every other file is this program's own. */
     const hook = name => {
-      const abs = H.resolve(name);
+      const abs = H.truename(name);
       /* edwind names a note by its path under the notes directory. */
-      if (under(abs, root) && abs !== root) return served(abs.slice(root.replace(/\/$/, '').length + 1));
+      if (root && abs.startsWith(root + '/')) return served(abs.slice(root.length + 1));
       Ed.hooks.visit = null;
       try { return Ed.visit(name); } finally { Ed.hooks.visit = hook; }
     };

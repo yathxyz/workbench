@@ -730,11 +730,18 @@ CMD('view-messages', '', '', 'Show the *Messages* buffer.', () => { Ed.setWindow
 const fileOf = name => (host.files && host.files.resolve ? host.files.resolve(name) : name);
 const fileLabel = f => (host.files && host.files.label ? host.files.label(f) : f);
 Ed.fileLabel = fileLabel;
+/* A buffer visiting the same file under another name (a symbolic link): with host.files.truename, the buffer
+   already open is the one visited, as Emacs's find-file-existing-other-name does. */
+function sameFile(file) {
+  if (!host.files || !host.files.truename) return null;
+  const t = host.files.truename(file);
+  return E.buffers.find(b => b.file && !b.shared && host.files.truename(b.file) === t) || null;
+}
 function visit(name) {
   /* In served mode files are edwind's buffers: the protocol client opens the replica (sync.js). */
   if (Ed.hooks.visit) return Ed.hooks.visit(name);
   const file = fileOf(name);
-  const existing = E.buffers.find(b => b.file === file);
+  const existing = E.buffers.find(b => b.file === file) || sameFile(file);
   if (existing) { Ed.setWindowBuffer(existing); if (Ed.hooks.visited) Ed.hooks.visited(existing, file, false); return existing; }
   let content;
   try { content = Ed.Store.get(file) ?? (host.files ? null : shippedConfig(name)); }

@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 import { FILES, createHost, loadEdwin } from './headless.mjs';
 
 const host = createHost({ workers: false });
@@ -18,7 +19,7 @@ const ev = src => { L.resetOps(); return L.evalText(src); };
 ev('(set! display-line-numbers #f)');
 
 /* A file system in memory, rooted at /w, as host-native.js shapes host.files. */
-const disk = new Map();
+const disk = new Map(), links = new Map();   // links: a symbolic link's path -> its target's
 let failWrites = false;
 host.files = {
   resolve: n => (n.startsWith('/') ? n : '/w/' + n),
@@ -28,6 +29,7 @@ host.files = {
   remove(n) { disk.delete(this.resolve(n)); },
   list: () => [...disk.keys()].filter(p => p.startsWith('/w/')).map(p => p.slice(3)),
   exists(n) { return disk.has(this.resolve(n)); },
+  truename(n) { const p = this.resolve(n); return links.get(p) || p; },
 };
 const exits = [];
 let suspended = 0;
@@ -63,6 +65,29 @@ test('with host.files a file is a path: visit reads it, the buffer keeps the abs
   await type(':w\n');
   assert.equal(disk.get('/w/notes.txt'), 'onex\ntwo\n');
   assert.equal(E.echo, 'Wrote notes.txt');
+});
+
+test('a file under a second name (a symbolic link) is the buffer already open', async () => {
+  await fresh();
+  disk.set('/w/real.txt', 'r\n'); links.set('/w/alias.txt', '/w/real.txt');
+  await type(':e real.txt\n');
+  const b = E.current;
+  await type(':e alias.txt\n');
+  assert.equal(E.current, b);
+  assert.equal(E.buffers.filter(x => x.file).length, 1);
+});
+
+test('host-native.js: foo, ./foo and bar/../foo are one path; ~ is the home directory', () => {
+  const src = readFileSync(new URL('../native/js/host-native.js', import.meta.url), 'utf8');
+  const N = { env: k => ({ HOME: '/home/u' })[k], cwd: () => '/w', realpath: p => (p === '/w/l' ? '/w/t' : null) };
+  const ctx = vm.createContext({ __n: N });
+  vm.runInContext(src, ctx);
+  const H = ctx.EdNativeHost;
+  for (const n of ['foo', './foo', 'bar/../foo', './/foo', '/w/./foo', '../w/foo']) assert.equal(H.resolve(n), '/w/foo', n);
+  assert.equal(H.resolve('~/a/../b'), '/home/u/b');
+  assert.equal(H.resolve('/../x'), '/x');
+  assert.equal(H.truename('./l'), '/w/t');
+  assert.equal(H.truename('new.txt'), '/w/new.txt');
 });
 
 test('require-final-newline adds the newline a saved file lacks', async () => {

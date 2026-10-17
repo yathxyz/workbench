@@ -16,6 +16,30 @@ struct Tty {
 struct Sock {
     stream: UnixStream,
     buf: Vec<u8>,
+    /// Bytes sent but not yet taken by the peer: written as the socket accepts them (POLLOUT), so a peer that
+    /// stops reading never blocks the loop, and lines still reach it whole and in order.
+    outq: Vec<u8>,
+}
+
+/// A peer that leaves this much unread is taken as gone: the socket is shut down and the loop reports it closed.
+const OUTQ_MAX: usize = 64 << 20;
+
+impl Sock {
+    /// Write what the socket accepts now. Err: the peer is gone.
+    fn flush(&mut self) -> std::io::Result<()> {
+        while !self.outq.is_empty() {
+            match self.stream.write(&self.outq) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(k) => {
+                    self.outq.drain(..k);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -251,6 +275,7 @@ pub fn sock_open(path: &str) -> Result<u32, String> {
             Sock {
                 stream,
                 buf: Vec::new(),
+                outq: Vec::new(),
             },
         );
         id
@@ -263,14 +288,15 @@ pub fn sock_send(id: u32, line: &str) -> bool {
         let Some(s) = st.socks.get_mut(&id) else {
             return false;
         };
-        let mut data = Vec::with_capacity(line.len() + 1);
-        data.extend_from_slice(line.as_bytes());
-        data.push(b'\n');
-        // A blocking write for the message: edwind reads promptly, and a half-sent line would break the protocol.
-        let _ = s.stream.set_nonblocking(false);
-        let ok = s.stream.write_all(&data).is_ok();
-        let _ = s.stream.set_nonblocking(true);
-        ok
+        s.outq.extend_from_slice(line.as_bytes());
+        s.outq.push(b'\n');
+        if s.flush().is_err() || s.outq.len() > OUTQ_MAX {
+            // The next wait sees the hang-up and reports the socket closed (the protocol client reconnects).
+            s.outq.clear();
+            let _ = s.stream.shutdown(std::net::Shutdown::Both);
+            return false;
+        }
+        true
     })
 }
 
@@ -355,9 +381,10 @@ pub fn wait(timeout: i32) -> Ready {
         }
         let ids: Vec<u32> = st.socks.keys().copied().collect();
         for id in &ids {
+            let s = &st.socks[id];
             fds.push(libc::pollfd {
-                fd: st.socks[id].stream.as_raw_fd(),
-                events: libc::POLLIN,
+                fd: s.stream.as_raw_fd(),
+                events: libc::POLLIN | if s.outq.is_empty() { 0 } else { libc::POLLOUT },
                 revents: 0,
             });
         }
@@ -408,6 +435,9 @@ pub fn wait(timeout: i32) -> Ready {
             }
             let mut closed = re & (libc::POLLHUP | libc::POLLERR) != 0 && re & libc::POLLIN == 0;
             if let Some(s) = st.socks.get_mut(&id) {
+                if re & libc::POLLOUT != 0 && s.flush().is_err() {
+                    closed = true;
+                }
                 let mut b = [0u8; 65536];
                 loop {
                     match s.stream.read(&mut b) {
@@ -439,4 +469,43 @@ pub fn wait(timeout: i32) -> Ready {
         }
     });
     ready
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn a_peer_that_stops_reading_never_blocks_a_send() {
+        let path = std::env::temp_dir().join(format!("edwin-sock-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let id = sock_open(path.to_str().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let line = "x".repeat(1 << 16);
+        // 4 MB, far more than the socket buffer holds, while the peer reads nothing.
+        let t0 = std::time::Instant::now();
+        for _ in 0..64 {
+            assert!(sock_send(id, &line));
+        }
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        // The peer starts reading: the loop writes the rest as the socket takes it, whole lines in order.
+        let reader = std::thread::spawn(move || {
+            let mut v = Vec::new();
+            peer.read_to_end(&mut v).unwrap();
+            v
+        });
+        while ST.with(|st| !st.borrow().socks[&id].outq.is_empty()) {
+            wait(100);
+        }
+        sock_close(id);
+        let got = reader.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got.len(), 64 * ((1 << 16) + 1));
+        assert!(got
+            .split(|&c| c == b'\n')
+            .take(64)
+            .all(|l| l.len() == 1 << 16));
+    }
 }

@@ -283,6 +283,26 @@ fn stat(scope: &mut v8::HandleScope, args: v8::FunctionCallbackArguments, mut rv
         Err(_) => rv.set(v8::null(scope).into()),
     }
 }
+/// The file's true name: the absolute path with every symbolic link resolved. For a file that does not exist
+/// yet, its directory's true name and its own name; null when the directory does not exist either.
+fn realpath(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let p = std::path::PathBuf::from(arg_str(scope, &args, 0));
+    let t = std::fs::canonicalize(&p).ok().or_else(|| {
+        let (dir, name) = (p.parent()?, p.file_name()?);
+        Some(std::fs::canonicalize(dir).ok()?.join(name))
+    });
+    match t.and_then(|t| t.to_str().map(|s| s.to_owned())) {
+        Some(t) => {
+            let v = v8::String::new(scope, &t).unwrap();
+            rv.set(v.into());
+        }
+        None => rv.set(v8::null(scope).into()),
+    }
+}
 fn read_dir(
     scope: &mut v8::HandleScope,
     args: v8::FunctionCallbackArguments,
@@ -441,7 +461,7 @@ macro_rules! natives {
     ($m:ident) => {
         $m!(
             "load" load, "args" args, "print" print, "eprint" eprint, "env" env, "cwd" cwd, "now" now,
-            "readFile" read_file, "writeFile" write_file, "appendFile" append_file, "stat" stat, "readDir" read_dir,
+            "readFile" read_file, "writeFile" write_file, "appendFile" append_file, "stat" stat, "realpath" realpath, "readDir" read_dir,
             "remove" remove, "mkdirs" mkdirs, "readStdin" read_stdin, "ttyOpen" tty_open, "ttyClose" tty_close,
             "ttyWrite" tty_write, "ttyFlush" tty_flush, "ttySize" tty_size, "suspend" suspend, "exit" exit,
             "sockOpen" sock_open, "sockSend" sock_send, "sockClose" sock_close

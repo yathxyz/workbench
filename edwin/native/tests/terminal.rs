@@ -331,6 +331,27 @@ fn files_keep_their_line_ends_mode_and_links() {
 }
 
 #[test]
+fn one_file_under_two_names_is_one_buffer() {
+    let d = workdir("names");
+    std::fs::write(d.join("real.txt"), "one\n").unwrap();
+    std::os::unix::fs::symlink(d.join("real.txt"), d.join("alias.txt")).unwrap();
+    let mut t = Pty::spawn(&d, &["real.txt"], &[]);
+    t.ready();
+    t.keys("Ax").esc();
+    t.keys(":e ./alias.txt\r").keys("Ay").esc();
+    t.keys(":e sub/../real.txt\r")
+        .keys("Az")
+        .esc()
+        .keys(":wq\r");
+    assert_eq!(t.exit(), 0);
+    assert_eq!(read(d.join("real.txt")), "onexyz\n");
+    assert!(std::fs::symlink_metadata(d.join("alias.txt"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
 fn a_file_that_is_not_text_is_refused() {
     let d = workdir("binary");
     std::fs::write(d.join("x.bin"), [0xffu8, 0xfe, 0x00, 0x80]).unwrap();
@@ -519,10 +540,11 @@ fn attached_notes_go_through_edwind_and_other_files_stay_local() {
     let (socket, notes) = (field("socket"), field("notes"));
     let d = workdir("attach");
     std::fs::write(d.join("local.txt"), "local\n").unwrap();
-    let note = format!("{notes}/a.md");
+    // The note named through a link to the notes directory and a dot segment: still edwind's note.
+    std::os::unix::fs::symlink(&notes, d.join("notes-link")).unwrap();
     let mut t = Pty::spawn(
         &d,
-        &["--socket", &socket, &note, "local.txt"],
+        &["--socket", &socket, "./notes-link/./a.md", "local.txt"],
         &[("EDWIN_NO_ATTACH", "")],
     );
     t.ready();
