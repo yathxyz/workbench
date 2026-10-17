@@ -12,12 +12,15 @@ if (!host) throw new Error('Edwin needs a host: load host-browser.js or host-nod
 const hooks = {};
 
 /* ---------- file store: the host's storage, under its own prefix ---------- */
+/* A host with a file system (host.files: the desktop shell, DT1) keeps files there instead: NAME is a path,
+   read gives the text or null, write throws when the file cannot be written, list names the files that
+   completion offers. */
 const PFX = 'lmacs:file:';
 const Store = {
-  get(n) { return host.storage.get(PFX + n); },
-  set(n, v) { return host.storage.set(PFX + n, v) !== false; },
-  del(n) { host.storage.remove(PFX + n); },
-  list() { return host.storage.keys().filter(k => k.startsWith(PFX)).map(k => k.slice(PFX.length)).sort(); },
+  get(n) { return host.files ? host.files.read(n) : host.storage.get(PFX + n); },
+  set(n, v) { if (host.files) { host.files.write(n, v); return true; } return host.storage.set(PFX + n, v) !== false; },
+  del(n) { if (host.files) host.files.remove(n); else host.storage.remove(PFX + n); },
+  list() { return host.files ? host.files.list() : host.storage.keys().filter(k => k.startsWith(PFX)).map(k => k.slice(PFX.length)).sort(); },
 };
 
 /* ---------- buffers ---------- */
@@ -1406,7 +1409,7 @@ function annotateCommand(name) {
 function annotateFunction(name) { const f = L.fnOrNull(intern(name)); if (!f) return L.S.macros.has(name) ? 'macro' : ''; return firstLine(f.doc); }
 function annotateVariable(name) { let v; try { v = L.get(name); } catch (e) { return ''; } const s = v === undefined ? '' : pr(v, true); return (s.length > 40 ? s.slice(0, 40) + '…' : s) + (L.S.gdoc.get(name) ? '  ' + firstLine(L.S.gdoc.get(name)) : ''); }
 function annotateBuffer(name) { const b = getBuffer(name); if (!b) return ''; return `${b.modified ? '*' : ' '}${b.readOnly ? '%' : ' '} ${String(b.rope.length).padStart(7)}  ${MODE_NAMES[b.mode] || b.mode}${b.file ? '  ' + b.file : ''}`; }
-function annotateFile(name) { const v = Store.get(name); const b = E.buffers.find(x => x.file === name); return (v === null ? 'new' : String(v.length).padStart(7) + ' chars') + (b ? '  (visiting)' : ''); }
+function annotateFile(name) { const v = Store.get(name), f = host.files && host.files.resolve ? host.files.resolve(name) : name; const b = E.buffers.find(x => x.file === f); return (v === null ? 'new' : String(v.length).padStart(7) + ' chars') + (b ? '  (visiting)' : ''); }
 
 /* ---------- interactive specs ---------- */
 const { commandNames, functionNames, variableNames, isCommand } = L;

@@ -542,11 +542,6 @@ of a line, swap the two characters before point."
   (interactive "*")
   (insert (format-time-string "%F")))
 
-(define-command (save-buffers-kill-terminal)
-  "Explain how to leave: Edwin lives in this page."
-  (interactive)
-  (message "Edwin runs inside this page; close the tab to quit. Unsaved buffers are lost."))
-
 ;;;; Key bindings
 
 (for-each
@@ -1810,12 +1805,23 @@ line-local finds.  With ARG, on when it is positive."
         (else (user-error "E32: No file name"))))
 (set-procedure-property! evil-write 'evil-ex-complete 'file)
 
+(define (evil--quit-program force code)
+  "End the program with exit status CODE, as Vim does on its last window.
+Unless FORCE, refuse while a buffer visiting a file has unsaved changes."
+  (let ((changed (modified-file-buffers)))
+    (cond ((or force (null? changed)) (kill-emacs code))
+          ((memq (current-buffer) changed)
+           (user-error "E37: No write since last change (add ! to override)"))
+          (else (user-error "E162: No write since last change for buffer \"~a\"" (buffer-name (car changed)))))))
+
 (evil-define-command (evil-quit force)
-  "Close this window (:q), or the buffer when it is the only window.
+  "Close this window (:q).  On the last window, end the program where the
+host runs Edwin as one (the terminal), else close the buffer.
 It refuses to drop unsaved changes unless FORCE (:q!)."
   #:no-repeat
   (interactive "<!>")
   (cond ((pair? (cdr (window-list))) (delete-window))
+        ((can-kill-emacs?) (evil--quit-program force 0))
         ((and (buffer-file-name) (buffer-modified?) (not force))
          (user-error "E37: No write since last change (add ! to override)"))
         ((equal? (buffer-name) "*scratch*")
@@ -1874,10 +1880,29 @@ It refuses to drop unsaved changes unless FORCE (:q!)."
               (buffer-list))
     (message "Saved ~a buffer~a" n (if (= n 1) "" "s"))))
 
-(evil-define-command (evil-quit-all)
-  "Explain that Edwin cannot close its page (:qa)."
+(evil-define-command (evil-quit-all force)
+  "End the program (:qa), refusing while files have unsaved changes unless
+FORCE (:qa!).  In a page, explain that Edwin cannot close it."
   #:no-repeat
-  (message "Edwin lives in this page; close the tab to leave"))
+  (interactive "<!>")
+  (if (can-kill-emacs?)
+      (evil--quit-program force 0)
+      (message "Edwin lives in this page; close the tab to leave")))
+
+(evil-define-command (evil-save-and-quit-all)
+  "Save every changed file, then end the program (:wqa, :xa)."
+  #:no-repeat
+  (evil-write-all)
+  (evil-quit-all #f))
+
+(evil-define-command (evil-quit-all-with-error-code code)
+  "End the program at once with exit status CODE, 1 by default (:cq).
+Nothing is saved: git and other callers read the status as \"abort\"."
+  #:no-repeat
+  (interactive "<a>")
+  (if (can-kill-emacs?)
+      (kill-emacs (if (and code (string->number code)) (string->number code) 1))
+      (message "Edwin lives in this page; close the tab to leave")))
 
 (evil-define-command (evil-edit file force)
   "Visit FILE (:e).  With no FILE, reload this buffer's file; :e! drops changes."
@@ -2042,7 +2067,8 @@ FILES    Files are kept in this browser's storage.  emacs.scm, evil.scm
  (lambda (c) (evil-ex-define-cmd (car c) (cdr c)))
  '(("w[rite]" . evil-write) ("q[uit]" . evil-quit) ("wq" . evil-save-and-quit)
    ("x[it]" . evil-save-modified-and-close) ("exi[t]" . evil-save-modified-and-close)
-   ("wa[ll]" . evil-write-all) ("qa[ll]" . evil-quit-all) ("wqa[ll]" . evil-quit-all) ("xa[ll]" . evil-quit-all)
+   ("wa[ll]" . evil-write-all) ("qa[ll]" . evil-quit-all) ("wqa[ll]" . evil-save-and-quit-all) ("xa[ll]" . evil-save-and-quit-all)
+   ("cq[uit]" . evil-quit-all-with-error-code) ("quita[ll]" . evil-quit-all)
    ("e[dit]" . evil-edit) ("ene[w]" . evil-new-buffer) ("sav[eas]" . evil-save-as) ("r[ead]" . evil-read)
    ("so[urce]" . evil-source) ("f[ile]" . evil-file-info)
    ("b[uffer]" . evil-buffer) ("bn[ext]" . evil-next-buffer) ("bp[revious]" . evil-prev-buffer) ("bN[ext]" . evil-prev-buffer)

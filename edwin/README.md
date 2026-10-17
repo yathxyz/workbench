@@ -25,6 +25,8 @@ first, undo undoes your own edits, and the runtime is Node.
 | `test/ot.test.mjs`, `test/ot-sim.mjs` | the OT properties with fast-check (`edwin-ot`; needs `NODE_PATH` at `tools/node_modules`) |
 | `test/conformance.test.mjs`, `test/crash.test.mjs`, `test/disk.test.mjs`, `test/edit-client.mjs` | the edwind gate suites (`edit-conformance`, `edit-crash`, `edit-disk`) and their client |
 | `src/display.js`, `test/display.test.mjs` | the display seam (DT0, see below): frames with no page, drawn on a cell grid for a terminal or native backend (`edwin-display`) |
+| `native/` | `edwin`, the desktop program (DT1, see below): a Rust crate with its own Cargo workspace that embeds V8 and these files; `native/js/` is its JavaScript (prelude, host, terminal, startup), `native/tests/` its pseudo-terminal suite (`cargo test`) |
+| `test/term.test.mjs`, `test/native.test.mjs` | the terminal encoder and decoder, and the core's seams for the program: files on a disk, exit statuses, input events (`edwin-native`) |
 
 These files came from the published Edwin artifact (version 1791768765, 2026-10-12). From now on this directory is
 the source.
@@ -389,7 +391,74 @@ Choices E3 made where the spec left one open, and where it had to deviate:
 - **Not in E3**: K4 (Edwin keymaps in the board's conflict checker) waits for the keymaps PR; a display-text
   mechanism in the renderer (block-ref text is a DOM post-pass) and an `imenuItems` hook are left for later.
 
-## Step DT0: the display seam (in review)
+## Step DT1: `edwin` in a terminal (in review)
+
+`edwin [-nw] [-R] [--standalone | --socket PATH] [+LINE] [FILE]...` is Edwin as a terminal program, meant to stand
+in for Vim or Neovim, `$EDITOR` included. `edwin/native` is a Rust crate (its own Cargo workspace, so V8 stays out
+of the Workbench crates and their Nix build) that embeds V8 (the `v8` crate, 130.0.1, prebuilt) and carries every
+source it runs: the unchanged core in `src/`, the shipped Scheme in `scm/`, and `native/js/`. Rust is only the
+floor: files, `/dev/tty` in raw mode, signals through a self-pipe, edwind's socket and one `poll(2)` loop. Edwin is
+a model frame (DT0) drawn by `native/js/term.js`.
+
+Build and run (the prebuilt V8 is downloaded by the `v8` crate's build script, or named by `RUSTY_V8_ARCHIVE`):
+
+    cd edwin/native && cargo build --release && ./target/release/edwin FILE
+    cargo test --release        # the pseudo-terminal suite (the edwind case needs node)
+
+- **Vim's contract.** `:q` on the last window ends the program, refusing with E37 or E162 while a file has unsaved
+  changes; `:q!`, `ZQ` and `:qa!` drop them. `:wq`, `:x`, `ZZ`, `:wqa` save first. `:cq` exits with status 1 (or
+  its argument) and saves nothing, so `git commit` aborts. `C-x C-c` asks about each changed file (y, n, !, q),
+  then confirms leaving with changes. In a split, `:q` closes the window, as before. The program blocks until it
+  ends, so `git`, `sudoedit` and anything else that runs `$EDITOR` work. `+LINE` starts on a line (`+` alone: the
+  last); `-` edits standard input (`git diff | edwin -`), the terminal being `/dev/tty`. Files the editor is handed by git (`COMMIT_EDITMSG`, `git-rebase-todo`...) start at the top
+  (`save-place-ignore-files-regexp`).
+- **Files are the disk's.** The host has a file system (`host.files`): the core's `Store` reads and writes paths,
+  relative to the directory `edwin` started in, `~` expanded. A buffer's file is the absolute path; it is shown and
+  completed by its label (relative under the working directory, `~/...` under home). Saves are atomic (a temporary
+  file beside it, the old mode, fsync, rename), except a symlink, a file with other hard links, or one in a
+  directory we cannot create files in, which are written in place. CRLF line ends and a byte order mark are kept.
+  A saved file ends in a newline (`require-final-newline`, which the program sets and `init.scm` may unset). A file
+  that is not UTF-8 is refused. recentf, savehist, save-place and prescient are one JSON file in
+  `~/.local/state/edwin/`; the user's Scheme is `~/.config/edwin/init.scm` and `~/.config/edwin/lisp/`.
+- **The terminal.** The alternate screen, no autowrap, synchronized output, rows redrawn only when they changed.
+  Truecolor when `COLORTERM` or `TERM` says so, else the nearest of the 256 colours, else of the 16
+  (`EDWIN_COLOR=truecolor|256|16` overrides). The cursor is the terminal's own, its shape per Evil state (DECSCUSR:
+  block, bar, underline) and its colour by OSC 12. The theme follows the background colour the terminal reports
+  (OSC 11), else `COLORFGBG`, else dark (`EDWIN_THEME=dark|light` overrides); `EDWIN_DEFAULT_COLORS=1` draws the
+  default face in the terminal's own colours. Kills and yanks go to the system clipboard by OSC 52, which reaches it
+  over SSH too (`EDWIN_OSC52=0` stops it). Mouse (SGR 1006): a click sets point and selects a window, a drag marks
+  a region, the wheel scrolls three lines. Bracketed paste arrives as one insertion; focus events change the cursor.
+  The kitty keyboard protocol's first level is asked for, so ESC, `C-i` and `M-` keys are unambiguous where the
+  terminal has it; elsewhere a lone ESC waits 25 ms for the rest of a sequence (`EDWIN_ESC_MS`).
+- **Signals.** `C-z` suspends in Vim's states (Normal, Motion, Visual, Insert) and `C-x C-z` in every state; `fg`
+  resumes and redraws. A resize redraws. On `SIGHUP` (the SSH connection dropped) or `SIGTERM`, changed files are
+  copied into `~/.local/state/edwin/rescue/` before the program exits.
+- **Startup.** `build.rs` runs `native/js/boot.js` (the host, the core, `Ed.boot` with the shipped Scheme, the
+  terminal key settings) in a V8 snapshot creator and the binary carries the heap; a start restores it and runs
+  `main.js` for the process (arguments, terminal, directories, storage, then the user's `init.scm`). First draw of a
+  200×50 terminal: 155 ms without the snapshot (75 compiling the core, 77 evaluating the Scheme), 40 ms with it
+  (`EDWIN_TRACE=1` logs the steps, `EDWIN_NO_SNAPSHOT=1` starts cold). The binary is 37.6 MB: V8, the 5.2 MB
+  snapshot and ICU's data (for `\p{...}` in regular expressions).
+- **edwind.** When an edwind answers (`--socket PATH`, else `$EDWIN_SOCKET`, else the service's
+  `/run/workbench-edit/edit.sock`; `--standalone` or `EDWIN_NO_ATTACH=1` never attach), `edwin` boots served
+  (`Ed.bootServed`), so its image, commands and user init are edwind's. Notes under edwind's notes directory are
+  opened through edwind, shared with the browser's frames; every other file stays the program's own, so a commit
+  message never needs edwind's write permission. Quitting waits (up to 5 s) until edwind has acknowledged every
+  edit. An attached start is cold (the snapshot holds a standalone boot).
+
+Core changes for DT1: `host.files` behind `Store` (and shipped config never read from the working directory);
+`kill-emacs`, `suspend-frame`, `can-kill-emacs?`, `display-graphic-p`, `modified-file-buffers` and a JS
+`save-buffers-kill-terminal` (the page's still say how to leave); `Ed.display.input(f, ev)`, the input half of the
+display seam (keys, paste, focus, mouse, resize in cell terms, as the page's frame wiring does it); `Ed.boot({
+deferUserInit})` with `Ed.loadUserInit()` and `hooks.beforeUserInit`; `Ed.reloadPersistent()` (stack.js's tables,
+read again once the program's storage is open); `require-final-newline`; and in `evil.scm` `:cq`, `:wqa`/`:xa`
+saving before they quit, and `:q`/`:qa` ending the program where the host can.
+
+Not in DT1: worker threads (jobs run on the main thread, as on a page without workers), the AI commands (no
+`fetch` in the program yet), editing files that are not UTF-8, Vim's swap files, the
+GUI (DT2), and Nix packaging of the binary (DT4: the prebuilt V8 must come from a fixed-output fetch).
+
+## Step DT0: the display seam (done)
 
 DT0 is the first step of desktop Edwin (the doc "Edwin on the Linux desktop", decided 2026-10-16: build through the
 GUI, DT0 then DT1 `edwin -nw` then DT2). A Rust shell will embed V8, run these same files and draw a terminal or a

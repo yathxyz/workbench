@@ -726,15 +726,22 @@ CMD('view-messages', '', '', 'Show the *Messages* buffer.', () => { Ed.setWindow
 
 /* ---------- files (kept in this browser's local storage) ---------- */
 /* hooks.visited(b, name, fresh) lets stack.js keep recentf and restore the saved place (save-place). */
+/* With a file system (host.files) a buffer's file is the absolute path; its name is the name as given. */
+const fileOf = name => (host.files && host.files.resolve ? host.files.resolve(name) : name);
+const fileLabel = f => (host.files && host.files.label ? host.files.label(f) : f);
+Ed.fileLabel = fileLabel;
 function visit(name) {
   /* In served mode files are edwind's buffers: the protocol client opens the replica (sync.js). */
   if (Ed.hooks.visit) return Ed.hooks.visit(name);
-  const existing = E.buffers.find(b => b.file === name);
-  if (existing) { Ed.setWindowBuffer(existing); if (Ed.hooks.visited) Ed.hooks.visited(existing, name, false); return existing; }
+  const file = fileOf(name);
+  const existing = E.buffers.find(b => b.file === file);
+  if (existing) { Ed.setWindowBuffer(existing); if (Ed.hooks.visited) Ed.hooks.visited(existing, file, false); return existing; }
+  let content;
+  try { content = Ed.Store.get(file) ?? (host.files ? null : shippedConfig(name)); }
+  catch (e) { signal('file-error', `Cannot read ${name}: ${e && e.message ? e.message : e}`); }
   const b = Ed.getBufferCreate(Ed.getBuffer(name) ? L.call('generate-new-buffer-name', [name]) : name);
-  const content = Ed.Store.get(name) ?? shippedConfig(name);
-  b.text = content ?? ''; b.pt = 0; b.file = name; b.mode = Ed.modeFor(name); b.modified = false; b.undo = [];
-  if (Ed.hooks.visited) Ed.hooks.visited(b, name, true);
+  b.text = content ?? ''; b.pt = 0; b.file = file; b.mode = Ed.modeFor(name); b.modified = false; b.undo = [];
+  if (Ed.hooks.visited) Ed.hooks.visited(b, file, true);
   Ed.setWindowBuffer(b);
   if (content === null) Ed.message('(New file)');
   { const save = E.current; E.current = b; try { L.resetOps(); L.runHook('find-file-hook'); } catch (e) { Ed.reportError(e); } finally { E.current = save; } }
@@ -742,11 +749,18 @@ function visit(name) {
 }
 Ed.visit = visit;
 CMD('find-file', 'FFind file: ', 'FILENAME', 'Visit FILENAME. Files are kept in this browser’s storage.', ([n]) => { if (!str(n).trim()) signal('user-error', 'No file name given'); return visit(n.trim()); });
-function writeTo(b, name) {
-  const ok = Ed.Store.set(name, b.text);
+L.defvar('require-final-newline', false, 'When true, saving a file adds a newline at its end if it has none (the terminal program sets it, as Vim does).');
+function writeTo(b, given) {
+  const name = fileOf(given);
+  if (truthy(L.get('require-final-newline')) && b.rope.length && b.rope.charCodeAt(b.rope.length - 1) !== 10) {
+    const pt = b.pt; b.pt = b.rope.length; Ed.insertText(b, '\n'); b.pt = Math.min(pt, b.rope.length);
+  }
+  let ok;
+  try { ok = Ed.Store.set(name, b.text); }
+  catch (e) { signal('file-error', `Cannot write ${name}: ${e && e.message ? e.message : e}`); }
   b.file = name; b.modified = false;
   if (Ed.hooks.wrote) Ed.hooks.wrote(b, name);
-  Ed.message(ok ? `Wrote ${name}` : `Wrote ${name} (kept for this session only: browser storage is unavailable)`);
+  Ed.message(ok ? `Wrote ${fileLabel(name)}` : `Wrote ${name} (kept for this session only: browser storage is unavailable)`);
 }
 CMD('save-buffer', async () => (cur().file ? [] : [await Ed.readMini('File to save in: ', cur().name.replace(/[*\s]/g, '') || 'untitled', () => Ed.Store.list())]),
   '&optional FILENAME', 'Save the current buffer to its file, asking for a name if it has none.', ([n]) => {
@@ -762,6 +776,52 @@ CMD('write-file', 'FWrite file: ', 'FILENAME', 'Save the current buffer to FILEN
 D('file-exists-p', 'FILENAME', 'Non-nil if FILENAME is saved in this browser.', ([n]) => bool(Ed.Store.get(str(n)) !== null));
 D('delete-file', 'FILENAME', 'Remove FILENAME from this browser’s storage.', ([n]) => { Ed.Store.del(str(n)); return false; });
 D('directory-files', '&rest IGNORED', 'Names of all saved files.', () => listOf(Ed.Store.list()));
+
+/* ---------- leaving Edwin (DT1) ----------
+   A host that runs Edwin as a program sets hooks.killEmacs(code), which ends it with exit status CODE, and
+   hooks.suspendFrame(), which stops it until the shell resumes it (the terminal frame: C-z, then fg). A page
+   sets neither: there the commands below say how to leave instead. */
+const LEAVE_PAGE = 'Edwin runs inside this page; close the tab to quit. Unsaved buffers are lost.';
+const exitCode = a => (a === undefined || a === false || a === NIL ? 0 : a === true ? 1 : num(a) & 255);
+const modifiedFiles = () => E.buffers.filter(b => b.file && b.modified);
+D('can-kill-emacs?', '', 'True when this host runs Edwin as a program that kill-emacs can end (the desktop shell); #f in a page.', () => bool(Ed.hooks.killEmacs));
+D('display-graphic-p', '&optional FRAME', 'True unless the selected frame is drawn on a character terminal.', () => bool(!(E.frame && E.frame.backend && E.frame.backend.tty)));
+D('modified-file-buffers', '', 'The buffers that visit a file and have unsaved changes.', () => listOf(modifiedFiles()));
+CMD('kill-emacs', '', '&optional ARG', 'End the program with exit status ARG (0 when absent, 1 for #t), dropping unsaved changes.', ([a]) => {
+  if (!Ed.hooks.killEmacs) { Ed.message(LEAVE_PAGE); return false; }
+  Ed.hooks.killEmacs(exitCode(a)); return false;
+});
+CMD('suspend-frame', '', '', 'Stop the program until the shell resumes it (C-z in a terminal, then fg).', () => {
+  if (!Ed.hooks.suspendFrame) { Ed.message('Nothing to suspend: Edwin runs inside this page'); return false; }
+  Ed.hooks.suspendFrame(); return false;
+});
+/* C-x C-c: offer to save each changed file, then confirm leaving with changes still unsaved (Emacs's order).
+   With a prefix argument every changed file is saved without asking. */
+CMD('save-buffers-kill-terminal', async () => {
+  if (!Ed.hooks.killEmacs) return [false];
+  const all = E.prefixArg !== null && E.prefixArg !== undefined;
+  for (const b of modifiedFiles()) {
+    let save = all;
+    while (!all) {
+      const ch = L.chr(await Ed.readChar(`Save file ${b.file}? (y, n, ! or q) `));
+      if (ch === 'y' || ch === 'Y' || ch === ' ') { save = true; break; }
+      if (ch === 'n' || ch === 'N') break;
+      if (ch === '!') { save = true; for (const x of modifiedFiles()) if (x !== b) { const was = E.current; E.current = x; try { L.call('save-buffer', []); } finally { E.current = was; } } break; }
+      if (ch === 'q' || ch === 'Q') return [false];
+      Ed.ding();
+    }
+    if (save) { const was = E.current; E.current = b; try { L.call('save-buffer', []); } finally { E.current = was; } }
+  }
+  if (modifiedFiles().length) {
+    const v = (await Ed.readMini('Modified buffers exist; exit anyway? (yes or no) ', '')).trim();
+    if (v !== 'yes') return [false];
+  }
+  return [true];
+}, '&optional GO', 'Offer to save each changed file, then end the program (C-x C-c). In a page it says how to leave.', ([go]) => {
+  if (!Ed.hooks.killEmacs) { Ed.message(LEAVE_PAGE); return false; }
+  if (truthy(go)) Ed.hooks.killEmacs(0);
+  return false;
+});
 /* ---------- consult-style commands: pick from a live list with preview ---------- */
 CMD('consult-buffer', async () => {
   const bufs = Ed.bufferNames(), files = Ed.Store.list().filter(f => !E.buffers.some(b => b.file === f));
@@ -1175,11 +1235,14 @@ const shipped = name => host.config(name);
    buffers of this runtime, so the buffer list and the completion word set hold only what the page opened. */
 let servedBoot = false;
 function shippedConfig(name) { const c = CONFIG.find(x => x[0] === name && (x[1] || servedBoot)); return c ? shipped(name) : null; }
+/* With a file system (host.files) a config name is a path in the working directory, not a saved copy: the
+   shipped files are read as they are, and their buffers visit no file. */
+const savedConfig = name => (host.files ? null : Ed.Store.get(name));
 function loadConfig(name, lazy) {
-  const saved = Ed.Store.get(name), orig = shipped(name);
+  const saved = savedConfig(name), orig = shipped(name);
   if (orig === null) return null;
   const text = saved ?? orig;
-  if (!lazy) { const b = Ed.getBufferCreate(name); b.text = text; b.file = name; b.modified = false; b.pt = 0; }
+  if (!lazy) { const b = Ed.getBufferCreate(name); b.text = text; b.file = host.files ? null : name; b.modified = false; b.pt = 0; }
   L.call('provide', [intern(name.replace(/\.scm$/, ''))]);   // (require 'org) does not load the shipped file again
   try { evalText(text); return null; }
   catch (e) {
@@ -1198,7 +1261,7 @@ CMD('reset-config', '', '', 'Restore the shipped emacs.scm, evil.scm and init.sc
   for (const [name] of CONFIG) {
     const orig = shipped(name);
     if (orig === null) continue;
-    Ed.Store.del(name);
+    if (!host.files) Ed.Store.del(name);
     const b = Ed.getBuffer(name);
     if (b) { b.text = orig; b.pt = 0; b.modified = false; b.undo = []; b.redo = []; }
     evalText(orig);
@@ -1253,17 +1316,22 @@ function boot(opts = {}) {
   const scratch = Ed.getBufferCreate('*scratch*'); scratch.text = SCRATCH; scratch.pt = 0;
   const errors = [];
   for (const [name, lazy] of CONFIG) { const err = loadConfig(name, lazy || servedBoot); if (err) errors.push(err); }
-  const userErr = opts.served ? null : loadUserInit(); if (userErr) errors.push(userErr);
+  /* The host's own settings go between the shipped files and the user's init (the terminal's keys, DT1). */
+  if (Ed.hooks.beforeUserInit) { try { Ed.hooks.beforeUserInit(); } catch (e) { errors.push(`Error in the host's settings: ${Ed.errorText(e)}`); } }
+  /* deferUserInit: the host evaluates the user's init later, with Ed.loadUserInit() (the desktop shell boots
+     into its startup snapshot first, DT1). */
+  const userErr = opts.served || opts.deferUserInit ? null : loadUserInit(); if (userErr) errors.push(userErr);
   E.buffers = [scratch, ...CONFIG.filter(c => !c[1] && !servedBoot).map(([n]) => Ed.getBuffer(n)).filter(Boolean), msgs];
   if (opts.frame) Ed.selectFrame(opts.frame);
   E.root = new Ed.Window(scratch); E.sel = null; Ed.selectWindow(E.root);
   if (errors.length) errors.forEach(e => Ed.message(e));
-  else Ed.message(Ed.Store.get('init.scm') !== null ? 'Loaded your saved init.scm. :h shows the key reference.' : 'Welcome to Edwin. :h shows the key reference; C-z toggles Emacs keys.');
+  else Ed.message(savedConfig('init.scm') !== null ? 'Loaded your saved init.scm. :h shows the key reference.' : 'Welcome to Edwin. :h shows the key reference; C-z toggles Emacs keys.');
   if (opts.frame) wire(opts.frame);
   Ed.render();
   Ed.commandLoop();
 }
 Ed.boot = boot;
+Ed.loadUserInit = () => { const err = loadUserInit(); if (err) Ed.message(err); return err; };
 
 /* ---------- the page's hooks and keys (section 9.3) ---------- */
 /* The board leader the frame releases (R9.7): a key event whose name equals it is neither handled nor
