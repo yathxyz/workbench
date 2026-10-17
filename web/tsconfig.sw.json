@@ -1,0 +1,14 @@
+{
+  // The service worker (sw.ts): the worker's globals instead of the page's.
+  "compilerOptions": {
+    "target": "esnext",
+    "lib": ["esnext", "webworker"],
+    "types": [],
+    "strict": true,
+    "noEmit": true,
+    "erasableSyntaxOnly": true,
+    "skipLibCheck": true,
+    "useUnknownInCatchVariables": false
+  },
+  "files": ["sw.ts"]
+}

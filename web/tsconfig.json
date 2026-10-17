@@ -1,0 +1,21 @@
+{
+  // The page (app.ts, keys.ts, bridge.ts): classic scripts the browser runs as plain JavaScript once their types are
+  // stripped (tools/strip.mjs; the nix web root carries only the .js). Erasable syntax only, so the stripped file
+  // keeps every line and column of the .ts. sw.ts, a service worker, has its own config (tsconfig.sw.json).
+  "compilerOptions": {
+    "target": "esnext",
+    "lib": ["esnext", "dom", "dom.iterable"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "types": [],
+    "strict": true,
+    "noEmit": true,
+    "allowJs": true,
+    "checkJs": false,
+    "erasableSyntaxOnly": true,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+    "useUnknownInCatchVariables": false
+  },
+  "files": ["globals.d.ts", "board.d.ts", "page.d.ts", "keys.ts", "bridge.ts", "app.ts"]
+}

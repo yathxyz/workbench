@@ -1,9 +1,10 @@
-# The web root: web/ as committed, the vendored xterm bundle, the Edwin console and frame runtime
-# under edwin/, and the fonts, converted to woff2 from nixpkgs at build time with a generated
-# fonts/fonts.css. No font file lives in the repo.
+# The web root: web/ with its TypeScript stripped to JavaScript (tools/strip.mts), the vendored xterm bundle,
+# the Edwin console and frame runtime under edwin/, and the fonts, converted to woff2 from nixpkgs at build
+# time with a generated fonts/fonts.css. No font file lives in the repo.
 {
   lib,
   runCommand,
+  nodejs,
   vendor,
   nerd-fonts,
   noto-fonts,
@@ -34,8 +35,8 @@ let
   mono = "${nerd-fonts.jetbrains-mono}/share/fonts/truetype/NerdFonts/JetBrainsMono";
   noto = "${noto-fonts}/share/fonts/noto";
 in
-runCommand "workbench-web" { nativeBuildInputs = [ woff2 ]; } ''
-  cp -r ${web} $out
+runCommand "workbench-web" { nativeBuildInputs = [ nodejs woff2 ]; } ''
+  node ${../tools/strip.mts} --web ${web} $out
   chmod -R u+w $out
   install -Dm444 -t $out/vendor ${vendor}/vendor.js ${vendor}/xterm.css
   install -Dm444 ${console} $out/edwin/index.html
