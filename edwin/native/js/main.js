@@ -22,6 +22,8 @@ Edit FILEs in Edwin, in this terminal or in a window.
   -R, --read-only    visit the files read-only
   --standalone       never attach to edwind
   --socket PATH      attach to the edwind listening on PATH
+  --daemon           start your own edwind in the background (--fg-daemon: in the foreground); each edwin
+                     then attaches to it, as emacsclient does to emacs --daemon
   +LINE, +           start on line LINE of the first file (+ alone: its last line)
   -                  edit what arrives on standard input
   -h, --help         show this text;  --version  show the version
@@ -97,7 +99,8 @@ if (!gui) { out(enc.enter()); N.ttyFlush(); }
 function edwindSocket() {
   if (N.env('EDWIN_NO_ATTACH')) return null;
   if (opts.standalone) return null;
-  const cands = opts.socket ? [opts.socket] : [envOf('EDWIN_SOCKET'), '/run/workbench-edit/edit.sock'].filter(Boolean);
+  const user = envOf('XDG_RUNTIME_DIR') ? envOf('XDG_RUNTIME_DIR') + '/edwin/edit.sock' : '';   // edwin --daemon's
+  const cands = opts.socket ? [opts.socket] : [envOf('EDWIN_SOCKET'), user, '/run/workbench-edit/edit.sock'].filter(Boolean);
   for (const p of cands) {
     try { const id = N.sockOpen(p); N.sockClose(id); return p; } catch (e) { if (opts.socket) throw new Error(`cannot attach to edwind at ${p}: ${e.message}`); }
   }
@@ -126,6 +129,7 @@ async function quit(code) {
   try { host.suspend(); } catch (e) { console.error(e); }
   leaveTerminal();
   if (attached && attached.unconfirmed) N.eprint(`edwin: edwind had not confirmed ${attached.unconfirmed} edit(s) when edwin quit\n`);
+  if (attached) for (const b of Ed.sync.buffers.values()) if (b.saveError) N.eprint(`edwin: ${b.name} was not saved: ${b.saveError}\n`);
   N.exit(code);
 }
 Ed.hooks.killEmacs = code => { quit(code); };

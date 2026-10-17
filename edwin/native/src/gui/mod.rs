@@ -103,6 +103,9 @@ impl App {
         self.scale = 1.0;
         self.fonts();
         let t = self.text.as_ref().unwrap();
+        if t.empty {
+            return Err("no fonts (fontconfig lists none)".into());
+        }
         let logical = LogicalSize::new(
             self.start.0 * t.cell_w + 2 * self.pad as u32,
             self.start.1 * t.cell_h + 2 * self.pad as u32,
@@ -663,6 +666,10 @@ mod tests {
     fn a_model_draws_its_faces_text_and_cursor() {
         let m = sample();
         let mut text = Text::new(None, 14.0);
+        if text.empty {
+            eprintln!("skipped: no fonts");
+            return;
+        }
         let (cw, ch) = (text.cell_w, text.cell_h);
         let (w, h) = (m.cols * cw, m.rows * ch);
         let px = match render_rgba(&m, &mut text, w, h) {
@@ -728,6 +735,10 @@ mod tests {
             color: Some("#d33682".into()),
         });
         let mut text = Text::new(None, 14.0);
+        if text.empty {
+            eprintln!("skipped: no fonts");
+            return;
+        }
         let (cw, ch) = (text.cell_w, text.cell_h);
         let (w, h) = (m.cols * cw, m.rows * ch);
         let px = match render_rgba(&m, &mut text, w, h) {

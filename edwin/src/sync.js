@@ -584,9 +584,11 @@ function onResult(msg) {
   c.resolve(r);
 }
 function spin(p, c) {
-  const t = setTimeout(() => { sync.spinning++; statusChanged(); t.fired = true; }, SPINNER_MS);
-  if (t.unref) t.unref();
-  const done = () => { clearTimeout(t); if (t.fired) { sync.spinning = Math.max(0, sync.spinning - 1); statusChanged(); } };
+  // A browser's (and the native prelude's) timer handle is a number, so the flag lives here, not on it.
+  let fired = false;
+  const t = setTimeout(() => { sync.spinning++; statusChanged(); fired = true; }, SPINNER_MS);
+  if (t && t.unref) t.unref();
+  const done = () => { clearTimeout(t); if (fired) { sync.spinning = Math.max(0, sync.spinning - 1); statusChanged(); } };
   p.then(done, done);
   return p;
 }
@@ -713,7 +715,17 @@ function visit(name) {
 }
 function save(b) { b = typeof b === 'string' ? sync.buffers.get(b) : b; if (!b) return Promise.resolve({ error: { condition: 'error', report: 'no such buffer' } }); const rid = newRid(); return new Promise(resolve => { sync.calls.set(rid, { resolve, frame: E.frame, at: Date.now(), rid }); send({ t: 'save', rid, buf: b.id }); }); }
 function revert(b) { b = typeof b === 'string' ? sync.buffers.get(b) : b; if (!b) return Promise.resolve({ error: { condition: 'error', report: 'no such buffer' } }); const rid = newRid(); return new Promise(resolve => { sync.calls.set(rid, { resolve, frame: E.frame, at: Date.now(), rid }); send({ t: 'revert', rid, buf: b.id }); }); }
-function saveShared(b) { spin(save(b)).then(r => { Ed.message(r.error ? `${b.name}: ${r.error.report}` : `Wrote ${b.file || b.id}`); Ed.scheduleRender(); }); return false; }
+/* The save goes out behind every edit already sent, so with none queued it covers the whole buffer: the buffer
+   counts as saved at once, which lets :wq go on to quit (a quitting frame waits for the answer). A refusal
+   marks it modified again and keeps the reason in b.saveError. */
+function saveShared(b) {
+  if (!b.queue.length) b.modified = false;
+  spin(save(b)).then(r => {
+    if (r.error) { b.modified = true; b.saveError = r.error.report; } else b.saveError = null;
+    Ed.message(r.error ? `${b.name}: ${r.error.report}` : `Wrote ${b.file || b.id}`); Ed.scheduleRender();
+  });
+  return false;
+}
 function revertShared(b) { spin(revert(b)).then(r => { Ed.message(r.error ? `${b.name}: ${r.error.report}` : `${b.file || b.id} reloaded`); Ed.scheduleRender(); }); return false; }
 function anchorAdd(buf, pos, label, id) {
   const bid = typeof buf === 'string' ? buf : buf.id;

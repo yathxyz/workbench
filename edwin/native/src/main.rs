@@ -28,6 +28,29 @@ static SNAPSHOT: &Aligned<[u8]> =
     &Aligned(*include_bytes!(concat!(env!("OUT_DIR"), "/snapshot.bin")));
 
 fn main() {
+    // `edwin --daemon` (in the background) and `edwin --fg-daemon` start the user's edwind, as Emacs's do: through
+    // edwin-daemon beside this program, which the package installs with edwind.
+    if let Some(a) = std::env::args()
+        .nth(1)
+        .filter(|a| a == "--daemon" || a == "--fg-daemon")
+    {
+        let daemon = std::env::current_exe()
+            .ok()
+            .and_then(|e| Some(e.parent()?.join("edwin-daemon")));
+        match daemon.filter(|d| d.exists()) {
+            Some(d) => {
+                let mut cmd = std::process::Command::new(d);
+                if a == "--fg-daemon" {
+                    cmd.arg("--fg");
+                }
+                cmd.args(std::env::args().skip(2));
+                let err = std::os::unix::process::CommandExt::exec(&mut cmd);
+                eprintln!("edwin: cannot start edwin-daemon: {err}");
+            }
+            None => eprintln!("edwin: {a} needs edwin-daemon beside edwin (the Nix package installs it with edwind)"),
+        }
+        std::process::exit(1);
+    }
     // V8 runs on a thread whose stack holds the Scheme evaluator's depth cap (R4.34; edwind sizes it alike).
     let code = std::thread::Builder::new()
         .name("edwin".into())
@@ -39,8 +62,17 @@ fn main() {
     std::process::exit(code);
 }
 
+/// The socket of the user's own edwind (`edwin --daemon`): $XDG_RUNTIME_DIR/edwin/edit.sock.
+fn user_socket() -> Option<String> {
+    std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(|d| format!("{d}/edwin/edit.sock"))
+}
+
 /// Whether main.js will attach to edwind, whose boot (Ed.bootServed) the snapshot cannot hold: the same
-/// choice main.js makes (--standalone, --socket, EDWIN_NO_ATTACH, EDWIN_SOCKET, the service's socket).
+/// choice main.js makes (--standalone, --socket, EDWIN_NO_ATTACH, EDWIN_SOCKET, the user's daemon, the
+/// service's socket).
 fn will_attach() -> bool {
     let args: Vec<String> = std::env::args().skip(1).take_while(|a| a != "--").collect();
     if args
@@ -61,6 +93,7 @@ fn will_attach() -> bool {
         .filter(|s| !s.is_empty())
         .into_iter()
         .collect();
+    cands.extend(user_socket());
     cands.push("/run/workbench-edit/edit.sock".into());
     cands
         .iter()
