@@ -52,13 +52,13 @@ boards directory. --board FILE seeds <boardsDir>/<host>.json from FILE before an
 Binaries come from --bin-dir, else from PATH. The web root comes from --web-root or
 $WB_WEB_ROOT (for example the output of `nix build .#workbench-web`).
 
-edwind (the editing server, edwin/server/main.mjs) runs beside wb-web with an edit.json: its socket
+edwind (the editing server, edwin/server/main.mts) runs beside wb-web with an edit.json: its socket
 in a 0700 directory under the temporary root, the harness's notesDir and boardsDir, the hub and web
 sockets, the home as its writable path and the module's refusal list (so POST /api/mv, which wb-web
 forwards to edwind, has the authority it has in production), and the same host as web.json, whose
 editSocket points at it. `edwind` comes from --bin-dir
-or PATH when present; otherwise the harness runs edwin/server/main.mjs from this checkout with node
-and the flags of the package wrapper ($EDWIND_MAIN names another main.mjs). --frames writes
+or PATH when present; otherwise the harness runs edwin/server/main.mts from this checkout with node
+and the flags of the package wrapper ($EDWIND_MAIN names another main.mts). --frames writes
 `frames: true` into web.json (ui.mjs and perf.mjs pass it when WB_FRAMES=1); without it the key is
 absent, so a wb-web that does not know it still starts.
 """
@@ -234,7 +234,7 @@ class Harness:
         }
         if frames:
             self.web_config["frames"] = True
-        # edwin/server/main.mjs loadConfig: unknown fields are refused, notesDir is required, the socket's
+        # edwin/server/main.mts loadConfig: unknown fields are refused, notesDir is required, the socket's
         # directory must be 0700 and owned by this user. configDir is private to the run: the user's own
         # init.scm never reaches a test.
         self.edit_config = {
@@ -301,13 +301,13 @@ class Harness:
         wait_until(lambda: can_connect_unix(self.hub_sock), "wb-hub", self.hub)
 
     def edwind_argv(self):
-        """`edwind --config edit.json` from --bin-dir or PATH; else node on this checkout's main.mjs (or
-        $EDWIND_MAIN) with the flags the package wrapper uses (nix/package.nix, edwin/test/edit-client.mjs)."""
+        """`edwind --config edit.json` from --bin-dir or PATH; else node on this checkout's main.mts (or
+        $EDWIND_MAIN) with the flags the package wrapper uses (nix/package.nix, edwin/test/edit-client.mts)."""
         try:
             return [self.bin("edwind"), "--config", self.edit_json]
         except RuntimeError:
             pass
-        main = os.environ.get("EDWIND_MAIN") or str(Path(__file__).resolve().parent.parent / "edwin" / "server" / "main.mjs")
+        main = os.environ.get("EDWIND_MAIN") or str(Path(__file__).resolve().parent.parent / "edwin" / "server" / "main.mts")
         node = shutil.which("node")
         if not node or not os.path.exists(main):
             raise RuntimeError(f"edwind not found (use --bin-dir or PATH), and no node for {main}")

@@ -714,13 +714,18 @@ in
         UMask = "0077";
         RuntimeDirectory = "workbench-edit";
         RuntimeDirectoryMode = "0700";
+        # edwind is TypeScript that Node strips at load; the compile cache keeps the stripped code, so only
+        # the first start after a deploy pays for it (about 240 ms).
+        CacheDirectory = "workbench-edit";
+        CacheDirectoryMode = "0700";
+        Environment = [ "NODE_COMPILE_CACHE=%C/workbench-edit" ];
         LoadCredential = editCredentials;
         Restart = "always";
         RestartSec = 1;
         TimeoutStopSec = 10;
         OOMScoreAdjust = 100;
         MemoryMax = "${toString (edit.memoryMiB * 5 / 4)}M";
-        # The server runs on a worker thread whose stack main.mjs sizes itself (32 MiB, the Scheme cap of
+        # The server runs on a worker thread whose stack main.mts sizes itself (32 MiB, the Scheme cap of
         # 10,000 frames needs about 8 MiB); the limit only has to admit that thread's stack.
         LimitSTACK = "64M";
 
