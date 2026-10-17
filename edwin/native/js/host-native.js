@@ -17,13 +17,25 @@ const env = k => { const v = N.env(k); return v === undefined || v === null || v
 let HOME = '/', CWD = '/', CONFIG_DIR = '/', STATE_DIR = '/';
 const join = (a, b) => (b.startsWith('/') ? b : (a.endsWith('/') ? a : a + '/') + b);
 const dirname = p => { const i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i); };
-/* A file name as the user gave it to an absolute path: ~ is the home directory, others are under CWD. */
+/* An absolute path without empty, . and .. segments (as the shell's cd does, not following links). */
+function normalize(p) {
+  const out = [];
+  for (const seg of p.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') out.pop(); else out.push(seg);
+  }
+  return '/' + out.join('/');
+}
+/* A file name as the user gave it to an absolute path: ~ is the home directory, others are under CWD. So
+   foo, ./foo and bar/../foo are one file. */
 function resolve(name) {
   const n = String(name);
   if (n === '~') return HOME;
-  if (n.startsWith('~/')) return join(HOME, n.slice(2));
-  return join(CWD, n);
+  if (n.startsWith('~/')) return normalize(join(HOME, n.slice(2)));
+  return normalize(join(CWD, n));
 }
+/* The file's true name, every symbolic link resolved: two names for one file have the same true name. */
+const truename = name => { const p = resolve(name); return N.realpath(p) || p; };
 function readDirs() {
   HOME = env('HOME') || '/';
   CWD = N.cwd();
@@ -82,7 +94,7 @@ function label(p) {
   if (HOME !== '/' && a.startsWith(HOME + '/')) return '~/' + a.slice(HOME.length + 1);
   return a;
 }
-const files = { read, write, remove: name => { N.remove(resolve(name)); listCache = null; }, list, resolve, label, exists: name => N.stat(resolve(name)) !== null, get cwd() { return CWD; } };
+const files = { read, write, remove: name => { N.remove(resolve(name)); listCache = null; }, list, resolve, label, truename, exists: name => N.stat(resolve(name)) !== null, get cwd() { return CWD; } };
 
 /* ---------- storage ---------- */
 function jsonStorage(file) {
@@ -157,5 +169,5 @@ function createHost(opts = {}) {
   return host;
 }
 
-globalThis.EdNativeHost = { createHost, resolve, label, env, join, dirname, get HOME() { return HOME; }, get CWD() { return CWD; } };
+globalThis.EdNativeHost = { createHost, resolve, truename, label, env, join, dirname, get HOME() { return HOME; }, get CWD() { return CWD; } };
 })();
