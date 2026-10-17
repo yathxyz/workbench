@@ -7,20 +7,44 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { writeAtomic, sha256 } from './files.mts';
+import type { By, Op, Undo } from './proto.mts';
 
 export const FORMAT = 1;
 export const GROUP_COMMIT_MS = 2;
 export const COMPACT_BYTES = 4 * 1024 * 1024;
 export const COMPACT_LINES = 20000;
 
+/* ---------- the journal format (R8.1) ---------- */
+export interface JournalHeader { t: 'hdr'; format?: number; jid: string; id: string; name: string; file: string | null; mode: string; base: { ver: number; sha256: string } }
+/* One sequenced batch. */
+export interface BatchLine { t: 'b'; ver: number; cid: string | null; seq: number | null; by: By; ops: Op[]; undo?: Undo; at: number }
+/* A rename of the buffer (R6.1). */
+export interface MvLine { t: 'mv'; id: string; file: string | null; name: string; at: number }
+/* The shared anchors as of version ver (anchors.mts). */
+export interface JournalAnchor { id: string; pos: number; label?: string; quote: string; prefix: string }
+export interface AnchorsLine { t: 'a'; ver: number; anchors: JournalAnchor[] }
+export type JournalLine = BatchLine | MvLine | AnchorsLine;
+export interface JournalContents { header: JournalHeader; batches: BatchLine[]; mv: MvLine[]; anchors: AnchorsLine | null; torn: boolean }
+
 export class JournalError extends Error {
-  constructor(msg, line) { super(msg); this.line = line; }
+  declare line: number;
+  constructor(msg: string, line: number) { super(msg); this.line = line; }
 }
 
 /* One buffer's journal file, appended to with group commit. */
+interface PendingLine { line: string; resolve: () => void; reject: (e: Error) => void }
 export class Journal {
-  constructor(file) { this.file = file; this.fd = null; this.pending = []; this.timer = null; this.lines = 0; this.bytes = 0; this.syncing = null; this.closed = false; }
-  open() {
+  declare file: string;
+  declare fd: number | null;
+  declare pending: PendingLine[];
+  declare timer: NodeJS.Timeout | null;
+  declare lines: number;
+  declare bytes: number;
+  declare syncing: Promise<void> | null;
+  declare closed: boolean;
+  declare failed: Error | undefined;
+  constructor(file: string) { this.file = file; this.fd = null; this.pending = []; this.timer = null; this.lines = 0; this.bytes = 0; this.syncing = null; this.closed = false; }
+  open(): this {
     if (this.fd === null) {
       this.fd = fs.openSync(this.file, 'a', 0o600);
       try { this.bytes = fs.fstatSync(this.fd).size; } catch (e) { this.bytes = 0; }
@@ -28,7 +52,7 @@ export class Journal {
     return this;
   }
   /* Write the header and the given batch lines fresh (a new journal, or a compaction's rewrite). */
-  static create(file, header, batches) {
+  static create(file: string, header: JournalHeader, batches: JournalLine[]): Journal {
     const lines = [JSON.stringify(header), ...batches.map(b => JSON.stringify(b))].join('\n') + '\n';
     writeAtomic(file, lines);
     const j = new Journal(file).open();
@@ -37,39 +61,39 @@ export class Journal {
   }
   /* Append OBJ as a line; resolves once it is on disk (fdatasync). Rejects on a write error (ENOSPC), in
      which case nothing of the line counts as written: the caller drops the batch. */
-  append(obj) {
+  append(obj: JournalLine): Promise<void> {
     this.open();
     if (this.failed) return Promise.reject(this.failed);
     const line = JSON.stringify(obj) + '\n';
-    return new Promise((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
       this.pending.push({ line, resolve, reject });
       if (!this.timer) this.timer = setTimeout(() => this.flush(), GROUP_COMMIT_MS);
     });
   }
   /* Write every pending line, one fdatasync for all of them. */
-  flush() {
+  flush(): Promise<void> {
     this.timer = null;
     const batch = this.pending; this.pending = [];
     if (!batch.length) return Promise.resolve();
     const run = async () => {
-      let failed = null, start = null;
+      let failed: Error | null = null, start: number | null = null;
       try {
         const data = Buffer.from(batch.map(b => b.line).join(''), 'utf8');
-        start = fs.fstatSync(this.fd).size;
+        start = fs.fstatSync(this.fd!).size;
         /* Test hooks (R16.7): EDWIND_FAULT=enospc-journal fails every append as a full disk does;
            enospc-journal-partial writes the lines and then fails, as a failing fdatasync does. */
         const fault = process.env.EDWIND_FAULT;
         if (fault === 'enospc-journal') throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
         let off = 0;
-        while (off < data.length) off += fs.writeSync(this.fd, data, off, data.length - off);
+        while (off < data.length) off += fs.writeSync(this.fd!, data, off, data.length - off);
         if (fault === 'enospc-journal-partial') throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
-        fs.fdatasyncSync(this.fd);
+        fs.fdatasyncSync(this.fd!);
         this.lines += batch.length; this.bytes += data.length;
       } catch (e) {
         failed = e;
         /* Whatever of the group reached the file is taken back, so a restart never replays a batch that was
            refused; from here on every append fails until a save makes a new journal. */
-        if (start !== null) { try { fs.ftruncateSync(this.fd, start); fs.fdatasyncSync(this.fd); } catch (e2) { /* the disk is in trouble */ } }
+        if (start !== null) { try { fs.ftruncateSync(this.fd!, start); fs.fdatasyncSync(this.fd!); } catch (e2) { /* the disk is in trouble */ } }
         this.failed = e;
       }
       for (const b of batch) failed ? b.reject(failed) : b.resolve();
@@ -78,29 +102,29 @@ export class Journal {
     return this.syncing;
   }
   /* Flush now and wait (shutdown). */
-  async drain() { if (this.timer) { clearTimeout(this.timer); this.timer = null; } await this.flush(); }
-  close() { if (this.fd !== null) { try { fs.closeSync(this.fd); } catch (e) { /* closed */ } this.fd = null; } this.closed = true; }
-  needsCompaction() { return this.bytes > COMPACT_BYTES || this.lines > COMPACT_LINES; }
+  async drain(): Promise<void> { if (this.timer) { clearTimeout(this.timer); this.timer = null; } await this.flush(); }
+  close(): void { if (this.fd !== null) { try { fs.closeSync(this.fd); } catch (e) { /* closed */ } this.fd = null; } this.closed = true; }
+  needsCompaction(): boolean { return this.bytes > COMPACT_BYTES || this.lines > COMPACT_LINES; }
 }
 
 /* Read a journal: {header, batches, mv, anchors, torn}. `anchors` is the last anchors line ({t: 'a', ver, anchors},
    anchors.mts) or null. A torn last line (no newline, or not JSON) is dropped and reported; any other bad line is
    a JournalError (the buffer then opens read-only, R8.4). */
-export function readJournal(file) {
+export function readJournal(file: string): JournalContents {
   const text = fs.readFileSync(file, 'utf8');
   const lines = text.split('\n');
   /* The last line ends with a newline when the file is whole; without one it is the tail of a write that
      did not finish and is dropped (R8.4). A complete JSON object without its newline is kept. */
   let torn = false;
-  const last = lines.pop();
+  const last = lines.pop()!;
   if (last !== '') { try { JSON.parse(last); lines.push(last); } catch (e) { torn = true; } }
-  const parse = (l, i) => { try { return JSON.parse(l); } catch (e) { throw new JournalError(`line ${i + 1} is not JSON`, i + 1); } };
+  const parse = (l: string, i: number): any => { try { return JSON.parse(l); } catch (e) { throw new JournalError(`line ${i + 1} is not JSON`, i + 1); } }; // any: a journal line as parsed, checked below
   if (!lines.length) throw new JournalError('empty journal', 0);
   const header = parse(lines[0], 0);
   if (header.t !== 'hdr' || !header.jid || !header.base || !Number.isInteger(header.base.ver)) throw new JournalError('bad header', 1);
   if (header.format !== undefined && header.format > FORMAT) throw new JournalError(`journal format ${header.format} is newer than this edwind (${FORMAT})`, 1);
-  const batches = [], mv = [];
-  let anchors = null;
+  const batches: BatchLine[] = [], mv: MvLine[] = [];
+  let anchors: AnchorsLine | null = null;
   for (let i = 1; i < lines.length; i++) {
     if (lines[i] === '') continue;
     const o = parse(lines[i], i);
@@ -115,14 +139,22 @@ export function readJournal(file) {
 }
 
 /* The header line of R8.1. */
-export const header = ({ jid, id, name, file, mode, baseVer, baseText }) => ({ t: 'hdr', format: FORMAT, jid, id, name, file, mode, base: { ver: baseVer, sha256: sha256(baseText) } });
+export interface HeaderFields { jid: string; id: string; name: string; file: string | null; mode: string; baseVer: number; baseText: string }
+export const header = ({ jid, id, name, file, mode, baseVer, baseText }: HeaderFields): JournalHeader => ({ t: 'hdr', format: FORMAT, jid, id, name, file, mode, base: { ver: baseVer, sha256: sha256(baseText) } });
 
 /* ---------- the index (R8.1) ---------- */
 /* The buffers by jid, and the moved records of renames (R6.1, §7: old id → {to, at, dir}). The moved records live
    here rather than in the journals so they outlive a kill of the buffer and a restart; the caller prunes them. */
+/* An index entry (SBuf.indexEntry) and a moved record. */
+export interface IndexEntry { jid: string; id: string; name: string; file: string | null; mode: string; ver: number; modified: boolean; lastOpen: number }
+export interface MovedRecord { to: string; at: number; dir: boolean }
 export class Index {
-  constructor(file) { this.file = file; this.buffers = new Map(); this.moved = new Map(); this.timer = null; this.load(); }
-  load() {
+  declare file: string;
+  declare buffers: Map<string, IndexEntry>;
+  declare moved: Map<string, MovedRecord>;
+  declare timer: NodeJS.Timeout | null;
+  constructor(file: string) { this.file = file; this.buffers = new Map(); this.moved = new Map(); this.timer = null; this.load(); }
+  load(): void {
     try {
       const o = JSON.parse(fs.readFileSync(this.file, 'utf8'));
       if (o.format !== undefined && o.format > FORMAT) throw new Error(`index format ${o.format} is newer than this edwind (${FORMAT})`);
@@ -130,10 +162,10 @@ export class Index {
       for (const m of o.moved || []) if (m && typeof m.from === 'string' && typeof m.to === 'string' && Number.isFinite(m.at)) this.moved.set(m.from, { to: m.to, at: m.at, dir: !!m.dir });
     } catch (e) { if (e.code !== 'ENOENT') throw e; }
   }
-  set(entry) { this.buffers.set(entry.jid, entry); this.schedule(); }
-  delete(jid) { this.buffers.delete(jid); this.schedule(); }
-  schedule() { if (!this.timer) this.timer = setTimeout(() => this.write(), 50); }
-  write() {
+  set(entry: IndexEntry): void { this.buffers.set(entry.jid, entry); this.schedule(); }
+  delete(jid: string): void { this.buffers.delete(jid); this.schedule(); }
+  schedule(): void { if (!this.timer) this.timer = setTimeout(() => this.write(), 50); }
+  write(): void {
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     const moved = [...this.moved].map(([from, m]) => ({ from, to: m.to, at: m.at, ...(m.dir ? { dir: true } : {}) }));
     writeAtomic(this.file, JSON.stringify({ format: FORMAT, buffers: [...this.buffers.values()], ...(moved.length ? { moved } : {}) }, null, 1) + '\n');
@@ -144,5 +176,5 @@ export class Index {
 export { ImageLog } from './image.mts';
 
 /* A random id: 96 bits (12 bytes) for a jid (R6.1). */
-export const randomId = (bytes = 12) => randomBytes(bytes).toString('hex');
-export const jidPath = (dir, jid, ext) => path.join(dir, 'buffers', jid + ext);
+export const randomId = (bytes = 12): string => randomBytes(bytes).toString('hex');
+export const jidPath = (dir: string, jid: string, ext: string): string => path.join(dir, 'buffers', jid + ext);

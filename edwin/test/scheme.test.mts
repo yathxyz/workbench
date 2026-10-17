@@ -7,21 +7,23 @@ import { Worker } from 'node:worker_threads';
 import v8 from 'node:v8';
 import vm from 'node:vm';
 import { loadScheme, MODE, SCHEME_FILE } from './scheme-load.mts';
+import type { Scheme, SchemeValue, SymObject } from './scheme-load.mts';
 
+type Globals = typeof globalThis & { Scheme: Scheme; schemeSource: string; window: unknown };
 const S = loadScheme(MODE);
-const run = (src, file) => S.evalString(src, file);
-const ev = (src, file) => S.write(run(src, file));
-const out = [];
+const run = (src: string, file?: string) => S.evalString(src, file);
+const ev = (src: string, file?: string) => S.write(run(src, file));
+const out: string[] = [];
 S.hooks.output = s => out.push(s);
 const files = new Map();
 S.hooks.readFile = p => (files.has(p) ? files.get(p) : null);
-const throwsKind = (src, kind) => assert.throws(() => run(src), e => e instanceof S.SchemeError && e.kind === kind, `${src} should signal ${kind}`);
+const throwsKind = (src: string, kind: string) => assert.throws(() => run(src), e => e instanceof S.SchemeError && e.kind === kind, `${src} should signal ${kind}`);
 
 describe(`Edwin Scheme (${MODE})`, () => {
   test('globalThis only: the module installs Scheme and schemeSource on globalThis', () => {
-    assert.equal(typeof globalThis.Scheme, 'object');
-    assert.match(globalThis.schemeSource, /^\(function schemeModule\(g\)/);
-    assert.equal(globalThis.window, undefined);
+    assert.equal(typeof (globalThis as Globals).Scheme, 'object');
+    assert.match((globalThis as Globals).schemeSource, /^\(function schemeModule\(g\)/);
+    assert.equal((globalThis as Globals).window, undefined);
   });
 
   test('R7RS-small subset', () => {
@@ -133,7 +135,7 @@ describe(`Edwin Scheme (${MODE})`, () => {
     out.length = 0;
     run('(display "to-console") (newline) (write-string "ws") (format #t "f~a" 1)');
     assert.equal(out.join(''), 'to-console\nwsf1', 'the default output port writes through hooks.output');
-    const got = [];
+    const got: string[] = [];
     const port = S.makeOutputPort(s => got.push(s), 'buffer');
     S.gdef('test-port', port);
     run('(display "hello" test-port) (write \'(1 "two") test-port) (parameterize ((current-output-port test-port)) (display "!"))');
@@ -275,7 +277,7 @@ describe(`Edwin Scheme (${MODE})`, () => {
     const quit = new S.SchemeError('quit', 'Quit', []);
     S.def('%test-quit', () => { throw quit; });
     assert.throws(() => run('(guard (e (#t \'caught)) (with-exception-handler (lambda (c) \'h) (lambda () (%test-quit))))'), e => e === quit);
-    const seen = [];
+    const seen: SchemeValue[] = [];
     assert.throws(() => S.withHandler(c => { seen.push(c); return S.DECLINE; }, () => run('(guard (e (#t \'caught)) (%test-quit))')), e => e === quit);
     assert.deepEqual(seen, [quit]);
     // Escapes and the guard's unwinding semantics are unchanged.
@@ -350,10 +352,10 @@ describe(`Edwin Scheme (${MODE})`, () => {
     assert.equal(S.withRestarts([{ name: 'abort', report: 'Return to the command loop', fn: () => 'aborted' }], () => run('(begin (abort) \'not-here)')), 'aborted');
     assert.equal(S.withRestarts([{ name: 'abort', fn: () => 'aborted' }], () => S.withHandler(c => S.invokeRestart('abort', []), () => run('(car 1)'))), 'aborted');
     assert.deepEqual(S.withRestarts([{ name: 'use-it', fn: (a, b) => [a, b], interactive: () => [1, 2] }], () => run('(invoke-restart-interactively \'use-it)')), [1, 2]);
-    S.hooks.restartArgs = r => [r.name.name.length];
+    S.hooks.restartArgs = r => [(r.name as SymObject).name.length];
     try { assert.equal(ev('(with-exception-handler (lambda (c) (invoke-restart-interactively \'use-value)) (lambda () unbound-z))'), '9'); } finally { S.hooks.restartArgs = null; }
     // Restarts during a handler see the restarts of the raise point.
-    assert.deepEqual(S.withRestarts([{ name: 'outer-r', fn: () => 0 }], () => S.withHandler(() => { const names = S.computeRestarts().map(r => r.name.name); throw new S.Escape('done', [names]); }, () => { try { return run('undefined-q'); } catch (e) { if (e instanceof S.Escape) return e.vals[0]; throw e; } })), ['use-value', 'store-value', 'outer-r']);
+    assert.deepEqual(S.withRestarts([{ name: 'outer-r', fn: () => 0 }], () => S.withHandler(() => { const names = S.computeRestarts().map(r => (r.name as SymObject).name); throw new S.Escape('done', [names]); }, () => { try { return run('undefined-q'); } catch (e) { if (e instanceof S.Escape) return e.vals[0]; throw e; } })), ['use-value', 'store-value', 'outer-r']);
   });
 
   test('R4.34 the shadow stack: backtraces, the depth cap, consistency after escapes', () => {
@@ -378,8 +380,8 @@ describe(`Edwin Scheme (${MODE})`, () => {
 (define (err-b) (let ((y (err-c))) y))`, 'err.scm');
     assert.equal(ev('(guard (e (#t (map (lambda (f) (procedure-name (stack-frame/procedure f))) (condition/backtrace e)))) (err-b))'), '("car" "err-c" "err-b")');
     try { run('(err-b)'); assert.fail('no error'); } catch (e) {
-      assert.deepEqual(S.conditionBacktrace(e).map(f => f.proc.procName), ['car', 'err-c', 'err-b']);
-      assert.deepEqual(S.conditionBacktrace(e)[1].loc, { file: 'err.scm', line: 2, col: 25 });
+      assert.deepEqual(S.conditionBacktrace(e)!.map(f => f.proc.procName), ['car', 'err-c', 'err-b']);
+      assert.deepEqual(S.conditionBacktrace(e)![1].loc, { file: 'err.scm', line: 2, col: 25 });
     }
     // The depth cap signals a catchable condition.
     const max = S.maxDepth;
@@ -417,7 +419,7 @@ S.evalString('(define (f n) (if (= n 0) 0 (+ 1 (f (- n 1)))))');
 const caught = S.write(S.evalString('(guard (e ((recursion-depth? e) (list (quote caught) (condition/report-string e)))) (f 100000))'));
 let plain = 'no error'; try { S.evalString('(f 100000)'); } catch (e) { plain = e.constructor.name; }
 parentPort.postMessage([caught, plain, S.stackDepth(), S.write(S.evalString('(f 100)'))]);`;
-    const res = await new Promise((resolve, reject) => {
+    const res = await new Promise<[string, string, number, string]>((resolve, reject) => {
       const w = new Worker(src, { eval: true, workerData: SCHEME_FILE, resourceLimits: { stackSizeMb: 1 } });
       w.once('message', resolve); w.once('error', reject);
     });
@@ -434,7 +436,7 @@ require('node:vm').runInThisContext(require('node:fs').readFileSync(workerData, 
 const S = globalThis.Scheme;
 S.evalString('(define (f n) (if (= n 0) 0 (+ 1 (f (- n 1)))))');
 parentPort.postMessage([S.write(S.evalString('(f 9900)')), S.write(S.evalString('(guard (e ((recursion-depth? e) (quote caught))) (f 20000))')), S.stackDepth()]);`;
-    const res = await new Promise((resolve, reject) => {
+    const res = await new Promise<[string, string, number]>((resolve, reject) => {
       const w = new Worker(src, { eval: true, workerData: SCHEME_FILE, resourceLimits: { stackSizeMb: 64 } });
       w.once('message', resolve); w.once('error', reject);
     });

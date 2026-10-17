@@ -9,7 +9,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { makeDir, startEdwind, stopEdwind, EditClient, EDWIN } from './edit-client.mts';
+import type { Msg, TestDir, EdwindChild } from './edit-client.mts';
 import { loadSchemeIn } from './scheme-load.mts';
+import type { Scheme } from './scheme-load.mts';
 import { fromJSON, LOG_BUFFER_ID } from '../server/image.mts';
 
 const SCHEME_SRC = fs.readFileSync(path.join(EDWIN, 'src/scheme.js'), 'utf8');
@@ -26,17 +28,22 @@ const PRELUDE = `
 (define-syntax defvar-shared (syntax-rules () ((_ name init) (define name init)) ((_ name init doc) (define name init))))
 `;
 
-let dir, child;
+let dir: TestDir, child: EdwindChild;
 before(async () => { dir = makeDir(); child = await startEdwind(dir, { env: ENV }); });
 after(async () => { for (const f of frames) f.close(); await stopEdwind(child); fs.rmSync(dir.root, { recursive: true, force: true }); });
 
-const until = async (cond, what, ms = 8000) => { const end = Date.now() + ms; for (;;) { const v = cond(); if (v) return v; if (Date.now() > end) throw new Error('timeout waiting for ' + what); await new Promise(r => setTimeout(r, 15)); } };
-const cli = async (extra = {}) => { const c = new EditClient(dir.cfg.socket); await c.connect(); const w = await c.hello(extra); assert.equal(w.t, 'welcome'); c.welcome = w; return c; };
-const status = async c => (await c.call('status')).value;
+const until = async (cond: () => unknown, what: string, ms = 8000) => { const end = Date.now() + ms; for (;;) { const v = cond(); if (v) return v; if (Date.now() > end) throw new Error('timeout waiting for ' + what); await new Promise(r => setTimeout(r, 15)); } };
+const cli = async (extra: Msg = {}) => { const c = new EditClient(dir.cfg.socket); await c.connect(); const w = await c.hello(extra); assert.equal(w.t, 'welcome'); c.welcome = w; return c; };
+const status = async (c: EditClient) => (await c.call('status')).value;
 const restart = async () => { await stopEdwind(child); child = await startEdwind(dir, { env: ENV }); };
 
 /* A simulated frame runtime. */
 class Frame {
+  declare cid: string; declare S: Scheme | null; declare gen: number; declare epoch: string | null;
+  /* The forms evaluated, the on-server forms skipped and the forms that raised, in order. */
+  declare applied: string[]; declare skipped: string[]; declare errors: { gen: number; form: string; error: string }[];
+  declare vars: Msg[]; declare boots: number;
+  declare client: EditClient; declare welcome: Msg; declare synced: number; declare loop: Promise<void>;
   constructor() { this.cid = randomBytes(16).toString('hex'); this.S = null; this.gen = 0; this.epoch = null; this.applied = []; this.skipped = []; this.errors = []; this.vars = []; this.boots = 0; }
   boot() { this.S = loadSchemeIn(SCHEME_SRC); this.S.evalString(PRELUDE); this.gen = 0; this.applied = []; this.skipped = []; this.errors = []; this.boots++; }
   /* hello, then R7.19: a new imageEpoch means a fresh runtime from generation 0; otherwise image?{from} resumes. */
@@ -51,9 +58,9 @@ class Frame {
     assert.equal(r.t, 'result'); this.synced = r.value.gen;
     return w;
   }
-  pump() { this.loop = (async () => { for (;;) { let m; try { m = await this.client.next(x => x.t === 'image' || x.t === 'var', 1e9); } catch (e) { return; } this.apply(m); } })(); }
-  apply(m) {
-    const S = this.S;
+  pump() { this.loop = (async () => { for (;;) { let m: Msg; try { m = await this.client.next(x => x.t === 'image' || x.t === 'var', 1e9); } catch (e) { return; } this.apply(m); } })(); }
+  apply(m: Msg) {
+    const S = this.S!;
     if (m.t === 'var') { this.vars.push(m); S.gdef(m.name, fromJSON(S, m.value)); return; }
     for (const text of m.forms) {
       const f = S.read(text);
@@ -62,12 +69,12 @@ class Frame {
     }
     this.gen = m.gen;
   }
-  ev(text) { return this.S.write(this.S.evalString(text)); }
+  ev(text: string) { return this.S!.write(this.S!.evalString(text)); }
   msgs() { return this.client.queue.filter(m => m.t === 'msg').map(m => m.text); }
   close() { try { this.client.close(); } catch (e) { /* closed */ } }
 }
 const frames = [new Frame(), new Frame(), new Frame()];
-const synced = async gen => until(() => frames.every(f => f.gen >= gen), `frames at generation ${gen} (at ${frames.map(f => f.gen)})`);
+const synced = async (gen: number) => until(() => frames.every(f => f.gen >= gen), `frames at generation ${gen} (at ${frames.map(f => f.gen)})`);
 const reconnectAll = async () => { await until(() => frames.every(f => f.client.closed), 'frames disconnected after the epoch change'); for (const f of frames) await f.connect(); };
 
 test('R4.14, R4.15, R4.16, R4.18, R13.9, Q2, A4: definitions from wb eval reach three frames in order; non-definitional forms stay on the server', async () => {
@@ -87,11 +94,11 @@ test('R4.14, R4.15, R4.16, R4.18, R13.9, Q2, A4: definitions from wb eval reach 
   assert.equal(st.imageGen, 7);
   await synced(7);
   const entries = (await a.call('image-entries')).value;
-  assert.deepEqual(entries.map(e => e.form), ['(define (f1) 1)', '(define-key global-map "C-c t" (lambda () (insert "x")))', '(defvar-shared shared-count 1 "The count.")', '(set! shared-count 41)', '(on-server (define (srv-secret) 42))', '(on-frames (define (frame-only) 3))', '(define uses-helper (helper))']);
-  assert.deepEqual(entries.map(e => e.gen), [1, 2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(entries.map((e: Msg) => e.form), ['(define (f1) 1)', '(define-key global-map "C-c t" (lambda () (insert "x")))', '(defvar-shared shared-count 1 "The count.")', '(set! shared-count 41)', '(on-server (define (srv-secret) 42))', '(on-frames (define (frame-only) 3))', '(define uses-helper (helper))']);
+  assert.deepEqual(entries.map((e: Msg) => e.gen), [1, 2, 3, 4, 5, 6, 7]);
   for (const e of entries) { assert.deepEqual(e.by, { kind: 'cli', device: a.device, session: 'acp-1' }); assert.equal(e.origin, 'cli:acp-1'); assert.ok(Number.isInteger(e.at)); }
   for (const f of frames) {
-    assert.deepEqual(f.applied, entries.map(e => e.form).filter(t => !t.startsWith('(on-server')).filter(t => !t.startsWith('(define uses-helper')), 'every logged form, in order');
+    assert.deepEqual(f.applied, entries.map((e: Msg) => e.form).filter((t: string) => !t.startsWith('(on-server')).filter((t: string) => !t.startsWith('(define uses-helper')), 'every logged form, in order');
     assert.deepEqual(f.skipped, ['(on-server (define (srv-secret) 42))']);
     assert.equal(f.ev('(f1)'), '1');
     assert.equal(f.ev('(cadr (car key-bindings))'), '"C-c t"', 'A4: the binding reached the frame without a reload');
@@ -99,9 +106,9 @@ test('R4.14, R4.15, R4.16, R4.18, R13.9, Q2, A4: definitions from wb eval reach 
     assert.equal(f.ev("(bound? 'srv-secret)"), '#f');
     assert.equal(f.ev('(frame-only)'), '3');
     assert.equal(f.errors.length, 1); assert.equal(f.errors[0].gen, 7); assert.match(f.errors[0].error, /helper/);
-    assert.ok(f.vars.some(v => v.name === 'shared-count' && v.value === 41), 'var{name, value} after the assignment');
-    assert.ok(f.msgs().some(t => /^Image changed by cli:acp-1: f1 /.test(t)), 'Q2: the banner names the origin and the definition');
-    assert.ok(!f.client.queue.some(m => m.t === 'image' && m.forms.some(t => /\(\+ 1 2\)|display "x"/.test(t))));
+    assert.ok(f.vars.some((v: Msg) => v.name === 'shared-count' && v.value === 41), 'var{name, value} after the assignment');
+    assert.ok(f.msgs().some((t: string) => /^Image changed by cli:acp-1: f1 /.test(t)), 'Q2: the banner names the origin and the definition');
+    assert.ok(!f.client.queue.some(m => m.t === 'image' && m.forms.some((t: string) => /\(\+ 1 2\)|display "x"/.test(t))));
   }
   /* R4.18: a value that is not JSON, or too large, is refused at assignment and the value stays. */
   r = await a.form("(set! shared-count 'dark)"); assert.equal(r.error.condition, 'error'); assert.match(r.error.report, /JSON-serialisable/);
@@ -145,7 +152,7 @@ test('R4.19, R7.19 a plain restart replays the log after boot: boot differs, ima
   assert.equal((await status(a)).imageProblems, 1);
   const r = await a.form('(define (f2) 2)'); assert.equal(r.value, 'f2');
   await synced(before.imageGen + 1);
-  for (const f of frames) { assert.equal(f.applied[f.applied.length - 1], '(define (f2) 2)'); assert.equal(f.ev('(f2)'), '2'); assert.equal(f.applied.filter(t => t === '(define (f1) 1)').length, 1, 'no entry twice'); }
+  for (const f of frames) { assert.equal(f.applied[f.applied.length - 1], '(define (f2) 2)'); assert.equal(f.ev('(f2)'), '2'); assert.equal(f.applied.filter((t: string) => t === '(define (f1) 1)').length, 1, 'no entry twice'); }
   a.close();
 });
 
@@ -171,9 +178,9 @@ test('R4.20 image-compact keeps the last definition per name and changes imageEp
   await a.form('(set! shared-count 5)');
   const r = await a.call('image-compact');
   assert.equal(r.value.dropped, 2, 'the earlier define of f1 and the duplicate set!'); assert.notEqual(r.value.epoch, e0);
-  const forms = (await a.call('image-entries')).value.map(e => e.form);
-  assert.deepEqual(forms.filter(t => /define \(f1\)/.test(t)), ['(define (f1) 11)']);
-  assert.deepEqual(forms.filter(t => /set! shared-count 5/.test(t)), ['(set! shared-count 5)']);
+  const forms = (await a.call('image-entries')).value.map((e: Msg) => e.form);
+  assert.deepEqual(forms.filter((t: string) => /define \(f1\)/.test(t)), ['(define (f1) 11)']);
+  assert.deepEqual(forms.filter((t: string) => /set! shared-count 5/.test(t)), ['(set! shared-count 5)']);
   assert.equal((await status(a)).imageEpoch, r.value.epoch);
   await reconnectAll();
   for (const f of frames) { assert.equal(f.boots, 3); assert.equal(f.ev('(f1)'), '11'); assert.equal(f.ev('shared-count'), '5'); }
@@ -236,14 +243,14 @@ test('R4.20 image-log is the read-only server special buffer *image-log*, update
   assert.ok(a.queue.some(m => m.t === 'display' && m.buf === LOG_BUFFER_ID), 'display{buf} to the caller');
   const v = new EditClient(dir.cfg.socket, { kind: 'frame' }); await v.connect(); await v.hello();
   const o = await v.open(LOG_BUFFER_ID);
-  assert.equal(o.meta.readOnly, 'server special buffer');
-  assert.match(o.text, /^Image log: 1 entries, generation 1/); assert.match(o.text, /#1  \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}  cli@[^\n]*\n\(define \(h1\) 1\)\n/);
+  assert.equal(o.meta!.readOnly, 'server special buffer');
+  assert.match(o.text!, /^Image log: 1 entries, generation 1/); assert.match(o.text!, /#1  \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}  cli@[^\n]*\n\(define \(h1\) 1\)\n/);
   await a.form('(define (h2) 2)');
   const edits = await v.next(m => m.t === 'edits' && m.buf === LOG_BUFFER_ID);
   assert.equal(edits.by.kind, 'server');
   const o2 = await (async () => { const w = new EditClient(dir.cfg.socket, { kind: 'frame' }); await w.connect(); await w.hello(); const x = await w.open(LOG_BUFFER_ID); w.close(); return x; })();
-  assert.match(o2.text, /#2 .*\n\(define \(h2\) 2\)/);
-  const bad = await v.edit(LOG_BUFFER_ID, o2.ver, [[0, '', 'x']]); assert.equal(bad.code, 'read_only');
+  assert.match(o2.text!, /#2 .*\n\(define \(h2\) 2\)/);
+  const bad = await v.edit(LOG_BUFFER_ID, o2.ver!, [[0, '', 'x']]); assert.equal(bad.code, 'read_only');
   v.close();
   /* The Scheme side: commands in the server image, declare-definitional. */
   assert.equal((await a.form('(image-problems)')).msg, 'Every image entry replayed');
@@ -255,7 +262,7 @@ test('R4.20 image-log is the read-only server special buffer *image-log*, update
   s = await a.form("(declare-definitional 'my-defthing)"); assert.equal(s.value, 'my-defthing');
   s = await a.form('(define (my-defthing . args) args)'); // the head must exist for the form to evaluate
   s = await a.form('(my-defthing 1 2)'); assert.equal(s.value, '(1 2)');
-  const forms = (await a.call('image-entries')).value.map(e => e.form);
+  const forms = (await a.call('image-entries')).value.map((e: Msg) => e.form);
   assert.ok(forms.includes("(declare-definitional 'my-defthing)") && forms.includes('(my-defthing 1 2)'), 'declared heads are logged');
   s = await a.form('(image-reset "yes")'); assert.match(s.msg, /^Image reset; the old log is .*\/image\.\d{4}-.*\.jsonl$/);
   assert.equal((await status(a)).imageGen, 0);

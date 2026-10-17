@@ -5,6 +5,10 @@
 import { createRequire } from 'node:module';
 import { PROTO, MAX_LINE, LineReader, ProtoError, encode, isObj, str, int, rid as ridOf, ops as opsOf, undo as undoOf, CLIENT_QUEUE_CAP, PING_EVERY_MS, HELLO_TIMEOUT_MS, SEL_PER_SECOND, CHUNK } from './proto.mts';
 import { randomId } from './journal.mts';
+import type net from 'node:net';
+import type { By, CallResult, ClientKind, ErrorMsg, OutMessage, SelOutMsg, WireMessage } from './proto.mts';
+import type { Server, Log } from './main.mts';
+import type { SBuf } from './buffers.mts';
 
 const require = createRequire(import.meta.url);
 
@@ -16,7 +20,28 @@ export const DEADLINE_CLI_MS = 30000;
 export const DEFINITIONAL = new Set(['define', 'define-command', 'define-record-type', 'define-syntax', 'define-macro', 'define-minor-mode', 'define-derived-mode', 'defvar', 'defvar-local', 'defcustom', 'defface', 'set!', 'setq', 'setq-default', 'add-hook!', 'remove-hook!', 'advice-add', 'advice-remove', 'define-key', 'keymap-set', 'global-set-key', 'evil-define-key', 'evil-ex-define-cmd', 'define-snippet', 'put', 'provide', 'require']);
 
 export class Client {
-  constructor(server, socket) {
+  declare server: Server;
+  declare socket: net.Socket;
+  declare log: Log;
+  /* Set by hello (§7.2). */
+  declare cid: string | null;
+  declare kind: ClientKind | null;
+  declare device: string | null;
+  declare session: string | null;
+  declare caps: Record<string, unknown>;
+  declare buffers: Set<SBuf>;
+  declare closed: boolean;
+  declare hello: boolean;
+  declare queue: string[];
+  declare queued: number;
+  declare writing: boolean;
+  declare bulk: string[];
+  declare selTimes: number[];
+  declare calls: Set<unknown>;
+  declare reader: LineReader;
+  declare helloTimer: NodeJS.Timeout;
+  declare pinger: NodeJS.Timeout;
+  constructor(server: Server, socket: net.Socket) {
     this.server = server; this.socket = socket; this.log = server.log;
     this.cid = null; this.kind = null; this.device = null; this.session = null; this.caps = {};
     this.buffers = new Set(); this.closed = false; this.hello = false;
@@ -24,8 +49,8 @@ export class Client {
     this.selTimes = [];
     this.calls = new Set();
     this.reader = new LineReader(line => this.onLine(line), () => this.send({ t: 'error', code: 'too_large', msg: `line longer than ${MAX_LINE} bytes` }));
-    socket.on('data', chunk => { try { this.reader.push(chunk); } catch (e) { this.fail(e); } });
-    socket.on('error', e => { if (e.code !== 'ECONNRESET' && e.code !== 'EPIPE') this.log.warn('client', { cid: this.cid, error: e.code || e.message }); });
+    socket.on('data', (chunk: Buffer) => { try { this.reader.push(chunk); } catch (e) { this.fail(e); } });
+    socket.on('error', (e: NodeJS.ErrnoException) => { if (e.code !== 'ECONNRESET' && e.code !== 'EPIPE') this.log.warn('client', { cid: this.cid, error: e.code || e.message }); });
     socket.on('close', () => this.onClose());
     socket.on('drain', () => { this.writing = false; this.pump(); });
     this.helloTimer = setTimeout(() => { if (!this.hello) { this.log.info('client', { event: 'no hello', cid: null }); this.destroy(); } }, HELLO_TIMEOUT_MS);
@@ -33,18 +58,18 @@ export class Client {
     this.pinger.unref();
   }
   /* Attribution (§7.9, R13.2). */
-  by() {
+  by(): By {
     if (this.kind === 'frame') return { kind: 'frame', cid: this.cid, device: this.device };
     if (this.kind === 'cli') return this.session ? { kind: 'cli', device: this.device, session: this.session } : { kind: 'cli', device: this.device };
     return { kind: 'web', cid: this.cid, device: this.device };
   }
-  deadlineMs() { return this.kind === 'cli' ? DEADLINE_CLI_MS : DEADLINE_FRAME_MS; }
+  deadlineMs(): number { return this.kind === 'cli' ? DEADLINE_CLI_MS : DEADLINE_FRAME_MS; }
 
   /* ---------- sending ---------- */
   /* Small frames: queued and written as the socket allows. */
-  send(obj) { if (this.closed) return; this.queue.push(encode(obj)); this.pump(); }
+  send(obj: OutMessage): void { if (this.closed) return; this.queue.push(encode(obj)); this.pump(); }
   /* edits, sel and msg count toward the slow-client cap (R14.14). */
-  sendBulkish(obj) {
+  sendBulkish(obj: OutMessage): void {
     if (this.closed) return;
     const line = encode(obj);
     this.queued += line.length;
@@ -59,48 +84,48 @@ export class Client {
     this.queue.push(line); this.pump();
   }
   /* Bulk frames (snap, chunk, image): written one at a time, each after the previous one drained. */
-  sendBulk(obj) { if (this.closed) return; this.queue.push(encode(obj)); this.pump(); }
+  sendBulk(obj: OutMessage): void { if (this.closed) return; this.queue.push(encode(obj)); this.pump(); }
   pump() {
     if (this.closed || this.writing) return;
     while (this.queue.length && !this.closed) {
-      const line = this.queue.shift();
+      const line = this.queue.shift()!;
       if (this.queued) this.queued = Math.max(0, this.queued - line.length);
       if (!this.socket.write(line)) { this.writing = true; return; } // the drain event resumes
     }
   }
-  destroy() { if (this.closed) return; this.closed = true; try { this.socket.end(); } catch (e) { /* closing */ } setTimeout(() => this.socket.destroy(), 100).unref(); }
-  onClose() {
+  destroy(): void { if (this.closed) return; this.closed = true; try { this.socket.end(); } catch (e) { /* closing */ } setTimeout(() => this.socket.destroy(), 100).unref(); }
+  onClose(): void {
     this.closed = true; clearTimeout(this.helloTimer); clearInterval(this.pinger);
     this.server.buffers.detachAll(this);
     this.server.clients.delete(this);
     this.log.info('client', { event: 'disconnect', cid: this.cid, kind: this.kind });
   }
-  fail(e) { this.log.error('client', { cid: this.cid, error: e.stack || String(e) }); this.destroy(); }
+  fail(e: any): void { this.log.error('client', { cid: this.cid, error: e.stack || String(e) }); this.destroy(); } // any: whatever a data handler threw
 
   /* ---------- receiving ---------- */
-  onLine(line) {
+  onLine(line: string): void {
     if (!line.trim()) return;
     if (this.server.onInput) this.server.onInput(this);
-    let msg;
+    let msg: unknown;
     try { msg = JSON.parse(line); } catch (e) { this.send({ t: 'error', code: 'bad_request', msg: 'not JSON' }); return; }
     if (!isObj(msg) || typeof msg.t !== 'string') { this.send({ t: 'error', code: 'bad_request', msg: 'a message is an object with t' }); return; }
     const rid = (() => { try { return ridOf(msg); } catch (e) { return undefined; } })();
-    const p = this.dispatch(msg);
-    if (p && typeof p.then === 'function') p.catch(e => this.reportError(e, rid, msg));
+    const p = this.dispatch(msg as WireMessage);
+    if (p && typeof (p as Promise<unknown>).then === 'function') (p as Promise<unknown>).catch(e => this.reportError(e, rid, msg as WireMessage));
   }
-  reportError(e, rid, msg) {
-    if (e instanceof ProtoError) { const out = { t: 'error', code: e.code, msg: e.message, ...e.extra }; if (rid !== undefined) out.rid = rid; if (msg && typeof msg.buf === 'string' && out.buf === undefined) out.buf = msg.buf; if (msg && msg.t === 'edit' && Number.isInteger(msg.seq) && out.seq === undefined) out.seq = msg.seq; this.send(out); return; }
+  reportError(e: any, rid: string | undefined, msg: WireMessage | undefined): void { // any: whatever dispatch threw
+    if (e instanceof ProtoError) { const out: ErrorMsg = { t: 'error', code: e.code, msg: e.message, ...e.extra }; if (rid !== undefined) out.rid = rid; if (msg && typeof msg.buf === 'string' && out.buf === undefined) out.buf = msg.buf; if (msg && msg.t === 'edit' && Number.isInteger(msg.seq) && out.seq === undefined) out.seq = msg.seq as number; this.send(out); return; }
     this.log.error('dispatch', { cid: this.cid, t: msg && msg.t, error: e.stack || String(e) });
-    const out = { t: 'error', code: 'bad_request', msg: 'internal error: ' + (e.message || String(e)) };
+    const out: ErrorMsg = { t: 'error', code: 'bad_request', msg: 'internal error: ' + (e.message || String(e)) };
     if (rid !== undefined) out.rid = rid;
     this.send(out);
   }
-  dispatch(msg) {
+  dispatch(msg: WireMessage): unknown {
     try {
       if (!this.hello) { if (msg.t !== 'hello') throw new ProtoError('bad_request', 'hello comes first'); return this.onHello(msg); }
       switch (msg.t) {
         case 'hello': throw new ProtoError('bad_request', 'already said hello');
-        case 'ping': this.send({ t: 'pong', rid: msg.rid }); return;
+        case 'ping': this.send({ t: 'pong', rid: msg.rid as string | undefined }); return;
         case 'pong': return;
         case 'open': return this.onOpen(msg);
         case 'close': { const sb = this.server.buffers.live(str(msg, 'buf')); if (sb) this.server.buffers.close(this, sb); return; }
@@ -118,33 +143,33 @@ export class Client {
       }
     } catch (e) { this.reportError(e, (() => { try { return ridOf(msg); } catch (x) { return undefined; } })(), msg); }
   }
-  onHello(msg) {
+  onHello(msg: WireMessage): void {
     const proto = msg.proto;
     if (!Number.isInteger(proto)) throw new ProtoError('bad_request', 'hello.proto must be an integer');
     if (proto !== PROTO && proto !== PROTO - 1) { this.send({ t: 'error', code: 'proto', msg: `protocol ${proto} is not supported; this edwind speaks ${PROTO}` }); this.destroy(); return; }
     const cid = str(msg, 'cid');
     if (!/^[0-9a-fA-F]{8,64}$/.test(cid)) throw new ProtoError('bad_request', 'cid must be 8 to 64 hex digits');
     const kind = str(msg, 'kind');
-    if (!['frame', 'cli', 'web'].includes(kind)) throw new ProtoError('bad_request', 'kind must be frame, cli or web');
-    this.cid = cid; this.kind = kind; this.device = str(msg, 'device', true) || kind + ':' + cid.slice(0, 8);
+    if (!(['frame', 'cli', 'web'] as string[]).includes(kind)) throw new ProtoError('bad_request', 'kind must be frame, cli or web');
+    this.cid = cid; this.kind = kind as ClientKind; this.device = str(msg, 'device', true) || kind + ':' + cid.slice(0, 8);
     this.session = str(msg, 'session', true) || null; this.caps = isObj(msg.caps) ? msg.caps : {};
     this.hello = true; clearTimeout(this.helloTimer);
     this.send({ t: 'welcome', proto: PROTO, build: this.server.build, boot: this.server.boot, imageEpoch: this.server.image.epoch, gen: this.server.image.gen, caps: {} });
     this.log.info('client', { event: 'connect', cid, kind, device: this.device });
     if (this.server.stopping) { this.send({ t: 'error', code: 'shutting_down', msg: 'edwind is stopping' }); this.destroy(); }
   }
-  onOpen(msg) {
+  onOpen(msg: WireMessage): void {
     const rid = ridOf(msg), buf = str(msg, 'buf'), since = int(msg, 'since', true);
     const create = msg.create === true;
-    this.server.buffers.open(this, msg, { rid, since, create });
+    this.server.buffers.open(this, msg as WireMessage & { buf: string }, { rid, since, create });
   }
-  onEdit(msg) {
+  onEdit(msg: WireMessage): Promise<void> {
     const buf = str(msg, 'buf'), base = int(msg, 'base'), seq = int(msg, 'seq');
     const ops = opsOf(msg), undo = undoOf(msg);
     const sb = this.server.buffers.get(buf);
     return this.server.buffers.seq.edit(this, sb, { base, seq, ops, undo }).catch(e => { if (e instanceof ProtoError) { e.extra = { buf: sb.id, seq, ...e.extra }; } throw e; });
   }
-  onSel(msg) {
+  onSel(msg: WireMessage): void {
     const buf = str(msg, 'buf');
     const now = Date.now();
     this.selTimes = this.selTimes.filter(t => now - t < 1000);
@@ -152,31 +177,31 @@ export class Client {
     this.selTimes.push(now);
     const sb = this.server.buffers.live(buf);
     if (!sb || !Array.isArray(msg.ranges)) return;
-    const out = { t: 'sel', buf: sb.id, by: this.by(), ranges: msg.ranges };
+    const out: SelOutMsg = { t: 'sel', buf: sb.id, by: this.by(), ranges: msg.ranges };
     for (const c of sb.clients) if (c !== this) c.sendBulkish(out);
   }
-  async onSaveRevert(msg) {
+  async onSaveRevert(msg: WireMessage): Promise<void> {
     const rid = ridOf(msg), buf = str(msg, 'buf');
     const sb = this.server.buffers.get(buf);
     const value = msg.t === 'save' ? await this.server.buffers.save(sb) : await this.server.buffers.revert(sb);
     if (msg.t === 'save' && sb.serverEdit) sb.serverEdit.saved = true;
     this.send({ t: 'result', rid, value });
   }
-  onImageQuery(msg) {
+  onImageQuery(msg: WireMessage): void {
     const rid = ridOf(msg), from = int(msg, 'from');
     const value = this.server.image.sendAfter(this, from);
     this.send({ t: 'result', rid, value });
   }
 
   /* ---------- call (§7.4) ---------- */
-  async onCall(msg) {
+  async onCall(msg: WireMessage): Promise<void> {
     const rid = ridOf(msg);
     if (rid === undefined) throw new ProtoError('bad_request', 'call needs a rid');
     const ctx = isObj(msg.ctx) ? { ...msg.ctx, rid } : { rid };
     const args = Array.isArray(msg.args) ? msg.args : [];
-    let out;
-    if (typeof msg.form === 'string') out = await this.server.evalForm(this, msg.form, ctx, msg.buf);
-    else if (typeof msg.cmd === 'string') out = await this.server.command(this, msg.cmd, args, ctx, msg.buf);
+    let out: CallResult | undefined;
+    if (typeof msg.form === 'string') out = await this.server.evalForm(this, msg.form, ctx, msg.buf as string | undefined);
+    else if (typeof msg.cmd === 'string') out = await this.server.command(this, msg.cmd, args, ctx, msg.buf as string | undefined);
     else throw new ProtoError('bad_request', 'call needs cmd or form');
     if (out === undefined) return; // a delayed result (server-edit --wait, D20)
     this.send({ t: 'result', rid, ...out });

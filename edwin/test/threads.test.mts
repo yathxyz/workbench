@@ -5,14 +5,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeDir, startEdwind, stopEdwind, EditClient } from './edit-client.mts';
+import type { Msg, TestDir, EdwindChild, ClientOptions } from './edit-client.mts';
 
-let dir, child;
+let dir: TestDir, child: EdwindChild;
 before(async () => { dir = makeDir(); child = await startEdwind(dir); });
 after(async () => { await stopEdwind(child); fs.rmSync(dir.root, { recursive: true, force: true }); });
-const client = async (opts) => { const c = new EditClient(dir.cfg.socket, opts); await c.connect(); const w = await c.hello(); assert.equal(w.t, 'welcome'); return c; };
-const note = (name, text) => { fs.writeFileSync(path.join(dir.dirs.notes, name), text); return name; };
-const value = async (c, form) => { const r = await c.form(form); assert.equal(r.error, undefined, JSON.stringify(r.error)); return r.value; };
-const spin = ms => `(let ((end (+ (current-time) ${ms / 1000}))) (let loop () (if (< (current-time) end) (loop))))`;
+const client = async (opts?: ClientOptions) => { const c = new EditClient(dir.cfg.socket, opts); await c.connect(); const w = await c.hello(); assert.equal(w.t, 'welcome'); return c; };
+const note = (name: string, text: string) => { fs.writeFileSync(path.join(dir.dirs.notes, name), text); return name; };
+const value = async (c: EditClient, form: string) => { const r = await c.form(form); assert.equal(r.error, undefined, JSON.stringify(r.error)); return r.value; };
+const spin = (ms: number) => `(let ((end (+ (current-time) ${ms / 1000}))) (let loop () (if (< (current-time) end) (loop))))`;
 
 test('R4.40 a waiter that times out or is killed leaves the queue: the next unlock or send wakes the live waiter', async () => {
   const c = await client();
@@ -120,7 +121,7 @@ test('R4.36 interrupt{rid} stops a running command with quit; the thread is gone
   const r = await f.next(m => m.rid === rid && m.t === 'result');
   assert.equal(r.error.condition, 'quit'); assert.ok(Date.now() - t0 < 1000);
   const threads = (await f.call('thread-list')).value;
-  assert.equal(threads.filter(t => t.client === f.cid).length, 0, 'the interrupted thread is gone');
+  assert.equal(threads.filter((t: Msg) => t.client === f.cid).length, 0, 'the interrupted thread is gone');
   f.close();
 });
 

@@ -20,23 +20,45 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ProtoError } from './proto.mts';
 import { Thread, jsonToScheme } from './threads.mts';
+import type { Restart, Resume, SchemeGen, SchemeSymbol } from './threads.mts';
+import type { By } from './proto.mts';
+import type { Client } from './session.mts';
+import type { SBuf } from './buffers.mts';
+import type { Ed as Edwin, Lisp, Log, SchemeValue, Server } from './main.mts';
+
+/* The evaluator S of edwin/src (scheme.js), untyped JavaScript like the rest of L. */
+type Scheme = Lisp['S'];
+export interface SourceLoc { file?: string | null; line: number; col?: number }
+/* The parts of a procedure the debugger reads: compound procedures have a scope (parameter name -> frame slot). */
+export interface SchemeProc { procName?: string; scope?: { names: Map<SchemeSymbol, number> } }
+/* One entry of S.conditionBacktrace, innermost first. */
+export interface StackFrame { proc: SchemeProc | null; frame: SchemeValue[] | null; loc: SourceLoc | null }
+/* What a thread yields to stop in the debugger (S.Suspend). */
+export interface Suspension { condition: SchemeValue; continuable: boolean }
+/* An inspected object: a title, free lines and the numbered parts. */
+export interface Description { title: string; lines: string[]; parts: [string, SchemeValue][] }
+export interface AproposItem { name: string; kind: 'command' | 'function' | 'variable' | 'macro'; where: string; doc: string }
+export interface DefinitionLocation { file: string | null; line: number | null; kind: 'procedure' | 'primitive' | 'macro' }
+export type RoomInfo = { heapUsedMiB: number; heapTotalMiB: number; rssMiB: number; externalMiB: number; buffers: number; chars: number; journalBytes: number; threads: number; clients: number; imageEntries: number };
+export interface ClientInfo { cid: string | null; kind: string | null; device: string | null; session: string | null; buffers: string[] }
+export interface PrimitiveEntry { name: string; args: string; doc: string; where: string; command: boolean; blocking: boolean; source: string | null }
 
 export const name = 'debug';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EDWIN = path.join(HERE, '..');
 const SCM_FILE = path.join(HERE, '..', 'scm', 'debug.scm');
-const SERVER_BY = { kind: 'server' };
+const SERVER_BY: By = { kind: 'server' };
 export const BACKTRACE = '*Backtrace*', INSPECTOR = '*Inspector*', THREADS = '*Threads*', CLIENTS = '*Clients*', APROPOS = '*Apropos*';
 
 /* A read-only special buffer the server renders, shared as name:NAME (image.mts does the same for *image-log*).
    TEXT replaces its contents as one server batch; CLIENT (if any) is told to display it. Returns the SBuf. */
-export async function showSpecial(server, bufName, text, client, how = 'other-window') {
+export async function showSpecial(server: Server, bufName: string, text: string, client: Client | null | undefined, how: string = 'other-window'): Promise<SBuf> {
   const { Ed, buffers } = server;
   const id = 'name:' + bufName;
   let sb = buffers.byId.get(id);
   if (!sb) {
     const ed = Ed.getBufferCreate(bufName); ed.mode = 'special-mode'; ed.readOnly = true;
-    sb = buffers.resolve(id, false);
+    sb = buffers.resolve(id, false) as SBuf;
     sb.readOnly = 'server special buffer';
   }
   await buffers.replaceText(sb, text, SERVER_BY);
@@ -44,33 +66,41 @@ export async function showSpecial(server, bufName, text, client, how = 'other-wi
   if (client && !client.closed) client.send({ t: 'display', buf: sb.id, how });
   return sb;
 }
-const pad = (s, n) => String(s).padEnd(n);
-const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+const pad = (s: unknown, n: number) => String(s).padEnd(n);
+const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
 
 /* ---------- the debugger ---------- */
 class Session {
-  constructor(dbg, thread, suspend) {
+  declare dbg: Debugger;
+  declare S: Scheme;
+  declare thread: Thread;
+  declare cond: SchemeValue;
+  declare continuable: boolean;
+  declare frames: StackFrame[];
+  declare restarts: Restart[];
+  declare at: number;
+  constructor(dbg: Debugger, thread: Thread, suspend: Suspension) {
     this.dbg = dbg; this.S = dbg.S;
     this.thread = thread; this.cond = suspend.condition; this.continuable = suspend.continuable;
     this.frames = (() => { try { return this.S.conditionBacktrace(this.cond) || []; } catch (e) { return []; } })();
     this.restarts = []; for (let n = thread.ts.restarts; n; n = n.next) this.restarts.push(n.r);
     this.at = Date.now();
   }
-  report() { return this.dbg.Ed.errorText(this.cond); }
-  conditionName() { const c = this.cond; return c instanceof this.S.SchemeError ? c.kind : c instanceof this.S.Raise ? 'raise' : 'error'; }
-  frame(n) { const f = this.frames[n]; if (!f) this.dbg.fail(`No stack frame ${n}`); return f; }
+  report(): string { return this.dbg.Ed.errorText(this.cond); }
+  conditionName(): string { const c = this.cond; return c instanceof this.S.SchemeError ? c.kind : c instanceof this.S.Raise ? 'raise' : 'error'; }
+  frame(n: number): StackFrame { const f = this.frames[n]; if (!f) this.dbg.fail(`No stack frame ${n}`); return f; }
   /* The locals of frame N: [[name, value], ...] by parameter name (R4.35). */
-  locals(n) {
-    const f = this.frame(n), out = [];
+  locals(n: number): [string, SchemeValue][] {
+    const f = this.frame(n), out: [string, SchemeValue][] = [];
     if (!f.proc || !f.proc.scope || !f.frame) return out;
     for (const [sym, k] of f.proc.scope.names) out.push([sym.name, f.frame[k]]);
     return out;
   }
-  environment(n) { const f = this.frame(n); return f.proc && f.proc.scope && f.frame ? new this.S.Environment(f.proc.scope, f.frame) : null; }
-  render() {
+  environment(n: number): SchemeValue | null { const f = this.frame(n); return f.proc && f.proc.scope && f.frame ? new this.S.Environment(f.proc.scope, f.frame) : null; }
+  render(): string {
     const S = this.S, t = this.thread;
     const out = [`Debugger entered: ${this.conditionName()}`, this.report(), ''];
-    out.push(`Thread ${t.id} (${t.name}, ${t.kind}${t.client ? ', for ' + t.client.kind + ' ' + t.client.cid.slice(0, 8) : ''}) is suspended${this.continuable ? '; the condition is continuable (c)' : ''}.`, '');
+    out.push(`Thread ${t.id} (${t.name}, ${t.kind}${t.client ? ', for ' + t.client.kind + ' ' + t.client.cid!.slice(0, 8) : ''}) is suspended${this.continuable ? '; the condition is continuable (c)' : ''}.`, '');
     out.push('Restarts:');
     this.restarts.forEach((r, i) => out.push(`  ${i}: [${r.name ? r.name.name : 'anonymous'}] ${S.restartReport(r)}`));
     if (!this.restarts.length) out.push('  (none)');
@@ -78,7 +108,7 @@ class Session {
     this.frames.forEach((f, i) => {
       const nm = f.proc && f.proc.procName ? f.proc.procName : 'anonymous';
       const params = f.proc && f.proc.scope ? [...f.proc.scope.names.keys()].map(s => s.name) : [];
-      const args = params.map(p => { const k = f.proc.scope.names.get(S.intern(p)); const v = f.frame ? f.frame[k] : undefined; return v === undefined ? p : `${p}=${clip(S.write(v), 40)}`; });
+      const args = params.map(p => { const k = f.proc!.scope!.names.get(S.intern(p)); const v = f.frame ? f.frame[k!] : undefined; return v === undefined ? p : `${p}=${clip(S.write(v), 40)}`; });
       const loc = f.loc ? ` at ${f.loc.file || ''}:${f.loc.line}${f.loc.col !== undefined ? ':' + f.loc.col : ''}` : '';
       out.push(`  ${pad(i + ':', 4)}(${[nm, ...args].join(' ')})${loc}`);
     });
@@ -88,61 +118,70 @@ class Session {
 }
 
 export class Debugger {
-  constructor(server) {
+  declare server: Server;
+  declare S: Scheme;
+  declare L: Lisp;
+  declare Ed: Edwin;
+  declare log: Log;
+  declare sessions: Map<number, Session>;
+  declare current: Session | null;
+  declare inspector: SchemeValue[];
+  declare _sources: Map<string, string> | undefined;
+  constructor(server: Server) {
     this.server = server; this.S = server.L.S; this.L = server.L; this.Ed = server.Ed; this.log = server.log;
     this.sessions = new Map(); // thread id -> Session
     this.current = null;
     this.inspector = [];       // the inspector's path: objects, outermost first
   }
   /* A frame to show the debugger in: the thread's own client when it is a frame, else the newest frame. */
-  frameFor(t) {
+  frameFor(t: Pick<Thread, 'client'>): Client | null {
     if (t.client && t.client.kind === 'frame' && !t.client.closed) return t.client;
     let last = null; for (const c of this.server.clients) if (c.kind === 'frame' && !c.closed) last = c;
     return last;
   }
-  wants(t) { return !!t && t.debugOnError && this.L.truthy(this.L.get('debug-on-error')) && this.frameFor(t) !== null; }
-  async onSuspend(t, suspend) {
+  wants(t: Thread | null): boolean { return !!t && t.debugOnError && this.L.truthy(this.L.get('debug-on-error')) && this.frameFor(t) !== null; }
+  async onSuspend(t: Thread, suspend: Suspension): Promise<void> {
     const s = new Session(this, t, suspend);
     this.sessions.set(t.id, s); this.current = s;
     this.log.info('debugger', { thread: t.id, condition: s.conditionName(), frames: s.frames.length });
     await this.refresh(this.frameFor(t));
   }
-  async refresh(client) {
+  async refresh(client: Client | null): Promise<SBuf> {
     const s = this.current;
     const text = s ? s.render() : 'No thread is in the debugger.\n';
     return showSpecial(this.server, BACKTRACE, text, client);
   }
-  fail(msg) { throw new this.S.SchemeError('error', msg, []); }
-  session(id) {
+  fail(msg: string): never { throw new this.S.SchemeError('error', msg, []); }
+  session(id?: number | null): Session {
     if (id === undefined || id === null) { if (!this.current) this.fail('No thread is in the debugger'); return this.current; }
     const s = this.sessions.get(Number(id)); if (!s) this.fail(`Thread ${id} is not in the debugger`); return s;
   }
-  drop(t) {
+  drop(t: Thread): void {
     const s = this.sessions.get(t.id); if (!s) return;
     this.sessions.delete(t.id);
     if (this.current === s) this.current = [...this.sessions.values()].pop() || null;
     this.refresh(null).catch(() => {});
   }
   /* The thread leaves the debugger: resumed (continue, a restart) or aborted. */
-  leave(s, how) {
+  leave(s: Pick<Session, 'thread'>, how: Resume): void {
     this.sessions.delete(s.thread.id);
     if (this.current === s) this.current = [...this.sessions.values()].pop() || null;
     const ok = this.server.threads.resumeThread(s.thread, how);
     if (!ok) this.fail(`Thread ${s.thread.id} is no longer suspended`);
     this.refresh(null).catch(() => {});
   }
-  restart(s, k, args) {
+  restart(s: Session, k: number, args?: SchemeValue[]): string {
     const r = s.restarts[k]; if (!r) this.fail(`No restart ${k}`);
     this.leave(s, { throw: new this.S.Unwind(r.tag, r, args || []) });
     return r.name ? r.name.name : 'anonymous';
   }
-  abort(s) { this.leave(s, { throw: new this.S.Unwind(s.thread.abortTag, s.thread.abortRestart, []) }); return 'abort'; }
-  continue_(s, value) {
+  abort(s: Session): string { this.leave(s, { throw: new this.S.Unwind(s.thread.abortTag, s.thread.abortRestart, []) }); return 'abort'; }
+  continue_(s: Session, value: SchemeValue): boolean {
     if (!s.continuable) this.fail('The condition is not continuable; use a restart or abort');
     this.leave(s, { value }); return true;
   }
   /* Evaluate TEXT in the lexical environment of frame N, on a short-lived command thread for CLIENT. */
-  async evalIn(s, n, text, client) {
+  async evalIn(s: Pick<Session, 'environment'>, n: number, text: string, client: Client): Promise<SchemeValue> {
     const { S, L } = this;
     const env = s.environment(n) || S.globalEnvironment;
     const forms = L.readAll(text);
@@ -153,18 +192,18 @@ export class Debugger {
 
   /* ---------- the inspector ---------- */
   /* The parts of OBJECT: {title, lines: [string], parts: [[label, value]]}. */
-  describe(x) {
+  describe(x: SchemeValue): Description {
     const { S, Ed } = this, server = this.server;
-    const parts = [], lines = [];
-    let title;
+    const parts: [string, SchemeValue][] = [], lines: string[] = [];
+    let title: string;
     if (x === S.NIL) title = 'the empty list';
     else if (x instanceof S.Pair) {
-      const items = []; let p = x; while (p instanceof S.Pair) { items.push(p.car); p = p.cdr; }
+      const items: SchemeValue[] = []; let p = x; while (p instanceof S.Pair) { items.push(p.car); p = p.cdr; }
       title = `a list of ${items.length}${p === S.NIL ? '' : ' (improper, tail ' + S.write(p) + ')'}`;
       items.forEach((v, i) => parts.push([String(i), v]));
-    } else if (Array.isArray(x)) { title = `a vector of ${x.length}`; x.forEach((v, i) => parts.push([String(i), v])); }
+    } else if (Array.isArray(x)) { title = `a vector of ${x.length}`; x.forEach((v: SchemeValue, i: number) => parts.push([String(i), v])); }
     else if (x instanceof Map) { title = `a hash table of ${x.size}`; for (const [k, v] of x) parts.push([S.write(k), v]); }
-    else if (x instanceof S.Record) { title = `a record of type ${x.type.name}`; x.type.fieldNames.forEach((f, i) => parts.push([f instanceof S.Sym ? f.name : String(f), x.fields[i]])); }
+    else if (x instanceof S.Record) { title = `a record of type ${x.type.name}`; x.type.fieldNames.forEach((f: SchemeValue, i: number) => parts.push([f instanceof S.Sym ? f.name : String(f), x.fields[i]])); }
     else if (x instanceof S.RecordType) { title = `the record type ${x.name}`; parts.push(['fields', S.listOf(x.fieldNames)]); }
     else if (x instanceof Ed.Buffer) {
       title = `the buffer ${x.name}`;
@@ -174,7 +213,7 @@ export class Debugger {
       if (sb) parts.push(['shared-id', sb.id], ['version', sb.ver], ['clients', S.listOf([...sb.clients])]);
       if (x.locals && x.locals.size) parts.push(['locals', x.locals]);
     } else if (x instanceof Thread) { title = `the thread ${x.id} (${x.name})`; for (const [k, v] of Object.entries(x.info())) parts.push([k, jsonToScheme(S, v)]); }
-    else if (x && x.constructor && x.constructor.name === 'Client' && x.cid) { title = `the client ${x.cid.slice(0, 8)} (${x.kind})`; parts.push(['cid', x.cid], ['kind', S.intern(x.kind)], ['device', x.device], ['session', x.session || false], ['buffers', S.listOf([...x.buffers].map(sb => sb.id))], ['closed', !!x.closed]); }
+    else if (x && x.constructor && x.constructor.name === 'Client' && x.cid) { title = `the client ${x.cid.slice(0, 8)} (${x.kind})`; parts.push(['cid', x.cid], ['kind', S.intern(x.kind)], ['device', x.device], ['session', x.session || false], ['buffers', S.listOf([...x.buffers].map((sb: SBuf) => sb.id))], ['closed', !!x.closed]); }
     else if (typeof x === 'function') {
       title = x.procName ? `the procedure ${x.procName}` : 'an anonymous procedure';
       parts.push(['kind', S.intern(typeof x.params === 'string' ? 'primitive' : 'compound')]);
@@ -193,7 +232,7 @@ export class Debugger {
     else title = S.write(x);
     return { title, lines, parts };
   }
-  renderInspector() {
+  renderInspector(): string {
     const { S } = this;
     if (!this.inspector.length) return 'Nothing is being inspected.\n';
     const x = this.inspector[this.inspector.length - 1];
@@ -203,35 +242,35 @@ export class Debugger {
     d.parts.forEach(([k, v], i) => out.push(`  ${pad(i + ':', 4)}${pad(k, 18)} ${clip(S.write(v), 100)}`));
     return out.join('\n') + '\n';
   }
-  async inspect(x, client) { this.inspector.push(x); return showSpecial(this.server, INSPECTOR, this.renderInspector(), client); }
-  async inspectNth(n, client) {
+  async inspect(x: SchemeValue, client: Client | null): Promise<SBuf> { this.inspector.push(x); return showSpecial(this.server, INSPECTOR, this.renderInspector(), client); }
+  async inspectNth(n: number, client: Client | null): Promise<SBuf> {
     const x = this.inspector[this.inspector.length - 1];
     if (x === undefined) this.fail('Nothing is being inspected');
     const d = this.describe(x); const p = d.parts[n];
     if (!p) this.fail(`No part ${n}`);
     return this.inspect(p[1], client);
   }
-  async inspectPop(client) { if (this.inspector.length > 1) this.inspector.pop(); return showSpecial(this.server, INSPECTOR, this.renderInspector(), client); }
+  async inspectPop(client: Client | null): Promise<SBuf> { if (this.inspector.length > 1) this.inspector.pop(); return showSpecial(this.server, INSPECTOR, this.renderInspector(), client); }
 
   /* ---------- introspection ---------- */
-  threadsText() {
+  threadsText(): string {
     const ts = [...this.server.threads.threads.values()];
     const out = [`${ts.length} thread${ts.length === 1 ? '' : 's'} (thread-kill N invokes a thread's abort restart; suspended ones are in *Backtrace*)`, '', `  ${pad('id', 5)}${pad('state', 11)}${pad('kind', 11)}${pad('client', 10)}${pad('runnable', 10)}${pad('held', 6)}name / waiting for`];
-    for (const t of ts) out.push(`  ${pad(t.id, 5)}${pad(t.state, 11)}${pad(t.kind, 11)}${pad(t.client ? t.client.kind + ':' + t.client.cid.slice(0, 4) : '-', 10)}${pad(Math.round(t.runnableMs) + ' ms', 10)}${pad(t.held.size, 6)}${t.name}${t.waiting ? ' (waiting for ' + t.waiting + ')' : ''}`);
+    for (const t of ts) out.push(`  ${pad(t.id, 5)}${pad(t.state, 11)}${pad(t.kind, 11)}${pad(t.client ? t.client.kind + ':' + t.client.cid!.slice(0, 4) : '-', 10)}${pad(Math.round(t.runnableMs) + ' ms', 10)}${pad(t.held.size, 6)}${t.name}${t.waiting ? ' (waiting for ' + t.waiting + ')' : ''}`);
     return out.join('\n') + '\n';
   }
-  clientsText() {
+  clientsText(): string {
     const cs = [...this.server.clients];
     const out = [`${cs.length} client${cs.length === 1 ? '' : 's'}`, '', `  ${pad('cid', 10)}${pad('kind', 7)}${pad('device', 24)}${pad('buffers', 9)}session`];
     for (const c of cs) out.push(`  ${pad(c.cid ? c.cid.slice(0, 8) : '-', 10)}${pad(c.kind || '-', 7)}${pad(clip(c.device || '-', 22), 24)}${pad(c.buffers.size, 9)}${c.session || ''}`);
     return out.join('\n') + '\n';
   }
-  clientInfo(c) { return { cid: c.cid, kind: c.kind, device: c.device, session: c.session, buffers: [...c.buffers].map(sb => sb.id) }; }
-  apropos(pattern) {
+  clientInfo(c: Client): ClientInfo { return { cid: c.cid, kind: c.kind, device: c.device, session: c.session, buffers: [...c.buffers].map(sb => sb.id) }; }
+  apropos(pattern: string): AproposItem[] {
     const { S, L, Ed } = this;
-    let re; try { re = new RegExp(pattern, 'i'); } catch (e) { re = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'); }
-    const first = d => (d ? String(d).split('\n')[0] : '');
-    const out = [];
+    let re: RegExp; try { re = new RegExp(pattern, 'i'); } catch (e) { re = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'); }
+    const first = (d: unknown) => (d ? String(d).split('\n')[0] : '');
+    const out: AproposItem[] = [];
     for (const [nm, box] of S.globals) {
       if (!re.test(nm)) continue;
       const v = box.value;
@@ -242,14 +281,14 @@ export class Debugger {
     out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     return out;
   }
-  aproposText(pattern, items) {
+  aproposText(pattern: string, items: AproposItem[]): string {
     const out = [`${items.length} match${items.length === 1 ? '' : 'es'} for ${JSON.stringify(pattern)}`, ''];
     for (const it of items) out.push(`${pad(it.name, 34)} ${pad(it.kind, 9)}${pad(it.where, 7)} ${it.doc}`);
     return out.join('\n') + '\n';
   }
   /* Where NAME is defined: {file, line, kind} for a Scheme procedure (its lambda's location), a JS primitive
      (the registry's line in edwin/src or edwin/server) or a macro; null when unknown. */
-  findDefinition(nm) {
+  findDefinition(nm: string): DefinitionLocation | null {
     const { S, L } = this;
     const f = L.fnOrNull(S.intern(nm));
     if (f && typeof f.params !== 'string') { const l = f.loc; return l && l.line !== undefined ? { file: l.file || null, line: l.line, kind: 'procedure' } : null; }
@@ -258,7 +297,7 @@ export class Debugger {
     if (S.macros.has(nm)) return { file: null, line: null, kind: 'macro' };
     return null;
   }
-  room() {
+  room(): RoomInfo {
     const m = process.memoryUsage();
     const bufs = this.server.buffers.all();
     let journalBytes = 0;
@@ -270,20 +309,20 @@ export class Debugger {
   /* ---------- the primitive registry (R4.48) ---------- */
   /* Source lines of the definers: D('name', CMD('name', pred('name', blocking('name', G('name' in edwin/src
      and edwin/server. The scan is textual and runs once. */
-  sourceMap() {
+  sourceMap(): Map<string, string> {
     if (this._sources) return this._sources;
-    const map = new Map(), files = new Map();
-    const scan = (dir, rel) => {
-      let names = []; try { names = fs.readdirSync(dir); } catch (e) { return; }
+    const map = new Map<string, string>(), files = new Map<string, string>();
+    const scan = (dir: string, rel: string) => {
+      let names: string[] = []; try { names = fs.readdirSync(dir); } catch (e) { return; }
       for (const f of names) {
-        if (!/\.(js|mjs)$/.test(f)) continue;
+        if (!/\.(js|mjs|mts)$/.test(f)) continue;
         const lines = fs.readFileSync(path.join(dir, f), 'utf8').split('\n');
         lines.forEach((line, i) => {
           const re = /\b(?:D|CMD|pred|blocking|G|def|serverOnly\(L\.D|L\.D|L\.CMD)\(\s*'([^']+)'/g;
-          let m; while ((m = re.exec(line))) if (!map.has(m[1])) map.set(m[1], `${rel}/${f}:${i + 1}`);
+          let m: RegExpExecArray | null; while ((m = re.exec(line))) if (!map.has(m[1])) map.set(m[1], `${rel}/${f}:${i + 1}`);
         });
         /* Primitives defined in loops (caar, <, ...) have no definer line: the file where the name is quoted. */
-        const quoted = /'([^'\s]+)'/g; let q; const text = lines.join('\n');
+        const quoted = /'([^'\s]+)'/g; let q: RegExpExecArray | null; const text = lines.join('\n');
         while ((q = quoted.exec(text))) if (!files.has(q[1])) files.set(q[1], `${rel}/${f}`);
       }
     };
@@ -293,11 +332,11 @@ export class Debugger {
   }
   /* The definer's file:line from the stack def captured (scheme.js def), relative to the repository: the first
      frame that is not one of the definer helpers (D, CMD, pred, G, blocking, ...). */
-  defSource(f) {
+  defSource(f: SchemeValue): string | null {
     if (!f.defAt) return null;
     const HELPERS = new Set(['def', 'D', 'CMD', 'pred', 'G', 'blocking', 'serverOnly', 'defineConditionType', 'alias']);
     for (const raw of String(f.defAt).split('\n').slice(1)) {
-      const m = /^\s*at\s+(?:([^\s(]+)\s+\()?(?:file:\/\/)?([^():\s]+\.m?js):(\d+)(?::\d+)?\)?\s*$/.exec(raw);
+      const m = /^\s*at\s+(?:([^\s(]+)\s+\()?(?:file:\/\/)?([^():\s]+\.(?:m?js|mts)):(\d+)(?::\d+)?\)?\s*$/.exec(raw);
       if (!m) continue;
       const [, fn, file, line] = m;
       if (fn && HELPERS.has(fn.replace(/^.*\./, ''))) continue;
@@ -308,8 +347,8 @@ export class Debugger {
     return null;
   }
   /* Every JS primitive of the image: name, arity (the parameter string), documentation, where it runs, source. */
-  registry() {
-    const { S } = this, src = this.sourceMap(), out = [];
+  registry(): PrimitiveEntry[] {
+    const { S } = this, src = this.sourceMap(), out: PrimitiveEntry[] = [];
     for (const [nm, box] of S.globals) {
       const f = box.value;
       if (typeof f !== 'function' || f.scope || !(typeof f.params === 'string' || f.defAt)) continue; // compound procedures are Scheme
@@ -322,7 +361,7 @@ export class Debugger {
 }
 
 /* ---------- the module ---------- */
-export async function install(server) {
+export async function install(server: Server): Promise<void> {
   const { L, Ed } = server, S = L.S;
   const dbg = new Debugger(server);
   server.debugger = dbg;
@@ -331,7 +370,7 @@ export async function install(server) {
   L.defvar('debug-on-error', true, 'Non-nil means a condition no handler takes suspends its thread in the debugger (R4.35). Commands run for frames only; cli calls and background threads report instead.');
 
   /* The evaluator asks here when a condition reaches the top without a handler (scheme.js debugG). */
-  S.hooks.debugG = function* (cond, continuable) {
+  S.hooks.debugG = function* (cond: SchemeValue, continuable: boolean): SchemeGen {
     const t = sched.current;
     /* A deadline (R14.13) or a cancelled thread ends the thread; it is not a bug to debug. */
     if (cond instanceof S.SchemeError && (cond.kind === 'timeout' || cond.kind === 'thread-cancelled')) return undefined;
@@ -339,15 +378,15 @@ export async function install(server) {
     const v = yield new S.Suspend(cond, continuable); // the scheduler parks the thread; the debugger resumes it
     return { value: v };
   };
-  sched.onSuspend = (t, y) => dbg.onSuspend(t, y).catch(e => { server.log.error('debugger', { error: e.stack || String(e) }); dbg.leave(dbg.sessions.get(t.id) || { thread: t }, { throw: y.condition }); });
+  sched.onSuspend = (t: Thread, y: Suspension) => dbg.onSuspend(t, y).catch((e: Error) => { server.log.error('debugger', { error: e.stack || String(e) }); dbg.leave(dbg.sessions.get(t.id) || { thread: t }, { throw: y.condition }); });
   /* A suspended thread resumed by other means (interrupt, thread-kill) leaves the debugger. */
-  sched.onUnsuspend = t => dbg.drop(t);
-  const D = (nm, args, doc, fn, gen) => { const f = L.D(nm, args, doc, fn); f.where = 'server'; if (gen) f.gen = gen; return f; };
+  sched.onUnsuspend = (t: Thread) => dbg.drop(t);
+  const D = (nm: string, args: string, doc: string, fn: (args: SchemeValue[]) => SchemeValue, gen?: (args: SchemeValue[]) => SchemeGen) => { const f = L.D(nm, args, doc, fn); f.where = 'server'; if (gen) f.gen = gen; return f; };
   const cur = () => sched.current;
   const frameClient = () => { const t = cur(); return t && t.client && t.client.kind === 'frame' ? t.client : dbg.frameFor(t || { client: null }); };
-  const blockOn = p => new S.Block(p, 'the display');
-  const sess = x => dbg.session(x === undefined || x === false ? undefined : S.num(x, 'debugger'));
-  const num = (x, who) => { const n = S.num(x, who); if (!Number.isInteger(n) || n < 0) throw new S.SchemeError('range-error', `${who}: expected a non-negative integer`, [x]); return n; };
+  const blockOn = (p: Promise<unknown>) => new S.Block(p, 'the display');
+  const sess = (x: SchemeValue) => dbg.session(x === undefined || x === false ? undefined : S.num(x, 'debugger'));
+  const num = (x: SchemeValue, who: string): number => { const n = S.num(x, who); if (!Number.isInteger(n) || n < 0) throw new S.SchemeError('range-error', `${who}: expected a non-negative integer`, [x]); return n; };
 
   /* Primitives behind the backtrace-mode commands of debug.scm (and usable from wb eval). */
   D('debugger-sessions', '', 'The ids of the threads suspended in the debugger.', () => S.listOf([...dbg.sessions.keys()]));
@@ -378,13 +417,13 @@ export async function install(server) {
   D('primitive-where', 'name', 'Where the primitive NAME runs: server, frame or both; #f for a compound procedure.', ([n]) => { const f = L.fnOrNull(n); if (!f || f.scope) return false; return S.intern(f.where || 'both'); });
 
   /* Server commands reached by call{cmd} (wb, and frames in E3); a Scheme condition becomes bad_request. */
-  const num0 = (a, i, dflt) => (Array.isArray(a) && a[i] !== undefined && a[i] !== null ? Number(a[i]) : dflt);
+  const num0 = <D extends number | undefined>(a: unknown[], i: number, dflt: D): number | D => (Array.isArray(a) && a[i] !== undefined && a[i] !== null ? Number(a[i]) : dflt);
   const define = server.defineCommand.bind(server);
   server.defineCommand = (nm, fn) => define(nm, async (...a) => { try { return await fn(...a); } catch (e) { if (e instanceof S.SchemeError) throw new ProtoError('bad_request', S.errorMessage(e)); throw e; } });
   server.defineCommand('debugger-state', () => ({ value: { current: dbg.current ? dbg.current.thread.id : null, sessions: [...dbg.sessions.values()].map(s => ({ thread: s.thread.id, condition: s.conditionName(), report: s.report(), continuable: s.continuable, frames: s.frames.length, restarts: s.restarts.map(r => ({ name: r.name ? r.name.name : null, report: S.restartReport(r) })) })) } }));
   server.defineCommand('debugger-frames', (client, args) => { const s = dbg.session(num0(args, 0, undefined)); return { value: s.frames.map((f, i) => ({ index: i, name: f.proc && f.proc.procName ? f.proc.procName : 'anonymous', locals: Object.fromEntries(s.locals(i).map(([k, v]) => [k, v === undefined ? null : S.write(v)])), loc: f.loc ? `${f.loc.file || ''}:${f.loc.line}` : null })) }; });
   server.defineCommand('debugger-eval', async (client, args) => { const s = dbg.session(num0(args, 2, undefined)); const n = num0(args, 0, 0); if (typeof args[1] !== 'string') throw new ProtoError('bad_request', 'debugger-eval needs [frame, form]'); const v = await dbg.evalIn(s, n, args[1], client); return { value: S.write(v) }; });
-  server.defineCommand('debugger-restart', (client, args) => ({ value: dbg.restart(dbg.session(num0(args, 1, undefined)), num0(args, 0, 0), (args[2] || []).map(a => jsonToScheme(S, a))) }));
+  server.defineCommand('debugger-restart', (client, args) => ({ value: dbg.restart(dbg.session(num0(args, 1, undefined)), num0(args, 0, 0), ((args[2] || []) as unknown[]).map(a => jsonToScheme(S, a))) }));
   server.defineCommand('debugger-continue', (client, args) => ({ value: dbg.continue_(dbg.session(num0(args, 1, undefined)), args[0] === undefined ? S.UNSPEC : jsonToScheme(S, args[0])) }));
   server.defineCommand('debugger-abort', (client, args) => ({ value: dbg.abort(dbg.session(num0(args, 0, undefined))) }));
   server.defineCommand('debugger-show', async (client, args) => { if (args[0] !== undefined) dbg.current = dbg.session(num0(args, 0, undefined)); const sb = await dbg.refresh(client); return { value: { buf: sb.id } }; });

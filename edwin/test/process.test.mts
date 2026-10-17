@@ -6,11 +6,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeDir, startEdwind, stopEdwind, EditClient } from './edit-client.mts';
+import type { TestDir, EdwindChild, ClientOptions } from './edit-client.mts';
 import { FakeHub } from './fake-hub.mts';
+import type { PtySession } from './fake-hub.mts';
 import { inputFrames, PTY_INPUT_FRAME } from '../server/hub.mts';
 import { stripAnsi, newSid, exitEvent } from '../server/process.mts';
 
-let dir, child, hub, hubPath;
+let dir: TestDir, child: EdwindChild, hub: FakeHub, hubPath: string;
 before(async () => {
   dir = makeDir();
   hubPath = path.join(dir.dirs.sock, 'hub.sock');
@@ -19,10 +21,10 @@ before(async () => {
   child = await startEdwind(dir);
 });
 after(async () => { await stopEdwind(child); await hub.stop(); fs.rmSync(dir.root, { recursive: true, force: true }); });
-const client = async (opts) => { const c = new EditClient(dir.cfg.socket, opts); await c.connect(); const w = await c.hello(); assert.equal(w.t, 'welcome'); return c; };
-const value = async (c, form) => { const r = await c.form(form); assert.equal(r.error, undefined, JSON.stringify(r.error)); return r.value; };
-const until = async (fn, what, ms = 10000) => { const end = Date.now() + ms; for (;;) { const v = await fn(); if (v) return v; if (Date.now() > end) throw new Error('timeout waiting for ' + what); await new Promise(r => setTimeout(r, 25)); } };
-const hubUp = c => until(async () => (await value(c, '(hub-status)')) === 'up', 'the hub to be up');
+const client = async (opts?: ClientOptions) => { const c = new EditClient(dir.cfg.socket, opts); await c.connect(); const w = await c.hello(); assert.equal(w.t, 'welcome'); return c; };
+const value = async (c: EditClient, form: string) => { const r = await c.form(form); assert.equal(r.error, undefined, JSON.stringify(r.error)); return r.value; };
+const until = async (fn: () => unknown, what: string, ms = 10000) => { const end = Date.now() + ms; for (;;) { const v = await fn(); if (v) return v; if (Date.now() > end) throw new Error('timeout waiting for ' + what); await new Promise(r => setTimeout(r, 25)); } };
+const hubUp = (c: EditClient) => until(async () => (await value(c, '(hub-status)')) === 'up', 'the hub to be up');
 
 test('unit: sids, input frames, ANSI stripping and sentinel events', () => {
   for (let i = 0; i < 20; i++) assert.match(newSid(), /^ed-[a-z2-7]{16}$/, 'ed- and 16 base32 characters (R4.43)');
@@ -135,9 +137,9 @@ test('M-x list-processes renders *Process List* with every process, card-less on
   assert.equal(r.value, '"name:*Process List*"');
   const o = await c.open('name:*Process List*');
   assert.equal(o.error, null);
-  assert.match(o.text, /^Process +PID +Status +Buffer +Shell +Session +Card +Command\n/);
+  assert.match(o.text!, /^Process +PID +Status +Buffer +Shell +Session +Card +Command\n/);
   const sid = JSON.parse(await value(c, '(process-sid pl)'));
-  const row = o.text.split('\n').find(l => l.startsWith('lister'));
+  const row = o.text!.split('\n').find(l => l.startsWith('lister'));
   assert.ok(row, 'the process is listed'); assert.match(row, /run/); assert.ok(row.includes(sid)); assert.ok(row.includes('sleep 30'));
   assert.equal(o.meta && o.meta.readOnly, 'server special buffer');
   c.close();
@@ -168,7 +170,7 @@ test('hub down: hub-error, then reconnect with backoff and re-attach to the live
   assert.equal(await value(c, '(process-status pr)'), 'run', 'the last known state while the hub is down');
   /* The hub comes back with the same sessions (the real hub persists them); edwind re-attaches with resume. */
   hub = await new FakeHub(hubPath, { sessions }).start();
-  sessions.get(sid).inputFn = d => hub.emitOut(sid, d.replace(/\n/g, '\r\n'));   // the fake cat, on the new hub
+  (sessions.get(sid) as PtySession).inputFn = d => hub.emitOut(sid, d.replace(/\n/g, '\r\n'));   // the fake cat, on the new hub
   await until(async () => (await value(c, '(hub-status)')) === 'up', 'the reconnect', 15000);
   const [re] = await hub.waitFor(r => r.t === 'pty.open' && r.sid === sid && !r.spawn);
   assert.deepEqual(Object.keys(re.resume).sort(), ['out', 'stream']);

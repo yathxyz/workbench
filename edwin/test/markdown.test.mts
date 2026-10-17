@@ -8,15 +8,17 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { startEdwin, FILES } from './headless.mts';
+import type { Edwin } from './headless.mts';
 
+type Globals = typeof globalThis & { L: Edwin; Ed: Edwin; EvilCore: Edwin; Markdown: Edwin };
 const ed = await startEdwin();
-const ev = src => ed.eval(src);
+const ev = (src: string) => ed.eval(src);
 // The dabbrev popup would take RET after three word characters; the wiki-capf case turns it back on.
 ev('(set! corfu-auto #f)');
-const EC = globalThis.EvilCore, MK = globalThis.Markdown;
+const EC = (globalThis as Globals).EvilCore, MK = (globalThis as Globals).Markdown;
 let n = 0;
 /* A fresh Markdown page named NAME (the page name is the file name without its extension) holding TEXT, point at its start, Normal state. */
-async function page(text = '', name) {
+async function page(text = '', name?: string) {
   const file = (name || `page${++n}`) + '.md';
   if (EC.stateOf(ed.E.current) !== 'normal') await ed.keys('ESC');
   await ed.type(`:e ${file}\n`);
@@ -26,10 +28,10 @@ async function page(text = '', name) {
   assert.equal(ed.E.current.mode, 'markdown-mode');
   return ed.E.current;
 }
-const face = pos => { const f = ev(`(markdown-face-at ${pos})`); return f === false ? null : f.name; };
+const face = (pos: number) => { const f = ev(`(markdown-face-at ${pos})`); return f === false ? null : f.name; };
 /* The face at the first character of NEEDLE in the buffer (plus OFF), 1-based positions for the Scheme side. */
-const faceOf = (needle, off = 0) => { const i = ed.text().indexOf(needle); assert.ok(i >= 0, needle); return face(i + 1 + off); };
-const posOf = (needle, off = 0) => { const i = ed.text().indexOf(needle); assert.ok(i >= 0, needle); return i + off; };
+const faceOf = (needle: string, off = 0) => { const i = ed.text().indexOf(needle); assert.ok(i >= 0, needle); return face(i + 1 + off); };
+const posOf = (needle: string, off = 0) => { const i = ed.text().indexOf(needle); assert.ok(i >= 0, needle); return i + off; };
 const line = () => { const t = ed.text(), p = ed.point(); return t.slice(t.lastIndexOf('\n', p - 1) + 1, t.indexOf('\n', p) < 0 ? t.length : t.indexOf('\n', p)); };
 
 test('the shipped Scheme in scm/ is what index.html carries, markdown.js loads after org.js in both hosts', () => {
@@ -46,7 +48,7 @@ test('the shipped Scheme in scm/ is what index.html carries, markdown.js loads a
 
 test('boot: markdown.scm, notes-syntax.scm and address.scm are loaded through require with no error', () => {
   const feats = ev('(features)');
-  const names = globalThis.L.arr(feats).map(s => s.name);
+  const names = (globalThis as Globals).L.arr(feats).map((s: Edwin) => s.name);
   for (const f of ['markdown', 'notes-syntax', 'address', 'org']) assert.ok(names.includes(f), f);
   assert.doesNotMatch(ed.Ed.getBuffer('*Messages*').text, /Error in/);
   for (const c of ['markdown-mode', 'markdown-outline-enter', 'markdown-demote', 'markdown-promote', 'markdown-todo-cycle', 'markdown-todo-cycle-backward',
@@ -125,10 +127,10 @@ test('R10.1 faces: headings (ATX and Setext), lists, tasks, emphasis, code, link
   assert.equal(faceOf('# not a heading'), 'markdown-code-block');
   assert.equal(faceOf('code();'), 'markdown-code-block');
   assert.equal(faceOf('after the fence'), null);
-  const faces = globalThis.L.arr(ev('(markdown-faces)')).map(s => s.name);
+  const faces = (globalThis as Globals).L.arr(ev('(markdown-faces)')).map((s: Edwin) => s.name);
   for (const f of ['markdown-heading-1', 'markdown-heading-6', 'markdown-bold', 'markdown-italic', 'markdown-code', 'markdown-link', 'markdown-wiki-link', 'markdown-block-ref',
     'markdown-task-todo', 'markdown-task-done', 'markdown-field-key', 'markdown-priority', 'markdown-anchor']) assert.ok(faces.includes(f), f);
-  assert.ok(faces.every(f => f.startsWith('markdown-')));
+  assert.ok(faces.every((f: string) => f.startsWith('markdown-')));
 });
 
 test('R10.2 wiki links and block references: faces, raw on the point\'s line, display text elsewhere', async () => {
@@ -148,14 +150,14 @@ test('R10.2 wiki links and block references: faces, raw on the point\'s line, di
   assert.equal(ev('(markdown-resolve-ref "^blk1")'), 'item one ^blk1');
   assert.equal(ev('(markdown-resolve-ref "Other")'), 'Other');
   assert.equal(ev('(markdown-resolve-ref "Nowhere › Here")'), false);
-  const ov = globalThis.L.arr(ev('(markdown-ref-overlays)'));
+  const ov = (globalThis as Globals).L.arr(ev('(markdown-ref-overlays)'));
   assert.equal(ov.length, 4);
-  assert.deepEqual(ov.map(v => v[2]), ['first para of the plan', 'item one ^blk1', 'item one ^blk1', 'Nowhere › Here · not found']);
+  assert.deepEqual(ov.map((v: Edwin) => v[2]), ['first para of the plan', 'item one ^blk1', 'item one ^blk1', 'Nowhere › Here · not found']);
   assert.equal(ed.text().slice(ov[0][0] - 1, ov[0][1] - 1), '((Other › Plan ¶1))');
   // On the point's line the reference is raw text, and no overlay covers it.
   ev(`(goto-char ${posOf('((Other › Plan ¶1))') + 3})`);
   assert.equal(faceOf('((Other › Plan ¶1))'), 'markdown-block-ref');
-  assert.equal(globalThis.L.arr(ev('(markdown-ref-overlays)')).length, 3);
+  assert.equal((globalThis as Globals).L.arr(ev('(markdown-ref-overlays)')).length, 3);
   // The resolution follows edits of the other page.
   const save = ed.E.current;
   ed.Ed.setWindowBuffer(other); ed.E.current = other;
@@ -186,7 +188,7 @@ test('wiki-follow: RET on a link calls wiki-follow-function; the default switche
   await page('# Follow\n\nGo to [[Other|the other page]] now.\nThen ((Other › Plan ¶1)) here.\nplain line\n', 'Follow');
   ev(`(goto-char ${posOf('the other page') + 1})`);
   await ed.keys('RET');
-  assert.deepEqual(globalThis.L.arr(ev('wiki-follow-log')), ['Other']);
+  assert.deepEqual((globalThis as Globals).L.arr(ev('wiki-follow-log')), ['Other']);
   assert.equal(ed.E.current.name, 'Follow.md');
   // RET elsewhere is Vim's RET: the next line.
   ev(`(goto-char ${posOf('Then') + 1})`);
@@ -318,17 +320,17 @@ test('R10.4 motions: ]] and [[ move by heading, gj and gk by visual line', async
 });
 
 test('R10.2 one task keyword table: notes-syntax.scm feeds both Org and markdown-mode, and a change reaches both', async () => {
-  assert.deepEqual(globalThis.L.arr(ev('notes-task-keywords')), ['TODO', 'NEXT', 'WAITING', 'HOLD', 'SOMEDAY', 'DONE', 'CANCELLED', 'DOING', 'NOW', 'LATER']);
-  assert.deepEqual(globalThis.L.arr(ev('notes-done-keywords')), ['DONE', 'CANCELLED']);
-  assert.deepEqual(globalThis.L.arr(globalThis.L.arr(ev('org-todo-keywords'))[0]).map(x => x.name || x),
+  assert.deepEqual((globalThis as Globals).L.arr(ev('notes-task-keywords')), ['TODO', 'NEXT', 'WAITING', 'HOLD', 'SOMEDAY', 'DONE', 'CANCELLED', 'DOING', 'NOW', 'LATER']);
+  assert.deepEqual((globalThis as Globals).L.arr(ev('notes-done-keywords')), ['DONE', 'CANCELLED']);
+  assert.deepEqual((globalThis as Globals).L.arr((globalThis as Globals).L.arr(ev('org-todo-keywords'))[0]).map((x: Edwin) => x.name || x),
     ['sequence', 'TODO(t)', 'NEXT(n)', 'WAITING(w@/!)', 'HOLD(h@/!)', 'SOMEDAY(s)', '|', 'DONE(d!)', 'CANCELLED(c@/!)']);
   assert.equal(ev('(notes-task-keyword-base "DOING")'), 'NEXT');
   const saved = ev('notes-task-keyword-table');
   try {
     ev('(notes-set-task-keywords! \'(("TODO" "t" #f #f) ("BLOCKED" "b" #f #f) ("DONE" "d" #t #f) ("SHIPPED" "s" #t #f) ("NOW" #f #f "TODO")))');
-    assert.deepEqual(globalThis.L.arr(ev('notes-task-keywords')), ['TODO', 'BLOCKED', 'DONE', 'SHIPPED', 'NOW']);
-    assert.deepEqual(globalThis.L.arr(ev('notes-done-keywords')), ['DONE', 'SHIPPED']);
-    assert.deepEqual(globalThis.L.arr(globalThis.L.arr(ev('org-todo-keywords'))[0]).map(x => x.name || x), ['sequence', 'TODO(t)', 'BLOCKED(b)', '|', 'DONE(d)', 'SHIPPED(s)']);
+    assert.deepEqual((globalThis as Globals).L.arr(ev('notes-task-keywords')), ['TODO', 'BLOCKED', 'DONE', 'SHIPPED', 'NOW']);
+    assert.deepEqual((globalThis as Globals).L.arr(ev('notes-done-keywords')), ['DONE', 'SHIPPED']);
+    assert.deepEqual((globalThis as Globals).L.arr((globalThis as Globals).L.arr(ev('org-todo-keywords'))[0]).map((x: Edwin) => x.name || x), ['sequence', 'TODO(t)', 'BLOCKED(b)', '|', 'DONE(d)', 'SHIPPED(s)']);
     // Markdown reads the new set at once.
     await page('- BLOCKED by x\n- SHIPPED done\n- WAITING gone\n');
     assert.equal(faceOf('BLOCKED'), 'markdown-task-other');
@@ -342,15 +344,15 @@ test('R10.2 one task keyword table: notes-syntax.scm feeds both Org and markdown
     ev('(org-todo)'); assert.match(ed.text(), /^\* DONE task/);
     ev('(org-todo)'); assert.match(ed.text(), /^\* SHIPPED task/);
   } finally {
-    globalThis.L.set('saved-task-table', saved);
+    (globalThis as Globals).L.set('saved-task-table', saved);
     ev('(notes-set-task-keywords! saved-task-table)');
   }
-  assert.deepEqual(globalThis.L.arr(ev('notes-task-keywords')), ['TODO', 'NEXT', 'WAITING', 'HOLD', 'SOMEDAY', 'DONE', 'CANCELLED', 'DOING', 'NOW', 'LATER']);
-  assert.ok(globalThis.L.arr(globalThis.L.arr(ev('org-todo-keywords'))[0]).includes('WAITING(w@/!)'));
-  const g = Object.fromEntries(globalThis.L.arr(ev('(notes-grammar)')).map(p => [p.car.name, p.cdr]));
-  assert.deepEqual(globalThis.L.arr(g['task-keywords']), ['TODO', 'NEXT', 'WAITING', 'HOLD', 'SOMEDAY', 'DONE', 'CANCELLED', 'DOING', 'NOW', 'LATER']);
+  assert.deepEqual((globalThis as Globals).L.arr(ev('notes-task-keywords')), ['TODO', 'NEXT', 'WAITING', 'HOLD', 'SOMEDAY', 'DONE', 'CANCELLED', 'DOING', 'NOW', 'LATER']);
+  assert.ok((globalThis as Globals).L.arr((globalThis as Globals).L.arr(ev('org-todo-keywords'))[0]).includes('WAITING(w@/!)'));
+  const g = Object.fromEntries((globalThis as Globals).L.arr(ev('(notes-grammar)')).map((p: Edwin) => [p.car.name, p.cdr]));
+  assert.deepEqual((globalThis as Globals).L.arr(g['task-keywords']), ['TODO', 'NEXT', 'WAITING', 'HOLD', 'SOMEDAY', 'DONE', 'CANCELLED', 'DOING', 'NOW', 'LATER']);
   assert.equal(g['task-keyword-table'], undefined);   // the grammar keeps the index's keys; the table is notes-task-keyword-table
-  assert.equal(globalThis.L.arr(ev('notes-task-keyword-table')).length, 10);
+  assert.equal((globalThis as Globals).L.arr(ev('notes-task-keyword-table')).length, 10);
 });
 
 test('wiki-copy-ref puts ((Name › Heading ¶N "quote")) on the kill ring and the clipboard', async () => {
@@ -377,7 +379,7 @@ test('wiki-capf: candidates from wiki-candidates and the open pages after [[, cl
   await page();
   await ed.type('iSee [[Al');
   assert.ok(ed.E.corfu && ed.E.corfu.wiki, 'the popup opened by itself after [[Al');
-  assert.deepEqual(ed.E.corfu.cands.map(c => c.text), ['Alpha]]', 'Alps]]']);
+  assert.deepEqual(ed.E.corfu.cands.map((c: Edwin) => c.text), ['Alpha]]', 'Alps]]']);
   await ed.keys('RET');
   assert.equal(ed.text(), 'See [[Alpha]]');
   assert.equal(ed.E.corfu, null);
@@ -386,15 +388,15 @@ test('wiki-capf: candidates from wiki-candidates and the open pages after [[, cl
   await ed.type(' and [[');
   assert.equal(ed.text(), 'See [[Alpha]] and [[]]');
   assert.ok(ed.E.corfu && ed.E.corfu.wiki);
-  assert.ok(ed.E.corfu.cands.some(c => c.text === 'Notes' && c.ann === 'page'), 'open pages are offered');
-  await ed.type('be'); assert.deepEqual(ed.E.corfu.cands.map(c => c.text), ['Beta']);
+  assert.ok(ed.E.corfu.cands.some((c: Edwin) => c.text === 'Notes' && c.ann === 'page'), 'open pages are offered');
+  await ed.type('be'); assert.deepEqual(ed.E.corfu.cands.map((c: Edwin) => c.text), ['Beta']);
   await ed.keys('TAB'); assert.equal(ed.text(), 'See [[Alpha]] and [[Beta]]');
   // The command itself, with the automatic popup off.
   ev('(set! corfu-auto #f)');
   await ed.keys('<right>'); await ed.keys('<right>');
   await ed.type(' [[alp'); assert.equal(ed.E.corfu, null);
   ev('(wiki-capf)');
-  assert.deepEqual(ed.E.corfu.cands.map(c => c.text), ['Alpha', 'Alps']);
+  assert.deepEqual(ed.E.corfu.cands.map((c: Edwin) => c.text), ['Alpha', 'Alps']);
   await ed.keys('RET'); assert.equal(ed.text(), 'See [[Alpha]] and [[Beta]] [[Alpha]]');
   await ed.keys('ESC');
   ev('(goto-char 1)');
@@ -425,7 +427,7 @@ test('journal-today opens notes-directory/journal/YYYY-MM-DD.md, or .org when jo
 
 test('imenu lists the headings (not those inside fences); consult-imenu uses them in Markdown buffers', async () => {
   await page('# One\ntext\n## Two\n```\n# not this\n```\n### Three\n');
-  const items = globalThis.L.arr(ev('(markdown-imenu-items)')).map(p => [p.car, p.cdr.car.name, p.cdr.cdr]);
+  const items = (globalThis as Globals).L.arr(ev('(markdown-imenu-items)')).map((p: Edwin) => [p.car, p.cdr.car.name, p.cdr.cdr]);
   assert.deepEqual(items, [['One', 'heading', 1], ['  Two', 'heading', 12], ['    Three', 'heading', 38]]);
   assert.ok(ed.L.isCommand(ed.L.intern('consult-imenu')));
   await ed.keys('M-g i');            // consult-imenu (SPC i in Normal state); the prompt lists the headings
@@ -457,7 +459,7 @@ test('R10.5 font-lock is incremental: a keystroke in a 10,000-line page re-fonti
   await ed.type('A');   // Insert state at the end of the line of point
   // Warm up: the first lex of the segment builds the fence index once.
   ev('(markdown-reset-stats)');
-  globalThis.Ed.hooks.lexSeg(b, from, to, b.rope.slice(from, to));
+  (globalThis as Globals).Ed.hooks.lexSeg(b, from, to, b.rope.slice(from, to));
   let st = stats(); assert.equal(st['fence-scans'], 1); assert.ok(st.lexed <= to - from);
   ev('(markdown-reset-stats)');
   const times = [];
@@ -465,7 +467,7 @@ test('R10.5 font-lock is incremental: a keystroke in a 10,000-line page re-fonti
     const t0 = performance.now();
     await ed.type(i % 10 === 9 ? '`' : 'x');          // backticks too: the fence index must not be rebuilt
     const seg = b.rope.slice(from, to);
-    const lx = globalThis.Ed.hooks.lexSeg(b, from, to, seg);
+    const lx = (globalThis as Globals).Ed.hooks.lexSeg(b, from, to, seg);
     times.push(performance.now() - t0);
     assert.equal(lx.cls.length, seg.length);
   }
@@ -480,7 +482,7 @@ test('R10.5 font-lock is incremental: a keystroke in a 10,000-line page re-fonti
   assert.ok(st.lexed < b.rope.length, 'fifty keystrokes lexed less than one pass over the buffer');
   await ed.keys('ESC');
   // The fence index stays right after incremental updates: a heading after the edited fence lines is still a heading.
-  const full = MK.fenceIndex(b), fresh = []; for (let k = b.rope.indexOf('```'); k >= 0; k = b.rope.indexOf('```', k + 1)) { const ls = Ed_bol(b, k); if (/^\s*$/.test(b.rope.slice(ls, k)) && !fresh.includes(ls)) fresh.push(ls); }
+  const full = MK.fenceIndex(b), fresh: number[] = []; for (let k = b.rope.indexOf('```'); k >= 0; k = b.rope.indexOf('```', k + 1)) { const ls = Ed_bol(b, k); if (/^\s*$/.test(b.rope.slice(ls, k)) && !fresh.includes(ls)) fresh.push(ls); }
   assert.deepEqual(full, fresh.sort((x, y) => x - y));
   // An edit that opens a fence changes the context of the lines after it, from the changed line on.
   ev(`(goto-char ${b.rope.indexOf('# Section 3') + 1})`);
@@ -490,5 +492,5 @@ test('R10.5 font-lock is incremental: a keystroke in a 10,000-line page re-fonti
   await ed.type('dd');
   assert.equal(faceOf('# Section 3', 2), 'markdown-heading-1');   // the # marker itself is markup
 });
-const Ed_bol = (b, p) => globalThis.Ed.bol(b.rope, p), Ed_eol = (b, p) => globalThis.Ed.eol(b.rope, p);
-const stats = () => Object.fromEntries(globalThis.L.arr(ev('(markdown-stats)')).map(p => [p.car.name, p.cdr]));
+const Ed_bol = (b: Edwin, p: number) => (globalThis as Globals).Ed.bol(b.rope, p), Ed_eol = (b: Edwin, p: number) => (globalThis as Globals).Ed.eol(b.rope, p);
+const stats = () => Object.fromEntries((globalThis as Globals).L.arr(ev('(markdown-stats)')).map((p: Edwin) => [p.car.name, p.cdr]));
