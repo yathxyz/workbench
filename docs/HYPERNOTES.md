@@ -11,7 +11,7 @@ The owner accepted every recommendation of the exploration:
 1. **One block engine, two syntaxes.** Babel is built once in edwind. Org's `#+begin_src` and markdown fences
    (```` ```lang {#id k=v} ````) both feed it. This widens the edwind spec's R10.8 (babel for Org) to markdown.
 2. **A small request layer in the bridge.** Cards use htmx's attribute names (`hx-get`, `hx-post`, `hx-target`,
-   `hx-swap`, `hx-trigger`, `hx-vals`) over a layer of about 3 KB in `web/bridge.js`, not a full htmx in every card.
+   `hx-swap`, `hx-trigger`, `hx-vals`) over a layer of about 3 KB in `web/bridge.ts`, not a full htmx in every card.
    `hx-get="chart"` names a Scheme handler in the note's environment, not a URL.
 3. **Text results stay in the file** for `scheme` and `sh` blocks, as a ```` ```result {of=id} ```` fence under the
    block. Cards are never stored, because they are live.
@@ -41,7 +41,7 @@ prose renders through a sanitiser and runs nothing.
 
 | Step | Content | Needs |
 |---|---|---|
-| H0 | Tear-out of `html` fences from page cards into artifact nodes bound to the block (F-A25). | `web/app.js` only |
+| H0 | Tear-out of `html` fences from page cards into artifact nodes bound to the block (F-A25). | `web/app.ts` only |
 | H1 | The babel engine in edwind for Org and markdown: `scheme` and `sh` blocks, results, `in=`, noweb, tangle, note environments, decision 4. | E3 |
 | H2 | Hypermedia: `define-handler` returning SXML, the bridge capability that carries `{note, handler, params}`, the `hx-*` layer, `broadcast!`, a grant per card. | H1 |
 | H3 | Export: a static page with stored results and each card's last HTML. Agent tools for blocks. | H2 |

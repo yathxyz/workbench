@@ -1,4 +1,4 @@
-// The board's key contexts (docs/DESIGN.md §6.4): web/keys.js with no browser. check() walks every context stack
+// The board's key contexts (docs/DESIGN.md §6.4): web/keys.ts with no browser. check() walks every context stack
 // over every key; the rows below are the conflicts measured before K0, each pinned to its fixed outcome.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -8,11 +8,11 @@ import path from 'node:path';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
-const K = require(process.env.WB_KEYS || path.join(here, '../web/keys.js'));
+const K: WBKeysAPI = require(process.env.WB_KEYS || path.join(here, '../web/keys.ts'));
 
-const ctx = (o = {}) => ({ transient: null, interior: null, view: 'canvas', place: 'board', ...o });
-const last = (c, k) => K.resolve(c, k).at(-1) || {};
-const outcome = (c, k) => { const s = last(c, k); return s.cmd || (s.pass ? 'pass' : s.swallow ? 'swallow' : s.fn ? 'fn' : 'none'); };
+const ctx = (o: Partial<WBKeyContext> = {}): WBKeyContext => ({ transient: null, interior: null, view: 'canvas', place: 'board', ...o });
+const last = (c: WBKeyContext, k: string): Partial<WBKeyStep> => K.resolve(c, k).at(-1) || {};
+const outcome = (c: WBKeyContext, k: string) => { const s = last(c, k); return s.cmd || (s.pass ? 'pass' : s.swallow ? 'swallow' : s.fn ? 'fn' : 'none'); };
 
 test('the checker finds no conflict in any context', () => {
   const r = K.check();
@@ -37,7 +37,7 @@ test('a page leaves the palette, the dock, the tree and the views to the board',
 });
 
 test('an Edwin frame or a web frame owns every key', () => {
-  for (const i of ['edwin', 'frame']) for (const k of ['C-k', 'C-`', 'M-1', 'ESC']) assert.equal(outcome(ctx({ interior: i }), k), 'pass', i + ' ' + k);
+  for (const i of ['edwin', 'frame'] as const) for (const k of ['C-k', 'C-`', 'M-1', 'ESC']) assert.equal(outcome(ctx({ interior: i }), k), 'pass', i + ' ' + k);
 });
 
 test('the palette moves its selection with C-j and C-k instead of toggling the dock', () => {
@@ -65,14 +65,14 @@ test('the board keeps its keys; views with key functions are tried first', () =>
 });
 
 test('the leader: Esc leaves any card (K3), ; opens hints, v is a prefix', () => {
-  assert.equal(K.leaderResolve('ESC').cmd, 'leave');
-  assert.equal(K.leaderResolve(';').cmd, 'hints');
-  assert.equal(K.leaderResolve('v').cmd, '>leader-v');
-  assert.equal(K.leaderResolve('m', 'leader-v').cmd, 'persp.manual');
+  assert.equal(K.leaderResolve('ESC')!.cmd, 'leave');
+  assert.equal(K.leaderResolve(';')!.cmd, 'hints');
+  assert.equal(K.leaderResolve('v')!.cmd, '>leader-v');
+  assert.equal(K.leaderResolve('m', 'leader-v')!.cmd, 'persp.manual');
 });
 
 test('key names follow Edwin, with symbols for shifted digits', () => {
-  const e = (key, code, m = {}) => ({ key, code, ctrlKey: false, altKey: false, shiftKey: false, metaKey: false, ...m });
+  const e = (key: string, code: string, m: Partial<WBKeyNameEvent> = {}): WBKeyNameEvent => ({ key, code, ctrlKey: false, altKey: false, shiftKey: false, metaKey: false, ...m });
   assert.equal(K.keyName(e(' ', 'Space', { ctrlKey: true })), 'C-SPC');
   assert.equal(K.keyName(e('K', 'KeyK', { ctrlKey: true, shiftKey: true })), 'C-S-k');
   assert.equal(K.keyName(e('%', 'Digit5', { altKey: true, shiftKey: true })), 'M-%');
@@ -102,24 +102,24 @@ test('desks (§10.8): Alt-Shift digits from the board and from a page, leader di
   assert.equal(outcome(ctx(), 'M-)'), 'desk.0');
   assert.equal(outcome(ctx({ interior: 'page' }), 'M-@'), 'desk.2');
   assert.equal(outcome(ctx({ interior: 'term' }), 'M-@'), 'pass');
-  assert.equal(K.leaderResolve('0').cmd, 'desk.0');
-  assert.equal(K.leaderResolve('`').cmd, 'desk.prev');
-  assert.equal(K.leaderResolve('m').cmd, '>leader-m');
-  assert.equal(K.leaderResolve('3', 'leader-M').cmd, 'desk.follow.3');
-  assert.equal(K.leaderResolve('a', 'leader-d').cmd, '>leader-da');
-  assert.equal(K.leaderResolve('4', 'leader-da').cmd, 'desk.also.4');
+  assert.equal(K.leaderResolve('0')!.cmd, 'desk.0');
+  assert.equal(K.leaderResolve('`')!.cmd, 'desk.prev');
+  assert.equal(K.leaderResolve('m')!.cmd, '>leader-m');
+  assert.equal(K.leaderResolve('3', 'leader-M')!.cmd, 'desk.follow.3');
+  assert.equal(K.leaderResolve('a', 'leader-d')!.cmd, '>leader-da');
+  assert.equal(K.leaderResolve('4', 'leader-da')!.cmd, 'desk.also.4');
   assert.equal(K.whereIs('desk.delete'), 'Ctrl-Space d k');
   assert.ok(![...K.commands()].some(c => c.startsWith('ws.') && c !== 'ws.last'), 'no workspace digit rows remain');
 });
 
 test('desks D2 (§10.8): overview, ring, overlay, attention and the new desk keys; the overview and the ring keep the keyboard', () => {
-  assert.equal(K.leaderResolve('g').cmd, 'overview');
-  assert.equal(K.leaderResolve('w').cmd, 'ring');
-  assert.equal(K.leaderResolve('x').cmd, 'overlay');
-  assert.equal(K.leaderResolve('!').cmd, 'attn.next');
-  assert.equal(K.leaderResolve('9').cmd, 'desk.9');
-  assert.equal(K.leaderResolve('x', 'leader-m').cmd, 'overlay.send');
-  for (const [k, c] of [['b', 'desk.promote'], ['s', 'desk.sticky'], ['t', 'desk.layout'], ['o', 'desk.open']]) assert.equal(K.leaderResolve(k, 'leader-d').cmd, c);
+  assert.equal(K.leaderResolve('g')!.cmd, 'overview');
+  assert.equal(K.leaderResolve('w')!.cmd, 'ring');
+  assert.equal(K.leaderResolve('x')!.cmd, 'overlay');
+  assert.equal(K.leaderResolve('!')!.cmd, 'attn.next');
+  assert.equal(K.leaderResolve('9')!.cmd, 'desk.9');
+  assert.equal(K.leaderResolve('x', 'leader-m')!.cmd, 'overlay.send');
+  for (const [k, c] of [['b', 'desk.promote'], ['s', 'desk.sticky'], ['t', 'desk.layout'], ['o', 'desk.open']]) assert.equal(K.leaderResolve(k, 'leader-d')!.cmd, c);
   assert.equal(outcome(ctx({ transient: 'overview' }), 'a'), 'overview.letter');
   assert.equal(outcome(ctx({ transient: 'overview' }), '3'), 'overview.3');
   assert.equal(outcome(ctx({ transient: 'overview' }), '<right>'), 'overview.right');
@@ -132,8 +132,8 @@ test('desks D2 (§10.8): overview, ring, overlay, attention and the new desk key
 });
 
 test('desks D3 (§10.8): revert and keep on the d map; d t steps the layouts', () => {
-  assert.equal(K.leaderResolve('u', 'leader-d').cmd, 'desk.revert');
-  assert.equal(K.leaderResolve('w', 'leader-d').cmd, 'desk.keep');
-  assert.equal(K.leaderResolve('t', 'leader-d').cmd, 'desk.layout');
+  assert.equal(K.leaderResolve('u', 'leader-d')!.cmd, 'desk.revert');
+  assert.equal(K.leaderResolve('w', 'leader-d')!.cmd, 'desk.keep');
+  assert.equal(K.leaderResolve('t', 'leader-d')!.cmd, 'desk.layout');
   assert.equal(K.whereIs('desk.revert'), 'Ctrl-Space d u');
 });

@@ -6,14 +6,14 @@
 // rule is the `after` marker of R6.11/R6.12 (OT.shiftMarker 'after'): an insert exactly at an anchor
 // advances it past the inserted text, a deleted range that covers it moves it to the range's start, a
 // replacement that covers it puts it at the end of the insertion. This is what today's board does
-// (web/app.js anchorField maps through changes with mapPos(pos, 1), which associates the position with the
+// (web/app.ts anchorField maps through changes with mapPos(pos, 1), which associates the position with the
 // character after it), so ink stays with the text it was drawn next to when someone types at the line start.
 //
 // Relocation after a disk revert (R8.12–R8.15): every anchor keeps the 24 characters after it (`quote`) and
 // the 16 before it (`prefix`), refreshed cheaply after every batch whose ops touch that window. A batch by
 // disk (a revert, a three-way merge, an explicit revert) is a diff that may put an anchor on the wrong line,
 // so after shifting it the anchor is moved to the nearest occurrence of prefix+quote, else of quote, as
-// web/app.js relocate() does; when neither is found the shifted position stands.
+// web/app.ts relocate() does; when neither is found the shifted position stands.
 //
 // Journal: an anchor add, an anchor remove and a relocation append one line `{t: "a", ver, anchors}` holding
 // the whole list as of version `ver` (the journal format stays 1: older edwinds skip unknown line kinds, and
@@ -76,7 +76,7 @@ export function capture(text: TextLike, a: Anchor): void {
   delete a.stale;
 }
 /* Where A belongs in TEXT (a string) after a wholesale change: the occurrence of prefix+quote, else of quote,
-   nearest to its shifted position; without a quote or a match, the shifted position clamped (web/app.js). */
+   nearest to its shifted position; without a quote or a match, the shifted position clamped (web/app.ts). */
 export function relocate(text: string, a: Anchor): number {
   if (a.quote) {
     for (const [needle, off] of [[(a.prefix || '') + a.quote, (a.prefix || '').length], [a.quote, 0]] as [string, number][]) {
