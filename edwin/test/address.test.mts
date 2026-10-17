@@ -1,15 +1,15 @@
 // Golden test for edwin/scm/address.scm (spec §16.1 row `edit-address`, §10.1 "Addresses"):
 // block-address, format-address and resolve-address in Scheme give the same results as
-// bufferAddress, fmtAddr and resolveBufferAddress in web/app.js over generated cases.
+// bufferAddress, fmtAddr and resolveBufferAddress in web/app.ts over generated cases.
 //
-// The three JavaScript functions are cut out of app.js by their source text and run in a vm
+// The three JavaScript functions are cut out of app.ts (types stripped) by their source text and run in a vm
 // context with small stand-ins for the page: nodeList() over generated buffers, live[id].view
 // .state.doc as a real CodeMirror Text, and clamp. Cases come from a seeded generator, so a
 // failing case is one integer; those go to address-seeds.json and are replayed first (R16.1).
 // Run: node --test edwin/test/address.test.mts (ADDRESS_RUNS, ADDRESS_SEED tune fast-check).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
+import { createRequire, stripTypeScriptTypes } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import vm from 'node:vm';
@@ -24,7 +24,7 @@ interface PageNode { id: string; kind: string; name: string }
 type Doc = unknown;
 /* An address as bufferAddress gives it. */
 interface JsAddress { name: string; path: string[]; para: number; quote: string }
-/* The three functions cut out of web/app.js, run in the vm context. */
+/* The three functions cut out of web/app.ts, run in the vm context. */
 interface AppAddresses {
   bufferAddress(n: { name: string }, state: { doc: Doc }, pos: number): JsAddress;
   fmtAddr(a: JsAddress): string;
@@ -52,9 +52,10 @@ const schemeResolve = (q: string, pages: Page[]) => {
 };
 
 // ---------------------------------------------------------------- the JavaScript side
-const appSource = readFileSync(join(ROOT, '..', 'web', 'app.js'), 'utf8');
-const cut = appSource.match(/function bufferAddress\(n, state, pos\) \{[\s\S]*?\n(?=\/\/ -{10,} )/);
-assert.ok(cut, 'bufferAddress is in web/app.js');
+// The page's source with its types stripped, as the browser gets it (tools/strip.mts).
+const appSource = stripTypeScriptTypes(readFileSync(join(ROOT, '..', 'web', 'app.ts'), 'utf8'), { mode: 'strip' });
+const cut = appSource.match(/function bufferAddress\([^)]*\)[^{]*\{[\s\S]*?\n(?=\/\/ -{10,} )/);
+assert.ok(cut, 'bufferAddress is in web/app.ts');
 const jsSource = cut[0];
 for (const fn of ['function fmtAddr(', 'function resolveBufferAddress(']) assert.ok(jsSource.includes(fn), `${fn} follows bufferAddress`);
 

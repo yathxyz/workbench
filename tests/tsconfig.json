@@ -1,0 +1,22 @@
+{
+  // The browser suites (ui.mts, perf.mts) and keys.test.mts: Node runs them as they are (type stripping).
+  // page.evaluate callbacks run in the page, so the DOM's types and the page's globals (web/*.d.ts) are in scope.
+  "compilerOptions": {
+    "target": "esnext",
+    "lib": ["esnext", "dom", "dom.iterable"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+    "typeRoots": ["../tools/node_modules/@types"],
+    "paths": { "playwright-core": ["../tools/node_modules/playwright-core/index.d.ts"] },
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+    "useUnknownInCatchVariables": false
+  },
+  "files": ["../web/globals.d.ts", "../web/board.d.ts", "ui.mts", "perf.mts", "keys.test.mts", "../tools/strip.mts"]
+}

@@ -19,12 +19,12 @@ let
     # An in-tree build of the desktop program (edwin/native) leaves its target/ beside the sources.
     fileset = lib.fileset.difference ../edwin (lib.fileset.maybeMissing ../edwin/native/target);
   };
-  # The address suite cuts bufferAddress and friends out of web/app.js, so it sees that one file too.
+  # The address suite cuts bufferAddress and friends out of web/app.ts, so it sees that one file too.
   edwinApp = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
       ../edwin
-      ../web/app.js
+      ../web/app.ts
     ];
   };
   # The edwind suites check MAX_LINE against wb-proto's (R7.2), so they see that one file of the crates.
@@ -33,6 +33,18 @@ let
     fileset = lib.fileset.unions [
       ../edwin
       ../crates/wb-proto/src/limits.rs
+    ];
+  };
+  # Everything tsc reads (the typecheck check).
+  typed = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      (lib.fileset.difference ../edwin (lib.fileset.maybeMissing ../edwin/native/target))
+      ../crates/wb-proto/src/limits.rs
+      (lib.fileset.difference ../web (lib.fileset.maybeMissing ../web/vendor))
+      ../tests
+      ../tools/vendor-entry.js
+      ../tools/strip.mts
     ];
   };
   # fast-check for the OT properties: a dev dependency pinned in tools/package-lock.json (R15.1), installed
@@ -90,7 +102,7 @@ let
       ''
         export HOME=$TMPDIR BASH=${pkgs.bashInteractive}/bin/bash
         ${lib.optionalString frames "export WB_FRAMES=1"}
-        node ${tests}/ui.mjs
+        node ${tests}/ui.mts
         touch $out
       '';
 in
@@ -161,18 +173,20 @@ in
     touch $out
   '';
 
-  # The board's key contexts (DESIGN §6.4) over the shipped web/keys.js: one command per key in every context
+  # The board's key contexts (DESIGN §6.4) over the shipped keys.js (stripped from web/keys.ts): one command per key in every context
   # stack, every card keeps the keys it needs, the leader's Esc leaves any card.
   web-keys = pkgs.runCommand "workbench-web-keys" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    WB_KEYS=${workbench-web}/keys.js node --test ${tests}/keys.test.mjs
+    WB_KEYS=${workbench-web}/keys.js node --test ${tests}/keys.test.mts
     touch $out
   '';
 
-  # tsc --strict over the TypeScript (edwin/tsconfig.json): Node only strips the types, this checks them.
+  # tsc --strict over the TypeScript: edwind and its suites (edwin/tsconfig.json), the page (web/tsconfig.json and
+  # tsconfig.sw.json) and the browser suites (tests/tsconfig.json). Node and tools/strip.mts only strip the
+  # types; this checks them. The page's library types come from the vendored packages (tools/vendor-entry.js).
   typecheck = pkgs.runCommand "workbench-typecheck" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    cp -r ${edwind} src && chmod -R u+w src && cd src
-    mkdir -p tools && ln -s ${edwinDevDeps}/node_modules tools/node_modules
-    node tools/node_modules/typescript/bin/tsc -p edwin
+    cp -r ${typed} src && chmod -R u+w src && cd src
+    ln -s ${edwinDevDeps}/node_modules tools/node_modules
+    for p in edwin web web/tsconfig.sw.json tests; do node tools/node_modules/typescript/bin/tsc -p $p; done
     touch $out
   '';
 
@@ -323,9 +337,9 @@ in
         touch $out
       '';
 
-  # tests/ui.mjs (the frontend's) in headless Chromium from nixpkgs. It starts the harness from
+  # tests/ui.mts (the frontend's) in headless Chromium from nixpkgs. It starts the harness from
   # WB_HARNESS and imports Playwright from WB_PLAYWRIGHT. The browser reaches the harness's Caddy
-  # through ui.mjs's own 127.0.0.1:18443 forwarder, which accepts only this build's uid. The suite
+  # through ui.mts's own 127.0.0.1:18443 forwarder, which accepts only this build's uid. The suite
   # runs once per page editor: `ui` with CodeMirror pages, `ui-frames` with pages as Edwin frames
   # (WB_FRAMES=1: the harness writes web.json frames: true and the frames section runs; edwind comes
   # from the workbench package on PATH). Two checks rather than one run after the other: each run

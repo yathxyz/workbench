@@ -90,7 +90,7 @@
 (define notes-front-matter-keys '("title" "tags" "aliases" "alias" "id"))
 ;; Fenced code: nothing inside is a heading, a task or a link.
 (define notes-fence-regexp "^\\s*(```|~~~)")
-;; Flashcards (the deck syntax of web/app.js): a block whose fields hold `card:: kind`, with deck::, back::
+;; Flashcards (the deck syntax of web/app.ts): a block whose fields hold `card:: kind`, with deck::, back::
 ;; and status::, and `{{c1::text}}` clozes in the body. Kinds: basic, reverse, cloze, type, pen, voice.
 (define notes-card-field "card")
 (define notes-card-kinds '("basic" "reverse" "cloze" "type" "pen" "voice"))
