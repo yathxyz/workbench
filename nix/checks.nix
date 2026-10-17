@@ -129,27 +129,27 @@ in
 
   # Edwin's editing core in Node with no browser and no page stand-ins (step E0 of the edwind plan).
   edwin-headless = pkgs.runCommand "workbench-edwin-headless" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --test ${edwin}/test/headless.test.mjs
+    node --test ${edwin}/test/headless.test.mts
     touch $out
   '';
 
   # Edwin's Scheme: the language (R4.3-R4.10, R4.31-R4.34), the editor-level forms (hooks, advice,
   # minor modes, buffer-locals, markers) and the shadow-stack cost bound (R4.34, at most 10%).
   edwin-scheme = pkgs.runCommand "workbench-edwin-scheme" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --test ${edwin}/test/scheme*.test.mjs
+    node --test ${edwin}/test/scheme*.test.mts
     touch $out
   '';
 
   # The evaluator budgets (E2 gate): the shadow stack at most 10% (R4.34) and generator mode at most 3x direct
   # (R4.38, measured 1.2x). The bench recurses 1,000 deep in both modes, so it needs more stack than Node's default.
   edwin-bench = pkgs.runCommand "workbench-edwin-bench" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --stack-size=6900 ${edwin}/test/scheme-bench.mjs
+    node --stack-size=6900 ${edwin}/test/scheme-bench.mts
     touch $out
   '';
 
   # The worker pool's Node host (E2): jobs on worker_threads, the main-thread fallback, cancellation.
   edwin-pool = pkgs.runCommand "workbench-edwin-pool" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --test ${edwin}/test/pool.test.mjs
+    node --test ${edwin}/test/pool.test.mts
     touch $out
   '';
 
@@ -157,7 +157,7 @@ in
   # wire checks (R7.7, R7.8, R7.14, R6.16, R6.17). OT_RUNS raises the run count; the check uses the default.
   edwin-ot = pkgs.runCommand "workbench-edwin-ot" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export NODE_PATH=${edwinDevDeps}/node_modules
-    node --test ${edwin}/test/ot.test.mjs
+    node --test ${edwin}/test/ot.test.mts
     touch $out
   '';
 
@@ -168,9 +168,17 @@ in
     touch $out
   '';
 
+  # tsc --strict over the TypeScript (edwin/tsconfig.json): Node only strips the types, this checks them.
+  typecheck = pkgs.runCommand "workbench-typecheck" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    cp -r ${edwind} src && chmod -R u+w src && cd src
+    mkdir -p tools && ln -s ${edwinDevDeps}/node_modules tools/node_modules
+    node tools/node_modules/typescript/bin/tsc -p edwin
+    touch $out
+  '';
+
   # The intrinsics lockdown every thread of edwind runs in place of --frozen-intrinsics (R14.11, R16.16).
   edit-lockdown = pkgs.runCommand "workbench-edit-lockdown" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --test ${edwind}/edwin/test/lockdown.test.mjs
+    node --test ${edwind}/edwin/test/lockdown.test.mts
     touch $out
   '';
 
@@ -178,7 +186,7 @@ in
   # the limits, chunking, resend, replay, the E1 server commands and the socket checks (R14.3, R16.12, R16.16, R16.17).
   edit-conformance = pkgs.runCommand "workbench-edit-conformance" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/conformance.test.mjs
+    node --test ${edwind}/edwin/test/conformance.test.mts
     touch $out
   '';
 
@@ -186,14 +194,14 @@ in
   # full disk during save and journal append (R16.5–R16.7). About thirteen minutes.
   edit-crash = pkgs.runCommand "workbench-edit-crash" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/crash.test.mjs
+    node --test ${edwind}/edwin/test/crash.test.mts
     touch $out
   '';
 
   # External writes, the three-way merge, the conflict and deleted marks, CRLF, atomic save (R8.12–R8.15).
   edit-disk = pkgs.runCommand "workbench-edit-disk" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/disk.test.mjs
+    node --test ${edwind}/edwin/test/disk.test.mts
     touch $out
   '';
 
@@ -201,7 +209,7 @@ in
   # relocation after a disk revert, survival across restart and compaction, user-init, capf-candidates, sel.
   edit-anchors = pkgs.runCommand "workbench-edit-anchors" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/anchors.test.mjs
+    node --test ${edwind}/edwin/test/anchors.test.mts
     touch $out
   '';
 
@@ -209,17 +217,17 @@ in
   # its grammar and the /api shapes (edit-notes), the block addresses against the golden file (edit-address).
   edit-image = pkgs.runCommand "workbench-edit-image" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/image.test.mjs
+    node --test ${edwind}/edwin/test/image.test.mts
     touch $out
   '';
   edit-notes = pkgs.runCommand "workbench-edit-notes" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/notes.test.mjs
+    node --test ${edwind}/edwin/test/notes.test.mts
     touch $out
   '';
   edit-address = pkgs.runCommand "workbench-edit-address" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export NODE_PATH=${edwinDevDeps}/node_modules
-    node --test ${edwinApp}/edwin/test/address.test.mjs
+    node --test ${edwinApp}/edwin/test/address.test.mts
     touch $out
   '';
 
@@ -227,14 +235,14 @@ in
   # table shared with Org, journal-today, and the incremental font-lock budget (a keystroke in 10,000 lines
   # re-fontifies in 2 ms), in the headless runtime.
   edwin-markdown = pkgs.runCommand "workbench-edwin-markdown" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --test ${edwin}/test/markdown.test.mjs
+    node --test ${edwin}/test/markdown.test.mts
     touch $out
   '';
 
   # The display seam (DT0 of desktop Edwin): model frames laid out on a cell grid for a backend that is not a page,
   # and the face and palette tables checked against index.html's, markdown-mode's and Org's stylesheets.
   edwin-display = pkgs.runCommand "workbench-edwin-display" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --test ${edwin}/test/display.test.mjs
+    node --test ${edwin}/test/display.test.mts
     touch $out
   '';
 
@@ -251,7 +259,7 @@ in
   # image replication, server commands and ask, anchors, server-only stubs.
   edit-frame = pkgs.runCommand "workbench-edit-frame" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/frame.test.mjs
+    node --test ${edwind}/edwin/test/frame.test.mts
     touch $out
   '';
 
@@ -259,21 +267,21 @@ in
   # commands; the debugger, the inspector, introspection and the primitive registry.
   edit-lisp = pkgs.runCommand "workbench-edit-lisp" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/threads.test.mjs ${edwind}/edwin/test/debug.test.mjs
+    node --test ${edwind}/edwin/test/threads.test.mts ${edwind}/edwin/test/debug.test.mts
     touch $out
   '';
 
   # Processes through the hub (R4.43-R4.45) and the section 5 session API, against the fake hub.
   edit-process = pkgs.runCommand "workbench-edit-process" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/process.test.mjs ${edwind}/edwin/test/wb.test.mjs
+    node --test ${edwind}/edwin/test/process.test.mts ${edwind}/edwin/test/wb.test.mts
     touch $out
   '';
 
-  # The Scheme boundary (R16.15, R4.52) and the credential rules (R16.19, in models.test.mjs).
+  # The Scheme boundary (R16.15, R4.52) and the credential rules (R16.19, in models.test.mts).
   edit-security = pkgs.runCommand "workbench-edit-security" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/security.test.mjs ${edwind}/edwin/test/models.test.mjs
+    node --test ${edwind}/edwin/test/security.test.mts ${edwind}/edwin/test/models.test.mts
     touch $out
   '';
 

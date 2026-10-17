@@ -16,8 +16,8 @@ const { Worker } = require('node:worker_threads');
 
 const SRC = __dirname;
 const ROOT = path.join(SRC, '..');
-const WORKER_FILE = path.join(ROOT, 'server', 'worker.mjs');
-const JOBS_FILE = path.join(ROOT, 'server', 'jobs.mjs');
+const WORKER_FILE = path.join(ROOT, 'server', 'worker.mts');
+const JOBS_FILE = path.join(ROOT, 'server', 'jobs.mts');
 /* The core, in load order: the order of the script tags in index.html. */
 const FILES = ['scheme', 'runtime', 'text', 'editor-core', 'editor-prims', 'evil-core', 'pool', 'complete', 'extras', 'stack', 'ai', 'evil-ex', 'org', 'markdown', 'ot', 'sync', 'display'];
 

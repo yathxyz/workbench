@@ -16,17 +16,17 @@ first, undo undoes your own edits, and the runtime is Node.
 | `scm/*.scm` | the shipped Scheme configuration (`emacs`, `evil`, `org`, `ai`, `init`), also inlined in `index.html` |
 | `index.html` | the page: styles, the Scheme blocks and the script tags. It loads `src/*.js` relative to itself, so serving this directory runs it, and a published copy keeps the `src/` paths |
 | `src/host-browser.js`, `src/host-node.js` | the host layer (R4.1): storage, the shipped Scheme, page attributes, suspend, clipboard, scheduling. The core reaches the page only through it and through frame objects |
-| `test/headless.mjs` | loads and boots the editor in Node on `host-node.js` (no page objects exist in the process) and drives it with keys |
-| `test/headless.test.mjs` | the headless suite: `node --test edwin/test/headless.test.mjs`, or `nix build .#checks.x86_64-linux.edwin-headless` |
-| `test/scheme.test.mjs`, `test/scheme-editor.test.mjs` | the Scheme suite: the language, and the editor-level forms. `nix build .#checks.x86_64-linux.edwin-scheme` runs both and the benchmark |
-| `test/scheme-bench.mjs` | evaluator benchmarks; fails when the shadow stack costs more than 10% (R4.34) |
+| `test/headless.mts` | loads and boots the editor in Node on `host-node.js` (no page objects exist in the process) and drives it with keys |
+| `test/headless.test.mts` | the headless suite: `node --test edwin/test/headless.test.mts`, or `nix build .#checks.x86_64-linux.edwin-headless` |
+| `test/scheme.test.mts`, `test/scheme-editor.test.mts` | the Scheme suite: the language, and the editor-level forms. `nix build .#checks.x86_64-linux.edwin-scheme` runs both and the benchmark |
+| `test/scheme-bench.mts` | evaluator benchmarks; fails when the shadow stack costs more than 10% (R4.34) |
 | `src/ot.js` | the OT library (ops, transform, rebase, undo, markers, hash) shared by edwind and its clients (E1) |
-| `server/*.mjs` | edwind, the text daemon (E1; see "Step E1" below) |
-| `test/ot.test.mjs`, `test/ot-sim.mjs` | the OT properties with fast-check (`edwin-ot`; needs `NODE_PATH` at `tools/node_modules`) |
-| `test/conformance.test.mjs`, `test/crash.test.mjs`, `test/disk.test.mjs`, `test/edit-client.mjs` | the edwind gate suites (`edit-conformance`, `edit-crash`, `edit-disk`) and their client |
-| `src/display.js`, `test/display.test.mjs` | the display seam (DT0, see below): frames with no page, drawn on a cell grid for a terminal or native backend (`edwin-display`) |
+| `server/*.mts` | edwind, the text daemon (E1; see "Step E1" below) |
+| `test/ot.test.mts`, `test/ot-sim.mts` | the OT properties with fast-check (`edwin-ot`; needs `NODE_PATH` at `tools/node_modules`) |
+| `test/conformance.test.mts`, `test/crash.test.mts`, `test/disk.test.mts`, `test/edit-client.mts` | the edwind gate suites (`edit-conformance`, `edit-crash`, `edit-disk`) and their client |
+| `src/display.js`, `test/display.test.mts` | the display seam (DT0, see below): frames with no page, drawn on a cell grid for a terminal or native backend (`edwin-display`) |
 | `native/` | `edwin`, the desktop program (DT1, see below): a Rust crate with its own Cargo workspace that embeds V8 and these files; `native/js/` is its JavaScript (prelude, host, terminal, startup), `native/tests/` its pseudo-terminal suite (`cargo test`) |
-| `test/term.test.mjs`, `test/native.test.mjs` | the terminal encoder and decoder, and the core's seams for the program: files on a disk, exit statuses, input events (`edwin-native`) |
+| `test/term.test.mts`, `test/native.test.mts` | the terminal encoder and decoder, and the core's seams for the program: files on a disk, exit statuses, input events (`edwin-native`) |
 
 These files came from the published Edwin artifact (version 1791768765, 2026-10-12). From now on this directory is
 the source.
@@ -76,35 +76,35 @@ the files on disk. `crates/wb-cli` is `wb buf`, `wb eval`, `wb edit` and `wb rep
 `services.workbench.edit.*` and `workbench-edit.service`; `nix/checks.nix` has `edwin-ot`, `edit-conformance`,
 `edit-crash` (about thirteen minutes: 1,000 kills) and `edit-disk`; `nix/vm.nix` step 10 covers R16.18's E1 part.
 
-Layout of `edwin/server/`: `main.mjs` (config, start, listen, `--check`, `--export`, evaluation, the E1 server
-commands), `session.mjs` (one client: §7 messages), `sequencer.mjs` (rebase, apply, journal, ack, replay, undo),
-`buffers.mjs` (open, save, revert, disk changes, compaction, index), `journal.mjs` (group commit, snapshots, the
-image log), `files.mjs` (text files, CRLF, atomic save), `paths.mjs` (ids and the file authority of R14.8),
-`watch.mjs` (inotify, the line-then-character diff, the three-way merge), `proto.mjs` (constants and field
-checks). `edwin/src/ot.js` is the OT library both ends share; `edwin/test/edit-client.mjs` is the test client.
+Layout of `edwin/server/`: `main.mts` (config, start, listen, `--check`, `--export`, evaluation, the E1 server
+commands), `session.mts` (one client: §7 messages), `sequencer.mts` (rebase, apply, journal, ack, replay, undo),
+`buffers.mts` (open, save, revert, disk changes, compaction, index), `journal.mts` (group commit, snapshots, the
+image log), `files.mts` (text files, CRLF, atomic save), `paths.mts` (ids and the file authority of R14.8),
+`watch.mts` (inotify, the line-then-character diff, the three-way merge), `proto.mts` (constants and field
+checks). `edwin/src/ot.js` is the OT library both ends share; `edwin/test/edit-client.mts` is the test client.
 
 Running edwind by hand: `edwind --config edit.json` where `edit.json` has at least `notesDir` (see
-`loadConfig` in `main.mjs` for the fields of R15.4); the socket's directory must be yours and 0700.
+`loadConfig` in `main.mts` for the fields of R15.4); the socket's directory must be yours and 0700.
 
 Choices E1 made where the spec left one open, and where it had to deviate:
 - **No `--permission` (R14.12).** Node 22 and 24 disable `fsync` and `fdatasync` under the permission model, and the
   journal and atomic save need both (R8.3, R8.7). `bin/edwind` runs with `--disallow-code-generation-from-strings`
-  and `--max-old-space-size` (the intrinsics lockdown is in-process, next item); `main.mjs` replaces every function of
-  `child_process` before anything else runs (`guardProcesses`, R4.45), and the Authority in `paths.mjs` is the
+  and `--max-old-space-size` (the intrinsics lockdown is in-process, next item); `main.mts` replaces every function of
+  `child_process` before anything else runs (`guardProcesses`, R4.45), and the Authority in `paths.mts` is the
   one check on file writes, with the unit's `ProtectSystem=strict` and `ReadWritePaths` behind it. The
   conformance suite checks the flags in effect and the guard (R16.16).
 - **No `--frozen-intrinsics` (R14.11), since 2026-10-16.** The flag made the Scheme evaluator 2.3 times slower
   (gen mode, geometric mean of the server bench: 131 ms against 59): V8 leaves its fast paths for every
-  object once any property of `Array.prototype` or `Object.prototype` is read-only. `server/lockdown.mjs`
-  does the flag's work with Node's own lists, in every thread of edwind (`main()`, `worker.mjs`, the notes
+  object once any property of `Array.prototype` or `Object.prototype` is read-only. `server/lockdown.mts`
+  does the flag's work with Node's own lists, in every thread of edwind (`main()`, `worker.mts`, the notes
   thread), except that those two prototypes are sealed, not frozen: they take no new keys and lose none (the
   prototype-pollution case), but an assignment over one of their existing methods is no longer refused. The
   functions they hold are frozen. Iterator and generator prototypes keep read-only data properties instead
   of the flag's override accessors, which cost every for-of loop and generator step. The server thread logs
-  `"lockdown":"locked"` on its `listen` line; `test/lockdown.test.mjs` is the suite.
+  `"lockdown":"locked"` on its `listen` line; `test/lockdown.test.mts` is the suite.
 - **Stack size.** The Scheme cap of 10,000 frames (R4.34) needs about 7 MiB of JS stack in direct mode (about
   8.4 MiB in E2's generator mode); Node's default reaches about 1,500. E1 sized `--stack-size` from `ulimit -s`;
-  since E2 `main.mjs` runs the server on a worker thread whose stack it sizes itself (`runInThread`, 32 MiB,
+  since E2 `main.mts` runs the server on a worker thread whose stack it sizes itself (`runInThread`, 32 MiB,
   `EDWIND_STACK_MIB`), so neither `bin/edwind` nor the unit depends on the soft limit. `guard` catches the JS
   stack running out as the `recursion-depth` condition when the stack is smaller than the cap. Browser frames
   keep the browser's depth.
@@ -131,7 +131,7 @@ Choices E1 made where the spec left one open, and where it had to deviate:
 - **Markers under concurrency (R16.3).** Markers that no deletion reached agree between every replica and the
   server. A marker at the boundary of a deleted range can legitimately differ by the length of a concurrent
   insert landing at that point: both sides apply Edwin's `shiftMarkers` rule, but see the operations in a
-  different order. `ot.test.mjs` states the property that holds; the frames' point stays where the user expects.
+  different order. `ot.test.mts` states the property that holds; the frames' point stays where the user expects.
 - **Edwin's key-value store** (`storage`) lives in `stateDir/storage.json`; compaction snapshots the text at the
   start of the retained history; journals compact at 4 MiB or 20,000 lines and after a save.
 - **`web.json`** is untouched in E1 (`editSocket`, `refusePaths` and the notes forwarding came with E2, R15.5; the
@@ -152,15 +152,15 @@ the model layer and processes through the hub are server modules with Scheme pri
 the gates `edit-image`, `edit-notes`, `edit-address`, `edwin-bench` (the evaluator budgets), `edit-lisp`,
 `edit-process`, `edwin-pool` and `edit-security`; wb-web forwards the notes endpoints and `sample` over `edit.sock`.
 
-Layout added in E2 (`edwin/server/` unless said): `threads.mjs` (the scheduler, held buffers, ask, timers,
-blocking primitives; `scm/threads.scm`), `debug.mjs` (the debugger, the inspector, apropos, find-definition,
-room, list-threads, list-clients, the primitive registry; `scm/debug.scm`), `image.mjs` (the image log and its
-replication, `*image-log*`), `notes.mjs` and `notes-parse.mjs` (the notes index on a worker thread;
-`scm/notes-syntax.scm` is the grammar), `worker.mjs` and `jobs.mjs` (the worker pool's Node host, with
-`src/pool.js`), `scm/address.scm` (block addresses, R6.14), `process.mjs` and `hub.mjs` (processes through the
-hub; `scm/process.scm`), `wb.mjs` (§5 sessions and events; `scm/wb.scm`), `models.mjs` (backends,
+Layout added in E2 (`edwin/server/` unless said): `threads.mts` (the scheduler, held buffers, ask, timers,
+blocking primitives; `scm/threads.scm`), `debug.mts` (the debugger, the inspector, apropos, find-definition,
+room, list-threads, list-clients, the primitive registry; `scm/debug.scm`), `image.mts` (the image log and its
+replication, `*image-log*`), `notes.mts` and `notes-parse.mts` (the notes index on a worker thread;
+`scm/notes-syntax.scm` is the grammar), `worker.mts` and `jobs.mts` (the worker pool's Node host, with
+`src/pool.js`), `scm/address.scm` (block addresses, R6.14), `process.mts` and `hub.mts` (processes through the
+hub; `scm/process.scm`), `wb.mts` (§5 sessions and events; `scm/wb.scm`), `models.mts` (backends,
 `http-request`, credentials, `sample`, usage; `scm/models.scm`). Modules install through the extension points
-of `main.mjs` (`MODULES`, `defineCommand`, `onMessage`, `statusProviders`, `buffers.on`).
+of `main.mts` (`MODULES`, `defineCommand`, `onMessage`, `statusProviders`, `buffers.on`).
 
 The evaluator in generator mode (R4.38, `src/scheme.js`): the same compiler produces generator closures, run
 with `yield*`, except for nodes that can call no compound procedure (constants, variable references, lambda,
@@ -169,8 +169,8 @@ calls to primitives with such arguments), which stay plain closures marked `.d`;
 predicates) still call procedures as functions. A thread yields `Block(promise)` (sleep, ask, join, I/O),
 `PREEMPT` (its slice is over) or `Suspend(condition)` (the debugger); `ThreadState` and `switchTo` swap the
 shadow stack, the handlers, the restarts and the parameter bindings. `loadEdwin(host, {mode: 'gen'})` selects
-it; frames and workers stay in direct mode. Budget: the gen/direct geomean of `scheme-bench.mjs` is 1.2x
-(limit 3x); the shadow stack costs 8.4% (limit 10%). Both suites of `scheme.test.mjs` run in both modes.
+it; frames and workers stay in direct mode. Budget: the gen/direct geomean of `scheme-bench.mts` is 1.2x
+(limit 3x); the shadow stack costs 8.4% (limit 10%). Both suites of `scheme.test.mts` run in both modes.
 
 Choices E2 made where the spec left one open, and where it had to deviate:
 - **Command threads are not preempted but do break.** A command thread (one `call{form}`, one server command)
@@ -189,7 +189,7 @@ Choices E2 made where the spec left one open, and where it had to deviate:
 - **Handlers in direct nodes run in place and cannot block.** A primitive error raised from a `.d` node with
   handlers installed runs the handlers synchronously (R4.31 holds), but a handler that blocks there gets
   `cannot-block`; the generator path has no such limit.
-- **The server runs on a worker thread** (`runInThread` in `main.mjs`) with `resourceLimits.stackSizeMb` 32, so
+- **The server runs on a worker thread** (`runInThread` in `main.mts`) with `resourceLimits.stackSizeMb` 32, so
   the 10,000-frame cap holds whatever `ulimit -s` is; the main thread relays SIGTERM and SIGINT. Logs are
   written synchronously (`fs.writeSync(2, …)`) because a worker's `process.stderr` is an asynchronous relay.
   `--stack-size` left `bin/edwind` and the test flags; `EDWIND_NO_THREAD=1` runs on the main thread.
@@ -228,14 +228,14 @@ Choices E2 made where the spec left one open, and where it had to deviate:
 - **The notes index parser runs on a dedicated `worker_threads` worker** (not the pool): `notes-grep` and
   `unlinked-mentions` block the calling thread while it searches (the sync channel remains for callers outside
   a thread). The pool's Node host compiles the lexer from a source string inside the worker and duplicates the
-  built-in jobs (deviations recorded in `jobs.mjs`).
-- **The hub client (`hub.mjs`, `server.hub`)** connects to `hubSocket` (default `/run/workbench-hub/hub.sock`,
+  built-in jobs (deviations recorded in `jobs.mts`).
+- **The hub client (`hub.mts`, `server.hub`)** connects to `hubSocket` (default `/run/workbench-hub/hub.sock`,
   DESIGN §3.2.1), answers the hello as `edwind/<build>`, sends one `watch` (R5.7) and keeps the session
   summaries current; it reconnects with the backoff of wb-web (250 ms to 5 s, jitter) and re-attaches live
   processes with `pty.open {resume}` (no spawn). An unreachable hub is logged at debug level only. Conditions
   `hub-error`, `process-error`, `stale-object`, `no-leader` sit under `error`; status gains `hub`, `hubVersion`,
   `hubSessions`.
-- **Processes (R4.43–R4.45, `process.mjs`, `scm/process.scm`)** are hub PTY sessions with ids `ed-` + 16 base32
+- **Processes (R4.43–R4.45, `process.mts`, `scm/process.scm`)** are hub PTY sessions with ids `ed-` + 16 base32
   chars; `make-process` takes `:name :command :shell :cwd :env :size :buffer :filter :sentinel :card :noquery`
   (default shell bash if the hub offers it, size 120x40). Output and exit run filters and sentinels on background
   threads, queued per process so chunks stay ordered; insertion at the process mark ignores read-only (as Emacs
@@ -245,7 +245,7 @@ Choices E2 made where the spec left one open, and where it had to deviate:
   returns at once when output arrived since the last call (Emacs). `M-x list-processes` is a server command
   rendering `name:*Process List*`. `:card t` is only recorded until EW-M4 (such sessions stay hidden `ed-`
   sessions, R9.22; `server.processes.onCard` is the hook for the board module). `pty.resize` is not sent.
-- **The §5 session API (`wb.mjs`, `scm/wb.scm`, feature `wb-hub`)**: interned session handles (`eq?`),
+- **The §5 session API (`wb.mts`, `scm/wb.scm`, feature `wb-hub`)**: interned session handles (`eq?`),
   `session-list`, `session-get` (one argument gives the handle, two a field), `card-session` (session or
   process), `card-send`, `card-read` (`pty.capture`, or the Org transcript of an `acp.open` replay),
   `card-interrupt`, `card-kill` (`:force` or `y-or-n-p`), `acp-prompt` and `acp-prompt-async` (mailbox),
@@ -256,8 +256,8 @@ Choices E2 made where the spec left one open, and where it had to deviate:
   `(id node-alist)` since card handles need the board family (EW-M4). The primitives live in `edwin/server`,
   not `edwin/src/wb.js` as the spec names, because server-only code lives there. R13.2 (classifying `wb`'s
   session from the hub summary) is not done; `server.hub.sessions` is ready for it. Both suites run against the
-  fake hub `test/fake-hub.mjs`.
-- **The model layer (§12, R14.4–R14.7)** is `models.mjs` with `scm/models.scm`. Backends are objects of two
+  fake hub `test/fake-hub.mts`.
+- **The model layer (§12, R14.4–R14.7)** is `models.mts` with `scm/models.scm`. Backends are objects of two
   kinds, the ones the spec names (`anthropic`: Messages API, `x-api-key`; `openai`: chat completions, bearer);
   the default backend `workbench` is `models.anthropic` of `edit.json`, its models the tier values; a backend
   without a credential is usable only on a loopback origin (a local model server). The key is read from
@@ -285,7 +285,7 @@ browser suite in each mode, and the VM test turns `edit.frames` on.
 Layout added in E3: `src/sync.js` (the replica client: `Ed.sync`, `Ed.bootServed`), frames in
 `src/editor-core.js` (`Frame`, `Ed.makeFrame`, one text-change path `applyOps`) and `src/editor-prims.js`
 (frame commands, `Ed.setLeaderKey`, served boot), `src/markdown.js` and `scm/markdown.scm` (markdown-mode),
-`server/anchors.mjs` (shared anchors and the frame commands), `console/index.html` (the `/edwin/` console),
+`server/anchors.mts` (shared anchors and the frame commands), `console/index.html` (the `/edwin/` console),
 `web/app.js`'s frames block (lazy frames, keys, migration, R13.7 tools), and in wb-web `relay_edit.rs` (the
 `/edit` relay), the `frames` key, `/api/info` `edit`/`editUp`, `/edwin/` static files and the board guard.
 
@@ -480,7 +480,7 @@ on the page.
   when they wait (`prefixWait`).
 - **Faces as data.** `FACES` maps every class the renderer, Org and markdown-mode emit, and the modeline and echo
   parts, to a spec in palette tokens with the page's fallback chains. `PALETTE` holds `index.html`'s light and dark
-  values. A token set with `set-face-color!` wins, as on the page. `display.test.mjs` parses `index.html`, the
+  values. A token set with `set-face-color!` wins, as on the page. `display.test.mts` parses `index.html`, the
   markdown-mode and the Org stylesheets and fails when a face and its rule disagree, or when a class has no face.
 
 Choices made in DT0:
