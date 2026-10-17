@@ -5,6 +5,9 @@
 //! ICU's data comes from EDWIN_ICU_DATA, else from the copy inside the v8 crate's sources.
 
 #[allow(dead_code)]
+#[path = "src/bridge.rs"]
+mod bridge;
+#[allow(dead_code)]
 #[path = "src/natives.rs"]
 mod natives;
 #[allow(dead_code)]

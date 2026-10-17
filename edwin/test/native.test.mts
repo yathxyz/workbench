@@ -267,3 +267,45 @@ test('save-place leaves commit messages at the top, as Vim and Emacs do', async 
     assert.equal(E.current.pt, kept ? 4 : 0, name);
   }
 });
+
+test('gui.js: window events reach display.input as the page names them; the backend draws through __n', async () => {
+  /* The natives gui.js uses (natives.rs), and what it defines. */
+  interface GuiNatives {
+    guiSize(): { cols: number; rows: number; theme?: string } | null;
+    guiDraw(json: string): void;
+    guiAction(name: string, arg?: string): void;
+  }
+  const G0 = globalThis as typeof globalThis & { __n?: GuiNatives; EdGui?: Edwin };
+  const calls: [string, unknown][] = [];
+  G0.__n = {
+    guiSize: () => ({ cols: 5, rows: 1, theme: 'light' }),
+    guiDraw: json => { calls.push(['draw', JSON.parse(json).cols]); },
+    guiAction: (name, arg) => { calls.push([name, arg]); },
+  };
+  vm.runInThisContext(readFileSync(new URL('../native/js/gui.js', import.meta.url), 'utf8'));
+  const G = G0.EdGui, s = G.screen();
+  assert.deepEqual(s.backend.size(), { cols: 8, rows: 3 }, 'a window is never smaller than 8x3 cells');
+  assert.equal(s.backend.tty, false);
+  assert.equal(s.theme(), 'light');
+  s.backend.draw({ cols: 8 }); s.backend.bell(); s.clipboard('copied'); s.iconify();
+  assert.deepEqual(calls, [['draw', 8], ['bell', undefined], ['clipboard', 'copied'], ['iconify', undefined]]);
+
+  const seen: string[] = [], on = { close: () => { seen.push('close'); }, drop: (p: string) => { seen.push('drop ' + p); } };
+  const D = Ed.display, input = D.input;
+  D.input = (f: Edwin, e: { type: string; key?: string }) => { assert.equal(f, frame); seen.push(e.type === 'key' ? e.key! : e.type); };
+  try {
+    const key = (k: string, code: string, mods = {}) => G.handle(JSON.stringify({ type: 'key', key: k, code, ...mods }), frame, on);
+    key('x', 'KeyX');
+    key('x', 'KeyX', { ctrlKey: true });
+    key('x', 'KeyX', { altKey: true });
+    key('Shift', 'ShiftLeft', { shiftKey: true });
+    key('Escape', 'Escape');
+    key('Enter', 'Enter');
+    G.handle(JSON.stringify({ type: 'text', text: 'é a\n' }), frame, on);
+    G.handle(JSON.stringify({ type: 'mouse', action: 'down', x: 1, y: 1, button: 0 }), frame, on);
+    G.handle(JSON.stringify({ type: 'close' }), frame, on);
+    G.handle(JSON.stringify({ type: 'drop', path: '/w/d.txt' }), frame, on);
+    G.handle('not json', frame, on);
+  } finally { D.input = input; delete G0.__n; }
+  assert.deepEqual(seen, ['x', 'C-x', 'M-x', 'ESC', 'RET', 'é', 'SPC', 'a', 'RET', 'mouse', 'close', 'drop /w/d.txt']);
+});

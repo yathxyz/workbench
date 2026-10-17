@@ -1,12 +1,16 @@
-//! edwin: Edwin's JavaScript core on embedded V8, in a terminal (DT1).
+//! edwin: Edwin's JavaScript core on embedded V8, in a terminal (DT1) or a window (DT2, `--gui`).
 //!
-//! The Rust side is the host's floor: the files, the terminal, signals, edwind's socket and the event loop.
-//! Everything Edwin is runs as JavaScript: native/js/prelude.js, host-native.js, term.js and main.js, which
-//! loads the unchanged core from edwin/src. All of it is compiled into the binary, with the shipped Scheme.
+//! The Rust side is the host's floor: the files, the terminal or the window, signals, edwind's socket and the
+//! event loop. Everything Edwin is runs as JavaScript: native/js/prelude.js, host-native.js, term.js and
+//! main.js, which loads the unchanged core from edwin/src. All of it is compiled into the binary, with the
+//! shipped Scheme.
 //!
-//! The loop: poll the terminal, the signal pipe and the sockets; hand what arrived to JS; run due timers;
-//! run microtasks; write what JS drew; sleep until the next input or timer.
+//! The loop: poll the terminal (or pump the window's events), the signal pipe and the sockets; hand what arrived
+//! to JS; run due timers; run microtasks; write or draw what JS drew; sleep until the next input or timer.
 
+mod bridge;
+#[cfg(feature = "gui")]
+mod gui;
 mod natives;
 mod snapshot;
 mod sources;
@@ -63,6 +67,76 @@ fn will_attach() -> bool {
         .any(|p| std::os::unix::net::UnixStream::connect(p).is_ok())
 }
 
+/// Whether the program was asked for a window (`-g`, `--gui`; `-nw` after them asks for the terminal again).
+/// Whether a window was asked for (-g, --gui; the last of those and -nw, -t wins) and its size in cells
+/// (--geometry=COLSxROWS).
+fn window_args() -> (bool, (u32, u32)) {
+    let (mut gui, mut size) = (false, (100, 36));
+    for a in std::env::args().skip(1).take_while(|a| a != "--") {
+        match a.as_str() {
+            "-g" | "--gui" => gui = true,
+            "-nw" | "--no-window" | "-t" => gui = false,
+            // These print and leave; no window for them.
+            "-h" | "--help" | "--version" => return (false, size),
+            _ => {
+                if let Some((c, r)) = a
+                    .strip_prefix("--geometry=")
+                    .and_then(|g| g.split_once('x'))
+                {
+                    if let (Ok(c), Ok(r)) = (c.parse(), r.parse()) {
+                        size = (c, r);
+                    }
+                }
+            }
+        }
+    }
+    (gui, size)
+}
+
+#[cfg(feature = "gui")]
+type Window = Option<gui::Gui>;
+#[cfg(not(feature = "gui"))]
+type Window = Option<()>;
+
+/// Opens the window when one was asked for. Without one the program runs in the terminal, as asked by -nw:
+/// when no display answers it says so and goes on there, if it has a terminal.
+fn open_window() -> Result<Window, i32> {
+    let (gui, size) = window_args();
+    if !gui {
+        return Ok(None);
+    }
+    #[cfg(feature = "gui")]
+    {
+        let why = match gui::unavailable() {
+            Some(why) => why,
+            None => match gui::Gui::open(size) {
+                Ok(g) => return Ok(Some(g)),
+                Err(e) => e,
+            },
+        };
+        fallback(&why)
+    }
+    #[cfg(not(feature = "gui"))]
+    {
+        let _ = size;
+        fallback("this edwin was built without the window (the gui feature)")
+    }
+}
+
+fn fallback(why: &str) -> Result<Window, i32> {
+    // SAFETY: isatty on the standard descriptors.
+    let tty = unsafe { libc::isatty(0) == 1 || libc::isatty(1) == 1 };
+    eprintln!(
+        "edwin: cannot open a window: {why}{}",
+        if tty { "; using the terminal" } else { "" }
+    );
+    if tty {
+        Ok(None)
+    } else {
+        Err(1)
+    }
+}
+
 fn run() -> i32 {
     snapshot::init_v8(&ICU_DATA.0);
     natives::start_clock(Instant::now());
@@ -72,6 +146,10 @@ fn run() -> i32 {
     if restore {
         params = params.snapshot_blob(&SNAPSHOT.0[..]);
     }
+    let window = match open_window() {
+        Ok(w) => w,
+        Err(code) => return code,
+    };
     let isolate = &mut v8::Isolate::new(params);
     let scope = &mut v8::HandleScope::new(isolate);
     let context = v8::Context::new(scope, Default::default());
@@ -99,6 +177,12 @@ fn run() -> i32 {
             return code;
         }
     }
+    #[cfg(feature = "gui")]
+    if let Some(gui) = window {
+        return gui_loop(scope, context, gui);
+    }
+    #[cfg(not(feature = "gui"))]
+    let _ = window;
     let code = event_loop(scope, context);
     sys::tty_close();
     code
@@ -181,5 +265,79 @@ fn event_loop(scope: &mut v8::HandleScope, context: v8::Local<v8::Context>) -> i
             // No terminal, no socket, no timer: nothing can happen any more.
             return natives::exit_code().unwrap_or(0);
         }
+    }
+}
+
+/// The window's loop: the terminal loop's steps, with the window's events pumped where the terminal is polled.
+#[cfg(feature = "gui")]
+fn gui_loop(
+    scope: &mut v8::HandleScope,
+    context: v8::Local<v8::Context>,
+    mut gui: gui::Gui,
+) -> i32 {
+    let g = context.global(scope);
+    let k = v8::String::new(scope, "__native").unwrap();
+    let nat = g.get(scope, k.into()).unwrap().to_object(scope).unwrap();
+    let (tick, next, signal, sock) = (
+        global_fn(scope, nat, "tick"),
+        global_fn(scope, nat, "next"),
+        global_fn(scope, nat, "signal"),
+        global_fn(scope, nat, "sock"),
+    );
+    let k = v8::String::new(scope, "gui").unwrap();
+    let on_event = nat
+        .get(scope, k.into())
+        .and_then(|v| v8::Local::<v8::Function>::try_from(v).ok());
+    let recv: v8::Local<v8::Value> = nat.into();
+    let mut next_ms: f64 = 0.0;
+    loop {
+        gui.present();
+        if let Some(code) = natives::exit_code() {
+            return code;
+        }
+        if gui.closed() {
+            // The system took the window away: as the terminal hanging up.
+            let s = v8::String::new(scope, "HUP").unwrap();
+            signal.call(scope, recv, &[s.into()]);
+            return natives::exit_code().unwrap_or(1);
+        }
+        let timeout =
+            (next_ms >= 0.0).then(|| std::time::Duration::from_micros((next_ms * 1000.0) as u64));
+        gui.pump(timeout, sys::poll_fds());
+        let ready = sys::wait(0);
+        for sig in ready.signals {
+            let s = v8::String::new(scope, sig).unwrap();
+            let tc = &mut v8::TryCatch::new(scope);
+            signal.call(tc, recv, &[s.into()]);
+            tc.perform_microtask_checkpoint();
+        }
+        for (id, line) in ready.socket_lines {
+            let a0 = v8::Integer::new(scope, id as i32).into();
+            let a1 = match line {
+                Some(l) => v8::String::new(scope, &l).unwrap().into(),
+                None => v8::null(scope).into(),
+            };
+            let tc = &mut v8::TryCatch::new(scope);
+            sock.call(tc, recv, &[a0, a1]);
+            tc.perform_microtask_checkpoint();
+        }
+        if let Some(f) = on_event {
+            for ev in gui.take_events() {
+                let s = v8::String::new(scope, &ev).unwrap();
+                let tc = &mut v8::TryCatch::new(scope);
+                f.call(tc, recv, &[s.into()]);
+                tc.perform_microtask_checkpoint();
+            }
+        }
+        if natives::exit_code().is_some() {
+            continue;
+        }
+        let tc = &mut v8::TryCatch::new(scope);
+        tick.call(tc, recv, &[]);
+        tc.perform_microtask_checkpoint();
+        next_ms = next
+            .call(tc, recv, &[])
+            .and_then(|v| v.number_value(tc))
+            .unwrap_or(-1.0);
     }
 }

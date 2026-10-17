@@ -60,6 +60,7 @@ globalThis.__native = {
   input(s) { if (handlers.input) try { handlers.input(s); } catch (e) { report(e); } },
   signal(name) { if (handlers.signal) try { handlers.signal(name); } catch (e) { report(e); } },
   sock(id, line) { if (handlers.sock) try { handlers.sock(id, line); } catch (e) { report(e); } },
+  gui(json) { if (handlers.gui) try { handlers.gui(json); } catch (e) { report(e); } },
 };
 
 /* ---------- console: a log file ---------- */

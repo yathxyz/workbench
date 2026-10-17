@@ -391,6 +391,31 @@ fn a_dash_edits_standard_input() {
 }
 
 #[test]
+fn a_window_without_a_display_is_the_terminal() {
+    let d = workdir("nodisplay");
+    std::fs::write(d.join("a.txt"), "one\n").unwrap();
+    let mut t = Pty::spawn(&d, &["--gui", "a.txt"], &[]);
+    t.ready().keys("Atwo").esc().keys(":wq\r");
+    assert_eq!(t.exit(), 0);
+    assert!(
+        contains(&t.out, b"cannot open a window: no display"),
+        "{}",
+        tail(&t.out)
+    );
+    assert_eq!(read(d.join("a.txt")), "onetwo\n");
+    // With no terminal either there is nothing to draw on.
+    let o = std::process::Command::new(BIN)
+        .args(["--gui", "a.txt"])
+        .current_dir(&d)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("cannot open a window: no display"));
+}
+
+#[test]
 fn help_version_and_bad_options_need_no_terminal() {
     let o = std::process::Command::new(BIN)
         .arg("--help")

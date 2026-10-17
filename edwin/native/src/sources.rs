@@ -23,6 +23,7 @@ pub const JS: &[(&str, &str)] = &[
     ("native/host-native", include_str!("../js/host-native.js")),
     ("native/boot", include_str!("../js/boot.js")),
     ("native/term", include_str!("../js/term.js")),
+    ("native/gui", include_str!("../js/gui.js")),
     ("native/main", include_str!("../js/main.js")),
 ];
 

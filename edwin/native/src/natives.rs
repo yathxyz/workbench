@@ -1,7 +1,7 @@
 //! __n: what the JavaScript host gets from Rust. Files throw JS errors with the system's message; reading a
 //! missing file gives null, as host.files.read promises.
 
-use crate::{sources, sys};
+use crate::{bridge, sources, sys};
 use std::cell::{Cell, OnceCell};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -441,6 +441,64 @@ fn sock_close(
     sys::sock_close(id);
 }
 
+/* ---------- the window (DT2): through the bridge, so this file needs no graphics library ---------- */
+/// {cols, rows, theme} of the open window, or null when the program runs in a terminal.
+fn gui_size(
+    scope: &mut v8::HandleScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let size = bridge::with(|b| b.open.then(|| (b.cols, b.rows, b.theme.clone())));
+    match size {
+        Some((cols, rows, theme)) => {
+            let o = v8::Object::new(scope);
+            let c = v8::Integer::new_from_unsigned(scope, cols).into();
+            set(scope, o, "cols", c);
+            let r = v8::Integer::new_from_unsigned(scope, rows).into();
+            set(scope, o, "rows", r);
+            if let Some(t) = theme {
+                let t = v8::String::new(scope, &t).unwrap().into();
+                set(scope, o, "theme", t);
+            }
+            rv.set(o.into());
+        }
+        None => rv.set(v8::null(scope).into()),
+    }
+}
+/// The model to draw, as JSON (the window draws the last one it was given after this turn of JS).
+fn gui_draw(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let json = arg_str(scope, &args, 0);
+    bridge::with(|b| b.model = Some(json));
+}
+/// An action for the window: bell, clipboard TEXT, iconify, raise.
+fn gui_action(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let name = arg_str(scope, &args, 0);
+    let arg = if args.length() > 1 {
+        arg_str(scope, &args, 1)
+    } else {
+        String::new()
+    };
+    bridge::with(|b| b.actions.push((name, arg)));
+}
+/// The system clipboard's text, or null.
+fn gui_clipboard(
+    scope: &mut v8::HandleScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    match bridge::clipboard_text() {
+        Some(t) => ret_str(scope, &mut rv, &t),
+        None => rv.set(v8::null(scope).into()),
+    }
+}
 fn args(
     scope: &mut v8::HandleScope,
     _args: v8::FunctionCallbackArguments,
@@ -464,7 +522,8 @@ macro_rules! natives {
             "readFile" read_file, "writeFile" write_file, "appendFile" append_file, "stat" stat, "realpath" realpath, "readDir" read_dir,
             "remove" remove, "mkdirs" mkdirs, "readStdin" read_stdin, "ttyOpen" tty_open, "ttyClose" tty_close,
             "ttyWrite" tty_write, "ttyFlush" tty_flush, "ttySize" tty_size, "suspend" suspend, "exit" exit,
-            "sockOpen" sock_open, "sockSend" sock_send, "sockClose" sock_close
+            "sockOpen" sock_open, "sockSend" sock_send, "sockClose" sock_close, "guiSize" gui_size,
+            "guiDraw" gui_draw, "guiAction" gui_action, "guiClipboard" gui_clipboard
         )
     };
 }

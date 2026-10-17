@@ -1,20 +1,24 @@
-/* edwin, the program (DT1): Edwin in a terminal, as a Vim or Emacs would run, and a usable $EDITOR.
+/* edwin, the program: Edwin in a terminal (DT1), as a Vim or Emacs would run, and a usable $EDITOR; or in a
+   window of its own (DT2, --gui).
 
-     edwin [-nw] [-R] [--standalone | --socket PATH] [+LINE] [FILE | -]...
+     edwin [-nw | -g] [-R] [--standalone | --socket PATH] [+LINE] [FILE | -]...
 
-   The core runs as a model frame (display.js) drawn by term.js. Files are read and written directly
+   The core runs as a model frame (display.js) drawn by term.js, or by the window (gui.js and the Rust side's
+   gui/, which opened it before this file runs: N.guiSize() says so). Files are read and written directly
    (host-native.js); when an edwind answers on its socket, the notes under its notes directory are opened
    through it instead, shared with the browser's frames. The process ends with the status the user asked
    for: :q, :wq, ZZ and C-x C-c give 0, :cq gives 1 (or its argument), so git commit and sudoedit can tell
-   an abort. C-z suspends to the shell; fg resumes. */
+   an abort. C-z suspends to the shell; fg resumes (in the window, C-z iconifies it). */
 (function () {
 'use strict';
 const N = globalThis.__n, H = globalThis.EdNativeHost, T = globalThis.EdTerm;
-const VERSION = 'edwin DT1';
+const VERSION = 'edwin DT2';
 const USAGE = `Usage: edwin [OPTION]... [+LINE] [FILE]...
-Edit FILEs in Edwin, in this terminal.
+Edit FILEs in Edwin, in this terminal or in a window.
 
-  -nw, --no-window   use this terminal (the only frame in this version)
+  -nw, --no-window   use this terminal (the default)
+  -g, --gui          open a window (EDWIN_FONT="Family 11" sets its font)
+  --geometry=COLSxROWS  the window's first size in characters (100x36)
   -R, --read-only    visit the files read-only
   --standalone       never attach to edwind
   --socket PATH      attach to the edwind listening on PATH
@@ -39,7 +43,8 @@ function parseArgs(argv) {
     if (opts && a === '--') { opts = false; continue; }
     if (opts && (a === '-h' || a === '--help')) o.help = true;
     else if (opts && a === '--version') o.version = true;
-    else if (opts && (a === '-nw' || a === '--no-window' || a === '-t')) { /* the terminal is the only frame here */ }
+    else if (opts && (a === '-nw' || a === '--no-window' || a === '-t' || a === '-g' || a === '--gui')) { /* main.rs chose */ }
+    else if (opts && /^--geometry=\d+x\d+$/.test(a)) { /* main.rs sized the window */ }
     else if (opts && (a === '-R' || a === '--read-only')) o.readOnly = true;
     else if (opts && a === '--standalone') o.standalone = true;
     else if (opts && a.startsWith('--socket=')) o.socket = a.slice(9);
@@ -61,28 +66,33 @@ if (opts.version) { N.print(VERSION + '\n'); N.exit(0); return; }
 
 /* Standard input as a buffer (edwin -), read before the terminal is taken. */
 const stdinText = opts.stdin ? N.readStdin() : null;
-if (!N.ttyOpen()) { N.eprint('edwin: no terminal to draw on (/dev/tty)\n'); N.exit(1); return; }
+/* The window main.rs opened (edwin --gui), else the terminal. */
+const gui = N.guiSize() !== null;
+if (gui) N.load('native/gui');
+if (!gui && !N.ttyOpen()) { N.eprint('edwin: no terminal to draw on (/dev/tty)\n'); N.exit(1); return; }
+const screen = gui ? globalThis.EdGui.screen() : null;
 
 /* ---------- the terminal ---------- */
 const envOf = k => H.env(k) || '';
-const enc = T.encoder({ color: envOf('EDWIN_COLOR') || T.colorMode({ COLORTERM: envOf('COLORTERM'), TERM: envOf('TERM'), TERM_PROGRAM: envOf('TERM_PROGRAM') }), defaultColors: envOf('EDWIN_DEFAULT_COLORS') === '1' });
-const dec = T.decoder();
-const out = s => N.ttyWrite(s);
-let size = N.ttySize();
-const backend = {
+const enc = gui ? null : T.encoder({ color: envOf('EDWIN_COLOR') || T.colorMode({ COLORTERM: envOf('COLORTERM'), TERM: envOf('TERM'), TERM_PROGRAM: envOf('TERM_PROGRAM') }), defaultColors: envOf('EDWIN_DEFAULT_COLORS') === '1' });
+const dec = gui ? null : T.decoder();
+const out = gui ? () => {} : s => N.ttyWrite(s);
+let size = gui ? null : N.ttySize();
+const backend = gui ? screen.backend : {
   tty: true,
   size: () => ({ cols: Math.max(8, size[0]), rows: Math.max(3, size[1]) }),
   draw: m => out(enc.draw(m)),
   bell: () => out(enc.bell()),
 };
-/* The theme: EDWIN_THEME, else the background colour the terminal reports, else COLORFGBG, else dark. */
+/* The theme: EDWIN_THEME, else the background colour the terminal reports (the desktop's, in the window), else
+   COLORFGBG, else dark. */
 const forced = /^(dark|light)$/.test(envOf('EDWIN_THEME')) ? envOf('EDWIN_THEME') : null;
 const fgbg = /;(\d+)$/.exec(envOf('COLORFGBG'));
-let theme = forced || (fgbg ? (Number(fgbg[1]) === 7 || Number(fgbg[1]) >= 9 ? 'light' : 'dark') : 'dark');
+let theme = forced || (gui && screen.theme()) || (fgbg ? (Number(fgbg[1]) === 7 || Number(fgbg[1]) >= 9 ? 'light' : 'dark') : 'dark');
+/* The first draw waits briefly for the terminal's replies (its background colour); a window has none. */
 let fenceDone = null;
-const fence = new Promise(r => { fenceDone = r; setTimeout(r, FENCE_MS); });
-out(enc.enter());
-N.ttyFlush();
+const fence = new Promise(r => { fenceDone = r; setTimeout(r, gui ? 0 : FENCE_MS); });
+if (!gui) { out(enc.enter()); N.ttyFlush(); }
 
 function edwindSocket() {
   if (N.env('EDWIN_NO_ATTACH')) return null;
@@ -96,18 +106,18 @@ function edwindSocket() {
 
 /* ---------- the core: in the startup snapshot already (boot.js), or loaded now ---------- */
 let sock = null;
-try { sock = edwindSocket(); } catch (e) { out(enc.leave()); N.ttyFlush(); N.ttyClose(); N.eprint('edwin: ' + e.message + '\n'); N.exit(1); return; }
+try { sock = edwindSocket(); } catch (e) { if (!gui) { out(enc.leave()); N.ttyFlush(); N.ttyClose(); } N.eprint('edwin: ' + e.message + '\n'); N.exit(1); return; }
 /* The shell restores the snapshot only when no edwind answered; one that answers since is not used. */
 if (!globalThis.EdBooted) { globalThis.EdBootAttach = !!sock; N.load('native/boot'); trace('core loaded'); }
 else sock = null;
 const host = globalThis.EdHost;
 host.init();
 globalThis.__native.thaw();
-host.onClipboard = s => { if (s.length <= 100000 && envOf('EDWIN_OSC52') !== '0') out(enc.clipboard(s)); };
+host.onClipboard = gui ? s => screen.clipboard(s) : s => { if (s.length <= 100000 && envOf('EDWIN_OSC52') !== '0') out(enc.clipboard(s)); };
 const Ed = globalThis.Ed, L = globalThis.L, E = Ed.E;
 
 let frame = null, quitting = false, escTimer = null;
-function leaveTerminal() { out(enc.leave()); N.ttyFlush(); N.ttyClose(); }
+function leaveTerminal() { if (gui) return; out(enc.leave()); N.ttyFlush(); N.ttyClose(); }
 /* End the program: storage flushed, the terminal given back, then exit with CODE. */
 async function quit(code) {
   if (quitting) return;
@@ -121,6 +131,7 @@ async function quit(code) {
 Ed.hooks.killEmacs = code => { quit(code); };
 Ed.hooks.suspendFrame = () => {
   try { host.suspend(); } catch (e) { console.error(e); }
+  if (gui) { screen.iconify(); return; }
   out(enc.leave()); N.ttyFlush();
   N.suspend();              // returns once the shell has resumed us (SIGCONT)
   resumed();
@@ -162,7 +173,16 @@ globalThis.__native.handlers.input = s => {
   dispatch(dec.feed(s));
   if (dec.pending()) escTimer = setTimeout(() => { escTimer = null; dispatch(dec.flush()); }, ESC_MS);
 };
+/* The window's events (keys, text, mouse, focus, resize, its close button, dropped files). */
+globalThis.__native.handlers.gui = json => {
+  if (!frame) return;
+  globalThis.EdGui.handle(json, frame, {
+    close: () => Ed.display.input(frame, { type: 'key', key: '<cmd:save-buffers-kill-terminal>' }),
+    drop: path => { Promise.resolve(Ed.visit(path)).then(() => Ed.render(), e => { Ed.message(Ed.errorText(e)); Ed.render(); }); },
+  });
+};
 globalThis.__native.handlers.signal = name => {
+  if (gui && (name === 'WINCH' || name === 'TSTP' || name === 'CONT')) return;
   if (name === 'WINCH') { size = N.ttySize(); if (frame) Ed.display.input(frame, { type: 'resize' }); }
   else if (name === 'TSTP') Ed.hooks.suspendFrame();
   else if (name === 'CONT') resumed();
@@ -218,7 +238,7 @@ async function start() {
   Ed.reloadPersistent();
   L.set('load-path', L.listOf(host.loadPath));
   if (sock) {
-    await Ed.bootServed({ transport: transport(sock), device: 'terminal' });
+    await Ed.bootServed({ transport: transport(sock), device: gui ? 'window' : 'terminal' });
     attached = { socket: sock, unconfirmed: 0 };
     const served = Ed.hooks.visit, dir = String(L.get('notes-directory') || '');
     /* Compared by true name, so ./notes/a.md, a link into the notes and a linked notes directory all count. */
