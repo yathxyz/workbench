@@ -1,4 +1,4 @@
-// The display seam (DT0): model frames drawn on a cell grid for a backend that is not a page (src/display.js).
+// The display seam (DT0): model frames drawn on a cell grid for a backend that is not a page (src/display.ts).
 // A fake backend records each model; the faces and the palette are checked against the stylesheets they mirror.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -7,7 +7,7 @@ import { createHost, loadEdwin } from './headless.mts';
 import type { Edwin } from './headless.mts';
 
 type Globals = typeof globalThis & { L: Edwin };
-/* The model a model frame hands its backend (src/display.js). */
+/* The model a model frame hands its backend (src/display.ts). */
 interface Face { fg?: string; bg?: string; weight?: number; bold?: boolean; italic?: boolean; underline?: boolean; strike?: boolean; box?: boolean }
 interface Segment { x: number; w: number; text: string; f: number }
 interface Model {
@@ -21,7 +21,7 @@ interface Model {
 /* A rule's declarations as the face tables spell them. */
 type Spec = { fg?: string[]; bg?: string[]; w?: number; i?: number; u?: number; s?: number; box?: number; hide?: number; a?: number };
 
-/* Boot with a host that keeps the stylesheets the modes register (markdown.js, org.js), for the face checks. */
+/* Boot with a host that keeps the stylesheets the modes register (markdown.ts, org.ts), for the face checks. */
 const host = createHost({ workers: false });
 const sheets: Record<string, string> = {};
 host.page.addStyle = (id, css) => { sheets[id] = css; };

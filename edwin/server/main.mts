@@ -6,7 +6,7 @@
 //   edwind --config … --write-roots                   print the write roots, one per line (for bin/edwind's flags)
 //   edwind --config … --primitives                    print the primitive registry as JSON (R4.48)
 //
-// The process loads Edwin's core headless (host-node.js), replays the journals, then listens on edit.sock.
+// The process loads Edwin's core headless (host-node.cts), replays the journals, then listens on edit.sock.
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
@@ -41,9 +41,9 @@ import type { Processes } from './process.mts';
 import type { Wb } from './wb.mts';
 import type { Anchors } from './anchors.mts';
 
-/* edwin/src, loaded through host-node.js, is untyped JavaScript: these name what the server holds of it. */
-export type Ed = any; // any: the Edwin core (edwin/src) is untyped JavaScript
-export type Lisp = any; // any: globalThis.L, the Scheme runtime of edwin/src, is untyped JavaScript
+/* edwin/src, loaded through host-node.cts, is outside this program's types: these name what the server holds of it. */
+export type Ed = any; // any: the Edwin core (edwin/src) is outside this program's types
+export type Lisp = any; // any: globalThis.L, the Scheme runtime of edwin/src, is outside this program's types
 export type EdBuffer = any; // any: an Edwin buffer object of edwin/src (rope, mode, markers)
 export type SchemeValue = any; // any: a value of the evaluator (edwin/src), of any Scheme type
 
@@ -189,7 +189,7 @@ export class Server {
     this.image = new ImageLog(path.join(cfg.stateDir, 'image.jsonl'));
     this.image.ensureEpoch(() => randomId(8));
   }
-  /* Load Edwin's core headless and boot it (host-node.js), then replay the image log (R4.19) and the journals. */
+  /* Load Edwin's core headless and boot it (host-node.cts), then replay the image log (R4.19) and the journals. */
   async start() {
     const { createHost, loadEdwin } = require(path.join(EDWIN, 'src/host-node.cts'));
     const storageFile = path.join(this.cfg.stateDir, 'storage.json');

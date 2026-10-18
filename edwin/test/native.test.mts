@@ -1,6 +1,6 @@
 // The core's seams for the desktop program (DT1): a host file system (host.files), leaving with an exit status
 // (hooks.killEmacs), suspending, the input half of the display seam, and persistent tables read again.
-// The Node host stands in for host-native.js; the program itself is tested by edwin/native/tests.
+// The Node host stands in for host-native.ts; the program itself is tested by edwin/native/tests.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -10,7 +10,7 @@ import type { Edwin, NodeHost } from './headless.mts';
 
 type Globals = typeof globalThis & { L: Edwin };
 const NATIVE_JS = new URL('../native/js', import.meta.url).pathname;
-/* host.files, as host-native.js shapes it (the Node host has none of its own). */
+/* host.files, as host-native.ts shapes it (the Node host has none of its own). */
 interface HostFiles {
   resolve(n: string): string; label(p: string): string; read(n: string): string | null; write(n: string, t: string): void; remove(n: string): void;
   list(): string[]; exists(n: string): boolean; truename(n: string): string;
@@ -27,7 +27,7 @@ const type = (s: string) => feed([...s].map(ch => (ch === ' ' ? 'SPC' : ch === '
 const ev = (src: string) => { L.resetOps(); return L.evalText(src); };
 ev('(set! display-line-numbers #f)');
 
-/* A file system in memory, rooted at /w, as host-native.js shapes host.files. */
+/* A file system in memory, rooted at /w, as host-native.ts shapes host.files. */
 const disk = new Map<string, string>(), links = new Map<string, string>();   // links: a symbolic link's path -> its target's
 let failWrites = false;
 host.files = {
@@ -45,7 +45,7 @@ let suspended = 0;
 Ed.hooks.killEmacs = (code: number) => exits.push(code);
 Ed.hooks.suspendFrame = () => { suspended++; };
 
-let size = { cols: 60, rows: 16 }, model: Edwin = null; // any: the display model is built by the untyped core
+let size = { cols: 60, rows: 16 }, model: Edwin = null; // any: the display model is built by the core, outside this program's types
 const frame = Ed.makeFrame(null, { backend: { tty: true, size: () => size, draw: (m: Edwin) => { model = m; } } });
 frame.focused = true;
 const fresh = async () => {
@@ -270,7 +270,7 @@ test('save-place leaves commit messages at the top, as Vim and Emacs do', async 
 });
 
 test('gui.js: window events reach display.input as the page names them; the backend draws through __n', async () => {
-  /* The natives gui.js uses (natives.rs), and what it defines. */
+  /* The natives gui.ts uses (natives.rs), and what it defines. */
   interface GuiNatives {
     guiSize(): { cols: number; rows: number; theme?: string } | null;
     guiDraw(json: string): void;
@@ -311,7 +311,7 @@ test('gui.js: window events reach display.input as the page names them; the back
   } finally { D.input = input; delete G0.__n; }
   assert.deepEqual(seen, ['x', 'C-x', 'M-x', 'ESC', 'RET', '@', 'é', 'SPC', 'a', 'RET', 'mouse', 'close', 'drop /w/d.txt']);
 
-  // Segments past U+02FF carry display.js's widths, so the window cannot count a character otherwise.
+  // Segments past U+02FF carry display.ts's widths, so the window cannot count a character otherwise.
   const m = G.withWidths({ lines: [[{ x: 0, w: 3, text: 'abc', f: 0 }, { x: 3, w: 4, text: 'a漢\u0627\u0670', f: 0 }]] });
   assert.equal(m.lines[0][0].cw, undefined);
   assert.deepEqual(m.lines[0][1].cw, [1, 2, 1, 0]);

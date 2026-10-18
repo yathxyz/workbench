@@ -8,7 +8,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 
-export type SchemeValue = any; // any: a value of the evaluator, which is untyped JavaScript (src/scheme.ts)
+export type SchemeValue = any; // any: a value of the evaluator (src/scheme.ts), outside this program's types
 export type SchemeMode = 'direct' | 'gen';
 /* A source location, as sourceLocation gives it. */
 export interface SourceLoc { file: string | null; line: number; col: number }
@@ -32,7 +32,7 @@ export interface SchemeHooks {
   threadSwitch: ((prev: unknown, next: unknown) => void) | null;
   debugG: ((r: unknown, continuable: boolean) => Generator<unknown, SchemeValue, unknown>) | null;
 }
-/* The Scheme object src/scheme.js exports (the members the suites use). */
+/* The Scheme object src/scheme.ts exports (the members the suites use). */
 export interface Scheme {
   Sym: new (name: string) => SymObject;
   Pair: new (car: SchemeValue, cdr: SchemeValue) => PairObject;

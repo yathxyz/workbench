@@ -41,7 +41,7 @@ import type { Client } from './session.mts';
 import type { WireMessage } from './proto.mts';
 import type { SchemeGen, Thread } from './threads.mts';
 
-/* The evaluator S of edwin/src, untyped JavaScript like the rest of L. */
+/* The evaluator S of edwin/src, outside this program's types like the rest of L. */
 type Scheme = Lisp['S'];
 /* A generator primitive's body: yields S.Block while it waits, returns R. */
 type Gen<R> = Generator<SchemeValue, R, SchemeValue>;

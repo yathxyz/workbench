@@ -1,6 +1,6 @@
 //! Every source the binary carries: the core (edwin/src), the native layer (native/js) and the shipped Scheme.
 
-/// JavaScript, by the name main.js loads it with (core files bare, the native layer under native/).
+/// JavaScript, by the name main.ts loads it with (core files bare, the native layer under native/).
 pub const JS: &[(&str, &str)] = &[
     ("scheme", include_str!("../../src/scheme.js")),
     ("runtime", include_str!("../../src/runtime.js")),

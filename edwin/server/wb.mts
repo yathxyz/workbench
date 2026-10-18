@@ -28,7 +28,7 @@ import type { Hub, Summary, SessionKind, HubMessage, AcpEvent } from './hub.mts'
 import type { Scheduler, SchemeGen, Thread } from './threads.mts';
 import type { SBuf } from './buffers.mts';
 
-/* The evaluator S of edwin/src, untyped JavaScript like the rest of L. */
+/* The evaluator S of edwin/src, loaded through vm like the rest of L: its types (core.d.ts) are not this program's. */
 type Scheme = Lisp['S'];
 /* A function receiving the acp.* messages of one session, and {t: 'down'} when the hub goes away. */
 export type AcpCollector = (m: HubMessage) => void;

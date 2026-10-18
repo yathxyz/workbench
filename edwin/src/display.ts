@@ -1,6 +1,6 @@
 /* Edwin's display seam (DT0): frames that are not page elements.
 
-   A page frame (Ed.makeFrame(el, ...)) is drawn by editor-core.js into the DOM, and the browser does the layout:
+   A page frame (Ed.makeFrame(el, ...)) is drawn by editor-core.ts into the DOM, and the browser does the layout:
    wrapping, widths, the line height. A model frame (Ed.makeFrame(null, {backend})) has no page. Each redisplay
    this file lays it out on a grid of character cells, backend.size() = {cols, rows}, and hands the result to
    backend.draw(model). A terminal (DT1) and a native window (DT2) are such backends; so is the fake backend of
@@ -22,15 +22,34 @@
    does on the page. test/display.test.mts checks both tables against the stylesheets they mirror.
 
    What a model frame does not show yet: snipe boxes and the pulse are cell faces or nothing (no animation), the
-   display text of markdown block references (a DOM pass in markdown.js) shows the reference, and the menubar of a
+   display text of markdown block references (a DOM pass in markdown.ts) shows the reference, and the menubar of a
    console frame is not drawn. */
 (function () {
 'use strict';
+type DispTheme = 'light' | 'dark';
+type DispRGBA = [number, number, number, number];
+/* A face spec in palette tokens (the comment above FACES). */
+type DispFaceSpec = { fg?: string | string[]; bg?: string | string[]; a?: number; w?: number; i?: number; u?: number; s?: number; box?: number; hide?: number; glyph?: string; p?: number };
+/* A glyph with the cell classes drawWindow caches on it (with the row's base classes). */
+type DispGlyph = EdGlyph & { kd?: string; kc?: string };
+/* The minibuffer's glyphs: a line break between its lines has no cur. */
+type DispEchoGlyph = Omit<EdGlyph, 'cur'> & { cur?: boolean };
+/* A text row of a window as drawn: the buffer position of each cell (-1: none), the end of its text. */
+interface DispRow { y: number; pos: Int32Array; end: number; endX: number }
+/* A window's rectangle from layout; drawWindow fills map, textX and textW. */
+interface DispRect { win: EdWindow; x: number; y: number; w: number; h: number; map: DispRow[]; textX: number; textW: number }
+interface DispDivider { x: number; y: number; h: number }
+interface DispLaid { line: EdRenderedLine; gl: DispGlyph[]; rows: DispGlyph[][] }
+type DispPainter = (g: Grid, y: number) => void;
+interface DispEcho { rows: DispPainter[]; cursor: { x: number; row: number } | null }
+/* f._layout: what posAt reads. */
+interface DispLayout { rects: DispRect[]; winH: number; cols: number; rows: number; echoRows: number }
+type DispMouseEvent = Extract<EdDisplayEvent, { type: 'mouse' }>;
 const L = globalThis.L, Ed = globalThis.Ed, E = Ed.E, H = Ed.hooks, host = Ed.host;
 const { truthy } = L;
 
 /* ---------- the palette and the faces ---------- */
-const PALETTE = {
+const PALETTE: Record<DispTheme, Record<string, string>> = {
   light: {
     'page': '#efe9dd', 'bg': '#fbf7f0', 'fg': '#000000', 'dim': '#595959', 'rule': '#c4b8ab', 'gutter': '#7f7f7f',
     'menu-bg': '#efe9dd', 'menu-fg': '#3a3a3a', 'ml-bg': '#cab9b2', 'ml-fg': '#000000', 'ml-dim': '#3a3a3a',
@@ -65,7 +84,7 @@ const PALETTE = {
    current line), 1 the text's own class, 2 the combinations (pa.d3, cand.sel), 3 the highlights, 4 avy, 5 the
    colours of other writers. A key "a.b" applies when a cell has both classes. */
 const TAG_BG = 'rgb(127 127 127 / 0.12)', BLOCK_BG = 'rgb(127 127 127 / 0.08)';
-const FACES = {
+const FACES: Record<string, DispFaceSpec> = {
   default: { fg: 'fg', bg: 'bg', p: 0 }, cl: { bg: 'hl', p: 0 },
   kw: { fg: 'kw', w: 500 }, fn: { fg: 'fn', w: 500 }, st: { fg: 'st' }, dc: { fg: 'dc', i: 1 }, cm: { fg: 'cm', i: 1 },
   co: { fg: 'co' }, nu: { fg: 'co' }, qu: { fg: 'co' }, pa: { fg: 'pa' },
@@ -85,7 +104,7 @@ const FACES = {
   wkp: { fg: 'dim' }, 'wk-key': { fg: 'kw', w: 600 },
   /* The completion popup has a border and a shadow on the page; in cells it is told apart by its background. */
   corfu: { fg: 'fg', bg: 'menu-bg', p: 0 },
-  /* markdown-mode (markdown.js CSS) */
+  /* markdown-mode (markdown.ts CSS) */
   'markdown-heading-1': { fg: ['md-heading', 'org-l1', 'kw'], w: 700 }, 'markdown-heading-2': { fg: ['md-heading', 'org-l2', 'fn'], w: 700 },
   'markdown-heading-3': { fg: ['md-heading', 'org-l3', 'st'], w: 600 }, 'markdown-heading-4': { fg: ['md-heading', 'org-l4', 'dc'], w: 600 },
   'markdown-heading-5': { fg: ['md-heading', 'org-l4', 'dc'], w: 600 }, 'markdown-heading-6': { fg: ['md-heading', 'org-l4', 'dc'], w: 600 },
@@ -107,7 +126,7 @@ const FACES = {
   'markdown-planning': { fg: ['md-markup', 'dim'], w: 600 }, 'markdown-date': { fg: ['md-date', 'co'], bg: ['md-tag-bg', 'org-tag-bg', TAG_BG] },
   'markdown-quote': { i: 1, fg: ['md-quote', 'dim'] }, 'markdown-table': { fg: ['md-table', 'co'] }, 'markdown-table-delimiter': { fg: ['md-markup', 'dim'] },
   'markdown-hr': { fg: ['md-markup', 'rule'] }, 'markdown-front-matter': { fg: ['md-meta', 'dim'] },
-  /* Org (org.js CSS): hidden markup, hidden leading stars, bullets drawn as glyphs */
+  /* Org (org.ts CSS): hidden markup, hidden leading stars, bullets drawn as glyphs */
   oh: { hide: 1 }, ohs: { fg: 'transparent' },
   ob1: { fg: ['org-star', 'kw'], glyph: '◉' }, ob2: { fg: ['org-star', 'kw'], glyph: '○' }, ob3: { fg: ['org-star', 'kw'], glyph: '◈' }, ob4: { fg: ['org-star', 'kw'], glyph: '◇' }, ob5: { fg: ['org-star', 'kw'], glyph: '✳' },
   ol1: { fg: ['org-l1', 'kw'], w: 700 }, ol2: { fg: ['org-l2', 'fn'], w: 700 }, ol3: { fg: ['org-l3', 'st'], w: 600 }, ol4: { fg: ['org-l4', 'dc'], w: 600 }, ol5: { fg: ['org-l5', 'rb3'], w: 600 },
@@ -120,32 +139,32 @@ const FACES = {
   oli: { fg: 'kw', w: 700 }, otb: { fg: 'co' }, ohr: { fg: 'rule' }, oe: { fg: 'dim' },
   oad: { w: 700, fg: 'fg' }, oat: { w: 700, fg: 'kw' }, oag: { w: 700, fg: 'fn' }, oac: { fg: 'dim' }, oaw: { fg: 'co' }, oao: { fg: 'rb1', w: 600 },
 };
-const NAMED = { black: '#000000', white: '#ffffff', red: '#ff0000', green: '#008000', blue: '#0000ff', yellow: '#ffff00', cyan: '#00ffff', magenta: '#ff00ff',
+const NAMED: Record<string, string> = { black: '#000000', white: '#ffffff', red: '#ff0000', green: '#008000', blue: '#0000ff', yellow: '#ffff00', cyan: '#00ffff', magenta: '#ff00ff',
   gray: '#808080', grey: '#808080', orange: '#ffa500', purple: '#800080', pink: '#ffc0cb', brown: '#a52a2a' };
-const hex2 = n => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0');
+const hex2 = (n: number) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0');
 /* A colour as [r, g, b, a], or null: '#rgb', '#rrggbb', 'rgb(r g b / a)', 'rgb(r, g, b)', 'rgba(...)', 'hsl(h s% l%)', a few names. */
-function parseColor(s) {
+function parseColor(s: string | undefined): DispRGBA | null {
   s = String(s).trim().toLowerCase();
   if (NAMED[s]) s = NAMED[s];
   let m = /^#([0-9a-f]{3})$/.exec(s);
-  if (m) return [...m[1]].map(c => parseInt(c + c, 16)).concat(1);
+  if (m) return [...m[1]].map(c => parseInt(c + c, 16)).concat(1) as DispRGBA;
   m = /^#([0-9a-f]{6})$/.exec(s);
-  if (m) return [0, 2, 4].map(i => parseInt(m[1].slice(i, i + 2), 16)).concat(1);
-  const alpha = v => v === undefined ? 1 : v.endsWith('%') ? parseFloat(v) / 100 : parseFloat(v);
+  if (m) return [0, 2, 4].map(i => parseInt(m![1].slice(i, i + 2), 16)).concat(1) as DispRGBA;
+  const alpha = (v: string | undefined) => v === undefined ? 1 : v.endsWith('%') ? parseFloat(v) / 100 : parseFloat(v);
   m = /^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)\s*(?:[/,]\s*([\d.]+%?)\s*)?\)$/.exec(s);
   if (m) return [+m[1], +m[2], +m[3], alpha(m[4])];
-  /* hsl(h s% l%), as sync.js gives each writer (writerColor) */
+  /* hsl(h s% l%), as sync.ts gives each writer (writerColor) */
   m = /^hsla?\(\s*([\d.]+)(?:deg)?[\s,]+([\d.]+)%[\s,]+([\d.]+)%\s*(?:[/,]\s*([\d.]+%?)\s*)?\)$/.exec(s);
   if (m) {
     const h = (+m[1] % 360) / 360, sat = +m[2] / 100, l = +m[3] / 100;
     const q = l < 0.5 ? l * (1 + sat) : l + sat - l * sat, p = 2 * l - q;
-    const ch = t => { t = (t + 1) % 1; return 255 * (t < 1 / 6 ? p + (q - p) * 6 * t : t < 1 / 2 ? q : t < 2 / 3 ? p + (q - p) * (2 / 3 - t) * 6 : p); };
+    const ch = (t: number) => { t = (t + 1) % 1; return 255 * (t < 1 / 6 ? p + (q - p) * 6 * t : t < 1 / 2 ? q : t < 2 / 3 ? p + (q - p) * (2 / 3 - t) * 6 : p); };
     return [ch(h + 1 / 3), ch(h), ch(h - 1 / 3), alpha(m[4])];
   }
   return null;
 }
 /* The value of one token in THEME: a set-face-color! override (a page variable), else the palette's. */
-function tokenColor(tok, theme) {
+function tokenColor(tok: string, theme: DispTheme): DispRGBA | 'transparent' | null {
   if (tok === 'transparent') return 'transparent';
   if (tok[0] === '#' || tok.startsWith('rgb')) return parseColor(tok);
   const o = host.page.getVar(tok);
@@ -153,15 +172,15 @@ function tokenColor(tok, theme) {
   const v = PALETTE[theme][tok];
   return v ? parseColor(v) : null;
 }
-function chainColor(chain, theme) {
+function chainColor(chain: string | string[], theme: DispTheme) {
   for (const t of Array.isArray(chain) ? chain : [chain]) { const c = tokenColor(t, theme); if (c) return c; }
   return null;
 }
-const over = (top, a, under) => '#' + [0, 1, 2].map(i => hex2(top[i] * a + under[i] * (1 - a))).join('');
-const toHex = c => '#' + hex2(c[0]) + hex2(c[1]) + hex2(c[2]);
+const over = (top: DispRGBA, a: number, under: DispRGBA) => '#' + [0, 1, 2].map(i => hex2(top[i] * a + under[i] * (1 - a))).join('');
+const toHex = (c: DispRGBA) => '#' + hex2(c[0]) + hex2(c[1]) + hex2(c[2]);
 /* The face of a cell whose classes are KEY (space-separated), in THEME, as concrete colours. */
-function resolveFace(key, theme) {
-  const cls = key.split(' ').filter(Boolean), layers = [];
+function resolveFace(key: string, theme: DispTheme): EdFace {
+  const cls = key.split(' ').filter(Boolean), layers: DispFaceSpec[] = [];
   for (const c of cls) {
     const e = FACES[c];
     if (e) layers.push(e);
@@ -171,10 +190,10 @@ function resolveFace(key, theme) {
   for (const c of cls) for (const d of cls) if (c !== d && FACES[c + '.' + d]) layers.push(FACES[c + '.' + d]);
   layers.sort((x, y) => (x.p ?? 1) - (y.p ?? 1));
   const pal = PALETTE[theme];
-  let fg = parseColor(pal.fg), bg = parseColor(pal.bg), fgT = false;
+  let fg = parseColor(pal.fg)!, bg = parseColor(pal.bg)!, fgT = false;
   const out = { weight: 400, italic: false, underline: false, strike: false, box: false };
   for (const e of layers) {
-    if (e.bg) { const c = chainColor(e.bg, theme); if (c && c !== 'transparent') bg = parseColor(over(c, (e.a ?? 1) * c[3], bg)); }
+    if (e.bg) { const c = chainColor(e.bg, theme); if (c && c !== 'transparent') bg = parseColor(over(c, (e.a ?? 1) * c[3], bg))!; }
     if (e.fg) { const c = chainColor(e.fg, theme); if (c === 'transparent') fgT = true; else if (c) { fg = c; fgT = false; } }
     if (e.w) out.weight = e.w;
     if (e.i) out.italic = true;
@@ -185,8 +204,8 @@ function resolveFace(key, theme) {
   return { fg: fgT ? toHex(bg) : toHex(fg), bg: toHex(bg), ...out, bold: out.weight >= 600 };
 }
 /* The spec of the hiding and glyph classes of a cell (Org's hidden markup and bullets), or null. */
-const specials = new Map();
-function special(cls) {
+const specials = new Map<string, DispFaceSpec | null>();
+function special(cls: string) {
   let r = specials.get(cls);
   if (r !== undefined) return r;
   r = null;
@@ -200,10 +219,10 @@ const WIDE = [[0x1100, 0x115f], [0x231a, 0x231b], [0x2329, 0x232a], [0x23e9, 0x2
   [0xa000, 0xa4cf], [0xa960, 0xa97f], [0xac00, 0xd7a3], [0xf900, 0xfaff], [0xfe10, 0xfe19], [0xfe30, 0xfe6f], [0xff00, 0xff60], [0xffe0, 0xffe6],
   [0x1f300, 0x1f64f], [0x1f900, 0x1f9ff], [0x20000, 0x3fffd]];
 const ZERO = /^[\p{Mn}\p{Me}​-‏⁠︀-️]$/u, EMOJI = /^\p{Emoji_Presentation}$/u;
-const widths = new Map();
+const widths = new Map<number, number>();
 /* The cells code point CP takes: 0 (combining marks, joiners, variation selectors), 2 (East Asian wide and
    full-width, emoji presentation) or 1. Tabs and control characters are the caller's (tab stops, ^X). */
-function charWidth(cp) {
+function charWidth(cp: number) {
   if (cp < 0x300) return 1;
   let w = widths.get(cp);
   if (w !== undefined) return w;
@@ -212,17 +231,21 @@ function charWidth(cp) {
   widths.set(cp, w);
   return w;
 }
-function strWidth(s) { let n = 0; for (const ch of s) n += charWidth(ch.codePointAt(0)); return n; }
+function strWidth(s: string) { let n = 0; for (const ch of s) n += charWidth(ch.codePointAt(0)!); return n; }
 
 /* A grid of cells: CH holds each cell's text ('' in the right half of a wide character), FC its classes. */
 class Grid {
-  constructor(cols, rows) {
+  declare cols: number;
+  declare rows: number;
+  declare ch: string[][];
+  declare fc: string[][];
+  constructor(cols: number, rows: number) {
     this.cols = cols; this.rows = rows; this.ch = []; this.fc = [];
     for (let y = 0; y < rows; y++) { this.ch.push(new Array(cols).fill(' ')); this.fc.push(new Array(cols).fill('default')); }
   }
   /* Write T (W cells) at X, Y with classes K; returns the next column. A cell out of bounds is skipped, and a wide
      character cut by the edge LIM becomes a space. */
-  put(x, y, t, w, k, lim = this.cols) {
+  put(x: number, y: number, t: string, w: number, k: string, lim = this.cols) {
     if (y < 0 || y >= this.rows) return x + w;
     if (w === 0) { if (x > 0 && x <= lim && this.ch[y][x - 1] !== '') this.ch[y][x - 1] += t; return x; }
     if (x < 0 || x + w > lim) { for (let i = 0; i < w; i++) if (x + i >= 0 && x + i < lim) this.cell(x + i, y, ' ', k); return x + w; }
@@ -230,18 +253,18 @@ class Grid {
     for (let i = 1; i < w; i++) this.cell(x + i, y, '', k);
     return x + w;
   }
-  cell(x, y, t, k) {
+  cell(x: number, y: number, t: string, k: string) {
     const row = this.ch[y];
     if (row[x] === '' && x > 0 && t !== '') row[x - 1] = ' ';        // over the right half of a wide character
     if (x + 1 < this.cols && row[x + 1] === '' && t !== '' && strWidth(row[x]) === 2) row[x + 1] = ' ';  // over its left half
     row[x] = t; this.fc[y][x] = k;
   }
-  text(x, y, s, k, lim = this.cols) { for (const ch of s) { if (x >= lim) break; x = this.put(x, y, ch, charWidth(ch.codePointAt(0)), k, lim); } return x; }
-  fill(x, y, n, k) { for (let i = 0; i < n; i++) if (x + i >= 0 && x + i < this.cols && y >= 0 && y < this.rows) this.cell(x + i, y, ' ', k); }
-  addClass(x, y, c) { if (y >= 0 && y < this.rows && x >= 0 && x < this.cols) this.fc[y][x] += ' ' + c; }
+  text(x: number, y: number, s: string, k: string, lim = this.cols) { for (const ch of s) { if (x >= lim) break; x = this.put(x, y, ch, charWidth(ch.codePointAt(0)!), k, lim); } return x; }
+  fill(x: number, y: number, n: number, k: string) { for (let i = 0; i < n; i++) if (x + i >= 0 && x + i < this.cols && y >= 0 && y < this.rows) this.cell(x + i, y, ' ', k); }
+  addClass(x: number, y: number, c: string) { if (y >= 0 && y < this.rows && x >= 0 && x < this.cols) this.fc[y][x] += ' ' + c; }
   /* Row Y as segments {x, w, text, f}: runs of equal classes, F from FACE (classes -> face index). */
-  segments(y, face) {
-    const row = this.ch[y], fr = this.fc[y], out = [];
+  segments(y: number, face: (k: string) => number) {
+    const row = this.ch[y], fr = this.fc[y], out: EdSegment[] = [];
     let x = 0;
     while (x < this.cols) {
       const k = fr[x];
@@ -257,32 +280,32 @@ class Grid {
 /* The glyphs of one rendered line (renderBuffer with runs): {t, w, p, k, cur} each, where T is what is shown, W
    its cells, P its offset in the line, K its classes. A tab reaches the next stop of 8, a control character shows
    as ^X, hidden markup takes no cell, and the cursor's own classes are dropped (the backend draws it). */
-const glyphCache = new WeakMap();   // a line's runs (renderBuffer reuses them for an unchanged line) -> its glyphs
-function glyphsOf(line) {
-  const hit = glyphCache.get(line.runs);
+const glyphCache = new WeakMap<EdRun[], DispGlyph[]>();   // a line's runs (renderBuffer reuses them for an unchanged line) -> its glyphs
+function glyphsOf(line: EdRenderedLine) {
+  const hit = glyphCache.get(line.runs!);
   if (hit) return hit;
   const out = glyphsOf1(line);
-  glyphCache.set(line.runs, out);
+  glyphCache.set(line.runs!, out);
   return out;
 }
-function glyphsOf1(line) {
-  const text = line.text, out = [];
+function glyphsOf1(line: EdRenderedLine) {
+  const text = line.text!, out: DispGlyph[] = [];
   let col = 0, pos = 0;
-  const push = (t, w, p, k, cur) => { out.push({ t, w, p, k, cur }); col += w; };
-  for (const r of line.runs) {
+  const push = (t: string, w: number, p: number, k: string, cur: boolean) => { out.push({ t, w, p, k, cur }); col += w; };
+  for (const r of line.runs!) {
     const isCur = r.k === 'cur';
     const k = isCur ? r.cls.split(' ').filter(c => c && !CURSOR_CLS.has(c)).join(' ') : r.cls;
-    if (r.k === 'eol' || r.k === 'ell') { for (const ch of r.t) push(ch, charWidth(ch.codePointAt(0)), r.s, k, false); continue; }
+    if (r.k === 'eol' || r.k === 'ell') { for (const ch of r.t!) push(ch, charWidth(ch.codePointAt(0)!), r.s, k, false); continue; }
     if (isCur && r.e === r.s) { push(' ', 1, r.s, k, true); continue; }
-    if (r.k === 'avy') { let p = r.s; for (const ch of r.t) { push(ch, charWidth(ch.codePointAt(0)), p, k, false); p += ch.length; } pos = Math.max(pos, r.e); continue; }
+    if (r.k === 'avy') { let p = r.s; for (const ch of r.t!) { push(ch, charWidth(ch.codePointAt(0)!), p, k, false); p += ch.length; } pos = Math.max(pos, r.e); continue; }
     const sp = special(k);
     for (let i = Math.max(r.s, pos); i < r.e;) {
-      const cp = text.codePointAt(i), n = cp > 0xffff ? 2 : 1;
-      let t, w;
+      const cp = text.codePointAt(i)!, n = cp > 0xffff ? 2 : 1;
+      let t: string, w: number;
       if (cp === 9) { w = 8 - (col % 8); t = ' '.repeat(w); }
       else if (cp < 0x20 || cp === 0x7f) { t = '^' + String.fromCharCode(cp ^ 0x40); w = 2; }
       else { t = String.fromCodePoint(cp); w = charWidth(cp); }
-      if (sp && !isCur) { if (sp.hide) { t = ''; w = 0; } else if (sp.glyph) { t = sp.glyph; w = charWidth(sp.glyph.codePointAt(0)); } }
+      if (sp && !isCur) { if (sp.hide) { t = ''; w = 0; } else if (sp.glyph) { t = sp.glyph; w = charWidth(sp.glyph.codePointAt(0)!); } }
       if (w === 0 && t && out.length && !isCur) out[out.length - 1].t += t;
       else push(t || '', w, i, k, isCur);
       i += n; pos = i;
@@ -293,10 +316,10 @@ function glyphsOf1(line) {
 const CURSOR_CLS = new Set(['cur', 'bar', 'hbar', 'half', 'ghost']);
 /* Break glyphs G into rows of COLS cells, as the page wraps a line (white-space: pre-wrap with overflow-wrap:
    anywhere): after the last space that fits, else anywhere. With NOWRAP the line is one row. */
-function wrap(g, cols, nowrap) {
+function wrap<G extends EdGlyph>(g: G[], cols: number, nowrap?: boolean) {
   if (nowrap) return [g];
-  const rows = [];
-  let row = [], w = 0;
+  const rows: G[][] = [];
+  let row: G[] = [], w = 0;
   for (const x of g) {
     if (w + x.w > cols && row.length) {
       let j = row.length - 1;
@@ -314,8 +337,8 @@ function wrap(g, cols, nowrap) {
 /* ---------- laying out a frame ---------- */
 /* The window rectangles of the tree NODE in the area X, Y, W, H: siblings share the room equally, as the page's
    flex layout does; side-by-side windows have a one-cell divider between them (DIVS). */
-function layout(node, x, y, w, h, out, divs) {
-  if (node instanceof Ed.Window) { out.push({ win: node, x, y, w, h }); return; }
+function layout(node: EdWindowNode, x: number, y: number, w: number, h: number, out: DispRect[], divs: DispDivider[]) {
+  if (node instanceof Ed.Window) { out.push({ win: node, x, y, w, h } as DispRect); return; }
   const n = node.children.length;
   if (node.dir === 'h') {
     const avail = Math.max(0, w - (n - 1));
@@ -330,16 +353,16 @@ function layout(node, x, y, w, h, out, divs) {
     node.children.forEach((c, i) => { const ch = Math.floor(h * (i + 1) / n) - Math.floor(h * i / n); layout(c, x, cy, w, ch, out, divs); cy += ch; });
   }
 }
-const SHAPES = { '': 'box', bar: 'bar', hbar: 'hbar', half: 'half' };
-function cursorColor(state, theme) {
+const SHAPES: Record<string, EdCursorShape> = { '': 'box', bar: 'bar', hbar: 'hbar', half: 'half' };
+function cursorColor(state: string | null, theme: DispTheme) {
   const tok = state === 'normal' || state === 'motion' || state === 'operator' ? 'cursor-normal' : state ? 'cursor-' + state : 'cursor';
   const c = chainColor([tok, 'cursor'], theme), fg = state && state !== 'insert' && state !== 'replace' && state !== 'visual' ? '#ffffff' : null;
-  return { color: toHex(c), fg: fg || toHex(chainColor('cursor-fg', theme)) };
+  return { color: toHex(c as DispRGBA), fg: fg || toHex(chainColor('cursor-fg', theme) as DispRGBA) };
 }
 
 /* Draw window R (a rectangle from layout) into G; ST is its windowState. Fills R.map (each text row's buffer
    positions, for posAt) and returns where its cursor went. */
-function drawWindow(g, r, st) {
+function drawWindow(g: Grid, r: DispRect, st: EdWindowState): { x: number; y: number } | null {
   const w = r.win, { b, selected, numbers, nowrap, centered, pt, opts } = st;
   const textRows = Math.max(0, r.h - 1);
   const total = Ed.lineCountB(b);
@@ -348,7 +371,7 @@ function drawWindow(g, r, st) {
   if (centered) { const cap = Number(host.page.getVar('center-cols')) || 100; if (cols > cap) { x0 += Math.floor((cols - cap) / 2); cols = cap; } }
   const ptLine = Ed.vLineNo(b, pt);
   let startLine = Ed.scrollStart(w, b, ptLine, Math.max(1, textRows), selected);
-  let lines, laid, curRow = -1;
+  let lines!: EdRenderedLines, laid!: DispLaid[], curRow = -1;
   for (let tries = 0; tries < 4; tries++) {
     w.start = Ed.vLineStart(b, startLine);
     lines = Ed.renderBuffer(b, { ...opts, runs: true, html: false, from: w.start, count: Math.max(1, textRows) + 1, cache: w._mcache });
@@ -372,7 +395,7 @@ function drawWindow(g, r, st) {
      view: the rows above it are skipped. */
   let skip = textRows > 0 && curRow >= textRows ? curRow - textRows + 1 : 0;
   r.map = []; r.textX = x0; r.textW = cols;
-  let y = r.y, shownLines = 0, cursor = null;
+  let y = r.y, shownLines = 0, cursor: { x: number; y: number } | null = null;
   for (const x of laid) {
     if (y >= r.y + textRows) break;
     const l = x.line, rowBase = l.cl && selected ? 'default cl' : 'default';
@@ -397,7 +420,7 @@ function drawWindow(g, r, st) {
         cx += gl.w;
       }
       const last = i === x.rows.length - 1;
-      r.map.push({ y, pos, end: last ? l.o + l.text.length : lastP, endX: Math.max(0, Math.min(r.w - 1, x0 - r.x + cx)) });
+      r.map.push({ y, pos, end: last ? l.o + l.text!.length : lastP, endX: Math.max(0, Math.min(r.w - 1, x0 - r.x + cx)) });
       y++;
     });
   }
@@ -408,7 +431,7 @@ function drawWindow(g, r, st) {
   if (r.h >= 1) drawModeline(g, r, Ed.modelineFields(w, st, ptLine), selected);
   return cursor;
 }
-function drawModeline(g, r, ml, selected) {
+function drawModeline(g: Grid, r: DispRect, ml: EdModelineFields, selected: boolean) {
   const y = r.y + r.h - 1, base = selected ? 'modeline' : 'modeline inactive', lim = r.x + r.w;
   g.fill(r.x, y, r.w, base);
   let x = r.x;
@@ -423,12 +446,12 @@ function drawModeline(g, r, ml, selected) {
 /* The echo area's rows: the minibuffer line and its candidates, the bindings of a pending prefix, or the message,
    at most MAX rows. Returns {rows: [painter(g, y)], cursor}; painting the rows sets cursor ({x, row}) when the
    minibuffer shows one. */
-function echoRows(f, look, cols, max) {
-  const rows = [], out = { rows, cursor: null };
+function echoRows(f: EdFrame, look: EdLook, cols: number, max: number) {
+  const rows: DispPainter[] = [], out: DispEcho = { rows, cursor: null };
   if (E.mini) {
     const v = Ed.miniView();
     const lines = Ed.renderBuffer(E.minibuf, { active: E.focused, lines: false, cursorClass: 'bar', runs: true, html: false });
-    const gl = [];
+    const gl: DispEchoGlyph[] = [];
     lines.forEach((l, i) => { if (i) gl.push({ t: '^J', w: 2, p: -1, k: '' }); gl.push(...glyphsOf(l)); });
     const head = (v.count !== null ? Math.max(7, strWidth(v.count) + 1) : 0) + strWidth(v.prompt);
     const flashW = v.flash ? 1 + strWidth(v.flash) : 0, room = Math.max(1, cols - head - flashW);
@@ -465,9 +488,9 @@ function echoRows(f, look, cols, max) {
   }
   const v = Ed.echoView(look);
   if (v.which) {
-    const items = look.prefixWait ? [] : look.prefixItems || [];
-    const flow = [];   // rows of [x, text, classes]
-    let row = [[0, (look.showcmd || '') + '-', 'echo wkp']], x = strWidth((look.showcmd || '') + '-') + 2;
+    const items = look.prefixWait ? [] : look.prefixItems as [string, string][] | undefined || [];
+    const flow: [number, string, string][][] = [];   // rows of [x, text, classes]
+    let row: [number, string, string][] = [[0, (look.showcmd || '') + '-', 'echo wkp']], x = strWidth((look.showcmd || '') + '-') + 2;
     for (const [k, d] of items) {
       const w = strWidth(k) + 1 + strWidth(d);
       if (x + w > cols && row.length) { flow.push(row); row = []; x = 0; }
@@ -478,10 +501,10 @@ function echoRows(f, look, cols, max) {
     for (const fr of flow.slice(0, max)) rows.push((g, y) => { g.fill(0, y, cols, 'echo'); for (const [x1, s, c] of fr) g.text(x1, y, s, c); });
     return out;
   }
-  const parts = [];
+  const parts: string[] = [];
   for (const ln of v.text.split('\n')) {
     let cur = '', w = 0;
-    for (const ch of ln) { const cw = charWidth(ch.codePointAt(0)); if (w + cw > cols) { parts.push(cur); cur = ''; w = 0; } cur += ch; w += cw; }
+    for (const ch of ln) { const cw = charWidth(ch.codePointAt(0)!); if (w + cw > cols) { parts.push(cur); cur = ''; w = 0; } cur += ch; w += cw; }
     parts.push(cur);
   }
   for (const s of parts.slice(0, Math.max(1, max))) rows.push((g, y) => { g.fill(0, y, cols, 'echo'); g.text(0, y, s, 'echo'); });
@@ -489,7 +512,7 @@ function echoRows(f, look, cols, max) {
 }
 
 /* The completion popup (corfu) under the cursor of the selected window, or above it when it does not fit. */
-function drawCorfu(g, cur, limitY) {
+function drawCorfu(g: Grid, cur: { x: number; y: number } | null, limitY: number) {
   const c = E.corfu;
   if (!c || E.mini || !cur) return;
   const N = Math.max(3, Number(L.get('corfu-count')) || 10);
@@ -510,20 +533,20 @@ function drawCorfu(g, cur, limitY) {
 }
 
 /* Cells of window R that show buffer positions in the set (or predicate) HIT get class CLS. */
-function markCells(g, r, hit, cls) {
+function markCells(g: Grid, r: DispRect, hit: (p: number) => boolean, cls: string) {
   for (const row of r.map) for (let i = 0; i < row.pos.length; i++) { const p = row.pos[i]; if (p >= 0 && hit(p)) g.addClass(r.x + i, row.y, cls); }
 }
-const AGENT_FADE_MS = 5000;   // as sync.js: an agent's cursor fades after five seconds (R9.13)
-function presenceOf(g, rects, out) {
+const AGENT_FADE_MS = 5000;   // as sync.ts: an agent's cursor fades after five seconds (R9.13)
+function presenceOf(g: Grid, rects: DispRect[], out: EdDisplayModel['presence']) {
   const now = Date.now();
   let fadeDue = 0;
   for (const r of rects) {
     const b = r.win.buffer;
     if (!b.presence || !b.presence.length) continue;
     for (const p of b.presence) {
-      if (p.agent) { const left = AGENT_FADE_MS - (now - p.at); if (left <= 0) continue; fadeDue = fadeDue ? Math.min(fadeDue, left) : left; }
+      if (p.agent) { const left = AGENT_FADE_MS - (now - (p.at as number)); if (left <= 0) continue; fadeDue = fadeDue ? Math.min(fadeDue, left) : left; }
       const pc = parseColor(p.color), col = pc ? toHex(pc) : '#888888';   // a class token cannot hold spaces: hex
-      for (const [from, to] of p.ranges) {
+      for (const [from, to] of p.ranges as [number, number][]) {
         if (from === to) {
           for (const row of r.map) {
             let i = row.pos.indexOf(from);
@@ -538,20 +561,20 @@ function presenceOf(g, rects, out) {
 }
 
 /* The model of frame F (the frame being drawn: withFrame). */
-function frameModel(f) {
-  const size = f.backend.size() || {}, cols = Math.max(1, size.cols | 0), rows = Math.max(1, size.rows | 0);
-  const theme = f.theme || f.backend.theme || (host.page.prefersDark && host.page.prefersDark() ? 'dark' : 'light');
+function frameModel(f: EdFrame): EdDisplayModel {
+  const size: { cols?: number; rows?: number } = f.backend!.size() || {}, cols = Math.max(1, size.cols! | 0), rows = Math.max(1, size.rows! | 0);
+  const theme = f.theme || f.backend!.theme || (host.page.prefersDark && host.page.prefersDark() ? 'dark' : 'light');
   const g = new Grid(cols, rows);
-  const wins = Ed.windowList(), states = new Map(wins.map(w => [w, Ed.windowState(w)]));
-  const look = states.get(E.sel) ? states.get(E.sel).look : {};
+  const wins = Ed.windowList(), states = new Map<EdWindow, EdWindowState>(wins.map(w => [w, Ed.windowState(w)]));
+  const look = states.get(E.sel!) ? states.get(E.sel!)!.look : {};
   const echo = echoRows(f, look, cols, Math.max(1, Math.floor(rows / 2)));
   const winH = Math.max(0, rows - echo.rows.length);
-  const rects = [], divs = [];
-  layout(E.root, 0, 0, cols, winH, rects, divs);
-  let cursor = null;
-  const ghosts = [];
+  const rects: DispRect[] = [], divs: DispDivider[] = [];
+  layout(E.root!, 0, 0, cols, winH, rects, divs);
+  let cursor: EdDisplayModel['cursor'] = null;
+  const ghosts: EdDisplayModel['ghosts'] = [];
   for (const r of rects) {
-    const st = states.get(r.win), c = drawWindow(g, r, st);
+    const st = states.get(r.win)!, c = drawWindow(g, r, st);
     if (!c) continue;
     if (st.selected && !E.mini) {   // the frame's own cursor, hollow while the frame does not have the keyboard
       const state = st.look.state || null;
@@ -562,10 +585,10 @@ function frameModel(f) {
   for (const d of divs) for (let y = d.y; y < d.y + d.h && y < winH; y++) g.put(d.x, y, '│', 1, 'default rule');
   echo.rows.forEach((paint, i) => paint(g, winH + i));
   if (echo.cursor && E.mini) cursor = { x: echo.cursor.x, y: winH + echo.cursor.row, shape: f.focused ? 'bar' : 'hollow', ...cursorColor(null, theme) };
-  /* Snipe matches in the selected window (stack.js boxes them on the page). */
+  /* Snipe matches in the selected window (stack.ts boxes them on the page). */
   const h = E.snipeHl, sr = rects.find(r => r.win === E.sel);
   if (h && sr && sr.win.buffer === h.b && !E.mini && h.str) {
-    const t = h.b.rope, fold = h.str === h.str.toLowerCase(), hits = new Set();
+    const t = h.b.rope, fold = h.str === h.str.toLowerCase(), hits = new Set<number>();
     const first = sr.map.length ? Math.max(0, Math.min(...sr.map.map(m => m.pos.find(p => p >= 0) ?? m.end))) : 0, last = sr.map.length ? sr.map[sr.map.length - 1].end : 0;
     const hay = t.slice(first, Math.min(t.length, last + h.str.length)), nd = fold ? h.str.toLowerCase() : h.str, src = fold ? hay.toLowerCase() : hay;
     for (let k = src.indexOf(nd), n = 0; k >= 0 && n < 200; k = src.indexOf(nd, k + 1), n++) {
@@ -574,13 +597,13 @@ function frameModel(f) {
     }
     if (hits.size) markCells(g, sr, p => hits.has(p), 'snipe');
   }
-  const presence = [];
+  const presence: EdDisplayModel['presence'] = [];
   const fadeDue = presenceOf(g, rects, presence);
   if (fadeDue) { clearTimeout(f._fadeTimer); f._fadeTimer = setTimeout(() => { for (const r of rects) r.win.buffer._presTick = (r.win.buffer._presTick || 0) + 1; Ed.scheduleRender(); }, fadeDue + 20); }
   drawCorfu(g, E.mini ? null : cursor, winH);
   /* Faces: each distinct set of classes resolves once; equal faces share an index. */
-  const faces = [], byJson = new Map(), byKey = new Map();
-  const face = k => {
+  const faces: EdFace[] = [], byJson = new Map<string, number>(), byKey = new Map<string, number>();
+  const face = (k: string) => {
     let i = byKey.get(k);
     if (i !== undefined) return i;
     const fc = resolveFace(k, theme), j = JSON.stringify(fc);
@@ -590,7 +613,7 @@ function frameModel(f) {
     return i;
   };
   face('default');
-  const lines = [];
+  const lines: EdSegment[][] = [];
   for (let y = 0; y < rows; y++) lines.push(g.segments(y, face));
   f._layout = { rects, winH, cols, rows, echoRows: echo.rows.length };
   const sb = E.sel && E.sel.buffer;
@@ -603,14 +626,14 @@ function frameModel(f) {
 H.renderModel = f => {
   const model = frameModel(f);
   f.lastModel = model;
-  f.backend.draw(model);
+  f.backend!.draw(model);
 };
 
 /* What is at cell X, Y of model frame F as last drawn: {area: 'text', window, pos} (pos the buffer position
    under the cell, or the end of the row past its text), {area: 'modeline', window}, {area: 'divider'},
    {area: 'echo'}, or null outside the frame. A backend maps a mouse click with it. */
-function posAt(f, x, y) {
-  const lay = f && f._layout;
+function posAt(f: EdFrame, x: number, y: number): EdDisplayHit {
+  const lay = f && f._layout as DispLayout | undefined;
   if (!lay || x < 0 || y < 0 || x >= lay.cols || y >= lay.rows) return null;
   if (y >= lay.winH) return { area: 'echo' };
   for (const r of lay.rects) {
@@ -626,8 +649,8 @@ function posAt(f, x, y) {
   return { area: 'divider' };
 }
 /* The backend's size or theme changed: draw again. */
-function redraw(f) { if (f && f.backend) { f._rkey = null; Ed.scheduleRender(); } }
-function setTheme(f, theme) { f.theme = theme === 'dark' ? 'dark' : theme === 'light' ? 'light' : null; redraw(f); }
+function redraw(f: EdFrame) { if (f && f.backend) { f._rkey = null; Ed.scheduleRender(); } }
+function setTheme(f: EdFrame, theme: string | null) { f.theme = theme === 'dark' ? 'dark' : theme === 'light' ? 'light' : null; redraw(f); }
 
 /* ---------- input: what a backend reports, as the page's frame wiring does it (wire in editor-prims) ----------
    input(f, ev) takes one event in cell terms:
@@ -637,10 +660,10 @@ function setTheme(f, theme) { f.theme = theme === 'dark' ? 'dark' : theme === 'l
      {type: 'mouse', action, x, y, button}  action down, drag, up or wheel (dy: +1 down, -1 up), button 0 = left
      {type: 'resize'}                       backend.size() changed */
 const WHEEL_LINES = 3;
-function input(f, ev) {
+function input(f: EdFrame, ev: EdDisplayEvent) {
   if (!f || !f.backend || !ev) return;
   const take = () => { if (E.frames.includes(f) && E.frame !== f) Ed.selectFrame(f); };
-  const hook = name => { try { L.resetOps(); L.runHook(name); } catch (e) { Ed.reportError(e); } };
+  const hook = (name: string) => { try { L.resetOps(); L.runHook(name); } catch (e) { Ed.reportError(e); } };
   switch (ev.type) {
     case 'key': take(); Ed.feedKey(ev.key); return;
     case 'paste': if (!ev.text) return; take(); E.pasteText = ev.text; Ed.feedKey('<cmd:clipboard-yank>'); return;
@@ -653,7 +676,7 @@ function input(f, ev) {
     case 'mouse': mouse(f, ev, take); return;
   }
 }
-function mouse(f, ev, take) {
+function mouse(f: EdFrame, ev: DispMouseEvent, take: () => void) {
   const st = f._mouse || (f._mouse = { from: null, win: null });
   if (ev.action === 'up') { st.from = null; st.win = null; return; }
   const at = posAt(f, ev.x, ev.y);
@@ -666,7 +689,7 @@ function mouse(f, ev, take) {
   }
   if (ev.action === 'drag') {
     if (st.from === null || !at || at.window !== st.win || at.area !== 'text' || E.frame !== f) return;
-    const b = st.win.buffer;
+    const b = st.win!.buffer;
     if (H.mouseDrag) H.mouseDrag(b, st.from, at.pos);
     else { b.mark = st.from; b.pt = at.pos; b.markActive = at.pos !== st.from; }
     Ed.render(); return;

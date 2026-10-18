@@ -6,12 +6,72 @@
    so the chat code never sees provider details. The Scheme API is documented at the top of ai.scm. */
 (function () {
 'use strict';
+/* the neutral request every backend takes, and what it answers */
+type AIMessage = { role: 'system' | 'user' | 'assistant'; content: string };
+type AIToolCtx = { signal?: AbortSignal };
+/* a page tool: INPUT is the model's JSON object */
+type AITool = { name: string; description: string; inputSchema: object; execute: (input: Record<string, unknown>, ctx?: AIToolCtx) => unknown };
+type AIRequest = {
+  messages: AIMessage[]; tools: AITool[]; modelTier: string; backend: string | null; presetBackend: string | null; presetModel: string | null; maxRounds: number;
+  temperature?: number; maxTokens?: number; effort?: string; model?: string;
+};
+/* the request a backend streams: send has chosen the model */
+type AIStreamRequest = AIRequest & { model: string };
+type AIStreamOpts = { onText: (text: string) => void; signal?: AbortSignal };
+type AIResult = { text: string; truncated?: boolean; tier?: string; usage?: unknown; rounds?: number };
+type AISendResult = AIResult & { backend: AIBackend; model: string; tried: string[] };
+/* true, or why the backend cannot answer here */
+type AIAvail = true | string;
+type AIBackendBase = {
+  name: string; models: string[];
+  _avail?: AIAvail | Promise<AIAvail>;
+  available(): AIAvail | Promise<AIAvail>;
+  stream(req: AIStreamRequest, o: AIStreamOpts): Promise<AIResult>;
+};
+type AIClaudeBackend = AIBackendBase & { kind: 'claude' };
+type AIHttpBackend = AIBackendBase & { kind: 'openai' | 'anthropic'; key?: SchemeValue; url: string; streamOn: boolean; headers: Record<string, string> };
+type AIMcpBackend = AIBackendBase & { kind: 'mcp'; server: string; tool: string };
+type AIBackend = AIClaudeBackend | AIHttpBackend | AIMcpBackend;
+/* what the gptel-make-* constructors take (the plist, keys camelCased) */
+type AIBackendOpts = { name?: string; host?: string; endpoint?: string; protocol?: string; key?: SchemeValue; models?: string[]; stream?: boolean; headers?: Record<string, string>; server?: string; tool?: string };
+type AIPreset = {
+  name: string; description: string; system: string; backend: string | null; model: string | null; modelTier: string;
+  temperature: number | undefined; maxTokens: number | undefined; tools: string[]; memory: boolean;
+};
+type AIPresetPlist = { description?: string; system?: string; backend?: string; model?: string; modelTier?: string; temperature?: unknown; maxTokens?: unknown; tools?: unknown; memory?: SchemeValue };
+type AIErrorOpts = { exhausted?: boolean; transient?: boolean; text?: string; status?: number };
+/* an error object in a provider's answer */
+type AIErrorBody = { message?: string; type?: string; code?: string };
+/* the artifact's sample and mcp capabilities, as this file calls them */
+type AISampleOpts = {
+  signal?: AbortSignal; cache: boolean; onText: (u: { text: string }) => void; modelTier?: string; model?: string; effort?: string;
+  tools?: { name: string; description: string; inputSchema: object; execute: (input: Record<string, unknown>, ctx?: AIToolCtx) => unknown }[];
+};
+type AISample = (turns: { role: string; content: string }[], opts: AISampleOpts) => Promise<{ text: string; truncated?: boolean; modelTierApplied?: string }>;
+type AIMcpResult = { payload?: unknown; content?: unknown };
+type AIMcp = { callTool(server: string, tool: string, args: unknown, opts: { signal?: AbortSignal }): Promise<AIMcpResult> };
+/* OpenAI chat completions: a streamed chunk or the whole answer */
+type AIOpenAIToolCall = { index?: number; id?: string; function?: { name?: string; arguments?: string } };
+type AIOpenAIMsg = { content?: string | null; tool_calls?: AIOpenAIToolCall[] };
+type AIOpenAIAnswer = { error?: AIErrorBody; usage?: unknown; choices?: { finish_reason?: string | null; delta?: AIOpenAIMsg; message?: AIOpenAIMsg }[] };
+type AIOpenAIWireMsg = { role: string; content: string | null; tool_calls?: unknown[]; tool_call_id?: string };
+/* the Messages API: a stream event or the whole answer */
+type AIAnthropicEvent = {
+  type: string; index: number; content_block: { type: string; id?: string; name?: string; text?: string };
+  delta: { type?: string; text: string; partial_json: string; stop_reason?: string }; usage?: unknown; error?: AIErrorBody;
+};
+type AIAnthropicAnswer = { type: string; error?: AIErrorBody; stop_reason: string | null; usage?: unknown; content?: { type: string; text?: string; id?: string; name?: string; input?: unknown }[] };
+type AIAnthropicBlock = { type: string; id?: string; name?: string; text?: string; json?: string };
+type AIActive = { ctl: AbortController; backend: string; phase: string };
+type AIRegion = { readonly s: number; readonly e: number; set(text: string): void; reset(pos: number): void; release(): void };
+type AIRewrite = { b: EdBuffer; s: number; e: number; text: string; tail: number };
+type AIChatTurn = { role: 'user' | 'assistant'; label?: string; lines: string[] };
 const L = globalThis.L, Ed = globalThis.Ed, E = Ed.E, H = Ed.hooks, EC = globalThis.EvilCore;
 const { intern, signal, truthy, listOf, arr, NIL, Sym } = L;
 const { D, CMD } = L;
 const cur = () => E.current;
 const { bol, eol } = Ed;
-const str = x => { if (typeof x !== 'string') signal('wrong-type-argument', 'expected a string, got', x); return x; };
+const str = (x: SchemeValue): string => { if (typeof x !== 'string') signal('wrong-type-argument', 'expected a string, got', x); return x as string; };
 const KEY_PFX = 'gptel/keys/';          // where older versions kept keys, as files (migrated at load)
 const SECRET_PFX = 'lmacs:secret:gptel/'; // storage prefix outside the file namespace
 const SANDBOX = 'blocked by the artifact sandbox: run Edwin from your own host, or use an mcp backend';
@@ -28,46 +88,51 @@ L.defvar('gptel-max-rounds', 8, 'Most tool rounds one request may make.');
 
 /* ---------- errors: one shape for every provider ---------- */
 class AIError extends Error {
-  constructor(code, message, opts) { super(message); this.code = code; this.exhausted = !!(opts && opts.exhausted); this.transient = !!(opts && opts.transient); this.text = opts && opts.text || ''; this.status = opts && opts.status; }
+  declare code: string;
+  declare exhausted: boolean;
+  declare transient: boolean;
+  declare text: string;
+  declare status: number | undefined;
+  constructor(code: string, message: string, opts?: AIErrorOpts) { super(message); this.code = code; this.exhausted = !!(opts && opts.exhausted); this.transient = !!(opts && opts.transient); this.text = opts && opts.text || ''; this.status = opts && opts.status; }
 }
-const cancelled = text => new AIError('cancelled', 'Aborted', { text });
-const isAbort = e => e && (e.name === 'AbortError' || e.code === 'cancelled');
+const cancelled = (text?: string) => new AIError('cancelled', 'Aborted', { text });
+const isAbort = (e: { name?: unknown; code?: unknown } | null | undefined) => e && (e.name === 'AbortError' || e.code === 'cancelled');
 const QUOTA_RE = /quota|credit|billing|balance|limit|exhaust|usage|insufficient/i;
 /* Classify an HTTP failure: 429, and 402/403 with a quota message, are exhaustion; 5xx (529 overloaded
    included) and 408 mean the backend is down for now. Both are worth a fallback. */
-function httpError(status, bodyText, url) {
+function httpError(status: number, bodyText: string, url: string) {
   let msg = bodyText;
-  try { const j = JSON.parse(bodyText); msg = (j.error && (j.error.message || j.error.type)) || j.message || j.detail || bodyText; } catch (e) { /* plain text */ }
+  try { const j = JSON.parse(bodyText) as { error?: AIErrorBody; message?: string; detail?: string }; msg = (j.error && (j.error.message || j.error.type)) || j.message || j.detail || bodyText; } catch (e) { /* plain text */ }
   msg = String(msg || '').replace(/\s+/g, ' ').slice(0, 300);
   const exhausted = status === 429 || ((status === 402 || status === 403) && QUOTA_RE.test(msg));
   const hint = status === 401 ? ' (set a key with M-x gptel-set-api-key)' : '';
   return new AIError(exhausted ? 'rate_limited' : 'http', `HTTP ${status} from ${hostOf(url)}: ${msg}${hint}`, { exhausted, status, transient: status >= 500 || status === 408 });
 }
-const hostOf = url => { try { return new URL(url).host; } catch (e) { return url; } };
+const hostOf = (url: string) => { try { return new URL(url).host; } catch (e) { return url; } };
 /* An error event inside a stream: overloaded or server-side errors are transient. */
-const streamError = (name, err) => new AIError('http', `${name}: ${err && err.message || (err ? JSON.stringify(err) : 'error')}`, { transient: /overload|server|api_error|unavailable|timeout/i.test(String(err && (err.type || err.code) || '')) });
+const streamError = (name: string, err: AIErrorBody | null | undefined) => new AIError('http', `${name}: ${err && err.message || (err ? JSON.stringify(err) : 'error')}`, { transient: /overload|server|api_error|unavailable|timeout/i.test(String(err && (err.type || err.code) || '')) });
 
 /* ---------- the artifact runtime: window.claude and its capabilities ---------- */
 const hasClaude = () => typeof claude !== 'undefined' && claude && typeof claude.use === 'function';
-const caps = new Map();
-function useCap(name) {
+const caps = new Map<string, Promise<unknown>>();
+function useCap(name: string) {
   if (!hasClaude()) return Promise.resolve(null);
   if (!caps.has(name)) caps.set(name, Promise.resolve().then(() => claude.use(name)).catch(() => null));
-  return caps.get(name);
+  return caps.get(name)!;
 }
 /* Hosts the page's CSP refused: the definitive sign of the sandbox. */
-const cspBlocked = new Set();
-Ed.host.onCspViolation(e => { if (e.blockedURI) cspBlocked.add(hostOf(e.blockedURI)); });
+const cspBlocked = new Set<string>();
+Ed.host.onCspViolation((e: { blockedURI?: string }) => { if (e.blockedURI) cspBlocked.add(hostOf(e.blockedURI)); });
 
 /* ---------- API keys: never in init.scm, never files ---------- */
 /* Keys live under their own storage prefix, not in Ed.Store: the Store is the file namespace that
    grep, find-file, recent files and project search list, and the model's grep tool reads it. */
-const secretMem = new Map();
-function getKey(name) {
+const secretMem = new Map<string, string>();
+function getKey(name: string) {
   try { const v = Ed.host.storage.get(SECRET_PFX + name); if (v !== null) return v; } catch (e) { /* no storage */ }
   return secretMem.has(name) ? secretMem.get(name) : null;
 }
-function setKey(name, key) {
+function setKey(name: string, key: string | null | undefined) {
   if (key) { secretMem.set(name, key); try { Ed.host.storage.set(SECRET_PFX + name, key); } catch (e) { /* memory only */ } }
   else { secretMem.delete(name); try { Ed.host.storage.remove(SECRET_PFX + name); } catch (e) { /* memory only */ } }
 }
@@ -78,7 +143,7 @@ function migrateKeys() {
 }
 try { migrateKeys(); } catch (e) { console.error(e); }
 /* :key may be a string, a procedure returning a string, or 'store (the stored key). Absent means stored. */
-function keyOf(b) {
+function keyOf(b: AIHttpBackend) {
   const k = b.key;
   if (typeof k === 'function') { const v = L.apply(k, []); return typeof v === 'string' && v ? v : null; }
   if (typeof k === 'string' && k !== 'store') return k;
@@ -86,9 +151,9 @@ function keyOf(b) {
 }
 
 /* ---------- helpers shared by the HTTP backends ---------- */
-const joinRounds = (a, b) => a && b ? a + '\n\n' + b : a || b;
-async function doFetch(b, url, headers, body, signal) {
-  let resp;
+const joinRounds = (a: string, b: string) => a && b ? a + '\n\n' + b : a || b;
+async function doFetch(b: AIBackend, url: string, headers: Record<string, string>, body: unknown, signal: AbortSignal | undefined) {
+  let resp: Response;
   try { resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal, mode: 'cors' }); }
   catch (e) {
     if (isAbort(e)) throw cancelled();
@@ -99,30 +164,30 @@ async function doFetch(b, url, headers, body, signal) {
   return resp;
 }
 /* Read a text/event-stream body, calling onData with each non-empty data: payload (except [DONE]). */
-async function readSSE(resp, onData) {
-  const reader = resp.body.getReader(), dec = new TextDecoder();
+async function readSSE(resp: Response, onData: (d: string) => void) {
+  const reader = resp.body!.getReader(), dec = new TextDecoder();
   let buf = '';
-  const line = l => { l = l.replace(/\r$/, ''); if (l.startsWith('data:')) { const d = l.slice(5).trim(); if (d && d !== '[DONE]') onData(d); } };
+  const line = (l: string) => { l = l.replace(/\r$/, ''); if (l.startsWith('data:')) { const d = l.slice(5).trim(); if (d && d !== '[DONE]') onData(d); } };
   try {
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
       buf += dec.decode(value, { stream: true });
-      let k;
+      let k: number;
       while ((k = buf.indexOf('\n')) >= 0) { line(buf.slice(0, k)); buf = buf.slice(k + 1); }
     }
     if (buf) line(buf);
   } catch (e) { if (isAbort(e)) throw cancelled(); throw e; }
 }
-const parseJSON = s => { try { return JSON.parse(s); } catch (e) { return null; } };
+const parseJSON = (s: string): unknown => { try { return JSON.parse(s); } catch (e) { return null; } };
 /* Run one page tool for a provider: the result is a string (an error becomes "Error: ..." so the model carries on). */
-async function runTool(tools, name, input, signal) {
+async function runTool(tools: AITool[] | undefined, name: string | undefined, input: unknown, signal: AbortSignal | undefined) {
   const t = (tools || []).find(x => x.name === name);
   if (!t) return `Error: unknown tool ${name}`;
   if (typeof input === 'string') input = input.trim() ? parseJSON(input) : {};
   if (!input || typeof input !== 'object') return 'Error: tool input is not a JSON object';
   try {
-    const r = await t.execute(input, { signal });
+    const r = await t.execute(input as Record<string, unknown>, { signal });
     const s = typeof r === 'string' ? r : JSON.stringify(r === undefined ? null : r);
     return s.length > 32000 ? s.slice(0, 32000) + '\n[truncated]' : s;
   } catch (e) { return 'Error: ' + (e && e.message || String(e)); }
@@ -130,10 +195,10 @@ async function runTool(tools, name, input, signal) {
 /* Probe the endpoint once per session: any HTTP answer means reachable; a TypeError inside the
    artifact means the page's CSP refused the host. Outside the artifact a failed probe does not block
    (CORS on HEAD differs from POST at some providers): the real request reports its own error. */
-function probeAvailable(b, url) {
+function probeAvailable(b: AIBackend, url: string) {
   if (b._avail !== undefined) return b._avail;
   if (cspBlocked.has(hostOf(url))) return (b._avail = SANDBOX);
-  b._avail = (async () => {
+  b._avail = (async (): Promise<AIAvail> => {
     try { await fetch(url, { method: 'HEAD', mode: 'cors', signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined }); return true; }
     catch (e) { if (hasClaude() || cspBlocked.has(hostOf(url))) return SANDBOX; return true; }
   })().then(v => (b._avail = v));
@@ -141,15 +206,15 @@ function probeAvailable(b, url) {
 }
 
 /* ---------- backends ---------- */
-const backends = {};
-function register(b) { backends[b.name] = b; return b.name; }
+const backends: Record<string, AIBackend> = {};
+function register(b: AIBackend) { backends[b.name] = b; return b.name; }
 
 /* Sample codes that mean "not usable here or right now" (sample.d.ts): another backend may answer. */
 const SAMPLE_TRANSIENT = new Set(['tools_unavailable', 'capability_disabled', 'capability_removed', 'not_declared', 'upstream_error']);
 /* Claude through the artifact's sample capability: no system role, so instructions go in a leading
    user turn; page tools pass straight through; the tier comes from the preset or gptel-model. */
-function makeClaude(o) {
-  const b = {
+function makeClaude(o: AIBackendOpts) {
+  const b: AIClaudeBackend = {
     name: o.name || 'Claude', kind: 'claude', models: ['default', 'quick', 'complex'],
     async available() {
       if (!hasClaude()) return 'Claude is available in the published artifact only';
@@ -157,14 +222,14 @@ function makeClaude(o) {
       return true;
     },
     async stream(req, { onText, signal }) {
-      const sample = await useCap('sample');
+      const sample = await useCap('sample') as AISample | null;
       if (!sample) throw new AIError('unavailable', 'Claude sampling is not available in this view');
       const sys = req.messages.filter(m => m.role === 'system').map(m => m.content).join('\n\n');
-      const turns = [];
+      const turns: { role: string; content: string }[] = [];
       if (sys) turns.push({ role: 'user', content: 'Instructions:\n' + sys });
       for (const m of req.messages) if (m.role === 'user' || m.role === 'assistant') turns.push({ role: m.role, content: m.content });
       if (!turns.length || turns[turns.length - 1].role !== 'user') turns.push({ role: 'user', content: 'Continue.' });
-      const opts = { signal, cache: false, onText: u => onText(u.text) };
+      const opts: AISampleOpts = { signal, cache: false, onText: u => onText(u.text) };
       const tier = ['quick', 'default', 'complex'].includes(req.model) ? req.model : req.modelTier || 'default';
       opts.modelTier = tier;
       if (req.model && req.model !== tier) opts.model = req.model;
@@ -186,17 +251,17 @@ function makeClaude(o) {
 
 /* OpenAI chat completions over fetch, with SSE streaming and the function-calling loop. Also
    covers xAI, OpenRouter, Groq, Mistral, Ollama and llama.cpp. */
-function makeOpenAI(o) {
+function makeOpenAI(o: AIBackendOpts & { name: string }) {
   const host = o.host || 'api.openai.com', endpoint = o.endpoint || '/v1/chat/completions';
   const url = /^https?:\/\//.test(host) ? host + endpoint : `${o.protocol || 'https'}://${host}${endpoint}`;
-  const b = {
+  const b: AIHttpBackend = {
     name: o.name, kind: 'openai', models: o.models || [], key: o.key, url, streamOn: o.stream !== false, headers: o.headers || {},
     available() { return probeAvailable(b, url); },
     async stream(req, { onText, signal }) {
       const key = keyOf(b);
-      const headers = { 'content-type': 'application/json', ...b.headers };
+      const headers: Record<string, string> = { 'content-type': 'application/json', ...b.headers };
       if (key) headers.authorization = 'Bearer ' + key;
-      const msgs = [];
+      const msgs: AIOpenAIWireMsg[] = [];
       for (const m of req.messages) if (m.role === 'system' || m.role === 'user' || m.role === 'assistant') msgs.push({ role: m.role, content: m.content });
       const tools = req.tools && req.tools.length ? req.tools.map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.inputSchema || { type: 'object', properties: {} } } })) : undefined;
       /* OpenAI reasoning models (o-series, gpt-5 except -chat) take only the default temperature, and
@@ -204,24 +269,24 @@ function makeOpenAI(o) {
          compatible servers, and routed names like openai/gpt-5.5, keep max_tokens. */
       const bare = String(req.model || '').replace(/^.*\//, ''), reasoning = /^(o\d|gpt-5)/i.test(bare) && !/-chat/i.test(bare);
       const tokensParam = hostOf(url) === 'api.openai.com' || (reasoning && bare === req.model) ? 'max_completion_tokens' : 'max_tokens';
-      let text = '', usage;
+      let text = '', usage: unknown;
       const maxRounds = req.maxRounds || 8;
       for (let round = 0; round < maxRounds; round++) {
-        const body = { model: req.model, messages: msgs, stream: b.streamOn };
+        const body: Record<string, unknown> = { model: req.model, messages: msgs, stream: b.streamOn };
         if (tools) body.tools = tools;
         if (req.maxTokens) body[tokensParam] = req.maxTokens;
         if (typeof req.temperature === 'number' && !reasoning) body.temperature = req.temperature;
         const resp = await doFetch(b, url, headers, body, signal);
-        let content = '', finish = null;
-        const calls = [];
+        let content = '', finish: string | null = null;
+        const calls: { id: string; name: string; args: string }[] = [];
         if (b.streamOn && /text\/event-stream/.test(resp.headers.get('content-type') || '')) {
           await readSSE(resp, d => {
-            const j = parseJSON(d); if (!j) return;
+            const j = parseJSON(d) as AIOpenAIAnswer | null; if (!j) return;
             if (j.error) throw streamError(b.name, j.error);
             if (j.usage) usage = j.usage;
             const ch = j.choices && j.choices[0]; if (!ch) return;
             if (ch.finish_reason) finish = ch.finish_reason;
-            const delta = ch.delta || ch.message || {};
+            const delta: AIOpenAIMsg = ch.delta || ch.message || {};
             if (typeof delta.content === 'string' && delta.content) { content += delta.content; onText(joinRounds(text, content)); }
             for (const tc of delta.tool_calls || []) {
               const i = typeof tc.index === 'number' ? tc.index : calls.length;
@@ -231,12 +296,12 @@ function makeOpenAI(o) {
             }
           });
         } else {
-          const j = parseJSON(await resp.text());
+          const j = parseJSON(await resp.text()) as AIOpenAIAnswer | null;
           if (!j) throw new AIError('http', `${b.name}: unreadable answer`);
           if (j.error) throw new AIError('http', `${b.name}: ${j.error.message || JSON.stringify(j.error)}`);
           usage = j.usage;
           finish = j.choices && j.choices[0] && j.choices[0].finish_reason || null;
-          const m = j.choices && j.choices[0] && j.choices[0].message || {};
+          const m: AIOpenAIMsg = j.choices && j.choices[0] && j.choices[0].message || {};
           if (typeof m.content === 'string') { content = m.content; onText(joinRounds(text, content)); }
           for (const tc of m.tool_calls || []) calls.push({ id: tc.id || '', name: tc.function && tc.function.name || '', args: tc.function && tc.function.arguments || '' });
         }
@@ -258,18 +323,18 @@ function makeOpenAI(o) {
 }
 
 /* The Anthropic Messages API: x-api-key, SSE content_block events, and the tool_use / tool_result loop. */
-function makeAnthropic(o) {
+function makeAnthropic(o: AIBackendOpts & { name: string }) {
   const host = o.host || 'api.anthropic.com', endpoint = o.endpoint || '/v1/messages';
   const url = /^https?:\/\//.test(host) ? host + endpoint : `${o.protocol || 'https'}://${host}${endpoint}`;
-  const b = {
+  const b: AIHttpBackend = {
     name: o.name, kind: 'anthropic', models: o.models || ['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5'], key: o.key, url, streamOn: o.stream !== false, headers: o.headers || {},
     available() { return probeAvailable(b, url); },
     async stream(req, { onText, signal }) {
       const key = keyOf(b);
-      const headers = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true', ...b.headers };
+      const headers: Record<string, string> = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true', ...b.headers };
       if (key) headers['x-api-key'] = key;
       const system = req.messages.filter(m => m.role === 'system').map(m => m.content).join('\n\n');
-      const msgs = [];
+      const msgs: { role: string; content: string | unknown[] }[] = [];
       for (const m of req.messages) {
         if (m.role !== 'user' && m.role !== 'assistant') continue;
         const last = msgs[msgs.length - 1];
@@ -278,24 +343,24 @@ function makeAnthropic(o) {
       }
       if (!msgs.length || msgs[msgs.length - 1].role !== 'user') msgs.push({ role: 'user', content: 'Continue.' });
       const tools = req.tools && req.tools.length ? req.tools.map(t => ({ name: t.name, description: t.description, input_schema: t.inputSchema || { type: 'object', properties: {} } })) : undefined;
-      let text = '', usage;
+      let text = '', usage: unknown;
       const maxRounds = req.maxRounds || 8;
       for (let round = 0; round < maxRounds; round++) {
-        const body = { model: req.model, max_tokens: req.maxTokens || 4096, messages: msgs, stream: b.streamOn };
+        const body: Record<string, unknown> = { model: req.model, max_tokens: req.maxTokens || 4096, messages: msgs, stream: b.streamOn };
         if (system) body.system = system;
         if (tools) body.tools = tools;
         if (req.effort) body.output_config = { effort: req.effort };
         const resp = await doFetch(b, url, headers, body, signal);
-        const blocks = [];
-        let content = '', stop = null;
-        const addText = s => { if (!s) return; content += s; onText(joinRounds(text, content)); };
+        const blocks: AIAnthropicBlock[] = [];
+        let content = '', stop: string | null | undefined = null;
+        const addText = (s: string | undefined) => { if (!s) return; content += s; onText(joinRounds(text, content)); };
         if (b.streamOn && /text\/event-stream/.test(resp.headers.get('content-type') || '')) {
           await readSSE(resp, d => {
-            const j = parseJSON(d); if (!j) return;
+            const j = parseJSON(d) as AIAnthropicEvent | null; if (!j) return;
             switch (j.type) {
               case 'content_block_start': blocks[j.index] = { type: j.content_block.type, id: j.content_block.id, name: j.content_block.name, text: j.content_block.text || '', json: '' }; break;
               case 'content_block_delta': {
-                const bl = blocks[j.index] || (blocks[j.index] = { type: 'text', text: '', json: '' });
+                const bl = (blocks[j.index] || (blocks[j.index] = { type: 'text', text: '', json: '' })) as AIAnthropicBlock & { text: string; json: string };
                 if (j.delta.type === 'text_delta') { bl.text += j.delta.text; addText(j.delta.text); }
                 else if (j.delta.type === 'input_json_delta') bl.json += j.delta.partial_json;
                 break;
@@ -306,7 +371,7 @@ function makeAnthropic(o) {
             }
           });
         } else {
-          const j = parseJSON(await resp.text());
+          const j = parseJSON(await resp.text()) as AIAnthropicAnswer | null;
           if (!j) throw new AIError('http', `${b.name}: unreadable answer`);
           if (j.type === 'error') throw new AIError('http', `${b.name}: ${j.error && j.error.message || 'error'}`);
           stop = j.stop_reason; usage = j.usage;
@@ -318,14 +383,14 @@ function makeAnthropic(o) {
         text = joinRounds(text, content);
         const uses = blocks.filter(x => x && x.type === 'tool_use');
         if (!uses.length || stop !== 'tool_use') return { text, usage, truncated: stop === 'max_tokens' };
-        const assistant = [];
+        const assistant: { type: string; text?: string; id?: string; name?: string; input?: unknown }[] = [];
         for (const x of blocks) {
           if (!x) continue;
           if (x.type === 'text' && x.text) assistant.push({ type: 'text', text: x.text });
           else if (x.type === 'tool_use') assistant.push({ type: 'tool_use', id: x.id, name: x.name, input: parseJSON(x.json || '{}') || {} });
         }
         msgs.push({ role: 'assistant', content: assistant });
-        const results = [];
+        const results: { type: string; tool_use_id: string | undefined; content: string }[] = [];
         for (const u of uses) {
           if (signal && signal.aborted) throw cancelled(text);
           results.push({ type: 'tool_result', tool_use_id: u.id, content: await runTool(req.tools, u.name, parseJSON(u.json || '{}') || {}, signal) });
@@ -343,8 +408,8 @@ function makeAnthropic(o) {
    result's text blocks. No streaming; page tools are not offered (the connector cannot call back). */
 /* Upstream throttling and outages arrive as server_unavailable (mcp.d.ts); the others mean the connector is not usable from here. */
 const MCP_TRANSIENT = new Set(['server_unavailable', 'server_not_connected', 'server_not_found', 'not_in_manifest', 'upstream_error']);
-function makeMcp(o) {
-  const b = {
+function makeMcp(o: AIBackendOpts & { name: string; server: string }) {
+  const b: AIMcpBackend = {
     name: o.name, kind: 'mcp', server: o.server, tool: o.tool || 'chat', models: o.models || [],
     async available() {
       if (!hasClaude()) return 'Claude connectors are available in the published artifact only';
@@ -352,17 +417,17 @@ function makeMcp(o) {
       return true;
     },
     async stream(req, { onText, signal }) {
-      const mcp = await useCap('mcp');
+      const mcp = await useCap('mcp') as AIMcp | null;
       if (!mcp) throw new AIError('unavailable', 'the mcp capability is not available in this view');
-      let res;
+      let res: AIMcpResult;
       try { res = await mcp.callTool(b.server, b.tool, { messages: req.messages.map(m => ({ role: m.role, content: m.content })), model: req.model }, { signal }); }
       catch (e) {
         if (!e || e.code === undefined) throw e;
         if (e.code === 'cancelled') throw cancelled();
         throw new AIError(e.code, `${b.name}: ${e.message || e.code}`, { exhausted: e.code === 'rate_limited', transient: !!e.retryable || MCP_TRANSIENT.has(e.code) });
       }
-      const p = res && res.payload;
-      const blocksText = c => Array.isArray(c) ? c.filter(x => x && x.type === 'text').map(x => x.text).join('') : typeof c === 'string' ? c : '';
+      const p = (res && res.payload) as string | { text?: unknown; content?: unknown } | null | undefined;
+      const blocksText = (c: unknown) => Array.isArray(c) ? c.filter(x => x && x.type === 'text').map(x => x.text).join('') : typeof c === 'string' ? c : '';
       let text = typeof p === 'string' ? p : p && typeof p.text === 'string' ? p.text : p && p.content !== undefined ? blocksText(p.content) : blocksText(res && res.content);
       text = String(text || '');
       if (!text) throw new AIError('empty', `${b.name}: empty answer`);
@@ -373,19 +438,19 @@ function makeMcp(o) {
   return register(b);
 }
 function mcpManifest() {
-  const servers = new Map();
-  for (const n in backends) { const b = backends[n]; if (b.kind !== 'mcp') continue; if (!servers.has(b.server)) servers.set(b.server, new Set()); servers.get(b.server).add(b.tool); }
+  const servers = new Map<string, Set<string>>();
+  for (const n in backends) { const b = backends[n]; if (b.kind !== 'mcp') continue; if (!servers.has(b.server)) servers.set(b.server, new Set()); servers.get(b.server)!.add(b.tool); }
   return { servers: [...servers].map(([server, tools]) => ({ server, tools: [...tools] })) };
 }
 
 /* ---------- presets and tools, in the neutral form ---------- */
-const presets = {};
-const TOOLS = {};
-function defTool(name, description, inputSchema, execute) { TOOLS[name] = { name, description, inputSchema, execute }; }
+const presets: Record<string, AIPreset> = {};
+const TOOLS: Record<string, AITool> = {};
+function defTool(name: string, description: string, inputSchema: object, execute: AITool['execute']) { TOOLS[name] = { name, description, inputSchema, execute }; }
 /* Feed the key of command NAME at the next safe point: the command loop parked at top level with no
    operator, prefix key, register name or minibuffer waiting for a key. A key fed earlier would be read
    by that reader as its argument and the command would be lost. */
-function feedAtTopLevel(name) {
+function feedAtTopLevel(name: string) {
   const k = `<cmd:${name}>`;
   if (globalThis.EdPool && typeof EdPool.deliver === 'function') EdPool.deliver(() => Ed.feedKey(k));
   else Ed.feedKey(k);
@@ -393,17 +458,17 @@ function feedAtTopLevel(name) {
 /* Confirmations run inside the command loop (the minibuffer is a recursive edit there): the tool
    queues its question and feeds a command key; gptel-confirm asks and answers the promise. An aborted
    request withdraws its question and counts as declined. */
-const confirms = [];
-function confirmInLoop(prompt, signal) {
+const confirms: { prompt: string; resolve: (ok: boolean) => void }[] = [];
+function confirmInLoop(prompt: string, signal: AbortSignal | undefined) {
   if (signal && signal.aborted) return Promise.resolve(false);
-  return new Promise(resolve => {
+  return new Promise<boolean>(resolve => {
     const c = { prompt, resolve };
     confirms.push(c);
     if (signal) signal.addEventListener('abort', () => { const i = confirms.indexOf(c); if (i >= 0) { confirms.splice(i, 1); resolve(false); } }, { once: true });
     feedAtTopLevel('gptel-confirm');
   });
 }
-const aborted = ctx => !!(ctx && ctx.signal && ctx.signal.aborted);
+const aborted = (ctx: AIToolCtx | undefined) => !!(ctx && ctx.signal && ctx.signal.aborted);
 CMD('gptel-confirm', async () => {
   const c = confirms.shift();
   if (!c) return [];
@@ -411,15 +476,15 @@ CMD('gptel-confirm', async () => {
   try { ok = /^y/i.test((await Ed.readMini(c.prompt + ' (y or n) ', '')).trim()); } finally { c.resolve(ok); }
   return [];
 }, '', 'Answer a pending tool confirmation (used by gptel tools; not for M-x).', () => false);
-const bufNamed = name => E.buffers.find(b => b.name === name) || E.buffers.find(b => b.file === name);
+const bufNamed = (name: string) => E.buffers.find(b => b.name === name) || E.buffers.find(b => b.file === name);
 defTool('list_buffers', 'List the open buffers: name, mode, size and file. Returns one line per buffer.', { type: 'object', properties: {} },
   () => E.buffers.filter(b => !b.minibuf).map(b => `${b.name}\t${b.mode}\t${b.rope.length} chars${b.file ? '\t' + b.file : ''}`).join('\n'));
 defTool('read_buffer', 'Return the text of an open buffer by name (the first 30000 characters). Use list_buffers for the names.',
   { type: 'object', properties: { name: { type: 'string', description: 'Buffer name' } }, required: ['name'] },
   ({ name }) => { const b = bufNamed(String(name)); if (!b) throw new Error('no buffer named ' + name); const t = b.rope.slice(0, 30000); return b.rope.length > 30000 ? t + '\n[truncated]' : t; });
 /* Pure so it can run in a worker: FILES is [[name, text], ...]. */
-function grepFiles(a) {
-  const re = new RegExp(a.regex, 'i' + (a.flags || '')), out = [];
+function grepFiles(a: { regex: string; flags?: string; files: [name: string, text: string][]; max: number }) {
+  const re = new RegExp(a.regex, 'i' + (a.flags || '')), out: string[] = [];
   for (const [name, text] of a.files) {
     let pos = 0, line = 1;
     while (pos <= text.length && out.length < a.max) {
@@ -438,18 +503,18 @@ defTool('grep', 'Search the saved files (and, optionally, only those whose name 
   async ({ regex, file }) => {
     try { new RegExp(String(regex)); } catch (e) { throw new Error('bad regex: ' + e.message); }
     const names = Ed.Store.list().filter(n => !file || n.includes(String(file)));
-    const files = names.map(n => [n, Ed.Store.get(n) || '']);
+    const files = names.map((n): [string, string] => [n, Ed.Store.get(n) || '']);
     const args = { regex: String(regex), files, max: 200 };
-    if (globalThis.EdPool && EdPool.ok && typeof EdPool.run === 'function') { try { return await EdPool.run('gptel-grep', args); } catch (e) { /* fall through */ } }
+    if (globalThis.EdPool && EdPool.ok && typeof EdPool.run === 'function') { try { return await EdPool.run<string>('gptel-grep', args); } catch (e) { /* fall through */ } }
     return grepFiles(args) || '(no matches)';
   });
 defTool('eval_scheme', 'Evaluate Scheme code in the editor and return the printed result. The user confirms first.',
   { type: 'object', properties: { code: { type: 'string' } }, required: ['code'] },
   async ({ code }, ctx) => {
     code = String(code);
-    if (!(await confirmInLoop(`Run Scheme ${code.replace(/\s+/g, ' ').slice(0, 60)}?`, ctx && ctx.signal))) return 'The user declined.';
+    if (!(await confirmInLoop(`Run Scheme ${(code as string).replace(/\s+/g, ' ').slice(0, 60)}?`, ctx && ctx.signal))) return 'The user declined.';
     if (aborted(ctx)) throw new Error('request aborted');
-    try { return L.write(L.evalText(code)); } catch (e) { throw new Error(Ed.errorText(e)); }
+    try { return L.write(L.evalText(code as string)); } catch (e) { throw new Error(Ed.errorText(e)); }
   });
 defTool('insert_text', 'Insert text at point in a buffer (the current one unless BUFFER is given). The user confirms first.',
   { type: 'object', properties: { text: { type: 'string' }, buffer: { type: 'string' } }, required: ['text'] },
@@ -472,7 +537,7 @@ defTool('remember', 'Save one durable fact about the user or their preferences t
   ({ fact }) => { remember(String(fact)); return 'Saved to memory.'; });
 
 /* Save a file and keep a visiting buffer in step. */
-function writeFile(name, content) {
+function writeFile(name: string, content: string) {
   Ed.Store.set(name, content);
   const b = E.buffers.find(x => x.file === name);
   if (b) { const pt = b.pt; Ed.replaceText(b, 0, b.rope.length, content); b.pt = Math.min(pt, b.rope.length); b.modified = false; }
@@ -484,16 +549,16 @@ const chatDir = () => String(L.get('gptel-chat-directory'));
 function ensureMemory() {
   if (Ed.Store.get(memoryFile()) === null) Ed.Store.set(memoryFile(), `:PROPERTIES:\n:ID: ${uuid()}\n:END:\n#+title: Assistant memory\n#+filetags: :memory:\n\n`);
 }
-function remember(fact) {
+function remember(fact: string) {
   ensureMemory();
   writeFile(memoryFile(), (Ed.Store.get(memoryFile()) || '') + `- [${today()}] ${fact.trim()}\n`);
 }
 function memoryText() { ensureMemory(); const t = Ed.Store.get(memoryFile()) || ''; return t.length > 20000 ? t.slice(-20000) : t; }
 
 /* ---------- requests: build, send with fallback ---------- */
-function presetNamed(name) { const p = presets[name]; if (!p) signal('user-error', `No gptel preset named ${name}`); return p; }
-const strOf = x => x instanceof Sym ? x.name : typeof x === 'string' ? x : null;
-function modelFor(b, req) {
+function presetNamed(name: string) { const p = presets[name]; if (!p) signal('user-error', `No gptel preset named ${name}`); return p; }
+const strOf = (x: SchemeValue) => x instanceof Sym ? x.name : typeof x === 'string' ? x : null;
+function modelFor(b: AIBackend, req: AIRequest) {
   const primary = req.backend || String(L.get('gptel-backend'));
   let m = b.name === primary ? strOf(L.get('gptel-model')) : null;
   if (!m && req.presetBackend === b.name) m = req.presetModel;
@@ -506,14 +571,14 @@ function modelFor(b, req) {
 }
 /* Try the current backend, then each fallback, on exhaustion or unavailability; ONSTART tells the
    caller which backend is about to answer so the chat heading can name it. */
-async function send(req, { onText, signal, onStart }) {
+async function send(req: AIRequest, { onText, signal, onStart }: { onText: (t: string) => void; signal?: AbortSignal; onStart?: (b: AIBackend, model: string) => void }): Promise<AISendResult> {
   const primary = req.backend || String(L.get('gptel-backend'));
   const names = [primary, ...arr(L.get('gptel-fallback-backends')).map(x => x instanceof Sym ? x.name : String(x))].filter((n, i, a) => a.indexOf(n) === i);
-  const tried = [];
+  const tried: string[] = [];
   for (const name of names) {
     const b = backends[name];
     if (!b) { tried.push(`${name}: no such backend`); continue; }
-    let ok;
+    let ok: unknown;
     try { ok = await b.available(); } catch (e) { ok = e && e.message || String(e); }
     if (ok !== true) { tried.push(`${name}: ${ok}`); continue; }
     const r = { ...req, model: modelFor(b, req) };
@@ -531,31 +596,31 @@ async function send(req, { onText, signal, onStart }) {
   }
   throw new AIError('unavailable', tried.length === 1 ? tried[0] : 'no backend answered: ' + tried.join('; '));
 }
-function buildRequest(preset, messages, opts) {
-  const req = { messages, tools: [], modelTier: preset.modelTier || 'default', backend: preset.backend || null, presetBackend: preset.backend || null, presetModel: preset.model || null, maxRounds: Number(L.get('gptel-max-rounds')) || 8 };
+function buildRequest(preset: AIPreset, messages: AIMessage[], opts?: Partial<AIRequest>) {
+  const req: AIRequest = { messages, tools: [], modelTier: preset.modelTier || 'default', backend: preset.backend || null, presetBackend: preset.backend || null, presetModel: preset.model || null, maxRounds: Number(L.get('gptel-max-rounds')) || 8 };
   if (preset.temperature !== undefined) req.temperature = preset.temperature;
   if (preset.maxTokens) req.maxTokens = preset.maxTokens;
   const effort = L.get('gptel-effort'); if (typeof effort === 'string') req.effort = effort;
   for (const n of preset.tools || []) { const t = TOOLS[n]; if (t) req.tools.push(t); }
   return Object.assign(req, opts || {});
 }
-function systemFor(preset) {
+function systemFor(preset: AIPreset) {
   let s = preset.system || '';
   if (preset.memory) s = (s ? s + '\n\n' : '') + 'Long-term memory about the user (memory.org):\n' + memoryText();
   return s;
 }
 
 /* ---------- chat buffers: Org, * prompts and ** answers ---------- */
-const isChat = b => !!b && (b.gptel === true || b.name === '*gptel*' || (!!b.file && b.file.startsWith(chatDir()) && b.file !== memoryFile()));
+const isChat = (b: EdBuffer | null | undefined) => !!b && (b.gptel === true || b.name === '*gptel*' || (!!b.file && b.file.startsWith(chatDir()) && b.file !== memoryFile()));
 /* An answer heading is one sendChat writes: "** Claude" or "** <backend> <model>". Any other "** "
    line is an ordinary subheading and belongs to the turn it is in. */
-function isAnswerLabel(label) {
+function isAnswerLabel(label: string) {
   if (label === 'Claude') return true;
   for (const n in backends) if (label === n || label.startsWith(n + ' ')) return true;
   return false;
 }
 /* The closing line of the block LINE opens (#+begin_x or a markdown fence), or null. */
-function blockEnd(line) {
+function blockEnd(line: string) {
   let m = /^\s*#\+begin_(\S+)/i.exec(line);
   if (m) return new RegExp('^\\s*#\\+end_' + m[1].replace(/[^\w-]/g, '') + '\\b', 'i');
   m = /^\s*(`{3,}|~{3,})/.exec(line);
@@ -564,19 +629,19 @@ function blockEnd(line) {
 /* Keep an answer from adding Org headings, as gptel's markdown conversion does: a "* item" bullet at
    column 0 becomes "- item", and a line starting with * inside a block gets Org's comma escape. With
    FINAL, a block the answer left open is closed, so it cannot swallow the next prompt. */
-function orgSafe(text, final) {
+function orgSafe(text: string, final?: boolean) {
   if (!/(^|\n)(\*|\s*```|\s*~~~|\s*#\+begin_)/i.test(text)) return text;
-  let end = null, close = '';
+  let end: RegExp | null = null, close = '';
   const out = text.split('\n').map(line => {
     if (end) { if (end.test(line)) { end = null; return line; } return line[0] === '*' ? ',' + line : line; }
-    if ((end = blockEnd(line))) { const m = /^\s*#\+begin_(\S+)/i.exec(line); close = m ? '#+end_' + m[1] : /^\s*([`~]+)/.exec(line)[1]; return line; }
+    if ((end = blockEnd(line))) { const m = /^\s*#\+begin_(\S+)/i.exec(line); close = m ? '#+end_' + m[1] : /^\s*([`~]+)/.exec(line)![1]; return line; }
     return /^\*+( |$)/.test(line) ? line.replace(/^\*+ ?/, '- ') : line;
   }).join('\n');
   return final && end ? out + (out.endsWith('\n') ? '' : '\n') + close : out;
 }
-function parseChat(text) {
-  const turns = [];
-  let t = null, drawer = false, block = null;
+function parseChat(text: string) {
+  const turns: AIChatTurn[] = [];
+  let t: AIChatTurn | null = null, drawer = false, block: RegExp | null = null;
   for (const line of text.split('\n')) {
     if (block) { if (block.test(line)) block = null; if (t) t.lines.push(line.replace(/^,(?=\*|#\+)/, '')); continue; }
     if (line.startsWith('* ') || line === '*') { t = { role: 'user', lines: [line.slice(2)] }; turns.push(t); drawer = false; }
@@ -588,24 +653,24 @@ function parseChat(text) {
   }
   return turns.map(x => ({ role: x.role, content: x.lines.join('\n').trim() })).filter(x => x.content);
 }
-function presetOfBuffer(b) {
+function presetOfBuffer(b: EdBuffer) {
   const head = b.rope.slice(0, Math.min(b.rope.length, 2000));
   const m = /^:GPTEL_PRESET:\s*(\S+)/m.exec(head);
   if (m && presets[m[1]]) return presets[m[1]];
   return presetNamed(String(L.get('gptel-preset')));
 }
-const labelFor = (b, model) => b.kind === 'claude' ? 'Claude' : `${b.name} ${model}`;
+const labelFor = (b: AIBackend, model: string) => b.kind === 'claude' ? 'Claude' : `${b.name} ${model}`;
 
 /* One request per buffer; the modeline shows "<backend>: thinking|writing" while it runs. */
-const active = new Map();
-/* ai.js loads before evil-ex.js (boot evaluates ai.scm), which sets H.look: wrap it at the first request. */
+const active = new Map<EdBuffer, AIActive>();
+/* ai.ts loads before evil-ex.ts (boot evaluates ai.scm), which sets H.look: wrap it at the first request. */
 let looked = false;
 function ensureLook() {
   if (looked) return;
   looked = true;
   const prevLook = H.look;
   H.look = (b, w) => {
-    const o = prevLook ? prevLook(b, w) : {};
+    const o: EdLook = prevLook ? prevLook(b, w) : {};
     const a = active.get(b);
     if (a && a.phase) o.extra = (o.extra ? o.extra + ' ' : '') + `${a.backend}: ${a.phase}`;
     return o;
@@ -617,16 +682,16 @@ function scheduleRender() {
   renderPending = true;
   setTimeout(() => { renderPending = false; try { Ed.render(); } catch (e) { console.error(e); } }, 40);
 }
-const alive = b => E.buffers.includes(b);
+const alive = (b: EdBuffer) => E.buffers.includes(b);
 /* A growing answer region [s, e) that follows the user's other edits through a temp marker. SET edits
    only the part that changed (a streamed delta is an insert at the end), so the edit log and undo
    history grow with the answer, not with its square. */
-function region(b, s, e) {
-  const start = { pos: s }, end = { pos: e === undefined ? s : e };
+function region(b: EdBuffer, s: number, e?: number) {
+  const start: EdTempMarker = { pos: s }, end: EdTempMarker = { pos: e === undefined ? s : e };
   b.temps.add(start); b.temps.add(end);
   return {
     get s() { return Math.min(start.pos, b.rope.length); }, get e() { return Math.min(Math.max(end.pos, start.pos), b.rope.length); },
-    set(text) {
+    set(text: string) {
       const s0 = this.s, e0 = this.e, old = b.rope.slice(s0, e0);
       if (old !== text) {
         let p = 0, q = 0;
@@ -640,35 +705,35 @@ function region(b, s, e) {
       }
       start.pos = s0; end.pos = s0 + text.length; start.dead = end.dead = false;
     },
-    reset(pos) { start.pos = end.pos = pos; start.dead = end.dead = false; },
+    reset(pos: number) { start.pos = end.pos = pos; start.dead = end.dead = false; },
     release() { b.temps.delete(start); b.temps.delete(end); },
   };
 }
-function fail(e, b) {
+function fail(e: unknown, b?: EdBuffer) {
   if (e instanceof AIError) { if (e.code === 'cancelled') Ed.message('gptel: aborted'); else Ed.message('gptel: ' + e.message); }
   else Ed.reportError(e);
 }
-function describe(res) {
+function describe(res: AISendResult) {
   const name = res.backend.name;
   const note = res.rounds ? ` (stopped after ${res.rounds} tool rounds)` : res.truncated ? ' (cut short)' : '';
   if (res.tried && res.tried.length) return `gptel: ${res.tried.map(t => t.split(':')[0]).join(', ')} did not answer (${res.tried[0].replace(/^[^:]*: /, '').slice(0, 80)}); ${name} answered${note}`;
   return `gptel: ${name} answered${note}`;
 }
 /* Every send edits B: a read-only buffer is refused before the request goes out, as Emacs refuses the edit. */
-const busy = b => { ensureLook(); if (active.has(b)) signal('user-error', 'gptel: a request is already running in this buffer (C-c C-k aborts it)'); Ed.checkRO(b); };
-function sendChat(b) {
+const busy = (b: EdBuffer) => { ensureLook(); if (active.has(b)) signal('user-error', 'gptel: a request is already running in this buffer (C-c C-k aborts it)'); Ed.checkRO(b); };
+function sendChat(b: EdBuffer) {
   busy(b);
   const upto = eol(b.rope, b.pt);
   const turns = parseChat(b.rope.slice(0, upto));
   if (!turns.length || turns[turns.length - 1].role !== 'user') signal('user-error', 'gptel: nothing to send; type your prompt under a "* " heading');
   const preset = presetOfBuffer(b);
   const sys = systemFor(preset);
-  const messages = sys ? [{ role: 'system', content: sys }, ...turns] : turns;
+  const messages: AIMessage[] = sys ? [{ role: 'system', content: sys }, ...turns] : turns;
   const req = buildRequest(preset, messages);
   const ctl = new AbortController();
   const st = { ctl, backend: req.backend || String(L.get('gptel-backend')), phase: 'thinking' };
   active.set(b, st);
-  let reg = null, last = '';
+  let reg: AIRegion | null = null, last = '';
   const run = async () => {
     try {
       const res = await send(req, {
@@ -689,11 +754,11 @@ function sendChat(b) {
         },
         onText(text) {
           if (!alive(b)) { ctl.abort(); return; }
-          st.phase = 'writing'; last = text; reg.set(orgSafe(text)); scheduleRender();
+          st.phase = 'writing'; last = text; reg!.set(orgSafe(text)); scheduleRender();
         },
       });
       if (!alive(b)) return;
-      reg.set(orgSafe(res.text, true) || (res.rounds ? `[no answer: stopped after ${res.rounds} tool rounds]` : ''));
+      reg!.set(orgSafe(res.text, true) || (res.rounds ? `[no answer: stopped after ${res.rounds} tool rounds]` : ''));
       resume.set(b, describe(res)); feedAtTopLevel('gptel-resume');
     } catch (e) {
       if (alive(b) && reg && e instanceof AIError && (e.text ? reg.e === reg.s : last)) reg.set(orgSafe(e.text || last, true));
@@ -703,7 +768,7 @@ function sendChat(b) {
   run();
 }
 /* After an answer: a fresh "* " heading at the end, point there in insert state, the file saved. */
-const resume = new Map();
+const resume = new Map<EdBuffer, string>();
 CMD('gptel-resume', '', '', 'Continue a chat after its answer (used by gptel-send; not for M-x).', () => {
   const b = [...resume.keys()].find(alive), why = b && resume.get(b); resume.clear();
   if (!b) return false;
@@ -713,28 +778,28 @@ CMD('gptel-resume', '', '', 'Continue a chat after its answer (used by gptel-sen
   b.pt = b.rope.length;
   if (b.file) { Ed.Store.set(b.file, b.text); b.modified = false; }
   if (b === cur() && !E.mini && E.evil && EC.stateOf(b) && EC.stateOf(b) !== 'insert') EC.enterInsert(b, 1, false);
-  Ed.message(why);
+  Ed.message(why!);
   return false;
 });
 
 /* ---------- one-shot in any other buffer, and rewrites ---------- */
 /* The active region (Evil visual selection or Emacs mark), deactivated, or null. */
-function takeRegion(b) {
+function takeRegion(b: EdBuffer): [number, number] | null {
   if (E.evil && EC.stateOf(b) === 'visual') { const [s, e] = EC.visualBounds(b); EC.setState(b, 'normal'); return [s, e]; }
   if (b.markActive && b.mark !== null && b.mark !== b.pt) { b.markActive = false; return [Math.min(b.pt, b.mark), Math.max(b.pt, b.mark)]; }
   return null;
 }
 const WORDISH = /[\p{L}\p{N}_.,;:!?'"-]/u;
-function sendOneShot(b) {
+function sendOneShot(b: EdBuffer) {
   busy(b);
-  let prompt, at;
+  let prompt: string, at: number;
   const r = takeRegion(b);
   if (r) { prompt = b.rope.slice(r[0], r[1]); at = r[1]; }
   else {
     /* The prompt ends at the end of the word at point, as gptel--at-word-end does: under Evil's
        normal state the cursor character is after point and belongs to the prompt. */
     let end = b.pt;
-    while (end < b.rope.length && WORDISH.test(b.rope.at(end))) end++;
+    while (end < b.rope.length && WORDISH.test(b.rope.at(end)!)) end++;
     prompt = b.rope.slice(Math.max(0, end - 8000), end); at = end;
   }
   if (!prompt.trim()) signal('user-error', 'gptel: nothing to send');
@@ -757,8 +822,8 @@ function sendOneShot(b) {
     finally { active.delete(b); reg.release(); scheduleRender(); }
   })();
 }
-let rewrite = null;
-function sendRewrite(b, s, e, instruction) {
+let rewrite: AIRewrite | null = null;
+function sendRewrite(b: EdBuffer, s: number, e: number, instruction: string) {
   busy(b);
   const text = b.rope.slice(s, e);
   const preset = presetNamed(String(L.get('gptel-preset')));
@@ -774,7 +839,7 @@ function sendRewrite(b, s, e, instruction) {
       const res = await send(req, { signal: ctl.signal, onStart(be) { st.backend = be.name; }, onText() { st.phase = 'writing'; scheduleRender(); } });
       if (!alive(b)) return;
       /* The region's own trailing whitespace stays (a linewise selection ends with its newline). */
-      const tail = /\s*$/.exec(text)[0];
+      const tail = /\s*$/.exec(text)![0];
       rewrite = { b, s: reg.s, e: reg.e, text: res.text.replace(/\s+$/, '') + tail, tail: tail.length };
       Ed.message(describe(res));
       feedAtTopLevel('gptel-rewrite-apply');
@@ -787,7 +852,7 @@ CMD('gptel-rewrite-apply', async () => {
   if (!r || !alive(r.b)) return [false];
   const shown = r.text.trim(), preview = shown.replace(/\s+/g, ' ').slice(0, 50);
   return [(await Ed.readMini(`Replace region with "${preview}${shown.length > 50 ? '...' : ''}"? (y or n) `, '')).trim(), r];
-}, '', 'Apply a finished rewrite after confirmation (used by gptel-rewrite; not for M-x).', ([ans, r]) => {
+}, '', 'Apply a finished rewrite after confirmation (used by gptel-rewrite; not for M-x).', ([ans, r]: [SchemeValue, AIRewrite | null | undefined]) => {
   if (!r || !/^y/i.test(String(ans || ''))) { if (r) Ed.message('gptel: rewrite discarded'); return false; }
   Ed.replaceText(r.b, r.s, r.e, r.text); r.b.pt = r.s + r.text.length - (r.tail || 0); r.b.markActive = false;
   Ed.message('gptel: region rewritten'); return false;
@@ -815,53 +880,53 @@ CMD('gptel', '', '', 'Open the *gptel* chat buffer (an Org buffer that is not fi
   if (E.evil && EC.stateOf(b) && EC.stateOf(b) !== 'insert') EC.enterInsert(b, 1, false);
   return false;
 });
-const slug = s => s.toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'chat';
-const stamp = () => { const d = new Date(), p = n => String(n).padStart(2, '0'); return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`; };
-const orgNow = () => { const d = new Date(), p = n => String(n).padStart(2, '0'); return `[${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()]} ${p(d.getHours())}:${p(d.getMinutes())}]`; };
-CMD('gptel-chat', async () => [await Ed.readMini('Chat topic: ', '')], 'TOPIC', 'Start a saved assistant chat about TOPIC in roam/chats/.', ([topic]) => {
+const slug = (s: string) => s.toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'chat';
+const stamp = () => { const d = new Date(), p = (n: number) => String(n).padStart(2, '0'); return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`; };
+const orgNow = () => { const d = new Date(), p = (n: number) => String(n).padStart(2, '0'); return `[${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()]} ${p(d.getHours())}:${p(d.getMinutes())}]`; };
+CMD('gptel-chat', async () => [await Ed.readMini('Chat topic: ', '')], 'TOPIC', 'Start a saved assistant chat about TOPIC in roam/chats/.', ([topic]: SchemeValue[]) => {
   topic = str(topic).trim(); if (!topic) signal('user-error', 'No topic given');
   ensureMemory();
-  const name = `${chatDir()}${stamp()}-${slug(topic)}.org`;
+  const name = `${chatDir()}${stamp()}-${slug(topic as string)}.org`;
   Ed.Store.set(name, `:PROPERTIES:\n:ID: ${uuid()}\n:GPTEL_PRESET: assistant\n:END:\n#+title: ${topic}\n#+created: ${orgNow()}\n#+filetags: :chat:\n\n* `);
-  const b = L.call('find-file', [name]);
+  const b = L.call('find-file', [name]) as EdBuffer;
   b.mode = 'org-mode'; b.pt = b.rope.length;
   if (E.evil && EC.stateOf(b) && EC.stateOf(b) !== 'insert') EC.enterInsert(b, 1, false);
   return b;
 });
 function chatFiles() { return Ed.Store.list().filter(n => n.startsWith(chatDir()) && n !== memoryFile() && n.endsWith('.org')).sort().reverse(); }
-function chatTitle(n) { const m = /^#\+title:\s*(.*)$/mi.exec((Ed.Store.get(n) || '').slice(0, 2000)); return m ? m[1].trim() : n; }
+function chatTitle(n: string) { const m = /^#\+title:\s*(.*)$/mi.exec((Ed.Store.get(n) || '').slice(0, 2000)); return m ? m[1].trim() : n; }
 CMD('gptel-chat-open', async () => {
   const files = chatFiles(); if (!files.length) signal('user-error', 'No saved chats yet (gptel-chat starts one)');
-  const byTitle = new Map(files.map(n => [`${chatTitle(n)}  (${n.slice(chatDir().length)})`, n]));
+  const byTitle = new Map(files.map((n): [string, string] => [`${chatTitle(n)}  (${n.slice(chatDir().length)})`, n]));
   const pick = await Ed.readMini('Chat: ', '', () => [...byTitle.keys()], { require: true, kind: 'gptel-chat', keepOrder: true });
   return [byTitle.get(pick) || pick];
-}, 'FILE', 'Open a saved chat by title.', ([n]) => { const b = L.call('find-file', [str(n)]); b.mode = 'org-mode'; return b; });
-CMD('gptel-edit-memory', '', '', 'Visit the assistant memory file.', () => { ensureMemory(); const b = L.call('find-file', [memoryFile()]); b.mode = 'org-mode'; return b; });
-CMD('gptel-set-preset', async () => [await Ed.readMini('Preset: ', '', () => Object.keys(presets), { require: true, kind: 'gptel-preset', annotate: n => presets[n].description || '' })], 'NAME', 'Make NAME the active preset.', ([n]) => {
+}, 'FILE', 'Open a saved chat by title.', ([n]: SchemeValue[]) => { const b = L.call('find-file', [str(n)]) as EdBuffer; b.mode = 'org-mode'; return b; });
+CMD('gptel-edit-memory', '', '', 'Visit the assistant memory file.', () => { ensureMemory(); const b = L.call('find-file', [memoryFile()]) as EdBuffer; b.mode = 'org-mode'; return b; });
+CMD('gptel-set-preset', async () => [await Ed.readMini('Preset: ', '', () => Object.keys(presets), { require: true, kind: 'gptel-preset', annotate: n => presets[n].description || '' })], 'NAME', 'Make NAME the active preset.', ([n]: SchemeValue[]) => {
   presetNamed(str(n)); L.set('gptel-preset', n); Ed.message(`gptel preset: ${n}`); return false;
 });
-const describeBackend = n => { const b = backends[n]; return b ? `${b.kind}${b.models && b.models.length ? '  ' + b.models.slice(0, 3).join(', ') + (b.models.length > 3 ? ', ...' : '') : ''}` : ''; };
-CMD('gptel-backend-select', async () => [await Ed.readMini('Backend: ', '', () => Object.keys(backends), { require: true, kind: 'gptel-backend', annotate: describeBackend })], 'NAME', 'Use backend NAME for gptel requests.', ([n]) => {
+const describeBackend = (n: string) => { const b = backends[n]; return b ? `${b.kind}${b.models && b.models.length ? '  ' + b.models.slice(0, 3).join(', ') + (b.models.length > 3 ? ', ...' : '') : ''}` : ''; };
+CMD('gptel-backend-select', async () => [await Ed.readMini('Backend: ', '', () => Object.keys(backends), { require: true, kind: 'gptel-backend', annotate: describeBackend })], 'NAME', 'Use backend NAME for gptel requests.', ([n]: SchemeValue[]) => {
   if (!backends[str(n)]) signal('user-error', `No gptel backend named ${n}`);
   L.set('gptel-backend', n); L.set('gptel-model', false);
-  Promise.resolve(backends[n].available()).then(ok => Ed.message(ok === true ? `gptel backend: ${n}` : `gptel backend: ${n} (${ok})`)).then(scheduleRender);
+  Promise.resolve(backends[n as string].available()).then(ok => Ed.message(ok === true ? `gptel backend: ${n}` : `gptel backend: ${n} (${ok})`)).then(scheduleRender);
   return false;
 });
 CMD('gptel-model-select', async () => {
   const b = backends[String(L.get('gptel-backend'))];
   return [await Ed.readMini(`Model for ${b ? b.name : L.get('gptel-backend')}: `, '', () => b ? b.models.slice() : [], { kind: 'gptel-model' })];
-}, 'NAME', 'Use model NAME with the current backend (free text allowed; empty resets to the preset’s choice).', ([n]) => {
+}, 'NAME', 'Use model NAME with the current backend (free text allowed; empty resets to the preset’s choice).', ([n]: SchemeValue[]) => {
   n = str(n).trim(); L.set('gptel-model', n || false); Ed.message(n ? `gptel model: ${n}` : 'gptel model: preset default'); return false;
 });
-CMD('gptel-set-effort', async () => [await Ed.readMini('Effort (Claude): ', '', () => ['low', 'medium', 'high', 'none'], { require: true, kind: 'gptel-effort' })], 'LEVEL', 'Set the thinking effort for Claude backends.', ([n]) => {
+CMD('gptel-set-effort', async () => [await Ed.readMini('Effort (Claude): ', '', () => ['low', 'medium', 'high', 'none'], { require: true, kind: 'gptel-effort' })], 'LEVEL', 'Set the thinking effort for Claude backends.', ([n]: SchemeValue[]) => {
   L.set('gptel-effort', n === 'none' ? false : str(n)); Ed.message(`gptel effort: ${n}`); return false;
 });
 /* The key is read with the echo area showing only asterisks; a paste is accepted as a whole. */
-async function readSecret(prompt) {
+async function readSecret(prompt: string) {
   let s = '';
   /* Like read-passwd, keep the key out of keyboard macros, the . register and the repeat record:
      everything nextKey records while it is typed is dropped again. */
-  const recs = [E.macro && E.macro.keys, E.ins && E.ins.keys, E.dotCand && E.dotCand.keys].filter(Array.isArray).map(a => [a, a.length]);
+  const recs = [E.macro && E.macro.keys, E.ins && E.ins.keys, E.dotCand && E.dotCand.keys].filter(Array.isArray).map((a): [string[], number] => [a, a.length]);
   try {
     for (;;) {
       E.prompt = prompt + '*'.repeat(s.length);
@@ -880,11 +945,11 @@ CMD('gptel-set-api-key', async () => {
   const d = String(L.get('gptel-backend'));
   const n = (await Ed.readMini(`API key for backend (default ${d}): `, '', () => names, { kind: 'gptel-backend', def: d, annotate: x => getKey(x) ? 'key stored' : 'no key' })).trim() || d;
   return [n, await readSecret(`Key for ${n} (RET to finish, empty clears): `)];
-}, 'BACKEND KEY', 'Store the API key for BACKEND in this browser (never in init.scm).', ([n, key]) => {
+}, 'BACKEND KEY', 'Store the API key for BACKEND in this browser (never in init.scm).', ([n, key]: SchemeValue[]) => {
   setKey(str(n), String(key || '').trim());
   Ed.message(key ? `gptel: key stored for ${n}` : `gptel: key cleared for ${n}`); return false;
 });
-async function pickMenu(title, items) {
+async function pickMenu(title: string, items: string[][]) {
   const labels = items.map(([k, label]) => `${k}  ${label}`);
   const pick = await Ed.readMini(title, '', () => labels, { require: true, kind: 'gptel-menu' });
   const it = items.find(([k, label]) => `${k}  ${label}` === pick || k === pick);
@@ -899,45 +964,45 @@ const MAIN_MENU = [
   ['p', 'set preset', 'gptel-set-preset'], ['b', 'select backend', 'gptel-backend-select'], ['m', 'select model', 'gptel-model-select'],
   ['k', 'set api key', 'gptel-set-api-key'], ['e', 'set effort (Claude)', 'gptel-set-effort']];
 const menuTitle = () => `gptel [${L.get('gptel-preset')} | ${L.get('gptel-backend')}${L.get('gptel-model') ? ' ' + L.get('gptel-model') : ''}]: `;
-CMD('gptel-preset-menu', async () => [await pickMenu(menuTitle(), PRESET_MENU)], 'COMMAND', 'Chat, preset, backend, model and key picks (SPC g l).', ([c]) => c ? Ed.callInteractively(intern(String(c))) : false);
-CMD('gptel-menu', async () => [await pickMenu(menuTitle(), MAIN_MENU)], 'COMMAND', 'Send, rewrite, abort and settings (SPC g L).', ([c]) => c ? Ed.callInteractively(intern(String(c))) : false);
+CMD('gptel-preset-menu', async () => [await pickMenu(menuTitle(), PRESET_MENU)], 'COMMAND', 'Chat, preset, backend, model and key picks (SPC g l).', ([c]: SchemeValue[]) => c ? Ed.callInteractively(intern(String(c))) : false);
+CMD('gptel-menu', async () => [await pickMenu(menuTitle(), MAIN_MENU)], 'COMMAND', 'Send, rewrite, abort and settings (SPC g L).', ([c]: SchemeValue[]) => c ? Ed.callInteractively(intern(String(c))) : false);
 CMD('gptel-rewrite', async () => {
   const b = cur();
   const r = takeRegion(b);
   if (!r) signal('user-error', 'gptel-rewrite needs a region');
-  return [r[0], r[1], await Ed.readMini('Rewrite instruction: ', '')];
-}, 'START END INSTRUCTION', 'Ask the model to rewrite the region per INSTRUCTION; the result replaces it after confirmation.', ([s, e, ins]) => {
+  return [r![0], r![1], await Ed.readMini('Rewrite instruction: ', '')];
+}, 'START END INSTRUCTION', 'Ask the model to rewrite the region per INSTRUCTION; the result replaces it after confirmation.', ([s, e, ins]: [number, number, SchemeValue]) => {
   const b = cur();
   sendRewrite(b, s, e, str(ins)); return false;
 });
 
 /* ---------- the Scheme constructors (see ai.scm for the documentation) ---------- */
 /* An alist (("X-Title" . "Edwin")) or a plist-free object of request headers. */
-function toHeaders(v) {
-  const o = {};
+function toHeaders(v: unknown) {
+  const o: Record<string, string> = {};
   if (Array.isArray(v)) for (const p of v) { if (p instanceof L.Pair) o[String(p.car)] = String(p.cdr instanceof L.Pair ? p.cdr.car : p.cdr); }
   else if (v && typeof v === 'object') Object.assign(o, v);
   return o;
 }
-function plist(args, who) {
-  const o = {};
+function plist(args: SchemeValue[], who: string) {
+  const o: Record<string, SchemeValue> = {};
   for (let i = 0; i + 1 < args.length; i += 2) {
     const k = args[i];
     if (!(k instanceof Sym) || k.name[0] !== ':') signal('wrong-type-argument', `${who}: expected a keyword, got`, k);
     let v = args[i + 1];
     if (v instanceof Sym) v = v.name;
     else if (v === NIL || v instanceof L.Pair) v = arr(v).map(x => x instanceof Sym ? x.name : x);
-    o[k.name.slice(1).replace(/-([a-z])/g, (m, c) => c.toUpperCase())] = v;
+    o[(k as SchemeSym).name.slice(1).replace(/-([a-z])/g, (m, c) => c.toUpperCase())] = v;
   }
   return o;
 }
-D('gptel-make-claude', '&rest PLIST', 'Define the built-in Claude backend (artifact sample capability). :name defaults to "Claude".', a => makeClaude(plist(a, 'gptel-make-claude')));
-D('gptel-make-openai', 'NAME &rest PLIST', 'Define an OpenAI-compatible backend: :host :endpoint :protocol :key :models :stream :headers.', ([n, ...a]) => { const o = plist(a, 'gptel-make-openai'); return makeOpenAI({ ...o, headers: toHeaders(o.headers), name: str(n) }); });
-D('gptel-make-anthropic', 'NAME &rest PLIST', 'Define an Anthropic Messages API backend: :key :models :host :stream.', ([n, ...a]) => { const o = plist(a, 'gptel-make-anthropic'); return makeAnthropic({ ...o, headers: toHeaders(o.headers), name: str(n) }); });
-D('gptel-make-mcp', 'NAME &rest PLIST', 'Define a backend on a claude.ai connector tool: :server :tool :models.', ([n, ...a]) => { const o = plist(a, 'gptel-make-mcp'); if (!o.server) signal('error', 'gptel-make-mcp needs :server'); return makeMcp({ ...o, name: str(n) }); });
-D('gptel-make-preset', 'NAME &rest PLIST', 'Define a preset: :description :system :backend :model :model-tier :temperature :max-tokens :tools :memory.', ([n, ...a]) => {
+D('gptel-make-claude', '&rest PLIST', 'Define the built-in Claude backend (artifact sample capability). :name defaults to "Claude".', (a: SchemeValue[]) => makeClaude(plist(a, 'gptel-make-claude') as AIBackendOpts));
+D('gptel-make-openai', 'NAME &rest PLIST', 'Define an OpenAI-compatible backend: :host :endpoint :protocol :key :models :stream :headers.', ([n, ...a]: SchemeValue[]) => { const o = plist(a, 'gptel-make-openai') as AIBackendOpts; return makeOpenAI({ ...o, headers: toHeaders(o.headers), name: str(n) }); });
+D('gptel-make-anthropic', 'NAME &rest PLIST', 'Define an Anthropic Messages API backend: :key :models :host :stream.', ([n, ...a]: SchemeValue[]) => { const o = plist(a, 'gptel-make-anthropic') as AIBackendOpts; return makeAnthropic({ ...o, headers: toHeaders(o.headers), name: str(n) }); });
+D('gptel-make-mcp', 'NAME &rest PLIST', 'Define a backend on a claude.ai connector tool: :server :tool :models.', ([n, ...a]: SchemeValue[]) => { const o = plist(a, 'gptel-make-mcp') as AIBackendOpts; if (!o.server) signal('error', 'gptel-make-mcp needs :server'); return makeMcp({ ...o, name: str(n) } as AIBackendOpts & { name: string; server: string }); });
+D('gptel-make-preset', 'NAME &rest PLIST', 'Define a preset: :description :system :backend :model :model-tier :temperature :max-tokens :tools :memory.', ([n, ...a]: SchemeValue[]) => {
   const name = n instanceof Sym ? n.name : str(n);
-  const o = plist(a, 'gptel-make-preset');
+  const o = plist(a, 'gptel-make-preset') as AIPresetPlist;
   presets[name] = { name, description: o.description || '', system: o.system || '', backend: o.backend || null, model: o.model || null, modelTier: o.modelTier || 'default',
     temperature: typeof o.temperature === 'number' ? o.temperature : undefined, maxTokens: typeof o.maxTokens === 'number' ? o.maxTokens : undefined,
     tools: Array.isArray(o.tools) ? o.tools.map(String) : [], memory: truthy(o.memory) && o.memory !== NIL && o.memory !== undefined };
@@ -945,7 +1010,7 @@ D('gptel-make-preset', 'NAME &rest PLIST', 'Define a preset: :description :syste
 });
 D('gptel-backends', '', 'Names of the defined backends.', () => listOf(Object.keys(backends)));
 D('gptel-presets', '', 'Names of the defined presets.', () => listOf(Object.keys(presets)));
-D('gptel-chat-buffer?', '&optional BUFFER', '#t when BUFFER is a gptel chat buffer.', ([b]) => isChat(b === undefined ? cur() : Ed.toBuffer(b)));
+D('gptel-chat-buffer?', '&optional BUFFER', '#t when BUFFER is a gptel chat buffer.', ([b]: SchemeValue[]) => isChat(b === undefined ? cur() : Ed.toBuffer(b)));
 
 globalThis.EdAI = { backends, presets, tools: TOOLS, AIError, send, buildRequest, parseChat, isChat, mcpManifest, getKey, setKey, keyOf, migrateKeys, grepFiles, memoryText, remember, active, makeClaude, makeOpenAI, makeAnthropic, makeMcp, SANDBOX };
 })();

@@ -1,14 +1,14 @@
 /* The first half of edwin's startup (DT1): the native host, the core, and Ed.boot with the shipped Scheme,
    but nothing of this process (no arguments, terminal, directories, storage or user init). The build runs it
    once and keeps the heap as V8's startup snapshot, so a start restores this state instead of compiling the
-   core and evaluating emacs.scm and evil.scm again; main.js does the rest. Without the snapshot (or when
-   edwin attaches to edwind, whose boot is Ed.bootServed) main.js loads this file itself.
+   core and evaluating emacs.scm and evil.scm again; main.ts does the rest. Without the snapshot (or when
+   edwin attaches to edwind, whose boot is Ed.bootServed) main.ts loads this file itself.
 
    EdBootAttach set: load the core without booting it. */
 (function () {
 'use strict';
 const N = globalThis.__n;
-/* The core files, in load order: host-node.js's FILES (a test keeps the two equal). */
+/* The core files, in load order: host-node.cts's FILES (a test keeps the two equal). */
 const FILES = ['scheme', 'runtime', 'text', 'editor-core', 'editor-prims', 'evil-core', 'pool', 'complete', 'extras', 'stack', 'ai', 'evil-ex', 'org', 'markdown', 'ot', 'sync', 'display'];
 
 const host = globalThis.EdNativeHost.createHost();

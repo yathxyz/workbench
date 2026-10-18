@@ -1,24 +1,28 @@
-/* The window (DT2): what main.js uses instead of the terminal when edwin runs with --gui.
+/* The window (DT2): what main.ts uses instead of the terminal when edwin runs with --gui.
 
-   The frame is the same model frame (display.js); its backend hands each model to the window (__n.guiDraw,
+   The frame is the same model frame (display.ts); its backend hands each model to the window (__n.guiDraw,
    drawn by edwin/native/src/gui). The window's events come back as JSON (__native.gui): keys arrive as the
    browser's keydown does, key and code and modifiers, and are named by the core's own Ed.keyName, so a key means
    in the window what it means on the page; text from an input method arrives whole; mouse, focus, paste and
-   resize are display.js's input events already. */
+   resize are display.ts's input events already. */
 (function () {
 'use strict';
 const N = globalThis.__n;
+/* What the window sends (edwin/native/src/gui), as JSON: a keydown, an input method's text, the close button, a
+   dropped file, or a display event. */
+type GuiWindowEvent = ({ type: 'key' } & Parameters<EdGuiApi['keydown']>[0]) | { type: 'text'; text?: unknown } | { type: 'close' } | { type: 'drop'; path?: unknown }
+  | Exclude<EdDisplayEvent, { type: 'key' }>;
 
-/* Each segment's character widths as display.js counts them (charWidth), so the window lays characters out as the
+/* Each segment's character widths as display.ts counts them (charWidth), so the window lays characters out as the
    model did; a segment of characters below U+0300 needs none (each takes one cell). */
 const NARROW = /^[\u0000-\u02ff]*$/;
-function withWidths(m) {
+function withWidths(m: EdDisplayModel) {
   const cw = globalThis.Ed.display.charWidth;
-  for (const row of m.lines || []) for (const s of row) if (!NARROW.test(s.text)) s.cw = Array.from(s.text, ch => cw(ch.codePointAt(0)));
+  for (const row of m.lines || []) for (const s of row) if (!NARROW.test(s.text)) s.cw = Array.from(s.text, ch => cw(ch.codePointAt(0)!));
   return m;
 }
 
-function screen() {
+function screen(): EdGuiScreen {
   return {
     backend: {
       tty: false, gui: true,
@@ -34,17 +38,17 @@ function screen() {
 
 /* A keydown as the page's frame gets it, for Ed.keyName. altGraph: the window found that Control and Alt made the
    character (AltGr on Windows-style layouts), so the key is the character, as on the page. */
-const keydown = ev => ({
+const keydown = (ev: Parameters<EdGuiApi['keydown']>[0]): EdKeyEvent => ({
   key: String(ev.key), code: String(ev.code || ''), isComposing: false,
   ctrlKey: !!ev.ctrlKey, altKey: !!ev.altKey, shiftKey: !!ev.shiftKey, metaKey: !!ev.metaKey,
-  getModifierState: m => m === 'AltGraph' && !!ev.altGraph,
+  getModifierState: (m: string) => m === 'AltGraph' && !!ev.altGraph,
 });
-const charKey = ch => (ch === ' ' ? 'SPC' : ch === '\n' || ch === '\r' ? 'RET' : ch === '\t' ? 'TAB' : ch);
+const charKey = (ch: string) => (ch === ' ' ? 'SPC' : ch === '\n' || ch === '\r' ? 'RET' : ch === '\t' ? 'TAB' : ch);
 
 /* One event from the window (JSON) for FRAME. ON holds what the program decides: close (the window's close
    button) and drop (a file dropped on the window). */
-function handle(json, frame, on) {
-  let ev;
+function handle(json: string, frame: EdFrame, on: { close(): void; drop(path: string): void }) {
+  let ev: GuiWindowEvent;
   try { ev = JSON.parse(json); } catch (e) { return; }
   const Ed = globalThis.Ed, D = Ed.display;
   switch (ev.type) {

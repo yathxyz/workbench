@@ -26,7 +26,7 @@ import type { Client } from './session.mts';
 import type { SBuf } from './buffers.mts';
 import type { Ed as Edwin, Lisp, Log, SchemeValue, Server } from './main.mts';
 
-/* The evaluator S of edwin/src (scheme.js), untyped JavaScript like the rest of L. */
+/* The evaluator S of edwin/src (scheme.ts), outside this program's types like the rest of L. */
 type Scheme = Lisp['S'];
 export interface SourceLoc { file?: string | null; line: number; col?: number }
 /* The parts of a procedure the debugger reads: compound procedures have a scope (parameter name -> frame slot). */
@@ -330,7 +330,7 @@ export class Debugger {
     for (const [nm, file] of files) if (!map.has(nm)) map.set(nm, file);
     this._sources = map; return map;
   }
-  /* The definer's file:line from the stack def captured (scheme.js def), relative to the repository: the first
+  /* The definer's file:line from the stack def captured (scheme.ts def), relative to the repository: the first
      frame that is not one of the definer helpers (D, CMD, pred, G, blocking, ...). */
   defSource(f: SchemeValue): string | null {
     if (!f.defAt) return null;
@@ -369,7 +369,7 @@ export async function install(server: Server): Promise<void> {
   if (!sched) throw new Error('debug.mts needs threads.mts installed first');
   L.defvar('debug-on-error', true, 'Non-nil means a condition no handler takes suspends its thread in the debugger (R4.35). Commands run for frames only; cli calls and background threads report instead.');
 
-  /* The evaluator asks here when a condition reaches the top without a handler (scheme.js debugG). */
+  /* The evaluator asks here when a condition reaches the top without a handler (scheme.ts debugG). */
   S.hooks.debugG = function* (cond: SchemeValue, continuable: boolean): SchemeGen {
     const t = sched.current;
     /* A deadline (R14.13) or a cancelled thread ends the thread; it is not a bug to debug. */

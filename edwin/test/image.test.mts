@@ -1,6 +1,6 @@
 // The edit-image gate (spec §16.1, R16.20 A4): the image log and its replication (§4.4, R4.14–R4.21,
 // R7.19, R13.9, §18.2 Q2). Two edwind restarts, three simulated frames: each frame is an isolated Scheme
-// (src/scheme.js alone) that evaluates every image{forms} it receives in order, skips on-server forms as
+// (src/scheme.ts alone) that evaluates every image{forms} it receives in order, skips on-server forms as
 // emacs.scm does in a frame, applies var messages, and starts a fresh runtime when welcome.imageEpoch
 // changes. The compaction threshold is lowered through EDWIND_IMAGE_COMPACT_ENTRIES.
 import { test, before, after } from 'node:test';
@@ -17,7 +17,7 @@ import { fromJSON, LOG_BUFFER_ID } from '../server/image.mts';
 const SCHEME_SRC = SCHEME_SOURCE;
 const COMPACT_ENTRIES = 12;
 const ENV = { EDWIND_IMAGE_COMPACT_ENTRIES: String(COMPACT_ENTRIES) };
-/* What a frame runtime has that bare scheme.js lacks, as far as this suite's forms go: a global-map and a
+/* What a frame runtime has that bare scheme.ts lacks, as far as this suite's forms go: a global-map and a
    define-key that records bindings, and the E2 macros of emacs.scm in their frame-side reading. */
 const PRELUDE = `
 (define global-map 'global-map)

@@ -716,7 +716,7 @@ pub fn render_rgba(m: &Model, text: &mut Text, w: u32, h: u32) -> Result<Vec<u8>
     Ok(out)
 }
 
-/// The cells a character of an input method's composition takes (it is not in the model, so display.js has not
+/// The cells a character of an input method's composition takes (it is not in the model, so display.ts has not
 /// counted it): Unicode's East Asian width, at least one.
 fn preedit_width(c: char) -> u32 {
     unicode_width::UnicodeWidthChar::width(c)

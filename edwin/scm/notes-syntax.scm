@@ -9,7 +9,7 @@
 ;;; the heading regexp by the file's extension and applies everything else to both.
 
 ;; Task keywords: the one table shared by Org (org.scm reads org-todo-keywords from it), markdown-mode
-;; (edwin/src/markdown.js reads notes-task-keywords and notes-done-keywords) and the notes index. An entry is
+;; (edwin/src/markdown.ts reads notes-task-keywords and notes-done-keywords) and the notes index. An entry is
 ;; (KEYWORD SELECTION DONE? ALIAS-OF): SELECTION is the Org fast-selection key with its logging flags
 ;; ("w@/!"), or #f for a keyword Org does not offer; DONE? marks a done state; ALIAS-OF names the keyword an
 ;; alias stands for. The first seven are the user's Org set; DOING, NOW and LATER are read as aliases (DOING

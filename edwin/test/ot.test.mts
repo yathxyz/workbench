@@ -1,4 +1,4 @@
-// OT properties (spec §16.2, R16.1–R16.4) over edwin/src/ot.js: convergence of random replicas,
+// OT properties (spec §16.2, R16.1–R16.4) over edwin/src/ot.ts: convergence of random replicas,
 // intention cases, marker agreement and undo. The scenarios come from a seeded generator, so a failing
 // case is one integer; those go to ot-seeds.json and are replayed forever (R16.1).
 import { test } from 'node:test';

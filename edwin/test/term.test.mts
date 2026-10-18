@@ -1,9 +1,9 @@
-// The terminal encoder and decoder of desktop Edwin (edwin/native/js/term.js, DT1).
+// The terminal encoder and decoder of desktop Edwin (edwin/native/js/term.ts, DT1).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
-/* native/js/term.js is still JavaScript: the shape the suite uses. */
+/* native/js/term.ts, which this program loads untyped: the shape the suite uses. */
 interface TermEvent { type: string; key?: string; text?: string; focused?: boolean; kind?: string; value?: unknown; action?: string; x?: number; y?: number; dy?: number }
 interface Decoder { feed(text: string): TermEvent[]; pending(): boolean; flush(): TermEvent[] }
 interface Face { fg: string; bg: string; weight: number; italic?: boolean }

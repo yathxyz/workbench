@@ -1,4 +1,4 @@
-//! The model a frame draws (src/display.js builds it; its header has the format), as the window reads it.
+//! The model a frame draws (src/display.ts builds it; its header has the format), as the window reads it.
 
 use serde::Deserialize;
 
@@ -38,7 +38,7 @@ pub struct Seg {
     pub w: u32,
     pub text: String,
     pub f: usize,
-    /// The cells each character takes, by display.js's charWidth (gui.js adds it to a segment with any character
+    /// The cells each character takes, by display.ts's charWidth (gui.ts adds it to a segment with any character
     /// past U+02FF; without it every character takes one).
     #[serde(default)]
     pub cw: Vec<u8>,

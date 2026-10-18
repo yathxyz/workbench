@@ -1,10 +1,10 @@
 // Load Edwin's core in Node with no browser, feed it keys, and read the buffers back.
 //
-// The core runs on the Node host (src/host-node.js), the same one edwind uses: no document, window or
+// The core runs on the Node host (src/host-node.cts), the same one edwind uses: no document, window or
 // localStorage exists in this process, so any page access left in the core fails here (R4.1).
 import { createRequire } from 'node:module';
 
-export type Edwin = any; // any: Edwin's core (Ed, E, L) is untyped JavaScript (edwin/src)
+export type Edwin = any; // any: Edwin's core (Ed, E, L) is outside this program's types (edwin/src)
 
 /* The host's key-value store (memoryStorage, or edwind's file store). */
 export interface HostStorage { get(k: string): string | null; set(k: string, v: unknown): boolean; remove(k: string): void; keys(): string[] }
@@ -23,7 +23,7 @@ export interface HostPage {
 }
 /* The named jobs of server/jobs.mts for the main thread. */
 export interface HostJobs { fns: Map<string, (...args: any[]) => unknown>; localOnly: Set<string> } // any: a job's arguments are whatever the pool passes it
-/* What src/host-node.js createHost gives back (R4.1). */
+/* What src/host-node.cts createHost gives back (R4.1). */
 export interface NodeHost {
   kind: 'node';
   headless: true;

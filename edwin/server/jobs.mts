@@ -1,16 +1,16 @@
 /* The named JS jobs of edwind's worker pool (R4.47, R15.3).
 
-   In the browser pool.js ships a job to its workers as source text: EdPool.define(name, fn, deps) joins
+   In the browser pool.ts ships a job to its workers as source text: EdPool.define(name, fn, deps) joins
    fn.toString() into the blob each worker is built from. edwind runs with code generation from strings
    disabled, so a worker is a file (worker.mts) that imports this module, and a job runs on a thread only
    when it is exported here under the name EdPool.run and EdPool.map use. EdPool.define(name, fn) in edwind
    accepts an exported name (FN is then the main-thread version, used when the pool is off), accepts a
    name in LOCAL_ONLY as a main-thread job, and refuses any other name: no function's source crosses to a
-   thread. Every export here is registered with the pool when pool.js loads, so a job needs no define call.
+   thread. Every export here is registered with the pool when pool.ts loads, so a job needs no define call.
 
    A job is (args, ctx) => value and must be pure: nothing from the editor, the process or the file system.
    ctx.buffer(id) is the text of a buffer the caller passed (opts.buffers, or a buffer in ARGS), ctx.rope(id)
-   its rope (text.js), ctx.version(id) its version, ctx.args the shared args of a map, ctx.state a Map kept
+   its rope (text.ts), ctx.version(id) its version, ctx.args the shared args of a map, ctx.state a Map kept
    per thread, ctx.worker the thread index, ctx.progress(x) reports to the caller, ctx.scheme is { S, L } on
    a thread that runs Scheme, ctx.transfer(ab) marks an ArrayBuffer to move instead of copy. Arguments and
    results cross by structured clone (plain data, typed arrays, Map, RegExp); typed arrays up to two levels
@@ -23,7 +23,7 @@
    Then EdPool.run('notes-parse', args, opts) resolves to the value (a promise with .cancel()), and
    EdPool.map('notes-parse', items, opts) to the list of values, split over the threads.
 
-   The jobs below are the pool's own, the same code as the define(...) calls in pool.js keep for the
+   The jobs below are the pool's own, the same code as the define(...) calls in pool.ts keep for the
    browser's workers and for the main thread; pool.test.mts checks that a thread and the main thread agree.
    Keep the two in step. */
 
@@ -72,8 +72,8 @@ export function unlist(a: { key: string }, ctx: JobCtx): boolean { ctx.state.del
 /* Indices of the items of list A.key matching every term of A.terms ([source, flags] pairs). */
 export function filter(a: { key: string; terms: [string, string][] }, ctx: JobCtx): Int32Array { return filterItems((ctx.state.get('list:' + a.key) as string[] | undefined) || [], a.terms); }
 /* Syntax classes and paren depths of the Lisp buffer A.id. The lexer (lex, markDocstrings, parenDepths)
-   is editor-core.js's, which worker.mts installs in the thread's global scope from Ed.LEX_SOURCE; the
-   main thread runs pool.js's own version of this job against Ed.lex. */
+   is editor-core.ts's, which worker.mts installs in the thread's global scope from Ed.LEX_SOURCE; the
+   main thread runs pool.ts's own version of this job against Ed.lex. */
 /* The lexer's functions as worker.mts installs them in the thread's global scope. */
 interface LexRealm {
   markDocstrings?: (t: string, cls: unknown) => unknown;
@@ -102,8 +102,8 @@ export function grep(it: { text?: string; id?: string; from?: number; to?: numbe
   return { hits: Int32Array.from(hits), truncated: n >= ctx.args.max };
 }
 
-/* Jobs the core's browser files define by source (evil-ex.js subst, org.js org-parse, stack.js
-   project-grep, ai.js gptel-grep) and no file here provides: in edwind they run on the main thread, as
+/* Jobs the core's browser files define by source (evil-ex.ts subst, org.ts org-parse, stack.ts
+   project-grep, ai.ts gptel-grep) and no file here provides: in edwind they run on the main thread, as
    when the pool is off. To move one to the threads, write it in a server file, export it above and take
    its name off this list. */
 export const LOCAL_ONLY = ['subst', 'org-parse', 'project-grep', 'gptel-grep'];

@@ -196,13 +196,14 @@ in
     touch $out
   '';
 
-  # tsc --strict over the TypeScript: edwind and its suites (edwin/tsconfig.json), the page (web/tsconfig.json and
-  # tsconfig.sw.json) and the browser suites (tests/tsconfig.json). Node and tools/strip.mts only strip the
+  # tsc --strict over the TypeScript: edwind and its suites (edwin/tsconfig.json), Edwin's core (edwin/src) and desktop
+  # Edwin's JavaScript (edwin/native/js), the page (web/tsconfig.json and tsconfig.sw.json) and the browser suites
+  # (tests/tsconfig.json). Node and tools/strip.mts only strip the
   # types; this checks them. The page's library types come from the vendored packages (tools/vendor-entry.js).
   typecheck = pkgs.runCommand "workbench-typecheck" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     cp -r ${typed} src && chmod -R u+w src && cd src
     ln -s ${edwinDevDeps}/node_modules tools/node_modules
-    for p in edwin web web/tsconfig.sw.json tests; do node tools/node_modules/typescript/bin/tsc -p $p; done
+    for p in edwin edwin/src edwin/native/js web web/tsconfig.sw.json tests; do node tools/node_modules/typescript/bin/tsc -p $p; done
     touch $out
   '';
 
@@ -276,7 +277,7 @@ in
     touch $out
   '';
 
-  # The desktop program's JavaScript (DT1): the terminal encoder and decoder (native/js/term.js), and the
+  # The desktop program's JavaScript (DT1): the terminal encoder and decoder (native/js/term.ts), and the
   # core's seams it uses (files on a disk, leaving with an exit status, input events). The program itself is
   # tested in a pseudo-terminal by edwin/native/tests (cargo test).
   edwin-native = pkgs.runCommand "workbench-edwin-native" { nativeBuildInputs = [ pkgs.nodejs ]; } ''

@@ -1,8 +1,8 @@
 {
   // edwind and the edwin suites: TypeScript that Node 24 runs as it is (type stripping), checked by
   // `tsc -p edwin` (the flake check `typecheck`). Erasable syntax only, so stripping keeps every line and
-  // column; relative imports name the .mts file. edwin/src (the core) is still JavaScript, loaded through
-  // vm, so the server sees it untyped.
+  // column; relative imports name the .mts file. edwin/src (the core) is classic scripts,
+  // typed by edwin/src/tsconfig.json and loaded through vm, so the server sees it untyped; host-node.cts is checked here.
   "compilerOptions": {
     "target": "esnext",
     "lib": ["esnext"],
@@ -21,5 +21,5 @@
     "noFallthroughCasesInSwitch": true,
     "useUnknownInCatchVariables": false
   },
-  "include": ["server/**/*.mts", "test/**/*.mts", "native/tests/**/*.mts"]
+  "include": ["server/**/*.mts", "test/**/*.mts", "native/tests/**/*.mts", "src/host-node.cts"]
 }

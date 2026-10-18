@@ -1,6 +1,6 @@
 // Evaluator benchmarks for Edwin Scheme: `node edwin/test/scheme-bench.mts [repetitions]`.
 //
-// Runs each benchmark on src/scheme.js with the shadow stack compiled in and compiled out
+// Runs each benchmark on src/scheme.ts with the shadow stack compiled in and compiled out
 // (globalThis.SCHEME_SHADOW_STACK = false at load), in generator mode (globalThis.SCHEME_MODE = 'gen',
 // edwind's evaluator, R4.38), and, for information, on the evaluator before the shadow stack (the
 // newest commit whose scheme.js has none). Every evaluator is loaded into its own contexts; the runs
