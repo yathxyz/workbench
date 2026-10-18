@@ -204,6 +204,33 @@ test('R9.12 anchors survive a restart, with later edits applied, and a compactio
   fs.rmSync(d2.root, { recursive: true, force: true });
 });
 
+test('R8.5 a reloaded journal counts its anchors lines toward compaction, as the running journal does', async () => {
+  const d2 = makeDir();
+  const p = path.join(d2.dirs.home, 'many.md'), id = '~/many.md';
+  fs.writeFileSync(p, 'text\n');
+  let ch = await startEdwind(d2);
+  let a = new EditClient(d2.cfg.socket); await a.connect(); await a.hello();
+  await a.open(id);
+  a.close(); await stopEdwind(ch);
+  /* A journal past the compaction line count (20,000) made of anchors lines only, as anchor-add and
+     anchor-remove leave behind (each one journals the whole list). */
+  const jdir = path.join(d2.dirs.state, 'buffers');
+  const jfile = path.join(jdir, fs.readdirSync(jdir).find(f => f.endsWith('.jsonl'))!);
+  fs.appendFileSync(jfile, (JSON.stringify({ t: 'a', ver: 0, anchors: [] }) + '\n').repeat(20001));
+  ch = await startEdwind(d2);
+  try {
+    a = new EditClient(d2.cfg.socket); await a.connect(); await a.hello();
+    const o = await a.open(id); assert.equal(o.text, 'text\n'); assert.equal(o.meta!.readOnly, false);
+    assert.equal((await a.edit(id, 0, [[0, '', 'more ']])).t, 'ack');
+    const lines = () => fs.readFileSync(jfile, 'utf8').trim().split('\n').length;
+    for (let i = 0; i < 100 && lines() > 2; i++) await sleep(20);
+    assert.equal(lines(), 2, 'the next batch compacted the journal: the header and that batch');
+    assert.equal((await a.open(id)).text, 'more text\n');
+    a.close();
+  } finally { await stopEdwind(ch); }
+  fs.rmSync(d2.root, { recursive: true, force: true });
+});
+
 test('R6.3 anchors die with the buffer; status counts them', async () => {
   const id = note('k.md', 'k\n');
   const a = await client({ kind: 'frame' });
