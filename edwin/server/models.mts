@@ -171,6 +171,9 @@ const RETRY_STATUS = new Set([429, 503, 529]);
 /* BASE plus the path ENDPOINT, keeping any path of BASE (a proxy prefix). */
 export const joinUrl = (base: string, endpoint: string): string => new URL(String(endpoint).replace(/^\/+/, ''), String(base).endsWith('/') ? String(base) : String(base) + '/').href;
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+/* The headers that describe a request body (the fetch standard's request-body-header names, with the framing
+   ones): a redirect that drops the body drops them too, so the next hop never waits for a body that is not sent. */
+const BODY_HEADERS = ['content-length', 'transfer-encoding', 'content-type', 'content-encoding', 'content-language', 'content-location'];
 
 /* ---------- credentials (R14.5–R14.7) ---------- */
 /* The handle: a frozen object with the name and the origin and nothing else. The key is never a property. */
@@ -331,9 +334,11 @@ export class Http {
   }
   *hopsG(u: URL, method: string, body: string | undefined, cred: Credential | null, opts: HttpRequestOptions, onChunk: ChunkHandler | null | undefined): Gen<HttpResult> {
     const S = this.S, who = opts.who || 'http-request', ctl = opts.ctl;
+    let bodyDropped = false;
     for (let hop = 0; ; hop++) {
       const headers: Record<string, string> = {};
       for (const [k, v] of Object.entries(opts.headers || {})) headers[String(k).toLowerCase()] = String(v);
+      if (bodyDropped) for (const k of BODY_HEADERS) delete headers[k];
       if (cred) {
         const secret = readSecret(cred);
         if (secret === null) throw this.err('user-error', `${who}: ${cred.__print()} is not available: no readable file ${cred.name} in the credentials directory (LoadCredential)`, [cred]);
@@ -349,7 +354,7 @@ export class Http {
         /* R14.4: with a credential attached a redirect may stay on the origin only. */
         if (cred && next.origin !== u.origin) throw this.err('credential-origin', `${who}: ${u.host} redirected to another origin (${next.host}) while ${cred.__print()} was attached; the request was not followed`, [cred]);
         u = this.checkUrl(next.href, who);
-        if (r.status === 301 || r.status === 302 || r.status === 303) { if (method !== 'GET' && method !== 'HEAD') method = 'GET'; body = undefined; }
+        if (r.status === 301 || r.status === 302 || r.status === 303) { if (method !== 'GET' && method !== 'HEAD') method = 'GET'; if (body !== undefined && body !== null) bodyDropped = true; body = undefined; }
         continue;
       }
       const handler = opts.onResponse ? opts.onResponse(r.status, r.headers) : onChunk;
