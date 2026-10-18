@@ -443,6 +443,11 @@ parentPort.postMessage([S.write(S.evalString('(f 9900)')), S.write(S.evalString(
     assert.deepEqual(res, ['9900', 'caught', 0]);
   });
 
+  test('regexp-replace with a procedure gets the match and its groups, named groups too', () => {
+    assert.equal(ev('(regexp-replace (regexp "(a)(x)?") "ba" (lambda (m g1 g2) (string-append "<" g1 (if g2 g2 "-") ">")))'), '"b<a->"');
+    assert.equal(ev('(regexp-replace (regexp "(?<k>[a-z]+)=(?<v>[0-9]+)") "a=1 bb=22" (lambda args (string-append (cadr args) ":" (caddr args) "/" (number->string (length args)))))'), '"a:1/3 bb:22/3"');
+  });
+
   test('call/ec, errors and the old entry points keep working', () => {
     assert.equal(ev('(call/ec (lambda (k) (dynamic-wind (lambda () #f) (lambda () (k 1)) (lambda () #f))))'), '1');
     const esc = S.callProc(S.evalString('(lambda (k) (k 5))'), [S.evalString('(lambda (x) (* x 2))')]);
