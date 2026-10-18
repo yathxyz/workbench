@@ -491,6 +491,11 @@ test('presence: another writer\'s sel is recorded per buffer with a colour and l
   c.close();
 });
 
+test('writer labels: an agent is named by the agent field edwind attributes it with', () => {
+  assert.equal(sync.writerLabel({ kind: 'agent', agent: 'gptel:notes.md' }), 'gptel:notes.md');
+  assert.equal(sync.writerLabel({ kind: 'agent' }), 'agent');
+});
+
 test('killed and moved: a buffer killed on the server leaves the frame; a message from edwind reaches the echo area', async () => {
   const id = note('x.md', 'bye\n');
   const b = await sync.open(id); show(Ed.getBuffer('*scratch*'));

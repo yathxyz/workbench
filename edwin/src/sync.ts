@@ -15,8 +15,6 @@
 /* edwind's messages as this client reads them (edwin/server/proto.mts, section 7) */
 type SyncBy = {
   kind: 'frame' | 'cli' | 'web' | 'disk' | 'server' | 'agent'; cid?: string | null; device?: string | null; session?: string; thread?: string; agent?: string; tab?: unknown;
-  /* read by writerLabel (edwind names an agent in agent) */
-  name?: string;
 };
 type SyncCondition = { condition: string; report: string; restarts?: unknown[]; backtrace?: string[] };
 type SyncAnchor = { id: string; pos: number; label?: string };
@@ -154,7 +152,7 @@ function fromJSON(j: unknown): SchemeValue {
 const writerKey = (by: SyncBy | null | undefined) => (by ? (by.cid ? 'c:' + by.cid : by.device ? 'd:' + by.device : 'k:' + by.kind) : 'k:?');
 function writerLabel(by: SyncBy | null | undefined) {
   if (!by) return '?';
-  if (by.kind === 'agent') return by.name || 'agent';
+  if (by.kind === 'agent') return by.agent || 'agent';
   if (by.kind === 'cli') return by.session ? 'wb ' + by.session : by.device || 'cli';
   if (by.kind === 'disk') return 'disk';
   if (by.kind === 'server') return by.thread || 'server';
