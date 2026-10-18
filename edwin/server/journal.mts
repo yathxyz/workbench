@@ -25,7 +25,7 @@ export interface JournalAnchor { id: string; pos: number; label?: string; quote:
 export interface AnchorsLine { t: 'a'; ver: number; anchors: JournalAnchor[] }
 export type JournalLine = BatchLine | MvLine | AnchorsLine;
 /* count: the whole lines read, the header and every kind of line included (Journal.lines, for compaction). */
-export interface JournalContents { header: JournalHeader; batches: BatchLine[]; mv: MvLine[]; anchors: AnchorsLine | null; torn: boolean; count: number }
+export interface JournalContents { header: JournalHeader; batches: BatchLine[]; mv: MvLine[]; anchors: AnchorsLine | null; torn: boolean; count: number; whole: number; unterminated: boolean }
 
 export class JournalError extends Error {
   declare line: number;
@@ -108,17 +108,19 @@ export class Journal {
   needsCompaction(): boolean { return this.bytes > COMPACT_BYTES || this.lines > COMPACT_LINES; }
 }
 
-/* Read a journal: {header, batches, mv, anchors, torn, count}. `anchors` is the last anchors line ({t: 'a', ver, anchors},
+/* Read a journal: {header, batches, mv, anchors, torn, count, whole, unterminated}. `anchors` is the last anchors line ({t: 'a', ver, anchors},
    anchors.mts) or null. A torn last line (no newline, or not JSON) is dropped and reported; any other bad line is
-   a JournalError (the buffer then opens read-only, R8.4). */
+   a JournalError (the buffer then opens read-only, R8.4). `whole` is the byte length of the whole lines and
+   `unterminated` says the kept last line has no newline: healTail uses them before the journal is appended to. */
 export function readJournal(file: string): JournalContents {
   const text = fs.readFileSync(file, 'utf8');
   const lines = text.split('\n');
   /* The last line ends with a newline when the file is whole; without one it is the tail of a write that
      did not finish and is dropped (R8.4). A complete JSON object without its newline is kept. */
-  let torn = false;
+  let torn = false, unterminated = false;
   const last = lines.pop()!;
-  if (last !== '') { try { JSON.parse(last); lines.push(last); } catch (e) { torn = true; } }
+  if (last !== '') { try { JSON.parse(last); lines.push(last); unterminated = true; } catch (e) { torn = true; } }
+  const whole = Buffer.byteLength(text) - (torn ? Buffer.byteLength(last) : 0);
   const parse = (l: string, i: number): any => { try { return JSON.parse(l); } catch (e) { throw new JournalError(`line ${i + 1} is not JSON`, i + 1); } }; // any: a journal line as parsed, checked below
   if (!lines.length) throw new JournalError('empty journal', 0);
   const header = parse(lines[0], 0);
@@ -137,7 +139,13 @@ export function readJournal(file: string): JournalContents {
     else if (o.t === 'a') anchors = o;
     /* Unknown line kinds are skipped: a newer edwind may add some (R15.15 covers the format version). */
   }
-  return { header, batches, mv, anchors, torn, count };
+  return { header, batches, mv, anchors, torn, count, whole, unterminated };
+}
+/* Before a read journal is appended to again: cut off a torn last line, and end a whole one that lost only its
+   newline. Appended after them, the next line would be glued to that tail and be lost with it at the next read. */
+export function healTail(file: string, { torn, whole, unterminated }: Pick<JournalContents, 'torn' | 'whole' | 'unterminated'>): void {
+  if (torn) fs.truncateSync(file, whole);
+  else if (unterminated) fs.appendFileSync(file, '\n');
 }
 
 /* The header line of R8.1. */
