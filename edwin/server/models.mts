@@ -146,7 +146,7 @@ interface ProviderBody {
 }
 interface ToolResult { callId: string; result: unknown }
 interface GateTicket { promise: Promise<void>; cancel: () => void }
-interface WaitingTicket extends GateTicket { resolve: () => void }
+interface WaitingTicket extends GateTicket { resolve: () => void; granted: boolean }
 
 export const name = 'models';
 export const MAX_CONCURRENT = 4;                     // R12.13
@@ -232,14 +232,16 @@ export class Backend {
 export class Gate {
   declare n: number; declare busy: number; declare waiters: WaitingTicket[];
   constructor(n: number) { this.n = n; this.busy = 0; this.waiters = []; }
-  /* A ticket: its promise resolves when a slot is free; cancel() withdraws a ticket still waiting. */
+  /* A ticket: its promise resolves when a slot is free. cancel() is for a ticket whose holder will not use the
+     slot (its thread was interrupted while it waited): it withdraws a ticket still waiting, and gives back a slot
+     already granted, which nobody would release otherwise. */
   acquire(): GateTicket {
-    if (this.busy < this.n) { this.busy++; return { promise: Promise.resolve(), cancel: () => {} }; }
-    const t = {} as WaitingTicket; t.promise = new Promise<void>(r => { t.resolve = r; }); this.waiters.push(t);
-    t.cancel = () => { const i = this.waiters.indexOf(t); if (i >= 0) this.waiters.splice(i, 1); };
+    if (this.busy < this.n) { this.busy++; let held = true; return { promise: Promise.resolve(), cancel: () => { if (held) { held = false; this.release(); } } }; }
+    const t = {} as WaitingTicket; t.granted = false; t.promise = new Promise<void>(r => { t.resolve = r; }); this.waiters.push(t);
+    t.cancel = () => { const i = this.waiters.indexOf(t); if (i >= 0) this.waiters.splice(i, 1); else if (t.granted) { t.granted = false; this.release(); } };
     return t;
   }
-  release() { const w = this.waiters.shift(); if (w) w.resolve(); else this.busy = Math.max(0, this.busy - 1); }
+  release() { const w = this.waiters.shift(); if (w) { w.granted = true; w.resolve(); } else this.busy = Math.max(0, this.busy - 1); }
   get queued() { return this.waiters.length; }
 }
 
