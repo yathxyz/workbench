@@ -398,11 +398,16 @@ CMD('project-find-regexp', async () => {
   const x = byLabel.get(picked)!;
   return [x.name, x.line, x.col, orig.b, orig.pt];
 }, 'FILE LINE COL', 'Search a regexp in every saved file and open buffer; pick a match (file:line: text) with live preview and jump to it (SPC p g).', ([name, line, col, ob, opt]: SchemeValue[]) => {
-  const b = (E.buffers.find(x => x.file === name) || Ed.getBuffer(name as string) || Ed.visit(name as string)) as EdBuffer;
+  const go = (b: EdBuffer | null | false) => {
+    if (!b) return false;
+    Ed.setWindowBuffer(b);
+    b.pt = Math.min(b.rope.length, Ed.lineStartB(b, line as number) + (col as number)); E.recenter = 'center';
+    return false;
+  };
   if (ob instanceof Ed.Buffer && E.buffers.includes(ob)) EC.pushJump(ob, opt as number);
-  Ed.setWindowBuffer(b);
-  b.pt = Math.min(b.rope.length, Ed.lineStartB(b, line as number) + (col as number)); E.recenter = 'center';
-  return false;
+  /* In served mode a file no buffer holds opens as a replica: Ed.visit gives a promise of it. */
+  const b = E.buffers.find(x => x.file === name) || Ed.getBuffer(name as string) || Ed.visit(name as string);
+  return b instanceof Promise ? b.then(go) : go(b);
 });
 L.put(intern('project-find-regexp'), 'evil-jump', true);
 L.addHook('post-command-pulse', intern('project-find-regexp'));

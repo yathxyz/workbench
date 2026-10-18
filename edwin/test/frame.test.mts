@@ -496,6 +496,15 @@ test('writer labels: an agent is named by the agent field edwind attributes it w
   assert.equal(sync.writerLabel({ kind: 'agent' }), 'agent');
 });
 
+test('project-find-regexp jumps to a match in a note no buffer holds yet: the replica opens, then point moves', async () => {
+  const id = note('grep-far.md', 'one\ntwo needle\n');
+  show(Ed.getBuffer('*scratch*'));
+  await L.call('project-find-regexp', [id, 2, 4, false, false]);
+  await until(() => E.sel.buffer.id === id && !E.sel.buffer.sync.opening, 'the replica in the window');
+  const b = E.sel.buffer;
+  assert.equal(b.text, 'one\ntwo needle\n'); assert.equal(b.pt, 8);
+});
+
 test('killed and moved: a buffer killed on the server leaves the frame; a message from edwind reaches the echo area', async () => {
   const id = note('x.md', 'bye\n');
   const b = await sync.open(id); show(Ed.getBuffer('*scratch*'));
