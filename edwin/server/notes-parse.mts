@@ -151,8 +151,10 @@ export function parseFile(id: string, text: string, grammar: RawGrammar): ParseR
     let rest = m[4];
     let priority = null, pm = G.priority.exec(rest);
     if (pm) { priority = pm[1]; rest = (rest.slice(0, pm.index) + rest.slice(pm.index + pm[0].length)).trim(); }
+    // The anchor follows any tags (anchorCard appends it), so it goes first.
+    rest = stripAnchor(rest, G);
     const tm = G.orgTags.exec(rest); if (tm) rest = rest.slice(0, tm.index);
-    rest = stripAnchor(rest, G).trim();
+    rest = rest.trim();
     const t: TaskRec = { id: `${id}:${ln}`, node, kw: m[3], title: rest, priority, scheduled: null, deadline: null, closed: null, tags: [], session: null, dispatched: null, target: null, prompt: '', path: id, line: ln, endLine: ln, fields: {} };
     for (const x of headingTags || []) addTag(t, x);
     if (tm) for (const x of tm[1].split(':').filter(Boolean)) addTag(t, x);
