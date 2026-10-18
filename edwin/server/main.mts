@@ -17,7 +17,7 @@ import { Worker, isMainThread, parentPort } from 'node:worker_threads';
 import { Authority, expandHome } from './paths.mts';
 import { Buffers } from './buffers.mts';
 import { Client } from './session.mts';
-import { ImageLog, randomId, readJournal, jidPath } from './journal.mts';
+import { ImageLog, randomId, readJournal, jidPath, SNAP_NEW } from './journal.mts';
 import { ProtoError } from './proto.mts';
 import { sha256 } from './files.mts';
 import * as imageModule from './image.mts';
@@ -401,7 +401,7 @@ export function check(cfg: Config, out = (s: string): unknown => process.stdout.
     try {
       const { header, batches, torn } = readJournal(path.join(dir, f));
       let base = null;
-      for (const ext of ['.snap', '.saved']) { const p = jidPath(cfg.stateDir, jid, ext); if (fs.existsSync(p)) { const t = fs.readFileSync(p, 'utf8'); if (sha256(t) === header.base.sha256) { base = t; break; } } }
+      for (const ext of ['.snap', SNAP_NEW, '.saved']) { const p = jidPath(cfg.stateDir, jid, ext); if (fs.existsSync(p)) { const t = fs.readFileSync(p, 'utf8'); if (sha256(t) === header.base.sha256) { base = t; break; } } }
       if (base === null && header.file && fs.existsSync(header.file)) { const t = fs.readFileSync(header.file, 'utf8').replace(/\r\n/g, '\n'); if (sha256(t) === header.base.sha256) base = t; }
       if (base === null && header.base.sha256 === sha256('')) base = '';
       if (base === null) { out(`${jid} ${header.id}: no snapshot, saved copy or file matches the journal base`); bad++; continue; }

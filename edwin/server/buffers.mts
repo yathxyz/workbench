@@ -8,7 +8,7 @@ import { createRequire } from 'node:module';
 import { ProtoError, CHUNK } from './proto.mts';
 import { PathError, expandHome, under } from './paths.mts';
 import { readText, saveAtomic, writeAtomic, fsyncDir, sha256, diskState, FileError, BIG } from './files.mts';
-import { Journal, readJournal, header as journalHeader, Index, randomId, jidPath } from './journal.mts';
+import { Journal, readJournal, header as journalHeader, Index, randomId, jidPath, SNAP_NEW } from './journal.mts';
 import { Sequencer } from './sequencer.mts';
 import { Watcher, diffOps, merge3 } from './watch.mts';
 import { restore as restoreAnchors, record as anchorsRecord, publicAnchors } from './anchors.mts';
@@ -29,6 +29,14 @@ export const AUTOSAVE_MS = 2000;
 export const MOVED_TTL_MS = 24 * 3600 * 1000;
 export const UNLOAD_AFTER_MS = 7 * 24 * 3600 * 1000;
 const DISK_BY: By = { kind: 'disk' };
+/* Test hook (R16.5): EDWIND_FAULT=kill-compact-snap or kill-compact-journal kills edwind between the steps of a compaction. */
+const crashPoint = (name: string): void => { if (process.env.EDWIND_FAULT === name) process.kill(process.pid, 'SIGKILL'); };
+/* The new snapshot of a compaction becomes the snapshot (an atomic rename). A failure is logged: SNAP_NEW still
+   matches the journal, and the next reload tries it. */
+function promoteSnap(next: string, snap: string, log: Log, buf: string): void {
+  try { fs.renameSync(next, snap); fsyncDir(path.dirname(snap)); }
+  catch (e) { log.error('compact', { buf, snapshot: e.code || e.message }); }
+}
 const SERVER_BY: By = { kind: 'server' };
 /* The refusal of a destination in, on or above a refused path: the words of wb-web's POST /api/mv (fsapi.rs), which
    forwards its moves here. */
@@ -185,12 +193,14 @@ export class Buffers {
     }
     const id = last ? last.id : header.id;
     let base: string | null = null, baseWhy = '';
-    const saved = jidPath(this.stateDir, e.jid, '.saved'), snap = jidPath(this.stateDir, e.jid, '.snap');
-    for (const f of [snap, saved]) {
+    const saved = jidPath(this.stateDir, e.jid, '.saved'), snap = jidPath(this.stateDir, e.jid, '.snap'), next = jidPath(this.stateDir, e.jid, SNAP_NEW);
+    /* A compaction killed after its journal was in place left the snapshot of that journal in SNAP_NEW: it
+       becomes the snapshot now, before a later compaction writes SNAP_NEW again. */
+    for (const f of [snap, next, saved]) {
       if (!fs.existsSync(f)) continue;
       const t = fs.readFileSync(f, 'utf8');
-      if (sha256(t) === header.base.sha256) { base = t; break; }
-      baseWhy = `${path.basename(f)} does not match the journal base`;
+      if (sha256(t) === header.base.sha256) { base = t; if (f === next) promoteSnap(next, snap, this.log, header.id); break; }
+      if (f !== next) baseWhy = `${path.basename(f)} does not match the journal base`;
     }
     let file: string | null = last && last.file !== undefined ? last.file : header.file, eol: Eol = 'lf', disk: DiskState | null = null, savedText: string | null = null;
     if (file) {
@@ -551,10 +561,16 @@ export class Buffers {
     /* Snapshot at the version where the retained history begins, so dedup and undo survive a restart. */
     const baseVer = sb.hist.length ? sb.hist[0].ver - 1 : sb.ver;
     const baseText = sb.hist.length ? OT.textBefore(text, sb.hist) : text;
-    writeAtomic(jidPath(this.stateDir, sb.jid, '.snap'), baseText);
+    /* The new snapshot goes beside the old one (SNAP_NEW) until the new journal is in place, so a kill at any step
+       leaves a journal whose base one of the two matches; reloadOne and --check try both. */
+    const snap = jidPath(this.stateDir, sb.jid, '.snap'), next = jidPath(this.stateDir, sb.jid, SNAP_NEW);
+    writeAtomic(next, baseText);
+    crashPoint('kill-compact-snap');
     sb.journal.close();
     sb.journal = Journal.create(sb.journal.file, journalHeader({ jid: sb.jid, id: sb.id, name: sb.name, file: sb.file, mode: sb.ed.mode, baseVer, baseText }),
       [...sb.hist.map(b => ({ t: 'b' as const, ver: b.ver, cid: b.cid, seq: b.seq, by: b.by, ops: b.ops, undo: b.undo, at: b.at })), ...(sb.anchors.length ? [anchorsRecord(sb)] : [])]);
+    crashPoint('kill-compact-journal');
+    promoteSnap(next, snap, this.log, sb.id);
     this.index.set(sb.indexEntry());
   }
 
@@ -568,7 +584,7 @@ export class Buffers {
     for (const c of sb.clients) { c.send({ t: 'killed', buf: sb.id }); c.buffers.delete(sb); }
     sb.clients.clear();
     if (sb.autosave) clearTimeout(sb.autosave);
-    if (sb.journal) { sb.journal.close(); for (const ext of ['.jsonl', '.snap', '.saved']) { try { fs.unlinkSync(jidPath(this.stateDir, sb.jid, ext)); } catch (e) { /* gone */ } } }
+    if (sb.journal) { sb.journal.close(); for (const ext of ['.jsonl', '.snap', SNAP_NEW, '.saved']) { try { fs.unlinkSync(jidPath(this.stateDir, sb.jid, ext)); } catch (e) { /* gone */ } } }
     this.byId.delete(sb.id); this.byJid.delete(sb.jid); this.index.delete(sb.jid);
     if (sb.serverEdit) { for (const w of sb.serverEdit.waiters) w(sb.serverEdit.saved ? 0 : 1); sb.serverEdit = null; }
     if (this.hooks.killed) this.hooks.killed(sb);

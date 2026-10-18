@@ -101,6 +101,58 @@ test('R16.5 SIGKILL at random points under a three-client load: acked batches su
   fs.rmSync(dir.root, { recursive: true, force: true });
 });
 
+test('R16.5 SIGKILL between the steps of a compaction: the state checks and loads with every acked batch', { timeout: 120000 }, async () => {
+  /* The compaction that moves the journal's base: a history past retention (more than 10,000 batches, two days
+     old), so the retained history starts after the base and the save's compaction writes a new snapshot. The
+     fault hook kills edwind after the snapshot is written, then after the journal is replaced. */
+  const N = 10005, old = Date.now() - 2 * 24 * 3600 * 1000;
+  for (const fault of ['kill-compact-snap', 'kill-compact-journal']) {
+    const dir = makeDir();
+    const file = path.join(dir.dirs.home, 'c.md'), id = '~/c.md';
+    fs.writeFileSync(file, 'base\n');
+    let child = await startEdwind(dir);
+    try { const a = new EditClient(dir.cfg.socket); await a.connect(); await a.hello(); assert.equal((await a.open(id)).text, 'base\n'); a.close(); }
+    finally { await stopEdwind(child); }
+    const jdir = path.join(dir.dirs.state, 'buffers');
+    const jfile = path.join(jdir, fs.readdirSync(jdir).find(f => f.endsWith('.jsonl'))!);
+    let lines = '';
+    for (let v = 1; v <= N; v++) lines += JSON.stringify({ t: 'b', ver: v, cid: null, seq: null, by: { kind: 'server' }, ops: [[0, '', 'x']], at: old + v }) + '\n';
+    fs.appendFileSync(jfile, lines);
+    const text = 'x'.repeat(N) + 'base\n';
+    child = await startEdwind(dir, { env: { EDWIND_FAULT: fault } });
+    try {
+      const b = new EditClient(dir.cfg.socket); await b.connect(); await b.hello();
+      const o = await b.open(id); assert.equal(o.text, text); assert.equal(o.ver, N);
+      assert.equal((await b.edit(id, N, [[0, '', 'y']])).t, 'ack');
+      const exited = new Promise(r => child.once('exit', r));
+      b.send({ t: 'save', rid: 'save', buf: id });
+      await Promise.race([exited, sleep(30000)]);
+      b.close();
+    } finally { await stopEdwind(child, 'SIGKILL'); }
+    assert.equal(child.signalCode, 'SIGKILL', `${fault}: edwind was killed in the compaction:\n${child.logs.slice(-1500)}`);
+    { const { ok, lines: out } = checkOk(dir.file); assert.equal(ok, true, `${fault}: edwind --check after the kill:\n${out.join('\n')}`); }
+    child = await startEdwind(dir);
+    try {
+      const c = new EditClient(dir.cfg.socket); await c.connect(); await c.hello();
+      const o = await c.open(id);
+      assert.equal(o.meta!.readOnly, false, `${fault}: ${o.meta!.readOnly}`);
+      assert.equal(o.text, 'y' + text, `${fault}: every acked batch is there`); assert.equal(o.ver, N + 1);
+      assert.equal((await c.edit(id, N + 1, [[0, '', 'z']])).t, 'ack');
+      assert.equal((await c.request({ t: 'save', buf: id })).value.saved, true, 'a later compaction goes through');
+      c.close();
+    } finally { await stopEdwind(child); }
+    const { ok, lines: out } = checkOk(dir.file); assert.equal(ok, true, out.join('\n'));
+    child = await startEdwind(dir);
+    try {
+      const d = new EditClient(dir.cfg.socket); await d.connect(); await d.hello();
+      const o = await d.open(id); assert.equal(o.text, 'zy' + text); assert.equal(o.ver, N + 2); assert.equal(o.meta!.readOnly, false);
+      d.close();
+    } finally { await stopEdwind(child); }
+    assert.deepEqual(fs.readdirSync(jdir).filter(f => !/\.(jsonl|snap|saved)$/.test(f)), [], `${fault}: no file but the journal, the snapshot and the saved copy is left`);
+    fs.rmSync(dir.root, { recursive: true, force: true });
+  }
+});
+
 test('R16.6 a journal truncated at every byte offset of its last line recovers to the last whole batch and logs it', { timeout: 3600000 }, async () => {
   const dir = makeDir();
   fs.writeFileSync(path.join(dir.dirs.notes, 'torn.md'), 'line\n');

@@ -180,3 +180,6 @@ export { ImageLog } from './image.mts';
 /* A random id: 96 bits (12 bytes) for a jid (R6.1). */
 export const randomId = (bytes = 12): string => randomBytes(bytes).toString('hex');
 export const jidPath = (dir: string, jid: string, ext: string): string => path.join(dir, 'buffers', jid + ext);
+/* The snapshot a compaction writes beside <jid>.snap until its new journal is in place (buffers.mts compact):
+   a journal's base is the text of <jid>.snap, of <jid>.snap.new, of <jid>.saved or of the file. */
+export const SNAP_NEW = '.snap.new';

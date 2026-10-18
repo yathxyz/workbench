@@ -151,7 +151,9 @@ Choices E1 made where the spec left one open, and where it had to deviate:
   insert landing at that point: both sides apply Edwin's `shiftMarkers` rule, but see the operations in a
   different order. `ot.test.mts` states the property that holds; the frames' point stays where the user expects.
 - **Edwin's key-value store** (`storage`) lives in `stateDir/storage.json`; compaction snapshots the text at the
-  start of the retained history; journals compact at 4 MiB or 20,000 lines and after a save.
+  start of the retained history; journals compact at 4 MiB or 20,000 lines and after a save. The new snapshot
+  is written as `<jid>.snap.new` and renamed over `<jid>.snap` once the compacted journal is in place, so a kill
+  at any step leaves a journal whose base one of them matches (reload and `--check` try both).
 - **`web.json`** is untouched in E1 (`editSocket`, `refusePaths` and the notes forwarding came with E2, R15.5; the
   `/edit` relay is E3); the module writes `refusePaths` into `edit.json` only. `/api/status`'s `edit` block
   (R15.11) came with E2 as well.
