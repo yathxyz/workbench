@@ -267,7 +267,8 @@ function exTable() {
   for (const p of arr(L.get('evil-ex-commands') ?? NIL)) {
     const spec = L.car(p), cmd = L.cdr(p);
     if (typeof spec !== 'string') continue;
-    const m = /^([^\[]*)(?:\[(.*)\])?$/.exec(spec)!;
+    const m = /^([^\[]*)(?:\[(.*)\])?$/.exec(spec);
+    if (!m) continue;   // a name like "foo[bar" (no closing bracket) is no command
     out.push({ req: m[1], full: m[1] + (m[2] || ''), cmd });
   }
   return out;

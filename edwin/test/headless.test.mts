@@ -50,6 +50,14 @@ test('ex commands: substitute, global and sort', async () => {
   await ed.type(':g/fig/d\n'); assert.ok(!ed.text().includes('fig'));
 });
 
+test('a malformed name in evil-ex-commands leaves the other ex commands working', async () => {
+  await fresh();
+  await ed.type('ib\na'); await ed.keys('ESC');
+  ed.eval('(set! evil-ex-commands (cons (cons "bad[name" \'ignore) evil-ex-commands))');
+  try { await ed.type(':sort\n'); assert.equal(ed.text(), 'a\nb'); }
+  finally { ed.eval('(set! evil-ex-commands (cdr evil-ex-commands))'); }
+});
+
 test('visual mode and text objects', async () => {
   await fresh();
   await ed.type('i(alpha beta) gamma'); await ed.keys('ESC');
