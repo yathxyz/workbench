@@ -436,7 +436,7 @@ own edwind when none answers, as `emacsclient -a ''` starts an Emacs daemon.
   the ssh program.
 - **Names.** A FILE argument that is not a path on this machine (not `/…`, `~…`, `./…` or `../…`) is a note on
   the remote host, named as under its notes directory (`journal.md`, `projects/edwin.md`); `./draft.txt` is a file
-  here. Inside, a full path under the remote notes directory is a note there; other names are files on this
+  here, and so is a full path, even when this machine has a notes directory at the same path. Inside, a full path under the remote notes directory is a note there; other names are files on this
   machine (DT1).
 - **The connection.** The start waits up to 30 s for the remote edwind to answer (a ping before hello, which
   draws an error reply and proves the whole path) and otherwise exits with status 1 and ssh's reason ("Could not
