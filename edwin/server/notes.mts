@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Worker, MessageChannel, receiveMessageOnPort } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
+import { randomBytes } from 'node:crypto';
 import { ProtoError } from './proto.mts';
 import { writeAtomic } from './files.mts';
 import { PathError, under, realPath } from './paths.mts';
@@ -36,6 +37,15 @@ const SCM_FILE = path.join(HERE, '..', 'scm', 'notes-syntax.scm');
 const PARSER = new URL('./notes-parse.mts', import.meta.url);
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const KEY_RE = /^[A-Za-z][\w-]*$/;
+/* A card id without a block anchor: path#LINE, then #fwd, #rev or #cN for the cards of one block. */
+const UNANCHORED_CARD = /^(.+)#(\d+)((?:#(?:fwd|rev|c\d+))?)$/;
+/* A new block anchor label: five base-36 characters. */
+const mintAnchor = () => { let s = ''; for (const b of randomBytes(5)) s += (b % 36).toString(36); return s; };
+/* A label from MINT that TAKEN (the file's anchors) does not hold, retried on a collision. */
+export function freeAnchor(taken: Set<string>, mint: () => string = mintAnchor, tries = 100): string {
+  for (let i = 0; i < tries; i++) { const label = mint(); if (!taken.has(label)) return label; }
+  throw new Error('no free anchor label');
+}
 
 type Params = Record<string, any>; // any: a server command's object argument (wire JSON), read field by field
 const param = (args: unknown): Params => (Array.isArray(args) && args[0] && typeof args[0] === 'object' && !Array.isArray(args[0]) ? args[0] : {});
@@ -653,7 +663,7 @@ export class Notes {
     }
     return { dir, reviews: out };
   }
-  appendReviews(p: Params) {
+  async appendReviews(client: Client, p: Params) {
     const reviews = p.reviews;
     if (!Array.isArray(reviews) || !reviews.every(r => r && typeof r === 'object')) throw bad('reviews must be a list of objects');
     const dir = this.reviewsDir();
@@ -669,8 +679,67 @@ export class Notes {
       if (f.symlink && !f.exists) throw new PathError('refused_path', `${f.real}: a dangling symlink`);
       file = this.server.auth.checkWrite(f.real);
     } catch (e) { throw new ProtoError('refused_path', e.message); }
-    if (reviews.length) fs.appendFileSync(file, reviews.map(r => JSON.stringify(r) + '\n').join(''), { mode: 0o600 });
-    return { dir, appended: reviews.length };
+    const { lines, anchored } = await this.anchorReviews(reviews, this.byOf(p.by, client));
+    if (lines.length) fs.appendFileSync(file, lines.map(r => JSON.stringify(r) + '\n').join(''), { mode: 0o600 });
+    return Object.keys(anchored).length ? { dir, appended: lines.length, anchored } : { dir, appended: lines.length };
+  }
+  /* Stable card ids. A card without a block anchor is `path#N` (its head line), so its reviews orphan as soon as
+     a line above it is added or removed. The first review of such a card mints a block anchor on its head line
+     (` ^xxxxx`, an edit like every write here) and is logged under `path#^xxxxx`; the card's earlier reviews,
+     under the old id, are copied into this host's log under the new one (`from` names the old id; a copy already
+     made is not repeated), so its history follows it. The old lines stay and match no card. A review whose card
+     is not found in the current text is logged as given. */
+  async anchorReviews(reviews: Record<string, unknown>[], by: By): Promise<{ lines: Record<string, unknown>[]; anchored: Record<string, string> }> {
+    const out = reviews.map(r => ({ ...r })), copies: Record<string, unknown>[] = [], anchored: Record<string, string> = {};
+    const bases = new Map<string, string | null>();
+    for (const r of out) {
+      const m = typeof r.card === 'string' ? UNANCHORED_CARD.exec(r.card) : null;
+      if (!m) continue;
+      const old = `${m[1]}#${m[2]}`;
+      if (!bases.has(old)) {
+        let base: string | null = null;
+        try { base = await this.anchorCard(m[1], Number(m[2]), by); } catch (e) { this.log.warn('notes', { anchor: old, error: e.code || e.message }); }
+        bases.set(old, base);
+        if (base) { anchored[old] = base; copies.push(...this.copiedReviews(old, base)); }
+      }
+      const base = bases.get(old);
+      if (base) r.card = base + m[3];
+    }
+    return { lines: [...copies, ...out], anchored };
+  }
+  /* The anchored id (`path#^label`) of the card whose head is line LINE of the note PATH, minting the anchor when
+     it has none; null when no card starts there. */
+  async anchorCard(id: string, line: number, by: By): Promise<string | null> {
+    const sb = this.noteBuffer(id, false), text = sb.text;
+    const card = parseFile(id, text, this.G).cards.find(c => c.line === line);
+    if (!card) return null;
+    const lines = text.split('\n'), head = lines[line - 1];
+    const have = this.G.anchor.exec(head);
+    if (have) return `${id}#^${have[1]}`;
+    const taken = new Set<string>();
+    for (const l of lines) { const am = this.G.anchor.exec(l); if (am) taken.add(am[1]); }
+    const label = freeAnchor(taken);
+    const keep = head.trimEnd(), added = ` ^${label}`;
+    const am = this.G.anchor.exec(keep + added);
+    if (!am || am[1] !== label) return null;   // a grammar whose anchors this line cannot carry: leave the card as is
+    let pos = 0; for (let i = 0; i < line - 1; i++) pos += lines[i].length + 1;
+    await this.editBuffer(sb, [[pos + keep.length, head.slice(keep.length), added]], by);
+    this.log.info('notes', { anchor: `${id}#^${label}`, was: `${id}#${line}` });
+    return `${id}#^${label}`;
+  }
+  /* The logged reviews of the card OLD (and its #fwd/#rev/#cN siblings) not yet copied to BASE, as copies. */
+  copiedReviews(old: string, base: string): Record<string, unknown>[] {
+    const all = this.readReviews().reviews as Record<string, unknown>[];
+    const key = (r: Record<string, unknown>, card: unknown) => JSON.stringify([card, r.t, r.g]);
+    const done = new Set(all.filter(r => typeof r.from === 'string' && typeof r.card === 'string' && (r.card === base || r.card.startsWith(base + '#'))).map(r => key(r, r.from)));
+    const out: Record<string, unknown>[] = [];
+    for (const r of all) {
+      if (typeof r.card !== 'string' || typeof r.from === 'string') continue;
+      const m = UNANCHORED_CARD.exec(r.card);
+      if (!m || `${m[1]}#${m[2]}` !== old || done.has(key(r, r.card))) continue;
+      out.push({ ...r, card: base + m[3], from: r.card });
+    }
+    return out;
   }
 
   /* ---------- the server commands (§11.3) ---------- */
@@ -685,7 +754,7 @@ export class Notes {
     def('notes-links', () => { const d = this.derived(); return { value: { files: d.files, links: d.links, backlinks: d.backlinks, outlinks: d.outlinks } }; });
     def('notes-cards', () => ({ value: { root: this.root, exists: this.exists(), cards: this.derived().cards } }));
     def('notes-reviews', () => ({ value: this.readReviews() }));
-    def('notes-reviews-append', (c, p) => ({ value: this.appendReviews(p) }));
+    def('notes-reviews-append', async (c, p) => ({ value: await this.appendReviews(c, p) }));
     def('notes-tasks', () => ({ value: { host: server.cfg.host, tasks: this.derived().tasks } }));
     def('notes-task', (c, p, args) => {
       const id = typeof args[0] === 'string' ? args[0] : p.id;

@@ -226,9 +226,10 @@ export function parseFile(id: string, text: string, grammar: RawGrammar): ParseR
     const h = headingOf(line, i);
     let srcId = cur ? cur.id : id;
     if (h) {
-      let text = h.text, tags: string[] = [];
+      /* The anchor ends the line, after any org tags. */
+      let text = stripAnchor(h.text, G), tags: string[] = [];
       const tm = G.orgTags.exec(text); if (tm) { tags = tm[1].split(':').filter(Boolean); text = text.slice(0, tm.index); }
-      text = stripAnchor(text, G).trim();
+      text = text.trim();
       const rec: HeadingRec = { id: `${id}#${ln}`, title: text, level: h.level, kind: 'heading', tags, body: trimBlank(lines.slice(i + (h.setext ? 2 : 1), i + (h.setext ? 2 : 1) + 5)).join('\n'), line: ln, path: id, orgId: null };
       inlineTags(h.text, rec);
       headings.push(rec); cur = rec; srcId = rec.id;
@@ -288,10 +289,10 @@ export function parseFile(id: string, text: string, grammar: RawGrammar): ParseR
     while (end < n && lines[end].trim() && !fenced.has(end) && !isHeadingLine(lines[end], end) && (!lm || indentOf(lines[end]) > headIndent)) end++;
     const props: Record<string, string> = {}, body: string[] = [];
     for (let k = j + 1; k < end; k++) { const f = G.field.exec(lines[k]); if (f) props[f[1].toLowerCase()] = f[2]; else body.push(lines[k].trim()); }
-    let title = hh ? hh.text : lm ? lm[3] : head.trim();
+    let title = stripAnchor(hh ? hh.text : lm ? lm[3] : head.trim(), G);
     const tm = G.orgTags.exec(title); if (tm) title = title.slice(0, tm.index);
     const am = G.anchor.exec(head);
-    title = stripAnchor(title, G).trim();
+    title = title.trim();
     const km = G.task.exec(head); if (km) title = title.replace(new RegExp(`^${escapeRe(km[3])}\\s+`), '');
     const baseId = am ? `${id}#^${am[1]}` : `${id}#${j + 1}`;
     const kind = G.cardKinds.has(String(props[G.cardField]).toLowerCase()) ? String(props[G.cardField]).toLowerCase() : 'basic';
