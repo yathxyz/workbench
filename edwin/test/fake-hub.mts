@@ -226,7 +226,7 @@ export class FakeHub {
       case 'pty.detach': conn.attached.delete(sid); if (sess && sess.summary.viewers > 0) { sess.summary.viewers--; this.publish(sess); } return ok({});
       case 'pty.input': {
         if (Buffer.byteLength(req.d) > (1 << 20)) return this.err(conn, null, 'bad_request', 'pty.input is limited to 1048576 bytes', sid);
-        if (!sess || !sess.summary.alive) return;
+        if (!sess || sess.summary.kind !== 'pty' || !sess.summary.alive) return; // as the hub: input to no pty session goes nowhere
         (sess as PtySession).inputs.push(req.d);
         if ((sess as PtySession).inputFn) (sess as PtySession).inputFn!(req.d); else ((sess as PtySession).pendingInputs || ((sess as PtySession).pendingInputs = [])).push(req.d);
         return;
@@ -240,6 +240,7 @@ export class FakeHub {
       }
       case 'pty.capture': {
         if (!sess) return this.err(conn, rid, 'not_found', `no session ${sid}`);
+        if (sess.summary.kind !== 'pty') return this.err(conn, rid, 'kind_mismatch', `${sid} is a acp session`);
         const lines = stripAnsi((sess as PtySession).ring).split('\n').map(l => l.trimEnd()); while (lines.length && !lines[lines.length - 1]) lines.pop();
         return ok({ text: lines.slice(-Math.min(req.lines || 200, 1000)).join('\n') });
       }
