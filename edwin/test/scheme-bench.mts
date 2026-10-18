@@ -102,6 +102,9 @@ function v2s(x: SchemeValue): string { return typeof x === 'bigint' ? x.toString
 
 const pct = (a: number, b: number): string => ((a / b - 1) * 100).toFixed(1).padStart(6) + '%';
 const head = ['benchmark'.padEnd(22), ...variants.map(v => v.name.padStart(18)), 'shadow cost'.padStart(12), 'gen / direct'.padStart(12), base ? 'vs original'.padStart(12) : ''];
+/* The stack the run had (nix/checks.nix runs the bench with --stack-size, as the deep recursions need it). */
+const stack = [...process.execArgv, ...(process.env.NODE_OPTIONS || '').split(/\s+/)].filter(f => /^--stack[-_]size\b/.test(f)).pop();
+console.log(`node ${process.version}, ${stack || 'the default --stack-size'}, best of ${REPS} runs`);
 console.log(head.join(' '));
 const ratios: number[] = [], genRatios: number[] = [];
 for (const r of rows) {

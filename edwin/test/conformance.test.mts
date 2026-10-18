@@ -308,7 +308,9 @@ test('§7.4 call{form}: value, out, msg; conditions come back in result, never a
 
 test('R4.14, R4.15 definitional forms enter the image log with a generation; image? replays them', async () => {
   const a = await client();
-  const g0 = (await client()).welcome.gen;
+  const probe = await client();
+  const g0 = probe.welcome.gen;
+  probe.close();
   await a.form('(define e1-logged 41)');
   await a.form('(set! e1-logged 42)');
   await a.form('(+ 1 2)');
