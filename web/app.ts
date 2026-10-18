@@ -3784,9 +3784,11 @@ const AGENT_TOOLS: AgentTool[] = [
       if (shape === 'arrow') {
         const a = findNode(from) || S.shapes.find(s => s.id === from), b = findNode(to) || S.shapes.find(s => s.id === to);
         if (!a || !b) throw new Error('an arrow needs existing from and to');
-        const down = b.y! > a.y! + a.h!;
-        const s = addShape({ type: 'arrow', color: c, text: t, x1: 0, y1: 0, x2: 0, y2: 0,
-          a: { id: a.id, dx: down ? a.w! / 2 : a.w!, dy: down ? a.h! : a.h! / 2 }, b: { id: b.id, dx: down ? b.w! / 2 : 0, dy: down ? 0 : b.h! / 2 } });
+        // an arrow has no box to bind to (bindTarget skips arrows too): that end sits unbound at its midpoint as drawn
+        const mid = (o: BoardNode | Shape): BoardPoint | null => { if (!('type' in o) || o.type !== 'arrow') return null; const e = arrowEnds(o); return { x: (e.x1 + e.x2) / 2, y: (e.y1 + e.y2) / 2 }; };
+        const pa = mid(a), pb = mid(b), down = (pb ? pb.y : b.y!) > (pa ? pa.y : a.y! + a.h!);
+        const s = addShape({ type: 'arrow', color: c, text: t, x1: pa?.x ?? 0, y1: pa?.y ?? 0, x2: pb?.x ?? 0, y2: pb?.y ?? 0,
+          a: pa ? null : { id: a.id, dx: down ? a.w! / 2 : a.w!, dy: down ? a.h! : a.h! / 2 }, b: pb ? null : { id: b.id, dx: down ? b.w! / 2 : 0, dy: down ? 0 : b.h! / 2 } });
         return s.id;
       }
       const nr = near && findNode(near), lines = t.split('\n'), longest = Math.max(...lines.map(l => l.length), 6);
@@ -8999,7 +9001,7 @@ AGENT_TOOLS.push(
   { name: 'node_addr', description: 'The address of a node (by board path), or of the active node when path is empty.', inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
     run: ({ path }: { path?: string } = {}) => { const n = path ? (findNode(path) || findFolder(path)) : activeId && S.nodes[activeId]; if (!n) throw new Error('no node at ' + (path || '(active)')); return addrOf(n); } },
   { name: 'cd_shell', description: 'Send cd to a shell so that it moves to a directory given as an fs: address (fs:/srv or fs:@host/srv). shell: the shell\'s board path; empty = the active shell.', inputSchema: { type: 'object', properties: { addr: { type: 'string' }, shell: { type: 'string' } }, required: ['addr'] },
-    run: ({ addr, shell }: { addr: string; shell?: string }) => { const a = parseAddr(addr); if (!a || a.kind !== 'fs') throw new Error('addr must be fs:[@host]/dir'); const n = shell ? findNode(shell) : activeId && S.nodes[activeId]; if (!n || n.kind !== 'term') throw new Error('no shell at ' + (shell || '(active)')); const h = a.host ? hostByName(a.host) : null; if (a.host && !h) throw new Error('unknown host @' + a.host); if (hostKey(h) !== hostKey(hostOf(n))) throw new Error('that directory is on another host than the shell'); const d = a.path || '~'; const b = live[n.id]?.backend; if (n.backend === 'pty') b?.input?.(` cd '${d.replace(/'/g, "'\\''")}'\r`); else if (b) { b.input(`cd ${d}\r`); } else throw new Error('shell not live'); return `${pathOf(n.id)}: cd ${d}`; } },
+    run: ({ addr, shell }: { addr: string; shell?: string }) => { const a = parseAddr(addr); if (!a || a.kind !== 'fs') throw new Error('addr must be fs:[@host]/dir'); const n = shell ? findNode(shell) : activeId && S.nodes[activeId]; if (!n || n.kind !== 'term') throw new Error('no shell at ' + (shell || '(active)')); const h = a.host ? hostByName(a.host) : null; if (a.host && !h) throw new Error('unknown host @' + a.host); if (hostKey(h) !== fsHostKey(n)) throw new Error('that directory is on another host than the shell'); const d = a.path || '~'; const b = live[n.id]?.backend; if (n.backend === 'pty') b?.input?.(` cd '${d.replace(/'/g, "'\\''")}'\r`); else if (b) { b.input(`cd ${d}\r`); } else throw new Error('shell not live'); return `${pathOf(n.id)}: cd ${d}`; } },
 );
 // ---- dropping into a tag folder tags the node; dragging between tag folders retags it; out of a tag folder removes the tag
 function tagDrop(n: BoardNode, t: FrameNode | null | undefined, from: FrameNode | null | undefined): void {

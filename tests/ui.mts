@@ -583,6 +583,12 @@ st = await p.evaluate(async ({ y, ym }) => { const C = window.__canvas, S = C.S;
 check('addresses: board paths; resolve finds folders, files, tags, notes, journal days and links; reserved and bogus refused', st.addrs.join() === 'board:/canvas-workbench,board:/canvas-workbench/machines,board:/canvas-workbench/machines/build' && st.res['board:/canvas-workbench/machines'].startsWith('fMach|') && +st.res['fs:~'].split('|')[2] >= 2 && st.res['tag:agent'] === 'tag:agent|tag:agent|1' && st.res['note:hosts'].startsWith('note:hosts|note:hosts|') && st.res['journal:' + YM.replace('-', '/')].endsWith('|1') && st.res['link:hosts'].endsWith('|1') && st.res['proc:@x/1'] === 'ERR' && st.res['bogus'] === 'ERR', JSON.stringify(st.res));
 check('navigator root lists every relation; tag, note, journal and link trees list', st.root.slice(-8).join() === '# tags,¶ notes,▦ journal,⇄ links,⌗ tmux,⚙ processes,⊙ units,! attention' && st.tags.join() === '#agent:1' && st.agent.join() === 'claude' && st.notes.some((x: string) => x.startsWith('plans:')) && st.plans.length > 0 && st.plans.every((x: string) => x.startsWith('iblock:')) && st.journal.join('|') === `${Y}|${YM}|${DAY}` && st.links.some((x: string) => x.startsWith('hosts:')) && st.lh.join() === 'pi:ghost', JSON.stringify(st));
 check('goAddr opens the navigator or the canvas and writes the hash; wb-style ls and cd work', st.v1 === 'tag:agent #tag:agent' && st.v2 === '#board:/canvas-workbench/machines canvas' && st.ls.includes('journal:' + DAYP) && st.cd === 'sh: cd /home/me/projects', JSON.stringify({ v1: st.v1, v2: st.v2, ls: st.ls, cd: st.cd }));
+st = await p.evaluate(() => { const C = window.__canvas, cd = C.AGENT_TOOLS.find((t: AgentTool) => t.name === 'cd_shell'), H = { name: 'cdhost', url: 'https://cdhost.invalid' };
+  C.HOSTLIST.push(H); const sh = C.addNode({ kind: 'term', backend: 'fake', name: 'cdsh', env: {}, hostUrl: H.url, x: 14000, y: 14400, w: 300, h: 200 });   // runs on cdhost, in no host folder
+  const run = (addr: string) => { try { return cd.run({ addr, shell: 'cdsh' }); } catch (e) { return 'ERR ' + e.message; } };
+  const r = { there: run('fs:@cdhost/srv'), here: run('fs:/srv') };
+  C.HOSTLIST.splice(C.HOSTLIST.indexOf(H), 1); C.removeNode(sh.id); return r; });
+check('cd_shell: a shell on another host by its hostUrl (outside that host\'s folder) takes cd to that host\'s fs: address and refuses a local one', /: cd \/srv$/.test(st.there) && /another host/.test(st.here), JSON.stringify(st));
 await p.goBack(); await sleep(500);
 st = await p.evaluate(() => [location.hash, window.__canvas.RG.dir, document.body.dataset.view || null]);
 check('browser back returns to the previous address', st[0] === '#tag:agent' && st[1] === 'tag:agent', JSON.stringify(st));
@@ -684,10 +690,19 @@ st = await p.evaluate(() => { const C = window.__canvas, S = C.S;
   C.pickClear(); C.pickInRect({ x: 11900, y: 11900 }, { x: 12700, y: 12400 });   // everything: the page, the sketch card, the shape
   r.all = { nodes: C.PICKED.size, shapes: C.SEL.shapes.size };
   C.removeSelection(); r.after = { page: !!S.nodes[pg.id], sketch: !!(n && S.nodes[n.id]), strokes: S.strokes.filter((s: Stroke) => s.id.startsWith('tst')).length, shape: S.shapes.some((s: Shape) => s.id === sh.id), chip: !document.querySelector<HTMLElement>('#pick-chip')!.hidden };
-  r.undo = C.removeUndo() && S.shapes.some((s: Shape) => s.id === sh.id); C.removeSelection; S.shapes = S.shapes.filter((s: Shape) => s.id !== sh.id);
+  r.undo = C.removeUndo() && S.shapes.some((s: Shape) => s.id === sh.id); C.SEL.shapes.add(sh.id); C.removeSelection(); r.again = !S.shapes.some((s: Shape) => s.id === sh.id);
   C.setTool?.('area'); r.cursorClass = document.querySelector('#viewport')!.classList.contains('tool-area'); C.setTool?.('select');
   return r; });
-check('area selection: a rectangle picks the ink and the shape inside it (not the card outside) and shows the chip; Sketch card turns the ink into a sketch card owning the strokes; a bigger rectangle takes cards too and Delete removes all; Ctrl-Z brings the shape back; the ⬚ tool exists', st.strokes === 3 && st.shapes === 1 && st.nodes === 0 && st.chip && st.pickedPaths === 3 && st.tool && st.sketchBtn && st.sk && st.sk.kind === 'sketch' && st.sk.owned === 3 && st.sk.inside && st.sk.picked && st.sk.strokesLeft === 0 && st.all.nodes === 2 && st.all.shapes === 1 && !st.after.page && !st.after.sketch && st.after.strokes === 0 && !st.after.shape && !st.after.chip && st.undo && st.cursorClass, JSON.stringify(st));
+check('area selection: a rectangle picks the ink and the shape inside it (not the card outside) and shows the chip; Sketch card turns the ink into a sketch card owning the strokes; a bigger rectangle takes cards too and Delete removes all; Ctrl-Z brings the shape back and Delete takes it again; the ⬚ tool exists', st.strokes === 3 && st.shapes === 1 && st.nodes === 0 && st.chip && st.pickedPaths === 3 && st.tool && st.sketchBtn && st.sk && st.sk.kind === 'sketch' && st.sk.owned === 3 && st.sk.inside && st.sk.picked && st.sk.strokesLeft === 0 && st.all.nodes === 2 && st.all.shapes === 1 && !st.after.page && !st.after.sketch && st.after.strokes === 0 && !st.after.shape && !st.after.chip && st.undo && st.again && st.cursorClass, JSON.stringify(st));
+
+// draw_shape (agent tool) between two arrows: an arrow has no box, so each end sits unbound at that arrow's midpoint
+st = await p.evaluate(() => { const C = window.__canvas, S = C.S, draw = C.AGENT_TOOLS.find((t: AgentTool) => t.name === 'draw_shape');
+  const a0 = C.addShape({ type: 'arrow', x1: 13000, y1: 13000, x2: 13200, y2: 13000 }), a1 = C.addShape({ type: 'arrow', x1: 13000, y1: 13200, x2: 13200, y2: 13400 });
+  let id: string | null = null, err = ''; try { id = draw.run({ shape: 'arrow', from: a0.id, to: a1.id }); } catch (e) { err = String(e); }
+  const s = S.shapes.find((x: Shape) => x.id === id), g = id && document.querySelector(`#shapes [data-id="${id}"]`);
+  const r = { err, ends: s ? [s.x1, s.y1, s.x2, s.y2] : null, bound: !!(s?.a || s?.b), drawn: !!g, nan: !!g && /NaN/.test(g.innerHTML) };
+  for (const x of [a0.id, a1.id, id]) if (x) C.SEL.shapes.add(x); C.removeSelection(); return r; });
+check('draw_shape from an arrow to an arrow: each end sits at that arrow\'s midpoint, unbound, and draws without NaN', !st.err && JSON.stringify(st.ends) === '[13100,13000,13100,13300]' && !st.bound && st.drawn && !st.nan, JSON.stringify(st));
 
 // ---- v18.2 (▦): a packed folder is no wider than its rows
 st = await p.evaluate(() => { const C = window.__canvas;
