@@ -699,6 +699,20 @@ const gs = await p.evaluate(() => { const C = window.__canvas; const r: Record<s
 if (gs.pal) { await p.keyboard.press('Escape'); await sleep(100); }
 await p.evaluate(() => window.__canvas.setView('canvas'));
 check('graph: a selection shows a card with ✕ and a hint; Esc clears it, so does ✕; then \'.\' opens no palette (N66)', st.sel && st.card && st.x && /Esc, ✕ or a click on empty space/.test(st.hint) && gs.sel === null && !gs.card && gs.afterX === null && !gs.pal, JSON.stringify({ st, gs }));
+// v9 removed the assistant pane (live.chat): the graph card's Ask assistant and Handwriting → ask the assistant are offered only while it exists
+await p.evaluate(() => window.__canvas.setView('graph')); await sleep(600);
+st = await p.evaluate(() => { const C = window.__canvas, chat = !!(C.S.chat && C.live.chat); C.graphSelect([...C.G.N.keys()][0]);
+  const card = !document.querySelector<HTMLElement>('#g-card')!.hidden, ask = [...document.querySelectorAll('#g-card button')].some(b => b.textContent === 'Ask assistant'); C.graphSelect(null);
+  const keep = C.INK.ids; C.INK.ids = ['x']; const ink = C.CMDS.find((c: PaletteItem) => c.l === 'Handwriting → ask the assistant'), offered = !!ink?.when?.(); C.INK.ids = keep;
+  return { chat, card, ask, ink: !!ink, offered }; });
+await p.evaluate(() => window.__canvas.setView('canvas'));
+check('graph: Ask assistant is on the card only while the assistant pane exists, and so is Handwriting → ask the assistant', st.card && st.ink && st.ask === st.chat && st.offered === st.chat, JSON.stringify(st));
+// the palette's Fullscreen: headless Chromium refuses a request without a user gesture; that is a toast, not an unhandled rejection
+st = await p.evaluate(async () => { const C = window.__canvas; let unhandled = 0; const on = () => { unhandled++; }; addEventListener('unhandledrejection', on);
+  document.querySelector('#toast')!.textContent = ''; C.CMDS.find((c: PaletteItem) => c.l === 'Fullscreen (browser)').run(); await new Promise(r => setTimeout(r, 300));
+  const r = { unhandled, full: !!document.fullscreenElement, toast: document.querySelector('#toast')!.textContent };
+  if (document.fullscreenElement) await document.exitFullscreen().catch(() => {}); removeEventListener('unhandledrejection', on); return r; });
+check('Fullscreen (browser): a refused request says so in a toast and leaves no unhandled rejection', st.unhandled === 0 && (st.full || st.toast === 'Fullscreen is not available here.'), JSON.stringify(st));
 
 // ---- v17 demo: spiral tiling, pane shares by dragging an edge, no ribbon ↔ tile ratchet, folder resize drives packing down to a stack
 await p.evaluate(() => window.__canvas.setView('canvas'));
