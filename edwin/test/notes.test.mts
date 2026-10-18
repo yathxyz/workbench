@@ -447,6 +447,11 @@ test('R11.10 from Lisp: notes-query, notes-backlinks, notes-file, notes-tasks, n
   assert.equal(await ev('(map (lambda (r) (cdr (assq (quote id) r))) (notes-query :kind "file" :tag "proj"))'), '("beta.md")');
   assert.equal(await ev('(map (lambda (r) (cdr (assq (quote id) r))) (notes-query :kind "heading" :text "under a setext"))'), '("beta.md#18")');
   assert.equal(await ev('(map (lambda (r) (cdr (assq (quote id) r))) (notes-query :kind "file" :path "gamma"))'), '("gamma/delta.org")');
+  /* :path is the file or a directory above it, by whole segments: a prefix of a name is not its directory. */
+  assert.equal(await ev('(map (lambda (r) (cdr (assq (quote id) r))) (notes-query :kind "file" :path "gamma/"))'), '("gamma/delta.org")');
+  assert.equal(await ev('(map (lambda (r) (cdr (assq (quote id) r))) (notes-query :kind "file" :path "gamma/delta.org"))'), '("gamma/delta.org")');
+  assert.equal(await ev('(notes-query :kind "file" :path "gam")'), '()');
+  assert.equal(await ev('(notes-query :kind "file" :path "gamma/delta")'), '()');
   assert.equal(await ev('(map (lambda (r) (cdr (assq (quote id) r))) (notes-query :kind "file" :linked-from "Delta"))'), '("alpha.md" "beta.md")');
   assert.equal(await ev('(map (lambda (r) (cdr (assq (quote id) r))) (notes-query :kind "file" :linked-to "sub/alpha"))'), '("alpha.md")');
   assert.equal(await ev('(map (lambda (r) (cdr (assq (quote title) r))) (notes-query :task-kw "WAITING"))'), '("on [[Beta]] to answer")');

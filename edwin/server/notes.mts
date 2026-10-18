@@ -713,7 +713,7 @@ export class Notes {
     else rows = kind ? d.nodes.filter(r => r.kind === kind) : d.nodes;
     if (f.tag) { const tag = String(f.tag).replace(/^#/, '').toLowerCase(); rows = rows.filter(r => (r.tags || []).some(t => t.toLowerCase() === tag)); }
     if (f.text) { const q = String(f.text).toLowerCase(); rows = rows.filter(r => [r.title, r.body, r.prompt, r.front, r.back, r.text, r.dst].some(s => typeof s === 'string' && s.toLowerCase().includes(q))); }
-    if (f.path) { const p = String(f.path).replace(/\/$/, ''); rows = rows.filter(r => { const rp = r.path || r.srcFile || ''; return rp === p || rp.startsWith(p + '/') || rp.startsWith(p); }); }
+    if (f.path) { const p = String(f.path).replace(/\/$/, ''); rows = rows.filter(r => { const rp = r.path || r.srcFile || ''; return !p || rp === p || rp.startsWith(p + '/'); }); }
     if (f['linked-from']) { const src = this.fileIdOf(f['linked-from']); const set = new Set(d.links.filter(l => l.srcFile === src && l.dstFile).map(l => l.dstFile)); rows = rows.filter(r => set.has((r.path || r.srcFile)!)); }
     if (f['linked-to']) { const dst = this.fileIdOf(f['linked-to']); const set = new Set(d.links.filter(l => l.dstFile === dst && l.srcFile !== dst).map(l => l.srcFile)); rows = rows.filter(r => set.has((r.path || r.srcFile)!)); }
     if (f['task-kw']) { const kws = Array.isArray(f['task-kw']) ? f['task-kw'] : [f['task-kw']]; rows = rows.filter(r => kws.includes(r.kw)); }
