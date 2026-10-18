@@ -66,8 +66,8 @@ CMD('avy-goto-char', async () => [await Ed.readChar('char: ')], 'char', 'Jump to
   jumpTo(await avyPick(out, w)); return false;
 });
 CMD('avy-goto-char-2', async () => { const a = await Ed.readChar('char 1: '); const b = await Ed.readChar('char 2: '); return [a, b]; }, 'c1 c2', 'Jump to a visible pair of characters.', async ([c1, c2]) => {
-  const b = cur(), w = E.sel!, [s, e] = visibleRange(w), pair = (L.chr(c1)! + L.chr(c2)!).toLowerCase(), t = b.rope.toLowerCase(), out = [];
-  for (let k = t.indexOf(pair, s); k >= 0 && k <= e; k = t.indexOf(pair, k + 1)) out.push(k);
+  const b = cur(), w = E.sel!, [s, e] = visibleRange(w), pair = (L.chr(c1)! + L.chr(c2)!).toLowerCase(), t = b.rope.slice(s, e + 2).toLowerCase(), out = [];
+  for (let k = t.indexOf(pair); k >= 0 && s + k <= e; k = t.indexOf(pair, k + 1)) out.push(s + k);
   jumpTo(await avyPick(out, w)); return false;
 });
 CMD('avy-goto-line', '', '', 'Jump to a visible line, chosen by its label (SPC l).', async () => {
@@ -213,7 +213,7 @@ CMD('bookmark-delete', async () => [await Ed.readMini('Delete bookmark: ', '', (
   const save = L.toFn(intern('save-buffer'));
   CMD('save-buffer', save.interactive as ExtrasSpec, save.params!, save.doc!, args => {
     const b = cur();
-    if (truthy(L.get('ws-butler-mode')) && Ed.isLisp(b) && /[ \t]+$/m.test(b.text)) { const pt = b.pt, before = b.rope.length; const t = b.rope.replace(/[ \t]+$/gm, ''); Ed.replaceText(b, 0, b.rope.length, t); b.pt = Math.min(pt, b.rope.length); void before; }
+    if (truthy(L.get('ws-butler-mode')) && Ed.isLisp(b) && /[ \t]+$/m.test(b.text)) { const pt = b.pt, before = b.rope.length; const t = b.text.replace(/[ \t]+$/gm, ''); Ed.replaceText(b, 0, b.rope.length, t); b.pt = Math.min(pt, b.rope.length); void before; }
     L.runHook('before-save-hook');
     return save(args);
   });

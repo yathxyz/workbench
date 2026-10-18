@@ -124,3 +124,19 @@ test('persistent tables flush through the host when the process suspends', async
   ed.host.suspend();
   assert.ok(ed.host.storage.keys().some((k: string) => k === 'edwin:savehist'));
 });
+
+test('ws-butler: saving a Scheme buffer drops its trailing blanks', async () => {
+  await fresh('scm');
+  await ed.type('i(define x 1)   \n(define y 2)\t'); await ed.keys('ESC');
+  await ed.type(':w\n');
+  assert.equal(ed.Ed.Store.get(`t${n}.scm`), '(define x 1)\n(define y 2)');
+  assert.equal(ed.text(), '(define x 1)\n(define y 2)');
+  assert.equal(ed.E.current.modified, false);
+});
+
+test('avy-goto-char-2 jumps to the only visible pair, matched without case', async () => {
+  await fresh();
+  await ed.type('ione Two three'); await ed.keys('ESC'); await ed.type('0');
+  await ed.keys('M-x'); await ed.type('avy-goto-char-2\ntw');
+  assert.equal(ed.point(), 4);
+});
