@@ -43,6 +43,8 @@ function makeBackend() {
     const u = new URL(req.url!, 'http://x');
     if (u.pathname === '/echo') return json(200, { auth: 'x-api-key' in req.headers, authValue: req.headers['x-api-key'] === KEY, bearer: req.headers.authorization === 'Bearer ' + KEY2, path: u.pathname });
     if (u.pathname === '/redir-same') { res.writeHead(302, { location: '/echo' }); return res.end(); }
+    if (u.pathname === '/redir-303' || u.pathname === '/redir-302') { res.writeHead(Number(u.pathname.slice(-3)), { location: '/method' }); return res.end(); }
+    if (u.pathname === '/method') return json(200, { method: req.method, length: req.headers['content-length'] ?? null, type: req.headers['content-type'] ?? null, body: text });
     if (u.pathname === '/redir-cross') { res.writeHead(302, { location: A.other!.origin + '/echo' }); return res.end(); }
     if (u.pathname === '/fail-next') { A.failNext = true; return json(200, { ok: true }); }
     if (u.pathname === '/release') { A.holdOff = true; for (const h of [...A.holds.splice(0), ...A.slow.splice(0)]) h(); return json(200, { ok: true }); }
@@ -198,6 +200,12 @@ test('R14.4, R16.19: http-request binds a credential to its origin; same-origin 
   r = await value(c, `(assq-ref (http-request "${A.origin}/redir-cross") (quote body))`);
   assert.equal(r, '"{\\"other\\":true}"');
   assert.equal(B.requests.length, n0 + 1); assert.equal(B.requests[n0].hasKey, false);
+  /* A redirect that turns a POST into a GET drops the body and the headers that describe it: the next hop is
+     not told of a body it never gets. */
+  for (const code of [303, 302]) {
+    r = await value(c, `(assq-ref (http-request "${A.origin}/redir-${code}" :method "POST" :body "{}" :headers (quote (("Content-Length" . "2") ("content-type" . "application/json"))) :timeout 3) (quote body))`);
+    assert.equal(r, '"{\\"method\\":\\"GET\\",\\"length\\":null,\\"type\\":null,\\"body\\":\\"\\"}"', `${code}: ${r}`);
+  }
   /* Plain http only to loopback; a credential must be a handle; the on-chunk callback streams the body. */
   e = await failure(c, '(http-request "http://example.invalid/")'); assert.equal(e.condition, 'http-error'); assert.match(e.report, /loopback/);
   e = await failure(c, `(http-request "${A.origin}/echo" :credential "${'not-a-handle'}")`); assert.equal(e.condition, 'wrong-type-argument');
