@@ -24,7 +24,8 @@ export interface MvLine { t: 'mv'; id: string; file: string | null; name: string
 export interface JournalAnchor { id: string; pos: number; label?: string; quote: string; prefix: string }
 export interface AnchorsLine { t: 'a'; ver: number; anchors: JournalAnchor[] }
 export type JournalLine = BatchLine | MvLine | AnchorsLine;
-export interface JournalContents { header: JournalHeader; batches: BatchLine[]; mv: MvLine[]; anchors: AnchorsLine | null; torn: boolean }
+/* count: the whole lines read, the header and every kind of line included (Journal.lines, for compaction). */
+export interface JournalContents { header: JournalHeader; batches: BatchLine[]; mv: MvLine[]; anchors: AnchorsLine | null; torn: boolean; count: number }
 
 export class JournalError extends Error {
   declare line: number;
@@ -107,7 +108,7 @@ export class Journal {
   needsCompaction(): boolean { return this.bytes > COMPACT_BYTES || this.lines > COMPACT_LINES; }
 }
 
-/* Read a journal: {header, batches, mv, anchors, torn}. `anchors` is the last anchors line ({t: 'a', ver, anchors},
+/* Read a journal: {header, batches, mv, anchors, torn, count}. `anchors` is the last anchors line ({t: 'a', ver, anchors},
    anchors.mts) or null. A torn last line (no newline, or not JSON) is dropped and reported; any other bad line is
    a JournalError (the buffer then opens read-only, R8.4). */
 export function readJournal(file: string): JournalContents {
@@ -124,10 +125,11 @@ export function readJournal(file: string): JournalContents {
   if (header.t !== 'hdr' || !header.jid || !header.base || !Number.isInteger(header.base.ver)) throw new JournalError('bad header', 1);
   if (header.format !== undefined && header.format > FORMAT) throw new JournalError(`journal format ${header.format} is newer than this edwind (${FORMAT})`, 1);
   const batches: BatchLine[] = [], mv: MvLine[] = [];
-  let anchors: AnchorsLine | null = null;
+  let anchors: AnchorsLine | null = null, count = 1;
   for (let i = 1; i < lines.length; i++) {
     if (lines[i] === '') continue;
     const o = parse(lines[i], i);
+    count++;
     if (o.t === 'b') {
       if (!Number.isInteger(o.ver) || !Array.isArray(o.ops)) throw new JournalError(`line ${i + 1}: bad batch`, i + 1);
       batches.push(o);
@@ -135,7 +137,7 @@ export function readJournal(file: string): JournalContents {
     else if (o.t === 'a') anchors = o;
     /* Unknown line kinds are skipped: a newer edwind may add some (R15.15 covers the format version). */
   }
-  return { header, batches, mv, anchors, torn };
+  return { header, batches, mv, anchors, torn, count };
 }
 
 /* The header line of R8.1. */
