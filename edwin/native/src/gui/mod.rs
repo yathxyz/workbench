@@ -1,6 +1,6 @@
 //! The window (DT2): Edwin's model frame drawn with wgpu in a winit window, the counterpart of the terminal.
 //!
-//! JS draws as in the terminal, a model per redisplay (src/display.js), handed over with __n.guiDraw; this module
+//! JS draws as in the terminal, a model per redisplay (src/display.ts), handed over with __n.guiDraw; this module
 //! draws the last one after each turn of JS. Input goes the other way, as events JS gives the core's own key
 //! naming (Ed.keyName, the page's), so a key means in the window what it means on the page.
 //!
@@ -771,7 +771,7 @@ mod tests {
     #[test]
     fn wide_characters_and_combining_marks_take_their_cells() {
         use super::model::{cells, Seg};
-        // The widths as gui.js gives them (display.js's charWidth); U+0670 is one of the marks a table could miss.
+        // The widths as gui.ts gives them (display.ts's charWidth); U+0670 is one of the marks a table could miss.
         let seg = Seg {
             x: 0,
             w: 7,

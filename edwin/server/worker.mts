@@ -1,9 +1,9 @@
-/* One thread of edwind's worker pool (R4.47, R15.3), started by host-node.js as new Worker(this file).
+/* One thread of edwind's worker pool (R4.47, R15.3), started by host-node.cts as new Worker(this file).
 
    The browser builds a worker from the sources of the core's module functions joined into a blob URL
-   (pool.js buildUrl). edwind runs with code generation from strings disabled, so this file loads the same
-   modules from their files: text.js (the rope), scheme.js and runtime.js (the Scheme the thread evaluates
-   shipped forms with), the codec, the thread primitives and the message loop from pool.js (which, run in a
+   (pool.ts buildUrl). edwind runs with code generation from strings disabled, so this file loads the same
+   modules from their files: text.ts (the rope), scheme.ts and runtime.ts (the Scheme the thread evaluates
+   shipped forms with), the codec, the thread primitives and the message loop from pool.ts (which, run in a
    realm with no editor, defines those three and stops), and the named jobs from jobs.mts. The protocol is
    workerMain's, unchanged: init, reset, edits, drop, broadcast, run, map and eval come in; ready, done,
    fail, progress, out, msg and bdone go out. workerData: { k, withScheme, lexSource, limits }. */
@@ -16,9 +16,9 @@ import * as jobs from './jobs.mts';
 import { lockdown } from './lockdown.mts';
 import type { TransferListItem } from 'node:worker_threads';
 
-/* What the core files (text.js, scheme.js, runtime.js, pool.js) leave on the thread's global object. */
-type CoreGlobal = typeof globalThis & Record<string, any>; // any: edwin/src is untyped JavaScript
-/* The browser worker's self, as workerMain (pool.js) uses it. */
+/* What the core files (text.ts, scheme.ts, runtime.ts, pool.ts) leave on the thread's global object. */
+type CoreGlobal = typeof globalThis & Record<string, any>; // any: edwin/src is loaded through vm, outside this program's types
+/* The browser worker's self, as workerMain (pool.ts) uses it. */
 interface WorkerSelf {
   Scheme: unknown;
   L: unknown;
@@ -38,7 +38,7 @@ const { withScheme, lexSource, limits } = workerData as { k: number; withScheme:
 
 load('text');
 if (withScheme) { load('scheme'); load('runtime'); }
-/* The Lisp lexer, for the lex job: editor-core.js has no file of its own for it and hands the pool its
+/* The Lisp lexer, for the lex job: editor-core.ts has no file of its own for it and hands the pool its
    source (Ed.LEX_SOURCE, the lexer's functions and constants); it is compiled here as the core files are,
    not evaluated as a string by the engine. */
 if (lexSource) vm.runInThisContext(lexSource, { filename: path.join(SRC, 'editor-core.ts') + ':lex' });

@@ -4,7 +4,7 @@
    it defines (the regexp sources and the task keyword table shared with Org), so the mode, the notes index
    and Org agree on what a link, a task or a field is.
 
-   Font-lock is incremental (R10.5): hooks.lexSeg classifies the shown segment only, as org.js does, and
+   Font-lock is incremental (R10.5): hooks.lexSeg classifies the shown segment only, as org.ts does, and
    the one piece of context a line needs from before the segment, whether it sits inside a ``` fence, comes
    from a per-buffer index of fence lines that an edit updates from the changed lines alone (hooks.edited),
    never by a pass over the whole text. Faces are CSS classes named markdown-*; the frame runtime maps them
@@ -22,10 +22,10 @@ const { intern, signal, truthy, listOf, arr, NIL, Sym } = L;
 const { D, CMD } = L;
 const { bol, eol, lineNoB, lineStartB } = Ed;
 const cur = () => E.current;
-const str = x => { if (typeof x !== 'string') signal('wrong-type-argument', 'expected a string, got', x); return x; };
-const num = x => { if (typeof x !== 'number') signal('wrong-type-argument', 'expected an integer, got', x); return Math.trunc(x); };
+const str = (x: SchemeValue) => { if (typeof x !== 'string') signal('wrong-type-argument', 'expected a string, got', x); return x as string; };
+const num = (x: SchemeValue) => { if (typeof x !== 'number') signal('wrong-type-argument', 'expected an integer, got', x); return Math.trunc(x as number); };
 const MD = { gen: 0, stats: { lexed: 0, lexCalls: 0, fenceScans: 0, fenceUpdates: 0 }, shift: false, rcache: new Map() };
-const isMd = b => !!b && (b.mode === 'markdown-mode' || (Ed.modeParents.size > 0 && Ed.modeChain(b.mode).includes('markdown-mode')));
+const isMd = (b: EdBuffer | null | undefined) => !!b && (b.mode === 'markdown-mode' || (Ed.modeParents.size > 0 && Ed.modeChain(b.mode).includes('markdown-mode')));
 const mdBuffers = () => E.buffers.filter(isMd);
 
 /* ---------- the shipped Scheme through require ----------
@@ -45,7 +45,7 @@ const SHIPPED = 'edwin:scm';
 }
 
 /* ---------- the grammar: notes-syntax.scm's regexps and keywords, compiled once per value ---------- */
-const DEFAULTS = {
+const DEFAULTS: Record<string, string> = {
   'notes-wiki-link-regexp': '\\[\\[([^\\[\\]\\n|]+?)(?:\\|([^\\[\\]\\n]*)|\\]\\[([^\\]\\n]*))?\\]\\]',
   'notes-block-ref-regexp': '\\(\\(([^()\\n]+?)\\)\\)',
   'notes-inline-link-regexp': '(?<!!)\\[([^\\]\\n]*)\\]\\(([^)\\s]+)\\)',
@@ -60,17 +60,17 @@ const DEFAULTS = {
   'notes-fence-regexp': '^\\s*(```|~~~)',
   'notes-url-regexp': '^(?:https?|mailto|ftp):',
 };
-const rxCache = new Map();
-function rx(name, flags = '') {
+const rxCache = new Map<string, { src: SchemeValue; re: RegExp }>();
+function rx(name: string, flags = '') {
   let src = L.get(name); if (typeof src !== 'string') src = DEFAULTS[name];
   const key = name + '/' + flags, c = rxCache.get(key);
   if (c && c.src === src) return c.re;
-  let re; try { re = new RegExp(src, flags); } catch (e) { re = new RegExp(DEFAULTS[name], flags); }
+  let re; try { re = new RegExp(src as string, flags); } catch (e) { re = new RegExp(DEFAULTS[name], flags); }
   rxCache.set(key, { src, re });
   return re;
 }
 /* The keyword sets {all, done, src} from notes-task-keywords and notes-done-keywords (the shared table). */
-let kwCache = null;
+let kwCache: MdKeywords | null = null;
 function taskKeywords() {
   const v = L.get('notes-task-keywords'), d = L.get('notes-done-keywords');
   if (kwCache && kwCache.src === v && kwCache.dsrc === d) return kwCache;
@@ -79,7 +79,7 @@ function taskKeywords() {
   return kwCache = { src: v, dsrc: d, all, done };
 }
 /* The task keyword at K in LINE, followed by a blank or the end: the keyword, or null. */
-function keywordAt(line, k, kw) {
+function keywordAt(line: string, k: number, kw: MdKeywords) {
   for (const w of kw.all) if (line.startsWith(w, k) && (k + w.length === line.length || line[k + w.length] === ' ' || line[k + w.length] === '\t')) return w;
   return null;
 }
@@ -93,17 +93,17 @@ const FACES = ['', 'markdown-heading-1', 'markdown-heading-2', 'markdown-heading
   ...DEFAULT_KWS.map(k => 'markdown-task-' + k), 'markdown-task-other', 'markdown-task-other-done', 'markdown-task-done-text',
   'markdown-field-key', 'markdown-priority', 'markdown-planning', 'markdown-date', 'markdown-quote', 'markdown-table', 'markdown-table-delimiter',
   'markdown-hr', 'markdown-front-matter'];
-const F = {}; FACES.forEach((nm, i) => { if (nm) F[nm.replace(/^markdown-/, '')] = i; });
-const taskFace = (w, kw) => { const i = FACES.indexOf('markdown-task-' + w.toLowerCase()); return i > 0 ? i : kw.done.includes(w) ? F['task-other-done'] : F['task-other']; };
+const F: Record<string, number> = {}; FACES.forEach((nm, i) => { if (nm) F[nm.replace(/^markdown-/, '')] = i; });
+const taskFace = (w: string, kw: MdKeywords) => { const i = FACES.indexOf('markdown-task-' + w.toLowerCase()); return i > 0 ? i : kw.done.includes(w) ? F['task-other-done'] : F['task-other']; };
 const TS_RE = /[<[]\d{4}-\d{2}-\d{2}(?: [^\s>\]]{1,3}\.?)?(?: \d{1,2}:\d{2}(?:-\d{1,2}:\d{2})?)?(?: [+.]+\d+[hdwmy])?(?: -\d+[hdwmy])?[>\]]/g;
 const HR_RE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
 const TABLE_DELIM_RE = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/;
 const PRE = /[\s\-('"{>]/, POST = /[\s\-.,:!?;'")}\\[>]/;
-const EM1 = { '*': 'italic', '_': 'italic' }, EM2 = { '*': 'bold', '_': 'bold', '~': 'strike' };
+const EM1: Record<string, string> = { '*': 'italic', '_': 'italic' }, EM2: Record<string, string> = { '*': 'bold', '_': 'bold', '~': 'strike' };
 
 /* ---------- the fence index: the line starts of every ``` or ~~~ line, kept up to date from the changed
    lines of each edit (R10.5), so a line's "inside a fence" context costs a binary search ---------- */
-function scanFences(r, from, to, out) {
+function scanFences(r: Rope, from: number, to: number, out: number[]) {
   const re = rx('notes-fence-regexp');
   for (let ls = from; ls <= to && ls <= r.length; ) {
     const le = eol(r, ls);
@@ -113,11 +113,11 @@ function scanFences(r, from, to, out) {
   }
   return out;
 }
-function fenceIndex(b) {
-  let c = b._mdf;
+function fenceIndex(b: EdBuffer) {
+  let c = b._mdf as MdFences | undefined;
   if (c && c.ver === b.ver) return c.list;
   MD.stats.fenceScans++;
-  const r = b.rope, list = [];
+  const r = b.rope, list: number[] = [];
   /* A native search for the markers finds the candidate lines; only those lines are tested. */
   for (const needle of ['```', '~~~']) for (let k = r.indexOf(needle); k >= 0; k = r.indexOf(needle, eol(r, k) + 1)) { const ls = bol(r, k); if (/^\s*$/.test(r.slice(ls, k))) list.push(ls); }
   list.sort((x, y) => x - y);
@@ -125,10 +125,10 @@ function fenceIndex(b) {
   return list;
 }
 /* Fence lines strictly before LS, counted: odd means LS is inside a fence. */
-function fencesBefore(list, ls) { let lo = 0, hi = list.length; while (lo < hi) { const m = (lo + hi) >> 1; if (list[m] < ls) lo = m + 1; else hi = m; } return lo; }
+function fencesBefore(list: number[], ls: number) { let lo = 0, hi = list.length; while (lo < hi) { const m = (lo + hi) >> 1; if (list[m] < ls) lo = m + 1; else hi = m; } return lo; }
 /* Front matter: a --- line at the top closed by the next --- line (within 200 lines); its end offset or -1. */
-function frontMatterEnd(b) {
-  const c = b._mdfm; if (c && c.ver === b.ver) return c.end;
+function frontMatterEnd(b: EdBuffer) {
+  const c = b._mdfm as MdFrontMatter | undefined; if (c && c.ver === b.ver) return c.end;
   const r = b.rope; let end = -1;
   if (/^---[ \t]*(\r?\n|$)/.test(r.slice(0, 8))) {
     let ls = eol(r, 0) + 1;
@@ -143,35 +143,35 @@ H.edited = b => {
   if (prevEdited) prevEdited(b);
   MD.gen++;
   if (!isMd(b)) return;
-  const c = b._mdf, ed = b.log[b.log.length - 1];
+  const c = b._mdf as MdFences | undefined, ed = b.log[b.log.length - 1];
   if (!c || !ed || ed.v !== b.ver) return;
   /* The touched lines in the new text run from LS to LE; in the old text the same lines ended at LE - D.
      Fence lines before them stay, those after move by D, and the touched lines are scanned again. */
   const r = b.rope, d = ed.ins.length - ed.del.length, ls = bol(r, ed.pos), le = eol(r, ed.pos + ed.ins.length), oldLe = le - d;
-  const list = [];
+  const list: number[] = [];
   for (const f of c.list) { if (f < ls) list.push(f); else if (f > oldLe) list.push(f + d); }
   const found = scanFences(r, ls, le, []);
   if (found.length) { list.push(...found); list.sort((x, y) => x - y); }
   c.list = list; c.ver = b.ver; MD.stats.fenceUpdates++;
-  const fm = b._mdfm; if (fm && fm.end >= 0 && ed.pos > fm.end) fm.ver = b.ver;
+  const fm = b._mdfm as MdFrontMatter | undefined; if (fm && fm.end >= 0 && ed.pos > fm.end) fm.ver = b.ver;
 };
 
 /* ---------- the lexer ---------- */
-function lexMdSeg(b, from, to, seg, ptLine) {
+function lexMdSeg(b: EdBuffer, from: number, to: number, seg: string, ptLine: number) {
   const n = seg.length, cls = new Uint8Array(n), r = b.rope, kw = taskKeywords(), folds = b.folds && b.folds.length ? b.folds : null;
-  const fences = fenceIndex(b), fm = frontMatterEnd(b), refs = [];
+  const fences = fenceIndex(b), fm = frontMatterEnd(b), refs: MdRef[] = [];
   const WIKI = rx('notes-wiki-link-regexp', 'g'), REF = rx('notes-block-ref-regexp', 'g'), INLINE = rx('notes-inline-link-regexp', 'g');
   const ANCHOR = rx('notes-anchor-regexp'), FIELD = rx('notes-field-regexp'), PRIO = rx('notes-priority-regexp', 'g'), PLAN = rx('notes-planning-regexp', 'g');
   const HEAD = rx('notes-md-heading-regexp'), SETEXT = rx('notes-md-setext-regexp'), ITEM = rx('notes-list-item-regexp'), TAG = rx('notes-inline-tag-regexp', 'g'), FENCE = rx('notes-fence-regexp');
   MD.stats.lexed += n; MD.stats.lexCalls++;
-  const fill = (a, z, c) => { for (let k = a; k < z; k++) cls[k] = c; };
+  const fill = (a: number, z: number, c: number) => { for (let k = a; k < z; k++) cls[k] = c; };
   /* Inline markup over the segment range A..Z of LINE (which starts at LS), on top of BASE. */
-  const inline = (line, ls, a, z, base) => {
+  const inline = (line: string, ls: number, a: number, z: number, base: number) => {
     if (z <= a) return;
     fill(a, z, base);
     const s = line.slice(a - ls, z - ls), off = a, bp = from + a;
     let m;
-    const free = (i, j) => { for (let k = i; k < j; k++) if (cls[off + k] !== base) return false; return true; };
+    const free = (i: number, j: number) => { for (let k = i; k < j; k++) if (cls[off + k] !== base) return false; return true; };
     /* Code spans first: nothing inside them is markup. */
     const code = /`+/g;
     while ((m = code.exec(s))) {
@@ -237,10 +237,10 @@ function lexMdSeg(b, from, to, seg, ptLine) {
     }
   };
   /* The text of the line after LE (a segment offset), from the rope: Setext underlines sit on it. */
-  const nextLine = le => { const p = from + le + 1; if (p >= r.length) return null; return r.slice(p, eol(r, p)); };
-  const prevLine = ls => { const p = from + ls; if (p === 0) return null; const q = bol(r, p - 1); return r.slice(q, p - 1); };
-  const setextOf = (line, under) => !!under && SETEXT.test(under) && /\S/.test(line) && !ITEM.test(line) && !/^\s*[>|#]/.test(line) && !HR_RE.test(line) && !FENCE.test(line) && !SETEXT.test(line);
-  const lexLine = (line, ls, le) => {
+  const nextLine = (le: number) => { const p = from + le + 1; if (p >= r.length) return null; return r.slice(p, eol(r, p)); };
+  const prevLine = (ls: number) => { const p = from + ls; if (p === 0) return null; const q = bol(r, p - 1); return r.slice(q, p - 1); };
+  const setextOf = (line: string, under: string | null) => !!under && SETEXT.test(under) && /\S/.test(line) && !ITEM.test(line) && !/^\s*[>|#]/.test(line) && !HR_RE.test(line) && !FENCE.test(line) && !SETEXT.test(line);
+  const lexLine = (line: string, ls: number, le: number) => {
     const bp = from + ls;
     if (fm >= 0 && bp <= fm) { fill(ls, le, F['front-matter']); return; }
     const fenceLine = line.length >= 3 && FENCE.test(line);
@@ -256,7 +256,7 @@ function lexMdSeg(b, from, to, seg, ptLine) {
       if (w) { fill(ls + k, ls + k + w.length, taskFace(w, kw)); k += w.length; while (line[k] === ' ') k++; if (kw.done.includes(w)) b0 = F['task-done-text']; }
       inline(line, ls, ls + k, le, b0); return;
     }
-    if (setextOf(line, nextLine(le))) { inline(line, ls, ls, le, nextLine(le)[0] === '=' ? F['heading-1'] : F['heading-2']); return; }
+    if (setextOf(line, nextLine(le))) { inline(line, ls, ls, le, nextLine(le)![0] === '=' ? F['heading-1'] : F['heading-2']); return; }
     if (SETEXT.test(line) && line.length) { const pl = prevLine(ls); if (pl !== null && setextOf(pl, line)) { fill(ls, le, F.markup); return; } }
     if (HR_RE.test(line)) { fill(ls, le, F.hr); return; }
     if (/^\s*>/.test(line)) { const k = line.indexOf('>') + 1; fill(ls, ls + k, F.markup); inline(line, ls, ls + k, le, F.quote); return; }
@@ -294,13 +294,13 @@ function lexMdSeg(b, from, to, seg, ptLine) {
 const prevLexSeg = H.lexSeg;
 H.lexSeg = (b, from, to, seg) => {
   if (!isMd(b)) return prevLexSeg ? prevLexSeg(b, from, to, seg) : null;
-  const ptl = bol(b.rope, b.pt), fv = b._foldVer || 0, kw = L.get('notes-task-keywords'), c = b._mlx;
+  const ptl = bol(b.rope, b.pt), fv = b._foldVer || 0, kw = L.get('notes-task-keywords'), c = b._mlx as MdLex | undefined;
   if (c && c.ver === b.ver && c.from === from && c.to === to && c.fv === fv && c.ptl === ptl && c.kw === kw) return c;
-  const { cls, refs } = lexMdSeg(b, from, to, seg, ptl);
+  const { cls, refs } = lexMdSeg(b, from, to, seg as string, ptl);
   return b._mlx = { ver: b.ver, from, to, fv, ptl, kw, cls, names: FACES, refs };
 };
 /* The face of the character at buffer position P (0-based), lexing its line with the buffer's context. */
-function faceAt(b, p) {
+function faceAt(b: EdBuffer, p: number) {
   const r = b.rope; if (p < 0 || p >= r.length) return '';
   const ls = bol(r, p), le = Math.min(r.length, eol(r, p) + 1);
   const { cls } = lexMdSeg(b, ls, le, r.slice(ls, le), bol(r, b.pt));
@@ -308,31 +308,31 @@ function faceAt(b, p) {
 }
 
 /* ---------- pages, addresses and references ---------- */
-const stripExt = s => s.replace(/^.*\//, '').replace(/\.[^.]+$/, '');
-function pageName(b) {
+const stripExt = (s: string) => s.replace(/^.*\//, '').replace(/\.[^.]+$/, '');
+function pageName(b: EdBuffer) {
   const v = Ed.localValue(b, 'page-name');
   if (typeof v === 'string' && v) return v;
   return stripExt(b.file || b.name);
 }
-function findPage(name) { name = String(name).trim().toLowerCase(); return mdBuffers().find(b => pageName(b).toLowerCase() === name) || null; }
-const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function findPage(name: SchemeValue) { name = String(name).trim().toLowerCase(); return mdBuffers().find(b => pageName(b).toLowerCase() === name) || null; }
+const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 /* Where the anchor LABEL is in B: a server anchor of that label (meta.anchors, R9.12), else the line that ends in ^LABEL. */
-function anchorPos(b, label) {
-  const anchors = b.meta && Array.isArray(b.meta.anchors) ? b.meta.anchors : [];
+function anchorPos(b: EdBuffer, label: string) {
+  const anchors: { label?: unknown; pos?: unknown }[] = b.meta && Array.isArray(b.meta.anchors) ? b.meta.anchors : [];
   for (const a of anchors) if (a && a.label === label && typeof a.pos === 'number') return Math.min(a.pos, b.rope.length);
   const m = new RegExp('(?:^|[ \\t])\\^' + esc(label) + '[ \\t]*$', 'm').exec(b.text);
   return m ? bol(b.rope, m.index + m[0].length - 1) : null;
 }
 /* The text of the block at POS in B, as resolveRef in app.js shows it: the rest of the line, its bullet or
    hashes dropped, at most 90 characters, the page name when the line is blank. */
-function blockText(b, pos) {
+function blockText(b: EdBuffer, pos: number) {
   const r = b.rope, p = Math.min(pos, r.length), le = eol(r, p), ls = bol(r, p);
   let text = (r.slice(p, le).trim() || r.slice(ls, le).trim()).replace(/^([-*+]|\d+\.)\s+|^#+\s+/, '');
   return text.length > 90 ? text.slice(0, 88) + '…' : text || pageName(b);
 }
 const pagesAlist = () => listOf(mdBuffers().map(b => new L.Pair(pageName(b), b.text)));
 /* Resolve ADDR over the open pages: {b, pos} or null. Addresses: Name#anchor, ^anchor, Name › Heading ¶N "quote", Name. */
-function resolveLocal(addr) {
+function resolveLocal(addr: string): MdHit | null {
   let m;
   if ((m = /^([^#›]+)#\^?([\w-]+)$/.exec(addr))) { const b = findPage(m[1]); if (b) { const p = anchorPos(b, m[2]); if (p !== null) return { b, pos: p }; } return null; }
   if ((m = /^\^([\w-]+)$/.exec(addr))) { for (const b of mdBuffers()) { const p = anchorPos(b, m[1]); if (p !== null) return { b, pos: p }; } return null; }
@@ -345,19 +345,19 @@ function resolveLocal(addr) {
   return b ? { b, pos: 0 } : null;
 }
 /* The record of a note in the server's index, as an object, or null. */
-function indexRecord(name) {
+function indexRecord(name: string) {
   if (!L.fnOrNull(intern('notes-file')) || !L.fnOrNull(intern('image-server?'))) return null;
   let v; try { if (!truthy(L.call('image-server?', []))) return null; v = L.call('notes-file', [name]); } catch (e) { return null; }
   if (!v || v === false) return null;
-  const o = {}; for (const p of arr(v)) if (p instanceof L.Pair) o[p.car instanceof Sym ? p.car.name : String(p.car)] = p.cdr;
+  const o: Record<string, SchemeValue> = {}; for (const p of arr(v)) if (p instanceof L.Pair) o[p.car instanceof Sym ? p.car.name : String(p.car)] = p.cdr;
   return o;
 }
 /* The text shown for ((ADDR)): from the open pages, else resolve-ref-function, else the server's index; null when nothing names it. */
-function resolveRef(addr) {
+function resolveRef(addr: string) {
   addr = String(addr).trim();
   const key = addr, gen = MD.gen + ':' + String(L.get('notes-generation') ?? ''), c = MD.rcache.get(key);
   if (c && c.gen === gen) return c.text;
-  let text = null;
+  let text: string | null = null;
   const hit = resolveLocal(addr);
   if (hit) text = blockText(hit.b, hit.pos);
   if (text === null) {
@@ -376,19 +376,19 @@ function resolveRef(addr) {
   MD.rcache.set(key, { gen, text });
   return text;
 }
-const displayText = addr => { const t = resolveRef(addr); return t === null ? addr + ' · not found' : t; };
+const displayText = (addr: string) => { const t = resolveRef(addr); return t === null ? addr + ' · not found' : t; };
 /* The link at P in B: {kind: wiki|ref|inline|url, target, s, e} or null. */
-function linkAt(b, p) {
+function linkAt(b: EdBuffer, p: number) {
   const r = b.rope, ls = bol(r, p), le = eol(r, p), line = r.slice(ls, le);
   const WIKI = rx('notes-wiki-link-regexp', 'g'), REF = rx('notes-block-ref-regexp', 'g'), INLINE = rx('notes-inline-link-regexp', 'g');
-  const res = [[WIKI, m => ({ kind: 'wiki', target: m[1].trim() })], [REF, m => ({ kind: 'ref', target: m[1].trim() })], [INLINE, m => ({ kind: 'inline', target: m[2] })],
+  const res: [RegExp, (m: RegExpExecArray) => { kind: string; target: string }][] = [[WIKI, m => ({ kind: 'wiki', target: m[1].trim() })], [REF, m => ({ kind: 'ref', target: m[1].trim() })], [INLINE, m => ({ kind: 'inline', target: m[2] })],
     [/<((?:https?|mailto|ftp):[^>\s]+)>/g, m => ({ kind: 'url', target: m[1] })], [/\bhttps?:\/\/[^\s<>\]()]+/g, m => ({ kind: 'url', target: m[0] })]];
   for (const [re, mk] of res) { let m; re.lastIndex = 0; while ((m = re.exec(line))) { const s = ls + m.index, e = s + m[0].length; if (p >= s && p < e) return { s, e, ...mk(m) }; } }
   return null;
 }
 /* The references whose display text replaces their source in the window: those not on the point's line. */
-function refsIn(b, from, to) {
-  const lx = H.lexSeg(b, from, to, b.rope.slice(from, to));
+function refsIn(b: EdBuffer, from: number, to: number) {
+  const lx = H.lexSeg!(b, from, to, b.rope.slice(from, to)) as MdLex | null;
   return lx && lx.refs ? lx.refs : [];
 }
 
@@ -411,16 +411,16 @@ D('%markdown-outline-enter', '', 'RET in a list item, as outlineEnter of the pag
   return true;
 });
 /* The lines a shift applies to: the region's lines in Visual state or with an active mark, else the line of point. */
-function shiftTarget(b) {
+function shiftTarget(b: EdBuffer) {
   const r = b.rope;
   let s = b.pt, e = b.pt, region = false;
   if (EC.stateOf(b) === 'visual' && b.mark !== null) { [s, e] = EC.visualRange(b, true); region = true; }
   else if (b.markActive && b.mark !== null && b.mark !== b.pt) { s = Math.min(b.pt, b.mark); e = Math.max(b.pt, b.mark); region = true; }
-  const last = region && e > s ? e - 1 : s, lines = [];
+  const last = region && e > s ? e - 1 : s, lines: number[] = [];
   for (let ls = bol(r, s); ; ls = eol(r, ls) + 1) { lines.push(ls); if (ls > last || eol(r, ls) >= r.length || eol(r, ls) + 1 > last) break; }
   return { lines, region };
 }
-D('%markdown-shift-lines', 'DIR', 'Indent (DIR 1) or dedent (DIR -1) by two spaces the list item at point, or every line of the region, as shiftLines of the page cards. #f when there is no region and point is not in a list item.', ([dir]) => {
+D('%markdown-shift-lines', 'DIR', 'Indent (DIR 1) or dedent (DIR -1) by two spaces the list item at point, or every line of the region, as shiftLines of the page cards. #f when there is no region and point is not in a list item.', ([dir]: SchemeValue[]) => {
   const b = cur(), d = num(dir) > 0 ? 1 : -1, ITEM = rx('notes-list-item-regexp');
   const { lines, region } = shiftTarget(b);
   if (!region && !ITEM.test(b.rope.slice(lines[0], eol(b.rope, lines[0])))) return false;
@@ -433,22 +433,22 @@ D('%markdown-shift-lines', 'DIR', 'Indent (DIR 1) or dedent (DIR -1) by two spac
   return true;
 });
 /* The task line at LS: the start of its keyword slot K, the keyword there (or null) and where the text after it begins. */
-function taskSlot(b, ls) {
+function taskSlot(b: EdBuffer, ls: number) {
   const r = b.rope, le = eol(r, ls), line = r.slice(ls, le), kw = taskKeywords();
-  const pm = /^(\s*)((?:[-*+]|\d+[.)])\s+(?:\[[ xX-]\]\s+)?|#{1,6}\s+)?/.exec(line);
+  const pm = /^(\s*)((?:[-*+]|\d+[.)])\s+(?:\[[ xX-]\]\s+)?|#{1,6}\s+)?/.exec(line)!;
   const k = pm[2] ? pm[0].length : pm[1].length;
   const w = keywordAt(line, k, kw);
   let z = k; if (w) { z = k + w.length; while (line[z] === ' ') z++; }
   return { line, k, kw: w, z, le };
 }
-D('%markdown-todo-cycle', 'BACK', 'Set the task at point to the next (or with BACK the previous) state of markdown-todo-cycle-order; a keyword outside the cycle goes to its column of markdown-todo-columns first. The new keyword.', ([back]) => {
+D('%markdown-todo-cycle', 'BACK', 'Set the task at point to the next (or with BACK the previous) state of markdown-todo-cycle-order; a keyword outside the cycle goes to its column of markdown-todo-columns first. The new keyword.', ([back]: SchemeValue[]) => {
   const b = cur(), r = b.rope, ls = bol(r, b.pt);
   if (!/\S/.test(r.slice(ls, eol(r, ls)))) signal('user-error', 'Not on a task line');
   const { k, kw, z } = taskSlot(b, ls);
   const order = arr(L.get('markdown-todo-cycle-order') ?? NIL).map(String);
   if (!order.length) signal('user-error', 'markdown-todo-cycle-order is empty');
-  const cols = new Map(arr(L.get('markdown-todo-columns') ?? NIL).filter(p => p instanceof L.Pair).map(p => [String(p.car), String(p.cdr)]));
-  const col = kw ? (cols.get(kw) || L.call('notes-task-keyword-base', [kw]) || kw) : null, j = col ? order.indexOf(col) : -1;
+  const cols = new Map(arr(L.get('markdown-todo-columns') ?? NIL).filter((p): p is SchemePair => p instanceof L.Pair).map(p => [String(p.car), String(p.cdr)] as [string, string]));
+  const col = kw ? (cols.get(kw) || L.call('notes-task-keyword-base', [kw]) || kw) : null, j = col ? order.indexOf(col as string) : -1;
   const next = truthy(back) ? (j < 0 ? order[order.length - 1] : order[(j + order.length - 1) % order.length]) : (j < 0 ? order[0] : order[(j + 1) % order.length]);
   Ed.replaceText(b, ls + k, ls + z, next + ' ');
   if (b.pt < ls + k) b.pt = ls + k;
@@ -456,41 +456,41 @@ D('%markdown-todo-cycle', 'BACK', 'Set the task at point to the next (or with BA
   return next;
 });
 L.defvar('markdown-after-todo-state-change-hook', NIL, 'Procedures called after markdown-todo-cycle changed a task keyword.');
-D('markdown-link-at', '[pos]', 'The link at POS (default point): #(kind target start end) with kind wiki, ref, inline or url and 1-based positions, or #f.', ([p]) => {
+D('markdown-link-at', '[pos]', 'The link at POS (default point): #(kind target start end) with kind wiki, ref, inline or url and 1-based positions, or #f.', ([p]: SchemeValue[]) => {
   const b = cur(), lk = linkAt(b, L.absent(p) ? b.pt : num(p) - 1);
   return lk ? [intern(lk.kind), lk.target, lk.s + 1, lk.e + 1] : false;
 });
-D('markdown-page-name', '[buffer]', 'The page name of BUFFER: its buffer-local page-name, else its file name without directory and extension.', ([bb]) => pageName(Ed.toBuffer(bb === undefined ? false : bb)));
-D('markdown-find-page', 'name', 'The open Markdown buffer whose page name is NAME (ignoring case), or #f.', ([n]) => findPage(str(n)) || false);
+D('markdown-page-name', '[buffer]', 'The page name of BUFFER: its buffer-local page-name, else its file name without directory and extension.', ([bb]: SchemeValue[]) => pageName(Ed.toBuffer(bb === undefined ? false : bb)));
+D('markdown-find-page', 'name', 'The open Markdown buffer whose page name is NAME (ignoring case), or #f.', ([n]: SchemeValue[]) => findPage(str(n)) || false);
 D('markdown-block-ref-at-point', '', 'A ((reference)) to the block at point: the address of block-address, formatted.', () => {
   const b = cur(), a = L.call('block-address', [pageName(b), b.text, b.pt]);
   return '((' + L.call('format-address', [a]) + '))';
 });
-D('markdown-resolve-ref', 'address', 'The text an ((ADDRESS)) shows: from the open pages, resolve-ref-function, or the notes index on the server; #f when nothing names it.', ([a]) => { const t = resolveRef(str(a)); return t === null ? false : t; });
-D('markdown-resolve-ref-position', 'address', 'The open buffer and 1-based position an ((ADDRESS)) names, as (buffer . pos), or #f.', ([a]) => { const h = resolveLocal(str(a).trim()); return h ? new L.Pair(h.b, h.pos + 1) : false; });
-D('markdown-ref-overlays', '[from to]', 'The ((references)) between FROM and TO (1-based, default the whole buffer) that are shown as their resolved text: a list of #(start end text), the point\'s line excluded.', ([f, t]) => {
+D('markdown-resolve-ref', 'address', 'The text an ((ADDRESS)) shows: from the open pages, resolve-ref-function, or the notes index on the server; #f when nothing names it.', ([a]: SchemeValue[]) => { const t = resolveRef(str(a)); return t === null ? false : t; });
+D('markdown-resolve-ref-position', 'address', 'The open buffer and 1-based position an ((ADDRESS)) names, as (buffer . pos), or #f.', ([a]: SchemeValue[]) => { const h = resolveLocal(str(a).trim()); return h ? new L.Pair(h.b, h.pos + 1) : false; });
+D('markdown-ref-overlays', '[from to]', 'The ((references)) between FROM and TO (1-based, default the whole buffer) that are shown as their resolved text: a list of #(start end text), the point\'s line excluded.', ([f, t]: SchemeValue[]) => {
   const b = cur(), from = L.absent(f) ? 0 : num(f) - 1, to = L.absent(t) ? b.rope.length : num(t) - 1;
   return listOf(refsIn(b, from, to).map(x => [x.s + 1, x.e + 1, displayText(x.addr)]));
 });
-D('markdown-face-at', '[pos]', 'The face (a symbol, markdown-*) of the character at POS (default point) in the current buffer, or #f for none.', ([p]) => { const b = cur(), f = faceAt(b, L.absent(p) ? b.pt : num(p) - 1); return f ? intern(f) : false; });
+D('markdown-face-at', '[pos]', 'The face (a symbol, markdown-*) of the character at POS (default point) in the current buffer, or #f for none.', ([p]: SchemeValue[]) => { const b = cur(), f = faceAt(b, L.absent(p) ? b.pt : num(p) - 1); return f ? intern(f) : false; });
 D('markdown-faces', '', 'The faces markdown-mode uses, as symbols.', () => listOf(FACES.filter(Boolean).map(intern)));
 D('markdown-stats', '', 'Counters of the lexer for tests: ((lexed . chars) (lex-calls . n) (fence-scans . n) (fence-updates . n)).', () => listOf(Object.entries(MD.stats).map(([k, v]) => new L.Pair(intern(k.replace(/[A-Z]/g, c => '-' + c.toLowerCase())), v))));
-D('markdown-reset-stats', '', 'Zero the lexer counters.', () => { for (const k in MD.stats) MD.stats[k] = 0; return false; });
-D('journal-day-string', '[date]', 'Today (or DATE, milliseconds since the epoch) as YYYY-MM-DD in local time.', ([d]) => { const x = L.absent(d) ? new Date() : new Date(num(d)); const p2 = n => String(n).padStart(2, '0'); return `${x.getFullYear()}-${p2(x.getMonth() + 1)}-${p2(x.getDate())}`; });
+D('markdown-reset-stats', '', 'Zero the lexer counters.', () => { for (const k in MD.stats) MD.stats[k as keyof typeof MD.stats] = 0; return false; });
+D('journal-day-string', '[date]', 'Today (or DATE, milliseconds since the epoch) as YYYY-MM-DD in local time.', ([d]: SchemeValue[]) => { const x = L.absent(d) ? new Date() : new Date(num(d)); const p2 = (n: number) => String(n).padStart(2, '0'); return `${x.getFullYear()}-${p2(x.getMonth() + 1)}-${p2(x.getDate())}`; });
 
 /* ---------- imenu: the headings ---------- */
-function imenuItems(b) {
-  const out = [], re = /^(#{1,6})[ \t]+(.*?)[ \t]*$/gm, t = b.text, fences = fenceIndex(b);
+function imenuItems(b: EdBuffer) {
+  const out: MdImenuItem[] = [], re = /^(#{1,6})[ \t]+(.*?)[ \t]*$/gm, t = b.text, fences = fenceIndex(b);
   let m;
   while ((m = re.exec(t))) { if (fencesBefore(fences, m.index) & 1) continue; out.push({ name: '  '.repeat(m[1].length - 1) + m[2], kind: 'heading', pos: m.index }); }
   return out;
 }
-D('markdown-imenu-items', '[buffer]', 'The imenu items of BUFFER: its headings as (name kind . position), position 1-based.', ([bb]) => listOf(imenuItems(Ed.toBuffer(bb === undefined ? false : bb)).map(it => new L.Pair(it.name, new L.Pair(intern(it.kind), it.pos + 1)))));
+D('markdown-imenu-items', '[buffer]', 'The imenu items of BUFFER: its headings as (name kind . position), position 1-based.', ([bb]: SchemeValue[]) => listOf(imenuItems(Ed.toBuffer(bb === undefined ? false : bb)).map(it => new L.Pair(it.name, new L.Pair(intern(it.kind), it.pos + 1)))));
 {
   const orig = L.toFn(intern('consult-imenu'));
   const spec = async () => {
     const b = cur();
-    if (!isMd(b)) return orig.interactive();
+    if (!isMd(b)) return (orig.interactive as () => unknown)();
     const items = imenuItems(b), w = E.sel, start = b.pt, startScroll = w ? w.start : 0;
     if (!items.length) signal('user-error', 'No headings found in this buffer');
     const names = items.map((it, i) => it.name + (items.findIndex(x => x.name === it.name) !== i ? ' <' + (i + 1) + '>' : ''));
@@ -502,26 +502,26 @@ D('markdown-imenu-items', '[buffer]', 'The imenu items of BUFFER: its headings a
     } finally { if (cancelled) { b.pt = start; if (w) w.start = startScroll; } }
     return [items[names.indexOf(v)].pos + 1];
   };
-  const g = CMD('consult-imenu', spec, orig.params, orig.doc, args => orig(args));
+  const g: SchemeProcedure = CMD('consult-imenu', spec, orig.params as string, orig.doc as string, (args: SchemeValue[]) => orig(args));
   if (orig.props) g.props = new Map(orig.props);
 }
 
 /* ---------- wiki-capf: the corfu popup after [[ ---------- */
-function wikiPrefix(b) {
+function wikiPrefix(b: EdBuffer) {
   const r = b.rope, ls = bol(r, b.pt), before = r.slice(ls, b.pt), m = /\[\[([^\[\]\n]*)$/.exec(before);
   return m ? { start: b.pt - m[1].length, text: m[1] } : null;
 }
-function wikiCandidates(b, prefix) {
-  const names = [], seen = new Set();
-  const add = (n, ann) => { if (typeof n === 'string' && n && !seen.has(n)) { seen.add(n); names.push({ n, ann }); } };
+function wikiCandidates(b: EdBuffer, prefix: string) {
+  const names: { n: string; ann: string }[] = [], seen = new Set<string>();
+  const add = (n: SchemeValue, ann: string) => { if (typeof n === 'string' && n && !seen.has(n)) { seen.add(n); names.push({ n, ann }); } };
   for (const x of arr(L.get('wiki-candidates') ?? NIL)) add(x, '');
   for (const pb of mdBuffers()) add(pageName(pb), 'page');
   const lower = prefix.toLowerCase(), closes = b.rope.slice(b.pt, b.pt + 2) === ']]';
-  const score = n => { const l = n.toLowerCase(); return l.startsWith(lower) ? 0 : l.includes(lower) ? 1 : -1; };
+  const score = (n: string) => { const l = n.toLowerCase(); return l.startsWith(lower) ? 0 : l.includes(lower) ? 1 : -1; };
   return names.map(x => ({ x, sc: score(x.n) })).filter(y => y.sc >= 0).sort((a, c) => a.sc - c.sc || (a.x.n < c.x.n ? -1 : 1)).slice(0, 200)
     .map(y => ({ text: y.x.n + (closes ? '' : ']]'), score: y.sc, ann: y.x.ann }));
 }
-function openWiki(b, auto) {
+function openWiki(b: EdBuffer, auto: boolean) {
   const p = wikiPrefix(b); if (!p) return false;
   const cands = wikiCandidates(b, p.text);
   if (!cands.length) { if (E.corfu && E.corfu.wiki) E.corfu = null; return false; }
@@ -544,7 +544,7 @@ D('%wiki-capf', '', 'Open the completion popup for the [[link before point: #t w
 
 /* ---------- auto-mode-alist, links by mouse, the display pass ---------- */
 {
-  const prevModeFor = H.modeFor, cache = new Map();
+  const prevModeFor = H.modeFor, cache = new Map<string, RegExp>();
   H.modeFor = name => {
     const al = L.get('auto-mode-alist');
     if (al) for (const p of arr(al)) {
@@ -573,10 +573,10 @@ D('%wiki-capf', '', 'Open the completion popup for the [[link before point: #t w
     if (prevOverlay) prevOverlay();
     if (!E.frame || !Ed.windowList) return;
     for (const w of Ed.windowList()) {
-      const b = w.buffer, lx = b && b._mlx;
+      const b = w.buffer, lx = b && b._mlx as MdLex | undefined;
       if (!isMd(b) || !w.view || !lx || !lx.refs.length) continue;
-      for (const span of w.view.querySelectorAll('span.markdown-block-ref-display')) {
-        const ln = span.closest('.ln'); if (!ln) continue;
+      for (const span of w.view.querySelectorAll<HTMLElement>('span.markdown-block-ref-display')) {
+        const ln = span.closest<HTMLElement>('.ln'); if (!ln) continue;
         const pos = Number(ln.dataset.o) + Number(span.dataset.o);
         const ref = lx.refs.find(x => pos >= x.s && pos < x.e); if (!ref) continue;
         const text = pos === ref.s ? displayText(ref.addr) : '';
@@ -628,5 +628,14 @@ Ed.host.page.addStyle('markdown-css', CSS);
 
 globalThis.Markdown = { MD, FACES, lexSeg: H.lexSeg, faceAt, linkAt, resolveRef, resolveLocal, pageName, findPage, imenuItems, fenceIndex, refsIn, displayText, taskKeywords,
   /* The face names of the characters FROM..TO of B, for tests. */
-  facesOf(b, from, to) { const seg = b.rope.slice(from, to); const r = H.lexSeg(b, from, to, seg); return r ? Array.from(r.cls, c => FACES[c]) : null; } };
+  facesOf(b: EdBuffer, from: number, to: number) { const seg = b.rope.slice(from, to); const r = H.lexSeg!(b, from, to, seg) as MdLex | null; return r ? Array.from(r.cls, c => FACES[c]) : null; } };
+interface MdKeywords { src: SchemeValue; dsrc: SchemeValue; all: string[]; done: string[] }
+interface MdFences { ver: number; list: number[] }
+interface MdFrontMatter { ver: number; end: number }
+/* a ((reference)) shown as its resolved text: S..E in the buffer */
+interface MdRef { s: number; e: number; addr: string }
+/* what hooks.lexSeg gives back, cached as b._mlx */
+interface MdLex { ver: number; from: number; to: number; fv: number; ptl: number; kw: SchemeValue; cls: Uint8Array; names: string[]; refs: MdRef[] }
+interface MdHit { b: EdBuffer; pos: number }
+interface MdImenuItem { name: string; kind: string; pos: number }
 })();

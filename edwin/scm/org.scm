@@ -1,5 +1,5 @@
 ;;; org.scm: Org mode as the desktop init-org.el sets it up: keywords, capture and roam
-;;; templates, the agenda groups, and the evil-org keys.  The commands live in org.js, which
+;;; templates, the agenda groups, and the evil-org keys.  The commands live in org.ts, which
 ;;; loads after this file, so the variables are defined here and leader keys go in init.scm.
 
 ;; The task keywords come from the one table of notes-syntax.scm (R10.2), shared with markdown-mode and the

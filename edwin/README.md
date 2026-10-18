@@ -19,12 +19,20 @@ that working:
   behaviour.
 - **Relative imports name the `.mts` file** (`allowImportingTsExtensions`); type-only imports use `import type`.
 - **`any` is marked**: every one carries `// any: <reason>`. Most are the aliases in `main.mts` (`Ed`, `Lisp`,
-  `EdBuffer`, `SchemeValue`) for the core in `edwin/src`, which is still JavaScript loaded through `vm`.
+  `EdBuffer`, `SchemeValue`) for the core in `edwin/src`, which the server loads through `vm` and so sees untyped.
 - The unit sets `NODE_COMPILE_CACHE` (`CacheDirectory=workbench-edit`), so only the first start after a deploy
   pays for stripping (about 240 ms).
 
-`edwin/src` and `web/` follow in later steps: classic scripts as `NAME.ts`, stripped at build time into `NAME.js`
-at the same path.
+The core (`src/*.ts`) and desktop Edwin's JavaScript (`native/js/*.ts`) are TypeScript too, checked by
+`tsc -p edwin/src` and `tsc -p edwin/native/js`. They are classic scripts (no `import` or `export`) that share
+globals; the types they hand each other are in `src/core.d.ts`. The browser, Node's `vm` and V8 run the `NAME.js`
+that `tools/strip.mts` makes beside each `NAME.ts`, so a page, desktop Edwin's build (`build.rs` refuses a missing or
+stale `.js`) and the nix packages all strip first. In a checkout:
+
+    node tools/strip.mts --in-place edwin/src edwin/native/js
+
+`host-node.cts` loads a `.js` only when it is at least as new as its `.ts`, and strips the `.ts` itself otherwise,
+so edwind and the suites need no step. `src/host-node.cts` is checked with the server (`tsc -p edwin`).
 
 ## Layout
 
@@ -33,16 +41,16 @@ at the same path.
 | `src/*.js` | the editor, in the order `index.html` loads it: `scheme` `runtime` `text` `editor-core` `editor-prims` `evil-core` `pool` `complete` `extras` `stack` `ai` `evil-ex` `org` `markdown` `ot` `sync` `display` |
 | `scm/*.scm` | the shipped Scheme configuration (`emacs`, `evil`, `org`, `ai`, `init`), also inlined in `index.html` |
 | `index.html` | the page: styles, the Scheme blocks and the script tags. It loads `src/*.js` relative to itself, so serving this directory runs it, and a published copy keeps the `src/` paths |
-| `src/host-browser.js`, `src/host-node.js` | the host layer (R4.1): storage, the shipped Scheme, page attributes, suspend, clipboard, scheduling. The core reaches the page only through it and through frame objects |
-| `test/headless.mts` | loads and boots the editor in Node on `host-node.js` (no page objects exist in the process) and drives it with keys |
+| `src/host-browser.ts`, `src/host-node.cts` | the host layer (R4.1): storage, the shipped Scheme, page attributes, suspend, clipboard, scheduling. The core reaches the page only through it and through frame objects |
+| `test/headless.mts` | loads and boots the editor in Node on `host-node.cts` (no page objects exist in the process) and drives it with keys |
 | `test/headless.test.mts` | the headless suite: `node --test edwin/test/headless.test.mts`, or `nix build .#checks.x86_64-linux.edwin-headless` |
 | `test/scheme.test.mts`, `test/scheme-editor.test.mts` | the Scheme suite: the language, and the editor-level forms. `nix build .#checks.x86_64-linux.edwin-scheme` runs both and the benchmark |
 | `test/scheme-bench.mts` | evaluator benchmarks; fails when the shadow stack costs more than 10% (R4.34) |
-| `src/ot.js` | the OT library (ops, transform, rebase, undo, markers, hash) shared by edwind and its clients (E1) |
+| `src/ot.ts` | the OT library (ops, transform, rebase, undo, markers, hash) shared by edwind and its clients (E1) |
 | `server/*.mts` | edwind, the text daemon (E1; see "Step E1" below) |
 | `test/ot.test.mts`, `test/ot-sim.mts` | the OT properties with fast-check (`edwin-ot`; needs `NODE_PATH` at `tools/node_modules`) |
 | `test/conformance.test.mts`, `test/crash.test.mts`, `test/disk.test.mts`, `test/edit-client.mts` | the edwind gate suites (`edit-conformance`, `edit-crash`, `edit-disk`) and their client |
-| `src/display.js`, `test/display.test.mts` | the display seam (DT0, see below): frames with no page, drawn on a cell grid for a terminal or native backend (`edwin-display`) |
+| `src/display.ts`, `test/display.test.mts` | the display seam (DT0, see below): frames with no page, drawn on a cell grid for a terminal or native backend (`edwin-display`) |
 | `native/` | `edwin`, the desktop program (DT1 and DT2, see below): a Rust crate with its own Cargo workspace that embeds V8 and these files; `native/js/` is its JavaScript (prelude, host, terminal, window, startup), `native/src/gui/` the window, `native/tests/` its pseudo-terminal and virtual-display suites (`cargo test`) |
 | `test/term.test.mts`, `test/native.test.mts` | the terminal encoder and decoder, and the core's seams for the program: files on a disk, exit statuses, input events (`edwin-native`) |
 
@@ -53,8 +61,8 @@ the source.
 
 The E0 gate of the edwind spec (§17) passes: `edwin-scheme`, `edwin-headless` with no stubs, and the other checks.
 
-- **Host layer and boot (R4.1, R4.11, R9.1).** `index.html` loads `host-browser.js` first and calls
-  `Ed.boot({host, frame})` after all 13 files. Under Node, `require('./src/host-node.js')` gives `createHost` and
+- **Host layer and boot (R4.1, R4.11, R9.1).** `index.html` loads `host-browser.js` (stripped from `host-browser.ts`) first and calls
+  `Ed.boot({host, frame})` after all 13 files. Under Node, `require('./src/host-node.cts')` gives `createHost` and
   `loadEdwin`; then `Ed.boot({host})`. Boot loads `emacs`, `evil`, `org`, `ai`, `init`, then the user's
   `~/.config/edwin/init.scm` when the host has one. Each shipped file is a feature, so `(require 'org)` does not load it again.
 - **Frames (R9.2, headless part).** Page elements are parts of a frame made by `Ed.makeFrame(root, parts)` and read
@@ -99,7 +107,7 @@ commands), `session.mts` (one client: §7 messages), `sequencer.mts` (rebase, ap
 `buffers.mts` (open, save, revert, disk changes, compaction, index), `journal.mts` (group commit, snapshots, the
 image log), `files.mts` (text files, CRLF, atomic save), `paths.mts` (ids and the file authority of R14.8),
 `watch.mts` (inotify, the line-then-character diff, the three-way merge), `proto.mts` (constants and field
-checks). `edwin/src/ot.js` is the OT library both ends share; `edwin/test/edit-client.mts` is the test client.
+checks). `edwin/src/ot.ts` is the OT library both ends share; `edwin/test/edit-client.mts` is the test client.
 
 Running edwind by hand: `edwind --config edit.json` where `edit.json` has at least `notesDir` (see
 `loadConfig` in `main.mts` for the fields of R15.4); the socket's directory must be yours and 0700.
@@ -177,12 +185,12 @@ blocking primitives; `scm/threads.scm`), `debug.mts` (the debugger, the inspecto
 room, list-threads, list-clients, the primitive registry; `scm/debug.scm`), `image.mts` (the image log and its
 replication, `*image-log*`), `notes.mts` and `notes-parse.mts` (the notes index on a worker thread;
 `scm/notes-syntax.scm` is the grammar), `worker.mts` and `jobs.mts` (the worker pool's Node host, with
-`src/pool.js`), `scm/address.scm` (block addresses, R6.14), `process.mts` and `hub.mts` (processes through the
+`src/pool.ts`), `scm/address.scm` (block addresses, R6.14), `process.mts` and `hub.mts` (processes through the
 hub; `scm/process.scm`), `wb.mts` (§5 sessions and events; `scm/wb.scm`), `models.mts` (backends,
 `http-request`, credentials, `sample`, usage; `scm/models.scm`). Modules install through the extension points
 of `main.mts` (`MODULES`, `defineCommand`, `onMessage`, `statusProviders`, `buffers.on`).
 
-The evaluator in generator mode (R4.38, `src/scheme.js`): the same compiler produces generator closures, run
+The evaluator in generator mode (R4.38, `src/scheme.ts`): the same compiler produces generator closures, run
 with `yield*`, except for nodes that can call no compound procedure (constants, variable references, lambda,
 calls to primitives with such arguments), which stay plain closures marked `.d`; a compound procedure keeps a
 `gbody` for the generator path and a plain entry that drives it (`driveSync`), so JS callers (hooks, sort
@@ -287,7 +295,7 @@ Choices E2 made where the spec left one open, and where it had to deviate:
   runs on a background thread per stream (`by {kind: "web", cid, device, tab}`), `cancel` interrupts it with
   the `cancelled` condition; four requests run at once and the rest queue (R12.13). One usage line per request,
   success or failure, goes to the log and `stateDir/usage.jsonl`; `model-usage` sums them. The server rebinds
-  `gptel-make-anthropic`, `gptel-make-openai`, `gptel-backends` and `gptel-send` that `ai.js` defines for
+  `gptel-make-anthropic`, `gptel-make-openai`, `gptel-backends` and `gptel-send` that `ai.ts` defines for
   frames, since those use `fetch` and browser-stored keys (R14.4). Not in E2: Edwin's built-in tools for gptel
   and the confirmation flow (R12.10–R12.12), `gptel`, `gptel-rewrite` and presets (R12.9) on the server; a
   backend defined in `init.scm` runs before the module loads (define it after, or on feature `models`).
@@ -302,9 +310,9 @@ the whole browser suite passes in both modes (`node tests/ui.mts <root>` and `WB
 <root>`). `nix/checks.nix` gains `edit-anchors`, `edwin-markdown` and `edit-frame`; `ui` and `ui-frames` run the
 browser suite in each mode, and the VM test turns `edit.frames` on.
 
-Layout added in E3: `src/sync.js` (the replica client: `Ed.sync`, `Ed.bootServed`), frames in
-`src/editor-core.js` (`Frame`, `Ed.makeFrame`, one text-change path `applyOps`) and `src/editor-prims.js`
-(frame commands, `Ed.setLeaderKey`, served boot), `src/markdown.js` and `scm/markdown.scm` (markdown-mode),
+Layout added in E3: `src/sync.ts` (the replica client: `Ed.sync`, `Ed.bootServed`), frames in
+`src/editor-core.ts` (`Frame`, `Ed.makeFrame`, one text-change path `applyOps`) and `src/editor-prims.ts`
+(frame commands, `Ed.setLeaderKey`, served boot), `src/markdown.ts` and `scm/markdown.scm` (markdown-mode),
 `server/anchors.mts` (shared anchors and the frame commands), `console/index.html` (the `/edwin/` console),
 `web/app.ts`'s frames block (lazy frames, keys, migration, R13.7 tools), and in wb-web `relay_edit.rs` (the
 `/edit` relay), the `frames` key, `/api/info` `edit`/`editUp`, `/edwin/` static files and the board guard.
@@ -330,7 +338,7 @@ shows `•` (unacked), `⚠ offline`, `⚠ disk` and `⟳` (a pending server cal
 The replica (R6.3–R6.23, §7): every text change goes through `applyOps(b, ops, origin)` (rope, markers, log,
 change hooks with `(edit-origin)`, redisplay); local edits are grouped per command (an Evil insert session or a
 run of self-inserts shares a group) and sent as one unacked batch with a queue behind it, composed while
-waiting; incoming batches are transformed against inflight and queue with `ot.js`, as the `ot-sim` model;
+waiting; incoming batches are transformed against inflight and queue with `ot.ts`, as the `ot-sim` model;
 undo on a shared buffer is by group, inverse-transformed through history (`undo: {g, of}`), with the server's
 `undo` command as the fallback for groups before the kept history, while local buffers keep snapshot undo.
 Hash checks every 50 versions, `bad_edit`, `stale_base`, `read_only`, `slow_client`, `shutting_down` and a
@@ -445,7 +453,7 @@ same core and the same model frame as `edwin -nw`; only the backend differs. The
 `gvim -f` does. Without a display, or without the system libraries the window needs, `edwin -g` says why and runs
 in the terminal; with no terminal either it exits with status 1.
 
-- **The window.** Rust opens it (winit 0.30, X11 and Wayland) before V8 starts. Each redisplay `native/js/gui.js`
+- **The window.** Rust opens it (winit 0.30, X11 and Wayland) before V8 starts. Each redisplay `native/js/gui.ts`
   hands the model (DT0's format) to Rust as JSON; `src/gui/` draws it with wgpu (Vulkan, else GL) as one instanced
   pass of rectangles and glyphs from an atlas, the glyphs shaped and rasterized by cosmic-text. Text sits on the
   model's cell grid: the cell is the font's advance wide and 1.5 times its size high (the page's line height,
@@ -473,7 +481,7 @@ The parity checklist against the browser frame (DT2's gate), each item with how 
 | Cursor per Evil state (box, bar, hbar, half); hollow when unfocused and in other windows | yes | offscreen render (bar); screenshots |
 | Region and Visual selection | yes | screenshot of a mouse drag |
 | Presence cursors with the writer's name (edwind) | yes | `another_writer_is_a_bar_and_a_name_tag` |
-| Keys named as on the page, `C-`, `M-`, Shift | yes | `native.test.mts` (gui.js); `keys_and_clicks_edit_and_wq_leaves_zero` (xdotool on Xvfb) |
+| Keys named as on the page, `C-`, `M-`, Shift | yes | `native.test.mts` (gui.ts); `keys_and_clicks_edit_and_wq_leaves_zero` (xdotool on Xvfb) |
 | Mouse: click, drag, wheel | yes | the same test (click); by hand (drag, wheel) |
 | Clipboard both ways | yes | by hand, with xclip |
 | Resize; HiDPI | yes | by hand (`xdotool windowsize`; `WINIT_X11_SCALE_FACTOR=2`) |
@@ -505,7 +513,7 @@ in for Vim or Neovim, `$EDITOR` included. `edwin/native` is a Rust crate (its ow
 of the Workbench crates and their Nix build) that embeds V8 (the `v8` crate, 130.0.1, prebuilt) and carries every
 source it runs: the unchanged core in `src/`, the shipped Scheme in `scm/`, and `native/js/`. Rust is only the
 floor: files, `/dev/tty` in raw mode, signals through a self-pipe, edwind's socket and one `poll(2)` loop. Edwin is
-a model frame (DT0) drawn by `native/js/term.js`.
+a model frame (DT0) drawn by `native/js/term.ts`.
 
 Build and run (the prebuilt V8 is downloaded by the `v8` crate's build script, or named by `RUSTY_V8_ARCHIVE`; `nix build .#edwin` does it all, see DT4):
 
@@ -540,9 +548,9 @@ Build and run (the prebuilt V8 is downloaded by the `v8` crate's build script, o
 - **Signals.** `C-z` suspends in Vim's states (Normal, Motion, Visual, Insert) and `C-x C-z` in every state; `fg`
   resumes and redraws. A resize redraws. On `SIGHUP` (the SSH connection dropped) or `SIGTERM`, changed files are
   copied into `~/.local/state/edwin/rescue/` before the program exits.
-- **Startup.** `build.rs` runs `native/js/boot.js` (the host, the core, `Ed.boot` with the shipped Scheme, the
+- **Startup.** `build.rs` runs `native/js/boot.ts` (the host, the core, `Ed.boot` with the shipped Scheme, the
   terminal key settings) in a V8 snapshot creator and the binary carries the heap; a start restores it and runs
-  `main.js` for the process (arguments, terminal, directories, storage, then the user's `init.scm`). First draw of a
+  `main.ts` for the process (arguments, terminal, directories, storage, then the user's `init.scm`). First draw of a
   200×50 terminal: 155 ms without the snapshot (75 compiling the core, 77 evaluating the Scheme), 40 ms with it
   (`EDWIN_TRACE=1` logs the steps, `EDWIN_NO_SNAPSHOT=1` starts cold). The binary is 37.6 MB: V8, the 5.2 MB
   snapshot and ICU's data (for `\p{...}` in regular expressions).
@@ -557,7 +565,7 @@ Core changes for DT1: `host.files` behind `Store` (and shipped config never read
 `kill-emacs`, `suspend-frame`, `can-kill-emacs?`, `display-graphic-p`, `modified-file-buffers` and a JS
 `save-buffers-kill-terminal` (the page's still say how to leave); `Ed.display.input(f, ev)`, the input half of the
 display seam (keys, paste, focus, mouse, resize in cell terms, as the page's frame wiring does it); `Ed.boot({
-deferUserInit})` with `Ed.loadUserInit()` and `hooks.beforeUserInit`; `Ed.reloadPersistent()` (stack.js's tables,
+deferUserInit})` with `Ed.loadUserInit()` and `hooks.beforeUserInit`; `Ed.reloadPersistent()` (stack.ts's tables,
 read again once the program's storage is open); `require-final-newline`; and in `evil.scm` `:cq`, `:wqa`/`:xa`
 saving before they quit, and `:q`/`:qa` ending the program where the host can.
 
@@ -573,17 +581,17 @@ native window. For that the core must be able to draw a frame that is not a page
 on the page.
 
 - **Model frames.** `Ed.makeFrame(null, {backend, buffer, kind, theme})` makes a frame with no root element. The
-  backend has `size()` → `{cols, rows}`, `draw(model)` and optionally `bell()`. Each redisplay `src/display.js`
+  backend has `size()` → `{cols, rows}`, `draw(model)` and optionally `bell()`. Each redisplay `src/display.ts`
   lays the frame out on that cell grid and calls `draw` with plain data (rows of styled segments, a face table, the
-  cursor and its shape, the window rectangles; the header of `display.js` has the format). `Ed.display.posAt(f, x, y)`
+  cursor and its shape, the window rectangles; the header of `display.ts` has the format). `Ed.display.posAt(f, x, y)`
   maps a cell back to a buffer position, the modeline or the echo area, for mouse input. `Ed.display.setTheme` and
   `Ed.display.redraw` are for the backend's theme and size changes.
 - **Styled runs.** `renderBuffer(b, {runs: true, html: false})` gives each line its text and its spans as data
   (`{s, e, cls}`, plus the cursor, avy labels, fold ellipsis and end-of-line region). The html of the page is byte
   for byte what it was (a golden corpus of 54 renders was compared before and after, and the suite checks runs against html).
 - **Shared logic.** The page and the model now share `windowState`, `scrollStart`, `modelineFields`, `miniView`
-  and `echoView` in `editor-core.js`, so scrolling, the modeline, the minibuffer and the echo area cannot drift
-  apart. `evil-ex.js` gives the which-key bindings as data (`prefixItems`) besides the html, and `stack.js` says
+  and `echoView` in `editor-core.ts`, so scrolling, the modeline, the minibuffer and the echo area cannot drift
+  apart. `evil-ex.ts` gives the which-key bindings as data (`prefixItems`) besides the html, and `stack.ts` says
   when they wait (`prefixWait`).
 - **Faces as data.** `FACES` maps every class the renderer, Org and markdown-mode emit, and the modeline and echo
   parts, to a spec in palette tokens with the page's fallback chains. `PALETTE` holds `index.html`'s light and dark
@@ -604,6 +612,6 @@ Choices made in DT0:
   and the label was escaped twice. Every term is marked now.
 
 Not in DT0 (each is a later step or a known gap): the menubar of a console frame, the pulse animation, markdown block
-references drawn as their resolved text (a DOM pass in `markdown.js`), screen-line motion (`gj`/`gk` in
+references drawn as their resolved text (a DOM pass in `markdown.ts`), screen-line motion (`gj`/`gk` in
 visual-line-mode falls back to buffer lines in a model frame), and per-character pixel metrics for proportional
 fonts (DT2 decides).

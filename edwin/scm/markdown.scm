@@ -2,7 +2,7 @@
 ;;;
 ;;; The grammar is notes-syntax.scm (wiki links, block refs, anchors, the task keyword table shared with
 ;;; Org, key:: fields, priorities); the lexer, the display overlays and the editing primitives (%markdown-*)
-;;; are in edwin/src/markdown.js, which loads after org.js. This file defines the variables the runtimes
+;;; are in edwin/src/markdown.ts, which loads after org.ts. This file defines the variables the runtimes
 ;;; bind, the mode, its commands and its keys. org.scm requires it after Org and before init.scm, so the
 ;;; user's init.scm can change everything here.
 
@@ -46,7 +46,7 @@
 ((block references)), ^anchors, key:: fields and [#A] priorities, folded by heading as Org folds."
   #f)
 
-;;;; Editing commands (the text work is in markdown.js)
+;;;; Editing commands (the text work is in markdown.ts)
 
 (define-command (markdown-outline-enter)
   "RET in a list: a new sibling bullet (a numbered one counts up, a task bullet keeps its [ ]), or on an

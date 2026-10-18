@@ -1,5 +1,5 @@
-//! The startup snapshot: V8's heap after native/js/boot.js has loaded the core and booted it with the shipped
-//! Scheme. build.rs makes it with this code; main.rs restores it, then runs main.js for this process.
+//! The startup snapshot: V8's heap after native/js/boot.ts has loaded the core and booted it with the shipped
+//! Scheme. build.rs makes it with this code; main.rs restores it, then runs main.ts for this process.
 
 use crate::natives;
 

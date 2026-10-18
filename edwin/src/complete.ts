@@ -8,36 +8,41 @@ const L = globalThis.L, Ed = globalThis.Ed, E = Ed.E, H = Ed.hooks, EC = globalT
 const { intern, signal, truthy } = L;
 const { D, CMD } = L;
 const cur = () => E.current;
+/* A candidate of the popup, and the text before point it completes. */
+interface CompleteCand { text: string; score: number; ann: string }
+type CompletePrefix = { start: number; text: string; file?: boolean };
+/* The popup's element remembers the candidates and the key it was drawn for. */
+interface CompletePopupEl extends HTMLElement { _cands?: unknown; _key?: string }
 
 L.defvar('corfu-auto', true, 'Non-#f opens the completion popup by itself while typing.');
 L.defvar('corfu-auto-prefix', 3, 'How many word characters are typed before the popup opens by itself.');
 L.defvar('corfu-count', 10, 'How many candidates the popup shows at once.');
 const SYM = /[\p{L}\p{N}_\-!?*<>=+\/.:]/u;
 const WORD = /[\p{L}\p{N}_]/u;
-function symbolChar(b) { return Ed.isLisp(b) ? SYM : WORD; }
+function symbolChar(b: EdBuffer) { return Ed.isLisp(b) ? SYM : WORD; }
 /* cape-file: a word with a / in it, or starting with ~ or ., names a file. A link type or key
    before it ([[file:roam/, path=roam/) is not part of the path. */
 const PATH = /[^\s"'()\[\]{}<>`]/u;
-function pathPrefixAt(b) {
+function pathPrefixAt(b: EdBuffer): CompletePrefix | null {
   const t = b.rope;
   let s = b.pt;
-  while (s > 0 && PATH.test(t.at(s - 1))) s--;
+  while (s > 0 && PATH.test(t.at(s - 1)!)) s--;
   let text = t.slice(s, b.pt);
   const k = Math.max(text.lastIndexOf(':'), text.lastIndexOf('='));
   if (k >= 0) { s += k + 1; text = text.slice(k + 1); }
   return text && /\/|^[~.]/.test(text) && !/^\.{1,2}$/.test(text) ? { start: s, text, file: true } : null;
 }
-function wordPrefixAt(b) {
+function wordPrefixAt(b: EdBuffer): CompletePrefix | null {
   const t = b.rope, re = symbolChar(b);
   let s = b.pt;
-  while (s > 0 && re.test(t.at(s - 1))) s--;
+  while (s > 0 && re.test(t.at(s - 1)!)) s--;
   return s < b.pt ? { start: s, text: t.slice(s, b.pt) } : null;
 }
-function prefixAt(b) { return pathPrefixAt(b) || wordPrefixAt(b); }
+function prefixAt(b: EdBuffer) { return pathPrefixAt(b) || wordPrefixAt(b); }
 /* The prefix and its candidates, as the capfs run on the desktop: cape-file first, and when it has
    nothing (no saved file under that folder, as with call/c or foo/ba) cape-dabbrev and the global
    names on the word before point. MIN is the shortest prefix to complete. */
-function completionAt(b, min) {
+function completionAt(b: EdBuffer, min: number) {
   const p = pathPrefixAt(b);
   if (p && p.text.length >= min) { const cs = fileCandidates(p.text); if (cs.length) return { p, cs }; }
   const w = wordPrefixAt(b);
@@ -45,25 +50,25 @@ function completionAt(b, min) {
   return null;
 }
 /* Saved files that start with the path typed (a leading ./ or ~/ is dropped: the store has no directories). */
-function fileCandidates(text) {
-  const bare = text.replace(/^(\.\/|~\/)/, ''), lower = bare.toLowerCase(), out = [];
+function fileCandidates(text: string) {
+  const bare = text.replace(/^(\.\/|~\/)/, ''), lower = bare.toLowerCase(), out: CompleteCand[] = [];
   for (const f of Ed.Store.list()) if (f !== bare && f.toLowerCase().startsWith(lower)) out.push({ text: f, score: 0, ann: 'file' });
   return out.slice(0, 200);
 }
 /* Words near point (a small window around it) score best; then words of this buffer, then of the
    others, from per-buffer indexes refreshed in the background after edits. */
 const SCAN = 4000;
-function scanWords(t, re, into, from, to) {
+function scanWords(t: string, re: RegExp, into: Set<string>, from?: number, to?: number) {
   const rx = new RegExp(re.source + '{3,}', 'gu'); rx.lastIndex = from || 0;
-  let m; const end = to === undefined ? t.length : to;
+  let m: RegExpExecArray | null; const end = to === undefined ? t.length : to;
   while ((m = rx.exec(t)) && m.index < end && into.size < 50000) into.add(m[0]);
   return into;
 }
 /* The words near point, in three parts: the text before the line of point, the line itself and the
    text after it. Typing changes only the line, so the two other parts are scanned again only when
    their text changed (a word never spans a line break, so the union is the same). */
-const near = { b: null, re: null, before: '', after: '', bw: null, aw: null };
-function nearWords(b, re) {
+const near: { b: EdBuffer | null; re: RegExp | null; before: string; after: string; bw: Set<string> | null; aw: Set<string> | null } = { b: null, re: null, before: '', after: '', bw: null, aw: null };
+function nearWords(b: EdBuffer, re: RegExp) {
   const r = b.rope, ls = Ed.bol(r, b.pt), le = Ed.eol(r, b.pt);
   const a = Ed.bol(r, Math.max(0, b.pt - SCAN)), z = Ed.eol(r, Math.min(r.length, b.pt + SCAN));
   const before = r.slice(a, ls), after = r.slice(le, z);
@@ -76,31 +81,31 @@ function nearWords(b, re) {
   return out;
 }
 /* The global names with their lowercase forms, extended as names are defined (they are never removed). */
-const gnames = [];
+const gnames: [name: string, lower: string, box: SchemeBox][] = [];
 function globalNames() {
   const g = L.S.globals;
   if (gnames.length !== g.size) { let i = 0; for (const [n, box] of g) { if (i++ < gnames.length) continue; gnames.push([n, n.toLowerCase(), box]); } }
   return gnames;
 }
-/* The index of each buffer comes from the worker pool (pool.js): sorted, so a prefix is a binary
+/* The index of each buffer comes from the worker pool (pool.ts): sorted, so a prefix is a binary
    search instead of a pass over every word of every buffer. */
 const P = globalThis.EdPool;
-function candidates(b, prefix) {
-  const lower = prefix.toLowerCase(), out = [], re = symbolChar(b);
-  const seen = new Map();
+function candidates(b: EdBuffer, prefix: string) {
+  const lower = prefix.toLowerCase(), out: CompleteCand[] = [], re = symbolChar(b);
+  const seen = new Map<string, number>();
   for (const w of nearWords(b, re)) seen.set(w, 0);
   for (const buf of E.buffers) {
     if (buf.name.startsWith(' ')) continue;
     const d = buf === b ? 1 : 1e9;
-    P.wordsWithPrefix(P.wordsIn(buf, symbolChar(buf).source), lower, w => { if (!seen.has(w)) seen.set(w, d); });
+    P.wordsWithPrefix(P.wordsIn(buf, symbolChar(buf).source), lower, (w: string) => { if (!seen.has(w)) seen.set(w, d); });
   }
   for (const [w, d] of seen) if (w !== prefix && w.toLowerCase().startsWith(lower)) out.push({ text: w, score: d, ann: '' });
   if (Ed.isLisp(b)) {
     for (const [n, nl, box] of globalNames()) {
       if (n === prefix || !nl.startsWith(lower)) continue;
-      let v; try { v = box.value; } catch (e) { continue; }
+      let v: SchemeValue; try { v = box.value; } catch (e) { continue; }
       if (v === undefined) continue;
-      const ann = typeof v === 'function' ? (v.interactive !== undefined ? 'command ' : 'proc ') + (v.doc ? v.doc.split('\n')[0] : '') : 'var ' + (L.S.gdoc.get(n) ? L.S.gdoc.get(n).split('\n')[0] : '');
+      const ann = typeof v === 'function' ? ((v as SchemeProcedure).interactive !== undefined ? 'command ' : 'proc ') + ((v as SchemeProcedure).doc ? (v as SchemeProcedure).doc!.split('\n')[0] : '') : 'var ' + (L.S.gdoc.get(n) ? L.S.gdoc.get(n)!.split('\n')[0] : '');
       const k = out.findIndex(c => c.text === n);
       if (k >= 0) out[k].ann = ann; else out.push({ text: n, score: 5e8, ann });
     }
@@ -109,7 +114,7 @@ function candidates(b, prefix) {
   out.sort((a, b) => a.score - b.score || (a.text < b.text ? -1 : 1));
   return out.slice(0, 200);
 }
-function open(b, auto, min) {
+function open(b: EdBuffer, auto: boolean, min?: number) {
   const r = completionAt(b, min || 1);
   if (!r) { close(); return false; }
   E.corfu = { start: r.p.start, prefix: r.p.text, cands: r.cs, index: 0, scroll: 0, auto };
@@ -127,7 +132,7 @@ CMD('completion-at-point', '*', '', 'Complete the word before point from the ope
   const b = cur();
   if (E.corfu) { accept(); return false; }
   if (!open(b, false)) signal('user-error', 'No completions');
-  if (E.corfu.cands.length === 1) accept();
+  if (E.corfu!.cands.length === 1) accept();
   return false;
 });
 CMD('corfu-next', '', '', 'Highlight the next completion.', () => { const c = E.corfu; if (c) c.index = (c.index + 1) % c.cands.length; return false; });
@@ -160,13 +165,13 @@ H.postCommand = (def, b, failed) => {
    the candidates, the highlighted row or the prefix change. It is placed in the next animation
    frame, where the browser lays the page out anyway: measuring the cursor at render time forced
    a layout of the lines that render had just changed. */
-function esc(s) { return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]); }
+function esc(s: string) { return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' } as Record<string, string>)[c]); }
 let placing = false;
 function place() {
   placing = false;
   const f = E.frame, el = f && f.el('corfu'), c = E.corfu;
   if (!el || el.hidden || !c || E.mini) return;
-  const curEl = E.sel.view.querySelector('.cur'), frame = f.root.getBoundingClientRect();
+  const curEl = E.sel!.view!.querySelector('.cur'), frame = f.root!.getBoundingClientRect();
   if (!curEl) { el.hidden = true; return; }
   /* Measured rectangles are divided by the frame's CSS scale to get layout pixels (R9.9). */
   const sc = Ed.frameScale(f), r = curEl.getBoundingClientRect();
@@ -178,10 +183,10 @@ function place() {
 }
 H.renderOverlay = () => {
   const f = E.frame; if (!f) return;
-  let el = f.el('corfu');
+  let el: CompletePopupEl | null = f.el('corfu');
   const c = E.corfu;
   if (!c || E.mini) { if (el && !el.hidden) el.hidden = true; return; }
-  if (!el) { el = f.root.ownerDocument.createElement('div'); el.className = 'corfu'; if (f.legacy) el.id = 'corfu'; f.root.appendChild(el); f.parts.corfu = el; }
+  if (!el) { el = f.root!.ownerDocument.createElement('div'); el.className = 'corfu'; if (f.legacy) el.id = 'corfu'; f.root!.appendChild(el); f.parts.corfu = el; }
   const N = Math.max(3, Number(L.get('corfu-count')) || 10);
   if (c.index < c.scroll) c.scroll = c.index; if (c.index >= c.scroll + N) c.scroll = c.index - N + 1;
   const key = c.scroll + ' ' + c.index + ' ' + N + ' ' + c.prefix;
@@ -189,7 +194,7 @@ H.renderOverlay = () => {
     el.innerHTML = c.cands.slice(c.scroll, c.scroll + N).map((x, i) => `<div class="cand${i + c.scroll === c.index ? ' sel' : ''}"><span class="cl"><b>${esc(x.text.slice(0, c.prefix.length))}</b>${esc(x.text.slice(c.prefix.length))}</span>${x.ann ? `<span class="ca">${esc(x.ann)}</span>` : ''}</div>`).join('');
     el._cands = c.cands; el._key = key;
   }
-  if (!E.sel.view.querySelector('.cur')) { el.hidden = true; return; }
+  if (!E.sel!.view!.querySelector('.cur')) { el.hidden = true; return; }
   el.hidden = false;
   /* Inside a frame callback (a wheel scroll, a resize) a new animation frame is the next one, and
      this frame would paint the popup where the text was: place it now, the layout is due anyway. */

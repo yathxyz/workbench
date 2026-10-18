@@ -2591,7 +2591,7 @@ FILES    Files are kept in this browser's storage.  emacs.scm, evil.scm
 </script>
 <script type="text/x-scheme" id="org-scm">
 ;;; org.scm: Org mode as the desktop init-org.el sets it up: keywords, capture and roam
-;;; templates, the agenda groups, and the evil-org keys.  The commands live in org.js, which
+;;; templates, the agenda groups, and the evil-org keys.  The commands live in org.ts, which
 ;;; loads after this file, so the variables are defined here and leader keys go in init.scm.
 
 ;; The task keywords come from the one table of notes-syntax.scm (R10.2), shared with markdown-mode and the
@@ -2761,7 +2761,7 @@ FILES    Files are kept in this browser's storage.  emacs.scm, evil.scm
 ;;; the heading regexp by the file's extension and applies everything else to both.
 
 ;; Task keywords: the one table shared by Org (org.scm reads org-todo-keywords from it), markdown-mode
-;; (edwin/src/markdown.js reads notes-task-keywords and notes-done-keywords) and the notes index. An entry is
+;; (edwin/src/markdown.ts reads notes-task-keywords and notes-done-keywords) and the notes index. An entry is
 ;; (KEYWORD SELECTION DONE? ALIAS-OF): SELECTION is the Org fast-selection key with its logging flags
 ;; ("w@/!"), or #f for a keyword Org does not offer; DONE? marks a done state; ALIAS-OF names the keyword an
 ;; alias stands for. The first seven are the user's Org set; DOING, NOW and LATER are read as aliases (DOING
@@ -3105,7 +3105,7 @@ FILES    Files are kept in this browser's storage.  emacs.scm, evil.scm
 ;;;
 ;;; The grammar is notes-syntax.scm (wiki links, block refs, anchors, the task keyword table shared with
 ;;; Org, key:: fields, priorities); the lexer, the display overlays and the editing primitives (%markdown-*)
-;;; are in edwin/src/markdown.js, which loads after org.js. This file defines the variables the runtimes
+;;; are in edwin/src/markdown.ts, which loads after org.ts. This file defines the variables the runtimes
 ;;; bind, the mode, its commands and its keys. org.scm requires it after Org and before init.scm, so the
 ;;; user's init.scm can change everything here.
 
@@ -3149,7 +3149,7 @@ FILES    Files are kept in this browser's storage.  emacs.scm, evil.scm
 ((block references)), ^anchors, key:: fields and [#A] priorities, folded by heading as Org folds."
   #f)
 
-;;;; Editing commands (the text work is in markdown.js)
+;;;; Editing commands (the text work is in markdown.ts)
 
 (define-command (markdown-outline-enter)
   "RET in a list: a new sibling bullet (a numbered one counts up, a task bullet keeps its [ ]), or on an

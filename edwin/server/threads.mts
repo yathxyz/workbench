@@ -1,6 +1,6 @@
 // The scheduler of the server image (spec §4.8: R4.38–R4.42, R4.46; §4.6: R4.27–R4.29; R14.13).
 //
-// Every evaluation in edwind runs as a thread: a generator (scheme.js in generator mode) driven here.
+// Every evaluation in edwind runs as a thread: a generator (scheme.ts in generator mode) driven here.
 // Command threads (call{form}, call{cmd}, agent tools) run until they finish, block or pass their
 // deadline; every COMMAND_BREAK_MS they let the event loop run (I/O, interrupt and answer messages,
 // edits to buffers they do not hold) and continue before any other thread. Background threads
@@ -27,7 +27,7 @@ import type { Client } from './session.mts';
 import type { SBuf } from './buffers.mts';
 import type { Ed as Edwin, EdBuffer, Lisp, Log, SchemeValue, Server } from './main.mts';
 
-/* The evaluator S of edwin/src (scheme.js), untyped JavaScript like the rest of L. */
+/* The evaluator S of edwin/src (scheme.ts), outside this program's types like the rest of L. */
 type Scheme = Lisp['S'];
 /* A generator the scheduler drives: it yields S.Block, S.Suspend or S.PREEMPT and is resumed with a value. */
 export type SchemeGen = Generator<SchemeValue, SchemeValue, SchemeValue>;
@@ -36,10 +36,10 @@ export type ThreadKind = 'command' | 'background';
 export type ThreadStateName = 'new' | 'runnable' | 'running' | 'blocked' | 'suspended' | 'done';
 /* What the scheduler keeps per thread beside the evaluator's state: the current buffer, the echo area, inhibit-read-only. */
 export interface ThreadData { current: EdBuffer | null; echo: string; inhibitRO: boolean }
-/* A restart of scheme.js (S.Restart). */
+/* A restart of scheme.ts (S.Restart). */
 export interface Restart { name: SchemeSymbol | false; report: SchemeValue; interactive: SchemeValue; fn: SchemeValue; tag: object; js: boolean }
 export interface SchemeSymbol { name: string }
-/* scheme.js ThreadState: the fields the scheduler and the debugger touch. */
+/* scheme.ts ThreadState: the fields the scheduler and the debugger touch. */
 export interface ThreadState {
   name: string | null;
   data: ThreadData | null;

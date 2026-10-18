@@ -1,4 +1,4 @@
-/* The native host (DT1): the same names as host-browser.js and host-node.js (R4.1), for Edwin's core inside
+/* The native host (DT1): the same names as host-browser.ts and host-node.cts (R4.1), for Edwin's core inside
    the desktop shell (edwin/native, a Rust program with V8 in it). The shell gives it __n, its natives:
    files, the terminal, sockets, the environment, exit. Unlike the page and edwind, this host has a file
    system the user edits directly: host.files, which the core's Store reads and writes (a file name is a
@@ -11,15 +11,15 @@
 'use strict';
 const N = globalThis.__n;
 
-const env = k => { const v = N.env(k); return v === undefined || v === null || v === '' ? null : v; };
+const env = (k: string) => { const v = N.env(k); return v === undefined || v === null || v === '' ? null : v; };
 /* The directories are the process's: read by init(), when the program starts (not when the startup snapshot
    was made). */
 let HOME = '/', CWD = '/', CONFIG_DIR = '/', STATE_DIR = '/';
-const join = (a, b) => (b.startsWith('/') ? b : (a.endsWith('/') ? a : a + '/') + b);
-const dirname = p => { const i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i); };
+const join = (a: string, b: string) => (b.startsWith('/') ? b : (a.endsWith('/') ? a : a + '/') + b);
+const dirname = (p: string) => { const i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i); };
 /* An absolute path without empty, . and .. segments (as the shell's cd does, not following links). */
-function normalize(p) {
-  const out = [];
+function normalize(p: string) {
+  const out: string[] = [];
   for (const seg of p.split('/')) {
     if (seg === '' || seg === '.') continue;
     if (seg === '..') out.pop(); else out.push(seg);
@@ -28,14 +28,14 @@ function normalize(p) {
 }
 /* A file name as the user gave it to an absolute path: ~ is the home directory, others are under CWD. So
    foo, ./foo and bar/../foo are one file. */
-function resolve(name) {
+function resolve(name: string) {
   const n = String(name);
   if (n === '~') return HOME;
   if (n.startsWith('~/')) return normalize(join(HOME, n.slice(2)));
   return normalize(join(CWD, n));
 }
 /* The file's true name, every symbolic link resolved: two names for one file have the same true name. */
-const truename = name => { const p = resolve(name); return N.realpath(p) || p; };
+const truename = (name: string) => { const p = resolve(name); return N.realpath(p) || p; };
 function readDirs() {
   HOME = env('HOME') || '/';
   CWD = N.cwd();
@@ -45,8 +45,8 @@ function readDirs() {
 readDirs();
 
 /* ---------- files: line ends and the byte order mark are kept per file ---------- */
-const shapes = new Map();   // absolute path -> { crlf, bom }
-function read(name) {
+const shapes = new Map<string, { crlf: boolean; bom: boolean }>();   // absolute path -> { crlf, bom }
+function read(name: string) {
   const p = resolve(name);
   let t = N.readFile(p);
   if (t === null) return null;
@@ -57,7 +57,7 @@ function read(name) {
   shapes.set(p, { crlf, bom });
   return t;
 }
-function write(name, text) {
+function write(name: string, text: string) {
   const p = resolve(name), sh = shapes.get(p) || { crlf: false, bom: false };
   let t = String(text);
   if (sh.crlf) t = t.replace(/\n/g, '\r\n');
@@ -68,14 +68,14 @@ function write(name, text) {
 /* The files completion offers: those under CWD, breadth first, without hidden and build directories, at
    most LIST_MAX of them; listed again when asked after LIST_TTL. */
 const LIST_MAX = 5000, LIST_TTL = 3000, SKIP = new Set(['node_modules', 'target', 'result', '__pycache__', 'dist', 'build']);
-let listCache = null, listAt = 0;
+let listCache: string[] | null = null, listAt = 0;
 function list() {
   const now = N.now();
   if (listCache && now - listAt < LIST_TTL) return listCache;
-  const out = [], queue = [''];
+  const out: string[] = [], queue = [''];
   while (queue.length && out.length < LIST_MAX) {
     const rel = queue.shift();
-    let ents;
+    let ents: [name: string, dir: boolean][];
     try { ents = N.readDir(join(CWD, rel || '.')); } catch (e) { continue; }
     ents.sort((a, b) => (a[0] < b[0] ? -1 : 1));
     for (const [name, dir] of ents) {
@@ -88,17 +88,17 @@ function list() {
   return out;
 }
 /* How a path is shown and offered: relative under CWD, ~/... under the home directory, else absolute. */
-function label(p) {
+function label(p: string) {
   const a = String(p);
   if (a.startsWith(CWD === '/' ? '/' : CWD + '/')) return a.slice(CWD === '/' ? 1 : CWD.length + 1);
   if (HOME !== '/' && a.startsWith(HOME + '/')) return '~/' + a.slice(HOME.length + 1);
   return a;
 }
-const files = { read, write, remove: name => { N.remove(resolve(name)); listCache = null; }, list, resolve, label, truename, exists: name => N.stat(resolve(name)) !== null, get cwd() { return CWD; } };
+const files: EdHostFiles = { read, write, remove: name => { N.remove(resolve(name)); listCache = null; }, list, resolve, label, truename, exists: name => N.stat(resolve(name)) !== null, get cwd() { return CWD; } };
 
 /* ---------- storage ---------- */
-function jsonStorage(file) {
-  let map = new Map(), timer = null;
+function jsonStorage(file: string): EdHostStorage & { flush(): void } {
+  let map = new Map<string, string>(), timer: number | null = null;
   try { const t = N.readFile(file); if (t) map = new Map(Object.entries(JSON.parse(t))); } catch (e) { console.error('storage: ' + e.message); }
   const flush = () => {
     if (timer !== null) { clearTimeout(timer); timer = null; }
@@ -106,7 +106,7 @@ function jsonStorage(file) {
   };
   const later = () => { if (timer === null) timer = setTimeout(flush, 2000); };
   return {
-    get: k => (map.has(k) ? map.get(k) : null),
+    get: k => (map.has(k) ? map.get(k)! : null),
     set: (k, v) => { map.set(k, String(v)); later(); return true; },
     remove: k => { if (map.delete(k)) later(); },
     keys: () => [...map.keys()],
@@ -115,25 +115,25 @@ function jsonStorage(file) {
 }
 
 /* The storage the core holds: in memory until init() opens the state file behind it. */
-function deferredStorage() {
-  let inner = null;
-  const mem = new Map();
+function deferredStorage(): EdHostStorage & { flush(): void; open(file: string): void } {
+  let inner: EdHostStorage & { flush(): void } | null = null;
+  const mem = new Map<string, string>();
   const use = () => inner;
   return {
-    get: k => (use() ? inner.get(k) : (mem.has(k) ? mem.get(k) : null)),
-    set: (k, v) => { if (use()) return inner.set(k, v); mem.set(k, String(v)); return true; },
-    remove: k => { if (use()) inner.remove(k); else mem.delete(k); },
-    keys: () => (use() ? inner.keys() : [...mem.keys()]),
+    get: k => (use() ? inner!.get(k) : (mem.has(k) ? mem.get(k)! : null)),
+    set: (k, v) => { if (use()) return inner!.set(k, v); mem.set(k, String(v)); return true; },
+    remove: k => { if (use()) inner!.remove(k); else mem.delete(k); },
+    keys: () => (use() ? inner!.keys() : [...mem.keys()]),
     flush: () => { if (inner) inner.flush(); },
     open(file) { inner = jsonStorage(file); },
   };
 }
 
-function createHost(opts = {}) {
-  const attrs = new Map(), vars = new Map(), suspend = [];
+function createHost(opts: { storage?: EdHostStorage; dark?: boolean } = {}): EdHost {
+  const attrs = new Map<string, unknown>(), vars = new Map<string, string>(), suspend: (() => void)[] = [];
   const storage = opts.storage || deferredStorage();
-  const tryRead = p => { try { return read(p); } catch (e) { return null; } };
-  const host = {
+  const tryRead = (p: string) => { try { return read(p); } catch (e) { return null; } };
+  const host: EdHost = {
     kind: 'native', headless: true,
     storage, files,
     config: name => (Object.prototype.hasOwnProperty.call(globalThis.__scm, name) ? globalThis.__scm[name] : null),

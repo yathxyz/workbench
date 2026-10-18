@@ -8,11 +8,11 @@
    Storage is in memory unless a store is passed in. config reads the shipped Scheme from scm/;
    userConfig and readFile read the user's files (CONFIG_DIR/init.scm, and files for load and require). */
 'use strict';
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const vm = require('node:vm');
-const { Worker } = require('node:worker_threads');
+const fs = require('node:fs') as typeof import('node:fs');
+const os = require('node:os') as typeof import('node:os');
+const path = require('node:path') as typeof import('node:path');
+const vm = require('node:vm') as typeof import('node:vm');
+const { Worker } = require('node:worker_threads') as typeof import('node:worker_threads');
 
 const SRC = __dirname;
 const ROOT = path.join(SRC, '..');
@@ -21,29 +21,54 @@ const JOBS_FILE = path.join(ROOT, 'server', 'jobs.mts');
 /* The core, in load order: the order of the script tags in index.html. */
 const FILES = ['scheme', 'runtime', 'text', 'editor-core', 'editor-prims', 'evil-core', 'pool', 'complete', 'extras', 'stack', 'ai', 'evil-ex', 'org', 'markdown', 'ot', 'sync', 'display'];
 
-function memoryStorage(map = new Map()) {
+/* The host's shape, as edwin/src/core.d.ts has it (EdHost and its parts) for the Node host; core.d.ts is not part of
+   this program, so the names here are this file's own. */
+interface NodeHostStorage { get(k: string): string | null; set(k: string, v: unknown): boolean; remove(k: string): void; keys(): string[]; flush?(): void }
+interface NodeHostPage {
+  getAttr(name: string): unknown; setAttr(name: string, v: unknown): void; getVar(name: string): string; setVar(name: string, v: unknown): void;
+  prefersDark(): boolean; addStyle(id: string, css: string): void; onResize(f: () => void): void; onMedia(query: string, f: () => void): void; onFontsLoaded(f: () => void): void;
+}
+/* What a pool thread starts with (core.d.ts EdPoolWorkerData). */
+interface NodeHostWorkerData { k: number; withScheme: boolean; lexSource: string; limits: { SCHEME_TIMEOUT: number; MIRROR_BUDGET: number } }
+/* The named jobs: their functions by name, and the names kept on the main thread. */
+interface NodeHostJobs { fns: Map<string, Function>; localOnly: Set<string> }
+interface NodeHostOpts { scmDir?: string; configDir?: string | null; storage?: NodeHostStorage; workers?: boolean }
+interface NodeHost {
+  kind: 'node'; headless: true; storage: NodeHostStorage;
+  config(name: string): string | null; userConfig(name: string): string | null; readFile(p: string): string | null;
+  loadPath: string[]; page: NodeHostPage;
+  onSuspend(f: () => void): void; suspend(): void; whenLoaded(f: () => void): void;
+  clipboard: string; setClipboard(s: string): void; openUrl(url?: string): boolean; onCspViolation(f?: unknown): void;
+  idle(f: () => void): unknown; nextFrame(f: () => void): unknown;
+  workers: boolean; workersUnavailable: string | null; workerCount: number; jobs: NodeHostJobs | null;
+  makeWorker(data: NodeHostWorkerData): PoolThread;
+}
+/* The globals loadEdwin sets and reads (the core's, untyped here). */
+type NodeHostGlobals = typeof globalThis & { Ed?: unknown; EdHost?: NodeHost; SCHEME_MODE?: 'direct' | 'gen' };
+
+function memoryStorage(map = new Map<string, string>()): NodeHostStorage {
   return {
-    get: k => (map.has(k) ? map.get(k) : null),
+    get: k => (map.has(k) ? map.get(k)! : null),
     set: (k, v) => { map.set(k, String(v)); return true; },
     remove: k => { map.delete(k); },
     keys: () => [...map.keys()],
   };
 }
-const readText = p => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return null; } };
-const mtime = p => { try { return fs.statSync(p).mtimeMs; } catch (e) { return -1; } };
+const readText = (p: string) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return null; } };
+const mtime = (p: string) => { try { return fs.statSync(p).mtimeMs; } catch (e) { return -1; } };
 
 /* The JavaScript of core file F of DIR (src/ by default), and the file a stack trace and definition-of name.
    The core is TypeScript run as classic scripts, which vm cannot strip: the build writes F.js beside F.ts
    (tools/strip.mts --in-place), and a checkout whose F.js is missing or older than F.ts gets F.ts stripped here
    (Node's stripper keeps every line and column, so positions are the .ts's either way). */
-function coreSource(f, dir = SRC) {
+function coreSource(f: string, dir = SRC) {
   const ts = path.join(dir, f + '.ts'), js = path.join(dir, f + '.js'), t = mtime(js);
-  const text = t >= 0 && t >= mtime(ts) ? fs.readFileSync(js, 'utf8') : require('node:module').stripTypeScriptTypes(fs.readFileSync(ts, 'utf8'), { mode: 'strip' });
+  const text = t >= 0 && t >= mtime(ts) ? fs.readFileSync(js, 'utf8') : (require('node:module') as typeof import('node:module')).stripTypeScriptTypes(fs.readFileSync(ts, 'utf8'), { mode: 'strip' });
   return { text, filename: ts };
 }
 
 /* ---------- the worker pool's threads (R4.47, R15.3) ----------
-   pool.js runs the same code on a Web Worker in the browser and on a worker_threads Worker here; the
+   pool.ts runs the same code on a Web Worker in the browser and on a worker_threads Worker here; the
    differences of the two APIs are absorbed by PoolThread, which looks like a Web Worker to the pool:
    onmessage and onerror properties, postMessage(value, transferList), terminate(). Every thread is the
    file server/worker.mts (never code built from a string), which imports the Edwin sources and the named
@@ -60,7 +85,11 @@ function stackSizeMb() {
 const STACK_MB = stackSizeMb();
 const THREAD_HEAP_MB = 512;   // a runaway job dies with its thread (the pool starts another) instead of taking edwind past MemoryMax
 class PoolThread {
-  constructor(data) {
+  declare onmessage: ((ev: { data: unknown }) => void) | null;
+  declare onerror: ((ev: { message: string; preventDefault(): void }) => void) | null;
+  declare closed: boolean;
+  declare thread: import('node:worker_threads').Worker;
+  constructor(data: NodeHostWorkerData) {
     this.onmessage = null; this.onerror = null; this.closed = false;
     const w = this.thread = new Worker(WORKER_FILE, { name: 'edwin-thread-' + data.k, workerData: data, resourceLimits: { stackSizeMb: STACK_MB, maxOldGenerationSizeMb: THREAD_HEAP_MB } });
     w.on('message', m => { if (this.onmessage) this.onmessage({ data: m }); });
@@ -68,8 +97,8 @@ class PoolThread {
     w.on('exit', code => this.fail('the thread exited with code ' + code));
   }
   /* A crash reaches the pool once, as a Web Worker error event would; a terminate() of our own is silent. */
-  fail(message) { if (this.closed) return; this.closed = true; if (this.onerror) this.onerror({ message, preventDefault() {} }); }
-  postMessage(m, transfer) { this.thread.postMessage(m, transfer || []); }
+  fail(message: string) { if (this.closed) return; this.closed = true; if (this.onerror) this.onerror({ message, preventDefault() {} }); }
+  postMessage(m: unknown, transfer?: readonly import('node:worker_threads').TransferListItem[]) { this.thread.postMessage(m, transfer || []); }
   terminate() { this.closed = true; this.thread.terminate().catch(() => {}); }
   ref() { this.thread.ref(); }
   unref() { this.thread.unref(); }
@@ -78,21 +107,21 @@ class PoolThread {
    pool is off, and what EdPool.define may name) and the names jobs.mts keeps on the main thread. The
    module is loaded synchronously (require of an ES module, Node 22.12 and later); where that is not
    possible the pool runs with no threads, as before. */
-function loadJobs() {
-  const ns = require(JOBS_FILE);
-  const fns = new Map();
+function loadJobs(): NodeHostJobs {
+  const ns = require(JOBS_FILE) as Record<string, unknown>;
+  const fns = new Map<string, Function>();
   for (const k of Object.keys(ns)) if (typeof ns[k] === 'function') fns.set(k, ns[k]);
   return { fns, localOnly: new Set(Array.isArray(ns.LOCAL_ONLY) ? ns.LOCAL_ONLY : []) };
 }
 
-function createHost(opts = {}) {
+function createHost(opts: NodeHostOpts = {}): NodeHost {
   const scmDir = opts.scmDir || path.join(ROOT, 'scm');
   const configDir = opts.configDir || null;
-  const attrs = new Map(), vars = new Map(), suspend = [];
+  const attrs = new Map<string, unknown>(), vars = new Map<string, string>(), suspend: (() => void)[] = [];
   /* The pool runs threads unless { workers: false } (tests of the main-thread fallbacks). */
-  let jobs = null, jobsError = null;
+  let jobs: NodeHostJobs | null = null, jobsError: string | null = null;
   try { jobs = loadJobs(); } catch (e) { jobsError = e && e.message ? e.message : String(e); }
-  const page = {
+  const page: NodeHostPage = {
     getAttr: name => attrs.get(name),
     setAttr: (name, v) => { if (v === undefined || v === null) attrs.delete(name); else attrs.set(name, v); },
     getVar: name => vars.get(name) ?? '',
@@ -132,12 +161,12 @@ function createHost(opts = {}) {
 /* Run the core files in this process with HOST, and give back Ed. Ed.boot({host}) starts it. MODE is the
    evaluator's mode (R4.38): 'gen' for the server image (threads, blocking calls, deadlines), 'direct' for
    frames and workers. */
-function loadEdwin(host = createHost(), { mode = 'direct' } = {}) {
-  if (globalThis.Ed) throw new Error('Edwin is already loaded in this process');
-  globalThis.EdHost = host;
-  globalThis.SCHEME_MODE = mode;
+function loadEdwin(host = createHost(), { mode = 'direct' }: { mode?: 'direct' | 'gen' } = {}) {
+  if ((globalThis as NodeHostGlobals).Ed) throw new Error('Edwin is already loaded in this process');
+  (globalThis as NodeHostGlobals).EdHost = host;
+  (globalThis as NodeHostGlobals).SCHEME_MODE = mode;
   for (const f of FILES) { const c = coreSource(f); vm.runInThisContext(c.text, { filename: c.filename }); }
-  return globalThis.Ed;
+  return (globalThis as NodeHostGlobals).Ed;
 }
 
 module.exports = { FILES, createHost, memoryStorage, loadEdwin, coreSource, workerCount, WORKER_FILE, JOBS_FILE };

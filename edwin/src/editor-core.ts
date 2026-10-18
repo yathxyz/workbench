@@ -4,12 +4,38 @@
    so keyboard macros and repeat can push keys back in front of it. */
 (function () {
 'use strict';
-const L = globalThis.L;
+/* editor-core's own types: window configurations, the moved markers of an edit, redisplay's lines, options and
+   caches, and the fields the core keeps on page elements. */
+type EcWinLeaf = { dir?: undefined; buffer: EdBuffer; pt: number; start: number; sel: boolean; popup: boolean };
+type EcWinSplit = { dir: 'h' | 'v'; children: EcWinConfig[] };
+type EcWinConfig = EcWinLeaf | EcWinSplit;
+type EcMoved = [m: EdMarker | EdTempMarker, pos: number, dead: boolean, to: number][];
+type EcLexInfo = { dirty?: boolean };
+type EcIsearchFrame = { pt: number; str: string; failing: boolean; match: [number, number] | null; dir: number; wrapped: boolean };
+type EcFoldPre = { ver: number | undefined; n: number; pre: Int32Array };
+type EcFoldBuffer = { _foldPre?: EcFoldPre | null };
+type EcLineBoth = { html: string; runs: EdRun[] };
+type EcLineVal = string | EdRun[] | EcLineBoth;
+type EcLine = { o: number; n: number | null; cl: boolean; html: string | undefined; pulse: boolean; runs?: EdRun[]; text?: string };
+type EcRendered = EcLine[] & { seg?: string; cache?: Map<string, EcLineVal> | null };
+type EcLexSeg = { cls: ArrayLike<number>; names: string[] };
+type EcPulse = { b: EdBuffer; ls: number };
+interface EcRenderOpts extends EdRenderOpts {
+  active?: boolean; numbers?: 'relative' | 'absolute' | null; cursorClass?: string; onChar?: boolean; hl?: RegExp | null;
+  current?: [number, number] | null; isearch?: EdIsearch | null; avy?: Map<number, string> | null; pulse?: number; cache?: Map<string, EcLineVal> | null;
+}
+interface EcWindowState extends EdWindowState { opts: EcRenderOpts }
+interface EcMetrics extends EdMetrics { sgen: number; ch: number; mono: boolean; padT: number; padX: number; nowrap: boolean; cw0: number; oh0: number; ow0: number; cw: number; top: number; oh: number }
+type EcView = HTMLElement & { _win?: EdWindow; _buf?: EdBuffer; _lines?: EcRendered };
+type EcLineEl = HTMLElement & { _o?: number; _h?: string; _cn?: string; _n?: number | null };
+type EcTextEl = HTMLElement & { _t?: string; _st?: string; _hid?: boolean };
+type EcEcho = HTMLElement & { _e?: string; _eh?: boolean; _dirty?: boolean; _h?: number };
+const L: LispApi = globalThis.L;
 const { intern, NIL, signal, pr, arr, listOf, truthy, SchemeError, Sym } = L;
-/* The host (host-browser.js or host-node.js) is everything the core needs from where it runs. */
-const host = globalThis.EdHost;
+/* The host (host-browser.ts or host-node.cts) is everything the core needs from where it runs. */
+const host: EdHost = globalThis.EdHost;
 if (!host) throw new Error('Edwin needs a host: load host-browser.js or host-node.js first');
-const hooks = {};
+const hooks: EdHooks = {};
 
 /* ---------- file store: the host's storage, under its own prefix ---------- */
 /* A host with a file system (host.files: the desktop shell, DT1) keeps files there instead: NAME is a path,
@@ -17,15 +43,17 @@ const hooks = {};
    completion offers. */
 const PFX = 'lmacs:file:';
 const Store = {
-  get(n) { return host.files ? host.files.read(n) : host.storage.get(PFX + n); },
-  set(n, v) { if (host.files) { host.files.write(n, v); return true; } return host.storage.set(PFX + n, v) !== false; },
-  del(n) { if (host.files) host.files.remove(n); else host.storage.remove(PFX + n); },
+  get(n: string) { return host.files ? host.files.read(n) : host.storage.get(PFX + n); },
+  set(n: string, v: string) { if (host.files) { host.files.write(n, v); return true; } return host.storage.set(PFX + n, v) !== false; },
+  del(n: string) { if (host.files) host.files.remove(n); else host.storage.remove(PFX + n); },
   list() { return host.files ? host.files.list() : host.storage.keys().filter(k => k.startsWith(PFX)).map(k => k.slice(PFX.length)).sort(); },
 };
 
 /* ---------- buffers ---------- */
+interface Buffer extends EdBuffer { _mark: EdMarker; _marks: Map<string, EdMarker>; _jumps: EdMarker[]; _lv: number }
 class Buffer {
-  constructor(name) {
+  declare static count: number | undefined;
+  constructor(name: string) {
     this.id = Buffer.count = (Buffer.count || 0) + 1;
     /* The text lives in a rope; every change is logged as a delta (VER, POS, DEL, INS) so caches,
        undo and the worker mirrors can follow it without keeping copies of the whole text. */
@@ -40,33 +68,34 @@ class Buffer {
     this.jumpIdx = 0;
     this.visual = null; this.evilState = undefined; this._lv = -1; this._lc = null;
   }
-  marker(pos, type) { const m = new Marker(this, pos, type); this.markers.add(m); return m; }
+  marker(pos: number | null, type?: 'before' | 'after') { const m = new Marker(this, pos, type); this.markers.add(m); return m; }
   /* The mark is a before marker; b.mark reads and sets its position (null when unset). */
   get mark() { return this._mark.pos; }
-  set mark(v) { this._mark.pos = v === null || v === undefined ? null : v; }
+  set mark(v: number | null) { this._mark.pos = v === null || v === undefined ? null : v; }
   /* Evil's marks: a table of before markers, read and written as positions (b.marks[k] = pos). */
   get marks() { return this._marksView || (this._marksView = marksView(this)); }
-  set marks(o) { for (const m of this._marks.values()) this.markers.delete(m); this._marks.clear(); for (const k in o) this.marks[k] = o[k]; }
+  set marks(o: Record<string, number | undefined>) { for (const m of this._marks.values()) this.markers.delete(m); this._marks.clear(); for (const k in o) this.marks[k] = o[k]; }
   /* The jump list: an array of before markers. Assigning it drops the markers left out. */
   get jumps() { return this._jumps; }
-  set jumps(a) {
-    const keep = new Set();
-    this._jumps = a.map(x => { const m = x instanceof Marker ? x : this.marker(x); keep.add(m); return m; });
-    for (const m of this.markers) if (m.jump && !keep.has(m)) this.markers.delete(m);
+  set jumps(a: EdMarker[]) {
+    const keep = new Set<EdMarker>();
+    this._jumps = a.map((x: EdMarker | number) => { const m = x instanceof Marker ? x : this.marker(x as number); keep.add(m); return m; });
+    for (const m of this.markers) if ((m as EdMarker).jump && !keep.has(m as EdMarker)) this.markers.delete(m);
     for (const m of keep) { m.jump = true; this.markers.add(m); }
   }
   /* The whole text as one string (built once per change, then cached). Hot paths read the rope. */
   get text() { return this.rope.toString(); }
-  set text(v) { setText(this, String(v)); }
+  set text(v: string) { setText(this, String(v)); }
   __print() { return '#<buffer ' + this.name + '>'; }
   get __type() { return 'buffer'; }
 }
 /* A marker: a position in a buffer that follows its edits, with an insertion type (R6.11). A before
    marker stays before text inserted at it; an after marker advances past it. A released marker
    (set-marker m #f) points nowhere and is no longer moved. */
+interface Marker extends EdMarker {}
 class Marker {
-  constructor(buffer, pos, type) { this.buffer = buffer; this.pos = pos; this.type = type === 'after' ? 'after' : 'before'; }
-  set(buffer, pos) {
+  constructor(buffer: EdBuffer | null, pos: number | null, type?: 'before' | 'after') { this.buffer = buffer; this.pos = pos; this.type = type === 'after' ? 'after' : 'before'; }
+  set(buffer: EdBuffer | null, pos: number | null) {
     if (this.buffer && this.buffer !== buffer) this.buffer.markers.delete(this);
     this.buffer = pos === null ? null : buffer; this.pos = pos;
     if (this.buffer) this.buffer.markers.add(this);
@@ -76,56 +105,60 @@ class Marker {
   __print() { return this.buffer && this.pos !== null ? `#<marker at ${this.pos + 1} in ${this.buffer.name}>` : '#<marker in no buffer>'; }
   get __type() { return 'marker'; }
 }
-function marksView(b) {
+function marksView(b: Buffer): Record<string, number | undefined> {
   const t = b._marks;
   return new Proxy(Object.create(null), {
-    get: (_, k) => { const m = typeof k === 'string' ? t.get(k) : undefined; return m ? m.pos : undefined; },
-    set: (_, k, v) => { let m = t.get(k); if (!m) { m = b.marker(v); t.set(k, m); } else m.pos = v; return true; },
-    deleteProperty: (_, k) => { const m = t.get(k); if (m) { b.markers.delete(m); t.delete(k); } return true; },
-    has: (_, k) => t.has(k),
+    get: (_, k: string) => { const m = typeof k === 'string' ? t.get(k) : undefined; return m ? m.pos : undefined; },
+    set: (_, k: string, v) => { let m = t.get(k); if (!m) { m = b.marker(v); t.set(k, m); } else m.pos = v; return true; },
+    deleteProperty: (_, k: string) => { const m = t.get(k); if (m) { b.markers.delete(m); t.delete(k); } return true; },
+    has: (_, k: string) => t.has(k),
     ownKeys: () => [...t.keys()],
-    getOwnPropertyDescriptor: (_, k) => (t.has(k) ? { value: t.get(k).pos, writable: true, enumerable: true, configurable: true } : undefined),
+    getOwnPropertyDescriptor: (_, k: string) => (t.has(k) ? { value: t.get(k)!.pos, writable: true, enumerable: true, configurable: true } : undefined),
   });
 }
-function modeFor(name) {
+function modeFor(name: string): string {
   if (hooks.modeFor) { const m = hooks.modeFor(name); if (m) return m; }
   if (name === '*scratch*') return 'scheme-interaction-mode';
   if (/\.(scm|ss|sld|el)$/.test(name)) return 'scheme-mode';
   if (/^\*(Help|Buffer List|Messages|Registers|Marks)\*$/.test(name)) return 'special-mode';
   return 'fundamental-mode';
 }
-const MODE_NAMES = { 'scheme-interaction-mode': 'Scheme Interaction', 'scheme-mode': 'Scheme', 'fundamental-mode': 'Fundamental', 'special-mode': 'Special', 'minibuffer-mode': 'Minibuffer', 'org-mode': 'Org', 'text-mode': 'Text' };
-const isLisp = b => b.mode === 'scheme-mode' || b.mode === 'scheme-interaction-mode' || b.mode === 'minibuffer-mode';
+const MODE_NAMES: Record<string, string> = { 'scheme-interaction-mode': 'Scheme Interaction', 'scheme-mode': 'Scheme', 'fundamental-mode': 'Fundamental', 'special-mode': 'Special', 'minibuffer-mode': 'Minibuffer', 'org-mode': 'Org', 'text-mode': 'Text' };
+const isLisp = (b: EdBuffer) => b.mode === 'scheme-mode' || b.mode === 'scheme-interaction-mode' || b.mode === 'minibuffer-mode';
 
 /* E.headless: no page to draw on (edwind, tests), as the host says. Redisplay and the browser wiring are
    then skipped, and everything else runs as in the page. */
 const E = {
   headless: !!host.headless, host, frames: [], frame: null,
-  buffers: [], win: null, current: null,
+  buffers: [], win: null, current: null as unknown as EdBuffer,
   history: [], pendingKeys: '',
   prefixArg: null, keepPrefix: false, uArg: false, uDigits: null, depth: 0,
   lastCommand: false, thisCommand: false, thisKeys: '', killRing: [], killIdx: 0,
   isearch: null, lastSearch: '', goalCol: null, cmdSeq: 0,
   inhibitRO: false, pasteText: '', timers: new Map(), suppressUndo: false, noUndo: false,
-};
+} as Partial<EdState> as EdState;
 /* The minibuffer, the echo area and the window tree are per frame (R9.2): E.minibuf, E.mini, E.echo,
    E.root, E.sel and the rest are accessors onto the selected frame (below, after Window). */
 
-function getBuffer(name) { return E.buffers.find(b => b.name === name) || null; }
-function getBufferCreate(name) {
+function getBuffer(name: string) { return E.buffers.find(b => b.name === name) || null; }
+function getBufferCreate(name: string) {
   let b = getBuffer(name);
   if (!b) { b = new Buffer(name); E.buffers.push(b); if (E.booted) runHookSafely('buffer-list-update-hook', []); }
   return b;
 }
-function toBuffer(x) {
+/* signal does not return */
+function toBuffer(x: SchemeValue): EdBuffer;
+function toBuffer(x: SchemeValue) {
   if (x instanceof Buffer) return x;
-  if (typeof x === 'string') { const b = getBuffer(x); if (!b) signal('error', 'No such buffer ' + x); return b; }
+  if (typeof x === 'string') { const b = getBuffer(x); if (!b) signal('error', 'No such buffer ' + x); return b!; }
   if (x === false || x === undefined) return E.current;
   signal('wrong-type-argument', intern('bufferp'), x);
 }
 /* ---------- windows: a tree of splits whose leaves show buffers ---------- */
+interface Window extends EdWindow {}
 class Window {
-  constructor(buffer) {
+  declare static count: number | undefined;
+  constructor(buffer: EdBuffer) {
     this.id = Window.count = (Window.count || 0) + 1;
     this.buffer = buffer; this.pt = buffer ? buffer.pt : 0; this.start = 0; this.lastLine = 0; this.rows = 20; this.prev = []; this.popup = false;
     this.el = null; this.view = null; this.ml = null; this.parent = null; this.dedicated = false;
@@ -133,11 +166,13 @@ class Window {
   __print() { return '#<window ' + this.id + ' on ' + (this.buffer ? this.buffer.name : 'nothing') + '>'; }
   get __type() { return 'window'; }
 }
-class Split { constructor(dir, children) { this.dir = dir; this.children = children; this.parent = null; this.el = null; for (const c of children) c.parent = this; } }
+interface Split extends EdSplit {}
+class Split { constructor(dir: 'h' | 'v', children: EdWindowNode[]) { this.dir = dir; this.children = children; this.parent = null; this.el = null; for (const c of children) c.parent = this; } }
 /* The per-frame state (R9.2): a window tree (wroot, sel, the winner history), a minibuffer with its
    echo area, prompt and flash, and whether the frame has the keyboard. A Frame (below) adds the page
    parts. With no frame (headless: edwind, the tests, a served runtime before its first card) the
    implicit state E.implicit holds one window tree, so the core works unchanged. */
+interface FrameState extends EdFrameState {}
 class FrameState {
   constructor() {
     this.wroot = null; this.sel = null; this.winHistory = []; this.winFuture = [];
@@ -149,13 +184,13 @@ class FrameState {
 E.implicit = new FrameState();
 /* The frame the core is working on: the one being drawn (render swaps it in), else the selected one,
    else the implicit state. E.root, E.sel, E.mini, E.minibuf, E.echo and the rest read and write it. */
-let rendering = null;
+let rendering: EdFrameState | null = null;
 const FS = () => rendering || E.frame || E.implicit;
 for (const [k, f] of [['root', 'wroot'], ['sel', 'sel'], ['winHistory', 'winHistory'], ['winFuture', 'winFuture'], ['mini', 'mini'], ['minibuf', 'minibuf'],
-  ['miniFlash', 'miniFlash'], ['echo', 'echo'], ['prompt', 'prompt'], ['focused', 'focused'], ['restoreScroll', 'restoreScroll'], ['recenter', 'recenter']])
-  Object.defineProperty(E, k, { get() { return FS()[f]; }, set(v) { FS()[f] = v; }, enumerable: true, configurable: true });
+  ['miniFlash', 'miniFlash'], ['echo', 'echo'], ['prompt', 'prompt'], ['focused', 'focused'], ['restoreScroll', 'restoreScroll'], ['recenter', 'recenter']] as [string, keyof EdFrameState][])
+  Object.defineProperty(E, k, { get() { return FS()[f]; }, set(v) { (FS() as Record<keyof EdFrameState, unknown>)[f] = v; }, enumerable: true, configurable: true });
 Object.defineProperty(E, 'win', { get() { return E.sel ? E.sel.buffer : null; }, set(b) { if (E.sel) E.sel.buffer = b; } });
-function leaves(node, out) { out = out || []; if (!node) return out; if (node instanceof Window) out.push(node); else for (const c of node.children) leaves(c, out); return out; }
+function leaves(node: EdWindowNode | null, out?: EdWindow[]): EdWindow[] { out = out || []; if (!node) return out; if (node instanceof Window) out.push(node); else for (const c of (node as EdSplit).children) leaves(c, out); return out; }
 function windowList() { return leaves(E.root); }
 /* Every window of every frame, the implicit tree included. */
 function allWindows() { const out = leaves(E.implicit.wroot); for (const f of E.frames) leaves(f.wroot, out); return out; }
@@ -164,16 +199,16 @@ const selWin = () => (E.frame || E.implicit).sel;
 /* Every minibuffer (one per frame, plus the implicit one). */
 function allMinibufs() { return [E.implicit.minibuf, ...E.frames.map(f => f.minibuf)]; }
 /* Run FN with frame F as the one the accessors read (redisplay of a frame that is not selected). */
-function withFrame(f, fn) { const save = rendering; rendering = f; try { return fn(); } finally { rendering = save; } }
-function selectWindow(w, keepPoint) {
+function withFrame<T>(f: EdFrameState | null, fn: () => T): T { const save = rendering; rendering = f; try { return fn(); } finally { rendering = save; } }
+function selectWindow(w: EdWindow | null | undefined, keepPoint?: boolean) {
   if (!w || w === E.sel) { if (w) E.current = E.mini ? E.minibuf : w.buffer; return; }
   if (E.sel && E.sel.buffer) { E.sel.pt = E.sel.buffer.pt; }
   E.sel = w;
   if (!keepPoint && w.buffer) w.buffer.pt = Math.min(w.pt, w.buffer.rope.length);
   E.current = E.mini ? E.minibuf : w.buffer; E.restoreScroll = true;
 }
-function setWindowBuffer(b, w) {
-  w = w || E.sel;
+function setWindowBuffer(b: EdBuffer, w?: EdWindow | null) {
+  w = w || E.sel!;
   if (w.buffer && w.buffer !== b) {
     w.prev = [w.buffer, ...w.prev.filter(x => x !== w.buffer)].slice(0, 20);
     w.buffer.lastStart = w.start; w.start = b.lastStart || 0;
@@ -183,15 +218,15 @@ function setWindowBuffer(b, w) {
   w.buffer = b; w.pt = b.pt;
   if (w === E.sel) { E.current = E.mini ? E.minibuf : b; E.restoreScroll = true; }
 }
-function otherBuffer() { return E.buffers.find(b => b !== E.win && !b.name.startsWith(' ') && !windowList().some(w => w.buffer === b)) || E.buffers.find(b => b !== E.win && !b.name.startsWith(' ')) || E.win; }
-function replaceNode(oldNode, newNode) {
+function otherBuffer() { return E.buffers.find(b => b !== E.win && !b.name.startsWith(' ') && !windowList().some(w => w.buffer === b)) || E.buffers.find(b => b !== E.win && !b.name.startsWith(' ')) || E.win!; }
+function replaceNode(oldNode: EdWindowNode, newNode: EdWindowNode) {
   const p = oldNode.parent;
   newNode.parent = p;
   if (!p) E.root = newNode; else p.children[p.children.indexOf(oldNode)] = newNode;
 }
-function splitWindow(w, dir, size) {
+function splitWindow(w: EdWindow | null, dir: string, size?: number) {
   // dir: 'below' or 'right'. The new window shows the same buffer and goes after W.
-  w = w || E.sel;
+  w = w || E.sel!;
   saveWinConfig();
   const nw = new Window(w.buffer); nw.pt = w.buffer.pt; nw.start = w.start;
   const axis = dir === 'right' ? 'h' : 'v';
@@ -200,33 +235,33 @@ function splitWindow(w, dir, size) {
   else { const parent = w.parent; const sp = new Split(axis, [w, nw]); sp.parent = parent; if (!parent) E.root = sp; else parent.children[parent.children.indexOf(w)] = sp; }
   return nw;
 }
-function deleteWindow(w) {
-  w = w || E.sel;
+function deleteWindow(w: EdWindow | null) {
+  w = w || E.sel!;
   if (windowList().length === 1) signal('user-error', 'Attempt to delete the sole window');
   saveWinConfig();
-  const p = w.parent;
+  const p = w.parent!;
   p.children.splice(p.children.indexOf(w), 1);
   if (p.children.length === 1) replaceNode(p, p.children[0]);
   if (w.el && w.el.parentNode) w.el.parentNode.removeChild(w.el);
   if (E.sel === w) { const ws = windowList(); E.sel = null; selectWindow(ws[0]); }
   return true;
 }
-function deleteOtherWindows(w) {
-  w = w || E.sel;
+function deleteOtherWindows(w: EdWindow | null) {
+  w = w || E.sel!;
   if (windowList().length === 1) return;
   saveWinConfig();
   for (const x of windowList()) if (x !== w && x.el && x.el.parentNode) x.el.parentNode.removeChild(x.el);
   w.parent = null; E.root = w; selectWindow(w);
 }
 function winConfig() {
-  const snap = n => n instanceof Window ? { buffer: n.buffer, pt: n === E.sel ? n.buffer.pt : n.pt, start: n.start, sel: n === E.sel, popup: n.popup }
-    : { dir: n.dir, children: n.children.map(snap) };
-  return snap(E.root);
+  const snap = (n: EdWindowNode): EcWinConfig => n instanceof Window ? { buffer: n.buffer, pt: n === E.sel ? n.buffer.pt : n.pt, start: n.start, sel: n === E.sel, popup: n.popup }
+    : { dir: (n as EdSplit).dir, children: (n as EdSplit).children.map(snap) };
+  return snap(E.root!);
 }
-function restoreWinConfig(cfg) {
+function restoreWinConfig(cfg: EcWinConfig) {
   for (const x of windowList()) if (x.el && x.el.parentNode) x.el.parentNode.removeChild(x.el);
-  let sel = null;
-  const build = c => {
+  let sel: EdWindow | null = null;
+  const build = (c: EcWinConfig): EdWindowNode => {
     if (c.dir) return new Split(c.dir, c.children.map(build));
     const b = E.buffers.includes(c.buffer) ? c.buffer : (E.buffers.find(x => !x.name.startsWith(' ')) || E.buffers[0]);
     const w = new Window(b); w.pt = Math.min(c.pt, b.rope.length); w.start = Math.min(c.start || 0, b.rope.length); w.popup = c.popup; if (c.sel) sel = w; return w;
@@ -235,11 +270,11 @@ function restoreWinConfig(cfg) {
   E.sel = null; selectWindow(sel || windowList()[0]);
 }
 function saveWinConfig() { E.winHistory.push(winConfig()); if (E.winHistory.length > 50) E.winHistory.shift(); E.winFuture = []; }
-function windowFor(b) { return windowList().find(w => w.buffer === b) || null; }
+function windowFor(b: EdBuffer) { return windowList().find(w => w.buffer === b) || null; }
 /* Show B in a window other than the selected one: reuse one, or split. */
-function popToBuffer(b, select) {
+function popToBuffer(b: EdBuffer, select?: boolean) {
   const existing = windowFor(b);
-  let w;
+  let w: EdWindow;
   if (existing) w = existing;
   else {
     const others = windowList().filter(x => x !== E.sel);
@@ -256,8 +291,10 @@ function popToBuffer(b, select) {
    area and the input, with the menubar, the completion popup and the snipe boxes. The core never looks
    up page elements itself: it asks the selected frame for a part by name (frame.el), so a page can hold
    several frames. With no frame (headless) nothing is drawn. */
+interface Frame extends EdFrame {}
 class Frame extends FrameState {
-  constructor(root, parts) {
+  declare static count: number | undefined;
+  constructor(root: HTMLElement | null, parts: Record<string, HTMLElement>) {
     super();
     this.id = Frame.count = (Frame.count || 0) + 1;
     this.root = root; this.parts = Object.assign(Object.create(null), parts);
@@ -266,11 +303,11 @@ class Frame extends FrameState {
   /* The part NAME (frame, menubar, windows, echo, input, corfu, snipe, presence): given at creation, or the
      element with that id inside the root, or the root itself. Parts made later (the popups) are found once made.
      A model frame (no root, DT0) has no parts: null. */
-  el(name) {
+  el(name: string) {
     const p = this.parts[name];
     if (p) return p;
     const r = this.root; if (!r) return null;
-    const el = r.id === name ? r : r.querySelector('#' + name);
+    const el = r.id === name ? r : r.querySelector<HTMLElement>('#' + name);
     if (el) this.parts[name] = el;
     return el;
   }
@@ -279,22 +316,22 @@ class Frame extends FrameState {
   focus() { const ta = this.el('input'); if (ta && ta.focus) ta.focus({ preventScroll: true }); else { selectFrame(this); this.focused = true; } }
   blur() { const ta = this.el('input'); if (ta && ta.blur && ta.ownerDocument.activeElement === ta) ta.blur(); else { this.focused = false; frameEvent('blur', this); } }
   /* Show B in the frame's selected window. */
-  showBuffer(b) { withFrame(this, () => setWindowBuffer(toBuffer(b), this.sel)); if (E.frame === this) E.current = this.mini ? this.minibuf : this.sel.buffer; scheduleRender(); return b; }
-  point() { return E.frame === this ? this.sel.buffer.pt : this.sel.pt; }
-  setPoint(p) { const b = this.sel.buffer; p = Math.max(0, Math.min(b.rope.length, p)); if (E.frame === this) b.pt = p; this.sel.pt = p; scheduleRender(); return p; }
+  showBuffer<T extends EdBuffer | string>(b: T): T { withFrame(this, () => setWindowBuffer(toBuffer(b)!, this.sel)); if (E.frame === this) E.current = this.mini ? this.minibuf : this.sel!.buffer; scheduleRender(); return b; }
+  point(): number { return E.frame === this ? this.sel!.buffer.pt : this.sel!.pt; }
+  setPoint(p: number) { const b = this.sel!.buffer; p = Math.max(0, Math.min(b.rope.length, p)); if (E.frame === this) b.pt = p; this.sel!.pt = p; scheduleRender(); return p; }
   /* Pixels from the top of the frame's element to the top of the drawn line holding POS, or null (R9.12). */
-  lineTop(pos) {
+  lineTop(pos: number) {
     const w = this.sel; if (!w || !w.view) return null;
     const ls = bol(w.buffer.rope, Math.max(0, Math.min(w.buffer.rope.length, pos)));
     const ln = w.view.querySelector(`.ln[data-o="${ls}"]`); if (!ln) return null;
-    const sc = frameScale(this), rr = this.root.getBoundingClientRect(), lr = ln.getBoundingClientRect();
+    const sc = frameScale(this), rr = this.root!.getBoundingClientRect(), lr = ln.getBoundingClientRect();
     return (lr.top - rr.top) / sc;
   }
   /* The buffer position under the client point, in this frame (works under a CSS transform, R9.9). */
-  posFromPoint(x, y) { return withFrame(this, () => { const w = windowAt(x, y); return w ? posFromPoint(x, y, w) : null; }); }
+  posFromPoint(x: number, y: number) { return withFrame(this, () => { const w = windowAt(x, y); return w ? posFromPoint(x, y, w) : null; }); }
   /* True while the frame's buffer has edits the server has not acknowledged (R9.15). */
   unacked() { const b = this.buffer; return !!(b && (b.inflight || (b.queue && b.queue.length))); }
-  setFontSize(px) { this.fontSize = px; if (this.root) this.root.style.setProperty('--text-size', px + 'px'); E.metricsGen++; scheduleRender(); }
+  setFontSize(px: number) { this.fontSize = px; if (this.root) this.root.style.setProperty('--text-size', px + 'px'); E.metricsGen++; scheduleRender(); }
   destroy() { deleteFrame(this); }
   __print() { return '#<frame ' + this.id + '>'; }
   get __type() { return 'frame'; }
@@ -304,12 +341,12 @@ class Frame extends FrameState {
    (R9.2, R9.3). The older form makeFrame(root, parts) takes a page that already holds the parts
    (edwin/index.html). The window tree starts with one window on BUFFER (else the current buffer).
    Ed.makeFrame(null, {backend, buffer, kind, theme}) makes a model frame (DT0): no page, no DOM; each redisplay
-   lays the frame out on backend.size()'s cell grid and hands the result to backend.draw (display.js). */
-function makeFrame(root, opts) {
+   lays the frame out on backend.size()'s cell grid and hands the result to backend.draw (display.ts). */
+function makeFrame(root: HTMLElement | null, opts?: EdMakeFrameOpts) {
   opts = opts || {};
   if (!root) return makeModelFrame(opts);
   const built = 'kind' in opts || 'buffer' in opts || 'fontSize' in opts;
-  const f = new Frame(root, built ? {} : opts);
+  const f = new Frame(root, built ? {} : opts as Record<string, HTMLElement>);
   if (built) buildFrame(f, root, opts);
   const b = (opts.buffer && toBuffer(opts.buffer)) || E.current || E.buffers[0];
   f.wroot = f.sel = new Window(b); f.sel.pt = b.pt;
@@ -320,7 +357,7 @@ function makeFrame(root, opts) {
   if (built) { watchTheme(root); scheduleRender(); }
   return f;
 }
-function makeModelFrame(opts) {
+function makeModelFrame(opts: EdMakeFrameOpts) {
   const be = opts.backend;
   if (!be || typeof be.size !== 'function' || typeof be.draw !== 'function') signal('error', 'Ed.makeFrame: a frame needs an element, or a backend with size() and draw()');
   const f = new Frame(null, {});
@@ -333,13 +370,13 @@ function makeModelFrame(opts) {
   scheduleRender();
   return f;
 }
-function buildFrame(f, root, opts) {
+function buildFrame(f: Frame, root: HTMLElement, opts: EdMakeFrameOpts) {
   const doc = root.ownerDocument;
   host.page.addStyle('edwin-frame-style', FRAME_CSS);
   root.classList.add('edwin-frame', 'unfocused');
   f.kind = opts.kind === 'card' ? 'card' : 'console'; f.legacy = false;
   root.dataset.kind = f.kind;
-  const mk = (tag, cls) => { const el = doc.createElement(tag); el.className = cls; root.appendChild(el); return el; };
+  const mk = (tag: string, cls: string) => { const el = doc.createElement(tag); el.className = cls; root.appendChild(el); return el; };
   if (f.kind === 'console') {
     const nav = mk('nav', 'ed-menubar'); nav.setAttribute('aria-label', 'Commands');
     nav.innerHTML = '<span class="name">Edwin</span><button type="button" data-key="ESC">Esc</button><button type="button" data-cmd="evil-ex">Ex <kbd>:</kbd></button>' +
@@ -359,7 +396,7 @@ function buildFrame(f, root, opts) {
 }
 /* A change of data-theme on <html> redraws every frame (R9.10); the colours themselves are CSS variables. */
 let themeWatched = false;
-function watchTheme(root) {
+function watchTheme(root: HTMLElement) {
   if (themeWatched) return;
   const doc = root.ownerDocument, win = doc.defaultView;
   if (!win || typeof win.MutationObserver !== 'function') return;
@@ -368,8 +405,8 @@ function watchTheme(root) {
 }
 /* The CSS scale an ancestor's transform applies to frame F (1 without one): layout pixels are divided by it
    to place overlays, and measured rectangles are divided by it to get layout pixels (R9.9). */
-function frameScale(f) { const r = f.root; if (!r || !r.offsetWidth) return 1; const w = r.getBoundingClientRect().width; return w > 0 ? w / r.offsetWidth : 1; }
-function selectFrame(f) {
+function frameScale(f: EdFrame) { const r = f.root; if (!r || !r.offsetWidth) return 1; const w = r.getBoundingClientRect().width; return w > 0 ? w / r.offsetWidth : 1; }
+function selectFrame(f: EdFrame) {
   if (!(f instanceof Frame) || !E.frames.includes(f)) signal('wrong-type-argument', 'not a live frame', f);
   if (E.frame === f) return f;
   const old = E.frame || E.implicit;
@@ -378,7 +415,7 @@ function selectFrame(f) {
   if (f.sel && f.sel.buffer) { const b = f.sel.buffer; b.pt = Math.min(f.sel.pt, b.rope.length); E.current = f.mini ? f.minibuf : b; }
   return f;
 }
-function deleteFrame(f) {
+function deleteFrame(f: EdFrame) {
   const i = E.frames.indexOf(f); if (i < 0) return false;
   E.frames.splice(i, 1);
   for (const w of leaves(f.wroot)) if (w.view && sizeWatch) sizeWatch.unobserve(w.view);
@@ -397,15 +434,15 @@ function deleteFrame(f) {
 }
 /* Ed.onFrameEvent(fn): fn({type, frame, buffer}) for edited, point, focus, blur and status (the page's title,
    snapshot and status refresh). */
-const frameListeners = [];
-function onFrameEvent(fn) { frameListeners.push(fn); return () => { const i = frameListeners.indexOf(fn); if (i >= 0) frameListeners.splice(i, 1); }; }
-function frameEvent(type, frame, buffer) {
+const frameListeners: ((ev: EdFrameEvent) => void)[] = [];
+function onFrameEvent(fn: (ev: EdFrameEvent) => void) { frameListeners.push(fn); return () => { const i = frameListeners.indexOf(fn); if (i >= 0) frameListeners.splice(i, 1); }; }
+function frameEvent(type: string, frame: EdFrame | null, buffer?: EdBuffer | null) {
   if (!frameListeners.length) return;
   const ev = { type, frame, buffer: buffer || (frame && frame.sel ? frame.sel.buffer : null) };
   for (const fn of frameListeners.slice()) { try { fn(ev); } catch (e) { console.error(e); } }
 }
 /* A part of the frame being drawn or selected, or null with no frame. */
-const $ = name => { const f = FS(); return f instanceof Frame ? f.el(name) : null; };
+const $ = (name: string) => { const f = FS(); return f instanceof Frame ? f.el(name) : null; };
 
 /* The stylesheet a built frame needs, injected once per page. Faces are the board's tokens with Edwin's
    modus values as fallbacks (R9.10); fonts are the page's (R9.11). */
@@ -518,32 +555,32 @@ const FRAME_CSS = `
 `;
 
 /* ---------- text primitives (0-based internally; Lisp sees 1-based) ---------- */
-function checkRO(b) { if (b.readOnly && !E.inhibitRO && !(L.get('inhibit-read-only') && L.get('inhibit-read-only').value)) signal('buffer-read-only', b); }
+function checkRO(b: EdBuffer) { if (b.readOnly && !E.inhibitRO && !(L.get('inhibit-read-only') && (L.get('inhibit-read-only') as SchemeParam).value)) signal('buffer-read-only', b); }
 /* ---------- the edit log ----------
    Each change appends { v, pos, del, ins, len, o }: at POS, DEL was replaced by INS, leaving a text of
    LEN characters at version V; O is the edit's origin (E.editOrigin: local, remote, server, agent, disk). Caches remember the version they were built from and ask spanOf for
    the part that changed since; undo goes back by applying the deltas in reverse. Entries older than
    every snapshot that may still be restored are dropped. */
-function logEdit(b, pos, del, ins) {
+function logEdit(b: EdBuffer, pos: number, del: string, ins: string) {
   const log = b.log;
   log.push({ v: ++b.ver, pos, del, ins, len: b.rope.length, o: E.editOrigin });
   if (log.length > 512 && (log.length & 127) === 0) trimLog(b);
   if (hooks.edited) hooks.edited(b);
 }
-function trimLog(b) {
+function trimLog(b: EdBuffer) {
   let min = b.ver;
   for (const s of b.undo) if (s.ver < min) min = s.ver;
   for (const s of b.redo) if (s.ver < min) min = s.ver;
   if (b.pendingUndo && b.pendingUndo.ver < min) min = b.pendingUndo.ver;
   if (b.pin < min) min = b.pin;
-  if (b._lv >= 0 && b._lv < min && b.ver - b._lv < 4096) min = b._lv;
+  if (b._lv! >= 0 && b._lv! < min && b.ver - b._lv! < 4096) min = b._lv!;
   if (hooks.logFloor) min = Math.min(min, hooks.logFloor(b));
   const log = b.log;
   let k = 0; while (k < log.length && log[k].v <= min) k++;
   if (k) log.splice(0, k);
 }
 /* Low-level change: no read-only check, no marker adjustment and no change hooks. Returns the removed text. */
-function ropeEdit(b, pos, n, ins) {
+function ropeEdit(b: EdBuffer, pos: number, n: number, ins: string) {
   const removed = b.rope.splice(pos, n, ins);
   if (removed || ins) logEdit(b, pos, removed, ins);
   return removed;
@@ -554,14 +591,14 @@ function ropeEdit(b, pos, n, ins) {
    - point and the points of the other windows on the buffer are after markers.
    A marker whose character was deleted is flagged dead (the :g and :normal line markers skip it).
    Markers a deletion moved are remembered by ENTRY, the log entry, so undo puts them back. */
-function shiftMarkers(b, pos, del, ins, entry) {
+function shiftMarkers(b: EdBuffer, pos: number, del: number, ins: number, entry?: EdLogEntry | null) {
   const e = pos + del, d = ins - del;
-  const after = p => (p < pos ? p : p > e || (del && p === e) ? p + d : pos + ins);
+  const after = (p: number) => (p < pos ? p : p > e || (del && p === e) ? p + d : pos + ins);
   b.pt = after(b.pt);
   const sw = selWin();
   for (const w of allWindows()) if (w.buffer === b && w !== sw) w.pt = after(w.pt);
   if (!b.markers.size) return;
-  let moved = null;
+  let moved: EcMoved | null = null;
   for (const m of b.markers) {
     const p = m.pos;
     if (p === null || p < pos) continue;
@@ -569,17 +606,17 @@ function shiftMarkers(b, pos, del, ins, entry) {
       if (p === e && del) (moved || (moved = [])).push([m, p, !!m.dead, p + d]);
       m.pos = p + d; continue;
     }
-    const q = m.type === 'after' ? pos + ins : pos;
+    const q = (m as EdMarker).type === 'after' ? pos + ins : pos;
     if (del) { if (p > pos) (moved || (moved = [])).push([m, p, !!m.dead, q]); m.dead = true; }
     m.pos = q;
   }
   if (moved && entry) markersMoved.set(entry, moved);
 }
 /* Markers a deletion moved, by log entry: [marker, old position, old dead flag, new position]. */
-const markersMoved = new WeakMap();
+const markersMoved = new WeakMap<EdLogEntry, EcMoved>();
 /* Undoing ENTRY: markers follow the inverse change, and those the deletion moved go back where they
    were, when nothing has moved them since. */
-function unshiftMarkers(b, entry) {
+function unshiftMarkers(b: EdBuffer, entry: EdLogEntry) {
   const moved = markersMoved.get(entry);
   const back = moved ? moved.filter(([m, , , q]) => b.markers.has(m) && m.pos === q) : null;
   shiftMarkers(b, entry.pos, entry.ins.length, entry.del.length, null);
@@ -598,7 +635,7 @@ function changeHooks() {
   const bf = L.get('before-change-functions'), af = L.get('after-change-functions');
   return (bf && bf !== NIL) || (af && af !== NIL) ? true : false;
 }
-function runChangeHook(b, name, args) {
+function runChangeHook(b: EdBuffer, name: string, args: SchemeValue[]) {
   const save = E.current;
   inChangeHook = true; E.current = b;
   try { runHookSafely(name, args); }
@@ -606,18 +643,18 @@ function runChangeHook(b, name, args) {
 }
 /* Run the hook NAME with ARGS; a function that signals is reported and taken off the hook, both its
    buffer-local and its default value, so one broken function cannot break every later edit. */
-function runHookSafely(name, args) {
+function runHookSafely(name: string, args?: SchemeValue[]) {
   for (const f of L.hookFns(name)) {
     try { L.apply(f, args); }
     catch (e) {
       if (L.isQuit(e)) throw e;
       removeHookEverywhere(name, f);
-      message(`Error in ${name} (${f.procName || pr(f, true)}): ${errorText(e)}; removed it from the hook`);
+      message(`Error in ${name} (${(f as SchemeProcedure).procName || pr(f, true)}): ${errorText(e)}; removed it from the hook`);
     }
   }
 }
-function removeHookEverywhere(name, f) {
-  const drop = v => (v && v !== NIL && typeof v !== 'function' ? listOf(arr(v).filter(x => x !== f)) : v === f ? NIL : v);
+function removeHookEverywhere(name: string, f: SchemeValue) {
+  const drop = (v: SchemeValue) => (v && v !== NIL && typeof v !== 'function' ? listOf(arr(v).filter(x => x !== f)) : v === f ? NIL : v);
   const ent = localized.get(name);
   if (ent) { ent.def = drop(ent.def); for (const b of E.buffers) if (b.locals && b.locals.has(name)) b.locals.set(name, drop(b.locals.get(name))); }
   else L.set(name, drop(L.get(name)));
@@ -629,8 +666,8 @@ function removeHookEverywhere(name, f) {
    variable (defvar-local, make-variable-buffer-local) gets a local value whenever it is set.
    Buffer-locals live with the buffer in each runtime; (put 'var 'shared-local #t) marks the ones that
    travel with the buffer's meta once frames share buffers (E3). */
-const localized = new Map();
-function localize(name) {
+const localized = new Map<string, EdLocalized>();
+function localize(name: string) {
   let ent = localized.get(name);
   if (ent) return ent;
   const box = L.S.gbox(name), d = Object.getOwnPropertyDescriptor(box, 'value');
@@ -648,27 +685,27 @@ function localize(name) {
   localized.set(name, ent);
   return ent;
 }
-function makeLocal(b, name) {
+function makeLocal(b: EdBuffer, name: string) {
   const ent = localize(name);
   if (!b.locals) b.locals = new Map();
   if (!b.locals.has(name)) b.locals.set(name, ent.def);
 }
-function localValue(b, name) {
+function localValue(b: EdBuffer, name: string) {
   const ent = localized.get(name);
   if (!ent) return L.get(name);
   return b && b.locals && b.locals.has(name) ? b.locals.get(name) : ent.def;
 }
-const defaultValue = name => { const ent = localized.get(name); return ent ? ent.def : L.get(name); };
-function setDefault(name, v) { const ent = localized.get(name); if (ent) ent.def = v; else L.set(name, v); return v; }
+const defaultValue = (name: string) => { const ent = localized.get(name); return ent ? ent.def : L.get(name); };
+function setDefault<T extends SchemeValue>(name: string, v: T): T { const ent = localized.get(name); if (ent) ent.def = v; else L.set(name, v); return v; }
 L.hooking.defaultValue = defaultValue;
 /* Run F with (edit-origin) answering ORIGIN: remote, server, disk or agent (E1 applies edits with it). */
-function withOrigin(origin, f) { const save = E.editOrigin; E.editOrigin = origin; try { return f(); } finally { E.editOrigin = save; } }
+function withOrigin<T>(origin: string, f: () => T): T { const save = E.editOrigin; E.editOrigin = origin; try { return f(); } finally { E.editOrigin = save; } }
 /* One change: hooks, the rope, the log, the markers. WHOLE is the whole new text when the caller has it
    (assigning b.text), so a large replacement resets the rope instead of splicing it. */
-function editOne(b, pos, n, ins, whole) {
+function editOne(b: EdBuffer, pos: number, n: number, ins: string, whole?: string) {
   const hk = changeHooks();
   if (hk) runChangeHook(b, 'before-change-functions', [pos + 1, pos + n + 1]);
-  let removed;
+  let removed: string;
   if (whole !== undefined && n + ins.length > (whole.length >> 1)) { removed = b.rope.slice(pos, pos + n); b.rope.reset(whole); if (removed || ins) logEdit(b, pos, removed, ins); }
   else removed = ropeEdit(b, pos, n, ins);
   if (removed || ins) shiftMarkers(b, pos, removed.length, ins.length, b.log[b.log.length - 1]);
@@ -678,10 +715,10 @@ function editOne(b, pos, n, ins, whole) {
 /* The one way text changes (R6.8): OPS, an array of [pos, del, ins] applied in order, change the rope,
    shift every marker, append to the log, run the change hooks with (edit-origin) = ORIGIN (local when
    absent: a command), bump b.ver (logEdit) and schedule redisplay. Local commands, remote batches,
-   reverts and undo all come through here; hooks.applied tells the protocol client (sync.js). Returns
+   reverts and undo all come through here; hooks.applied tells the protocol client (sync.ts). Returns
    the ops as applied, with the removed text read from the buffer. */
-function applyOps(b, ops, origin, whole) {
-  const out = [], eff = origin || E.editOrigin;
+function applyOps(b: EdBuffer, ops: EdEditOp[], origin?: string, whole?: string) {
+  const out: EdAppliedOp[] = [], eff = origin || E.editOrigin;
   withOrigin(eff, () => {
     for (const op of ops) {
       const pos = op[0], n = typeof op[1] === 'string' ? op[1].length : op[1], ins = op[2];
@@ -699,12 +736,12 @@ function applyOps(b, ops, origin, whole) {
 }
 /* The per-op entry the server and the editing primitives use: one change at POS of N characters into INS;
    the origin is the current one (Ed.withOrigin). Returns the removed text. */
-function editText(b, pos, n, ins) {
+function editText(b: EdBuffer, pos: number, n: number, ins: string) {
   const r = applyOps(b, [[pos, n, ins]]);
   return r.length ? r[0][1] : '';
 }
 /* Assigning b.text: change the differing middle only, as one edit. */
-function setText(b, v) {
+function setText(b: EdBuffer, v: string) {
   const r = b.rope;
   if (r.flat === v) return;
   const old = r.toString();
@@ -721,7 +758,7 @@ function scheduleRender() {
 }
 /* The span changed since version OLD: { pre, suf } lengths of the untouched prefix and suffix, or null
    when the log no longer reaches back that far. */
-function spanOf(b, old) {
+function spanOf(b: EdBuffer, old: number) {
   const log = b.log;
   let pre = Infinity, suf = Infinity, k = log.length - 1;
   for (; k >= 0 && log[k].v > old; k--) {
@@ -734,7 +771,7 @@ function spanOf(b, old) {
   return { pre, suf };
 }
 /* Whether the text differs from what it was at version VER (an edit undone by another is no change). */
-function changedSince(b, ver) {
+function changedSince(b: EdBuffer, ver: number) {
   if (ver === b.ver) return false;
   const log = b.log;
   let k = log.length - 1, pre = Infinity, suf = Infinity, n = 0;
@@ -747,13 +784,13 @@ function changedSince(b, ver) {
   for (let j = log.length - 1; j > k; j--) { const e = log[j], a = e.pos - pre; then = then.slice(0, a) + e.del + then.slice(a + e.ins.length); }
   return then !== now;
 }
-function insertText(b, s) {
+function insertText(b: EdBuffer, s: string) {
   if (!s) return;
   checkRO(b);
   editText(b, b.pt, 0, s);
   b.modified = true;
 }
-function deleteText(b, s, e) {
+function deleteText(b: EdBuffer, s: number, e: number) {
   if (s > e) [s, e] = [e, s];
   s = Math.max(0, s); e = Math.min(b.rope.length, e);
   if (s === e) return '';
@@ -763,16 +800,16 @@ function deleteText(b, s, e) {
   return gone;
 }
 /* Replace [s, e) with str as one edit, keeping point relative to the end of the text when it was after e. */
-function replaceText(b, s, e, str) {
+function replaceText(b: EdBuffer, s: number, e: number, str: string) {
   const pt = b.pt;
   b.pt = s; deleteText(b, s, e); b.pt = s; insertText(b, str);
   b.pt = pt >= e ? pt - (e - s) + str.length : Math.min(pt, s + str.length);
 }
 /* Line and column helpers take a string or a rope (the rope has the String read methods). */
-const bol = (t, p) => p <= 0 ? 0 : t.lastIndexOf('\n', p - 1) + 1;
-const eol = (t, p) => { const k = t.indexOf('\n', p); return k < 0 ? t.length : k; };
+const bol = (t: EdText, p: number) => p <= 0 ? 0 : t.lastIndexOf('\n', p - 1) + 1;
+const eol = (t: EdText, p: number) => { const k = t.indexOf('\n', p); return k < 0 ? t.length : k; };
 /* The rope behind T: T itself, or the buffer whose cached whole text is T. */
-function ropeOf(t) {
+function ropeOf(t: EdText) {
   if (typeof t !== 'string') return t;
   const c = E.current;
   if (c && c.rope.flat === t) return c.rope;
@@ -780,48 +817,48 @@ function ropeOf(t) {
   for (const b of E.buffers) if (b.rope.flat === t) return b.rope;
   return null;
 }
-const lineNo = (t, p) => { const r = ropeOf(t); if (r) return r.lineOf(p); let n = 1; for (let k = t.indexOf('\n'); k >= 0 && k < p; k = t.indexOf('\n', k + 1)) n++; return n; };
-function column(t, p) { let c = 0; for (let k = bol(t, p); k < p; k++) c = t.charCodeAt(k) === 9 ? (c + 8) & ~7 : c + 1; return c; }
+const lineNo = (t: EdText, p: number) => { const r = ropeOf(t); if (r) return r.lineOf(p); let n = 1; for (let k = t.indexOf('\n'); k >= 0 && k < p; k = t.indexOf('\n', k + 1)) n++; return n; };
+function column(t: EdText, p: number) { let c = 0; for (let k = bol(t, p); k < p; k++) c = t.charCodeAt(k) === 9 ? (c + 8) & ~7 : c + 1; return c; }
 /* Position of COL on the line starting at LS (clamped to the line end). */
-function posAtColumn(t, ls, col) { const le = eol(t, ls); let c = 0, k = ls; while (k < le) { const w = t.charCodeAt(k) === 9 ? ((c + 8) & ~7) - c : 1; if (c + w > col) break; c += w; k++; } return k; }
+function posAtColumn(t: EdText, ls: number, col: number) { const le = eol(t, ls); let c = 0, k = ls; while (k < le) { const w = t.charCodeAt(k) === 9 ? ((c + 8) & ~7) - c : 1; if (c + w > col) break; c += w; k++; } return k; }
 /* Number of the last line that holds text: a final newline ends the last line rather than starting a new one. */
-function lastLineStart(t) { return t.length && t.charCodeAt(t.length - 1) === 10 ? bol(t, t.length - 1) : bol(t, t.length); }
-function lineStartOf(t, n) { const r = ropeOf(t); if (r) return r.lineStart(n); let p = 0; for (let k = 1; k < n; k++) { const q = t.indexOf('\n', p); if (q < 0) return p; p = q + 1; } return p; }
+function lastLineStart(t: EdText) { return t.length && t.charCodeAt(t.length - 1) === 10 ? bol(t, t.length - 1) : bol(t, t.length); }
+function lineStartOf(t: EdText, n: number) { const r = ropeOf(t); if (r) return r.lineStart(n); let p = 0; for (let k = 1; k < n; k++) { const q = t.indexOf('\n', p); if (q < 0) return p; p = q + 1; } return p; }
 /* Line numbers and line starts come from the rope's newline counts, O(log n). */
-function lineNoB(b, p) { return b.rope.lineOf(p); }
-function lineStartB(b, n) { return b.rope.lineStart(Math.max(1, n)); }
-function lineCountB(b) { const r = b.rope, nl = r.newlines(); return r.length && r.charCodeAt(r.length - 1) === 10 ? nl : nl + 1; }
-function lineIndex(b) { const r = b.rope, out = [0]; for (let k = r.indexOf('\n'); k >= 0; k = r.indexOf('\n', k + 1)) out.push(k + 1); return out; }
+function lineNoB(b: EdBuffer, p: number) { return b.rope.lineOf(p); }
+function lineStartB(b: EdBuffer, n: number) { return b.rope.lineStart(Math.max(1, n)); }
+function lineCountB(b: EdBuffer) { const r = b.rope, nl = r.newlines(); return r.length && r.charCodeAt(r.length - 1) === 10 ? nl : nl + 1; }
+function lineIndex(b: EdBuffer) { const r = b.rope, out = [0]; for (let k = r.indexOf('\n'); k >= 0; k = r.indexOf('\n', k + 1)) out.push(k + 1); return out; }
 /* Syntax classes and paren depths, cached per text version and updated incrementally: an edit
    re-lexes only from the top-level form (a paren in column 0, as Emacs assumes) before the change
    to the one after it, and the untouched classes on both sides are kept. The class and depth arrays
    are updated in place (with spare capacity), so an edit moves the tail instead of copying both. */
-function lexOf(b, soft) {
+function lexOf(b: EdBuffer, soft?: boolean) {
   if (b._lv === b.ver && b._lc) return b._lc;
   /* Redisplay (SOFT) does not wait for the lex of a big buffer when most of it must be lexed (the
      first time, or after a change of more than 1MB): the worker pool makes it and the text shows
      plain until then. A command that needs the classes lexes at once. */
   if (soft && b.rope.length > (1 << 19) && globalThis.EdPool && EdPool.ok) {
     if (b._lexBusy) return null;
-    const sp = b._lc ? spanOf(b, b._lv) : null;
+    const sp = b._lc ? spanOf(b, b._lv!) : null;
     if ((!sp || b.rope.length - sp.suf - sp.pre > (1 << 20)) && EdPool.lexAsync(b)) return null;
   }
   const r = b.rope, n = r.length;
-  const span = b._lc ? spanOf(b, b._lv) : null;
-  if (!span || Math.abs(n - b._llen) > 100000) {
+  const span = b._lc ? spanOf(b, b._lv!) : null;
+  if (!span || Math.abs(n - b._llen!) > 100000) {
     const t = r.toString();
     b._lcb = b._lc = markDocstrings(t, lex(t)); b._ldb = b._ld = parenDepths(t, b._lc, 0, n, 0); b._lv = b.ver; b._llen = n;
     return b._lc;
   }
   /* _lc and _ld are views of length n on buffers with spare capacity (_lcb, _ldb), so reads past
      the end give undefined as they do on an exact-size array. */
-  const oc = b._lcb, od = b._ldb, oldN = b._llen, shift = n - oldN;
+  const oc = b._lcb as Uint8Array, od = b._ldb as Uint8Array, oldN = b._llen!, shift = n - oldN;
   /* Clean restart points: a column-0 paren the old lex saw as a real paren. */
   let s = span.pre;
   for (;;) { s = s === 0 ? 0 : r.lastIndexOf('\n(', s - 1) + 1; if (s <= 0) { s = 0; break; } if (oc[s] === C.PAR && oc[s - 1] !== C.STR && oc[s - 1] !== C.DOC) break; s--; }
   let e = n - span.suf;
   for (;;) { e = r.indexOf('\n(', e); if (e < 0) { e = n; break; } e++; if (oc[e - shift] === C.PAR) break; }
-  const info = {};
+  const info: EcLexInfo = {};
   let mid = lex(r.slice(s, e), info);
   if (info.dirty && e < n) { e = n; mid = lex(r.slice(s), info); }
   const startDepth = s < n && r.charCodeAt(s) === 40 ? od[s] : 0;
@@ -835,21 +872,21 @@ function lexOf(b, soft) {
   const base = Math.max(0, s - 1);
   markDocstrings(r.slice(base, Math.min(n, e + 65536)), cls, Math.max(0, s - 1), e, base);
   d.fill(0, s, e);
-  const end = parenDepths(r, cls, s, e, startDepth, d);
+  const end = parenDepths(r, cls, s, e, startDepth, d) as number;
   if (e < n && ((end % 6) + 6) % 6 !== d[e]) parenDepths(r, cls, e, n, end, d);
   b._lcb = cls; b._ldb = d; b._lc = cls.subarray(0, n); b._ld = d.subarray(0, n); b._lv = b.ver; b._llen = n;
   return b._lc;
 }
 /* A lex made elsewhere (the worker pool) for version VER of B. */
-function installLex(b, ver, cls, d) { b._lcb = b._lc = cls; b._ldb = b._ld = d; b._lv = ver; b._llen = cls.length; }
+function installLex(b: EdBuffer, ver: number, cls: Uint8Array | number[], d: unknown) { b._lcb = b._lc = cls; b._ldb = b._ld = d; b._lv = ver; b._llen = cls.length; }
 /* Lengths of the common prefix and suffix of two texts (the suffix never overlaps the prefix). */
-function diffSpan(a, b) {
+function diffSpan(a: string, b: string) {
   const n = Math.min(a.length, b.length);
   let pre = 0; while (pre < n && a.charCodeAt(pre) === b.charCodeAt(pre)) pre++;
   let suf = 0; while (suf < n - pre && a.charCodeAt(a.length - 1 - suf) === b.charCodeAt(b.length - 1 - suf)) suf++;
   return { pre, suf };
 }
-function parenDepths(t, cls, from, to, depth, d) {
+function parenDepths(t: EdText, cls: ArrayLike<number>, from: number, to: number, depth: number, d?: Uint8Array): number | Uint8Array {
   const ret = arguments.length > 5;
   d = d || new Uint8Array(t.length);
   for (let k = from; k < to; k++) if (cls[k] === C.PAR) { if (t.charCodeAt(k) === 40) { d[k] = ((depth % 6) + 6) % 6; depth++; } else { depth--; d[k] = ((depth % 6) + 6) % 6; } }
@@ -863,9 +900,9 @@ const KEYWORDS = new Set(('define define-syntax define-macro define-record-type 
   'parameterize guard dynamic-wind call/ec catch throw unwind-protect ignore-errors save-excursion with-current-buffer interactive ' +
   'let-values receive assert delay push! pop! inc! dec! when-let if-let and-let* -> ->> evil-define-motion evil-define-operator ' +
   'evil-define-text-object evil-define-key evil-ex-define-cmd define-key global-set-key').split(' '));
-const isWS = c => c === ' ' || c === '\n' || c === '\t' || c === '\r' || c === '\f';
-const isDelim = c => c === undefined || isWS(c) || '()";\'`,[]'.includes(c);
-function lex(t, info) {
+const isWS = (c: string) => c === ' ' || c === '\n' || c === '\t' || c === '\r' || c === '\f';
+const isDelim = (c: string | undefined) => c === undefined || isWS(c) || '()";\'`,[]'.includes(c);
+function lex(t: string, info?: EcLexInfo) {
   const n = t.length, cls = new Uint8Array(n);
   if (info) info.dirty = false;
   let i = 0, quoted = false, afterParen = false, defName = false;
@@ -904,11 +941,11 @@ function lex(t, info) {
 }
 /* Docstrings: a string that directly follows the argument list of a defun/defmacro.
    T may be a piece of the text that starts at BASE; FROM and TO are positions in the whole text. */
-function markDocstrings(t, cls, from, to, base) {
+function markDocstrings(t: string, cls: Uint8Array, from?: number, to?: number, base?: number) {
   base = base || 0;
   const view = base ? cls.subarray(base) : cls;
   const re = /\((?:define|define-command|evil-define-(?:motion|operator|text-object|command))\s+\(/g;
-  let m;
+  let m: RegExpExecArray | null;
   re.lastIndex = from ? from - base : 0;
   while ((m = re.exec(t))) {
     if (to !== undefined && m.index + base >= to) break;
@@ -916,13 +953,13 @@ function markDocstrings(t, cls, from, to, base) {
     if (view[open] !== C.PAR) continue;
     const close = forwardSexp(t, view, open); if (close === null) continue;
     let k = close; while (k < t.length && isWS(t[k])) k++;
-    if (t[k] === '"' && view[k] === C.STR) { const e = forwardSexp(t, view, k); for (let q = k; q < e; q++) view[q] = C.DOC; }
+    if (t[k] === '"' && view[k] === C.STR) { const e = forwardSexp(t, view, k)!; for (let q = k; q < e; q++) view[q] = C.DOC; }
   }
   return cls;
 }
 /* The sexp scanners read characters with charAt, so they work on a string or on the buffer's rope. */
-const inStr = c => c === C.STR || c === C.DOC;
-function forwardSexp(t, cls, p) {
+const inStr = (c: number) => c === C.STR || c === C.DOC;
+function forwardSexp(t: EdText, cls: ArrayLike<number>, p: number) {
   const n = t.length;
   for (;;) { while (p < n && isWS(t.charAt(p))) p++; if (p < n && cls[p] === C.CMT) { while (p < n && t.charCodeAt(p) !== 10) p++; continue; } break; }
   while (p < n && cls[p] === C.QUO) p++;
@@ -938,7 +975,7 @@ function forwardSexp(t, cls, p) {
   while (p < n && (cls[p] === C.NUM || !isDelim(t.charAt(p)))) p++;
   return p;
 }
-function backwardSexp(t, cls, p) {
+function backwardSexp(t: EdText, cls: ArrayLike<number>, p: number) {
   for (;;) { while (p > 0 && isWS(t.charAt(p - 1))) p--; if (p > 0 && cls[p - 1] === C.CMT) { while (p > 0 && cls[p - 1] === C.CMT) p--; continue; } break; }
   if (p <= 0) return null;
   const c = t.charAt(p - 1);
@@ -954,18 +991,18 @@ function backwardSexp(t, cls, p) {
   while (p > 0 && cls[p - 1] === C.QUO) p--;
   return p;
 }
-function upList(t, cls, p) { let d = 0; for (let k = p - 1; k >= 0; k--) if (cls[k] === C.PAR) { if (t.charCodeAt(k) === 41) d++; else if (d-- === 0) return k; } return null; }
-function matchParen(t, cls, k) {
+function upList(t: EdText, cls: ArrayLike<number>, p: number) { let d = 0; for (let k = p - 1; k >= 0; k--) if (cls[k] === C.PAR) { if (t.charCodeAt(k) === 41) d++; else if (d-- === 0) return k; } return null; }
+function matchParen(t: EdText, cls: ArrayLike<number>, k: number) {
   if (t.charAt(k) === '(') { const e = forwardSexp(t, cls, k); return e === null ? null : e - 1; }
   return backwardSexp(t, cls, k + 1);
 }
 
 /* ---------- Lisp indentation ---------- */
-const BODY = { lambda: 1, let: 1, 'let*': 1, letrec: 1, 'letrec*': 1, 'named-lambda': 1, when: 1, unless: 1, while: 1, until: 1, if: 2, dolist: 1, dotimes: 1,
+const BODY: Record<string, number> = { lambda: 1, let: 1, 'let*': 1, letrec: 1, 'letrec*': 1, 'named-lambda': 1, when: 1, unless: 1, while: 1, until: 1, if: 2, dolist: 1, dotimes: 1,
   'condition-case': 2, 'unwind-protect': 1, catch: 1, 'with-current-buffer': 1, 'save-excursion': 0, begin: 0, 'ignore-errors': 0, do: 2,
   parameterize: 1, guard: 1, 'let-values': 1, receive: 2, 'syntax-rules': 1, 'define-record-type': 2, 'when-let': 1, 'if-let': 1, 'and-let*': 1,
   'define-syntax': 1, 'define-macro': 1, 'call/ec': 0, 'dynamic-wind': 0, 'let-syntax': 1, case: 1 };
-function lispIndentFor(t, cls, ls) {
+function lispIndentFor(t: EdText, cls: ArrayLike<number>, ls: number) {
   if (ls > 0 && inStr(cls[ls - 1]) && inStr(cls[ls])) return null;
   const open = upList(t, cls, ls);
   if (open === null) return 0;
@@ -985,9 +1022,9 @@ function lispIndentFor(t, cls, ls) {
   let a = j; while (a < le && (t.charAt(a) === ' ' || t.charAt(a) === '\t')) a++;
   return a < le && t.charAt(a) !== ';' ? column(t, a) : oc + 1;
 }
-function indentLine(b) {
+function indentLine(b: EdBuffer) {
   const t = b.rope, ls = bol(t, b.pt);
-  const cls = lexOf(b);
+  const cls = lexOf(b)!;
   const want = lispIndentFor(t, cls, ls);
   if (want === null) return;
   let ie = ls; while (ie < t.length && (t.charAt(ie) === ' ' || t.charAt(ie) === '\t')) ie++;
@@ -1000,14 +1037,15 @@ function indentLine(b) {
 }
 
 /* ---------- keymaps ---------- */
+interface Keymap extends EdKeymap {}
 class Keymap {
-  constructor(name) { this.name = name || null; this.map = new Map(); this.parent = null; }
+  constructor(name?: string | null) { this.name = (name || null) as string; this.map = new Map(); this.parent = null; }
   __print() { return '#<keymap' + (this.name ? ' ' + this.name : '') + '>'; }
   get __type() { return 'keymap'; }
 }
 const PREFIX = Symbol('prefix');
-const ALIAS = { '<return>': 'RET', '<tab>': 'TAB', '<backtab>': 'S-TAB', '<backspace>': 'DEL', '<escape>': 'ESC', '<space>': 'SPC', ' ': 'SPC', '<delete>': '<deletechar>', 'C-[': 'ESC', 'C-i': 'TAB', 'C-m': 'RET' };
-function normKey(k) {
+const ALIAS: Record<string, string> = { '<return>': 'RET', '<tab>': 'TAB', '<backtab>': 'S-TAB', '<backspace>': 'DEL', '<escape>': 'ESC', '<space>': 'SPC', ' ': 'SPC', '<delete>': '<deletechar>', 'C-[': 'ESC', 'C-i': 'TAB', 'C-m': 'RET' };
+function normKey(k: string) {
   if (ALIAS[k]) return ALIAS[k];
   const mods = new Set();
   let rest = k;
@@ -1016,21 +1054,21 @@ function normKey(k) {
   const out = (mods.has('C') ? 'C-' : '') + (mods.has('M') ? 'M-' : '') + (mods.has('S') ? 'S-' : '') + rest;
   return ALIAS[out] || out;
 }
-function kbd(s) { return String(s).trim().split(/\s+/).filter(Boolean).map(normKey).join(' '); }
-function defineKey(km, keys, def) {
+function kbd(s: string) { return String(s).trim().split(/\s+/).filter(Boolean).map(normKey).join(' '); }
+function defineKey(km: EdKeymap, keys: string, def: EdBinding) {
   const parts = kbd(keys).split(' ');
   let m = km;
   for (let k = 0; k < parts.length - 1; k++) {
     let sub = m.map.get(parts[k]);
     if (!(sub instanceof Keymap)) { sub = new Keymap(); m.map.set(parts[k], sub); }
-    m = sub;
+    m = sub as EdKeymap;
   }
   const last = parts[parts.length - 1];
   if (def === false) m.map.delete(last); else m.map.set(last, def);
   return def;
 }
-function lookupIn(km, parts) {
-  let m = km;
+function lookupIn(km: EdKeymap, parts: string[]) {
+  let m: EdBinding | undefined = km;
   for (const p of parts) {
     if (!(m instanceof Keymap)) return undefined;
     let d = m.map.get(p);
@@ -1040,7 +1078,7 @@ function lookupIn(km, parts) {
   }
   return m;
 }
-const KM = name => { const v = L.get(name); return v instanceof Keymap ? v : null; };
+const KM = (name: string) => { const v = L.get(name); return v instanceof Keymap ? v : null; };
 /* ---------- minor and derived modes (R4.25) ----------
    A minor mode is a command and a variable that holds its state, buffer-local unless the mode is
    global. Edwin Scheme has one binding per name, so the variable cannot share the command's name as in
@@ -1049,20 +1087,20 @@ const KM = name => { const v = L.get(name); return v instanceof Keymap ? v : nul
    variable NAME-map, is searched after the Evil state maps and before the major mode's map. A derived
    major mode records its parent: its keymap inherits the parent's, and Evil's per-mode maps of the
    parent apply to it too. */
-const minorModes = new Map();
-const minorOn = (b, m) => { const v = m.global ? L.get(m.variable) : localValue(b, m.variable); return v !== undefined && v !== false && v !== NIL; };
-function minorMaps(b) {
-  const out = [];
+const minorModes = new Map<string, EdMinorMode>();
+const minorOn = (b: EdBuffer, m: EdMinorMode) => { const v = m.global ? L.get(m.variable) : localValue(b, m.variable); return v !== undefined && v !== false && v !== NIL; };
+function minorMaps(b: EdBuffer) {
+  const out: EdKeymap[] = [];
   for (const m of minorModes.values()) if (minorOn(b, m)) { const km = KM(m.name + '-map'); if (km) out.push(km); }
   return out;
 }
-function lighters(b) { let s = ''; for (const m of minorModes.values()) if (m.lighter && minorOn(b, m)) s += m.lighter; return s; }
-const modeParents = new Map();
+function lighters(b: EdBuffer) { let s = ''; for (const m of minorModes.values()) if (m.lighter && minorOn(b, m)) s += m.lighter; return s; }
+const modeParents = new Map<string, string>();
 /* MODE and the modes it derives from, nearest first. */
-function modeChain(mode) { const out = [mode]; for (let m = modeParents.get(mode), n = 0; m && n < 32; m = modeParents.get(m), n++) out.push(m); return out; }
-function activeMaps(b) {
+function modeChain(mode: string) { const out = [mode]; for (let m = modeParents.get(mode), n = 0; m && n < 32; m = modeParents.get(m), n++) out.push(m); return out; }
+function activeMaps(b?: EdBuffer | null) {
   b = b || E.current;
-  const out = [];
+  const out: EdKeymap[] = [];
   if (b.minibuf && E.mini) { const m = KM('minibuffer-local-map'); if (m) out.push(m); }
   if (hooks.stateMaps) out.push(...hooks.stateMaps(b));
   if (minorModes.size) out.push(...minorMaps(b));
@@ -1070,7 +1108,7 @@ function activeMaps(b) {
   const g = KM('global-map'); if (g) out.push(g);
   return out;
 }
-function lookupWith(maps, seq) {
+function lookupWith(maps: EdKeymap[], seq: string) {
   const parts = seq.split(' ');
   let prefix = false;
   for (const m of maps) {
@@ -1080,10 +1118,10 @@ function lookupWith(maps, seq) {
   }
   return prefix ? PREFIX : undefined;
 }
-const lookupKey = (seq, b) => lookupWith(activeMaps(b), seq);
-function whereIs(cmd, maps) {
-  const out = [];
-  const walk = (m, pre, seen) => {
+const lookupKey = (seq: string, b?: EdBuffer | null) => lookupWith(activeMaps(b), seq);
+function whereIs(cmd: SchemeValue, maps?: EdKeymap[]) {
+  const out: string[] = [];
+  const walk = (m: EdKeymap, pre: string, seen: Set<EdKeymap>) => {
     if (seen.has(m)) return; seen.add(m);
     for (const [k, d] of m.map) {
       const seq = pre ? pre + ' ' + k : k;
@@ -1095,20 +1133,20 @@ function whereIs(cmd, maps) {
   return [...new Set(out)].filter(s => maps || sameCmd(lookupKey(s, E.win), cmd)).sort((a, b) => a.length - b.length);
 }
 /* Two command designators name the same command: the same symbol, the same procedure, or a symbol and the procedure it holds. */
-function sameCmd(a, b) {
+function sameCmd(a: EdBinding | undefined, b: EdBinding | undefined) {
   if (a === b) return true;
   if (a === undefined || b === undefined || a === PREFIX || b === PREFIX) return false;
-  const fa = L.fnOrNull(a), fb = L.fnOrNull(b);
+  const fa = L.fnOrNull(a as SchemeValue), fb = L.fnOrNull(b as SchemeValue);
   return !!fa && fa === fb;
 }
 
 /* ---------- decoding browser key events into Emacs key descriptions ---------- */
-const SPECIAL = { Enter: 'RET', Backspace: 'DEL', Tab: 'TAB', Escape: 'ESC', ArrowUp: '<up>', ArrowDown: '<down>', ArrowLeft: '<left>', ArrowRight: '<right>',
+const SPECIAL: Record<string, string> = { Enter: 'RET', Backspace: 'DEL', Tab: 'TAB', Escape: 'ESC', ArrowUp: '<up>', ArrowDown: '<down>', ArrowLeft: '<left>', ArrowRight: '<right>',
   Delete: '<deletechar>', Home: '<home>', End: '<end>', PageUp: '<prior>', PageDown: '<next>', Insert: '<insert>' };
-const CODEMAP = { Comma: [',', '<'], Period: ['.', '>'], Slash: ['/', '?'], Semicolon: [';', ':'], Quote: ["'", '"'], BracketLeft: ['[', '{'],
+const CODEMAP: Record<string, string[]> = { Comma: [',', '<'], Period: ['.', '>'], Slash: ['/', '?'], Semicolon: [';', ':'], Quote: ["'", '"'], BracketLeft: ['[', '{'],
   BracketRight: [']', '}'], Backslash: ['\\', '|'], Minus: ['-', '_'], Equal: ['=', '+'], Backquote: ['`', '~'], Space: ['SPC', 'SPC'] };
 const SHIFT_DIGIT = ')!@#$%^&*(';
-function keyName(e) {
+function keyName(e: EdKeyEvent) {
   if (/^(Shift|Control|Alt|Meta|CapsLock|AltGraph|OS|Hyper|Super|Fn|Dead|Unidentified|Process)$/.test(e.key) || e.isComposing) return null;
   if (e.metaKey) return null;                        // leave Cmd/Super shortcuts to the browser
   if (e.ctrlKey && e.shiftKey && e.code === 'KeyV') return null; // let the browser paste
@@ -1118,7 +1156,7 @@ function keyName(e) {
   if (SPECIAL[e.key]) base = SPECIAL[e.key];
   else if (/^F\d{1,2}$/.test(e.key)) base = '<f' + e.key.slice(1) + '>';
   else if (ctrl || meta) {
-    const c = e.code;
+    const c = e.code!;
     if (/^Key[A-Z]$/.test(c)) base = e.shiftKey && !ctrl ? c[3] : c[3].toLowerCase();
     else if (/^Digit\d$/.test(c)) base = e.shiftKey ? SHIFT_DIGIT[+c[5]] : c[5];
     else if (CODEMAP[c]) base = CODEMAP[c][e.shiftKey ? 1 : 0];
@@ -1128,11 +1166,11 @@ function keyName(e) {
   else return null;
   return normKey((ctrl ? 'C-' : '') + (meta ? 'M-' : '') + (e.shiftKey && base.length > 1 && (base[0] === '<' || base === 'TAB') ? 'S-' : '') + base);
 }
-const selfInsertable = k => k === 'SPC' || [...k].length === 1;
-const keyChar = k => k === 'SPC' ? ' ' : k === 'RET' ? '\n' : k === 'TAB' ? '\t' : selfInsertable(k) ? k : null;
+const selfInsertable = (k: string) => k === 'SPC' || [...k].length === 1;
+const keyChar = (k: string) => k === 'SPC' ? ' ' : k === 'RET' ? '\n' : k === 'TAB' ? '\t' : selfInsertable(k) ? k : null;
 
 /* ---------- echo area and messages ---------- */
-function message(s) {
+function message(s: string) {
   E.echo = s;
   if (s) {
     const m = getBufferCreate('*Messages*');
@@ -1143,35 +1181,35 @@ function message(s) {
   }
 }
 function ding() { if (E.frame && E.frame.backend) { if (E.frame.backend.bell) E.frame.backend.bell(); return; } const f = E.frame && E.frame.root; if (!f) return; f.classList.remove('bell'); void f.offsetWidth; f.classList.add('bell'); }
-function errorText(e) {
+function errorText(e: unknown) {
   if (e instanceof SchemeError) return L.errorMessage(e);
   if (e instanceof L.S.Raise) return L.errorMessage(e);
   if (e instanceof L.Escape) return 'Escape procedure called outside its extent';
   if (e instanceof RangeError) return 'Recursion too deep (stack overflow)';
   console.error(e);
-  return 'Internal error: ' + (e && e.message);
+  return 'Internal error: ' + (e && (e as Error).message);
 }
 const QUIET = L.QUIET;
-function quietQuit() { L.quit(true); }
-function reportError(e) {
+function quietQuit(): never { L.quit(true); }
+function reportError(e: unknown) {
   if (L.isQuit(e)) { if (!L.isQuietQuit(e)) { E.echo = 'Quit'; ding(); } return; }
   message(errorText(e)); ding();
 }
 
 /* ---------- the input queue ---------- */
 const SENTINEL = '\u0000end-of-keys';
-const queue = [];
-let wake = null;
+const queue: EdQueuedKey[] = [];
+let wake: (() => void) | null = null;
 function wakeUp() { if (wake) { const w = wake; wake = null; w(); } }
-function feedKey(k) { queue.push({ k, real: true }); wakeUp(); }
+function feedKey(k: string) { queue.push({ k, real: true }); wakeUp(); }
 /* Push keys in front of the queue. Replayed keys are not recorded into keyboard macros. */
-function unreadKeys(keys, real = false) { queue.unshift(...keys.map(k => ({ k, real, noRecord: real }))); wakeUp(); }
-function pushSentinel(keys) { queue.unshift(...keys.map(k => ({ k, real: false })), { k: SENTINEL, real: false }); wakeUp(); }
+function unreadKeys(keys: string[], real = false) { queue.unshift(...keys.map(k => ({ k, real, noRecord: real }))); wakeUp(); }
+function pushSentinel(keys: string[]) { queue.unshift(...keys.map(k => ({ k, real: false })), { k: SENTINEL, real: false }); wakeUp(); }
 function flushReplay() { for (let i = queue.length - 1; i >= 0; i--) if (!queue[i].real && queue[i].k !== SENTINEL) queue.splice(i, 1); }
-async function nextKey(opts) {
+async function nextKey(opts?: { sentinel?: boolean }) {
   for (;;) {
     if (queue.length) {
-      const it = queue.shift();
+      const it = queue.shift()!;
       if (it.k === SENTINEL && !(opts && opts.sentinel)) { queue.unshift(it); quietQuit(); }
       E.lastKeyReal = it.real;
       if (it.k !== SENTINEL && !it.noRecord && hooks.recordKey) hooks.recordKey(it);
@@ -1180,21 +1218,21 @@ async function nextKey(opts) {
     render();
     E.idle = true;
     for (const r of idleWaiters.splice(0)) r();
-    await new Promise(r => { wake = r; });
+    await new Promise<void>(r => { wake = r; });
     E.idle = false;
   }
 }
-const idleWaiters = [];
-function whenIdle() { return new Promise(r => { if (E.idle && !queue.length) r(); else idleWaiters.push(r); }); }
+const idleWaiters: (() => void)[] = [];
+function whenIdle() { return new Promise<void>(r => { if (E.idle && !queue.length) r(); else idleWaiters.push(r); }); }
 
 /* ---------- minibuffer: a recursive edit that runs commands until exit or abort ---------- */
-async function readMini(prompt, initial, completer, opts) {
+async function readMini(prompt: string, initial?: string, completer?: EdCompleter | null, opts?: EdMiniOpts) {
   opts = opts || {};
   if (E.mini) signal('error', 'Command attempted to use minibuffer while in minibuffer');
   const mb = E.minibuf;
   mb.text = initial || ''; mb.pt = mb.rope.length; mb.mark = null; mb.markActive = false; mb.undo = []; mb.redo = []; mb.pendingUndo = null;
   const saved = { cur: E.current, prefix: E.prefixArg, cmd: E.thisCommand, keys: E.thisKeys, last: E.lastCommand };
-  const m = E.mini = { prompt, completer: completer || null, opts, histIdx: -1, history: opts.history || historyFor(opts.kind), done: null, index: opts.noIndex ? -1 : 0, cache: null, cacheKey: null, scroll: 0 };
+  const m: EdMini = E.mini = { prompt, completer: completer || null, opts, histIdx: -1, history: opts.history || historyFor(opts.kind), done: null, index: opts.noIndex ? -1 : 0, cache: null, cacheKey: null, scroll: 0 };
   E.current = mb; E.echo = ''; E.miniFlash = '';
   E.depth++;
   try {
@@ -1209,7 +1247,7 @@ async function readMini(prompt, initial, completer, opts) {
   } finally {
     E.depth--;
     if (E.mini === m) E.mini = null;
-    E.current = E.buffers.includes(saved.cur) ? saved.cur : E.win;
+    E.current = E.buffers.includes(saved.cur) ? saved.cur : E.win!;
     E.prefixArg = saved.prefix; E.thisCommand = saved.cmd; E.thisKeys = saved.keys; E.lastCommand = saved.last; E.miniFlash = '';
     if (opts.onExit) opts.onExit();
     if (hooks.miniExit) hooks.miniExit(m);
@@ -1220,36 +1258,36 @@ async function readMini(prompt, initial, completer, opts) {
 /* Orderless matching: the input is split into terms; each term must match somewhere, in any order.
    A term is a regexp when it looks like one, else a literal. Matches are case-insensitive unless the term has capitals.
    Candidates that match at the start sort first, then by recent use, then alphabetically. */
-function termRegex(term) {
+function termRegex(term: string) {
   const ci = term === term.toLowerCase() ? 'i' : '';
   if (/[\\^$.*+?()[\]{}|]/.test(term)) { try { return new RegExp(term, ci); } catch (e) { /* literal */ } }
   return new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), ci);
 }
-const recentUse = new Map(); // completer kind -> Map(candidate -> tick)
+const recentUse = new Map<string, Map<string, number>>(); // completer kind -> Map(candidate -> tick)
 let useTick = 0;
 /* Minibuffer histories, one per completer kind as in Emacs (M-x, buffers, files...); the others share
-   E.history. savehist (stack.js) persists them. */
-const histories = new Map();
-function historyFor(kind) { if (!kind) return E.history; let h = histories.get(kind); if (!h) { h = []; histories.set(kind, h); } return h; }
+   E.history. savehist (stack.ts) persists them. */
+const histories = new Map<string, string[]>();
+function historyFor(kind?: string) { if (!kind) return E.history; let h = histories.get(kind); if (!h) { h = []; histories.set(kind, h); } return h; }
 /* Prescient: for these kinds a candidate chosen before sorts first, the most recently chosen first
    (the last prescient-history-length choices), then by how often it was chosen, then shorter
    candidates first, as prescient.el does. The table persists (prescient-persist-mode) through
-   stack.js. The tables have no prototype, so a candidate named __proto__ or constructor is
+   stack.ts. The tables have no prototype, so a candidate named __proto__ or constructor is
    just a key. */
-const PRESCIENT_KINDS = new Set(['command', 'buffer', 'consult-buffer', 'file']);
-const prescient = { tick: 0, kinds: Object.create(null), save: null, limit: 300 };
+const PRESCIENT_KINDS = new Set<string | undefined>(['command', 'buffer', 'consult-buffer', 'file']);
+const prescient: EdApi['prescient'] = { tick: 0, kinds: Object.create(null), save: null, limit: 300 };
 L.defvar('prescient-history-length', 100, 'How many of the last chosen candidates of each kind sort by recency, before the frequency order.');
 const histLen = () => Math.max(0, Number(L.get('prescient-history-length')) || 0);
-function prescientFor(kind) { return PRESCIENT_KINDS.has(kind) && Object.hasOwn(prescient.kinds, kind) ? prescient.kinds[kind] : null; }
+function prescientFor(kind?: string) { return PRESCIENT_KINDS.has(kind) && Object.hasOwn(prescient.kinds, kind!) ? prescient.kinds[kind!] : null; }
 /* Candidate -> rank among the last prescient-history-length choices of table K (0 is the newest). */
-function prescientRecency(k) {
+function prescientRecency(k: Record<string, [number, number]>) {
   const keys = Object.keys(k).sort((a, b) => k[b][1] - k[a][1]), out = new Map(), n = Math.min(keys.length, histLen());
   for (let i = 0; i < n; i++) out.set(keys[i], i);
   return out;
 }
-function prescientBump(kind, v) {
+function prescientBump(kind: string | undefined, v: string) {
   if (!PRESCIENT_KINDS.has(kind)) return;
-  const k = Object.hasOwn(prescient.kinds, kind) ? prescient.kinds[kind] : (prescient.kinds[kind] = Object.create(null));
+  const k = Object.hasOwn(prescient.kinds, kind!) ? prescient.kinds[kind!] : (prescient.kinds[kind!] = Object.create(null));
   const e = Object.hasOwn(k, v) ? k[v] : (k[v] = [0, 0]);
   e[0]++; e[1] = ++prescient.tick;
   const keys = Object.keys(k);
@@ -1267,7 +1305,7 @@ L.defvar('vertico-resize', true, 'Non-#f shrinks the candidate list to the candi
 /* Whether every candidate that matches query Q2 also matches Q1, so Q2 can filter Q1's results:
    each term of Q1 is a literal inside some literal term of Q2 (typing extends the input). */
 const RE_META = /[\\^$.*+?()[\]{}|]/;
-function narrows(q1, q2) {
+function narrows(q1: string, q2: string) {
   const t1 = q1.trim().split(/\s+/).filter(Boolean), t2 = q2.trim().split(/\s+/).filter(Boolean);
   if (!t1.length) return true;
   return t1.every(a => !RE_META.test(a) && t2.some(c => !RE_META.test(c) && c.includes(a)));
@@ -1276,26 +1314,26 @@ const ASYNC_MIN = 20000;
 /* Candidates for the current input. A longer input filters the previous results instead of the
    whole list; a big list (consult-line on a big buffer) is filtered by the worker pool, and the
    previous results stay on screen until the answer comes. SYNC forces an answer now (RET, TAB). */
-function miniCandidates(sync) {
+function miniCandidates(sync?: boolean) {
   const m = E.mini; if (!m || !m.completer) return [];
   const q = E.minibuf.text;
   if (m.cache && m.cacheKey === q) return m.cache;
   const all = m.completer(q);
   const terms = q.trim().split(/\s+/).filter(Boolean).map(termRegex);
-  const recent = recentUse.get(m.opts.kind || m.prompt) || new Map();
+  const recent = recentUse.get(m.opts.kind || m.prompt) || new Map<string, number>();
   const pres = prescientFor(m.opts.kind);
-  const finish = out => {
+  const finish = (out: string[]) => {
     if (!m.opts.keepOrder) {
       const first = terms.length ? terms[0] : null, def = m.opts.def;
-      const score = c => (c === def && !terms.length ? -1 : first && first.test(c) && c.search(first) === 0 ? 0 : 1);
+      const score = (c: string) => (c === def && !terms.length ? -1 : first && first.test(c) && c.search(first) === 0 ? 0 : 1);
       /* listOrder keeps the completer's order (recentf) among equals instead of the alphabet. */
-      const tie = m.opts.listOrder ? () => 0 : (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+      const tie = m.opts.listOrder ? () => 0 : (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
       if (pres) {
         /* Recency, then frequency, then (among the never chosen) the match score and length; the
            completer's order (recentf) stands in for length with listOrder. */
-        const isDef = c => (c === def && !terms.length ? -1 : 0), z = [0, 0], rec = prescientRecency(pres);
-        const get = c => (Object.hasOwn(pres, c) ? pres[c] : z), rank = c => { const r = rec.get(c); return r === undefined ? Infinity : r; };
-        const len = m.opts.listOrder ? () => 0 : (a, b) => a.length - b.length;
+        const isDef = (c: string) => (c === def && !terms.length ? -1 : 0), z = [0, 0], rec = prescientRecency(pres);
+        const get = (c: string) => (Object.hasOwn(pres, c) ? pres[c] : z), rank = (c: string) => { const r = rec.get(c); return r === undefined ? Infinity : r; };
+        const len = m.opts.listOrder ? () => 0 : (a: string, b: string) => a.length - b.length;
         out.sort((a, b) => isDef(a) - isDef(b) || rank(a) - rank(b) || get(b)[0] - get(a)[0] || score(a) - score(b) || len(a, b) || tie(a, b));
       } else out.sort((a, b) => score(a) - score(b) || (recent.get(b) || 0) - (recent.get(a) || 0) || tie(a, b));
     }
@@ -1304,8 +1342,8 @@ function miniCandidates(sync) {
   };
   if (!terms.length) return finish(all.slice());
   /* The base: the previous matches when this input narrows them (kept in list order), else all. */
-  const base = m.matched && m.cacheAll === all && narrows(m.matchedKey, q) ? m.matched : all;
-  const filter = list => { const out = []; for (const c of list) { let ok = true; for (const t of terms) if (!t.test(c)) { ok = false; break; } if (ok) out.push(c); } return out; };
+  const base = m.matched && m.cacheAll === all && narrows(m.matchedKey!, q) ? m.matched : all;
+  const filter = (list: string[]) => { const out = []; for (const c of list) { let ok = true; for (const t of terms) if (!t.test(c)) { ok = false; break; } if (ok) out.push(c); } return out; };
   if (!sync && base.length >= ASYNC_MIN && globalThis.EdPool && EdPool.ok) {
     if (m.asyncKey !== q) {
       m.asyncKey = q;
@@ -1315,7 +1353,7 @@ function miniCandidates(sync) {
         const matched = Array.from(idx, i => base[i]);
         m.matched = matched; m.matchedKey = q;
         finish(matched.slice());
-        if (m.opts.onSelect) { const c = m.cache; m.opts.onSelect(m.index >= 0 && m.index < c.length ? c[m.index] : null, q); }
+        if (m.opts.onSelect) { const c = m.cache!; m.opts.onSelect(m.index >= 0 && m.index < c.length ? c[m.index] : null, q); }
         render();
       }, () => { m.asyncKey = null; });
     }
@@ -1325,9 +1363,9 @@ function miniCandidates(sync) {
   m.matched = matched; m.matchedKey = q;
   return finish(matched.slice());
 }
-function markUsed(m, v) { const key = m.opts.kind || m.prompt; let r = recentUse.get(key); if (!r) { r = new Map(); recentUse.set(key, r); } r.set(v, ++useTick); prescientBump(m.opts.kind, v); }
+function markUsed(m: EdMini, v: string) { const key = m.opts.kind || m.prompt; let r = recentUse.get(key); if (!r) { r = new Map(); recentUse.set(key, r); } r.set(v, ++useTick); prescientBump(m.opts.kind, v); }
 /* RET: take the highlighted candidate; with none highlighted, the input itself. */
-function exitMini(inputOnly) {
+function exitMini(inputOnly?: boolean) {
   const m = E.mini; if (!m) return;
   let v = E.minibuf.text;
   if (m.completer && !inputOnly) {
@@ -1344,7 +1382,7 @@ function exitMini(inputOnly) {
   if (v && m.history[0] !== v) { m.history.unshift(v); if (m.history.length > 100) m.history.length = 100; }
   m.done = { value: v };
 }
-function miniMove(d, cycle = true) {
+function miniMove(d: number, cycle = true) {
   const m = E.mini; if (!m || !m.completer) { historyMove(-d); return; }
   const c = miniCandidates(), min = m.opts.require ? 0 : -1, max = c.length - 1;
   let i = m.index + d;
@@ -1361,7 +1399,7 @@ function miniInsert() {
 }
 function abortMini() { if (E.mini) E.mini.done = { quit: true }; }
 function completeMini() {
-  const m = E.mini, c = miniCandidates(true), mb = E.minibuf;
+  const m = E.mini!, c = miniCandidates(true), mb = E.minibuf;
   if (m.completer && m.index >= 0 && m.index < c.length && c.length > 1 && !c.every(x => x.startsWith(mb.text))) { miniInsert(); return; }
   if (!c.length) { E.miniFlash = ' [No match]'; return; }
   if (c.length === 1) { mb.text = c[0]; mb.pt = c[0].length; E.miniFlash = ' [Sole completion]'; return; }
@@ -1370,13 +1408,13 @@ function completeMini() {
   if (p.length > mb.rope.length) { mb.text = p; mb.pt = p.length; }
   else E.miniFlash = c.includes(mb.text) ? ' [Complete, but not unique]' : '';
 }
-function historyMove(d) {
+function historyMove(d: number) {
   const m = E.mini; if (!m) return;
   const k = m.histIdx + d;
   if (k < -1 || k >= m.history.length) { E.miniFlash = d > 0 ? ' [Beginning of history]' : ' [End of history]'; return; }
   m.histIdx = k; const v = k < 0 ? '' : m.history[k]; E.minibuf.text = v; E.minibuf.pt = v.length;
 }
-async function readKeySeq(prompt) {
+async function readKeySeq(prompt: string) {
   E.prompt = prompt;
   try {
     let seq = '';
@@ -1388,43 +1426,43 @@ async function readKeySeq(prompt) {
     }
   } finally { E.prompt = null; }
 }
-async function readChar(prompt) {
+async function readChar(prompt?: string) {
   E.prompt = prompt || '';
   try {
     const k = await nextKey();
     if (k === 'C-g' || k === 'ESC') quietQuit();
     const ch = keyChar(k);
     if (ch === null) signal('error', 'Non-character input event: ' + k);
-    return L.mkchar(ch);
+    return L.mkchar(ch!);
   } finally { E.prompt = null; }
 }
 
 /* ---------- annotations shown beside candidates, as marginalia does ---------- */
-function firstLine(s) { return (s || '').split('\n')[0]; }
-function annotateCommand(name) {
+function firstLine(s?: string | null) { return (s || '').split('\n')[0]; }
+function annotateCommand(name: string) {
   const f = L.fnOrNull(intern(name)); if (!f) return '';
   const keys = whereIs(intern(name));
   return (keys.length ? keys.slice(0, 2).join(', ') + '  ' : '') + firstLine(f.doc);
 }
-function annotateFunction(name) { const f = L.fnOrNull(intern(name)); if (!f) return L.S.macros.has(name) ? 'macro' : ''; return firstLine(f.doc); }
-function annotateVariable(name) { let v; try { v = L.get(name); } catch (e) { return ''; } const s = v === undefined ? '' : pr(v, true); return (s.length > 40 ? s.slice(0, 40) + '…' : s) + (L.S.gdoc.get(name) ? '  ' + firstLine(L.S.gdoc.get(name)) : ''); }
-function annotateBuffer(name) { const b = getBuffer(name); if (!b) return ''; return `${b.modified ? '*' : ' '}${b.readOnly ? '%' : ' '} ${String(b.rope.length).padStart(7)}  ${MODE_NAMES[b.mode] || b.mode}${b.file ? '  ' + b.file : ''}`; }
-function annotateFile(name) { const v = Store.get(name), f = host.files && host.files.resolve ? host.files.resolve(name) : name; const b = E.buffers.find(x => x.file === f); return (v === null ? 'new' : String(v.length).padStart(7) + ' chars') + (b ? '  (visiting)' : ''); }
+function annotateFunction(name: string) { const f = L.fnOrNull(intern(name)); if (!f) return L.S.macros.has(name) ? 'macro' : ''; return firstLine(f.doc); }
+function annotateVariable(name: string) { let v: SchemeValue; try { v = L.get(name); } catch (e) { return ''; } const s = v === undefined ? '' : pr(v, true); return (s.length > 40 ? s.slice(0, 40) + '…' : s) + (L.S.gdoc.get(name) ? '  ' + firstLine(L.S.gdoc.get(name)) : ''); }
+function annotateBuffer(name: string) { const b = getBuffer(name); if (!b) return ''; return `${b.modified ? '*' : ' '}${b.readOnly ? '%' : ' '} ${String(b.rope.length).padStart(7)}  ${MODE_NAMES[b.mode] || b.mode}${b.file ? '  ' + b.file : ''}`; }
+function annotateFile(name: string) { const v = Store.get(name), f = host.files && host.files.resolve ? host.files.resolve(name) : name; const b = E.buffers.find(x => x.file === f); return (v === null ? 'new' : String(v.length).padStart(7) + ' chars') + (b ? '  (visiting)' : ''); }
 
 /* ---------- interactive specs ---------- */
 const { commandNames, functionNames, variableNames, isCommand } = L;
 const bufferNames = () => E.buffers.map(b => b.name).filter(n => !n.startsWith(' '));
-function prefixNumeric(p) {
+function prefixNumeric(p: SchemeValue) {
   if (p === null || p === undefined || p === false) return 1;
   if (typeof p === 'number') return p;
   if (p === intern('-')) return -1;
-  if (Array.isArray(p)) return p[0];
+  if (Array.isArray(p)) return p[0] as number;
   return 1;
 }
-function withDefault(prompt, def) { return def ? prompt.replace(/:\s*$/, '') + ` (default ${def}): ` : prompt; }
-const specCodes = {};
-async function specArgs(spec) {
-  const out = [];
+function withDefault(prompt: string, def?: string) { return def ? prompt.replace(/:\s*$/, '') + ` (default ${def}): ` : prompt; }
+const specCodes: Record<string, () => Promise<SchemeValue[]>> = {};
+async function specArgs(spec: string) {
+  const out: SchemeValue[] = [];
   let s = spec;
   while (s && '*^@'.includes(s[0])) { if (s[0] === '*') checkRO(E.current); s = s.slice(1); }
   for (const item of (s || '').split('\n')) {
@@ -1441,9 +1479,9 @@ async function specArgs(spec) {
     switch (code) {
       case 'p': out.push(prefixNumeric(E.prefixArg)); break;
       case 'P': out.push(E.prefixArg === null ? false : E.prefixArg); break;
-      case 'r': { const b = E.current; if (b.mark === null) signal('error', 'The mark is not set now, so there is no region'); out.push(Math.min(b.pt, b.mark) + 1, Math.max(b.pt, b.mark) + 1); break; }
+      case 'r': { const b = E.current; if (b.mark === null) signal('error', 'The mark is not set now, so there is no region'); out.push(Math.min(b.pt, b.mark!) + 1, Math.max(b.pt, b.mark!) + 1); break; }
       case 'd': out.push(E.current.pt + 1); break;
-      case 'm': if (E.current.mark === null) signal('error', 'The mark is not set now'); out.push(E.current.mark + 1); break;
+      case 'm': if (E.current.mark === null) signal('error', 'The mark is not set now'); out.push(E.current.mark! + 1); break;
       case 'i': out.push(false); break;
       case 's': case 'M': out.push(await readMini(prompt, '')); break;
       case 'n': { const v = await readMini(prompt, ''); const n = Number(v); if (v.trim() === '' || isNaN(n)) signal('error', 'Please enter a number.'); out.push(n); break; }
@@ -1463,41 +1501,41 @@ async function specArgs(spec) {
   }
   return out;
 }
-async function callInteractively(cmd) {
+async function callInteractively(cmd: SchemeValue) {
   const f = L.toFn(cmd);
-  let spec = f.interactive;
+  let spec = f.interactive as SchemeValue;
   if (spec === undefined) signal('wrong-type-argument', `${L.cmdName(cmd)} is not a command`);
   /* A command declared (:where 'server) runs in edwind (R4.27): the protocol client sends call{cmd, ctx}
      and the command loop goes on without waiting. */
-  if (f.where === 'server' && hooks.serverCommand) return hooks.serverCommand(L.cmdName(cmd), f);
-  let args;
-  if (typeof spec === 'function' && spec.jsSpec) args = await spec();
+  if (f.where === 'server' && hooks.serverCommand) return hooks.serverCommand(L.cmdName(cmd), f) as SchemeValue;
+  let args: SchemeValue[];
+  if (typeof spec === 'function' && (spec as SchemeProcedure).jsSpec) args = await (spec as () => Promise<SchemeValue[]>)();
   else {
-    if (typeof spec === 'function') { spec = L.callProc(spec, []); if (spec && typeof spec.then === 'function') spec = await spec; }
+    if (typeof spec === 'function') { spec = L.callProc(spec, []); if (spec && typeof (spec as Promise<SchemeValue>).then === 'function') spec = await spec; }
     if (typeof spec === 'string') args = await specArgs(spec);
     else if (spec === false || spec === undefined || spec === L.UNSPEC) args = [];
     else args = arr(spec);
   }
   L.resetOps();
   const r = L.callProc(f, args);
-  return r && typeof r.then === 'function' ? await r : r;
+  return r && typeof (r as Promise<SchemeValue>).then === 'function' ? await r : r;
 }
 /* An operator whose work was done while reading its motion (surround) throws OpDone: not an error. */
 const callInteractively0 = callInteractively;
-async function callInteractivelySafe(cmd) { try { return await callInteractively0(cmd); } catch (e) { if (E.OpDone && e instanceof E.OpDone) return false; throw e; } }
+async function callInteractivelySafe(cmd: SchemeValue) { try { return await callInteractively0(cmd); } catch (e) { if (E.OpDone && e instanceof E.OpDone) return false; throw e; } }
 
 /* ---------- undo: a linear history with redo; an insert session counts as one change ---------- */
 /* Snapshots hold a version, not a copy of the text: restoring one replays the edit log backwards. */
-const snap = b => ({ ver: b.ver, pt: b.pt, mark: b.mark, modified: b.modified });
-function recordUndo(b, before) {
+const snap = (b: EdBuffer): EdSnap => ({ ver: b.ver, pt: b.pt, mark: b.mark, modified: b.modified });
+function recordUndo(b: EdBuffer, before: EdSnap) {
   const self = intern('self-insert-command');
   if (E.thisCommand === self && E.lastCommand === self && b.typeRun < 20 && b.undo.length) { b.typeRun++; b.redo = []; return; }
   b.typeRun = 0; b.undo.push(before); b.redo = [];
   if (b.undo.length > 500) b.undo.shift();
 }
 /* Bring the text back to its content at snapshot S, then put point at the first changed position. */
-function restoreSnap(b, s) {
-  const log = b.log, ops = [];
+function restoreSnap(b: EdBuffer, s: EdSnap) {
+  const log = b.log, ops: EdLogEntry[] = [];
   let k = log.length - 1;
   while (k >= 0 && log[k].v > s.ver) ops.push(log[k--]);
   if (k < 0 && ops.length && log[0].v !== s.ver + 1) signal('user-error', 'Undo history is no longer available');
@@ -1531,24 +1569,24 @@ function restoreSnap(b, s) {
   b.mark = s.mark === null ? null : Math.min(s.mark, newLen);
   for (const m of b.markers) if (m.pos !== null && m.pos > newLen) m.pos = newLen;
 }
-function flushPendingUndo(b) {
+function flushPendingUndo(b: EdBuffer) {
   if (b.pendingUndo) { if (changedSince(b, b.pendingUndo.ver)) { b.undo.push(b.pendingUndo); b.redo = []; } b.pendingUndo = null; }
 }
-function undoStep(b) {
-  /* A replica undoes by groups through everyone else's edits (R6.15–R6.19, sync.js). */
+function undoStep(b: EdBuffer) {
+  /* A replica undoes by groups through everyone else's edits (R6.15–R6.19, sync.ts). */
   if (b.shared && hooks.undoShared) { E.noUndo = true; return hooks.undoShared(b); }
   flushPendingUndo(b);
   if (!b.undo.length) signal('user-error', 'Already at oldest change');
-  const cur = snap(b), s = b.undo.pop();
+  const cur = snap(b), s = b.undo.pop()!;
   b.redo.push(cur); restoreSnap(b, s); E.noUndo = true;
 }
-function redoStep(b) {
+function redoStep(b: EdBuffer) {
   if (b.shared && hooks.redoShared) { E.noUndo = true; return hooks.redoShared(b); }
   if (!b.redo.length) signal('user-error', 'Already at newest change');
-  const cur = snap(b), s = b.redo.pop();
+  const cur = snap(b), s = b.redo.pop()!;
   b.undo.push(cur); restoreSnap(b, s); E.noUndo = true;
 }
-function finishUndo(b, before) {
+function finishUndo(b: EdBuffer, before: EdSnap) {
   if (E.suppressUndo) return;
   if (E.noUndo) { b.pendingUndo = null; return; }
   if (hooks.inSession && hooks.inSession(b)) { if (!b.pendingUndo) b.pendingUndo = before; return; }
@@ -1558,7 +1596,7 @@ function finishUndo(b, before) {
 }
 
 /* ---------- the command loop ---------- */
-async function runCommand(def, keys) {
+async function runCommand(def: SchemeValue, keys?: string) {
   const ch = keys ? keyChar(keys) : null;
   L.set('last-command-event', ch ? L.mkchar(ch) : (keys ? intern(keys) : false));
   E.thisCommand = L.cmdSym(def);
@@ -1591,12 +1629,12 @@ async function runCommand(def, keys) {
    window-configuration-change-hook. */
 function windowLayout() {
   if (!E.root) return '';
-  const walk = n => (n instanceof Split ? n.dir + '(' + n.children.map(walk).join(',') + ')' : n.id + ':' + (n.buffer ? n.buffer.id : 0));
+  const walk = (n: EdWindow | Split): string => (n instanceof Split ? n.dir + '(' + n.children.map(walk).join(',') + ')' : n.id + ':' + (n.buffer ? n.buffer.id : 0));
   return walk(E.root);
 }
 /* Run FN as a callback outside any command (a thread result): its edits become one undo step,
    the log is pinned while it runs, errors go to the echo area, and the screen is redrawn. */
-function runCallback(fn) {
+function runCallback<T>(fn: () => T) {
   const b = E.current, before = snap(b), pin = b.pin;
   if (before.ver < b.pin) b.pin = before.ver;
   E.noUndo = false;
@@ -1604,7 +1642,7 @@ function runCallback(fn) {
   catch (e) { reportError(e); return undefined; }
   finally { finishUndo(b, before); b.pin = pin; render(); }
 }
-async function dispatch(k) {
+async function dispatch(k: string) {
   if (k.startsWith('<cmd:')) { await runCommand(intern(k.slice(5, -1)), ''); return; }
   if (hooks.beforeKey && await hooks.beforeKey(k)) return;
   if (E.uArg && /^(-|[0-9])$/.test(k)) {
@@ -1653,7 +1691,7 @@ async function commandLoop() {
   }
 }
 /* Run KEYS as if typed, in a nested loop, and return when they are used up (for :normal). */
-async function executeKeys(keys) {
+async function executeKeys(keys: string[]) {
   pushSentinel(keys);
   E.depth++;
   try {
@@ -1670,31 +1708,31 @@ async function executeKeys(keys) {
 }
 
 /* ---------- incremental search (Emacs style) ---------- */
-function isearchStart(dir) {
+function isearchStart(dir: number) {
   E.isearch = { dir, str: '', origin: E.current.pt, stack: [], failing: false, wrapped: false, match: null };
 }
 /* Start of the last match of the global regexp RE (matches at most LEN long) at or before FROM,
    scanning back in windows (slices of a flat string are O(1)), so the cost follows the distance
    to the match, not the size of the text. */
-function lastMatch(str, re, from, len, win) {
+function lastMatch(str: string, re: RegExp, from: number, len: number, win?: number) {
   win = win || 65536;
   for (let hi = from; hi >= 0; hi -= win) {
     const ws = Math.max(0, hi - win + 1), sub = str.slice(ws, Math.min(str.length, hi + len));
-    let last = -1, m;
+    let last = -1, m: RegExpExecArray | null;
     re.lastIndex = 0;
     while ((m = re.exec(sub)) && ws + m.index <= hi) { last = m.index; re.lastIndex = m.index + 1; }
     if (last >= 0) return ws + last;
   }
   return -1;
 }
-function isearchFind(next) {
-  const s = E.isearch, b = E.current;
+function isearchFind(next: boolean) {
+  const s = E.isearch!, b = E.current;
   if (!s.str) { s.match = null; s.failing = false; return; }
   /* Case folding with a regular expression, not by lowercasing a copy of the whole buffer. */
   const fold = s.str === s.str.toLowerCase();
   const hay = b.text, needle = s.str;
   const re = fold ? new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi') : null;
-  let i;
+  let i: number;
   if (s.dir > 0) {
     const from = s.failing && next ? 0 : next ? b.pt : (s.match ? s.match[0] : s.origin);
     if (s.failing && next) s.wrapped = true;
@@ -1708,13 +1746,13 @@ function isearchFind(next) {
   }
 }
 function isearchExit() {
-  const s = E.isearch, b = E.current;
+  const s = E.isearch!, b = E.current;
   if (s.str) E.lastSearch = s.str;
   if (b.pt !== s.origin) { b.mark = s.origin; b.markActive = false; E.echo = 'Mark saved where search started'; }
   E.isearch = null;
 }
-function isearchKey(k) {
-  const s = E.isearch, b = E.current;
+function isearchKey(k: string) {
+  const s = E.isearch!, b = E.current;
   const def = lookupKey(k);
   const name = def instanceof L.Sym ? def.name : '';
   const save = () => s.stack.push({ pt: b.pt, str: s.str, failing: s.failing, match: s.match, dir: s.dir, wrapped: s.wrapped });
@@ -1729,10 +1767,10 @@ function isearchKey(k) {
     if (dir !== s.dir) { s.dir = dir; s.failing = false; }
     isearchFind(true); return true;
   }
-  if (k === 'DEL') { const p = s.stack.pop(); if (p) { Object.assign(s, p); b.pt = p.pt; } else ding(); return true; }
+  if (k === 'DEL') { const p = s.stack.pop() as EcIsearchFrame | undefined; if (p) { Object.assign(s, p); b.pt = p.pt; } else ding(); return true; }
   if (k === 'RET') { isearchExit(); return true; }
   if (k === 'C-w') {
-    const end = s.match ? s.match[1] : b.pt; let e = end; while (e < b.rope.length && /\w/.test(b.rope.at(e))) e++;
+    const end = s.match ? s.match[1] : b.pt; let e = end; while (e < b.rope.length && /\w/.test(b.rope.at(e)!)) e++;
     if (e === end && e < b.rope.length) e++;
     save(); s.str += b.rope.slice(end, e); isearchFind(false); return true;
   }
@@ -1741,7 +1779,7 @@ function isearchKey(k) {
   isearchExit();
   return false;
 }
-async function isearch(dir) {
+async function isearch(dir: number) {
   isearchStart(dir);
   while (E.isearch) {
     const k = await nextKey();
@@ -1750,22 +1788,22 @@ async function isearch(dir) {
 }
 
 /* ---------- redisplay ---------- */
-const esc = s => s.replace(/[&<>"]/g, c => c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : '&quot;');
+const esc = (s: string) => s.replace(/[&<>"]/g, c => c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : '&quot;');
 const CLS_NAMES = ['', 'cm', 'st', 'pa', 'nu', 'kw', 'fn', 'co', 'qu', 'dc'];
 const FLAG = { REGION: 1, MATCH: 2, LAZY: 4, PAREN: 8, MISMATCH: 16 };
 E.avy = null; E.pulse = null;
-function markMatches(t, flags, re, limit) {
+function markMatches(t: string, flags: Uint8Array, re: RegExp, limit: number) {
   const r = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
-  let m, count = 0;
+  let m: RegExpExecArray | null, count = 0;
   while ((m = r.exec(t)) && count++ < limit) {
     if (m[0] === '') { r.lastIndex++; continue; }
     for (let j = m.index; j < m.index + m[0].length; j++) flags[j] |= FLAG.LAZY;
   }
 }
 /* Display flags for the text from FROM to TO only; the array is indexed from FROM. */
-function computeFlags(b, opts, from, to, slice) {
+function computeFlags(b: EdBuffer, opts: EcRenderOpts, from: number, to: number, slice?: string) {
   const t = b.rope, n = t.length, flags = new Uint8Array(to - from + 1);
-  const mark = (a, z, f) => { a = Math.max(a, from); z = Math.min(z, to); for (let k = a; k < z; k++) flags[k - from] |= f; };
+  const mark = (a: number, z: number, f: number) => { a = Math.max(a, from); z = Math.min(z, to); for (let k = a; k < z; k++) flags[k - from] |= f; };
   if (b.visual && b.mark !== null) {
     const s = Math.min(b.pt, b.mark), e = Math.max(b.pt, b.mark);
     if (b.visual === 'char') mark(s, Math.min(e + 1, n), FLAG.REGION);
@@ -1780,7 +1818,7 @@ function computeFlags(b, opts, from, to, slice) {
     }
   } else if (b.markActive && b.mark !== null) mark(Math.min(b.pt, b.mark), Math.max(b.pt, b.mark), FLAG.REGION);
   if (slice === undefined) slice = t.slice(from, to);
-  if (opts.hl) { const r = new RegExp(opts.hl.source, opts.hl.flags.includes('g') ? opts.hl.flags : opts.hl.flags + 'g'); let m, count = 0; while ((m = r.exec(slice)) && count++ < 3000) { if (m[0] === '') { r.lastIndex++; continue; } mark(from + m.index, from + m.index + m[0].length, FLAG.LAZY); } }
+  if (opts.hl) { const r = new RegExp(opts.hl.source, opts.hl.flags.includes('g') ? opts.hl.flags : opts.hl.flags + 'g'); let m: RegExpExecArray | null, count = 0; while ((m = r.exec(slice)) && count++ < 3000) { if (m[0] === '') { r.lastIndex++; continue; } mark(from + m.index, from + m.index + m[0].length, FLAG.LAZY); } }
   if (opts.isearch && opts.isearch.str) {
     const s = opts.isearch, fold = s.str === s.str.toLowerCase();
     const hay = fold ? slice.toLowerCase() : slice, needle = fold ? s.str.toLowerCase() : s.str;
@@ -1790,51 +1828,51 @@ function computeFlags(b, opts, from, to, slice) {
   if (opts.current) mark(opts.current[0], opts.current[1], FLAG.MATCH);
   return flags;
 }
-function parenFlags(b, cls, flags, onChar, from, to) {
+function parenFlags(b: EdBuffer, cls: ArrayLike<number>, flags: Uint8Array, onChar: boolean | undefined, from: number, to: number) {
   const t = b.rope, p = b.pt, c0 = t.charAt(p);
   let k = -1;
   if (onChar && (c0 === '(' || c0 === ')') && cls[p] === C.PAR) k = p;
   else if (p > 0 && t.charAt(p - 1) === ')' && cls[p - 1] === C.PAR) k = p - 1;
   else if (c0 === '(' && cls[p] === C.PAR) k = p;
-  const set = (i, f) => { if (i >= from && i < to) flags[i - from] |= f; };
+  const set = (i: number, f: number) => { if (i >= from && i < to) flags[i - from] |= f; };
   if (k >= 0) { const o = matchParen(t, cls, k); if (o === null || o === undefined) set(k, FLAG.MISMATCH); else { set(k, FLAG.PAREN); set(o, FLAG.PAREN); } }
 }
-function spanClass(cls, f) {
+function spanClass(cls: string, f: number) {
   let cn = cls;
   if (f & FLAG.REGION) cn += ' rg'; if (f & FLAG.LAZY) cn += ' lz'; if (f & FLAG.MATCH) cn += ' im';
   if (f & FLAG.PAREN) cn += ' pm'; if (f & FLAG.MISMATCH) cn += ' px';
   const d = (f >> 5) & 7; if (d) cn += ' d' + (d - 1);
   return cn.trim();
 }
-/* Folds: B.folds is a sorted list of {s, e} ranges that org.js keeps, S the end of the line that stays
+/* Folds: B.folds is a sorted list of {s, e} ranges that org.ts keeps, S the end of the line that stays
    shown and E the end of the last hidden line. The lines that start after S and at or before E are
    not shown; the line that ends at S shows an ellipsis in their place. */
-function foldAt(folds, ls) {
-  let lo = 0, hi = folds.length - 1, f = null;
+function foldAt(folds: EdFold[], ls: number) {
+  let lo = 0, hi = folds.length - 1, f: EdFold | null = null;
   while (lo <= hi) { const m = (lo + hi) >> 1; if (folds[m].s < ls) { f = folds[m]; lo = m + 1; } else hi = m - 1; }
   return f && ls <= f.e ? f : null;
 }
-function foldEndingAt(folds, le) {
+function foldEndingAt(folds: EdFold[], le: number) {
   let lo = 0, hi = folds.length - 1;
   while (lo <= hi) { const m = (lo + hi) >> 1, s = folds[m].s; if (s === le) return folds[m]; if (s < le) lo = m + 1; else hi = m - 1; }
   return null;
 }
-const foldsOf = b => b.folds && b.folds.length ? b.folds : null;
+const foldsOf = (b: EdBuffer) => b.folds && b.folds.length ? b.folds : null;
 /* Lines hidden by F, counted once: an edit inside a fold removes it and one before it shifts it. */
-function foldLines(b, f) { if (f.n === undefined) f.n = lineNoB(b, f.e) - lineNoB(b, f.s); return f.n; }
-/* Hidden lines before each fold, cumulative, so a shown line number is a binary search away. org.js keeps
+function foldLines(b: EdBuffer, f: EdFold) { if (f.n === undefined) f.n = lineNoB(b, f.e) - lineNoB(b, f.s); return f.n; }
+/* Hidden lines before each fold, cumulative, so a shown line number is a binary search away. org.ts keeps
    the folds sorted and bumps b._foldVer when the list changes; an edit before a fold only shifts it. */
-function foldPrefix(b, F) {
-  let c = b._foldPre;
+function foldPrefix(b: EdBuffer, F: EdFold[]) {
+  let c = (b as EcFoldBuffer)._foldPre;
   if (!c || c.ver !== b._foldVer || c.n !== F.length) {
     const pre = new Int32Array(F.length + 1);
     for (let i = 0; i < F.length; i++) pre[i + 1] = pre[i] + foldLines(b, F[i]);
-    c = b._foldPre = { ver: b._foldVer, n: F.length, pre };
+    c = (b as EcFoldBuffer)._foldPre = { ver: b._foldVer, n: F.length, pre };
   }
   return c.pre;
 }
 /* Line numbers that count shown lines only: the line of P, or of the headline that hides it. */
-function vLineNo(b, p) {
+function vLineNo(b: EdBuffer, p: number) {
   const F = foldsOf(b); if (!F) return lineNoB(b, p);
   const pre = foldPrefix(b, F);
   let lo = 0, hi = F.length;
@@ -1843,14 +1881,14 @@ function vLineNo(b, p) {
   return lineNoB(b, p) - pre[lo];
 }
 /* Start of the Nth shown line. */
-function vLineStart(b, n) {
+function vLineStart(b: EdBuffer, n: number) {
   const F = foldsOf(b); if (!F) return lineStartB(b, n);
   const pre = foldPrefix(b, F);
   let lo = 0, hi = F.length;
   while (lo < hi) { const mid = (lo + hi) >> 1; if (lineNoB(b, F[mid].s) - pre[mid] < n) lo = mid + 1; else hi = mid; }
   return lineStartB(b, n + pre[lo]);
 }
-function vLineCount(b) { const F = foldsOf(b); if (!F) return lineCountB(b); return lineCountB(b) - foldPrefix(b, F)[F.length]; }
+function vLineCount(b: EdBuffer) { const F = foldsOf(b); if (!F) return lineCountB(b); return lineCountB(b) - foldPrefix(b, F)[F.length]; }
 /* Render the lines of B from the line at O.from, at most O.count lines (every line when o.lines is
    false: the minibuffer). Span offsets are relative to the line start, so an edit changes only the
    lines it touches. Returns [{o, n, cl, html}], or one HTML string without lines.
@@ -1858,12 +1896,14 @@ function vLineCount(b) { const F = foldsOf(b); if (!F) return lineCountB(b); ret
    inputs (text, classes, flags, depths, the cursor) did not change is reused instead of being
    built again from spans; the Map of the lines just rendered is returned as .cache.
    With o.runs (DT0, the display seam), each line instead carries .text (its text, no newline) and .runs,
-   the same spans as data for a backend that is not a page (display.js): {s, e, cls} with offsets from the
+   the same spans as data for a backend that is not a page (display.ts): {s, e, cls} with offsets from the
    line start and the class string of the span, plus k: 'cur' (the cursor; e === s at the end of a line),
    'avy' and 'ell' (t: the label or the fold ellipsis shown instead), 'eol' (the region past the end).
    The two never share a cache; o.html === false skips the html. */
 let KBUF = new Uint16Array(1024);
-function renderBuffer(b, o) {
+function renderBuffer(b: EdBuffer, o: EcRenderOpts & { runs: true }): EcRendered;
+function renderBuffer(b: EdBuffer, o: EcRenderOpts): EcRendered | string;
+function renderBuffer(b: EdBuffer, o: EcRenderOpts) {
   const r = b.rope, n = r.length;
   const lines = o.lines !== false;
   const pt = o.pt === undefined ? b.pt : o.pt;
@@ -1881,25 +1921,25 @@ function renderBuffer(b, o) {
   const from = ls, to = endPos;
   /* Work on the shown lines only: SEG is the text from FROM to TO, and t reads it with buffer positions. */
   const seg = r.slice(from, to);
-  const t = { charAt: k => seg.charAt(k - from), slice: (a, z) => seg.slice(a - from, z - from) };
-  const eolS = p => { const q = seg.indexOf('\n', p - from); return q < 0 ? to : q + from; };
+  const t = { charAt: (k: number) => seg.charAt(k - from), slice: (a: number, z: number) => seg.slice(a - from, z - from) };
+  const eolS = (p: number) => { const q = seg.indexOf('\n', p - from); return q < 0 ? to : q + from; };
   const cls = isLisp(b) && !b.minibuf ? lexOf(b, true) : null;
-  /* A mode's own lexer (hooks.lexSeg, org.js) classifies the shown segment: ECLS is indexed from FROM
+  /* A mode's own lexer (hooks.lexSeg, org.ts) classifies the shown segment: ECLS is indexed from FROM
      and named by its own table. */
-  const ext = !cls && lines && hooks.lexSeg ? hooks.lexSeg(b, from, to, seg) : null;
+  const ext = !cls && lines && hooks.lexSeg ? hooks.lexSeg(b, from, to, seg) as EcLexSeg : null;
   const ecls = ext ? ext.cls : null, names = ext ? ext.names : CLS_NAMES;
   const ellT = folds ? String(hooks.ellipsis ? hooks.ellipsis(b) : '...') : '';
   const ell = folds ? `<span class="oe">${esc(ellT)}</span>` : '';
   const flags = computeFlags(b, o, from, to, seg);
   if (cls && o.active) parenFlags(b, cls, flags, o.onChar, from, to);
-  const depths = cls && b._ld && truthy(L.get('rainbow-delimiters-enabled')) ? b._ld : null;
-  const key = k => ((cls && k < n ? cls[k] : ecls ? ecls[k - from] || 0 : 0) << 8) | flags[k - from] | (depths && cls[k] === C.PAR ? (depths[k] + 1) << 5 : 0);
+  const depths = cls && b._ld && truthy(L.get('rainbow-delimiters-enabled')) ? b._ld as Uint8Array : null;
+  const key = (k: number) => ((cls && k < n ? cls[k] : ecls ? ecls[k - from] || 0 : 0) << 8) | flags[k - from] | (depths && cls![k] === C.PAR ? (depths[k] + 1) << 5 : 0);
   const last = lastLineStart(r);
   const showPhantom = pt === n || n === 0;
-  const out = [];
+  const out: EcRendered = [];
   const wantRuns = !!o.runs, wantHtml = o.html !== false || !wantRuns;
-  let R = null;
-  const cache = (lines || wantRuns) && !o.avy ? o.cache || null : null, next = (lines || wantRuns) && !o.avy ? new Map() : null;
+  let R: EdRun[] | null = null;
+  const cache = (lines || wantRuns) && !o.avy ? o.cache || null : null, next = (lines || wantRuns) && !o.avy ? new Map<string, EcLineVal>() : null;
   /* The cache key also names the class table (a mode's own lexer numbers its classes differently) and
      the fold ellipsis, which change a line's html without changing its text or keys. */
   const ckPre = (o.active ? 1 : 0) + '|' + (o.cursorClass || '') + '|' + (ext ? 'x' : '') + '|' + ell + '|' + (wantRuns ? 'R' + (wantHtml ? 'H' : '') + '|' : '');
@@ -1916,14 +1956,14 @@ function renderBuffer(b, o) {
     if (KBUF.length < len) KBUF = new Uint16Array(len + (len >> 1) + 1024);
     const kb = KBUF;
     for (let k = ls; k <= le; k++) kb[k - ls] = key(k);
-    let ck = null;
+    let ck: string | null = null;
     if (next && len <= 8192) {
-      ck = ckPre + (pt >= ls && pt <= le ? pt - ls : -1) + '|' + (le < n ? 1 : 0) + (folds && foldEndingAt(folds, le) ? 'E' : '') + '|' + seg.slice(ls - from, le - from) + '\u0000' + String.fromCharCode.apply(null, kb.subarray(0, len));
+      ck = ckPre + (pt >= ls && pt <= le ? pt - ls : -1) + '|' + (le < n ? 1 : 0) + (folds && foldEndingAt(folds, le) ? 'E' : '') + '|' + seg.slice(ls - from, le - from) + '\u0000' + String.fromCharCode.apply(null, kb.subarray(0, len) as unknown as number[]);
       const hit = cache ? cache.get(ck) : undefined;
       if (hit !== undefined) { next.set(ck, hit); pushLine(hit, le); continue; }
     }
     if (wantRuns) R = [];
-    const flush = end => {
+    const flush = (end: number) => {
       if (end <= start) return;
       const kk = kb[start - ls];
       if (R) R.push({ s: start - ls, e: end - ls, cls: spanClass(names[kk >> 8], kk & 255) });
@@ -1932,7 +1972,7 @@ function renderBuffer(b, o) {
     for (let k = ls; k <= le; k++) {
       if (o.avy && o.avy.has(k)) {
         flush(k);
-        const lab = o.avy.get(k), w = Math.min(lab.length, Math.max(1, le - k));
+        const lab = o.avy.get(k)!, w = Math.min(lab.length, Math.max(1, le - k));
         if (R) R.push({ s: k - ls, e: k - ls + w, cls: 'avy', k: 'avy', t: lab.slice(0, w) });
         if (wantHtml) html += `<span class="avy" data-o="${k - rel}">${esc(lab.slice(0, w))}</span>`;
         start = k + w; k += w - 1; continue;
@@ -1956,27 +1996,27 @@ function renderBuffer(b, o) {
       }
       if (k > start && kb[k - ls] !== kb[start - ls]) { flush(k); start = k; }
     }
-    const val = !R ? html : wantHtml ? { html, runs: R } : R;
-    if (ck !== null) next.set(ck, val);
+    const val: EcLineVal = !R ? html : wantHtml ? { html, runs: R } : R;
+    if (ck !== null) next!.set(ck, val);
     pushLine(val, le);
   }
-  function pushLine(val, le) {
+  function pushLine(val: EcLineVal, le: number) {
     const num = o.numbers ? (o.numbers === 'relative' && ln !== curLine ? Math.abs(ln - curLine) : ln) : null;
     if (wantRuns) {
-      const x = { o: ls, n: num, cl: ln === curLine, html: wantHtml ? val.html : undefined, pulse: o.pulse === ls, runs: wantHtml ? val.runs : val, text: seg.slice(ls - from, le - from) };
+      const x = { o: ls, n: num, cl: ln === curLine, html: wantHtml ? (val as EcLineBoth).html : undefined, pulse: o.pulse === ls, runs: wantHtml ? (val as EcLineBoth).runs : val as EdRun[], text: seg.slice(ls - from, le - from) };
       out.push(x);
-    } else out.push({ o: ls, n: num, cl: ln === curLine, html: val, pulse: o.pulse === ls });
+    } else out.push({ o: ls, n: num, cl: ln === curLine, html: val as string, pulse: o.pulse === ls });
     ls = le >= n ? n + 1 : le + 1;
     if (folds && ls <= n) { const f = foldAt(folds, ls); if (f) { ls = f.e + 1; if (ls > n) ls = n + 1; else ln = lineNoB(b, ls) - 1; } }
   }
   if (lines || wantRuns) { out.seg = folds ? vis : seg; out.cache = next; return out; }
   return out.map(x => x.html).join('\n');
 }
-function syncLines(view, lines) {
-  const kids = view.children;
+function syncLines(view: EcView, lines: EcLine[]) {
+  const kids = view.children as HTMLCollectionOf<EcLineEl>;
   /* When the window scrolls, the line at index i is the one that was at i+1 (or i-1): its element
      is moved into place rather than refilled, since parsing innerHTML costs more than the rest. */
-  let byO = null;
+  let byO: Map<number | undefined, EcLineEl> | null = null;
   for (let i = 0; i < lines.length; i++) {
     const L0 = lines[i];
     let el = kids[i];
@@ -1988,30 +2028,30 @@ function syncLines(view, lines) {
       else if (!el) { el = view.ownerDocument.createElement('div'); view.appendChild(el); }
     }
     if (byO !== null) byO.delete(el._o);
-    if (el._h !== L0.html) { el.innerHTML = L0.html; el._h = L0.html; }
+    if (el._h !== L0.html) { el.innerHTML = L0.html!; el._h = L0.html; }
     /* Compare against values kept on the element: reading className and dataset costs more. */
     const cn = (L0.cl ? 'ln cl' : 'ln') + (L0.pulse ? ' pulse' : '');
     if (el._cn !== cn) { el.className = cn; el._cn = cn; }
     if (el._o !== L0.o) { el.dataset.o = String(L0.o); el._o = L0.o; }
     if (el._n !== L0.n) { if (L0.n === null) el.removeAttribute('data-n'); else el.dataset.n = String(L0.n); el._n = L0.n; }
   }
-  while (kids.length > lines.length) view.removeChild(view.lastChild);
+  while (kids.length > lines.length) view.removeChild(view.lastChild!);
 }
 /* Scrolling moves the window start by whole lines, as in Emacs; the view itself never scrolls. */
-function scrollWindow(w, lines) {
+function scrollWindow(w: EdWindow, lines: number) {
   const b = w.buffer, cur = vLineNo(b, w.start), total = vLineCount(b);
   const target = Math.max(1, Math.min(total, cur + lines));
   w.start = vLineStart(b, target);
 }
-function onScroll(w) { void w; }
-function percent(w) {
+function onScroll(w: EdWindow) { void w; }
+function percent(w: EdWindow) {
   const b = w.buffer, total = lineCountB(b), first = lineNoB(b, w.start), lastShown = w.lastLine || first;
   if (first <= 1 && lastShown >= total) return 'All';
   if (first <= 1) return 'Top';
   if (lastShown >= total) return 'Bot';
   return Math.round((first - 1) / Math.max(1, total - 1) * 100) + '%';
 }
-function lineHeight() { return metrics(E.sel).lh; }
+function lineHeight() { return metrics(E.sel!).lh; }
 /* Geometry of a window's text view. The style-derived parts (line height, character width,
    padding) are cached until the view's classes or the font (E.metricsGen, bumped by the face
    commands and on web-font loads) change, since getComputedStyle and the probe force style work.
@@ -2024,7 +2064,7 @@ function lineHeight() { return metrics(E.sel).lh; }
    scrollbar as its content changes, so the size is read every time then. */
 E.metricsGen = 0; E.sizeGen = 0;
 host.page.onFontsLoaded(() => { E.metricsGen++; render(); });
-function sizeChanged() { E.sizeGen++; }
+function sizeChanged() { E.sizeGen!++; }
 /* A render from inside a frame callback (an animation frame, a resize observer, a media query
    change): the layout is computed in this frame anyway, so overlays place themselves at once
    instead of a frame late (E.inFrame). */
@@ -2041,17 +2081,17 @@ host.page.onMedia('(max-width: 560px)', () => { E.metricsGen++; frameRender(); }
 const sizeWatch = typeof ResizeObserver === 'function' ? new ResizeObserver(entries => {
   let stale = false;
   for (const en of entries) {
-    const v = en.target, m = v._win && v._win._m;
+    const v = en.target as EcView, m = v._win && v._win._m;
     if (!m || !v.isConnected) continue;
     if (v.offsetHeight !== m.oh0 || v.offsetWidth !== m.ow0) stale = true;
   }
   if (stale) { sizeChanged(); frameRender(); }
 }) : null;
-function metrics(w) {
-  const v = w.view, key = v.className + '|' + E.metricsGen;
-  let m = w._m;
+function metrics(w: EdWindow) {
+  const v = w.view!, key = v.className + '|' + E.metricsGen;
+  let m = w._m as EcMetrics | undefined;
   if (!m || m.key !== key) {
-    const cs = v.ownerDocument.defaultView.getComputedStyle(v);
+    const cs = v.ownerDocument.defaultView!.getComputedStyle(v);
     const probe = v.ownerDocument.createElement('span');
     probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;left:0;top:0';
     probe.textContent = '0'.repeat(64);
@@ -2063,19 +2103,19 @@ function metrics(w) {
     probe.textContent = 'iW'.repeat(32);
     const mono = Math.abs(probe.getBoundingClientRect().width / 64 / sc - ch) < 0.01;
     v.removeChild(probe);
-    m = w._m = { key, sgen: -1, lh: parseFloat(cs.lineHeight) || 21, ch, mono, padT: parseFloat(cs.paddingTop) || 0, padX: (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0), nowrap: v.classList.contains('nowrap') };
+    m = w._m = { key, sgen: -1, lh: parseFloat(cs.lineHeight) || 21, ch, mono, padT: parseFloat(cs.paddingTop) || 0, padX: (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0), nowrap: v.classList.contains('nowrap') } as EcMetrics;
   }
   if (m.sgen !== E.sizeGen || m.nowrap) {
-    m.ch0 = v.clientHeight; m.cw0 = v.clientWidth; m.oh0 = v.offsetHeight; m.ow0 = v.offsetWidth; m.cw = m.cw0 - m.padX; m.top = v.clientTop + m.padT; m.oh = v.getBoundingClientRect().height / viewScale(v); m.sgen = E.sizeGen;
+    m.ch0 = v.clientHeight; m.cw0 = v.clientWidth; m.oh0 = v.offsetHeight; m.ow0 = v.offsetWidth; m.cw = m.cw0 - m.padX; m.top = v.clientTop + m.padT; m.oh = v.getBoundingClientRect().height / viewScale(v); m.sgen = E.sizeGen!;
   }
   return m;
 }
 /* The scale an ancestor's CSS transform applies to element V (1 without one). */
-function viewScale(v) { const ow = v.offsetWidth; if (!ow) return 1; const w = v.getBoundingClientRect().width; return w > 0 ? w / ow : 1; }
+function viewScale(v: HTMLElement) { const ow = v.offsetWidth; if (!ow) return 1; const w = v.getBoundingClientRect().width; return w > 0 ? w / ow : 1; }
 /* Whether every shown line fits on one row, judged without layout: printable ASCII and tabs only
    in a monospace font, with three columns to spare (the cursor at the line end, the end-of-line
    region mark, rounding). Anything else is measured in the DOM. */
-function fitsRows(seg, m, cols, nowrap) {
+function fitsRows(seg: string, m: EcMetrics, cols: number, nowrap: boolean) {
   if (!m.mono || !(m.ch > 0) || /[^\t\n\x20-\x7e]/.test(seg)) return false;
   if (nowrap) return true;
   const lim = cols - 3;
@@ -2091,51 +2131,51 @@ function fitsRows(seg, m, cols, nowrap) {
 }
 /* Build or update the DOM for the window tree, then draw each window. */
 function ensureWindowDom() {
-  const root = $('windows'), doc = root.ownerDocument;
-  const build = node => {
+  const root = $('windows')!, doc = root.ownerDocument;
+  const build = (node: EdWindowNode): HTMLElement => {
     if (node instanceof Window) {
       if (!node.el) {
-        node.el = doc.createElement('div'); node.el.className = 'win'; node.el.dataset.wid = node.id;
+        node.el = doc.createElement('div'); node.el.className = 'win'; node.el.dataset.wid = node.id as unknown as string;
         node.view = doc.createElement('div'); node.view.className = 'text'; node.view.setAttribute('role', 'textbox'); node.view.setAttribute('aria-multiline', 'true');
         node.ml = doc.createElement('div'); node.ml.className = 'modeline';
         node.ml.innerHTML = '<span class="ml-tag" hidden></span><span class="ml-state"></span><span class="ml-name"></span><span class="ml-pos"></span><span class="ml-mode"></span><span class="ml-extra"></span><span class="ml-sync"></span><span class="ml-cmd"></span>';
         node.el.appendChild(node.view); node.el.appendChild(node.ml);
-        node.view._win = node; if (sizeWatch) sizeWatch.observe(node.view, { box: 'border-box' });
+        (node.view as EcView)._win = node; if (sizeWatch) sizeWatch.observe(node.view, { box: 'border-box' });
         if (hooks.wireWindow) hooks.wireWindow(node);
       }
       return node.el;
     }
     if (!node.el) { node.el = doc.createElement('div'); }
-    node.el.className = 'split ' + node.dir;
-    const kids = node.children.map(build);
+    node.el.className = 'split ' + (node as EdSplit).dir;
+    const kids = (node as EdSplit).children.map(build);
     // Keep children in order; move or append as needed without rebuilding their contents.
     for (let i = 0; i < kids.length; i++) if (node.el.children[i] !== kids[i]) { node.el.insertBefore(kids[i], node.el.children[i] || null); sizeChanged(); }
-    while (node.el.children.length > kids.length) { node.el.removeChild(node.el.lastChild); sizeChanged(); }
+    while (node.el.children.length > kids.length) { node.el.removeChild(node.el.lastChild!); sizeChanged(); }
     return node.el;
   };
-  const top = build(E.root);
+  const top = build(E.root!);
   if (root.firstChild !== top) { root.textContent = ''; root.appendChild(top); sizeChanged(); }
-  while (root.children.length > 1) { root.removeChild(root.lastChild); sizeChanged(); }
+  while (root.children.length > 1) { root.removeChild(root.lastChild!); sizeChanged(); }
 }
-function windowRows(w) { if (!w.view) return w.rows || 24; const m = metrics(w); return Math.max(1, Math.floor(m.ch0 / m.lh)); }
-/* What window W shows this redisplay, for the page and for display.js alike: whether it is the selected window
+function windowRows(w: EdWindow) { if (!w.view) return w.rows || 24; const m = metrics(w); return Math.max(1, Math.floor(m.ch0 / m.lh)); }
+/* What window W shows this redisplay, for the page and for display.ts alike: whether it is the selected window
    of the frame being drawn, its point, Evil's look, and the options its text is rendered with. */
-function windowState(w) {
+function windowState(w: EdWindow): EcWindowState {
   /* The selected window of a frame that is not the selected frame shows its own point (w.pt) with a ghost cursor. */
   const b = w.buffer, selected = w === E.sel && FS() === (E.frame || E.implicit);
-  const look = hooks.look ? hooks.look(b, w) : {};
+  const look: EdLook = hooks.look ? hooks.look(b, w) : {};
   const nums = L.get('display-line-numbers');
   const numbers = nums === intern('relative') ? 'relative' : truthy(nums) && nums !== NIL ? 'absolute' : null;
   const centered = truthy(localValue(b, 'centered-view-enabled'));
   const nowrap = truthy(L.get('truncate-lines')) && !truthy(localValue(b, 'visual-line-enabled'));
   const active = selected && !E.mini && E.focused;
   const pt = selected ? b.pt : Math.min(w.pt, b.rope.length);
-  const opts = { active, numbers, cursorClass: look.cursor || '', onChar: look.onChar, hl: look.hl, current: selected ? look.current : null, isearch: selected ? E.isearch : null, pt, avy: E.avy && E.avy.win === w ? E.avy.labels : null, pulse: selected && E.pulse && E.pulse.b === b ? E.pulse.ls : -1 };
+  const opts: EcRenderOpts = { active, numbers, cursorClass: look.cursor || '', onChar: look.onChar, hl: look.hl as RegExp | null | undefined, current: selected ? look.current as [number, number] | null : null, isearch: selected ? E.isearch : null, pt, avy: E.avy && E.avy.win === w ? E.avy.labels as Map<number, string> : null, pulse: selected && E.pulse && (E.pulse as EcPulse).b === b ? (E.pulse as EcPulse).ls : -1 };
   return { b, selected, look, numbers, centered, nowrap, active, pt, opts };
 }
 /* The first shown line (shown-line numbers: folds hide some) of a window ROWS rows tall with point on shown
    line PTLINE: the window's start, unless point left the window or a recenter (C-l, zz) is pending. */
-function scrollStart(w, b, ptLine, rows, selected) {
+function scrollStart(w: EdWindow, b: EdBuffer, ptLine: number, rows: number, selected: boolean) {
   if (w.start > b.rope.length) w.start = 0;
   w.start = bol(b.rope, w.start);
   let startLine = vLineNo(b, w.start);
@@ -2151,7 +2191,7 @@ function scrollStart(w, b, ptLine, rows, selected) {
 /* The modeline's fields for window W (ST from windowState), read after the window is drawn (percent needs
    w.lastLine): the Evil tag and its state, the modified mark, the buffer name, the position, the modes, the
    macro note, the sync status and the pending command. */
-function modelineFields(w, st, ptLine) {
+function modelineFields(w: EdWindow, st: EdWindowState, ptLine: number): EdModelineFields {
   const { b, look, pt, selected } = st;
   return {
     tag: look.tag || '', state: look.state || '', mark: b.readOnly ? '%%' : b.modified ? '**' : '--', name: b.name,
@@ -2160,32 +2200,32 @@ function modelineFields(w, st, ptLine) {
     extra: look.extra || '', sync: hooks.modeStatus ? hooks.modeStatus(b, FS()) : '', cmd: selected ? look.showcmd || '' : '',
   };
 }
-function renderWindow(w) {
-  const st = windowState(w), { b, selected, look, numbers, centered, nowrap, pt, opts } = st, view = w.view;
+function renderWindow(w: EdWindow) {
+  const st = windowState(w), { b, selected, look, numbers, centered, nowrap, pt, opts } = st, view = w.view as EcView;
   const total = lineCountB(b);
   /* Style and class writes only when they change: each one dirties style and layout. */
   const gw = String(Math.max(2, String(total).length));
-  if (w._gw !== gw) { view.style.setProperty('--gw', gw); w._gw = gw; }
+  if ((w as { _gw?: string })._gw !== gw) { view.style.setProperty('--gw', gw); (w as { _gw?: string })._gw = gw; }
   const vc = (numbers ? 'n' : '') + (nowrap ? 'w' : '') + (centered ? 'c' : '');
   if (w._vc !== vc) { view.classList.toggle('numbers', !!numbers); view.classList.toggle('nowrap', nowrap); view.classList.toggle('centered', centered); w._vc = vc; }
-  if (w._selected !== selected) { w.el.classList.toggle('selected', selected); w._selected = selected; }
+  if (w._selected !== selected) { w.el!.classList.toggle('selected', selected); w._selected = selected; }
   if (view._buf !== b) { view.textContent = ''; view._buf = b; }
   const m = metrics(w), rows = Math.max(1, Math.floor(m.ch0 / m.lh));
   /* Line numbers here count shown lines (folds hide some); w.lastLine stays a real line number. */
   const ptLine = vLineNo(b, pt);
   let startLine = scrollStart(w, b, ptLine, rows, selected);
-  let lines, fits = false;
+  let lines!: EcRendered, fits = false;
   let cols = Math.floor((m.cw - (numbers ? (Math.max(2, String(total).length) + 2) * m.ch : 0)) / m.ch);
-  /* centered-view-mode caps each line's text at --center-cols (index.html, set by extras.js). */
+  /* centered-view-mode caps each line's text at --center-cols (index.html, set by extras.ts). */
   if (centered) cols = Math.min(cols, Number(host.page.getVar('center-cols')) || 100);
   // Wrapped lines take more than one row: render, measure, and move the start down until point fits.
   // When no shown line can wrap, every line is one row of m.lh and the geometry is known without layout.
   for (let tries = 0; tries < 4; tries++) {
     w.start = vLineStart(b, startLine);
-    lines = renderBuffer(b, { ...opts, from: w.start, count: rows + 1, cache: w._lcache });
+    lines = renderBuffer(b, { ...opts, from: w.start, count: rows + 1, cache: w._lcache as Map<string, EcLineVal> | undefined }) as EcRendered;
     w._lcache = lines.cache;
     syncLines(view, lines);
-    fits = fitsRows(lines.seg, m, cols, nowrap);
+    fits = fitsRows(lines.seg!, m, cols, nowrap);
     if (fits) {
       if (ptLine <= startLine || ptLine >= startLine + lines.length) break;
       const over = m.top + (ptLine - startLine + 1) * m.lh - (m.oh + 1);
@@ -2202,7 +2242,7 @@ function renderWindow(w) {
   let lastLine = startLine - 1;
   if (fits) {
     let k = 0; while (k < lines.length && m.top + k * m.lh < m.oh) k++;
-    while (view.children.length > k) view.removeChild(view.lastChild);
+    while (view.children.length > k) view.removeChild(view.lastChild!);
     lastLine += k;
   } else {
     /* Read every position first, then remove: a removal between reads would force a new layout. */
@@ -2214,7 +2254,7 @@ function renderWindow(w) {
   view._lines = lines;
   /* The modeline fields are set only when they change: a DOM write dirties the layout even when
      the text is the same. */
-  const ml = modelineFields(w, st, ptLine), mq = w._mq || (w._mq = {}), q = c => mq[c] || (mq[c] = w.ml.querySelector('.' + c));
+  const ml = modelineFields(w, st, ptLine), mq = (w._mq || (w._mq = {})) as Record<string, EcTextEl>, q = (c: string) => mq[c] || (mq[c] = w.ml!.querySelector<EcTextEl>('.' + c)!);
   const tag = q('ml-tag');
   if (ml.tag) { putText(tag, ml.tag); if (tag._st !== ml.state) { tag.dataset.state = ml.state; tag._st = ml.state; } }
   if (tag._hid !== !ml.tag) { tag.hidden = !ml.tag; tag._hid = !ml.tag; }
@@ -2227,28 +2267,28 @@ function renderWindow(w) {
   putText(q('ml-cmd'), ml.cmd);
   return look;
 }
-function putText(el, s) { if (el._t !== s) { el.textContent = s; el._t = s; } }
+function putText(el: EcTextEl, s: string) { if (el._t !== s) { el.textContent = s; el._t = s; } }
 /* The echo area is written only when its content changes, and a change can change its height,
    and with it the windows above. Its height is read at the start of the next render, before that
    render writes anything, and the windows' sizes are read again only when it moved: most changes
    (isearch, ex and minibuffer typing) keep it. The resize observer redraws in between. */
-function setEcho(echo, s, html) {
+function setEcho(echo: EcEcho, s: string, html: boolean) {
   if (echo._e === s && echo._eh === html) return;
   if (html) echo.innerHTML = s; else echo.textContent = s;
   echo._e = s; echo._eh = html; echo._dirty = true;
 }
-function echoMoved(echo) {
+function echoMoved(echo: EcEcho) {
   if (!echo._dirty) return;
   echo._dirty = false;
   const h = echo.offsetHeight;
   if (h !== echo._h) { echo._h = h; sizeChanged(); }
 }
-/* The minibuffer as data, for the page and display.js: the candidate count ("3/41", "0", null without completion),
+/* The minibuffer as data, for the page and display.ts: the candidate count ("3/41", "0", null without completion),
    the prompt, the flash, and the shown candidates (vertico-count of them around the selected one), each with its
    label, annotation, whether it is selected, and MARKS, the [from, to) spans of the label that the input's
    terms match. PAD is how many empty rows keep the list vertico-count tall when vertico-resize is #f. */
-function miniView() {
-  const m = E.mini, cands = m.completer ? miniCandidates() : [];
+function miniView(): EdMiniView {
+  const m = E.mini!, cands = m.completer ? miniCandidates() : [];
   const label = m.opts.label || (s => s);
   const annotate = m.opts.annotate || null;
   const N = Math.max(3, Math.min(20, Number(L.get('vertico-count')) || 12));
@@ -2262,24 +2302,24 @@ function miniView() {
   const pad = items.length && !truthy(L.get('vertico-resize')) ? Math.max(0, N - items.length) : 0;
   return { count: m.completer ? (cands.length ? (m.index + 1) + '/' + cands.length : '0') : null, prompt: m.prompt, flash: E.miniFlash || '', items, pad };
 }
-/* The echo area outside the minibuffer, for the page and display.js: TEXT (a message, the isearch line, a key
+/* The echo area outside the minibuffer, for the page and display.ts: TEXT (a message, the isearch line, a key
    prompt, else Evil's state line), or WHICH when a prefix key is pending and its bindings are shown instead. */
-function echoView(look) {
+function echoView(look: EdLook) {
   let text = E.echo || (E.depth === 0 ? look.stateEcho || '' : '');
   const prompting = E.prompt !== null && E.prompt !== undefined;
   if (E.isearch) { const s = E.isearch; text = `${s.failing ? 'Failing ' : ''}${s.wrapped ? 'Wrapped ' : ''}I-search${s.dir < 0 ? ' backward' : ''}: ${s.str}`; }
-  else if (prompting) text = E.prompt;
+  else if (prompting) text = E.prompt!;
   return { text: String(text), which: !!look.prefixHelp && !E.isearch && !prompting };
 }
 /* The spans of S that any of the regexps TERMS match, sorted and merged: [[from, to), ...]. */
-function matchSpans(s, terms) {
-  const spans = [];
+function matchSpans(s: string, terms: RegExp[]) {
+  const spans: [number, number][] = [];
   for (const t of terms) {
-    let re; try { re = new RegExp(t.source, t.flags.includes('g') ? t.flags : t.flags + 'g'); } catch (e) { continue; }
+    let re: RegExp; try { re = new RegExp(t.source, t.flags.includes('g') ? t.flags : t.flags + 'g'); } catch (e) { continue; }
     for (const x of s.matchAll(re)) if (x[0]) spans.push([x.index, x.index + x[0].length]);
   }
   spans.sort((a, b) => a[0] - b[0]);
-  const out = [];
+  const out: [number, number][] = [];
   for (const sp of spans) { const last = out[out.length - 1]; if (last && sp[0] <= last[1]) last[1] = Math.max(last[1], sp[1]); else out.push(sp); }
   return out;
 }
@@ -2288,30 +2328,30 @@ function matchSpans(s, terms) {
    for every frame drawn (with that frame current), and the ones that place the popups (corfu, snipe) on
    E.frame then leave them placed for the selected frame. */
 function render() {
-  const sel = E.frame, drawable = f => (f.root || f.backend) && f.wroot && f.sel;
+  const sel = E.frame, drawable = (f: EdFrame) => (f.root || f.backend) && f.wroot && f.sel;
   for (const f of E.frames) if (f !== sel && drawable(f)) renderFrame(f);
   if (sel && drawable(sel)) renderFrame(sel);
 }
-function frameKey(f) {
+function frameKey(f: EdFrame) {
   let k = (f.mini ? 'm' : '') + f.echo + '|' + f.miniFlash + '|' + E.metricsGen + '|' + E.sizeGen + '|' + (hooks.statusKey ? hooks.statusKey() : '') + (f.backend ? '|' + f.focused + ':' + f.theme + ':' + JSON.stringify(f.backend.size()) : '');
   for (const w of leaves(f.wroot)) { const b = w.buffer; k += `|${w.id}:${b.id}:${b.ver}:${w.pt}:${w.start}:${b.presence ? b.presence.length + ':' + (b._presTick || 0) : ''}`; }
   return k;
 }
-function renderFrame(f) {
+function renderFrame(f: EdFrame) {
   if (f !== E.frame) { const k = frameKey(f); if (k === f._rkey) return; f._rkey = k; }
-  /* A model frame (no page) is laid out and drawn by display.js, which sets hooks.renderModel. */
-  if (f.backend) { if (hooks.renderModel) withFrame(f, () => hooks.renderModel(f)); return; }
+  /* A model frame (no page) is laid out and drawn by display.ts, which sets hooks.renderModel. */
+  if (f.backend) { if (hooks.renderModel) withFrame(f, () => hooks.renderModel!(f)); return; }
   withFrame(f, () => renderOne(f));
 }
-function renderOne(f) {
+function renderOne(f: EdFrame) {
   ensureWindowDom();
-  const echo = $('echo');
+  const echo = $('echo') as EcEcho;
   echoMoved(echo);
-  let look = {};
+  let look: EdLook = {};
   for (const w of windowList()) { const l = renderWindow(w); if (w === E.sel) look = l; }
   if (E.mini) {
     const v = miniView();
-    const hl = it => { let out = '', k = 0; for (const [a, z] of it.marks) { out += esc(it.label.slice(k, a)) + '<b>' + esc(it.label.slice(a, z)) + '</b>'; k = z; } return out + esc(it.label.slice(k)); };
+    const hl = (it: EdMiniView['items'][number]) => { let out = '', k = 0; for (const [a, z] of it.marks) { out += esc(it.label.slice(k, a)) + '<b>' + esc(it.label.slice(a, z)) + '</b>'; k = z; } return out + esc(it.label.slice(k)); };
     let rows = v.items.map(it => `<div class="cand${it.sel ? ' sel' : ''}"><span class="cl">${hl(it)}</span>${it.ann ? `<span class="ca">${esc(it.ann)}</span>` : ''}</div>`).join('');
     rows += '<div class="cand"> </div>'.repeat(v.pad);
     const count = v.count !== null ? `<span class="cc">${v.count}</span>` : '';
@@ -2324,21 +2364,21 @@ function renderOne(f) {
     if (v.which) setEcho(echo, `<span class="wkp">${esc(look.showcmd || '')}-</span>${look.prefixHelp}`, true);
     else setEcho(echo, v.text, false);
   }
-  f.root.classList.toggle('unfocused', !f.focused);
+  f.root!.classList.toggle('unfocused', !f.focused);
   /* Display overlays (block-ref text, the popups) for this frame: F is current (withFrame) for the duration. */
   if (hooks.renderOverlay) hooks.renderOverlay(f);
   if (hooks.renderPresence) hooks.renderPresence(f);
 }
 /* The client rect of LEN characters at buffer position P in window W, from the drawn lines (null when
    the line is not drawn). Overlays (snipe, presence) place themselves with it. */
-function rectAt(w, p, len) {
-  const view = w.view, t = w.buffer.rope, ls = bol(t, p);
+function rectAt(w: EdWindow, p: number, len: number) {
+  const view = w.view!, t = w.buffer.rope, ls = bol(t, p);
   const ln = view.querySelector(`.ln[data-o="${ls}"]`);
   if (!ln) return null;
-  let off = p - ls, startNode = null, startOff = 0;
+  let off = p - ls, startNode: Node | null = null, startOff = 0;
   const doc = ln.ownerDocument, walker = doc.createTreeWalker(ln, 4 /* NodeFilter.SHOW_TEXT */);
   for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-    const n = node.nodeValue.length;
+    const n = node.nodeValue!.length;
     if (!startNode) { if (off < n || (off === n && len === 0)) { startNode = node; startOff = off; off += len; } else { off -= n; continue; } }
     if (startNode && off <= n) { const r = doc.createRange(); r.setStart(startNode, startOff); r.setEnd(node, off); const rs = r.getClientRects(); return rs.length ? rs[0] : r.getBoundingClientRect(); }
     if (startNode) off -= n;
@@ -2347,44 +2387,44 @@ function rectAt(w, p, len) {
 }
 
 /* ---------- pointer: map a screen point to a buffer position ---------- */
-function windowAt(x, y) {
-  const f = FS(); if (!f.root) return null;
+function windowAt(x: number, y: number) {
+  const f = FS() as Partial<EdFrame>; if (!f.root) return null;
   const el = f.root.ownerDocument.elementFromPoint(x, y);
   const we = el && el.closest ? el.closest('.win') : null;
   return we ? windowList().find(w => w.el === we) || null : null;
 }
-function posFromPoint(x, y, w) {
+function posFromPoint(x: number, y: number, w?: EdWindow | null) {
   w = w || windowAt(x, y) || E.sel;
   if (!w || !w.view) return null;
-  let node, off;
-  const doc = FS().root.ownerDocument;
+  let node: Node, off: number;
+  const doc = (FS() as EdFrame).root!.ownerDocument;
   if (doc.caretPositionFromPoint) { const r = doc.caretPositionFromPoint(x, y); if (!r) return null; node = r.offsetNode; off = r.offset; }
   else if (doc.caretRangeFromPoint) { const r = doc.caretRangeFromPoint(x, y); if (!r) return null; node = r.startContainer; off = r.startOffset; }
   else return null;
   const view = w.view, t = w.buffer.text;
   if (node === view) {
-    for (const ln of view.querySelectorAll('.ln')) { const r = ln.getBoundingClientRect(); if (y >= r.top && y < r.bottom) return eol(t, +ln.dataset.o); }
+    for (const ln of view.querySelectorAll<HTMLElement>('.ln')) { const r = ln.getBoundingClientRect(); if (y >= r.top && y < r.bottom) return eol(t, +ln.dataset.o!); }
     return t.length;
   }
-  const el = node.nodeType === 3 ? node.parentElement : node;
+  const el = (node.nodeType === 3 ? node.parentElement : node) as HTMLElement;
   if (!view.contains(el)) return null;
   if (el.classList.contains('ln')) {
-    const ls = +el.dataset.o;
+    const ls = +el.dataset.o!;
     if (off >= el.childNodes.length) return eol(t, ls);
-    return posOfEl(el.childNodes[off], 0, t) ?? ls;
+    return posOfEl(el.childNodes[off] as HTMLElement, 0, t) ?? ls;
   }
-  return posOfEl(el.closest('[data-o]'), node.nodeType === 3 ? off : 0, t);
+  return posOfEl(el.closest<HTMLElement>('[data-o]'), node.nodeType === 3 ? off : 0, t);
 }
-function posOfEl(el, off, t) {
+function posOfEl(el: HTMLElement | null, off: number, t: string) {
   if (!el || !el.dataset) return null;
-  if (el.classList.contains('ln')) return off ? eol(t, +el.dataset.o) : +el.dataset.o;
-  const line = el.closest('.ln'), base = (line ? +line.dataset.o : 0) + (+el.dataset.o);
-  if (el.classList.contains('cur')) return base + Math.min(off, +el.dataset.len);
+  if (el.classList.contains('ln')) return off ? eol(t, +el.dataset.o!) : +el.dataset.o!;
+  const line = el.closest<HTMLElement>('.ln'), base = (line ? +line.dataset.o! : 0) + (+el.dataset.o!);
+  if (el.classList.contains('cur')) return base + Math.min(off, +el.dataset.len!);
   if (el.classList.contains('eolsel')) return base;
   return Math.min(base + off, t.length);
 }
 
-/* The lexer's source, for the worker pool (pool.js) to lex big buffers off the main thread. */
+/* The lexer's source, for the worker pool (pool.ts) to lex big buffers off the main thread. */
 const LEX_SOURCE = `const C = ${JSON.stringify(C)}; const KEYWORDS = new Set(${JSON.stringify([...KEYWORDS])});
 const isWS = ${isWS}; const isDelim = ${isDelim}; const inStr = ${inStr};
 ${lex}
@@ -2403,5 +2443,5 @@ globalThis.Ed = {
   specCodes, callInteractively, undoStep, redoStep, snap, runCommand, dispatch, commandLoop, executeKeys, isearch, render, renderBuffer,
   posFromPoint, windowAt, lineHeight, whenIdle, frameRender, windowState, scrollStart, modelineFields, miniView, echoView, matchSpans, percent, foldsOf, onScroll, scrollWindow, lineIndex, lineNoB, lineStartB, lineCountB, foldAt, vLineNo, vLineStart, vLineCount, windowRows, ensureWindowDom, Window, Split, windowList, selectWindow, splitWindow, deleteWindow, deleteOtherWindows, winConfig, restoreWinConfig, saveWinConfig, windowFor, popToBuffer, leaves, get queueLength() { return queue.length; },
   runCallback,
-};
+} satisfies Partial<EdApi> as unknown as EdApi;
 })();

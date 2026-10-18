@@ -16,7 +16,7 @@ export interface UndoTag { g?: string | number; of?: string | number; ofCid?: st
 /* A sequenced batch as undoOps and textBefore read it. */
 export interface UndoBatch { ver?: number; ops: EditOp[]; cid: string; undo?: UndoTag | null; len?: number }
 export type MarkerType = 'before' | 'after';
-/* The surface of src/ot.js (R7.14), which is untyped JavaScript. */
+/* The surface of src/ot.ts (R7.14), which this program loads untyped. */
 export interface OTModule {
   OTError: new (code: string, msg: string) => Error & { code: string };
   apply(text: string, ops: EditOp[]): string;

@@ -1,5 +1,5 @@
 // The frame runtime against a real edwind (E3 H1, spec 6.3, 7, 9.5): Edwin's core on the Node host with
-// src/sync.js as the protocol client, over a net.Socket wrapped to look like a WebSocket (one JSON text
+// src/sync.ts as the protocol client, over a net.Socket wrapped to look like a WebSocket (one JSON text
 // per send, newline framed on the wire). A second writer is an EditClient with an ot-sim style replica.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,7 +12,7 @@ import type { Msg, TestDir, EdwindChild, ClientOptions } from './edit-client.mts
 import { rng, randOp } from './ot-sim.mts';
 import type { EditOp, OTModule } from './ot-sim.mts';
 
-type EdwinCore = any; // any: Edwin's core (edwin/src) is untyped JavaScript
+type EdwinCore = any; // any: Edwin's core (edwin/src) is outside this program's types
 type Batch = { seq: number; base: number; ops: EditOp[] };
 
 const require = createRequire(import.meta.url);
@@ -632,7 +632,7 @@ test('E3 H3 gap 5: hooks.mouseDown gets the event as third argument; readFile fa
   assert.equal(L.S.hooks.readFile('/no/such/dir/notes-syntax.scm'), shipped);
   assert.equal(L.S.hooks.readFile('/no/such/dir/absent.scm'), null);
   assert.equal(L.S.hooks.readFile('/no/such/dir/notes-syntax.txt'), null);
-  /* markdown.js's edwin:scm entry still answers. */
+  /* markdown.ts's edwin:scm entry still answers. */
   assert.equal(L.S.hooks.readFile('edwin:scm/notes-syntax.scm'), shipped);
   /* So (load "<any dir>/address.scm") resolves to the shipped file. */
   assert.equal(L.truthy(L.evalText('(begin (load "/no/such/dir/address.scm") (procedure? address-name))')), true);

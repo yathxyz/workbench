@@ -1,6 +1,6 @@
 /* The terminal half of desktop Edwin (DT1): a model frame's cell grid to escape sequences, and the bytes a
    terminal sends to Edwin key descriptions, mouse, paste, focus and query replies. It knows nothing of Ed:
-   the native shell (host-native.js, main.js) wires it to a frame, and the tests drive it from Node.
+   the native shell (host-native.ts, main.ts) wires it to a frame, and the tests drive it from Node.
 
    EdTerm.encoder({ color, defaultColors }) draws models:
      enter()        the setup string: alternate screen, no autowrap, mouse, bracketed paste, focus events,
@@ -18,14 +18,15 @@
    {type: 'mouse', action, x, y, button, shift, meta, ctrl, dy}, {type: 'reply', kind, value}. */
 (function () {
 'use strict';
+type TermRGB = [number, number, number];
 
 /* ---------- colours ---------- */
-const hexRgb = h => { const n = parseInt(h.slice(1, 7), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
+const hexRgb = (h: string): TermRGB => { const n = parseInt(h.slice(1, 7), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
 const CUBE = [0, 95, 135, 175, 215, 255];
-const d2 = (a, b) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2;
+const d2 = (a: number[], b: number[]) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2;
 /* The nearest colour of the xterm 256 palette: the 6x6x6 cube or the grey ramp, whichever is closer. */
-function to256(rgb) {
-  const ci = v => (v < 48 ? 0 : v < 115 ? 1 : Math.min(5, Math.floor((v - 35) / 40)));
+function to256(rgb: TermRGB) {
+  const ci = (v: number) => (v < 48 ? 0 : v < 115 ? 1 : Math.min(5, Math.floor((v - 35) / 40)));
   const c = rgb.map(ci), cube = c.map(i => CUBE[i]);
   const avg = Math.round((rgb[0] + rgb[1] + rgb[2]) / 3), gi = avg > 238 ? 23 : Math.max(0, Math.round((avg - 8) / 10)), gv = 8 + gi * 10;
   return d2(rgb, [gv, gv, gv]) < d2(rgb, cube) ? 232 + gi : 16 + 36 * c[0] + 6 * c[1] + c[2];
@@ -33,8 +34,8 @@ function to256(rgb) {
 /* The 16 ANSI colours as xterm draws them. */
 const ANSI = [[0, 0, 0], [205, 0, 0], [0, 205, 0], [205, 205, 0], [0, 0, 238], [205, 0, 205], [0, 205, 205], [229, 229, 229],
   [127, 127, 127], [255, 0, 0], [0, 255, 0], [255, 255, 0], [92, 92, 255], [255, 0, 255], [0, 255, 255], [255, 255, 255]];
-function to16(rgb) { let best = 0, bd = Infinity; ANSI.forEach((a, i) => { const d = d2(rgb, a); if (d < bd) { bd = d; best = i; } }); return best; }
-function colorSgr(hex, bg, mode) {
+function to16(rgb: TermRGB) { let best = 0, bd = Infinity; ANSI.forEach((a, i) => { const d = d2(rgb, a); if (d < bd) { bd = d; best = i; } }); return best; }
+function colorSgr(hex: string, bg: boolean, mode: EdColorMode) {
   const rgb = hexRgb(hex);
   if (mode === 'truecolor') return `${bg ? 48 : 38};2;${rgb[0]};${rgb[1]};${rgb[2]}`;
   if (mode === '256') return `${bg ? 48 : 38};5;${to256(rgb)}`;
@@ -43,7 +44,7 @@ function colorSgr(hex, bg, mode) {
 }
 /* The colour depth a terminal declares: COLORTERM truecolor/24bit, a TERM naming direct colour or one of the
    terminals known to draw it, else 256 for a *-256color TERM, else 16. */
-function colorMode(env) {
+function colorMode(env: { COLORTERM?: string; TERM?: string; TERM_PROGRAM?: string }): EdColorMode {
   const ct = (env.COLORTERM || '').toLowerCase(), term = (env.TERM || '').toLowerCase();
   if (ct === 'truecolor' || ct === '24bit' || /direct|truecolor/.test(term) || /^(xterm-kitty|alacritty|foot|wezterm|xterm-ghostty|contour)/.test(term)) return 'truecolor';
   if (/256/.test(term) || env.TERM_PROGRAM) return '256';
@@ -53,12 +54,12 @@ function colorMode(env) {
 /* ---------- output ---------- */
 const ESC = '\x1b', CSI = '\x1b[', OSC = '\x1b]', ST = '\x1b\\';
 /* DECSCUSR shapes, steady: block 2, underline 4, bar 6. A terminal draws an unfocused cursor hollow itself. */
-const SHAPE = { box: 2, hollow: 2, half: 4, hbar: 4, bar: 6 };
-function b64(s) {
+const SHAPE: Record<EdCursorShape, number> = { box: 2, hollow: 2, half: 4, hbar: 4, bar: 6 };
+function b64(s: string) {
   /* UTF-8, then base64: OSC 52 carries bytes. */
-  const bytes = [];
+  const bytes: number[] = [];
   for (const ch of s) {
-    let c = ch.codePointAt(0);
+    let c = ch.codePointAt(0)!;
     if (c < 0x80) bytes.push(c);
     else if (c < 0x800) bytes.push(0xc0 | c >> 6, 0x80 | c & 63);
     else if (c < 0x10000) bytes.push(0xe0 | c >> 12, 0x80 | c >> 6 & 63, 0x80 | c & 63);
@@ -72,17 +73,17 @@ function b64(s) {
   }
   return out;
 }
-/* Text a terminal may draw at another width than display.js counted (wide, combining or emoji characters):
+/* Text a terminal may draw at another width than display.ts counted (wide, combining or emoji characters):
    after a segment holding any, the next one is placed with an explicit cursor move. */
 const RISKY = /[^\x20-\x7e -˿Ͱ-῿‐-‧‰-⁞←-⏿─-◿]/;
-const SAFE_TEXT = s => s.replace(/[\x00-\x1f\x7f-\x9f]/g, '?');
+const SAFE_TEXT = (s: string) => s.replace(/[\x00-\x1f\x7f-\x9f]/g, '?');
 
-function encoder(opts = {}) {
+function encoder(opts: { color?: EdColorMode; defaultColors?: boolean } = {}): EdTermEncoder {
   const mode = opts.color || 'truecolor';
-  let screen = [], size = null, cursorShape = null, cursorColor = null, defaultColors = !!opts.defaultColors;
-  function faceSgr(fc, base) {
+  let screen: string[] = [], size: [cols: number, rows: number] | null = null, cursorShape: number | null = null, cursorColor: string | null = null, defaultColors = !!opts.defaultColors;
+  function faceSgr(fc: EdFace, base: EdFace) {
     let s = '0';
-    if (fc.bold || fc.weight >= 600) s += ';1';
+    if (fc.bold || fc.weight! >= 600) s += ';1';
     if (fc.italic) s += ';3';
     if (fc.underline || fc.box) s += ';4';
     if (fc.strike) s += ';9';
@@ -139,16 +140,16 @@ function encoder(opts = {}) {
 }
 
 /* ---------- input ---------- */
-const TILDE = { 1: '<home>', 2: '<insert>', 3: '<deletechar>', 4: '<end>', 5: '<prior>', 6: '<next>', 7: '<home>', 8: '<end>',
+const TILDE: Record<number, string> = { 1: '<home>', 2: '<insert>', 3: '<deletechar>', 4: '<end>', 5: '<prior>', 6: '<next>', 7: '<home>', 8: '<end>',
   11: '<f1>', 12: '<f2>', 13: '<f3>', 14: '<f4>', 15: '<f5>', 17: '<f6>', 18: '<f7>', 19: '<f8>', 20: '<f9>', 21: '<f10>', 23: '<f11>', 24: '<f12>' };
-const LETTER = { A: '<up>', B: '<down>', C: '<right>', D: '<left>', H: '<home>', F: '<end>', P: '<f1>', Q: '<f2>', R: '<f3>', S: '<f4>' };
+const LETTER: Record<string, string> = { A: '<up>', B: '<down>', C: '<right>', D: '<left>', H: '<home>', F: '<end>', P: '<f1>', Q: '<f2>', R: '<f3>', S: '<f4>' };
 /* Kitty's functional keys (CSI u) that have a name in Edwin; the keypad sends its plain keys. */
-const KITTY = { 9: 'TAB', 13: 'RET', 27: 'ESC', 127: 'DEL', 57399: '0', 57400: '1', 57401: '2', 57402: '3', 57403: '4', 57404: '5', 57405: '6',
+const KITTY: Record<number, string> = { 9: 'TAB', 13: 'RET', 27: 'ESC', 127: 'DEL', 57399: '0', 57400: '1', 57401: '2', 57402: '3', 57403: '4', 57404: '5', 57405: '6',
   57406: '7', 57407: '8', 57408: '9', 57409: '.', 57410: '/', 57411: '*', 57412: '-', 57413: '+', 57414: 'RET', 57415: '=',
   57417: '<left>', 57418: '<right>', 57419: '<up>', 57420: '<down>', 57421: '<prior>', 57422: '<next>', 57423: '<home>', 57424: '<end>', 57425: '<insert>', 57426: '<deletechar>' };
-const MODIFIER_ONLY = c => c >= 57441 && c <= 57452;   // shift, ctrl, alt, super... pressed alone
+const MODIFIER_ONLY = (c: number) => c >= 57441 && c <= 57452;   // shift, ctrl, alt, super... pressed alone
 /* A key name with modifiers, in the core's order (C- M- S-). S- is kept for named keys only, as keyName does. */
-function withMods(base, mods) {
+function withMods(base: string, mods: number) {
   const shift = mods & 1, meta = mods & 2, ctrl = mods & 4;
   let b = base;
   if (b.length === 1 && /[a-zA-Z]/.test(b)) { if (ctrl) b = b.toLowerCase(); else if (shift) b = b.toUpperCase(); }
@@ -158,8 +159,8 @@ function withMods(base, mods) {
   return (ctrl ? 'C-' : '') + (meta ? 'M-' : '') + (shift && named ? 'S-' : '') + b;
 }
 /* One character typed without an escape sequence. */
-function plainKey(ch) {
-  const c = ch.codePointAt(0);
+function plainKey(ch: string) {
+  const c = ch.codePointAt(0)!;
   if (c === 13) return 'RET';
   if (c === 9) return 'TAB';
   if (c === 127) return 'DEL';
@@ -172,10 +173,10 @@ function plainKey(ch) {
   return ch;
 }
 
-function decoder() {
-  let buf = '', paste = null;
+function decoder(): EdTermDecoder {
+  let buf = '', paste: string | null = null;
   /* The length of a complete sequence at buf[i] (ESC there), or 0 while it is unfinished. */
-  function seqEnd(i) {
+  function seqEnd(i: number) {
     const n = buf[i + 1];
     if (n === undefined) return 0;
     if (n === '[') {
@@ -188,14 +189,14 @@ function decoder() {
       return 0;
     }
     /* ESC and one character: Meta. */
-    const cp = buf.codePointAt(i + 1);
+    const cp = buf.codePointAt(i + 1)!;
     return 1 + (cp > 0xffff ? 2 : 1);
   }
-  function csi(body, out) {
+  function csi(body: string, out: EdTermEvent[]) {
     const final = body[body.length - 1], params = body.slice(0, -1);
     if (params[0] === '<' && (final === 'M' || final === 'm')) {
       const [b, x, y] = params.slice(1).split(';').map(Number);
-      const ev = { type: 'mouse', x: x - 1, y: y - 1, button: b & 3, shift: !!(b & 4), meta: !!(b & 8), ctrl: !!(b & 16) };
+      const ev = { type: 'mouse' as const, x: x - 1, y: y - 1, button: b & 3, shift: !!(b & 4), meta: !!(b & 8), ctrl: !!(b & 16) };
       if (b & 64) { if ((b & 3) < 2) out.push({ ...ev, action: 'wheel', button: 0, dy: (b & 1) ? 1 : -1 }); return; }
       out.push({ ...ev, action: final === 'm' ? 'up' : (b & 32) ? 'drag' : 'down' });
       return;
@@ -225,14 +226,14 @@ function decoder() {
     if (final === 'Z') { out.push({ type: 'key', key: 'S-TAB' }); return; }
     if (LETTER[final]) out.push({ type: 'key', key: withMods(LETTER[final], mods) });
   }
-  function osc(body, out) {
+  function osc(body: string, out: EdTermEvent[]) {
     const m = /^11;rgb:([0-9a-f]+)\/([0-9a-f]+)\/([0-9a-f]+)/i.exec(body);
     if (m) {
       const v = m.slice(1).map(h => Math.round(parseInt(h, 16) / (16 ** h.length - 1) * 255));
       out.push({ type: 'reply', kind: 'background', value: '#' + v.map(x => x.toString(16).padStart(2, '0')).join('') });
     }
   }
-  function take(out, flushing) {
+  function take(out: EdTermEvent[], flushing: boolean) {
     let i = 0;
     while (i < buf.length) {
       if (paste !== null) {
@@ -249,12 +250,12 @@ function decoder() {
         continue;
       }
       const ch = buf[i];
-      if (ch !== '\x1b') { const cp = buf.codePointAt(i), s = String.fromCodePoint(cp); out.push({ type: 'key', key: plainKey(s) }); i += s.length; continue; }
+      if (ch !== '\x1b') { const cp = buf.codePointAt(i)!, s = String.fromCodePoint(cp); out.push({ type: 'key', key: plainKey(s) }); i += s.length; continue; }
       const len = seqEnd(i);
       if (!len) { if (!flushing) break; out.push({ type: 'key', key: 'ESC' }); i++; continue; }
       const n = buf[i + 1];
       if (n === '[') csi(buf.slice(i + 2, i + len), out);
-      else if (n === 'O') { const f = buf[i + 2]; if (LETTER[f]) out.push({ type: 'key', key: LETTER[f] }); else if (f === 'M') out.push({ type: 'key', key: 'RET' }); else out.push({ type: 'key', key: 'M-O' }, ...(f ? [{ type: 'key', key: plainKey(f) }] : [])); }
+      else if (n === 'O') { const f = buf[i + 2]; if (LETTER[f]) out.push({ type: 'key', key: LETTER[f] }); else if (f === 'M') out.push({ type: 'key', key: 'RET' }); else out.push({ type: 'key', key: 'M-O' }, ...(f ? [{ type: 'key' as const, key: plainKey(f) }] : [])); }
       else if (n === ']') osc(buf.slice(i + 2, i + len).replace(/(\x07|\x1b\\?)$/, ''), out);
       else if (n === 'P' || n === '_') { /* DCS and APC replies: nothing Edwin reads */ }
       else if (n === '\x1b') { out.push({ type: 'key', key: 'ESC' }); i++; continue; }

@@ -4,14 +4,127 @@
    A shared buffer is an Edwin Buffer whose text is driven by the protocol: b.shared, b.id (the buffer id),
    b.sver (the last server version applied), b.inflight (the one unacknowledged batch), b.queue (later local
    batches, rebased on inflight), b.hist (sequenced batches since open), b.meta (file, mode, anchors, ...)
-   and b.presence (other writers' cursors). The transform is edwin/src/ot.js, used exactly as the test
+   and b.presence (other writers' cursors). The transform is edwin/src/ot.ts, used exactly as the test
    model edwin/test/ot-sim.mts Client does. Every text change goes through Ed.applyOps (R6.8): local
    commands reach this file through hooks.applied, remote batches are applied with it.
 
-   Loaded after ot.js in both runtimes; it does nothing until Ed.sync.start or Ed.bootServed is called,
+   Loaded after ot.ts in both runtimes; it does nothing until Ed.sync.start or Ed.bootServed is called,
    so edwind and the headless tests carry it inert. */
 (function () {
 'use strict';
+/* edwind's messages as this client reads them (edwin/server/proto.mts, section 7) */
+type SyncBy = {
+  kind: 'frame' | 'cli' | 'web' | 'disk' | 'server' | 'agent'; cid?: string | null; device?: string | null; session?: string; thread?: string; agent?: string; tab?: unknown;
+  /* read by writerLabel (edwind names an agent in agent) */
+  name?: string;
+};
+type SyncCondition = { condition: string; report: string; restarts?: unknown[]; backtrace?: string[] };
+type SyncAnchor = { id: string; pos: number; label?: string };
+type SyncMeta = { file: string | null; mode: string; modified: boolean; readOnly: string | boolean; saved: number; diskChanged: string | null; eol: 'lf' | 'crlf'; anchors: SyncAnchor[]; locals: Record<string, unknown>; ver: number };
+type SyncWelcomeMsg = { t: 'welcome'; proto: number; build: string; boot: string; imageEpoch: string; gen: number; caps: Record<string, unknown> };
+type SyncPingMsg = { t: 'ping' | 'pong'; rid?: string };
+type SyncErrorMsg = { t: 'error'; code: string; msg: string; rid?: string; buf?: string; seq?: number; [k: string]: unknown };
+type SyncResultMsg = { t: 'result'; rid?: string; value?: unknown; error?: SyncCondition; msg?: string; out?: string };
+type SyncOpenedMsg = { t: 'opened'; rid?: string; buf: string; ver: number };
+type SyncSnapMsg = { t: 'snap'; rid?: string; buf: string; ver: number; text: string; meta: SyncMeta; more?: true };
+type SyncChunkMsg = { t: 'chunk'; rid?: string; buf: string; text: string; more: boolean };
+type SyncMetaMsg = { t: 'meta'; buf: string } & SyncMeta;
+type SyncMovedMsg = { t: 'moved'; buf: string; to: string };
+type SyncKilledMsg = { t: 'killed'; buf: string };
+type SyncAckMsg = { t: 'ack'; buf: string; seq: number | null; ver: number; h?: number };
+type SyncEditsMsg = { t: 'edits'; buf: string; ver: number; ops: EdOTOp[]; by: SyncBy; h?: number };
+type SyncSelMsg = { t: 'sel'; buf: string; by: SyncBy; ranges: unknown[] };
+type SyncEchoMsg = { t: 'msg'; text: string; level: string };
+type SyncDisplayMsg = { t: 'display'; buf: string; how: string };
+type SyncImageMsg = { t: 'image'; gen: number; forms: string[] };
+type SyncVarMsg = { t: 'var'; name: string; value: unknown };
+type SyncAskMsg = { t: 'ask'; rid: string; kind: string; prompt: string; init?: unknown; table?: unknown };
+type SyncServerMsg = SyncWelcomeMsg | SyncPingMsg | SyncErrorMsg | SyncResultMsg | SyncOpenedMsg | SyncSnapMsg | SyncChunkMsg | SyncMetaMsg | SyncMovedMsg
+  | SyncKilledMsg | SyncAckMsg | SyncEditsMsg | SyncSelMsg | SyncEchoMsg | SyncDisplayMsg | SyncImageMsg | SyncVarMsg | SyncAskMsg;
+/* a message to edwind */
+type SyncOut = { t: string; [k: string]: unknown };
+/* the answer to a call, save or revert: the result frame without t and rid */
+type SyncReply = { value?: unknown; error?: SyncCondition; msg?: string; out?: string };
+type SyncCall = { resolve: (r: SyncReply) => void; frame: EdFrame | null; at: number; rid: string };
+/* an undo group (R6.15), a batch queued and in flight, and a sequenced batch of b.hist */
+type SyncUndo = { g: string | number; of?: string | number; redo?: boolean };
+type SyncBatch = { ops: EdOTOp[]; undo: SyncUndo };
+type SyncInflight = SyncBatch & { seq: number; base: number };
+type SyncHist = { ver: number; ops: EdOTOp[]; cid: string | null; undo?: SyncUndo; by?: SyncBy };
+type SyncHistItem = { ops: EdOTOp[]; cid: string | null; undo: SyncUndo; by?: SyncBy };
+type SyncSnap = { rid?: string; ver: number; text: string; meta: SyncMeta };
+/* a timer handle: a number, or Node's Timeout */
+type SyncTimer = number & { unref?: () => void };
+type SyncAsk = { rid: string; kind: string; prompt: string; init: unknown; table: string[] | null; frame: EdFrame | null };
+type SyncCtx = { point?: number; mark?: number; buffer?: string | number; prefix?: SchemeValue };
+type SyncCallOpts = { cmd?: string; form?: string; args?: unknown[]; buf?: string | EdBuffer; ctx?: unknown };
+type SyncPending = { buf: string; sver: number; sverText: string; seq: number; inflight: SyncInflight | null; queue: SyncBatch[] };
+type SyncListener = (...args: unknown[]) => unknown;
+/* a replica's protocol state (b.sync) */
+interface SyncBufState extends EdBufferSync {
+  undoStack: (string | number)[];
+  redoStack: { u: number; of: string | number }[];
+  create: boolean;
+  waiters: { resolve: (b: SyncBuffer) => void; reject: (e: Error) => void }[];
+  anchorsServer: SyncAnchor[];
+  anchorsVer?: number;
+  lastSel: string | null;
+  selTimer: SyncTimer | null;
+  snap?: SyncSnap | null;
+  snapText?: string | null;
+  /* the undo group of the command making a change (groupFor) */
+  g?: number;
+  gCmd?: number;
+  gRun?: number;
+  gSession?: boolean;
+  gWasSelf?: boolean;
+}
+/* a buffer edwind shares */
+interface SyncBuffer extends EdBuffer {
+  id: string;
+  shared: boolean;
+  sver: number;
+  inflight: SyncInflight | null;
+  queue: SyncBatch[];
+  hist: SyncHist[];
+  presence: EdPresence[];
+  sync: SyncBufState;
+  meta: EdBufferMeta;
+}
+type SyncClient = {
+  state: string;
+  started: boolean;
+  ready: boolean;
+  cid: string | null;
+  device: string | null;
+  transport: (() => EdTransport) | null;
+  sock: EdTransport | null;
+  sockOpen?: boolean;
+  epoch: string | null;
+  boot: string | null;
+  gen: number;
+  welcome: SyncWelcomeMsg | null;
+  epochChanged: boolean;
+  buffers: Map<string, SyncBuffer>;
+  calls: Map<string, SyncCall>;
+  listeners: Map<string, SyncListener[]>;
+  ridN: number;
+  backoff: number;
+  reconnectTimer: SyncTimer | null;
+  closing: boolean;
+  spinning: number;
+  asks: SyncAsk[];
+  askPending: boolean;
+  startP?: Promise<SyncWelcomeMsg>;
+  firstWelcome?: ((m: SyncWelcomeMsg) => void) | null;
+  /* the buffer this file is changing, so hooks.applied ignores it */
+  applying?: EdBuffer | null;
+  /* the undo group the next local change carries (an undo or redo batch, the page) */
+  pendingUndo?: SyncUndo | null;
+  booted?: boolean;
+  on(ev: string, fn: SyncListener): () => void;
+  emit(ev: string, ...args: unknown[]): boolean;
+};
 const L = globalThis.L, Ed = globalThis.Ed, E = Ed.E, H = Ed.hooks, OT = globalThis.EdOT;
 const { intern, NIL, signal, listOf, truthy, Sym } = L;
 const host = Ed.host;
@@ -22,24 +135,24 @@ const SPINNER_MS = 150;       // R4.27
 const BACKOFF_MIN = 250, BACKOFF_MAX = 8000;   // R7.19 shutting_down
 const AGENT_FADE_MS = 5000;   // R9.13
 
-function randomHex(n) {
+function randomHex(n: number) {
   const c = globalThis.crypto;
   if (c && c.getRandomValues) { const a = new Uint8Array(n / 2); c.getRandomValues(a); return Array.from(a, x => x.toString(16).padStart(2, '0')).join(''); }
   let s = ''; while (s.length < n) s += Math.floor(Math.random() * 16).toString(16); return s;
 }
-const basename = id => { const s = id.startsWith('name:') ? id.slice(5) : id; const i = s.lastIndexOf('/'); return i >= 0 ? s.slice(i + 1) : s; };
+const basename = (id: string) => { const s = id.startsWith('name:') ? id.slice(5) : id; const i = s.lastIndexOf('/'); return i >= 0 ? s.slice(i + 1) : s; };
 const timeTag = () => new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/, '').replace('T', '-');
 /* JSON from the server as a Scheme value (var, R4.18): arrays are lists, objects hash tables, integers exact. */
-function fromJSON(j) {
+function fromJSON(j: unknown): SchemeValue {
   if (j === null || j === undefined) return false;
   if (Array.isArray(j)) return listOf(j.map(fromJSON));
-  if (typeof j === 'object') { const m = new Map(); for (const [k, v] of Object.entries(j)) m.set(k, fromJSON(v)); return m; }
+  if (typeof j === 'object') { const m = new Map<SchemeValue, SchemeValue>(); for (const [k, v] of Object.entries(j)) m.set(k, fromJSON(v)); return m; }
   if (typeof j === 'number' && Number.isInteger(j)) return BigInt(j);
-  return j;
+  return j as SchemeValue;
 }
 /* A writer's key, label and colour (R9.13). */
-const writerKey = by => (by ? (by.cid ? 'c:' + by.cid : by.device ? 'd:' + by.device : 'k:' + by.kind) : 'k:?');
-function writerLabel(by) {
+const writerKey = (by: SyncBy | null | undefined) => (by ? (by.cid ? 'c:' + by.cid : by.device ? 'd:' + by.device : 'k:' + by.kind) : 'k:?');
+function writerLabel(by: SyncBy | null | undefined) {
   if (!by) return '?';
   if (by.kind === 'agent') return by.name || 'agent';
   if (by.kind === 'cli') return by.session ? 'wb ' + by.session : by.device || 'cli';
@@ -47,12 +160,12 @@ function writerLabel(by) {
   if (by.kind === 'server') return by.thread || 'server';
   return by.device || by.kind;
 }
-function writerColor(key) { let h = 0; for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0; return `hsl(${h % 360} 65% 45%)`; }
-const originOf = by => (by && by.kind === 'disk' ? 'disk' : by && by.kind === 'server' ? 'server' : by && by.kind === 'agent' ? 'agent' : 'remote');
-const deletes = o => { let n = 0; for (const x of o.c) if (typeof x === 'number' && x < 0) n -= x; return n; };
+function writerColor(key: string) { let h = 0; for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0; return `hsl(${h % 360} 65% 45%)`; }
+const originOf = (by: SyncBy | null | undefined) => (by && by.kind === 'disk' ? 'disk' : by && by.kind === 'server' ? 'server' : by && by.kind === 'agent' ? 'agent' : 'remote');
+const deletes = (o: EdTextOperation) => { let n = 0; for (const x of o.c) if (typeof x === 'number' && x < 0) n -= x; return n; };
 
 /* ---------- the client ---------- */
-const sync = {
+const sync: SyncClient = {
   state: 'offline', started: false, ready: false, cid: null, device: null, transport: null, sock: null,
   epoch: null, boot: null, gen: 0, welcome: null, epochChanged: false,
   buffers: new Map(), calls: new Map(), listeners: new Map(),
@@ -61,11 +174,11 @@ const sync = {
   emit(ev, ...args) { const l = this.listeners.get(ev); let handled = false; if (l) for (const fn of l.slice()) { try { if (fn(...args) === true) handled = true; } catch (e) { console.error(e); } } return handled; },
 };
 const newRid = () => 'f' + (++sync.ridN);
-function setState(s) { if (sync.state === s) return; sync.state = s; sync.emit('state', s); statusChanged(); }
+function setState(s: string) { if (sync.state === s) return; sync.state = s; sync.emit('state', s); statusChanged(); }
 function statusChanged() { for (const f of E.frames) Ed.frameEvent('status', f); Ed.scheduleRender(); }
-function send(obj) { if (sync.sock && sync.sockOpen) { try { sync.sock.send(JSON.stringify(obj)); return true; } catch (e) { return false; } } return false; }
+function send(obj: SyncOut) { if (sync.sock && sync.sockOpen) { try { sync.sock.send!(JSON.stringify(obj)); return true; } catch (e) { return false; } } return false; }
 
-function start({ transport, device, cid } = {}) {
+function start({ transport, device, cid }: { transport?: () => EdTransport; device?: string; cid?: string } = {}) {
   if (sync.started) return sync.startP;
   if (typeof transport !== 'function') throw new Error('Ed.sync.start needs a transport factory');
   sync.started = true; sync.transport = transport;
@@ -78,15 +191,15 @@ function connect() {
   if (sync.closing || sync.epochChanged) return;
   sync.reconnectTimer = null;
   setState('connecting');
-  let s;
-  try { s = sync.transport(); } catch (e) { scheduleReconnect(); return; }
+  let s: EdTransport;
+  try { s = sync.transport!(); } catch (e) { scheduleReconnect(); return; }
   sync.sock = s; sync.sockOpen = false;
   s.onopen = () => { if (sync.sock !== s) return; sync.sockOpen = true; send({ t: 'hello', proto: 1, cid: sync.cid, kind: 'frame', device: sync.device, caps: {} }); };
   s.onmessage = ev => { if (sync.sock === s) onLine(typeof ev === 'string' ? ev : ev.data); };
   s.onclose = () => onClose(s);
   s.onerror = () => { /* onclose follows */ };
 }
-function onClose(s) {
+function onClose(s: EdTransport) {
   if (sync.sock !== s) return;
   sync.sock = null; sync.sockOpen = false;
   setState('offline');
@@ -100,15 +213,15 @@ function scheduleReconnect() {
   sync.reconnectTimer = setTimeout(connect, wait);
   if (sync.reconnectTimer.unref) sync.reconnectTimer.unref();
 }
-function close() { sync.closing = true; if (sync.reconnectTimer) clearTimeout(sync.reconnectTimer); if (sync.sock) { try { sync.sock.close(); } catch (e) { /* closing */ } } }
+function close() { sync.closing = true; if (sync.reconnectTimer) clearTimeout(sync.reconnectTimer); if (sync.sock) { try { sync.sock.close!(); } catch (e) { /* closing */ } } }
 
 /* ---------- messages from edwind ---------- */
-function onLine(text) {
-  let msg; try { msg = JSON.parse(text); } catch (e) { return; }
+function onLine(text: string) {
+  let msg: { t?: unknown } | null; try { msg = JSON.parse(text); } catch (e) { return; }
   if (!msg || typeof msg.t !== 'string') return;
-  try { dispatch(msg); } catch (e) { console.error('sync', msg.t, e); }
+  try { dispatch(msg as SyncServerMsg); } catch (e) { console.error('sync', msg.t, e); }
 }
-function dispatch(msg) {
+function dispatch(msg: SyncServerMsg) {
   switch (msg.t) {
     case 'welcome': return onWelcome(msg);
     case 'ping': return void send({ t: 'pong', rid: msg.rid });
@@ -132,7 +245,7 @@ function dispatch(msg) {
     default: return;   // R7.4
   }
 }
-function onWelcome(msg) {
+function onWelcome(msg: SyncWelcomeMsg) {
   sync.welcome = msg;
   if (sync.epoch && msg.imageEpoch !== sync.epoch) {
     /* R7.19: the image was reset or compacted; the page starts a fresh frame runtime. */
@@ -146,25 +259,25 @@ function onWelcome(msg) {
   if (!first) imageQuery(sync.gen).catch(() => {});
   if (sync.firstWelcome) { const r = sync.firstWelcome; sync.firstWelcome = null; r(msg); }
 }
-function sendOpen(b, opts = {}) {
+function sendOpen(b: SyncBuffer, opts: { snap?: boolean } = {}) {
   const s = b.sync, rid = newRid();
-  const m = { t: 'open', rid, buf: b.id };
+  const m: { t: 'open'; rid: string; buf: string; since?: number; create?: boolean } = { t: 'open', rid, buf: b.id };
   if (!opts.snap && b.sver >= 0) m.since = b.sver;
   if (s.create) m.create = true;
   s.opening = rid; s.snapText = null;
   send(m);
   return rid;
 }
-function bufOf(msg) { return sync.buffers.get(msg.buf) || null; }
+function bufOf(msg: { buf: string }) { return sync.buffers.get(msg.buf) || null; }
 
 /* ---------- open, snap, opened ---------- */
-function open(id, { create } = {}) {
+function open(id: string, { create }: { create?: boolean } = {}): Promise<SyncBuffer> {
   if (typeof id !== 'string' || !id) return Promise.reject(new Error('Ed.sync.open needs a buffer id'));
   let b = sync.buffers.get(id);
   if (b) return b.sync.opening || b.sver < 0 ? openPromise(b) : Promise.resolve(b);
   let name = basename(id);
-  if (Ed.getBuffer(name)) name = L.call('generate-new-buffer-name', [name]);
-  b = new Ed.Buffer(name);
+  if (Ed.getBuffer(name)) name = L.call('generate-new-buffer-name', [name]) as string;
+  b = new Ed.Buffer(name) as SyncBuffer;
   b.id = id; b.shared = true; b.file = id; b.sver = -1; b.inflight = null; b.queue = []; b.hist = []; b.presence = [];
   b.meta = { file: null, mode: b.mode, modified: false, readOnly: false, saved: 0, diskChanged: null, eol: 'lf', anchors: [], locals: {} };
   b.readOnly = true;   // until the snapshot
@@ -175,12 +288,12 @@ function open(id, { create } = {}) {
   if (sync.state === 'online') sendOpen(b);
   return p;
 }
-function openPromise(b) { return new Promise((resolve, reject) => b.sync.waiters.push({ resolve, reject })); }
-function settleOpen(b, err) { const ws = b.sync.waiters.splice(0); for (const w of ws) (err ? w.reject(err) : w.resolve(b)); }
+function openPromise(b: SyncBuffer) { return new Promise<SyncBuffer>((resolve, reject) => b.sync.waiters.push({ resolve, reject })); }
+function settleOpen(b: SyncBuffer, err?: Error) { const ws = b.sync.waiters.splice(0); for (const w of ws) (err ? w.reject(err) : w.resolve(b)); }
 /* Ed.sync.close(buf): the subscription ends and the replica goes with it at once (close has no answer to wait
    for): kill-buffer moves every window showing it, in any frame, to another buffer first, so closed replicas do
    not pile up in the buffer list. An open still on its way is settled with an error. */
-function closeBuffer(id) {
+function closeBuffer(id: string | SyncBuffer) {
   const b = typeof id === 'string' ? sync.buffers.get(id) : id;
   if (!b) return;
   send({ t: 'close', buf: b.id });
@@ -188,19 +301,19 @@ function closeBuffer(id) {
   if (b.sync && b.sync.opening) { b.sync.opening = null; settleOpen(b, Object.assign(new Error(`${b.id}: closed`), { code: 'closed' })); }
   if (E.buffers.includes(b)) { try { L.call('kill-buffer', [b]); } catch (e) { Ed.reportError(e); } Ed.scheduleRender(); }
 }
-function onSnap(msg) {
+function onSnap(msg: SyncSnapMsg) {
   const b = bufOf(msg); if (!b) return;
   const s = b.sync;
   s.snap = { rid: msg.rid, ver: msg.ver, text: msg.text, meta: msg.meta };
   if (!msg.more) finishSnap(b);
 }
-function onChunk(msg) {
+function onChunk(msg: SyncChunkMsg) {
   const b = bufOf(msg); if (!b || !b.sync.snap) return;
   b.sync.snap.text += msg.text;
   if (!msg.more) finishSnap(b);
 }
-function finishSnap(b) {
-  const s = b.sync, snap = s.snap; s.snap = null;
+function finishSnap(b: SyncBuffer) {
+  const s = b.sync, snap = s.snap!; s.snap = null;
   if ((b.inflight || b.queue.length) && snap.text === s.sverText) {
     /* The server has no history for us (a restart) but the same text: our pending batches still apply and
        are resent after opened (R7.16). */
@@ -224,7 +337,7 @@ function finishSnap(b) {
   statusChanged();
 }
 /* Replace the whole text of B as one change with ORIGIN: the differing middle only. */
-function replaceText(b, text, origin) {
+function replaceText(b: EdBuffer, text: string, origin: string) {
   const old = b.rope.toString();
   if (old === text) return;
   const n = Math.min(old.length, text.length);
@@ -235,14 +348,14 @@ function replaceText(b, text, origin) {
   sync.applying = b;
   try { Ed.applyOps(b, [[pre, old.slice(pre, old.length - suf), text.slice(pre, text.length - suf)]], origin, text); } finally { sync.applying = null; }
 }
-function onOpened(msg) {
+function onOpened(msg: SyncOpenedMsg) {
   const b = bufOf(msg); if (!b) return;
   const s = b.sync;
   if (s.opening !== msg.rid && s.opening !== null) return;
   s.opening = null;
   if (b.sver < 0) { b.sver = msg.ver; }
   if (b.inflight) sendEdit(b);   // R7.16: resend the unacknowledged batch
-  else if (b.queue.length) { const q = b.queue.shift(); b.inflight = { seq: ++s.seq, base: b.sver, ops: q.ops, undo: q.undo }; sendEdit(b); }
+  else if (b.queue.length) { const q = b.queue.shift()!; b.inflight = { seq: ++s.seq, base: b.sver, ops: q.ops, undo: q.undo }; sendEdit(b); }
   settleOpen(b);
   statusChanged();
 }
@@ -250,23 +363,23 @@ function onOpened(msg) {
 /* ---------- local edits (R7.12, R6.15) ---------- */
 /* The undo group of the change a command is making in B: one per command, shared by an Evil insert
    session and by a run of self-inserts (R6.15). */
-function groupFor(b) {
+function groupFor(b: SyncBuffer) {
   const s = b.sync, self = intern('self-insert-command');
   if (s.gCmd === E.cmdSeq && s.g !== undefined) return s.g;
   const inSession = !!(H.inSession && H.inSession(b));
-  const selfRun = E.thisCommand === self && E.lastCommand === self && s.gWasSelf && s.gRun < 20;
+  const selfRun = E.thisCommand === self && E.lastCommand === self && s.gWasSelf && s.gRun! < 20;
   const cont = s.g !== undefined && ((inSession && s.gSession) || selfRun);
-  if (!cont) { s.g = ++s.gCount; s.gRun = 0; } else s.gRun++;
+  if (!cont) { s.g = ++s.gCount; s.gRun = 0; } else s.gRun!++;
   s.gCmd = E.cmdSeq; s.gSession = inSession; s.gWasSelf = E.thisCommand === self;
-  return s.g;
+  return s.g!;
 }
-const wireUndo = u => (u.of !== undefined ? { g: u.g, of: u.of } : { g: u.g });
-function sendEdit(b) {
+const wireUndo = (u: SyncUndo) => (u.of !== undefined ? { g: u.g, of: u.of } : { g: u.g });
+function sendEdit(b: SyncBuffer) {
   const f = b.inflight; if (!f) return;
   if (sync.state !== 'online' || b.sync.opening) return;
   send({ t: 'edit', buf: b.id, base: f.base, seq: f.seq, ops: f.ops, undo: wireUndo(f.undo) });
 }
-function local(b, ops, undo) {
+function local(b: SyncBuffer, ops: EdOTOp[], undo: SyncUndo | null | undefined) {
   const s = b.sync;
   const u = undo || { g: groupFor(b) };
   if (!b.inflight) { b.inflight = { seq: ++s.seq, base: b.sver, ops: ops.slice(), undo: u }; sendEdit(b); }
@@ -279,11 +392,11 @@ H.applied = (b, ops, origin) => {
   if (!sync.started || !b.shared || sync.applying === b) return;
   if (origin !== 'local') return;
   const u = sync.pendingUndo; sync.pendingUndo = null;
-  local(b, ops, u);
+  local(b as SyncBuffer, ops, u);
 };
 
 /* ---------- remote batches and acks (R6.9) ---------- */
-function onEdits(msg) {
+function onEdits(msg: SyncEditsMsg) {
   const b = bufOf(msg); if (!b || b.sver < 0) return;
   const s = b.sync;
   if (msg.ver <= b.sver) return;                       // already applied (a replay overlap)
@@ -313,7 +426,7 @@ function onEdits(msg) {
   touchPresence(b, msg.by);
   anchorsChanged(b);
 }
-function onAck(msg) {
+function onAck(msg: SyncAckMsg) {
   const b = bufOf(msg); if (!b) return;
   const s = b.sync;
   if (!b.inflight || b.inflight.seq !== msg.seq) {
@@ -328,22 +441,22 @@ function onAck(msg) {
   for (const [pos, del, ins] of f.ops) for (const a of s.anchorsServer) a.pos = OT.shiftMarker(a.pos, 'after', pos, del.length, ins.length);
   b.inflight = null;
   if (msg.h !== undefined && OT.hash(s.sverText) !== msg.h) { divergence(b, 'the text hash differs'); return; }
-  if (b.queue.length) { const q = b.queue.shift(); b.inflight = { seq: ++s.seq, base: b.sver, ops: q.ops, undo: q.undo }; sendEdit(b); }
+  if (b.queue.length) { const q = b.queue.shift()!; b.inflight = { seq: ++s.seq, base: b.sver, ops: q.ops, undo: q.undo }; sendEdit(b); }
   anchorsChanged(b);
   for (const fr of E.frames) if (fr.sel && fr.sel.buffer === b) Ed.frameEvent('status', fr, b);
   Ed.scheduleRender();
 }
 const HIST_MAX = 10000;
-function trimHist(b) { if (b.hist.length > HIST_MAX) b.hist.splice(0, b.hist.length - HIST_MAX); }
+function trimHist(b: SyncBuffer) { if (b.hist.length > HIST_MAX) b.hist.splice(0, b.hist.length - HIST_MAX); }
 /* R7.14, R7.18: the replica is discarded; unsent edits go to an offline buffer; the buffer is reopened fresh. */
-function divergence(b, why) {
+function divergence(b: SyncBuffer, why: string) {
   console.warn('edwin sync: divergence on', b.id, why);
   Ed.message(`${b.name}: ${why}; reloading it from edwind`);
   offlineCopy(b, why);
   b.inflight = null; b.queue = [];
   reopen(b, why, { snap: true });
 }
-function offlineCopy(b, why) {
+function offlineCopy(b: SyncBuffer, why: string) {
   if (!b.inflight && !b.queue.length) return null;
   const name = `${b.name}~offline-${timeTag()}`;
   const nb = Ed.getBufferCreate(name);
@@ -351,29 +464,29 @@ function offlineCopy(b, why) {
   Ed.message(`${b.name}: your unsent edits are kept in ${name} (${why})`);
   return nb;
 }
-function reopen(b, why, opts = {}) {
+function reopen(b: SyncBuffer, why: string, opts: { snap?: boolean } = {}) {
   if (sync.state !== 'online') return;
   if (opts.snap) { b.inflight = null; b.queue = []; }
   sendOpen(b, opts);
 }
 
 /* ---------- undo (R6.15-R6.19) ---------- */
-function historyItems(b, from) {
-  const out = b.hist.slice(from || 0).map(x => ({ ops: x.ops, cid: x.cid, undo: x.undo || { g: 'v' + x.ver }, by: x.by }));
+function historyItems(b: SyncBuffer, from?: number) {
+  const out: SyncHistItem[] = b.hist.slice(from || 0).map(x => ({ ops: x.ops, cid: x.cid, undo: x.undo || { g: 'v' + x.ver }, by: x.by }));
   if (b.inflight) out.push({ ops: b.inflight.ops, cid: sync.cid, undo: b.inflight.undo });
   for (const q of b.queue) out.push({ ops: q.ops, cid: sync.cid, undo: q.undo });
   return out;
 }
-function applyUndoBatch(b, ops, undo) {
+function applyUndoBatch(b: SyncBuffer, ops: EdOTOp[], undo: SyncUndo) {
   sync.pendingUndo = undo;
   try { Ed.applyOps(b, ops, 'local'); } finally { sync.pendingUndo = null; }
   if (ops.length) { b.pt = Math.min(ops[0][0] + (ops[0][2] ? ops[0][2].length : 0), b.rope.length); if (H.clampPoint) H.clampPoint(b); }
 }
-function otherWriter(items) { for (let i = items.length - 1; i >= 0; i--) if (items[i].cid !== sync.cid) return writerLabel(items[i].by); return 'another writer'; }
-function undoShared(b) {
+function otherWriter(items: SyncHistItem[]) { for (let i = items.length - 1; i >= 0; i--) if (items[i].cid !== sync.cid) return writerLabel(items[i].by); return 'another writer'; }
+function undoShared(b: SyncBuffer) {
   const s = b.sync;
   while (s.undoStack.length) {
-    const g = s.undoStack.pop();
+    const g = s.undoStack.pop()!;
     const items = historyItems(b);
     const idx = items.findIndex(x => x.cid === sync.cid && x.undo && x.undo.g === g);
     if (idx < 0) { s.undoStack.length = 0; break; }   // before the retained history: the server undoes (R6.19)
@@ -391,12 +504,12 @@ function undoShared(b) {
   spin(call({ cmd: 'undo', buf: b.id })).then(r => { Ed.message(r.error ? r.error.report : r.msg || (r.value ? 'Undo' : 'No further undo information')); Ed.scheduleRender(); });
   return false;
 }
-function redoShared(b) {
+function redoShared(b: SyncBuffer) {
   const s = b.sync;
   const r = s.redoStack.pop();
   if (!r) signal('user-error', 'Already at newest change');
   const items = historyItems(b);
-  const idx = items.findIndex(x => x.cid === sync.cid && x.undo && x.undo.g === r.u);
+  const idx = items.findIndex(x => x.cid === sync.cid && x.undo && x.undo.g === r!.u);
   if (idx < 0) signal('user-error', 'Redo history is no longer available');
   const text = b.rope.toString();
   const before = OT.textBefore(text, items.slice(idx));
@@ -415,17 +528,17 @@ function redoShared(b) {
   Ed.message(partial ? `Redo (partial: changed by ${otherWriter(items.slice(idx + 1))})` : 'Redo');
   return false;
 }
-H.undoShared = undoShared;
-H.redoShared = redoShared;
+H.undoShared = undoShared as (b: EdBuffer) => unknown;
+H.redoShared = redoShared as (b: EdBuffer) => unknown;
 
 /* ---------- meta, anchors (R9.12), presence (R9.13) ---------- */
-function applyMeta(b, m, ver) {
+function applyMeta(b: SyncBuffer, m: Partial<SyncMeta>, ver?: number) {
   const s = b.sync;
-  const meta = b.meta || {};
-  for (const k of ['file', 'mode', 'modified', 'readOnly', 'saved', 'diskChanged', 'eol', 'locals']) if (m[k] !== undefined) meta[k] = m[k];
+  const meta: EdBufferMeta = b.meta || {};
+  for (const k of ['file', 'mode', 'modified', 'readOnly', 'saved', 'diskChanged', 'eol', 'locals'] as const) if (m[k] !== undefined) (meta as Record<string, unknown>)[k] = m[k];
   b.meta = meta;
   if (Array.isArray(m.anchors)) {
-    const at = Number.isInteger(ver) ? ver : Number.isInteger(m.ver) ? m.ver : b.sver;
+    const at = (Number.isInteger(ver) ? ver : Number.isInteger(m.ver) ? m.ver : b.sver) as number;
     const anchors = m.anchors.map(a => ({ id: a.id, pos: a.pos, label: a.label }));
     /* Positions at version AT are brought to the current server version through the batches since. */
     if (at < b.sver) for (const h of b.hist) if (h.ver > at) for (const [pos, del, ins] of h.ops) for (const a of anchors) a.pos = OT.shiftMarker(a.pos, 'after', pos, del.length, ins.length);
@@ -439,34 +552,34 @@ function applyMeta(b, m, ver) {
   statusChanged();
 }
 /* b.meta.anchors in the replica's coordinates: the server positions mapped through inflight and the queue. */
-function anchorsChanged(b) {
+function anchorsChanged(b: SyncBuffer) {
   const s = b.sync;
   const out = s.anchorsServer.map(a => ({ id: a.id, pos: a.pos, label: a.label }));
-  const through = ops => { for (const [pos, del, ins] of ops) for (const a of out) a.pos = OT.shiftMarker(a.pos, 'after', pos, del.length, ins.length); };
+  const through = (ops: EdOTOp[]) => { for (const [pos, del, ins] of ops) for (const a of out) a.pos = OT.shiftMarker(a.pos, 'after', pos, del.length, ins.length); };
   if (b.inflight) through(b.inflight.ops);
   for (const q of b.queue) through(q.ops);
   b.meta.anchors = out;
 }
 /* Local edits move the anchors too (R9.12): b.meta.anchors is recomputed after every change. */
-{ const prev = H.applied; H.applied = (b, ops, origin) => { prev(b, ops, origin); if (b.shared && b.sync && sync.started) anchorsChanged(b); }; }
-function onMeta(msg) { const b = bufOf(msg); if (!b) return; applyMeta(b, msg, msg.ver); }
-function onSel(msg) {
+{ const prev = H.applied; H.applied = (b, ops, origin) => { prev!(b, ops, origin); if (b.shared && b.sync && sync.started) anchorsChanged(b as SyncBuffer); }; }
+function onMeta(msg: SyncMetaMsg) { const b = bufOf(msg); if (!b) return; applyMeta(b, msg, msg.ver); }
+function onSel(msg: SyncSelMsg) {
   const b = bufOf(msg); if (!b || !Array.isArray(msg.ranges)) return;
   const key = writerKey(msg.by);
   let p = b.presence.find(x => x.key === key);
   if (!p) { p = { key, by: msg.by, color: writerColor(key), label: writerLabel(msg.by), ranges: [], at: 0 }; b.presence.push(p); }
-  p.ranges = msg.ranges.filter(r => Array.isArray(r) && r.length === 2).map(r => [Math.max(0, Math.min(b.rope.length, r[0])), Math.max(0, Math.min(b.rope.length, r[1]))]);
+  p.ranges = (msg.ranges.filter(r => Array.isArray(r) && r.length === 2) as number[][]).map((r): [number, number] => [Math.max(0, Math.min(b.rope.length, r[0])), Math.max(0, Math.min(b.rope.length, r[1]))]);
   p.at = Date.now(); p.agent = msg.by && msg.by.kind === 'agent';
   b._presTick = (b._presTick || 0) + 1;
   Ed.scheduleRender();
 }
-function touchPresence(b, by) {
+function touchPresence(b: SyncBuffer, by: SyncBy | null | undefined) {
   if (!by) return;
   const key = writerKey(by), p = b.presence.find(x => x.key === key);
   if (p) { p.at = Date.now(); b._presTick = (b._presTick || 0) + 1; }
 }
 /* Our own point and mark, sent as sel at most 20 times a second. */
-function maybeSendSel(b) {
+function maybeSendSel(b: SyncBuffer) {
   if (!b.shared || sync.state !== 'online') return;
   const s = b.sync;
   const r = b.markActive && b.mark !== null ? [Math.min(b.pt, b.mark), Math.max(b.pt, b.mark)] : [b.pt, b.pt];
@@ -479,14 +592,14 @@ function maybeSendSel(b) {
 }
 /* Other writers' cursors and regions, drawn in a frame's presence layer with the writer's colour and label. */
 H.renderPresence = f => {
-  let layer = f.el('presence');
-  const doc = f.root.ownerDocument;
+  let layer = f.el('presence') as (HTMLElement & { _h?: string }) | null;
+  const doc = f.root!.ownerDocument;
   const bufs = Ed.leaves(f.wroot).map(w => w.buffer);
   const any = bufs.some(b => b.presence && b.presence.length);
   if (!any) { if (layer) layer.textContent = ''; return; }
-  if (!layer) { layer = doc.createElement('div'); layer.className = 'ed-presence'; layer.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:3;overflow:hidden'; f.root.appendChild(layer); f.parts.presence = layer; }
-  const sc = Ed.frameScale(f), fr = f.root.getBoundingClientRect(), now = Date.now();
-  const parts = [];
+  if (!layer) { layer = doc.createElement('div'); layer.className = 'ed-presence'; layer.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:3;overflow:hidden'; f.root!.appendChild(layer); f.parts.presence = layer; }
+  const sc = Ed.frameScale(f), fr = f.root!.getBoundingClientRect(), now = Date.now();
+  const parts: string[] = [];
   let fadeDue = 0;
   for (const w of Ed.leaves(f.wroot)) {
     const b = w.buffer; if (!b.presence) continue;
@@ -508,10 +621,10 @@ H.renderPresence = f => {
   if (layer._h !== html) { layer.innerHTML = html; layer._h = html; }
   if (fadeDue) { clearTimeout(f._fadeTimer); f._fadeTimer = setTimeout(() => { for (const b of bufs) b._presTick = (b._presTick || 0) + 1; Ed.frameRender(); }, fadeDue + 20); }
 };
-function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]); }
+function esc(s: unknown) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' } as Record<string, string>)[c]); }
 /* Client rects of the text from FROM to TO in window W, line by line, for the lines that are drawn. */
-function rangeRects(w, from, to) {
-  const t = w.buffer.rope, out = [];
+function rangeRects(w: EdWindow, from: number, to: number) {
+  const t = w.buffer.rope, out: { left: number; top: number; width: number; height: number }[] = [];
   let ls = Ed.bol(t, from), n = 0;
   while (ls <= to && n++ < 200) {
     const le = Ed.eol(t, ls);
@@ -525,7 +638,7 @@ function rangeRects(w, from, to) {
 }
 
 /* ---------- moved, killed, display ---------- */
-function onMoved(msg) {
+function onMoved(msg: SyncMovedMsg) {
   const b = bufOf(msg); if (!b) return;
   sync.buffers.delete(b.id);
   /* This tab already holds a replica of the new id (an open of an old id edwind sent on): that one stays, and the
@@ -547,56 +660,57 @@ function onMoved(msg) {
   sendOpen(b, { snap: true });
   sync.emit('moved', { buf: msg.buf, to: msg.to });   // the page that names the buffer by id follows (app.js)
 }
-function onKilled(msg) {
+function onKilled(msg: SyncKilledMsg) {
   const b = bufOf(msg); if (!b) return;
   sync.buffers.delete(b.id); b.shared = false;
   if (E.buffers.includes(b)) { try { L.call('kill-buffer', [b]); } catch (e) { Ed.reportError(e); } }
   Ed.message(`${b.name} was killed on the server`);
   Ed.scheduleRender();
 }
-function onDisplay(msg) {
+function onDisplay(msg: SyncDisplayMsg) {
   if (sync.emit('display', { buf: msg.buf, how: msg.how })) return;
   if (!E.frame) return;
   open(msg.buf).then(b => { Ed.popToBuffer(b, false); Ed.scheduleRender(); }, e => Ed.message(String(e && e.message || e)));
 }
 
 /* ---------- calls, results, errors (section 7.4) ---------- */
-function ctxNow(buf) {
-  const b = buf || E.current, ctx = {};
+function ctxNow(buf?: EdBuffer | null) {
+  const b = buf || E.current, ctx: SyncCtx = {};
   if (b) { ctx.point = b.pt + 1; if (b.mark !== null && b.mark !== undefined) ctx.mark = b.mark + 1; if (b.shared) ctx.buffer = b.id; }
   if (E.prefixArg !== null && E.prefixArg !== undefined) ctx.prefix = E.prefixArg;
   return ctx;
 }
-function call({ cmd, form, args, buf, ctx } = {}) {
+function call({ cmd, form, args, buf, ctx }: SyncCallOpts = {}): Promise<SyncReply> {
   if (sync.state !== 'online') return Promise.resolve({ error: { condition: 'offline', report: 'edwind is not connected' } });
   const rid = newRid();
-  const m = { t: 'call', rid, ctx: ctx || ctxNow() };
+  const m: { t: 'call'; rid: string; ctx: unknown; form?: string; cmd?: string; args?: unknown[]; buf?: string | number } = { t: 'call', rid, ctx: ctx || ctxNow() };
   if (typeof form === 'string') m.form = form; else m.cmd = String(cmd);
   if (args !== undefined) m.args = args;
   const bid = typeof buf === 'string' ? buf : buf && buf.shared ? buf.id : E.current && E.current.shared ? E.current.id : undefined;
   if (bid) m.buf = bid;
   return new Promise(resolve => { sync.calls.set(rid, { resolve, frame: E.frame, at: Date.now(), rid }); send(m); });
 }
-function onResult(msg) {
-  const c = sync.calls.get(msg.rid); if (!c) return;
-  sync.calls.delete(msg.rid); spinnerOff(c);
-  const r = {}; for (const k of ['value', 'error', 'msg', 'out']) if (msg[k] !== undefined) r[k] = msg[k];
+function onResult(msg: SyncResultMsg) {
+  const c = sync.calls.get(msg.rid!); if (!c) return;
+  sync.calls.delete(msg.rid!); spinnerOff(c);
+  const r: SyncReply = {}; for (const k of ['value', 'error', 'msg', 'out'] as const) if (msg[k] !== undefined) (r as Record<string, unknown>)[k] = msg[k];
   c.resolve(r);
 }
-function spin(p, c) {
+function spin<T>(p: Promise<T>, c?: unknown) {
   // A browser's (and the native prelude's) timer handle is a number, so the flag lives here, not on it.
   let fired = false;
-  const t = setTimeout(() => { sync.spinning++; statusChanged(); fired = true; }, SPINNER_MS);
+  const t: SyncTimer = setTimeout(() => { sync.spinning++; statusChanged(); fired = true; }, SPINNER_MS);
   if (t && t.unref) t.unref();
   const done = () => { clearTimeout(t); if (fired) { sync.spinning = Math.max(0, sync.spinning - 1); statusChanged(); } };
   p.then(done, done);
   return p;
 }
+function spinnerOff(c?: SyncCall): void;
 function spinnerOff() { /* the spinner is per call through spin(); nothing to do for the call record */ }
-function imageQuery(from) { const rid = newRid(); return new Promise(resolve => { sync.calls.set(rid, { resolve, frame: E.frame, at: Date.now(), rid }); send({ t: 'image?', rid, from }); }); }
-function onError(msg) {
+function imageQuery(from: number) { const rid = newRid(); return new Promise<SyncReply>(resolve => { sync.calls.set(rid, { resolve, frame: E.frame, at: Date.now(), rid }); send({ t: 'image?', rid, from }); }); }
+function onError(msg: SyncErrorMsg) {
   const code = msg.code || 'bad_request';
-  if (msg.rid && sync.calls.has(msg.rid)) { const c = sync.calls.get(msg.rid); sync.calls.delete(msg.rid); c.resolve({ error: { condition: code, report: msg.msg || code } }); return; }
+  if (msg.rid && sync.calls.has(msg.rid)) { const c = sync.calls.get(msg.rid)!; sync.calls.delete(msg.rid); c.resolve({ error: { condition: code, report: msg.msg || code } }); return; }
   const b = msg.buf ? sync.buffers.get(msg.buf) : null;
   if (b && msg.rid && b.sync.opening === msg.rid) {
     /* The open failed (no_buffer, bad_id, not_text, refused_path): the buffer goes away. */
@@ -626,7 +740,7 @@ function onError(msg) {
 }
 
 /* ---------- ask (R4.29, R10.10) ---------- */
-function onAsk(msg) {
+function onAsk(msg: SyncAskMsg) {
   const c = sync.calls.get(msg.rid);
   sync.asks.push({ rid: msg.rid, kind: msg.kind, prompt: String(msg.prompt || ''), init: msg.init, table: Array.isArray(msg.table) ? msg.table.map(String) : null, frame: c ? c.frame : E.frame });
   pumpAsks();
@@ -638,17 +752,17 @@ L.CMD('%sync-ask', '', '', 'Answer the next ask from edwind in the calling frame
   if (E.mini) { setTimeout(pumpAsks, 100); return false; }
   sync.asks.shift();
   if (a.frame && E.frames.includes(a.frame) && E.frame !== a.frame) Ed.selectFrame(a.frame);
-  let value, quit = false;
+  let value: unknown, quit = false;
   try {
     switch (a.kind) {
-      case 'completing': value = await Ed.readMini(a.prompt, a.init || '', () => a.table || [], { kind: 'ask' }); break;
+      case 'completing': value = await Ed.readMini(a.prompt, a.init as string || '', () => a.table || [], { kind: 'ask' }); break;
       case 'y-or-n': {
         for (;;) { const ch = L.chr(await Ed.readChar(a.prompt + '(y or n) ')); if (ch === 'y' || ch === 'Y') { value = true; break; } if (ch === 'n' || ch === 'N') { value = false; break; } Ed.ding(); }
         break;
       }
       case 'char': value = L.chr(await Ed.readChar(a.prompt)); break;
-      case 'number': { const v = await Ed.readMini(a.prompt, a.init || ''); const n = Number(v); value = v.trim() !== '' && !isNaN(n) ? n : v; break; }
-      case 'yes-or-no': default: value = await Ed.readMini(a.prompt, a.init || ''); break;
+      case 'number': { const v = await Ed.readMini(a.prompt, a.init as string || ''); const n = Number(v); value = v.trim() !== '' && !isNaN(n) ? n : v; break; }
+      case 'yes-or-no': default: value = await Ed.readMini(a.prompt, a.init as string || ''); break;
     }
   } catch (e) { if (!L.isQuit(e)) throw e; quit = true; }
   if (quit) { send({ t: 'answer', rid: a.rid, quit: true }); E.echo = 'Quit'; }
@@ -660,10 +774,10 @@ L.CMD('%sync-ask', '', '', 'Answer the next ask from edwind in the calling frame
 { const prev = H.beforeKey; H.beforeKey = async k => { if (k === 'C-g' && sync.started && sync.calls.size && sync.state === 'online') send({ t: 'interrupt' }); return prev ? prev(k) : false; }; }
 
 /* ---------- the image (R4.15-R4.18) ---------- */
-function onImage(msg) {
+function onImage(msg: SyncImageMsg) {
   const forms = Array.isArray(msg.forms) ? msg.forms : [];
   for (const text of forms) {
-    let read;
+    let read: SchemeValue[];
     try { read = L.readAll(String(text)); } catch (e) { Ed.message(`Image #${msg.gen}: unreadable form: ${Ed.errorText(e)}`); continue; }
     for (const f of read) {
       if (f instanceof L.Pair && f.car instanceof Sym && f.car.name === 'on-server') continue;   // R4.16
@@ -675,7 +789,7 @@ function onImage(msg) {
 }
 
 /* ---------- server commands and evaluation (R4.27, R4.15) ---------- */
-function serverCommand(name) {
+function serverCommand(name: string) {
   const b = E.current;
   const p = spin(call({ cmd: name, args: [], buf: b, ctx: ctxNow(b) }));
   p.then(r => {
@@ -685,7 +799,7 @@ function serverCommand(name) {
   });
   return false;
 }
-function evalServer(text, { insert, buf, done } = {}) {
+function evalServer(text: string, { insert, buf, done }: { insert?: 'inline' | 'line' | null; buf?: EdBuffer; done?: string } = {}) {
   const b = buf && buf.shared ? buf : null;
   const p = spin(call({ form: text, buf: b || undefined, ctx: ctxNow(buf) }));
   p.then(r => {
@@ -700,9 +814,9 @@ function evalServer(text, { insert, buf, done } = {}) {
 }
 
 /* ---------- files in served mode: visit, save, revert, kill ---------- */
-function visit(name) {
+function visit(name: string): SyncBuffer | Promise<SyncBuffer | false> {
   const id = String(name).trim();
-  const existing = sync.buffers.get(id) || E.buffers.find(b => b.shared && (b.id === id || b.file === id));
+  const existing = (sync.buffers.get(id) || E.buffers.find(b => b.shared && (b.id === id || b.file === id))) as SyncBuffer | undefined;
   if (existing && existing.sver >= 0) { Ed.setWindowBuffer(existing); if (H.visited) H.visited(existing, id, false); return existing; }
   return open(id, { create: true }).then(b => {
     Ed.setWindowBuffer(b);
@@ -713,12 +827,12 @@ function visit(name) {
     return b;
   }, e => { Ed.message(e && e.message ? e.message : String(e)); Ed.scheduleRender(); return false; });
 }
-function save(b) { b = typeof b === 'string' ? sync.buffers.get(b) : b; if (!b) return Promise.resolve({ error: { condition: 'error', report: 'no such buffer' } }); const rid = newRid(); return new Promise(resolve => { sync.calls.set(rid, { resolve, frame: E.frame, at: Date.now(), rid }); send({ t: 'save', rid, buf: b.id }); }); }
-function revert(b) { b = typeof b === 'string' ? sync.buffers.get(b) : b; if (!b) return Promise.resolve({ error: { condition: 'error', report: 'no such buffer' } }); const rid = newRid(); return new Promise(resolve => { sync.calls.set(rid, { resolve, frame: E.frame, at: Date.now(), rid }); send({ t: 'revert', rid, buf: b.id }); }); }
+function save(b: EdBuffer | string | undefined) { b = typeof b === 'string' ? sync.buffers.get(b) : b; if (!b) return Promise.resolve({ error: { condition: 'error', report: 'no such buffer' } }); const rid = newRid(); return new Promise<SyncReply>(resolve => { sync.calls.set(rid, { resolve, frame: E.frame, at: Date.now(), rid }); send({ t: 'save', rid, buf: b.id }); }); }
+function revert(b: EdBuffer | string | undefined) { b = typeof b === 'string' ? sync.buffers.get(b) : b; if (!b) return Promise.resolve({ error: { condition: 'error', report: 'no such buffer' } }); const rid = newRid(); return new Promise<SyncReply>(resolve => { sync.calls.set(rid, { resolve, frame: E.frame, at: Date.now(), rid }); send({ t: 'revert', rid, buf: b.id }); }); }
 /* The save goes out behind every edit already sent, so with none queued it covers the whole buffer: the buffer
    counts as saved at once, which lets :wq go on to quit. A quitting frame waits for the answer while b.saving,
    and stays when it is a refusal, which marks the buffer modified again and keeps the reason in b.saveError. */
-function saveShared(b) {
+function saveShared(b: SyncBuffer) {
   if (!b.queue.length) b.modified = false;
   b.saving = true; b.saveError = null;
   spin(save(b)).then(r => {
@@ -728,18 +842,18 @@ function saveShared(b) {
   });
   return false;
 }
-function revertShared(b) { spin(revert(b)).then(r => { Ed.message(r.error ? `${b.name}: ${r.error.report}` : `${b.file || b.id} reloaded`); Ed.scheduleRender(); }); return false; }
-function anchorAdd(buf, pos, label, id) {
+function revertShared(b: SyncBuffer) { spin(revert(b)).then(r => { Ed.message(r.error ? `${b.name}: ${r.error.report}` : `${b.file || b.id} reloaded`); Ed.scheduleRender(); }); return false; }
+function anchorAdd(buf: SyncBuffer | string, pos: number, label?: string | null, id?: string | null) {
   const bid = typeof buf === 'string' ? buf : buf.id;
-  const args = [bid, pos]; if (label !== undefined && label !== null) args.push(label); if (id !== undefined && id !== null) { if (args.length < 3) args.push(null); args.push(id); }
-  return call({ cmd: 'anchor-add', args, buf: bid, ctx: {} }).then(r => { if (r.error) throw Object.assign(new Error(r.error.report), r.error); return r.value && r.value.id !== undefined ? r.value.id : r.value; });
+  const args: unknown[] = [bid, pos]; if (label !== undefined && label !== null) args.push(label); if (id !== undefined && id !== null) { if (args.length < 3) args.push(null); args.push(id); }
+  return call({ cmd: 'anchor-add', args, buf: bid, ctx: {} }).then(r => { if (r.error) throw Object.assign(new Error(r.error.report), r.error); return r.value && (r.value as { id?: unknown }).id !== undefined ? (r.value as { id?: unknown }).id : r.value; });
 }
-function anchorRemove(buf, id) { const bid = typeof buf === 'string' ? buf : buf.id; return call({ cmd: 'anchor-remove', args: [bid, id], buf: bid, ctx: {} }).then(r => { if (r.error) throw Object.assign(new Error(r.error.report), r.error); return r.value; }); }
+function anchorRemove(buf: SyncBuffer | string, id: string) { const bid = typeof buf === 'string' ? buf : buf.id; return call({ cmd: 'anchor-remove', args: [bid, id], buf: bid, ctx: {} }).then(r => { if (r.error) throw Object.assign(new Error(r.error.report), r.error); return r.value; }); }
 
 /* ---------- the mode line (R9.15) and the frame events ---------- */
 H.modeStatus = b => {
   if (!sync.started) return '';
-  const out = [];
+  const out: string[] = [];
   if (b.shared) {
     if (b.inflight || (b.queue && b.queue.length)) out.push('•');
     if (sync.state !== 'online') out.push('⚠ offline');
@@ -757,44 +871,44 @@ H.statusKey = () => (sync.started ? sync.state + '|' + sync.spinning : '');
     /* An insert session that ended closes its undo group: the next change in that buffer starts a new one. */
     for (const sb of sync.buffers.values()) if (sb.sync.gSession && !(H.inSession && H.inSession(sb))) sb.sync.gSession = false;
     const f = E.frame, fb = f && f.sel ? f.sel.buffer : E.current;
-    if (fb && fb.shared) maybeSendSel(fb);
+    if (fb && fb.shared) maybeSendSel(fb as SyncBuffer);
     if (f && fb) { const k = fb.pt + ':' + fb.id; if (f._lastPoint !== k) { f._lastPoint = k; Ed.frameEvent('point', f, fb); } }
   };
 }
 
 /* ---------- served-mode boot (R4.11, R4.12, R9.1) ---------- */
-function memoryStorage() {
-  const map = new Map();
-  return { get: k => (map.has(k) ? map.get(k) : null), set: (k, v) => { map.set(k, String(v)); return true; }, remove: k => { map.delete(k); }, keys: () => [...map.keys()] };
+function memoryStorage(): EdHostStorage {
+  const map = new Map<string, string>();
+  return { get: k => (map.has(k) ? map.get(k)! : null), set: (k, v) => { map.set(k, String(v)); return true; }, remove: k => { map.delete(k); }, keys: () => [...map.keys()] };
 }
 /* Primitives the registry marks server-only exist here as stubs that signal server-only (R4.30). */
-function defineStubs(registry) {
+function defineStubs(registry: unknown) {
   if (!Array.isArray(registry)) return 0;
   let n = 0;
-  for (const p of registry) {
+  for (const p of registry as ({ where?: unknown; name?: unknown; args?: string; doc?: string } | null)[]) {
     if (!p || p.where !== 'server' || typeof p.name !== 'string' || p.name === '%image-server?') continue;
     if (L.get(p.name) !== undefined) continue;
     const name = p.name;
-    const f = L.D(name, p.args || '', `${p.doc || ''} (runs in edwind only)`.trim(), () => signal('server-only', name, `runs in edwind: declare the command (:where 'server)`));
+    const f = L.D<SchemeProcedure>(name, p.args || '', `${p.doc || ''} (runs in edwind only)`.trim(), () => signal('server-only', name, `runs in edwind: declare the command (:where 'server)`));
     f.where = 'server'; n++;
   }
   return n;
 }
-async function bootServed({ sources, transport, device, cid, pending } = {}) {
+async function bootServed({ sources, transport, device, cid, pending }: { sources?: Record<string, string>; transport?: () => EdTransport; device?: string; cid?: string; pending?: unknown } = {}) {
   if (sync.booted) throw new Error('Ed.bootServed was already called');
   sync.booted = true;
   if (sources) { host.sources = sources; host.config = name => (Object.prototype.hasOwnProperty.call(sources, name) ? sources[name] : null); }
   /* R4.12: the browser's lmacs:file:* and edwin:* stores are not read in served mode. */
   if (host.kind === 'browser') { host.pageStorage = host.storage; host.storage = memoryStorage(); }
-  const notServer = L.D('%image-server?', '', '#f: this runtime is a frame (sync.js).', () => false); notServer.where = 'both';
+  const notServer = L.D<SchemeProcedure>('%image-server?', '', '#f: this runtime is a frame (sync.js).', () => false); notServer.where = 'both';
   Ed.boot({ served: true });
   Ed.hooks.serverCommand = serverCommand;
   Ed.hooks.evalServer = evalServer;
   Ed.hooks.visit = visit;
-  Ed.hooks.saveShared = saveShared;
-  Ed.hooks.revertShared = revertShared;
-  Ed.hooks.killShared = b => closeBuffer(b);
-  if (pending) importPending(pending);
+  Ed.hooks.saveShared = saveShared as (b: EdBuffer) => boolean;
+  Ed.hooks.revertShared = revertShared as (b: EdBuffer) => unknown;
+  Ed.hooks.killShared = b => closeBuffer(b as SyncBuffer);
+  if (pending) importPending(pending as (SyncPending | null)[]);
   await start({ transport, device, cid });
   const ui = await call({ cmd: 'user-init' });
   if (ui && typeof ui.value === 'string' && ui.value.trim()) { try { for (const f of L.readAll(ui.value)) { L.resetOps(); L.ev(f); } } catch (e) { Ed.message(`Error in ~/.config/edwin/init.scm: ${Ed.errorText(e)}`); } }
@@ -803,11 +917,11 @@ async function bootServed({ sources, transport, device, cid, pending } = {}) {
   if (prims && prims.value) defineStubs(prims.value);
   await refreshCandidates();
   const info = await call({ cmd: 'notes-info' });
-  if (info && info.value && typeof info.value.root === 'string') L.set('notes-directory', info.value.root);
+  if (info && info.value && typeof (info.value as { root?: unknown }).root === 'string') L.set('notes-directory', (info.value as { root: string }).root);
   const op = L.get('open-page'); if (typeof op === 'function') L.set('wiki-follow-function', op);
-  L.set('resolve-ref-function', L.D('%sync-resolve-ref', 'address', 'The text an ((ADDRESS)) shows, from the server\'s notes index (R10.4): cached; #f while the answer is on its way.', ([a]) => resolveRef(String(a))));
+  L.set('resolve-ref-function', L.D('%sync-resolve-ref', 'address', 'The text an ((ADDRESS)) shows, from the server\'s notes index (R10.4): cached; #f while the answer is on its way.', ([a]: SchemeValue[]) => resolveRef(String(a))));
   sync.ready = true; sync.emit('ready');
-  return sync;
+  return sync as SyncClient & EdSyncApi;
 }
 async function refreshCandidates() {
   const r = await call({ cmd: 'capf-candidates', args: [{ kind: 'wiki' }] });
@@ -816,14 +930,14 @@ async function refreshCandidates() {
 }
 /* ((references)) to pages that are not open resolve on the server (markdown-resolve-ref there reads the notes
    index); the answer is cached by address and the display cache is invalidated when it lands. */
-const refs = new Map(); let refGen = 0;
-function resolveRef(addr) {
+const refs = new Map<string, { pending: boolean; text: string | false }>(); let refGen = 0;
+function resolveRef(addr: string) {
   const c = refs.get(addr);
   if (c) return c.pending ? false : c.text;
   refs.set(addr, { pending: true, text: false });
   if (refs.size > 2000) for (const k of [...refs.keys()].slice(0, 1000)) refs.delete(k);
   call({ form: `(markdown-resolve-ref ${JSON.stringify(addr)})`, ctx: {} }).then(r => {
-    let text = false;
+    let text: string | false = false;
     if (!r.error && typeof r.value === 'string') { try { const v = L.read(r.value); if (typeof v === 'string') text = v; } catch (e) { /* not a string */ } }
     refs.set(addr, { pending: false, text });
     L.set('notes-generation', BigInt(-(++refGen)));   // a new cache key for markdown-mode's display cache
@@ -833,11 +947,11 @@ function resolveRef(addr) {
 }
 /* Unsent edits across a runtime reload (R7.19, R6.10): exportPending() before, pending: in bootServed after. */
 function exportPending() {
-  const out = [];
+  const out: SyncPending[] = [];
   for (const b of sync.buffers.values()) if (b.inflight || b.queue.length) out.push({ buf: b.id, sver: b.sver, sverText: b.sync.sverText, seq: b.sync.seq, inflight: b.inflight, queue: b.queue });
   return out;
 }
-function importPending(list) {
+function importPending(list: (SyncPending | null)[]) {
   for (const p of list) {
     if (!p || typeof p.buf !== 'string') continue;
     open(p.buf).catch(() => {});

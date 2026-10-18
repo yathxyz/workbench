@@ -5,11 +5,16 @@
 (function () {
 'use strict';
 const N = globalThis.__n;
+/* A timer's callback: as setTimeout takes it. */
+type PreludeHandler = Parameters<typeof setTimeout>[0];
+interface PreludeTimer { f: PreludeHandler; args: unknown[]; at: number; every: number }
+/* What crypto.getRandomValues fills: an integer typed array. */
+type PreludeIntArray = { length: number; [i: number]: number; BYTES_PER_ELEMENT?: number };
 
 /* ---------- timers ---------- */
-const timers = new Map();
+const timers = new Map<number, PreludeTimer>();
 let seq = 0;
-function add(f, ms, args, every) {
+function add(f: PreludeHandler, ms: number | undefined, args: unknown[], every: boolean) {
   if (typeof f !== 'function') throw new TypeError('setTimeout: the callback is not a function');
   const id = ++seq, d = Math.max(0, Number(ms) || 0);
   timers.set(id, { f, args, at: N.now() + d, every: every ? Math.max(1, d) : 0 });
@@ -17,19 +22,19 @@ function add(f, ms, args, every) {
 }
 globalThis.setTimeout = (f, ms, ...args) => add(f, ms, args, false);
 globalThis.setInterval = (f, ms, ...args) => add(f, ms, args, true);
-globalThis.clearTimeout = globalThis.clearInterval = id => { timers.delete(id); };
+globalThis.clearTimeout = globalThis.clearInterval = id => { timers.delete(id!); };
 globalThis.queueMicrotask = f => { Promise.resolve().then(f); };
 globalThis.performance = { now: () => N.now(), timeOrigin: Date.now() - N.now() };
 
 /* ---------- the event loop's side: due timers, then milliseconds to the next (-1: none) ---------- */
-const handlers = { input: null, signal: null, sock: null };
-let frozenAt = null;
-function report(e) { try { console.error(e && e.stack ? e.stack : String(e)); } catch (e2) { /* nowhere to say it */ } }
+const handlers: EdNativeLoop['handlers'] = { input: null, signal: null, sock: null };
+let frozenAt: number | null = null;
+function report(e: unknown) { try { console.error(e && (e as Error).stack ? (e as Error).stack : String(e)); } catch (e2) { /* nowhere to say it */ } }
 globalThis.__native = {
   handlers,
   tick() {
     const now = N.now();
-    const due = [];
+    const due: [number, PreludeTimer][] = [];
     for (const [id, t] of timers) if (t.at <= now) due.push([id, t]);
     due.sort((a, b) => a[1].at - b[1].at || a[0] - b[0]);
     for (const [id, t] of due) {
@@ -49,7 +54,7 @@ globalThis.__native = {
     const shift = N.now() - frozenAt;
     for (const t of timers.values()) t.at += shift;
     frozenAt = null; logFile = null;
-    globalThis.performance.timeOrigin = Date.now() - N.now();
+    (globalThis.performance as { timeOrigin: number }).timeOrigin = Date.now() - N.now();
   },
   /* Milliseconds to the next timer (-1: none), asked again after microtasks may have added one. */
   next() {
@@ -64,7 +69,7 @@ globalThis.__native = {
 };
 
 /* ---------- console: a log file ---------- */
-let logFile = null;
+let logFile: string | null = null;
 function logPath() {
   if (logFile !== null) return logFile;
   const home = N.env('HOME') || '/tmp';
@@ -73,17 +78,17 @@ function logPath() {
   try { N.mkdirs(logFile.slice(0, logFile.lastIndexOf('/')) || '/'); } catch (e) { /* the append reports it */ }
   return logFile;
 }
-const show = a => (typeof a === 'string' ? a : a instanceof Error ? (a.stack || a.message) : (() => { try { return JSON.stringify(a); } catch (e) { return String(a); } })());
-const log = level => (...a) => { try { N.appendFile(logPath(), `${new Date().toISOString()} ${level} ${a.map(show).join(' ')}\n`); } catch (e) { /* no log */ } };
+const show = (a: unknown) => (typeof a === 'string' ? a : a instanceof Error ? (a.stack || a.message) : (() => { try { return JSON.stringify(a); } catch (e) { return String(a); } })());
+const log = (level: string) => (...a: unknown[]) => { try { N.appendFile(logPath(), `${new Date().toISOString()} ${level} ${a.map(show).join(' ')}\n`); } catch (e) { /* no log */ } };
 globalThis.console = { log: log('info'), info: log('info'), warn: log('warn'), error: log('error'), debug: () => {}, trace: log('trace') };
 
 /* ---------- text and randomness ---------- */
 class TextEncoder {
   get encoding() { return 'utf-8'; }
   encode(s = '') {
-    const out = [];
+    const out: number[] = [];
     for (const ch of String(s)) {
-      const c = ch.codePointAt(0);
+      const c = ch.codePointAt(0)!;
       if (c < 0x80) out.push(c);
       else if (c < 0x800) out.push(0xc0 | c >> 6, 0x80 | c & 63);
       else if (c < 0x10000) out.push(0xe0 | c >> 12, 0x80 | c >> 6 & 63, 0x80 | c & 63);
@@ -93,9 +98,9 @@ class TextEncoder {
   }
 }
 globalThis.TextEncoder = TextEncoder;
-const hex = n => Math.floor(Math.random() * 16 ** n).toString(16).padStart(n, '0');
+const hex = (n: number) => Math.floor(Math.random() * 16 ** n).toString(16).padStart(n, '0');
 globalThis.crypto = {
-  getRandomValues(a) { for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 2 ** (8 * (a.BYTES_PER_ELEMENT || 1))); return a; },
+  getRandomValues<T extends ArrayBufferView | null>(a: T & PreludeIntArray): T { for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 2 ** (8 * (a.BYTES_PER_ELEMENT || 1))); return a; },
   randomUUID: () => `${hex(8)}-${hex(4)}-4${hex(3)}-${(8 + Math.floor(Math.random() * 4)).toString(16)}${hex(3)}-${hex(12)}`,
 };
 })();

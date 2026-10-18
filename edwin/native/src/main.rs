@@ -1,8 +1,8 @@
 //! edwin: Edwin's JavaScript core on embedded V8, in a terminal (DT1) or a window (DT2, `--gui`).
 //!
 //! The Rust side is the host's floor: the files, the terminal or the window, signals, edwind's socket and the
-//! event loop. Everything Edwin is runs as JavaScript: native/js/prelude.js, host-native.js, term.js and
-//! main.js, which loads the unchanged core from edwin/src. All of it is compiled into the binary, with the
+//! event loop. Everything Edwin is runs as JavaScript: native/js/prelude.ts, host-native.ts, term.ts and
+//! main.ts, which loads the unchanged core from edwin/src. All of it is compiled into the binary, with the
 //! shipped Scheme.
 //!
 //! The loop: poll the terminal (or pump the window's events), the signal pipe and the sockets; hand what arrived
@@ -70,8 +70,8 @@ fn user_socket() -> Option<String> {
         .map(|d| format!("{d}/edwin/edit.sock"))
 }
 
-/// Whether main.js will attach to edwind, whose boot (Ed.bootServed) the snapshot cannot hold: the same
-/// choice main.js makes (--standalone, --socket, EDWIN_NO_ATTACH, EDWIN_SOCKET, the user's daemon, the
+/// Whether main.ts will attach to edwind, whose boot (Ed.bootServed) the snapshot cannot hold: the same
+/// choice main.ts makes (--standalone, --socket, EDWIN_NO_ATTACH, EDWIN_SOCKET, the user's daemon, the
 /// service's socket).
 fn will_attach() -> bool {
     let args: Vec<String> = std::env::args().skip(1).take_while(|a| a != "--").collect();

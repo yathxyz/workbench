@@ -1,5 +1,5 @@
 // Edwin Scheme by itself: `node --test edwin/test/scheme.test.mts`.
-// Loads only src/scheme.js (no editor, no page stand-ins). The suite runs once per evaluator mode
+// Loads only src/scheme.ts (no editor, no page stand-ins). The suite runs once per evaluator mode
 // in MODES (only 'direct' today; EDWIN_SCHEME_MODE picks one).
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
@@ -22,7 +22,7 @@ const throwsKind = (src: string, kind: string) => assert.throws(() => run(src), 
 describe(`Edwin Scheme (${MODE})`, () => {
   test('globalThis only: the module installs Scheme and schemeSource on globalThis', () => {
     assert.equal(typeof (globalThis as Globals).Scheme, 'object');
-    assert.match((globalThis as Globals).schemeSource, /^\(function schemeModule\(g\)/);
+    assert.match((globalThis as Globals).schemeSource, /^\(function schemeModule\(g\s*\)/);
     assert.equal((globalThis as Globals).window, undefined);
   });
 

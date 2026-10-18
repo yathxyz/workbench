@@ -13,7 +13,7 @@ pub struct Bridge {
     pub rows: u32,
     /// The desktop's theme when the window system says it ("dark" or "light").
     pub theme: Option<String>,
-    /// The last model drawn (JSON, as display.js builds it) that the window has not taken yet.
+    /// The last model drawn (JSON, as display.ts builds it) that the window has not taken yet.
     pub model: Option<String>,
     /// Actions in the order asked: ("bell", ""), ("clipboard", text), ("iconify", ""), ("raise", "").
     pub actions: Vec<(String, String)>,

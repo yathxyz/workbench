@@ -1,6 +1,6 @@
 //! Makes the startup snapshot (src/snapshot.rs) and finds ICU's data, both for the binary to carry.
 //!
-//! The snapshot is V8's heap after native/js/boot.js has loaded Edwin's core and booted it with the shipped
+//! The snapshot is V8's heap after native/js/boot.ts has loaded Edwin's core and booted it with the shipped
 //! Scheme, made here with the same natives and V8 flags the binary uses (the files below are its own).
 //! ICU's data comes from EDWIN_ICU_DATA, else from the copy inside the v8 crate's sources.
 
