@@ -854,8 +854,10 @@ D('revert-buffer', '', 'Reload the current buffer from its saved file, dropping 
   });
 }
 D('evil--show-help-text', 'TEXT', 'Show TEXT in the *Help* buffer.', ([t]: SchemeValue[]) => { showList('*Help*', String(t)); Ed.message('q returns to the previous buffer'); return false; });
+/* The order :bn walks: local buffers by their number (creation order), then shared ones by edwind's string id. */
+const byId = (a: number | string, z: number | string) => typeof a === typeof z ? (a < z ? -1 : a > z ? 1 : 0) : typeof a === 'number' ? -1 : 1;
 function cycleBuffer(d: number) {
-  const list = E.buffers.filter(x => !x.name.startsWith(' ') && !/^\*(Messages|Help|Registers|Marks|Buffer List)\*$/.test(x.name)).sort((a, z) => (a.id as number) - (z.id as number));
+  const list = E.buffers.filter(x => !x.name.startsWith(' ') && !/^\*(Messages|Help|Registers|Marks|Buffer List)\*$/.test(x.name)).sort((a, z) => byId(a.id, z.id));
   if (!list.length) return;
   let k = list.indexOf(E.win!); k = ((k < 0 ? 0 : k + d) % list.length + list.length) % list.length;
   Ed.setWindowBuffer(list[k]);
