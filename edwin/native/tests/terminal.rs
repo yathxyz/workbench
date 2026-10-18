@@ -662,7 +662,7 @@ fn attached_notes_go_through_edwind_and_other_files_stay_local() {
     assert_eq!(t.exit(), 0);
     assert_eq!(
         up.finish(),
-        r##"{"server":"# Shared page\ntyped in the terminal\nand quit\n","disk":"# Shared page\ntyped in the terminal\nand quit\n"}"##
+        r##"{"server":"# Shared page\ntyped in the terminal\nand quit\n","disk":"# Shared page\ntyped in the terminal\nand quit\n","opened":["a.md","b.md"]}"##
     );
 }
 
@@ -683,10 +683,13 @@ fn remote_notes_go_through_ssh() {
     let ssh = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake-ssh");
     let ssh = ssh.to_str().unwrap();
     let remote = format!("box:{}", up.socket);
+    // The same path on both machines here: as an argument, a full path is a file on this machine all the same.
+    let here = format!("{}/here.md", up.notes);
+    std::fs::write(&here, "here\n").unwrap();
     // A note is named as it is under the remote notes directory; ./local.txt is a file on this machine.
     let mut t = Pty::spawn(
         &d,
-        &["--remote", &remote, "a.md", "./local.txt"],
+        &["--remote", &remote, "a.md", "./local.txt", &here],
         &[
             ("EDWIN_NO_ATTACH", ""),
             ("EDWIN_SSH", ssh),
@@ -725,7 +728,7 @@ fn remote_notes_go_through_ssh() {
     );
     assert_eq!(
         up.finish(),
-        r##"{"server":"# Shared page\ntyped over ssh\n","disk":"# Shared page\ntyped over ssh\n"}"##
+        r##"{"server":"# Shared page\ntyped over ssh\n","disk":"# Shared page\ntyped over ssh\n","opened":["a.md"]}"##
     );
 }
 

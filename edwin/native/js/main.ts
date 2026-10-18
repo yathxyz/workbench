@@ -275,9 +275,10 @@ function lineMessage(b: EdBuffer) {
   return `"${Ed.fileLabel(b.file!)}" ${n}L, ${b.rope.length}C${b.readOnly ? ' [readonly]' : ''}`;
 }
 /* Attached to a remote edwind, a FILE argument that is not a path here (not /…, ~…, ./… or ../…) is one of its
-   notes, named as under its notes directory. Inside, names resolve against the buffer's directory, as in TRAMP:
-   from a note, the remote notes directory. */
-let remote = false, notesRoot = '';
+   notes, named as under its notes directory, and every other one is a file here, even where the two machines share
+   the notes directory's path. Inside, names resolve against the buffer's directory, as in TRAMP: from a note, the
+   remote notes directory. */
+let remote = false, notesRoot = '', visitHere = (name: string) => Ed.visit(name);
 const remoteNote = (name: string) => remote && notesRoot && !/^(\/|~|\.\.?(\/|$))/.test(name);
 async function start() {
   Ed.reloadPersistent();
@@ -295,9 +296,9 @@ async function start() {
       const n = String(name), abs = remote ? n : H.truename(n);
       /* edwind names a note by its path under the notes directory. */
       if (root && abs.startsWith(root + '/')) return served!(abs.slice(root.length + 1));
-      Ed.hooks.visit = null;
-      try { return Ed.visit(name); } finally { Ed.hooks.visit = hook; }
+      return visitHere(name);
     };
+    visitHere = (name: string) => { Ed.hooks.visit = null; try { return Ed.visit(name); } finally { Ed.hooks.visit = hook; } };
     Ed.hooks.visit = hook;
   } else {
     Ed.loadUserInit();
@@ -311,7 +312,7 @@ async function start() {
   for (const f of opts.files.slice().reverse()) {
     try {
       const isNew = !remoteNote(f) && N.stat(H.resolve(f)) === null;
-      const b = await Ed.visit(remoteNote(f) ? notesRoot + '/' + f : f);
+      const b = await (remoteNote(f) ? Ed.visit(notesRoot + '/' + f) : remote ? visitHere(f) : Ed.visit(f));
       if (b) { if (opts.readOnly) b.readOnly = true; visited.unshift(b); if (isNew) fresh.add(b); }
     } catch (e) { failed.push(Ed.errorText(e)); }
   }
