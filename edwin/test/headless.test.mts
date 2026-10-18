@@ -58,6 +58,16 @@ test('a malformed name in evil-ex-commands leaves the other ex commands working'
   finally { ed.eval('(set! evil-ex-commands (cdr evil-ex-commands))'); }
 });
 
+test(':bn visits every buffer when some have a shared buffer\'s string id', async () => {
+  const names = ['bn1.txt', 'bn2.txt', 'bn3.txt', 'bn4.txt'];
+  for (const f of names) await ed.type(`:e ${f}\n`);
+  for (const f of ['bn2.txt', 'bn3.txt']) ed.Ed.getBuffer(f).id = 'srv/' + f;
+  const seen = new Set<string>(), all = ed.E.buffers.filter((b: Edwin) => !b.name.startsWith(' ') && !/^\*(Messages|Help|Registers|Marks|Buffer List)\*$/.test(b.name)).length;
+  for (let i = 0; i < all; i++) { await ed.type(':bn\n'); seen.add(ed.E.win.name); }
+  assert.equal(seen.size, all);
+  for (const f of names) assert.ok(seen.has(f), f);
+});
+
 test('visual mode and text objects', async () => {
   await fresh();
   await ed.type('i(alpha beta) gamma'); await ed.keys('ESC');
