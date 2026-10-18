@@ -8,6 +8,7 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { makeDir, startEdwind, stopEdwind, EditClient } from './edit-client.mts';
+import { Gate } from '../server/models.mts';
 import type { Msg, TestDir, EdwindChild, ClientOptions } from './edit-client.mts';
 
 type Release = (value?: unknown) => void;
@@ -297,6 +298,24 @@ test('R12.8, R12.13: cancel aborts the HTTP request; rate limits are retried; fo
   assert.ok(dones.every(d => d.t === 'sample.done' && d.text === 'Hello'), JSON.stringify(dones));
   A.holdOff = false;
   web.close();
+});
+
+test('R12.13: a model slot granted to a request whose thread is interrupted before it resumes goes back to the gate', async () => {
+  const g = new Gate(1);
+  g.acquire();                               // granted at once
+  const b = g.acquire();                     // waits
+  assert.equal(g.queued, 1);
+  g.release();                               // a is done: the slot passes to b
+  await b.promise;
+  b.cancel();                                // b's thread was interrupted before it took the slot up
+  assert.equal(g.busy, 0, 'the slot is free again');
+  const c = g.acquire(); let got = false; c.promise.then(() => { got = true; });
+  await sleep(0); assert.equal(got, true, 'the next request runs at once');
+  /* A slot granted at once, cancelled the same way; a cancel twice gives back one slot only. */
+  c.cancel(); c.cancel(); assert.equal(g.busy, 0);
+  const d = g.acquire(), e = g.acquire(); assert.equal(g.queued, 1);
+  e.cancel(); assert.equal(g.queued, 0, 'a waiting ticket is withdrawn'); assert.equal(g.busy, 1);
+  d.cancel(); assert.equal(g.busy, 0);
 });
 
 test('R12.9, R12.14: gptel-send streams into the buffer as the agent gptel:<backend>; usage is accounted', async () => {
