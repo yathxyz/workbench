@@ -26,6 +26,15 @@ test('R4.40 a waiter that times out or is killed leaves the queue: the next unlo
   c.close();
 });
 
+test('R4.40 a thread that ends holding a mutex releases it and wakes the next waiter', async () => {
+  const c = await client();
+  const t0 = Date.now();
+  assert.equal(await value(c, '(define m3 (make-mutex)) (define holder (make-thread (lambda () (mutex-lock! m3) (thread-sleep! 0.05) (quote held)) "holder")) (thread-yield) (define waiter (make-thread (lambda () (mutex-lock! m3 3)) "waiter")) (list (thread-join holder 2) (thread-join waiter 5) (mutex-owner m3))'), '(held #t #f)');
+  assert.ok(Date.now() - t0 < 2000, 'the waiter was woken, not timed out');
+  assert.equal(await value(c, '(+ 1 2)'), '3', 'the scheduler still runs');
+  c.close();
+});
+
 test('R4.40 make-thread, mailboxes and thread-join; a background thread is preempted and killed', async () => {
   const c = await client();
   assert.equal(await value(c, '(define mb (make-mailbox)) (define t1 (make-thread (lambda () (thread-sleep! 0.05) (mailbox-send! mb (quote hi)) 42) "t1")) (list (mailbox-receive! mb 1) (thread-join t1) (thread-alive? t1))'), '(hi 42 #f)');
