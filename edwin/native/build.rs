@@ -46,10 +46,33 @@ fn icu_data() -> PathBuf {
     })
 }
 
+/// The JavaScript sources.rs embeds is each .ts of the core and of js/ stripped beside it (the .js are
+/// gitignored): a .js missing or older than its .ts would build the old program, so the build stops.
+fn check_stripped() {
+    for dir in ["js", "../src"] {
+        for e in std::fs::read_dir(dir).expect("read the sources").flatten() {
+            let ts = e.path();
+            if ts.extension().is_none_or(|x| x != "ts") || ts.to_string_lossy().ends_with(".d.ts") {
+                continue;
+            }
+            let js = ts.with_extension("js");
+            let age = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            if age(&js).is_none_or(|j| Some(j) < age(&ts)) {
+                panic!(
+                    "{} is missing or older than {}: run `node tools/strip.mts --in-place edwin/src edwin/native/js` in the repository",
+                    js.display(),
+                    ts.display()
+                );
+            }
+        }
+    }
+}
+
 fn main() {
     for dir in ["src", "js", "../src", "../scm"] {
         println!("cargo:rerun-if-changed={dir}");
     }
+    check_stripped();
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let icu = icu_data();
     println!("cargo:rerun-if-changed={}", icu.display());

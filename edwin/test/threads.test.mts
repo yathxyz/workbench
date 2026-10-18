@@ -4,11 +4,11 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 import { Scheduler } from '../server/threads.mts';
 import { makeDir, startEdwind, stopEdwind, EditClient } from './edit-client.mts';
 import type { Msg, TestDir, EdwindChild, ClientOptions } from './edit-client.mts';
 import type { Server } from '../server/main.mts';
+import { loadSchemeIn, SCHEME_SOURCE } from './scheme-load.mts';
 
 let dir: TestDir, child: EdwindChild;
 before(async () => { dir = makeDir(); child = await startEdwind(dir); });
@@ -175,7 +175,7 @@ test('R15.11 status carries the event-loop lag and ack percentiles and the threa
 
 test('R4.35 a thread suspended with no debugger, or whose debugger fails, is resumed by the scheduler', () => {
   /* The scheduler alone over the real evaluator; the test steps the threads itself (no pump). */
-  const S = createRequire(import.meta.url)('../src/scheme.js');
+  const S = loadSchemeIn(SCHEME_SOURCE) as any; // any: the suite uses S.Suspend, which scheme-load's Scheme leaves out
   const errors: string[] = [];
   const log = { error: (ev: string) => errors.push(ev), warn() {}, info() {}, debug() {} };
   const sched = new Scheduler({ log, L: { S, resetOps() {} }, Ed: { message() {} } } as unknown as Server);

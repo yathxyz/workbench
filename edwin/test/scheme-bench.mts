@@ -6,12 +6,12 @@
 // newest commit whose scheme.js has none). Every evaluator is loaded into its own contexts; the runs
 // are interleaved and the best is kept. Prints a table and exits 1 when the shadow stack costs more
 // than 10% or generator mode more than 3x direct mode (geometric means over the benchmarks).
-import { readFileSync } from 'node:fs';
+import { stripTypeScriptTypes } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import v8 from 'node:v8';
 import vm from 'node:vm';
-import { ROOT, SCHEME_FILE, loadSchemeIn } from './scheme-load.mts';
+import { ROOT, SCHEME_SOURCE, loadSchemeIn } from './scheme-load.mts';
 import type { Scheme, SchemeValue } from './scheme-load.mts';
 
 /* An evaluator to time: how to load it, and its loaded instances. */
@@ -54,9 +54,9 @@ const BENCHES: [name: string, setup: string, expr: string][] = [
 
 function baselineSource(): { src: string; commit: string } | null {
   try {
-    const commits = execFileSync('git', ['log', '--format=%H', '--', 'edwin/src/scheme.js'], { cwd: ROOT, encoding: 'utf8' }).trim().split('\n');
+    const commits = execFileSync('git', ['log', '--format=%H', '--', 'edwin/src/scheme.ts', 'edwin/src/scheme.js'], { cwd: ROOT, encoding: 'utf8' }).trim().split('\n');
     for (const c of commits) {
-      const src = execFileSync('git', ['show', `${c}:edwin/src/scheme.js`], { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 26 });
+      let src: string; try { src = execFileSync('git', ['show', `${c}:edwin/src/scheme.js`], { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 26, stdio: ['ignore', 'pipe', 'ignore'] }); } catch { src = stripTypeScriptTypes(execFileSync('git', ['show', `${c}:edwin/src/scheme.ts`], { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 26 }), { mode: 'strip' }); }
       if (!src.includes('SCHEME_SHADOW_STACK')) return { src, commit: c.slice(0, 8) };
     }
   } catch (e) { /* no git: skip the baseline */ }
@@ -69,7 +69,7 @@ function baselineSource(): { src: string; commit: string } | null {
 v8.setFlagsFromString('--expose-gc');
 const gc = vm.runInNewContext('gc') as () => void;
 const INSTANCES = 2;
-const current = readFileSync(SCHEME_FILE, 'utf8');
+const current = SCHEME_SOURCE;
 const base = baselineSource();
 const variants: Variant[] = [
   { name: 'shadow on', load: () => loadSchemeIn(current) },

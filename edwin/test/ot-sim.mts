@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-export const OT = require('../src/ot.js') as OTModule;
+export const OT = require('../src/ot.ts') as OTModule;
 
 /* An op of the wire and journal form: [pos, del, ins] (R7.5). */
 export type EditOp = [pos: number, del: string, ins: string];

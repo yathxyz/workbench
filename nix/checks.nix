@@ -14,32 +14,48 @@ let
     root = ../tests;
     fileset = ../tests;
   };
-  edwin = lib.fileset.toSource {
+  # edwin/ as the repository holds it: no in-tree build of the desktop program (edwin/native/target), and no
+  # .js stripped beside the core's .ts in a checkout (tools/strip.mts --in-place; gitignored).
+  edwinTree = lib.fileset.difference ../edwin (
+    lib.fileset.unions [
+      (lib.fileset.maybeMissing ../edwin/native/target)
+      (lib.fileset.fileFilter (f: f.hasExt "js") ../edwin/src)
+      (lib.fileset.fileFilter (f: f.hasExt "js") ../edwin/native/js)
+    ]
+  );
+  # The core and native/js run as classic scripts, which vm cannot strip: the suites get each .ts with its
+  # .js beside it, as edwind's package has them (host-node.cts would otherwise strip them in every process).
+  stripped =
+    name: src: edwinDir:
+    pkgs.runCommand name { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+      cp -r ${src} $out && chmod -R u+w $out
+      node ${../tools/strip.mts} --in-place $out/${edwinDir}src $out/${edwinDir}native/js
+    '';
+  edwin = stripped "workbench-edwin-tree" (lib.fileset.toSource {
     root = ../edwin;
-    # An in-tree build of the desktop program (edwin/native) leaves its target/ beside the sources.
-    fileset = lib.fileset.difference ../edwin (lib.fileset.maybeMissing ../edwin/native/target);
-  };
+    fileset = edwinTree;
+  }) "";
   # The address suite cuts bufferAddress and friends out of web/app.ts, so it sees that one file too.
-  edwinApp = lib.fileset.toSource {
+  edwinApp = stripped "workbench-edwin-app-tree" (lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      ../edwin
+      edwinTree
       ../web/app.ts
     ];
-  };
+  }) "edwin/";
   # The edwind suites check MAX_LINE against wb-proto's (R7.2), so they see that one file of the crates.
-  edwind = lib.fileset.toSource {
+  edwind = stripped "workbench-edwind-tree" (lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      ../edwin
+      edwinTree
       ../crates/wb-proto/src/limits.rs
     ];
-  };
+  }) "edwin/";
   # Everything tsc reads (the typecheck check).
   typed = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      (lib.fileset.difference ../edwin (lib.fileset.maybeMissing ../edwin/native/target))
+      edwinTree
       ../crates/wb-proto/src/limits.rs
       (lib.fileset.difference ../web (lib.fileset.maybeMissing ../web/vendor))
       ../tests

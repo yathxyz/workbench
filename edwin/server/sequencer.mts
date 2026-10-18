@@ -14,7 +14,7 @@ import type { Thread } from './threads.mts';
 import type { Ed, Log } from './main.mts';
 
 const require = createRequire(import.meta.url);
-const OT = require('../src/ot.js');
+const OT = require('../src/ot.ts');
 
 /* History retention (R7.17). */
 export const HIST_MIN_BATCHES = 10000;

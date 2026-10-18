@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
 import v8 from 'node:v8';
 import vm from 'node:vm';
-import { loadScheme, MODE, SCHEME_FILE } from './scheme-load.mts';
+import { loadScheme, MODE, SCHEME_SOURCE } from './scheme-load.mts';
 import type { Scheme, SchemeValue, SymObject } from './scheme-load.mts';
 
 type Globals = typeof globalThis & { Scheme: Scheme; schemeSource: string; window: unknown };
@@ -413,14 +413,14 @@ describe(`Edwin Scheme (${MODE})`, () => {
     // recursion-depth condition at the guard, after unwinding; edwind runs with a stack sized for the cap.
     const src = `
 const { parentPort, workerData } = require('node:worker_threads');
-require('node:vm').runInThisContext(require('node:fs').readFileSync(workerData, 'utf8'));
+require('node:vm').runInThisContext(workerData);
 const S = globalThis.Scheme;
 S.evalString('(define (f n) (if (= n 0) 0 (+ 1 (f (- n 1)))))');
 const caught = S.write(S.evalString('(guard (e ((recursion-depth? e) (list (quote caught) (condition/report-string e)))) (f 100000))'));
 let plain = 'no error'; try { S.evalString('(f 100000)'); } catch (e) { plain = e.constructor.name; }
 parentPort.postMessage([caught, plain, S.stackDepth(), S.write(S.evalString('(f 100)'))]);`;
     const res = await new Promise<[string, string, number, string]>((resolve, reject) => {
-      const w = new Worker(src, { eval: true, workerData: SCHEME_FILE, resourceLimits: { stackSizeMb: 1 } });
+      const w = new Worker(src, { eval: true, workerData: SCHEME_SOURCE, resourceLimits: { stackSizeMb: 1 } });
       w.once('message', resolve); w.once('error', reject);
     });
     assert.match(res[0], /^\(caught "Recursion too deep: the JavaScript stack ran out at depth \d+"\)$/);
@@ -432,12 +432,12 @@ parentPort.postMessage([caught, plain, S.stackDepth(), S.write(S.evalString('(f 
   test('R4.34 the default cap of 10,000 frames (in a thread with a big stack)', async () => {
     const src = `
 const { parentPort, workerData } = require('node:worker_threads');
-require('node:vm').runInThisContext(require('node:fs').readFileSync(workerData, 'utf8'));
+require('node:vm').runInThisContext(workerData);
 const S = globalThis.Scheme;
 S.evalString('(define (f n) (if (= n 0) 0 (+ 1 (f (- n 1)))))');
 parentPort.postMessage([S.write(S.evalString('(f 9900)')), S.write(S.evalString('(guard (e ((recursion-depth? e) (quote caught))) (f 20000))')), S.stackDepth()]);`;
     const res = await new Promise<[string, string, number]>((resolve, reject) => {
-      const w = new Worker(src, { eval: true, workerData: SCHEME_FILE, resourceLimits: { stackSizeMb: 64 } });
+      const w = new Worker(src, { eval: true, workerData: SCHEME_SOURCE, resourceLimits: { stackSizeMb: 64 } });
       w.once('message', resolve); w.once('error', reject);
     });
     assert.deepEqual(res, ['9900', 'caught', 0]);

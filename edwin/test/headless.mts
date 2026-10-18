@@ -53,6 +53,7 @@ interface HostNode {
   createHost(opts?: HostOptions): NodeHost;
   loadEdwin(host?: NodeHost, opts?: { mode?: 'direct' | 'gen' }): Edwin;
   memoryStorage(map?: Map<string, string>): HostStorage;
+  coreSource(f: string, dir?: string): { text: string; filename: string };
 }
 /* The driver startEdwin gives back. */
 export interface HeadlessEdwin {
@@ -69,7 +70,7 @@ export interface HeadlessEdwin {
 interface EdwinGlobals { L: Edwin }
 
 const require = createRequire(import.meta.url);
-export const { FILES, createHost, loadEdwin, memoryStorage } = require('../src/host-node.js') as HostNode;
+export const { FILES, createHost, loadEdwin, memoryStorage, coreSource } = require('../src/host-node.cts') as HostNode;
 
 // Load and boot Edwin (once per process: it keeps its state in globals) and give back a driver.
 export async function startEdwin(opts: HostOptions = {}): Promise<HeadlessEdwin> {

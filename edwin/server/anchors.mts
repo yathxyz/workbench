@@ -40,7 +40,7 @@ import type { AnchorsLine, JournalAnchor } from './journal.mts';
 import type { SchemeGen } from './threads.mts';
 
 const require = createRequire(import.meta.url);
-const OT = require('../src/ot.js');
+const OT = require('../src/ot.ts');
 
 export const name = 'anchors';
 export const QUOTE = 24;

@@ -1,0 +1,16 @@
+{
+  // Desktop Edwin's JavaScript (DT1, DT2): classic scripts V8 runs after the core, as the .js tools/strip.mts
+  // makes beside each .ts (build.rs checks they are current). No DOM: the natives are __n (prelude.ts).
+  "compilerOptions": {
+    "target": "esnext",
+    "lib": ["esnext"],
+    "types": [],
+    "strict": true,
+    "noEmit": true,
+    "erasableSyntaxOnly": true,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+    "useUnknownInCatchVariables": false
+  },
+  "include": ["*.ts", "../../src/core.d.ts"]
+}

@@ -23,7 +23,7 @@ import type { IndexEntry, MovedRecord } from './journal.mts';
 import type { Anchor } from './anchors.mts';
 
 const require = createRequire(import.meta.url);
-const OT = require('../src/ot.js');
+const OT = require('../src/ot.ts');
 
 export const AUTOSAVE_MS = 2000;
 export const MOVED_TTL_MS = 24 * 3600 * 1000;

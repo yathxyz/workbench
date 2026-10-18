@@ -119,8 +119,8 @@ test('R4.50 apropos, find-definition, room, list-threads and list-clients', asyn
   assert.match((await f.open('name:*Apropos*')).text!, /mailbox-receive! +function +server/);
   const fd = (await f.call('definition-of', ['make-thread'])).value;
   assert.equal(fd.kind, 'primitive'); assert.equal(fd.file, 'edwin/server/threads.mts'); assert.ok(fd.line > 0);
-  assert.equal((await f.call('definition-of', ['car'])).value.file, 'edwin/src/scheme.js');
-  assert.equal((await f.call('definition-of', ['caar'])).value.file, 'edwin/src/scheme.js', 'defined in a loop: the file, no line');
+  assert.equal((await f.call('definition-of', ['car'])).value.file, 'edwin/src/scheme.ts');
+  assert.equal((await f.call('definition-of', ['caar'])).value.file, 'edwin/src/scheme.ts', 'defined in a loop: the file, no line');
   await value(f, '(define (my-proc a) (+ a 1))');
   const fd2 = (await f.call('definition-of', ['my-proc'])).value;
   assert.equal(fd2.kind, 'procedure');
@@ -141,7 +141,7 @@ test('R4.48 the primitive registry: every JS primitive with arity, documentation
   const prims = (await c.call('primitives')).value;
   assert.ok(prims.length > 500, String(prims.length));
   const by = Object.fromEntries(prims.map((p: Msg) => [p.name, p]));
-  assert.equal(by.car.where, 'both'); assert.match(by.car.source, /^edwin\/src\/scheme\.js:\d+$/); assert.equal(by.car.args, 'p');
+  assert.equal(by.car.where, 'both'); assert.match(by.car.source, /^edwin\/src\/scheme\.ts:\d+$/); assert.equal(by.car.args, 'p');
   assert.equal(by['make-thread'].where, 'server'); assert.equal(by['thread-join'].blocking, true);
   assert.equal(by['notes-query'].where, 'server');
   for (const p of prims) { assert.ok(typeof p.name === 'string' && ['server', 'frame', 'both'].includes(p.where), p.name); assert.doesNotMatch(p.name, /js-eval|javascript|js->|->js|eval-js|new-function/i); }

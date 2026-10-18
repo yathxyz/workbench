@@ -14,7 +14,7 @@ import type { Edwin } from './headless.mts';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { workerCount } = require('../src/host-node.js');
+const { workerCount } = require('../src/host-node.cts');
 const jobs = await import('../server/jobs.mts');
 
 const ed = await startEdwin();

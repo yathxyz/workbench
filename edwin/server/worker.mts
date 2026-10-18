@@ -8,7 +8,7 @@
    workerMain's, unchanged: init, reset, edits, drop, broadcast, run, map and eval come in; ready, done,
    fail, progress, out, msg and bdone go out. workerData: { k, withScheme, lexSource, limits }. */
 import { parentPort, workerData } from 'node:worker_threads';
-import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
@@ -32,16 +32,17 @@ interface WorkerSelf {
 lockdown(); // before the core files load, as --frozen-intrinsics was (lockdown.mts)
 
 const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src');
-const load = (f: string) => { const p = path.join(SRC, f); vm.runInThisContext(fs.readFileSync(p, 'utf8'), { filename: p }); };
+const { coreSource } = createRequire(import.meta.url)('../src/host-node.cts') as { coreSource(f: string): { text: string; filename: string } };
+const load = (f: string) => { const c = coreSource(f); vm.runInThisContext(c.text, { filename: c.filename }); };
 const { withScheme, lexSource, limits } = workerData as { k: number; withScheme: boolean; lexSource: string | null; limits: unknown };
 
-load('text.js');
-if (withScheme) { load('scheme.js'); load('runtime.js'); }
+load('text');
+if (withScheme) { load('scheme'); load('runtime'); }
 /* The Lisp lexer, for the lex job: editor-core.js has no file of its own for it and hands the pool its
    source (Ed.LEX_SOURCE, the lexer's functions and constants); it is compiled here as the core files are,
    not evaluated as a string by the engine. */
-if (lexSource) vm.runInThisContext(lexSource, { filename: path.join(SRC, 'editor-core.js') + ':lex' });
-load('pool.js');
+if (lexSource) vm.runInThisContext(lexSource, { filename: path.join(SRC, 'editor-core.ts') + ':lex' });
+load('pool');
 const { codecModule, workerPrims, workerMain } = (globalThis as CoreGlobal).EdPoolWorker;
 
 /* What workerMain expects of its realm: the browser worker's self, as a plain object. */
