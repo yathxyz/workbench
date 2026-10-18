@@ -283,7 +283,7 @@ export class Scheduler {
     t.state = 'done'; t.waiting = null; t.suspend = null;
     this.release(t);
     /* A mutex a finished thread still holds is released, so a forgotten mutex-unlock! blocks nobody for good. */
-    for (const m of t.owned) { m.owner = null; const w = m.waiters.shift(); if (w) (w as unknown as (ok: boolean) => void)(true); }
+    for (const m of t.owned) { m.owner = null; const w = m.waiters.shift(); if (w && w.wake) w.wake(true); }
     t.owned.clear();
     this.threads.delete(t.id);
     const settle = () => {
