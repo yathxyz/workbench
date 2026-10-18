@@ -438,6 +438,95 @@ test('R14.8 notes-reviews-append writes through the real path: a symlinked .revi
   a.close();
 });
 
+test('Stable card ids: the first review of an unanchored card mints a block anchor; its history follows the card', async () => {
+  const a = await client(), b = await client({ kind: 'frame' });
+  const note = 'cards/minted.md';
+  const text = '# Minted\n\n## first card\ncard:: basic\ndeck:: m\nback:: one\n\n## both ways\ncard:: reverse\nback:: two\n\n## kept ^keep1\ncard:: basic\nback:: three\n';
+  await value(a, 'notes-append', [{ path: note, text }]);
+  const ids = async () => (await value(a, 'notes-cards')).cards.filter((c: Msg) => c.file === note).map((c: Msg) => c.id);
+  assert.deepEqual(await ids(), [`${note}#3`, `${note}#8#fwd`, `${note}#8#rev`, `${note}#^keep1`]);
+  /* Reviews another host logged under the line ids. */
+  const reviews = path.join(dir.dirs.notes, '.reviews'), log = path.join(reviews, 'test.jsonl');
+  const old = [{ card: `${note}#3`, g: 3, t: '2026-10-10T09:00:00.000Z' }, { card: `${note}#8#fwd`, g: 2, t: '2026-10-10T09:01:00.000Z' }, { card: `${note}#8#rev`, g: 4, t: '2026-10-10T09:02:00.000Z' }];
+  fs.writeFileSync(path.join(reviews, 'phone.jsonl'), old.map(r => JSON.stringify(r) + '\n').join(''));
+  try {
+    /* The first review: an anchor on the head line, as an edit; the review and the earlier one under the new id. */
+    const size = fs.existsSync(log) ? fs.statSync(log).size : 0;
+    const r = await value(a, 'notes-reviews-append', [{ reviews: [{ card: `${note}#3`, g: 4, t: '2026-10-14T09:00:00.000Z' }] }]);
+    const first = r.anchored[`${note}#3`];
+    assert.match(first, /^cards\/minted\.md#\^[a-z0-9]{5}$/);
+    assert.equal(r.appended, 2);
+    const label = first.split('^')[1];
+    const o = await b.open(note);
+    assert.equal(o.text, text.replace('## first card\n', `## first card ^${label}\n`));
+    const logged = () => fs.readFileSync(log, 'utf8').slice(size).trim().split('\n').map(l => JSON.parse(l));
+    assert.deepEqual(logged(), [{ ...old[0], card: first, from: `${note}#3` }, { card: first, g: 4, t: '2026-10-14T09:00:00.000Z' }]);
+    assert.deepEqual(await ids(), [first, `${note}#8#fwd`, `${note}#8#rev`, `${note}#^keep1`]);
+    /* The file is written by the autosave. */
+    const disk = () => { try { return fs.readFileSync(path.join(dir.dirs.notes, note), 'utf8'); } catch (e) { return ''; } };
+    const until = Date.now() + 6000;
+    while (!disk().includes(`^${label}`) && Date.now() < until) await sleep(100);
+    assert.ok(fs.readFileSync(path.join(dir.dirs.notes, note), 'utf8').includes(`## first card ^${label}\n`));
+    /* Again under the line id (a page that has not reloaded): the same anchor, no second copy, no second edit. */
+    const r2 = await value(a, 'notes-reviews-append', [{ reviews: [{ card: `${note}#3`, g: 3, t: '2026-10-14T09:05:00.000Z' }, { card: first, g: 3, t: '2026-10-14T09:06:00.000Z' }] }]);
+    assert.deepEqual(r2.anchored, { [`${note}#3`]: first });
+    assert.equal(r2.appended, 2);
+    assert.equal((await b.open(note)).text!.split(`^${label}`).length, 2);
+    /* A reverse card: one anchor for both sides, and both sides' history copied. */
+    const r3 = await value(a, 'notes-reviews-append', [{ reviews: [{ card: `${note}#8#rev`, g: 1, t: '2026-10-14T09:10:00.000Z' }] }]);
+    const both = r3.anchored[`${note}#8`];
+    assert.equal(r3.appended, 3);
+    const tail = logged().slice(-3);
+    assert.deepEqual(tail, [{ ...old[1], card: `${both}#fwd`, from: `${note}#8#fwd` }, { ...old[2], card: `${both}#rev`, from: `${note}#8#rev` }, { card: `${both}#rev`, g: 1, t: '2026-10-14T09:10:00.000Z' }]);
+    /* An anchored card is left alone, whichever id names it. */
+    const before = (await b.open(note)).text;
+    const r4 = await value(a, 'notes-reviews-append', [{ reviews: [{ card: `${note}#^keep1`, g: 3, t: '2026-10-14T09:20:00.000Z' }] }]);
+    assert.deepEqual(r4, { dir: reviews, appended: 1 });
+    const r5 = await value(a, 'notes-reviews-append', [{ reviews: [{ card: `${note}#12`, g: 3, t: '2026-10-14T09:21:00.000Z' }] }]);
+    assert.deepEqual(r5.anchored, { [`${note}#12`]: `${note}#^keep1` });
+    assert.equal(logged().at(-1).card, `${note}#^keep1`);
+    assert.equal((await b.open(note)).text, before);
+    /* A line that starts no card is logged as given. */
+    const r6 = await value(a, 'notes-reviews-append', [{ reviews: [{ card: `${note}#1`, g: 3, t: '2026-10-14T09:22:00.000Z' }] }]);
+    assert.deepEqual(r6, { dir: reviews, appended: 1 });
+    /* Moving the card: lines above it change, its id and its reviews stay. */
+    const o2 = await b.open(note);
+    const moved = o2.text!.replace('# Minted\n', '# Minted\n\nSome new text above.\n');
+    await b.edit(note, o2.ver!, [[0, o2.text!, moved]]);
+    const later = Date.now() + 6000;
+    while (!(await ids()).includes(`${note}#^keep1`) || (await value(a, 'notes-cards')).cards.find((c: Msg) => c.id === first)?.line !== 5) {
+      if (Date.now() > later) assert.fail('the edit was not indexed');
+      await sleep(100);
+    }
+    assert.deepEqual(await ids(), [first, `${both}#fwd`, `${both}#rev`, `${note}#^keep1`]);
+    const all = (await value(a, 'notes-reviews')).reviews.filter((x: Msg) => x.card === first && !x.from);
+    assert.equal(all.length, 3);
+  } finally { fs.rmSync(path.join(reviews, 'phone.jsonl')); }
+  a.close(); b.close();
+});
+
+test('Stable card ids: an org heading card keeps its tags when an anchor is minted after them', async () => {
+  const a = await client();
+  const note = 'cards/minted.org';
+  await value(a, 'notes-append', [{ path: note, text: '* What is mkIf? :nixos:\ncard:: basic\nback:: a guard\n' }]);
+  const r = await value(a, 'notes-reviews-append', [{ reviews: [{ card: `${note}#1`, g: 3, t: '2026-10-14T10:00:00.000Z' }] }]);
+  const id = r.anchored[`${note}#1`];
+  const card = (await value(a, 'notes-cards')).cards.find((c: Msg) => c.id === id);
+  assert.equal(card.title, 'What is mkIf?');
+  const heading = (await value(a, 'notes-nodes', [{}])).nodes.find((n: Msg) => n.path === note && n.kind === 'heading');
+  assert.deepEqual([heading.title, heading.tags], ['What is mkIf?', ['nixos']]);
+  a.close();
+});
+
+test('Stable card ids: a minted label never collides with an anchor of the file', async () => {
+  const { freeAnchor } = await import('../server/notes.mts');
+  const seq = ['aaaaa', 'bbbbb', 'ccccc'];
+  assert.equal(freeAnchor(new Set(['aaaaa', 'bbbbb']), () => seq.shift()!), 'ccccc');
+  assert.throws(() => freeAnchor(new Set(['zzzzz']), () => 'zzzzz', 5), /no free anchor label/);
+  const labels = new Set(Array.from({ length: 200 }, () => freeAnchor(new Set())));
+  for (const l of labels) assert.match(l, /^[a-z0-9]{5}$/);
+});
+
 test('R11.10 from Lisp: notes-query, notes-backlinks, notes-file, notes-tasks, notes-cards, notes-find, unlinked-mentions, notes-grep', async () => {
   const a = await client();
   const ev = async (form: string) => { const r = await a.form(form); assert.equal(r.t, 'result', JSON.stringify(r)); assert.equal(r.error, undefined, JSON.stringify(r)); return r.value; };
