@@ -5,8 +5,8 @@
 //   {t:"epoch", epoch, at}              the image epoch (R4.20); rewritten by reset, compaction and revert
 //   {t:"form", gen, at, by, form}       one definitional form: its generation, the time, the caller's by()
 //                                       (origin cli:<session> for wb eval, R13.9) and the form as `write` prints it
-// A torn last line is dropped at load. A replay failure is kept in memory on the entry (`failed`) and never
-// written: the next start replays again.
+// A torn last line is dropped at load, and cut off the file before the next append. A replay failure is kept in
+// memory on the entry (`failed`) and never written: the next start replays again.
 //
 // The module installs the server commands image-log, image-compact, image-reset, image-save-to-init,
 // image-problems, image-revert-entry and image-entries (§4.6, reached by call{cmd}), the server-only
@@ -136,6 +136,13 @@ export class ImageLog {
       let o: any; try { o = JSON.parse(line); } catch (e) { continue; } // a torn last line; any: a parsed line, checked field by field
       if (o.t === 'epoch') { this.epoch = o.epoch; continue; }
       if (o.t === 'form' && Number.isInteger(o.gen) && typeof o.form === 'string') { this.entries.push(o); this.gen = Math.max(this.gen, o.gen); this.bytes += line.length + 1; }
+    }
+    /* The next append must start a line of its own: a torn last line is cut off, a whole one gets its newline.
+       Glued to the tail, the next form would be lost with it at the next load. */
+    if (text && !text.endsWith('\n')) {
+      const last = text.slice(text.lastIndexOf('\n') + 1);
+      let whole = true; try { JSON.parse(last); } catch (e) { whole = false; }
+      if (whole) fs.appendFileSync(this.file, '\n'); else fs.truncateSync(this.file, Buffer.byteLength(text) - Buffer.byteLength(last));
     }
   }
   /* The epoch changes only when the image is reset, compacted or an entry is reverted (R4.20); a fresh log gets one. */

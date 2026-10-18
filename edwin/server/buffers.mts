@@ -8,7 +8,7 @@ import { createRequire } from 'node:module';
 import { ProtoError, CHUNK } from './proto.mts';
 import { PathError, expandHome, under } from './paths.mts';
 import { readText, saveAtomic, writeAtomic, fsyncDir, sha256, diskState, FileError, BIG } from './files.mts';
-import { Journal, readJournal, header as journalHeader, Index, randomId, jidPath, SNAP_NEW } from './journal.mts';
+import { Journal, readJournal, healTail, header as journalHeader, Index, randomId, jidPath, SNAP_NEW } from './journal.mts';
 import { Sequencer } from './sequencer.mts';
 import { Watcher, diffOps, merge3 } from './watch.mts';
 import { restore as restoreAnchors, record as anchorsRecord, publicAnchors } from './anchors.mts';
@@ -181,7 +181,7 @@ export class Buffers {
     const jfile = jidPath(this.stateDir, e.jid, '.jsonl');
     if (!fs.existsSync(jfile)) { this.index.delete(e.jid); return; }
     /* Unload stale saved buffers: a header-only journal and no open for 7 days (R8.6). */
-    const { header, batches, mv, anchors, torn, count } = readJournal(jfile);
+    const read = readJournal(jfile), { header, batches, mv, anchors, torn, count } = read;
     /* The newest mv line names the current id, file and name (R8.1); compaction folds them into the header. */
     let last: { id: string; file?: string | null; name?: string } | null = mv.length ? mv[mv.length - 1] : null;
     /* A rename whose mv line never became durable (a crash right after it, or a full disk): the index, written
@@ -227,6 +227,7 @@ export class Buffers {
     }
     restoreAnchors(sb, anchors, batches.slice(0, applied));
     if (torn) this.log.warn('reload', { buf: id, truncated: 'a torn last journal line was dropped' });
+    healTail(jfile, read);
     sb.journal = new Journal(jfile).open();
     sb.journal.lines = count;   // every line on disk, anchors lines too, as appends count them
     if (mvLost) sb.journal.append({ t: 'mv', id: sb.id, file: sb.file, name: sb.name, at: Date.now() }).catch(err => this.log.error('reload', { buf: id, journal: err.code || err.message }));

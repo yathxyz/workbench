@@ -173,7 +173,19 @@ test('R16.6 a journal truncated at every byte offset of its last line recovers t
     fs.writeFileSync(jfile, pristine.subarray(0, off));
     const { ok, lines: out } = checkOk(dir.file);
     assert.equal(ok, true, `offset ${off}: ${out.join('\n')}`);
-    if (off === pristine.length - 1) { assert.match(out[0], /ok, 6 batches, version 6$/, 'a whole last line without its newline counts'); continue; }
+    if (off === pristine.length - 1) {
+      assert.match(out[0], /ok, 6 batches, version 6$/, 'a whole last line without its newline counts');
+      // The next batch starts a line of its own after it.
+      child = await startEdwind(dir); started++;
+      const b = new EditClient(dir.cfg.socket); await b.connect(); await b.hello();
+      assert.equal((await b.open('torn.md')).ver, 6);
+      assert.equal((await b.edit('torn.md', 6, [[0, '', 'b7 ']])).ver, 7);
+      b.close(); await stopEdwind(child);
+      const after = checkOk(dir.file);
+      assert.equal(after.ok, true, after.lines.join('\n')); assert.match(after.lines[0], /ok, 7 batches, version 7$/, 'the batch after an unterminated line is whole on disk');
+      fs.writeFileSync(jfile, pristine);
+      continue;
+    }
     assert.match(out[0], off === lastStart ? /ok, 5 batches, version 5$/ : /ok, 5 batches, version 5, torn last line dropped/, `offset ${off}`);
     // Every ninth offset, and the edges, also through a real start.
     if (off === lastStart || off === pristine.length - 2 || (off - lastStart) % 9 === 0) {
@@ -187,6 +199,10 @@ test('R16.6 a journal truncated at every byte offset of its last line recovers t
       const ack = await b.edit('torn.md', 5, [[0, '', 'b6 😀 ']]);
       assert.equal(ack.ver, 6); assert.equal((await b.open('torn.md')).text, texts[6]);
       b.close(); await stopEdwind(child);
+      // The torn tail is cut off the file, so the batch acked after the restart is a whole line of it.
+      const after = checkOk(dir.file);
+      assert.equal(after.ok, true, `offset ${off}: ${after.lines.join('\n')}`);
+      assert.match(after.lines[0], /ok, 6 batches, version 6$/, `offset ${off}: the batch acked after the restart is on disk`);
       if (off !== lastStart) assert.match(child.logs, /torn last journal line was dropped/, 'the truncation is logged');
       assert.match(child.logs, /reload \{"buf":"torn.md","ver":5,"batches":5\}/);
       fs.writeFileSync(jfile, pristine); // the run above re-journaled; restore for the next offset
@@ -196,6 +212,20 @@ test('R16.6 a journal truncated at every byte offset of its last line recovers t
   // Whole lines are never dropped: the pristine journal checks with 6 batches.
   fs.writeFileSync(jfile, pristine);
   assert.match(checkOk(dir.file).lines[0], /ok, 6 batches, version 6$/);
+  fs.rmSync(dir.root, { recursive: true, force: true });
+});
+
+test('R16.6 an image log cut inside its last line takes the next form on a line of its own', async () => {
+  const { ImageLog } = await import('../server/image.mts');
+  const dir = makeDir(), file = path.join(dir.root, 'image.jsonl'), by = { kind: 'cli' as const };
+  const line = (gen: number, form: string) => JSON.stringify({ t: 'form', gen, at: 1, by, form });
+  const head = JSON.stringify({ t: 'epoch', epoch: 'e0', at: 1 }) + '\n' + line(1, '(define a 1)') + '\n';
+  // A torn tail, and a whole line that lost only its newline.
+  for (const [tail, kept] of [[line(2, '(define b 2)').slice(0, 30), []], [line(2, '(define b 2)'), ['(define b 2)']]] as const) {
+    fs.writeFileSync(file, head + tail);
+    new ImageLog(file).append('(define c 3)', by);
+    assert.deepEqual(new ImageLog(file).entries.map(e => e.form), ['(define a 1)', ...kept, '(define c 3)'], tail);
+  }
   fs.rmSync(dir.root, { recursive: true, force: true });
 });
 
