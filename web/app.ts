@@ -1191,7 +1191,7 @@ class AcpBackend implements CardBackend {
         if (ev.toolCall?.toolCallId != null) this.tool(ev.toolCall);
         break;
       case 'permission_resolved': {
-        const p = this.pending.get(ev.req as number) as AcpPermPending | undefined, o: JsonObject = ev.outcome as JsonObject || {}, opt = p?.options.find(x => x?.optionId === o.optionId), by = ev.by && ev.by !== 'user' ? ' (by ' + vtext(ev.by) + ')' : '';
+        const p = this.pending.get(ev.req as number), o: JsonObject = ev.outcome as JsonObject || {}, opt = p?.options?.find(x => x?.optionId === o.optionId), by = ev.by && ev.by !== 'user' ? ' (by ' + vtext(ev.by) + ')' : '';   // p may be an elicitation, which has no options
         this.pending.delete(ev.req as number);
         const verb = /^allow/.test(vtext(opt?.kind)) ? 'allowed' : /^reject/.test(vtext(opt?.kind)) ? 'rejected' : 'answered';
         this.add({ k: 'note', text: o.outcome === 'selected' ? verb + ': ' + vtext(opt?.name || o.optionId) + by : 'permission cancelled' + by });
@@ -5753,7 +5753,7 @@ async function rvGrade(g: number) {
   const line: RvLogLine = { t: new Date().toISOString(), card: c.id, g, ms: Date.now() - RV.shownAt, mode: RV.mode, dev: DAEMON ? undefined : 'browser' };
   if (st) line.pre = { d: +st.d.toFixed(2), s: +st.s.toFixed(2), r: +FSRS.R((Date.now() - st.last) / FSRS.DAY, st.s).toFixed(3) };
   if (RV.mode === 'pen' && RV.ink.length) line.ink = { strokes: RV.ink.length, points: RV.ink.reduce((n, s) => n + s.length, 0) };
-  if (!DAEMON) delete line.dev; else delete line.dev;
+  if (DAEMON) delete line.dev;   // the daemon's log is per host; a log kept in the board names the browser
   await rvAppend([line]); RV.done++; RV.undo.push(c.id); RV.cur = null; renderReview();
 }
 async function rvUndo() { const id = RV.undo.pop(); if (!id) return; await rvAppend([{ t: new Date().toISOString(), card: id, g: 0, note: 'retract previous' }]); RV.done = Math.max(0, RV.done - 1); RV.cur = RV.cards.find(c => c.id === id); renderReview(); }
@@ -6870,10 +6870,10 @@ async function artFromFile(n: ArtifactNode, L: LiveEntry): Promise<boolean> {
   if (st.mtime === n.fileMtime && n.head) return false;
   const r = await fetch(`/api/cat?path=${encodeURIComponent(n.file!)}&limit=6000000`);
   const html = await r.text();
-  const sha = await shaShort(html);
-  if (sha !== n.head) { await artPublish(n, { html }); }
+  const sha = await shaShort(html), changed = sha !== n.head;   // before the publish moves head
+  if (changed) await artPublish(n, { html });
   n.fileMtime = st.mtime; dirty();
-  return sha !== n.head || true;
+  return changed;
 }
 function artWatch(n: ArtifactNode) {
   if (!DAEMON || !n.file) return;
