@@ -626,6 +626,15 @@ st = await p.evaluate(async () => { const C = window.__canvas, S = C.S, sl = (ms
   C.perspSet('manual', true);
   return { ghost1, ghost2, edges, gmount, mounted, rows }; });
 check('filesystem perspective: hard links are ghosts with a dashed edge to the other name (one inode); mount points carry a badge', st.ghost1?.[0] === 2 && st.ghost1[1] === null && /×2/.test(st.ghost1[2]) && st.ghost2?.[0] === 2 && st.ghost2[1] === true && /also \/home\/me\/canvas-readme.md/.test(st.ghost2[2]) && st.edges.join() === 'README.md>canvas-readme.md' && st.gmount?.[0] === true && /⛁/.test(st.gmount[1]) && st.mounted?.[0] === true && st.mounted[1] && st.rows.includes('data:mount') && st.rows.includes('canvas-readme.md:hardlink ×2'), JSON.stringify(st));
+// symlinks (the seed's notes → projects/canvas, and a link to a file made here) and a path under a file
+st = await p.evaluate(() => { const C = window.__canvas, S = C.S;
+  S.fs.c.tmp.c.lnk = { t: 'd', c: { 'f.txt': { t: 'f', d: 'hello link\n' }, 'f-link': { t: 'l', d: '/tmp/lnk/f.txt' }, 'd-link': { t: 'l', d: '/home/me/projects/canvas' } } };
+  const prev = (dir: string, nm: string) => { try { C.rgPreview(C.rgEntries(dir).find((x: RgEntry) => x.name === nm)); return document.querySelector('#rg-prev')!.textContent; } catch (e) { return 'threw ' + e; } };
+  const sh = C.addNode({ kind: 'term', backend: 'fake', name: 'lnsh', env: {}, x: 14000, y: 14000, w: 300, h: 200 }), b = C.live[sh.id].backend;
+  const run = (l: string) => { try { return b.exec(l); } catch (e) { return 'threw ' + e; } };
+  const r = { pf: prev('fs:/tmp/lnk', 'f-link'), pd: prev('fs:/home/me', 'notes'), lsDir: run('ls /tmp/lnk/d-link'), lsFile: run('ls /tmp/lnk/f-link'), rm: run('rm /tmp/lnk/f.txt/x'), still: !!S.fs.c.tmp.c.lnk.c['f.txt'] };
+  delete S.fs.c.tmp.c.lnk; C.rgPreview(undefined); C.removeNode(sh.id); return r; });
+check('symlinks: the navigator previews a link to a file as that file and a link to a directory without throwing; the simulated shell\'s ls lists a linked directory and names a linked file; rm under a file does nothing', st.pf === 'hello link\n' && !st.pd.startsWith('threw') && st.lsDir.includes('README.md') && st.lsFile === '/tmp/lnk/f-link' && st.rm === '' && st.still, JSON.stringify(st));
 // ---- v18 (tab backgrounds cut off on small items; ⊞ again cycles aspect ratios, the screen's first)
 st = await p.evaluate(() => { const C = window.__canvas, LH = 32;
   const f = C.addNode({ kind: 'frame', name: 'aspect', mode: 'free', shape: 'folder', x: 6000, y: 6000, w: 900, h: 400 });
