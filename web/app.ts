@@ -3251,7 +3251,7 @@ cmd('Selection → text (read the handwriting)', () => { INK.ids = [...SEL.strok
 cmd('Undo the last removal', () => removeUndo(), '', () => !!REMOVE_UNDO);
 for (const c of ['ink', 'red', 'blue']) cmd(`Ink colour: ${c}`, onCanvas(() => { $(`.sw[data-color="${c}"]`)!.click(); }));
 cmd('Handwriting → text', () => inkToText(), '', () => INK.ids.length > 0);
-cmd('Handwriting → ask the assistant', () => inkAsk(), '', () => INK.ids.length > 0);
+cmd('Handwriting → ask the assistant', () => inkAsk(), '', () => INK.ids.length > 0 && hasChat());
 cmd('Show or hide drawing tools', () => toggleDock('draw'));
 cmd('Show or hide the add bar', () => toggleDock('new'));
 cmd('New Emacs buffer…', onCanvas(() => $('#add-emacs')!.click()), '', () => DAEMON);
@@ -3971,7 +3971,7 @@ async function inkToText() {
   } finally { chip.classList.remove('busy'); }
 }
 async function inkAsk() {
-  const ids = [...INK.ids]; if (!ids.length) return;
+  const ids = [...INK.ids]; if (!ids.length || !hasChat()) return;   // v9: no assistant pane, nothing to ask
   if (!(await canSeeImages())) return;
   const img = await inkImage(ids);
   toggleSide(true, true);
@@ -4703,7 +4703,7 @@ function graphSelect(id: string | null) {
   if (g.kind === 'buffer') B('Open in editor', () => edOpen(g.ref));
   if (g.ref) B('Show on canvas', () => { setView('canvas'); jumpNode(g.ref!); });
   if (g.ref) B(g.ref.kind === 'frame' ? 'Enter as workspace' : 'Open as tab', () => { setView('canvas'); g.ref!.kind === 'frame' ? wsEnter(g.ref) : focusOpen(g.ref); });
-  B('Ask assistant', () => { toggleSide(true); const ta = live.chat.ta!; ta.value = `About [[${g.label}]]: `; ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); });
+  if (hasChat()) B('Ask assistant', () => { toggleSide(true); const ta = live.chat.ta!; ta.value = `About [[${g.label}]]: `; ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); });
   const hint = el('div', 'gc-hint', 'Neighbours of ' + g.label + ' are bright; the rest is dimmed. Esc, ✕ or a click on empty space shows all.');
   card.append(head, pre, ...(nb.length ? [links] : []), acts, hint);
   graphKick();
@@ -7919,7 +7919,7 @@ function setLeader(k: LeaderName) { if (!LEADERS[k]) return; S.leader = k; dirty
 // Open artifacts watch for the leader themselves (bridge.js); tell them when it changes.
 function keysToFrames() { for (const L of Object.values(live)) if (L?.port) try { L.port.postMessage({ t: 'keys', keys: { leader: leaderKeyName() } }); } catch {} }
 function folderMode(m: FrameMode, cascade?: boolean) { const n = activeId && S.nodes[activeId]; const f = n && (n.kind === 'frame' ? n : n.in && S.nodes[n.in] as FrameNode); if (f) cascade ? setModeCascade(f, m) : setMode(f, m); else toast('Pick a folder or something inside one.'); }
-function toggleFullscreen() { try { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen(); } catch (e) { toast('Fullscreen is not available here.'); } }
+function toggleFullscreen() { const no = () => toast('Fullscreen is not available here.'); try { (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen())?.catch(no); } catch { no(); } }   // it rejects without a user gesture, or in a frame that does not allow it
 function leaderOpen(prefix?: string) {
   const wk = $('#which-key') as HTMLElement | null; if (!wk) return;
   if (!LEADER.on) LEADER.target = document.activeElement as HTMLElement | null;
