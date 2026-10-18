@@ -4,8 +4,11 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createRequire } from 'node:module';
+import { Scheduler } from '../server/threads.mts';
 import { makeDir, startEdwind, stopEdwind, EditClient } from './edit-client.mts';
 import type { Msg, TestDir, EdwindChild, ClientOptions } from './edit-client.mts';
+import type { Server } from '../server/main.mts';
 
 let dir: TestDir, child: EdwindChild;
 before(async () => { dir = makeDir(); child = await startEdwind(dir); });
@@ -168,4 +171,29 @@ test('R15.11 status carries the event-loop lag and ack percentiles and the threa
   const s = (await c.call('status')).value;
   assert.ok('loopLagP95Ms' in s); assert.ok('ackP95Ms' in s); assert.equal(typeof s.threads, 'number');
   c.close();
+});
+
+test('R4.35 a thread suspended with no debugger, or whose debugger fails, is resumed by the scheduler', () => {
+  /* The scheduler alone over the real evaluator; the test steps the threads itself (no pump). */
+  const S = createRequire(import.meta.url)('../src/scheme.js');
+  const errors: string[] = [];
+  const log = { error: (ev: string) => errors.push(ev), warn() {}, info() {}, debug() {} };
+  const sched = new Scheduler({ log, L: { S, resetOps() {} }, Ed: { message() {} } } as unknown as Server);
+  sched.stopping = true;
+  try {
+    const cond = new S.SchemeError('error', 'boom', []);
+    /* No debugger: the thread goes on with no value. */
+    const a = sched.spawn(function* () { const v = yield new S.Suspend(cond, true); return v === undefined ? 'resumed' : v; });
+    sched.step(a);
+    assert.equal(a.state, 'runnable');
+    sched.step(a);
+    assert.equal(a.state, 'done'); assert.equal(a.result, 'resumed');
+    /* A debugger that throws: the condition is delivered to the thread, and the failure is logged. */
+    sched.onSuspend = () => { throw new Error('no frame to show the debugger in'); };
+    const b = sched.spawn(function* () { try { yield new S.Suspend(cond, false); return 'continued'; } catch (e) { return e === cond ? 'thrown' : 'other'; } });
+    sched.step(b);
+    assert.equal(b.state, 'runnable'); assert.deepEqual(errors, ['debugger']);
+    sched.step(b);
+    assert.equal(b.state, 'done'); assert.equal(b.result, 'thrown');
+  } finally { sched.lag.disable(); }
 });

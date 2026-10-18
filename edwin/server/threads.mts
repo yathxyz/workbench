@@ -272,8 +272,8 @@ export class Scheduler {
     if (y instanceof S.Suspend) {
       t.state = 'suspended'; t.waiting = 'the debugger'; t.suspend = y;
       this.release(t);
-      if (this.onSuspend) { try { this.onSuspend(t, y); } catch (e) { this.log.error('debugger', { error: e.stack || String(e) }); (t as Thread & { resumeFromDebugger(how: Resume): void }).resumeFromDebugger({ throw: y.condition }); } }
-      else (t as Thread & { resumeFromDebugger(how: Resume): void }).resumeFromDebugger({ value: undefined });
+      if (this.onSuspend) { try { this.onSuspend(t, y); } catch (e) { this.log.error('debugger', { error: e.stack || String(e) }); this.resumeThread(t, { throw: y.condition }); } }
+      else this.resumeThread(t, { value: undefined });
       return;
     }
     /* Anything else yielded is a bug in a primitive: treat it as a value. */
