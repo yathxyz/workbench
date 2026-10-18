@@ -1,0 +1,3 @@
+#!/bin/sh
+# For tests/terminal.rs, as EDWIN_SSH: stands in for ssh (fake-ssh.mjs).
+exec node "$(dirname "$0")/fake-ssh.mjs" "$@"

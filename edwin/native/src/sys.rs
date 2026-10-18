@@ -1,5 +1,5 @@
-//! The Unix floor: the terminal (/dev/tty in raw mode), signals through a self-pipe, edwind's sockets, and
-//! one poll(2) over all of them.
+//! The Unix floor: the terminal (/dev/tty in raw mode), signals through a self-pipe, edwind's sockets (a remote
+//! edwind's through ssh), and one poll(2) over all of them.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,6 +19,46 @@ struct Sock {
     /// Bytes sent but not yet taken by the peer: written as the socket accepts them (POLLOUT), so a peer that
     /// stops reading never blocks the loop, and lines still reach it whole and in order.
     outq: Vec<u8>,
+    /// The ssh carrying a remote edwind's socket, ended with it.
+    ssh: Option<Ssh>,
+}
+
+struct Ssh {
+    child: std::process::Child,
+    /// Its standard error, in a file already unlinked: read when the connection fails.
+    stderr: std::fs::File,
+}
+
+impl Ssh {
+    /// What ssh said (its last lines: why it gave up), or how it ended.
+    fn reason(&mut self) -> String {
+        use std::io::Seek;
+        let mut text = String::new();
+        let _ = self.stderr.seek(std::io::SeekFrom::Start(0));
+        let _ = self.stderr.read_to_string(&mut text);
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !lines.is_empty() {
+            return lines[lines.len().saturating_sub(3)..].join("; ");
+        }
+        match self.child.try_wait() {
+            Ok(Some(st)) => format!("ssh ended ({st})"),
+            _ => "ssh closed the connection".into(),
+        }
+    }
+}
+
+impl Drop for Sock {
+    fn drop(&mut self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if let Some(ssh) = self.ssh.as_mut() {
+            let _ = ssh.child.kill();
+            let _ = ssh.child.wait();
+        }
+    }
 }
 
 /// A peer that leaves this much unread is taken as gone: the socket is shut down and the loop reports it closed.
@@ -49,6 +89,8 @@ struct State {
     carry: Vec<u8>,
     socks: HashMap<u32, Sock>,
     next_sock: u32,
+    /// Why a remote socket closed (ssh's last words), until JS asks (sock_error).
+    sock_errors: HashMap<u32, String>,
 }
 
 thread_local! {
@@ -263,8 +305,31 @@ pub fn tty_is_open() -> bool {
 
 /* ---------- sockets ---------- */
 
-pub fn sock_open(path: &str) -> Result<u32, String> {
-    let stream = UnixStream::connect(path).map_err(|e| e.to_string())?;
+/// A remote edwind: `ssh://DEST/SOCKET`, DEST as ssh takes it (`host`, `user@host`, `host:port`, a Host of
+/// ~/.ssh/config), SOCKET its socket there (/run/workbench-edit/edit.sock, Workbench's, when left out).
+pub const SSH_PREFIX: &str = "ssh://";
+const REMOTE_SOCKET: &str = "/run/workbench-edit/edit.sock";
+
+/// Open edwind's socket at PATH. A remote one runs `ssh -W SOCKET DEST` with its standard input and output on
+/// one end of a socket pair, so the rest of this file sees one more Unix socket. With WAIT (ms) this returns once
+/// edwind has answered through it, or fails with ssh's reason; without, the connection is made while the loop
+/// runs and a failure is a close (sock_error says why).
+pub fn sock_open(path: &str, wait: Option<u32>) -> Result<u32, String> {
+    let (stream, ssh) = match path.strip_prefix(SSH_PREFIX) {
+        Some(spec) => {
+            let (stream, mut ssh) = ssh_spawn(spec)?;
+            if let Some(ms) = wait {
+                if let Err(e) = ssh_probe(&stream, ms) {
+                    let why = if e.is_empty() { ssh.reason() } else { e };
+                    let _ = ssh.child.kill();
+                    let _ = ssh.child.wait();
+                    return Err(why);
+                }
+            }
+            (stream, Some(ssh))
+        }
+        None => (UnixStream::connect(path).map_err(|e| e.to_string())?, None),
+    };
     stream.set_nonblocking(true).map_err(|e| e.to_string())?;
     Ok(ST.with(|st| {
         let mut st = st.borrow_mut();
@@ -276,10 +341,112 @@ pub fn sock_open(path: &str) -> Result<u32, String> {
                 stream,
                 buf: Vec::new(),
                 outq: Vec::new(),
+                ssh,
             },
         );
         id
     }))
+}
+
+fn ssh_spawn(spec: &str) -> Result<(UnixStream, Ssh), String> {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let (dest, socket) = match spec.find('/') {
+        Some(i) => (&spec[..i], &spec[i..]),
+        None => (spec, REMOTE_SOCKET),
+    };
+    if dest.is_empty() {
+        return Err("no host in the ssh:// address".into());
+    }
+    let err = |e: std::io::Error| e.to_string();
+    let (ours, theirs) = UnixStream::pair().map_err(err)?;
+    let name = std::env::temp_dir().join(format!(
+        "edwin-ssh-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let stderr = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&name)
+        .map_err(err)?;
+    let _ = std::fs::remove_file(&name);
+    let program = std::env::var("EDWIN_SSH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ssh".into());
+    // BatchMode: ssh never asks on the terminal, which edwin holds in raw mode (keys come from the agent, or a
+    // ControlMaster connection). Its own process group: the terminal's signals are edwin's to handle.
+    let child = std::process::Command::new(&program)
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-W",
+            socket,
+            "--",
+        ])
+        .arg(format!("{SSH_PREFIX}{dest}"))
+        .stdin(Stdio::from(OwnedFd::from(theirs.try_clone().map_err(err)?)))
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .stderr(Stdio::from(stderr.try_clone().map_err(err)?))
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("cannot run {program}: {e}"))?;
+    Ok((ours, Ssh { child, stderr }))
+}
+
+/// Wait up to MS for edwind to answer through ssh: a ping before hello draws an error reply, which proves the
+/// whole path and leaves the connection as new (edwind takes hello next). Err("") when ssh gave up (its reason
+/// is in its standard error), else what went wrong here.
+fn ssh_probe(stream: &UnixStream, ms: u32) -> Result<(), String> {
+    let mut s = stream;
+    s.write_all(b"{\"t\":\"ping\",\"rid\":\"edwin-probe\"}\n")
+        .map_err(|_| String::new())?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(ms.max(1) as u64)))
+        .map_err(|e| e.to_string())?;
+    let mut b = [0u8; 4096];
+    let mut got = Vec::new();
+    loop {
+        match s.read(&mut b) {
+            Ok(0) => return Err(String::new()),
+            Ok(k) => {
+                got.extend_from_slice(&b[..k]);
+                if got.contains(&b'\n') {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(format!("no answer in {} s", ms / 1000));
+            }
+            Err(_) => return Err(String::new()),
+        }
+    }
+    // The reply is the only line edwind sends before hello; anything after it would be out of protocol.
+    if !got.starts_with(b"{") {
+        return Err(format!(
+            "not an edwind: {}",
+            String::from_utf8_lossy(&got).trim()
+        ));
+    }
+    stream.set_read_timeout(None).map_err(|e| e.to_string())
+}
+
+/// Why the remote socket ID closed, once.
+pub fn sock_error(id: u32) -> Option<String> {
+    ST.with(|st| st.borrow_mut().sock_errors.remove(&id))
 }
 
 pub fn sock_send(id: u32, line: &str) -> bool {
@@ -301,11 +468,8 @@ pub fn sock_send(id: u32, line: &str) -> bool {
 }
 
 pub fn sock_close(id: u32) {
-    ST.with(|st| {
-        if let Some(s) = st.borrow_mut().socks.remove(&id) {
-            let _ = s.stream.shutdown(std::net::Shutdown::Both);
-        }
-    });
+    // Dropping it shuts the socket down (and ends its ssh).
+    ST.with(|st| st.borrow_mut().socks.remove(&id));
 }
 
 pub fn sock_count() -> usize {
@@ -479,7 +643,14 @@ pub fn wait(timeout: i32) -> Ready {
                 }
             }
             if closed {
-                st.socks.remove(&id);
+                if let Some(mut s) = st.socks.remove(&id) {
+                    if let Some(ssh) = s.ssh.as_mut() {
+                        let _ = ssh.child.kill();
+                        let _ = ssh.child.wait();
+                        let why = ssh.reason();
+                        st.sock_errors.insert(id, why);
+                    }
+                }
                 ready.socket_lines.push((id, None));
             }
         }
@@ -497,7 +668,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("edwin-sock-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        let id = sock_open(path.to_str().unwrap()).unwrap();
+        let id = sock_open(path.to_str().unwrap(), None).unwrap();
         let (mut peer, _) = listener.accept().unwrap();
         let line = "x".repeat(1 << 16);
         // 4 MB, far more than the socket buffer holds, while the peer reads nothing.

@@ -51,7 +51,7 @@ so edwind and the suites need no step. `src/host-node.cts` is checked with the s
 | `test/ot.test.mts`, `test/ot-sim.mts` | the OT properties with fast-check (`edwin-ot`; needs `NODE_PATH` at `tools/node_modules`) |
 | `test/conformance.test.mts`, `test/crash.test.mts`, `test/disk.test.mts`, `test/edit-client.mts` | the edwind gate suites (`edit-conformance`, `edit-crash`, `edit-disk`) and their client |
 | `src/display.ts`, `test/display.test.mts` | the display seam (DT0, see below): frames with no page, drawn on a cell grid for a terminal or native backend (`edwin-display`) |
-| `native/` | `edwin`, the desktop program (DT1 and DT2, see below): a Rust crate with its own Cargo workspace that embeds V8 and these files; `native/js/` is its JavaScript (prelude, host, terminal, window, startup), `native/src/gui/` the window, `native/tests/` its pseudo-terminal and virtual-display suites (`cargo test`) |
+| `native/` | `edwin`, the desktop program (DT1 to DT4, see below): a Rust crate with its own Cargo workspace that embeds V8 and these files; `native/js/` is its JavaScript (prelude, host, terminal, window, startup), `native/src/gui/` the window, `native/tests/` its pseudo-terminal and virtual-display suites (`cargo test`) |
 | `test/term.test.mts`, `test/native.test.mts` | the terminal encoder and decoder, and the core's seams for the program: files on a disk, exit statuses, input events (`edwin-native`) |
 
 These files came from the published Edwin artifact (version 1791768765, 2026-10-12). From now on this directory is
@@ -419,7 +419,45 @@ Choices E3 made where the spec left one open, and where it had to deviate:
 - **Not in E3**: K4 (Edwin keymaps in the board's conflict checker) waits for the keymaps PR; a display-text
   mechanism in the renderer (block-ref text is a DOM post-pass) and an `imenuItems` hook are left for later.
 
-## Step DT4: Edwin from the flake (in review)
+## Step DT3: attach anywhere (in review)
+
+A desktop frame attaches to an edwind on another machine, ex44's in particular, so its notes (and what ex44's
+edwind does with them) are edited from the laptop with the laptop's own editor; and `edwin -a` starts the user's
+own edwind when none answers, as `emacsclient -a ''` starts an Emacs daemon.
+
+- **`--remote HOST[:SOCKET]`** attaches through ssh: `edwin -g --remote ex44 journal.md`. The program runs
+  `ssh -o BatchMode=yes -W SOCKET ssh://HOST` (SOCKET is Workbench's, `/run/workbench-edit/edit.sock`, unless
+  given) with ssh's standard input and output on one end of a socket pair, so the rest of the program sees one more
+  Unix socket and the protocol is unchanged. HOST is anything ssh takes (`user@host`, `host:port`, a `Host` of
+  `~/.ssh/config`). BatchMode: ssh never asks on the terminal edwin holds, so keys come from the agent (or a
+  ControlMaster connection, which also makes each connection cheap). edwind's socket directory is mode 0700, so the
+  ssh user is the one `services.workbench.user` names; OpenSSH forwards Unix sockets by default
+  (`AllowStreamLocalForwarding`). `EDWIN_SOCKET=ssh://ex44` makes the remote edwind the default; `EDWIN_SSH` names
+  the ssh program.
+- **Names.** A FILE argument that is not a path on this machine (not `/…`, `~…`, `./…` or `../…`) is a note on
+  the remote host, named as under its notes directory (`journal.md`, `projects/edwin.md`); `./draft.txt` is a file
+  here. Inside, a full path under the remote notes directory is a note there; other names are files on this
+  machine (DT1).
+- **The connection.** The start waits up to 30 s for the remote edwind to answer (a ping before hello, which
+  draws an error reply and proves the whole path) and otherwise exits with status 1 and ssh's reason ("Could not
+  resolve hostname", "open failed: connect failed"). After that, a dropped connection is retried while the
+  editor runs, as the browser's frames retry: the frame keeps its replica, edits wait in its queue, and ssh's
+  reason goes in the log (`~/.local/state/edwin/edwin.log`). Remote latency touches only acknowledgements.
+- **`-a`, `--start-daemon`.** When no edwind answers on `$EDWIN_SOCKET`, the user's socket or Workbench's,
+  edwin runs `edwin-daemon` beside it (DT4), waits up to 10 s for `$XDG_RUNTIME_DIR/edwin/edit.sock`, and
+  attaches. The daemon outlives the frame. Without `edwin-daemon` (a cargo build), or if it fails, edwin says so
+  and edits on its own. `EDITOR="edwin -a"` gives every commit message the same buffers as the window.
+- **Checked by** `remote_notes_go_through_ssh` (through `tests/fake-ssh`, which joins ssh's standard streams to
+  the socket here; also the failure message) and `dash_a_starts_the_daemon_and_attaches` (a stand-in
+  `edwin-daemon` beside a copy of the binary; the frame shows in edwind's log); by hand through a real OpenSSH
+  10.5 sshd on localhost: the window edited a remote note, saved, survived the remote edwind restarting (it
+  reconnected and saved again), and reported a missing socket and an unknown host.
+- **Not in DT3:** wb-web's `/edit` over HTTPS. wb-web accepts a frame only from its trusted front proxy (the
+  `x-workbench-proxy-secret` header and `publicOrigin`), so a desktop client would need the proxy's own login;
+  ssh reaches the same edwind with the user's keys and no new credential. Starting an edwind on the remote host
+  (`-a` is local only), and one frame attached to two edwinds at once (`sync.ts` holds one connection per runtime).
+
+## Step DT4: Edwin from the flake (done)
 
 The flake builds Edwin on its own, as Emacs ships `emacs`, `emacs --daemon` and `emacsclient`:
 
