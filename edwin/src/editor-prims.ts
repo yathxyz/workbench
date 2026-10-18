@@ -473,8 +473,8 @@ D('current-global-map', '', 'The global keymap.', () => L.get('global-map'));
 CMD('global-set-key', 'kSet key globally: \nCSet key to command: ', 'KEY COMMAND', 'Bind KEY to COMMAND in the global keymap.', ([k, c]) => Ed.defineKey(L.get('global-map') as EdKeymap, str(k), c));
 D('global-unset-key', 'KEY', 'Remove the global binding of KEY.', ([k]) => Ed.defineKey(L.get('global-map') as EdKeymap, str(k), false));
 CMD('local-set-key', 'kSet key locally: \nCSet key locally to command: ', 'KEY COMMAND', 'Bind KEY in the current major mode’s keymap.', ([k, c]) => {
-  const s = intern(cur().mode + '-map'); if (!(s.value instanceof Ed.Keymap)) s.value = new Ed.Keymap(s.name);
-  return Ed.defineKey(s.value, str(k), c);
+  const n = cur().mode + '-map'; let km = L.get(n); if (!(km instanceof Ed.Keymap)) { km = new Ed.Keymap(n); L.set(n, km); }
+  return Ed.defineKey(km as EdKeymap, str(k), c);
 });
 D('lookup-key', 'KEYMAP KEY', 'The binding of KEY in KEYMAP.', ([m, k]) => { const d = Ed.lookupIn(keymapOf(m), Ed.kbd(str(k)).split(' ')); return d === undefined ? false : d; });
 D('key-binding', 'KEY', 'The command KEY runs in the current buffer.', ([k]) => { const d = Ed.lookupKey(Ed.kbd(str(k))); return d === undefined || d === Ed.PREFIX ? false : d; });

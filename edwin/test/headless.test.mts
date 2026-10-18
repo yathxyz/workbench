@@ -140,3 +140,15 @@ test('avy-goto-char-2 jumps to the only visible pair, matched without case', asy
   await ed.keys('M-x'); await ed.type('avy-goto-char-2\ntw');
   assert.equal(ed.point(), 4);
 });
+
+test('local-set-key binds in the current major mode’s keymap', async () => {
+  await fresh();
+  await ed.type('ione two'); await ed.keys('ESC');
+  await ed.type(':(define-command (shout-local) (interactive) (upcase-region (point-min) (point-max)))\n');
+  await ed.type(`:(local-set-key "C-c z" 'shout-local)\n`);
+  assert.ok(ed.eval(`(keymapp ${ed.E.current.mode}-map)`));
+  await ed.keys('C-c z'); assert.equal(ed.text(), 'ONE TWO');
+  await fresh('scm');
+  await ed.type('ione'); await ed.keys('ESC'); await ed.keys('C-c z');
+  assert.equal(ed.text(), 'one', 'another major mode keeps its own keys');
+});
