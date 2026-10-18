@@ -226,12 +226,17 @@ test('with host.workers false the pool is off: every path runs on the main threa
     try { await P.run('words', { id: 0, src: '[a-z]', cap: 10 }); out.run = 'resolved'; } catch (e) { out.run = e.kind; }
     await ed.type(':e off.txt\\n'); ed.Ed.insertText(ed.E.current, 'aaa bbb aaa');
     out.local = (await P.run('words', { id: ed.E.current.id, src: '[a-z]', cap: 10 }, { buffers: [ed.E.current], fallback: 'local' })).n;
+    /* What fails on the main thread fails with the condition a thread would send back. */
+    try { await ed.eval("(define fr (thread-run (lambda () (raise 'boom)))) fr"); } catch (e) { out.rejected = e.kind; }
+    out.raised = ed.L.write(ed.eval('(let ((e (future-error fr))) (list (condition? e) (error-kind e) (condition/report-string e)))'));
+    try { await P.run('words', { id: 12345, src: '[a-z]', cap: 10 }, { fallback: 'local' }); } catch (e) { out.localErr = e.kind; }
     try { P.define('not-a-job', a => a); out.define = 'accepted'; } catch (e) { out.define = 'raised'; }
     console.log(JSON.stringify(out));`;
   const r = spawnSync(process.execPath, [...process.execArgv.filter(a => !a.startsWith('--test')), '--input-type=module', '-e', src], { encoding: 'utf8', timeout: 60000 });
   assert.equal(r.status, 0, r.stderr);
   const out = JSON.parse(r.stdout.trim().split('\n').pop()!);
-  assert.deepEqual(out, { workers: false, ok: false, scheme: false, three: 3, pm: '(1 4 9)', poolOk: false, count: 0, run: 'no-worker', local: 2, define: 'raised' });
+  assert.deepEqual(out, { workers: false, ok: false, scheme: false, three: 3, pm: '(1 4 9)', poolOk: false, count: 0, run: 'no-worker', local: 2, define: 'raised',
+    rejected: 'raise', raised: '(#t raise "Uncaught exception: boom")', localErr: 'job-error' });
 });
 
 test('createHost: the worker switch, the job table and the thread factory are the host\'s (R4.1)', () => {
