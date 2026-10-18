@@ -515,6 +515,13 @@ test('Stable card ids: an org heading card keeps its tags when an anchor is mint
   assert.equal(card.title, 'What is mkIf?');
   const heading = (await value(a, 'notes-nodes', [{}])).nodes.find((n: Msg) => n.path === note && n.kind === 'heading');
   assert.deepEqual([heading.title, heading.tags], ['What is mkIf?', ['nixos']]);
+  // A card head that is also a task keeps its task title and tags too.
+  const todo = 'cards/minted-todo.org';
+  await value(a, 'notes-append', [{ path: todo, text: '* TODO Learn mkMerge :nixos:\ncard:: basic\nback:: merges\n' }]);
+  const r2 = await value(a, 'notes-reviews-append', [{ reviews: [{ card: `${todo}#1`, g: 3, t: '2026-10-14T10:00:00.000Z' }] }]);
+  assert.ok(r2.anchored[`${todo}#1`]);
+  const task = (await value(a, 'notes-tasks')).tasks.find((t: Msg) => t.path === todo);
+  assert.deepEqual([task.title, task.tags], ['Learn mkMerge', ['nixos']]);
   a.close();
 });
 
