@@ -1,20 +1,22 @@
 /* edwin, the program: Edwin in a terminal (DT1), as a Vim or Emacs would run, and a usable $EDITOR; or in a
    window of its own (DT2, --gui).
 
-     edwin [-nw | -g] [-R] [--standalone | --socket PATH] [+LINE] [FILE | -]...
+     edwin [-nw | -g] [-R] [-a] [--standalone | --socket PATH | --remote HOST] [+LINE] [FILE | -]...
 
    The core runs as a model frame (display.ts) drawn by term.ts, or by the window (gui.ts and the Rust side's
    gui/, which opened it before this file runs: N.guiSize() says so). Files are read and written directly
    (host-native.ts); when an edwind answers on its socket, the notes under its notes directory are opened
-   through it instead, shared with the browser's frames. The process ends with the status the user asked
+   through it instead, shared with the browser's frames. --remote HOST attaches to the edwind on another machine
+   through ssh (DT3); its notes are then named as they are under its notes directory. The process ends with the status the user asked
    for: :q, :wq, ZZ and C-x C-c give 0, :cq gives 1 (or its argument), so git commit and sudoedit can tell
    an abort. C-z suspends to the shell; fg resumes (in the window, C-z iconifies it). */
 (function () {
 'use strict';
 const N = globalThis.__n, H = globalThis.EdNativeHost, T = globalThis.EdTerm;
-/* The command line, as parseArgs reads it. line: +LINE (Infinity for + alone); socket: --socket's path. */
-interface MainOpts { files: string[]; line: number | null; readOnly: boolean; standalone: boolean; socket: string | null; stdin: boolean; help: boolean; version: boolean }
-const VERSION = 'edwin DT2';
+/* The command line, as parseArgs reads it. line: +LINE (Infinity for + alone); socket: --socket's path; remote:
+   --remote's HOST[:SOCKET]. */
+interface MainOpts { files: string[]; line: number | null; readOnly: boolean; standalone: boolean; socket: string | null; remote: string | null; stdin: boolean; help: boolean; version: boolean }
+const VERSION = 'edwin DT3';
 const USAGE = `Usage: edwin [OPTION]... [+LINE] [FILE]...
 Edit FILEs in Edwin, in this terminal or in a window.
 
@@ -24,6 +26,9 @@ Edit FILEs in Edwin, in this terminal or in a window.
   -R, --read-only    visit the files read-only
   --standalone       never attach to edwind
   --socket PATH      attach to the edwind listening on PATH
+  --remote HOST[:SOCKET]  attach through ssh to the edwind on HOST (its socket SOCKET, Workbench's by
+                     default); FILEs are then its notes, by their names under its notes directory
+  -a, --start-daemon start your own edwind (edwin --daemon) when none answers, then attach to it
   --daemon           start your own edwind in the background (--fg-daemon: in the foreground); each edwin
                      then attaches to it, as emacsclient does to emacs --daemon
   +LINE, +           start on line LINE of the first file (+ alone: its last line)
@@ -36,12 +41,13 @@ C-z suspends to the shell. Your init file is ~/.config/edwin/init.scm.
 const ESC_MS = Number(N.env('EDWIN_ESC_MS')) || 25;     // how long a lone ESC waits for the rest of a sequence
 const FENCE_MS = 60;                                     // how long the first draw waits for the terminal's replies
 const DRAIN_MS = 5000;                                   // how long quitting waits for edwind to confirm edits
+const REMOTE_MS = 30000;                                 // how long the start waits for a remote edwind to answer
 /* EDWIN_TRACE=1 logs how long each startup step took (in the log file, as console does). */
 const trace = N.env('EDWIN_TRACE') ? ((what: string) => console.log(`startup ${what} ${N.now().toFixed(1)} ms`)) : () => {};
 trace('main');
 
 function parseArgs(argv: string[]) {
-  const o: MainOpts = { files: [], line: null, readOnly: false, standalone: false, socket: null, stdin: false, help: false, version: false };
+  const o: MainOpts = { files: [], line: null, readOnly: false, standalone: false, socket: null, remote: null, stdin: false, help: false, version: false };
   let opts = true;
   for (const a of argv) {
     if (opts && a === '--') { opts = false; continue; }
@@ -51,15 +57,21 @@ function parseArgs(argv: string[]) {
     else if (opts && /^--geometry=\d+x\d+$/.test(a)) { /* main.rs sized the window */ }
     else if (opts && (a === '-R' || a === '--read-only')) o.readOnly = true;
     else if (opts && a === '--standalone') o.standalone = true;
+    else if (opts && (a === '-a' || a === '--start-daemon')) { /* main.rs started it */ }
     else if (opts && a.startsWith('--socket=')) o.socket = a.slice(9);
     else if (opts && a === '--socket') o.socket = '';
     else if (o.socket === '') o.socket = a;
+    else if (opts && a.startsWith('--remote=')) o.remote = a.slice(9);
+    else if (opts && a === '--remote') o.remote = '';
+    else if (o.remote === '') o.remote = a;
     else if (opts && a === '-') o.stdin = true;
     else if (opts && /^\+\d*$/.test(a)) o.line = a === '+' ? Infinity : Number(a.slice(1));
     else if (opts && a.startsWith('-') && a.length > 1) throw new Error(`unknown option ${a} (edwin --help lists them)`);
     else o.files.push(a);
   }
   if (o.socket === '') throw new Error('--socket needs a path');
+  if (o.remote === '') throw new Error('--remote needs a host');
+  if (o.remote !== null && o.socket !== null) throw new Error('--remote and --socket name two edwinds; give one');
   return o;
 }
 
@@ -98,13 +110,22 @@ let fenceDone: (() => void) | null = null;
 const fence = new Promise<void>(r => { fenceDone = r; setTimeout(r, gui ? 0 : FENCE_MS); });
 if (!gui) { out(enc!.enter()); N.ttyFlush(); }
 
+/* --remote HOST[:SOCKET] as the socket address the native side takes: ssh://HOST[/SOCKET]. */
+const remoteAddress = (r: string) => { const i = r.indexOf(':/'); return 'ssh://' + (i < 0 ? r : r.slice(0, i) + r.slice(i + 1)); };
+const isRemote = (p: string) => p.startsWith('ssh://');
+/* The connection that proved a remote edwind answers, kept for the first connection of the boot (one ssh). */
+let probeId: number | null = null;
 function edwindSocket() {
   if (N.env('EDWIN_NO_ATTACH')) return null;
   if (opts.standalone) return null;
   const user = envOf('XDG_RUNTIME_DIR') ? envOf('XDG_RUNTIME_DIR') + '/edwin/edit.sock' : '';   // edwin --daemon's
-  const cands = opts.socket ? [opts.socket] : [envOf('EDWIN_SOCKET'), user, '/run/workbench-edit/edit.sock'].filter(Boolean);
+  const named = opts.remote !== null ? remoteAddress(opts.remote) : opts.socket;
+  const cands = named ? [named] : [envOf('EDWIN_SOCKET'), user, '/run/workbench-edit/edit.sock'].filter(Boolean);
   for (const p of cands) {
-    try { const id = N.sockOpen(p); N.sockClose(id); return p; } catch (e) { if (opts.socket) throw new Error(`cannot attach to edwind at ${p}: ${e.message}`); }
+    try {
+      if (isRemote(p)) { probeId = N.sockOpen(p, REMOTE_MS); return p; }
+      const id = N.sockOpen(p); N.sockClose(id); return p;
+    } catch (e) { if (named || isRemote(p)) throw new Error(`cannot attach to edwind at ${e.message}`); /* "PATH: why" */ }
   }
   return null;
 }
@@ -213,14 +234,20 @@ const sockets = new Map<number, EdTransport>();
 globalThis.__native.handlers.sock = (id, line) => {
   const ws = sockets.get(id);
   if (!ws) return;
-  if (line === null) { sockets.delete(id); if (ws.onclose) ws.onclose({ code: 1006 }); }
+  if (line === null) {
+    sockets.delete(id);
+    const why = N.sockError(id);
+    if (why) console.error(`edwind connection closed: ${why}`);
+    if (ws.onclose) ws.onclose({ code: 1006 });
+  }
   else if (ws.onmessage) ws.onmessage({ data: line });
 };
-/* A WebSocket-shaped transport over edwind's Unix socket (one JSON message per line), as sync.ts wants. */
+/* A WebSocket-shaped transport over edwind's Unix socket (one JSON message per line), as sync.ts wants. A remote
+   one reconnects without waiting: ssh connects while the editor runs, and a failure is a close. */
 const transport = (path: string) => (): EdTransport => {
   const ws: EdTransport = { onopen: null, onmessage: null, onclose: null, onerror: null, readyState: 0 };
   let id: number;
-  try { id = N.sockOpen(path); } catch (e) { setTimeout(() => { if (ws.onerror) ws.onerror(e); if (ws.onclose) ws.onclose({ code: 1006 }); }, 0); return ws; }
+  try { if (probeId !== null) { id = probeId; probeId = null; } else id = N.sockOpen(path); } catch (e) { setTimeout(() => { if (ws.onerror) ws.onerror(e); if (ws.onclose) ws.onclose({ code: 1006 }); }, 0); return ws; }
   sockets.set(id, ws);
   ws.send = s => N.sockSend(id, s);
   ws.close = () => { sockets.delete(id); N.sockClose(id); ws.readyState = 3; };
@@ -247,18 +274,25 @@ function lineMessage(b: EdBuffer) {
   const n = b.rope.length ? Ed.lineCountB(b) : 0;
   return `"${Ed.fileLabel(b.file!)}" ${n}L, ${b.rope.length}C${b.readOnly ? ' [readonly]' : ''}`;
 }
+/* Attached to a remote edwind, a FILE argument that is not a path here (not /…, ~…, ./… or ../…) is one of its
+   notes, named as under its notes directory. Inside, names resolve against the buffer's directory, as in TRAMP:
+   from a note, the remote notes directory. */
+let remote = false, notesRoot = '';
+const remoteNote = (name: string) => remote && notesRoot && !/^(\/|~|\.\.?(\/|$))/.test(name);
 async function start() {
   Ed.reloadPersistent();
   L.set('load-path', L.listOf(host.loadPath));
   if (sock) {
+    remote = isRemote(sock);
     await Ed.bootServed({ transport: transport(sock), device: gui ? 'window' : 'terminal' });
     attached = { socket: sock, unconfirmed: 0 };
     const served = Ed.hooks.visit, dir = String(L.get('notes-directory') || '');
-    /* Compared by true name, so ./notes/a.md, a link into the notes and a linked notes directory all count. */
-    const root = dir ? H.truename(dir).replace(/\/$/, '') : '';
+    /* Compared by true name, so ./notes/a.md, a link into the notes and a linked notes directory all count. A
+       remote edwind's notes directory is on its machine: compared as written. */
+    const root = notesRoot = !dir ? '' : remote ? dir.replace(/\/$/, '') : H.truename(dir).replace(/\/$/, '');
     /* Notes go through edwind; every other file is this program's own. */
     const hook = (name: string) => {
-      const abs = H.truename(name);
+      const n = String(name), abs = remote ? n : H.truename(n);
       /* edwind names a note by its path under the notes directory. */
       if (root && abs.startsWith(root + '/')) return served!(abs.slice(root.length + 1));
       Ed.hooks.visit = null;
@@ -276,8 +310,8 @@ async function start() {
   const visited: EdBuffer[] = [], fresh = new Set<EdBuffer>(), failed: string[] = [];
   for (const f of opts.files.slice().reverse()) {
     try {
-      const isNew = N.stat(H.resolve(f)) === null;
-      const b = await Ed.visit(f);
+      const isNew = !remoteNote(f) && N.stat(H.resolve(f)) === null;
+      const b = await Ed.visit(remoteNote(f) ? notesRoot + '/' + f : f);
       if (b) { if (opts.readOnly) b.readOnly = true; visited.unshift(b); if (isNew) fresh.add(b); }
     } catch (e) { failed.push(Ed.errorText(e)); }
   }

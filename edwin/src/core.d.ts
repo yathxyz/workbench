@@ -2071,8 +2071,11 @@ interface EdNatives {
   /* stop until SIGCONT */
   suspend(): void;
   exit(code: number): void;
-  sockOpen(path: string): number;
+  /* waitMs: wait that long for a remote (ssh://) edwind to answer before returning */
+  sockOpen(path: string, waitMs?: number): number;
   sockSend(id: number, s: string): void;
+  /* why remote socket id closed (ssh's last line), or null */
+  sockError(id: number): string | null;
   sockClose(id: number): void;
   /* the window: its size and theme (null in a terminal), the model as JSON, an action, the clipboard */
   guiSize(): { cols: number; rows: number; theme?: 'light' | 'dark' } | null;

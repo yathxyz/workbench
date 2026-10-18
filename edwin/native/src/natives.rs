@@ -418,7 +418,12 @@ fn sock_open(
     mut rv: v8::ReturnValue,
 ) {
     let p = arg_str(scope, &args, 0);
-    match sys::sock_open(&p) {
+    // A second argument (ms) waits for a remote edwind to answer before returning.
+    let wait = args
+        .get(1)
+        .is_number()
+        .then(|| args.get(1).uint32_value(scope).unwrap_or(0));
+    match sys::sock_open(&p, wait) {
         Ok(id) => rv.set(v8::Integer::new(scope, id as i32).into()),
         Err(e) => throw(scope, &format!("{p}: {e}")),
     }
@@ -431,6 +436,18 @@ fn sock_send(
     let id = args.get(0).uint32_value(scope).unwrap_or(0);
     let line = arg_str(scope, &args, 1);
     rv.set(v8::Boolean::new(scope, sys::sock_send(id, &line)).into());
+}
+/// Why remote socket ID closed (ssh's last line), or null.
+fn sock_error(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let id = args.get(0).uint32_value(scope).unwrap_or(0);
+    match sys::sock_error(id) {
+        Some(e) => rv.set(v8::String::new(scope, &e).unwrap().into()),
+        None => rv.set_null(),
+    }
 }
 fn sock_close(
     scope: &mut v8::HandleScope,
@@ -522,7 +539,7 @@ macro_rules! natives {
             "readFile" read_file, "writeFile" write_file, "appendFile" append_file, "stat" stat, "realpath" realpath, "readDir" read_dir,
             "remove" remove, "mkdirs" mkdirs, "readStdin" read_stdin, "ttyOpen" tty_open, "ttyClose" tty_close,
             "ttyWrite" tty_write, "ttyFlush" tty_flush, "ttySize" tty_size, "suspend" suspend, "exit" exit,
-            "sockOpen" sock_open, "sockSend" sock_send, "sockClose" sock_close, "guiSize" gui_size,
+            "sockOpen" sock_open, "sockSend" sock_send, "sockClose" sock_close, "sockError" sock_error, "guiSize" gui_size,
             "guiDraw" gui_draw, "guiAction" gui_action, "guiClipboard" gui_clipboard
         )
     };

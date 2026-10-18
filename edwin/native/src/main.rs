@@ -70,34 +70,87 @@ fn user_socket() -> Option<String> {
         .map(|d| format!("{d}/edwin/edit.sock"))
 }
 
-/// Whether main.ts will attach to edwind, whose boot (Ed.bootServed) the snapshot cannot hold: the same
-/// choice main.ts makes (--standalone, --socket, EDWIN_NO_ATTACH, EDWIN_SOCKET, the user's daemon, the
-/// service's socket).
-fn will_attach() -> bool {
-    let args: Vec<String> = std::env::args().skip(1).take_while(|a| a != "--").collect();
-    if args
+fn option_args() -> Vec<String> {
+    std::env::args().skip(1).take_while(|a| a != "--").collect()
+}
+
+/// Whether the program may attach at all (not --standalone, EDWIN_NO_ATTACH, --help or --version).
+fn may_attach(args: &[String]) -> bool {
+    !(args
         .iter()
         .any(|a| a == "--standalone" || a == "--help" || a == "-h" || a == "--version")
-        || std::env::var_os("EDWIN_NO_ATTACH").is_some()
-    {
+        || std::env::var_os("EDWIN_NO_ATTACH").is_some())
+}
+
+/// Whether main.ts will attach to edwind, whose boot (Ed.bootServed) the snapshot cannot hold: the same
+/// choice main.ts makes (--standalone, --socket, --remote, EDWIN_NO_ATTACH, EDWIN_SOCKET, the user's daemon,
+/// the service's socket). A remote edwind (ssh) is not tried here: asking for one counts as attaching.
+fn will_attach() -> bool {
+    let args = option_args();
+    if !may_attach(&args) {
         return false;
     }
-    if args
-        .iter()
-        .any(|a| a == "--socket" || a.starts_with("--socket="))
+    if args.iter().any(|a| {
+        a == "--socket"
+            || a.starts_with("--socket=")
+            || a == "--remote"
+            || a.starts_with("--remote=")
+    }) {
+        return true;
+    }
+    let env = std::env::var("EDWIN_SOCKET").ok().filter(|s| !s.is_empty());
+    if env
+        .as_deref()
+        .is_some_and(|s| s.starts_with(sys::SSH_PREFIX))
     {
         return true;
     }
-    let mut cands: Vec<String> = std::env::var("EDWIN_SOCKET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .into_iter()
-        .collect();
+    let mut cands: Vec<String> = env.into_iter().collect();
     cands.extend(user_socket());
     cands.push("/run/workbench-edit/edit.sock".into());
     cands
         .iter()
         .any(|p| std::os::unix::net::UnixStream::connect(p).is_ok())
+}
+
+/// `-a` (`--start-daemon`): when no edwind answers, start the user's (edwin-daemon beside this program) and wait
+/// for its socket, as `emacsclient -a ''` starts an Emacs daemon. When that fails, edwin edits on its own.
+fn start_daemon_if_asked() {
+    let args = option_args();
+    if !args.iter().any(|a| a == "-a" || a == "--start-daemon")
+        || !may_attach(&args)
+        || will_attach()
+    {
+        return;
+    }
+    let Some(sock) = user_socket() else {
+        eprintln!("edwin: -a needs XDG_RUNTIME_DIR for the daemon's socket; editing on its own");
+        return;
+    };
+    let daemon = std::env::current_exe()
+        .ok()
+        .and_then(|e| Some(e.parent()?.join("edwin-daemon")))
+        .filter(|d| d.exists());
+    let Some(daemon) = daemon else {
+        eprintln!("edwin: -a needs edwin-daemon beside edwin (the Nix package installs it); editing on its own");
+        return;
+    };
+    match std::process::Command::new(daemon)
+        .stdin(std::process::Stdio::null())
+        .status()
+    {
+        Ok(st) if st.success() => {}
+        Ok(_) => return eprintln!("edwin: edwin-daemon failed; editing on its own"),
+        Err(e) => return eprintln!("edwin: cannot run edwin-daemon: {e}; editing on its own"),
+    }
+    let end = Instant::now() + std::time::Duration::from_secs(10);
+    while Instant::now() < end {
+        if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    eprintln!("edwin: edwind did not answer on {sock} (its log: ~/.local/state/edwin/edwind.log); editing on its own");
 }
 
 /// Whether the program was asked for a window (`-g`, `--gui`; `-nw` after them asks for the terminal again).
@@ -181,6 +234,7 @@ fn run() -> i32 {
     snapshot::init_v8(&ICU_DATA.0);
     natives::start_clock(Instant::now());
     sys::install_signals();
+    start_daemon_if_asked();
     let restore = std::env::var_os("EDWIN_NO_SNAPSHOT").is_none() && !will_attach();
     let mut params = v8::CreateParams::default().external_references(&**natives::external_refs());
     if restore {
