@@ -11,7 +11,7 @@ import type { OTModule, EditOp, SimBatch, UndoBatch } from './ot-sim.mts';
 const require = createRequire(import.meta.url);
 // fast-check is a dev dependency pinned in tools/package-lock.json (R15.1); NODE_PATH names its node_modules.
 const fc = require('fast-check'); // any: fast-check's types are not resolvable from edwin/ (it lives in tools/node_modules)
-const OT = require('../src/ot.js') as OTModule;
+const OT = require('../src/ot.ts') as OTModule;
 const SEEDS: number[] = JSON.parse(readFileSync(new URL('./ot-seeds.json', import.meta.url), 'utf8'));
 const RUNS = Number(process.env.OT_RUNS || 10000);
 

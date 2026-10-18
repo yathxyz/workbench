@@ -18,7 +18,7 @@ type WelcomedClient = EditClient & { welcome: Msg };
 interface RunResult { code: number | null; out: string }
 
 const require = createRequire(import.meta.url);
-const OT = require('../src/ot.js') as OTModule;
+const OT = require('../src/ot.ts') as OTModule;
 const { MAX_LINE, CODES } = await import('../server/proto.mts');
 
 let dir: TestDir, child: EdwindChild;

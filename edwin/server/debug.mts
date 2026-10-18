@@ -315,7 +315,7 @@ export class Debugger {
     const scan = (dir: string, rel: string) => {
       let names: string[] = []; try { names = fs.readdirSync(dir); } catch (e) { return; }
       for (const f of names) {
-        if (!/\.(js|mjs|mts)$/.test(f)) continue;
+        if (!/\.(js|mjs|mts|cts|ts)$/.test(f) || f.endsWith('.d.ts') || (f.endsWith('.js') && names.includes(f.slice(0, -3) + '.ts'))) continue; // a built .js beside its .ts: the .ts
         const lines = fs.readFileSync(path.join(dir, f), 'utf8').split('\n');
         lines.forEach((line, i) => {
           const re = /\b(?:D|CMD|pred|blocking|G|def|serverOnly\(L\.D|L\.D|L\.CMD)\(\s*'([^']+)'/g;
@@ -336,7 +336,7 @@ export class Debugger {
     if (!f.defAt) return null;
     const HELPERS = new Set(['def', 'D', 'CMD', 'pred', 'G', 'blocking', 'serverOnly', 'defineConditionType', 'alias']);
     for (const raw of String(f.defAt).split('\n').slice(1)) {
-      const m = /^\s*at\s+(?:([^\s(]+)\s+\()?(?:file:\/\/)?([^():\s]+\.(?:m?js|mts)):(\d+)(?::\d+)?\)?\s*$/.exec(raw);
+      const m = /^\s*at\s+(?:([^\s(]+)\s+\()?(?:file:\/\/)?([^():\s]+\.(?:m?js|[mc]?ts)):(\d+)(?::\d+)?\)?\s*$/.exec(raw);
       if (!m) continue;
       const [, fn, file, line] = m;
       if (fn && HELPERS.has(fn.replace(/^.*\./, ''))) continue;

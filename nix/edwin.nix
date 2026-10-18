@@ -91,7 +91,10 @@ rustPlatform.buildRustPackage {
 
   env.RUSTY_V8_ARCHIVE = rustyV8;
   # build.rs embeds the ICU data the v8 crate carries; here the crate is in the vendored sources.
+  # sources.rs embeds the core and native/js as JavaScript: each .ts stripped to the .js beside it.
+  nativeBuildInputs = [ nodejs ];
   preBuild = ''
+    node ${../tools/strip.mts} --in-place src native/js
     export EDWIN_ICU_DATA=$(find -L "$NIX_BUILD_TOP/cargo-vendor-dir" -path '*/v8-130.0.1/third_party/icu/flutter_desktop/icudtl.dat' | head -n1)
     test -f "$EDWIN_ICU_DATA"
   '';

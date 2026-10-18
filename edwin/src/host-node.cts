@@ -1,4 +1,4 @@
-/* The Node host: the same names as host-browser.js (R4.1), for Edwin's core with no page at all. edwind
+/* The Node host: the same names as host-browser.ts (R4.1), for Edwin's core with no page at all. edwind
    runs the core with it, and so do the headless tests.
 
    The core files are classic scripts that keep their state in globals, so loadEdwin runs them in this
@@ -30,6 +30,17 @@ function memoryStorage(map = new Map()) {
   };
 }
 const readText = p => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return null; } };
+const mtime = p => { try { return fs.statSync(p).mtimeMs; } catch (e) { return -1; } };
+
+/* The JavaScript of core file F of DIR (src/ by default), and the file a stack trace and definition-of name.
+   The core is TypeScript run as classic scripts, which vm cannot strip: the build writes F.js beside F.ts
+   (tools/strip.mts --in-place), and a checkout whose F.js is missing or older than F.ts gets F.ts stripped here
+   (Node's stripper keeps every line and column, so positions are the .ts's either way). */
+function coreSource(f, dir = SRC) {
+  const ts = path.join(dir, f + '.ts'), js = path.join(dir, f + '.js'), t = mtime(js);
+  const text = t >= 0 && t >= mtime(ts) ? fs.readFileSync(js, 'utf8') : require('node:module').stripTypeScriptTypes(fs.readFileSync(ts, 'utf8'), { mode: 'strip' });
+  return { text, filename: ts };
+}
 
 /* ---------- the worker pool's threads (R4.47, R15.3) ----------
    pool.js runs the same code on a Web Worker in the browser and on a worker_threads Worker here; the
@@ -125,8 +136,8 @@ function loadEdwin(host = createHost(), { mode = 'direct' } = {}) {
   if (globalThis.Ed) throw new Error('Edwin is already loaded in this process');
   globalThis.EdHost = host;
   globalThis.SCHEME_MODE = mode;
-  for (const f of FILES) vm.runInThisContext(fs.readFileSync(path.join(SRC, f + '.js'), 'utf8'), { filename: path.join(SRC, f + '.js') });
+  for (const f of FILES) { const c = coreSource(f); vm.runInThisContext(c.text, { filename: c.filename }); }
   return globalThis.Ed;
 }
 
-module.exports = { FILES, createHost, memoryStorage, loadEdwin, workerCount, WORKER_FILE, JOBS_FILE };
+module.exports = { FILES, createHost, memoryStorage, loadEdwin, coreSource, workerCount, WORKER_FILE, JOBS_FILE };

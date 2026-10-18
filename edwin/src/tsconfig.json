@@ -1,0 +1,18 @@
+{
+  // Edwin's core: classic scripts (no import or export) that share globals, run by the browser, by Node's vm
+  // (host-node.cts) and by desktop Edwin's V8, each as the .js tools/strip.mts makes beside the .ts. Erasable
+  // syntax only, so the .js keeps every line and column. The globals one file gives the next are in core.d.ts.
+  "compilerOptions": {
+    "target": "esnext",
+    "lib": ["esnext", "dom", "dom.iterable", "webworker.importscripts"],
+    "types": [],
+    "strict": true,
+    "noEmit": true,
+    "erasableSyntaxOnly": true,
+    "isolatedModules": false,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+    "useUnknownInCatchVariables": false
+  },
+  "include": ["*.ts"]
+}

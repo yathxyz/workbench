@@ -59,9 +59,9 @@ pub fn run_source(scope: &mut v8::HandleScope, name: &str) -> bool {
     let tc = &mut v8::TryCatch::new(scope);
     let code = v8::String::new(tc, src).unwrap();
     let file = if name.starts_with("native/") {
-        format!("edwin/{}.js", name.replacen("native/", "native/js/", 1))
+        format!("edwin/{}.ts", name.replacen("native/", "native/js/", 1))
     } else {
-        format!("edwin/src/{name}.js")
+        format!("edwin/src/{name}.ts")
     };
     let origin_name = v8::String::new(tc, &file).unwrap();
     let origin = v8::ScriptOrigin::new(

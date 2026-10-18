@@ -10,11 +10,11 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { makeDir, startEdwind, stopEdwind, EditClient, EDWIN } from './edit-client.mts';
 import type { Msg, TestDir, EdwindChild } from './edit-client.mts';
-import { loadSchemeIn } from './scheme-load.mts';
+import { loadSchemeIn, SCHEME_SOURCE } from './scheme-load.mts';
 import type { Scheme } from './scheme-load.mts';
 import { fromJSON, LOG_BUFFER_ID } from '../server/image.mts';
 
-const SCHEME_SRC = fs.readFileSync(path.join(EDWIN, 'src/scheme.js'), 'utf8');
+const SCHEME_SRC = SCHEME_SOURCE;
 const COMPACT_ENTRIES = 12;
 const ENV = { EDWIND_IMAGE_COMPACT_ENTRIES: String(COMPACT_ENTRIES) };
 /* What a frame runtime has that bare scheme.js lacks, as far as this suite's forms go: a global-map and a

@@ -12,7 +12,7 @@ import type { Msg } from './edit-client.mts';
 import type { OTModule, Server, SimMsg } from './ot-sim.mts';
 
 const require = createRequire(import.meta.url);
-const OT = require('../src/ot.js') as OTModule;
+const OT = require('../src/ot.ts') as OTModule;
 const { check, loadConfig, makeLog } = await import(MAIN) as typeof import('../server/main.mts');
 const ROUNDS = Number(process.env.CRASH_ROUNDS || 1000);
 const SEED = Number(process.env.CRASH_SEED || 7);

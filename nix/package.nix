@@ -30,7 +30,7 @@ rustPlatform.buildRustPackage {
       ../Cargo.lock
       ../crates
       # wb-cli's integration tests start a real edwind (crates/wb-cli/tests/common/mod.rs).
-      ../edwin/src
+      (lib.fileset.difference ../edwin/src (lib.fileset.fileFilter (f: f.hasExt "js") ../edwin/src))
       ../edwin/scm
       ../edwin/server
     ];
@@ -51,6 +51,7 @@ rustPlatform.buildRustPackage {
   preCheck = ''
     export BASH
     export WB_EDWIND_MAIN="$PWD/edwin/server/main.mts" WB_NODE=${nodejs}/bin/node
+    node ${../tools/strip.mts} --in-place edwin/src
   '';
 
   # wb-fake-acp, the scripted test agent, goes to its own output and never to $out/bin.

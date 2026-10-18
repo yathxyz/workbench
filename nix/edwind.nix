@@ -13,7 +13,7 @@ let
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      ../edwin/src
+      (lib.fileset.difference ../edwin/src (lib.fileset.fileFilter (f: f.hasExt "js") ../edwin/src))
       ../edwin/scm
       ../edwin/server
     ];
@@ -30,6 +30,9 @@ stdenv.mkDerivation {
   installPhase = ''
     mkdir -p $out/share/edwin $out/bin
     cp -r edwin/src edwin/scm edwin/server $out/share/edwin/
+    # The core runs as classic scripts through vm, which cannot strip types: each .ts gets its .js beside it.
+    chmod -R u+w $out/share/edwin/src
+    ${nodejs}/bin/node ${../tools/strip.mts} --in-place $out/share/edwin/src
     cat > $out/bin/edwind <<EOF
     #!${stdenv.shell}
     : "\''${EDWIND_MEMORY_MIB:=1024}"

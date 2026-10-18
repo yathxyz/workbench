@@ -13,7 +13,7 @@ interface Term {
   decoder(): Decoder; encoder(opts?: { color?: string; defaultColors?: boolean }): Encoder;
   colorMode(env: Record<string, string>): string; to256(rgb: number[]): number; to16(rgb: number[]): number; b64(s: string): string;
 }
-const T = createRequire(import.meta.url)('../native/js/term.js') as Term;
+const T = createRequire(import.meta.url)('../native/js/term.ts') as Term;
 const keys = (evs: TermEvent[]) => evs.filter(e => e.type === 'key').map(e => e.key);
 
 test('plain bytes decode to Edwin key names', () => {

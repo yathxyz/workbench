@@ -26,7 +26,7 @@ let
       ../edwin/index.html;
   edwinSrc = lib.fileset.toSource {
     root = ../edwin/src;
-    fileset = lib.fileset.fileFilter (f: f.hasExt "js") ../edwin/src;
+    fileset = lib.fileset.fileFilter (f: f.hasExt "ts" && !lib.hasSuffix ".d.ts" f.name) ../edwin/src;
   };
   edwinScm = lib.fileset.toSource {
     root = ../edwin/scm;
@@ -40,7 +40,7 @@ runCommand "workbench-web" { nativeBuildInputs = [ nodejs woff2 ]; } ''
   chmod -R u+w $out
   install -Dm444 -t $out/vendor ${vendor}/vendor.js ${vendor}/xterm.css
   install -Dm444 ${console} $out/edwin/index.html
-  install -Dm444 -t $out/edwin/src ${edwinSrc}/*.js
+  node ${../tools/strip.mts} $out/edwin/src ${edwinSrc}/*.ts
   install -Dm444 -t $out/edwin/scm ${edwinScm}/*.scm
 
   mkdir fonts

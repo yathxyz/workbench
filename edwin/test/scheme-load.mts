@@ -1,14 +1,14 @@
-// Load Edwin's Scheme (src/scheme.js) into Node by itself, with no page stand-ins.
+// Load Edwin's Scheme (src/scheme.ts) into Node by itself, with no page stand-ins.
 //
 // loadScheme() runs it in this context (vm.runInThisContext), as the editor does, and returns the
 // Scheme object; loadSchemeIn(source, globals) runs a source text in a fresh context (the benchmark
 // loads several evaluators side by side that way).
-import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 
-export type SchemeValue = any; // any: a value of the evaluator, which is untyped JavaScript (src/scheme.js)
+export type SchemeValue = any; // any: a value of the evaluator, which is untyped JavaScript (src/scheme.ts)
 export type SchemeMode = 'direct' | 'gen';
 /* A source location, as sourceLocation gives it. */
 export interface SourceLoc { file: string | null; line: number; col: number }
@@ -89,7 +89,9 @@ export interface Scheme {
 interface SchemeGlobals { SCHEME_MODE?: string; SCHEME_SHADOW_STACK?: boolean; Scheme?: Scheme }
 
 export const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-export const SCHEME_FILE = join(ROOT, 'src', 'scheme.js');
+export const SCHEME_FILE = join(ROOT, 'src', 'scheme.ts');
+/* Its JavaScript (host-node.cts coreSource: the built scheme.js, or scheme.ts stripped). */
+export const SCHEME_SOURCE: string = (createRequire(import.meta.url)('../src/host-node.cts') as { coreSource(f: string): { text: string } }).coreSource('scheme').text;
 
 // The evaluator modes a suite runs in: 'direct' (the closure compiler, frames) and 'gen' (generator
 // closures, edwind; R4.38). Both must pass the same suite.
@@ -99,7 +101,7 @@ export const MODE: string = process.env.EDWIN_SCHEME_MODE || 'direct';
 export function loadScheme(mode: string = MODE): Scheme {
   if (!MODES.includes(mode)) throw new Error('unknown Scheme evaluator mode: ' + mode);
   (globalThis as SchemeGlobals).SCHEME_MODE = mode;
-  vm.runInThisContext(readFileSync(SCHEME_FILE, 'utf8'), { filename: 'scheme.js' });
+  vm.runInThisContext(SCHEME_SOURCE, { filename: 'scheme.ts' });
   return (globalThis as SchemeGlobals).Scheme!;
 }
 
@@ -107,6 +109,6 @@ export function loadSchemeIn(source: string, globals: SchemeGlobals = {}): Schem
   const sandbox: SchemeGlobals & Record<string, unknown> = { performance, TextEncoder, console, ...globals };
   sandbox.window = sandbox; sandbox.self = sandbox;
   vm.createContext(sandbox);
-  vm.runInContext(source, sandbox, { filename: 'scheme.js' });
+  vm.runInContext(source, sandbox, { filename: 'scheme.ts' });
   return sandbox.Scheme!;
 }

@@ -16,8 +16,8 @@ type EdwinCore = any; // any: Edwin's core (edwin/src) is untyped JavaScript
 type Batch = { seq: number; base: number; ops: EditOp[] };
 
 const require = createRequire(import.meta.url);
-const { createHost, loadEdwin, memoryStorage } = require('../src/host-node.js');
-const OT = require('../src/ot.js') as OTModule;
+const { createHost, loadEdwin, memoryStorage } = require('../src/host-node.cts');
+const OT = require('../src/ot.ts') as OTModule;
 
 let dir: TestDir, child: EdwindChild, Ed: EdwinCore, E: EdwinCore, L: EdwinCore, sync: EdwinCore;
 const note = (name: string, text: string) => { fs.writeFileSync(path.join(dir.dirs.notes, name), text); return name; };

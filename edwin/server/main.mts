@@ -191,7 +191,7 @@ export class Server {
   }
   /* Load Edwin's core headless and boot it (host-node.js), then replay the image log (R4.19) and the journals. */
   async start() {
-    const { createHost, loadEdwin } = require(path.join(EDWIN, 'src/host-node.js'));
+    const { createHost, loadEdwin } = require(path.join(EDWIN, 'src/host-node.cts'));
     const storageFile = path.join(this.cfg.stateDir, 'storage.json');
     const host = createHost({ scmDir: path.join(EDWIN, 'scm'), configDir: this.cfg.configDir, storage: fileStorage(storageFile, this.log) });
     this.Ed = loadEdwin(host, { mode: 'gen' });
@@ -394,7 +394,7 @@ function fileStorage(file: string, log: Log) {
 export function check(cfg: Config, out = (s: string): unknown => process.stdout.write(s + '\n')) {
   const dir = path.join(cfg.stateDir, 'buffers');
   let bad = 0, n = 0;
-  const OT = require(path.join(EDWIN, 'src/ot.js'));
+  const OT = require(path.join(EDWIN, 'src/ot.ts'));
   for (const f of fs.existsSync(dir) ? fs.readdirSync(dir).filter(x => x.endsWith('.jsonl')) : []) {
     n++;
     const jid = f.slice(0, -6);

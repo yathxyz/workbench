@@ -5,10 +5,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
-import { FILES, createHost, loadEdwin } from './headless.mts';
+import { FILES, createHost, loadEdwin, coreSource } from './headless.mts';
 import type { Edwin, NodeHost } from './headless.mts';
 
 type Globals = typeof globalThis & { L: Edwin };
+const NATIVE_JS = new URL('../native/js', import.meta.url).pathname;
 /* host.files, as host-native.js shapes it (the Node host has none of its own). */
 interface HostFiles {
   resolve(n: string): string; label(p: string): string; read(n: string): string | null; write(n: string, t: string): void; remove(n: string): void;
@@ -54,9 +55,9 @@ const fresh = async () => {
   exits.length = 0;
 };
 
-test('boot.js loads the core files in host-node.js\'s order', () => {
-  const src = readFileSync(new URL('../native/js/boot.js', import.meta.url), 'utf8');
-  const m = /const FILES = (\[[^\]]*\])/.exec(src);
+test('boot.ts loads the core files in host-node.cts\'s order', () => {
+  const src = readFileSync(new URL('../native/js/boot.ts', import.meta.url), 'utf8');
+  const m = /const FILES(?::[^=]*)? = (\[[^\]]*\])/.exec(src);
   assert.deepEqual(JSON.parse(m![1].replace(/'/g, '"')), FILES);
 });
 
@@ -85,8 +86,8 @@ test('a file under a second name (a symbolic link) is the buffer already open', 
   assert.equal(E.buffers.filter((x: Edwin) => x.file).length, 1);
 });
 
-test('host-native.js: foo, ./foo and bar/../foo are one path; ~ is the home directory', () => {
-  const src = readFileSync(new URL('../native/js/host-native.js', import.meta.url), 'utf8');
+test('host-native.ts: foo, ./foo and bar/../foo are one path; ~ is the home directory', () => {
+  const src = coreSource('host-native', NATIVE_JS).text;
   const N = { env: (k: string) => ({ HOME: '/home/u' } as Record<string, string>)[k], cwd: () => '/w', realpath: (p: string) => (p === '/w/l' ? '/w/t' : null) };
   const ctx = vm.createContext({ __n: N });
   vm.runInContext(src, ctx);
@@ -282,7 +283,7 @@ test('gui.js: window events reach display.input as the page names them; the back
     guiDraw: json => { calls.push(['draw', JSON.parse(json).cols]); },
     guiAction: (name, arg) => { calls.push([name, arg]); },
   };
-  vm.runInThisContext(readFileSync(new URL('../native/js/gui.js', import.meta.url), 'utf8'));
+  vm.runInThisContext(coreSource('gui', NATIVE_JS).text);
   const G = G0.EdGui, s = G.screen();
   assert.deepEqual(s.backend.size(), { cols: 8, rows: 3 }, 'a window is never smaller than 8x3 cells');
   assert.equal(s.backend.tty, false);

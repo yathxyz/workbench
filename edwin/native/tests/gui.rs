@@ -302,7 +302,7 @@ fn keystroke_to_screen_latency_budget() {
         return;
     };
     let dir = workdir("latency");
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/display.js");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/display.ts");
     std::fs::copy(src, dir.join("big.js")).unwrap();
     let lat = dir.join("latency.log");
     let lat_s = lat.display().to_string();
