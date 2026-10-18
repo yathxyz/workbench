@@ -636,8 +636,9 @@ function resolveJob(job: PoolJob, val: unknown, versions?: PoolVersions) {
   if (job.cbs && job.cbs.onDone) job.cbs.onDone(val, job.versions);
   if (job.future) settleFuture(job.future, 'done', val as SchemeValue, null, job.versions);
 }
-function rejectJob(job: PoolJob, err: PoolErr, versions?: PoolVersions) {
+function rejectJob(job: PoolJob, e: unknown, versions?: PoolVersions) {
   if (job.status === 'done' || job.status === 'failed') return;
+  const err = asCondition(e);
   finishJob(job); job.status = 'failed';
   job.versions = versions || new Map(); job.promise.versions = job.versions;
   job.rej(err);
@@ -653,7 +654,7 @@ function cancelAll(tag?: string) { for (const q of [ui, batch]) for (const job o
 /* Run a job on the main thread when idle (no worker, or a job that could not be compiled there). */
 function runLocally(job: PoolJob, fn: () => unknown) {
   job.status = 'running';
-  idle(() => { try { resolveJob(job, fn(), new Map()); } catch (e) { rejectJob(job, e instanceof Error ? e : mkErr('job-error', String(e))); } });
+  idle(() => { try { resolveJob(job, fn(), new Map()); } catch (e) { rejectJob(job, e); } });
 }
 let scheduled = false;
 function schedule() { if (scheduled) return; scheduled = true; queueMicrotask(() => { scheduled = false; runSchedule(); }); }
@@ -802,6 +803,16 @@ function decodeError(e: PoolWireError | null | undefined) {
   for (const i of e.irritants || []) irr.push(safeDecode(i));
   const err = new SchemeError(kind, msg, irr);
   if (e.stack) err.stack = e.stack;
+  return err;
+}
+/* What a job threw on the main thread, as the condition a thread sends back for it (encodeError). */
+function asCondition(e: unknown): PoolErr {
+  if (e instanceof SchemeError) return e;
+  if (e instanceof S.Raise) return new SchemeError('raise', S.errorMessage(e), [e.obj]);
+  if (e instanceof RangeError) return mkErr('error', 'Stack overflow');
+  if (e instanceof S.Escape) return mkErr('error', 'Escape procedure called outside its extent');
+  const err = mkErr('job-error', e && (e as Error).message !== undefined ? (e as Error).message : String(e));
+  if (e instanceof Error && e.stack) err.stack = e.stack;
   return err;
 }
 function progress(job: PoolJob, x: unknown) {
@@ -1250,7 +1261,7 @@ function runLocalNow(f: Future) {
   if (!f.localQueued) return;
   f.localQueued = false; f.status = 'running';
   try { L.resetOps(); const v = f.localFn!(); settleFuture(f, 'done', v, null, new Map()); }
-  catch (e) { settleFuture(f, 'failed', undefined, e instanceof Error ? e : mkErr('error', String(e)), new Map()); }
+  catch (e) { settleFuture(f, 'failed', undefined, asCondition(e), new Map()); }
 }
 /* The gate: callbacks run only while the command loop is parked at top level and nothing is queued. */
 let running = 0;
