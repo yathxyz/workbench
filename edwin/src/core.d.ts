@@ -2286,8 +2286,8 @@ type TPoolToWorker =
   | TPoolJobMsg;
 type TPoolFromWorker =
   | { t: 'ready'; k: number; scheme: boolean; names: string[]; macros: string[] }
-  | { t: 'done'; req: number; val: unknown; versions: Record<string, number>; ms: number; evicted: TPoolId[] }
-  | { t: 'fail'; req: number; error: TPoolWireError; versions: Record<string, number> }
+  | { t: 'done'; req: number; val: unknown; versions: TPoolVersions; ms: number; evicted: TPoolId[] }
+  | { t: 'fail'; req: number; error: TPoolWireError; versions: TPoolVersions }
   | { t: 'progress'; req: number; x: unknown }
   | { t: 'out'; s: string }
   | { t: 'msg'; s: string }

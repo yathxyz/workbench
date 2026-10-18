@@ -82,8 +82,8 @@ type PoolToWorker =
   | PoolJobMsg;
 type PoolFromWorker =
   | { t: 'ready'; k: number; scheme: boolean; names: string[]; macros: string[] }
-  | { t: 'done'; req: number; val: unknown; versions: Record<string, number>; ms: number; evicted: PoolId[] }
-  | { t: 'fail'; req: number; error: PoolWireError; versions: Record<string, number> }
+  | { t: 'done'; req: number; val: unknown; versions: PoolVersions; ms: number; evicted: PoolId[] }
+  | { t: 'fail'; req: number; error: PoolWireError; versions: PoolVersions }
   | { t: 'progress'; req: number; x: unknown }
   | { t: 'out'; s: string }
   | { t: 'msg'; s: string }
@@ -370,15 +370,16 @@ function workerMain(self: PoolRealm, limits: PoolLimits) {
     return [...set];
   }
   const evalEncoded = (f: PoolEnc) => S!.evalForm(codec!.decode(f));
-  function makeCtx(m: PoolJobMsg, versions: Record<string, number>, used: Set<PoolId>, extra: ArrayBufferLike[]): EdPoolCtx {
-    const get = (id: PoolId) => { const r = mirrors.get(id); if (!r) throw new Error('buffer ' + id + ' is not mirrored on this worker'); versions[id] = r.ver; r.lastUse = ++useN; used.add(id); return r; };
+  function makeCtx(m: PoolJobMsg, versions: PoolVersions, used: Set<PoolId>, extra: ArrayBufferLike[]): EdPoolCtx {
+    const get = (id: PoolId) => { const r = mirrors.get(id); if (!r) throw new Error('buffer ' + id + ' is not mirrored on this worker'); versions.set(id, r.ver); r.lastUse = ++useN; used.add(id); return r; };
     return { buffer: id => get(id).rope!.toString(), rope: id => get(id).rope, version: id => get(id).ver, args: m.args, state: W.state, worker: W.k,
       progress: x => self.postMessage({ t: 'progress', req: m.req, x }), scheme: S ? { S, L } as { S: SchemeApi; L: LispApi } : null, transfer: ab => extra.push(ab) };
   }
   function runJob(m: PoolJobMsg) {
     W.req = m.req; W.t0 = performance.now();
-    const versions: Record<string, number> = {}, used = new Set<PoolId>(), extra: ArrayBufferLike[] = [];
-    W.touch = r => { versions[r.id] = r.ver; r.lastUse = ++useN; used.add(r.id); };
+    /* a Map, not an object: it keeps a shared buffer's string id apart from a local buffer's number */
+    const versions: PoolVersions = new Map(), used = new Set<PoolId>(), extra: ArrayBufferLike[] = [];
+    W.touch = r => { versions.set(r.id, r.ver); r.lastUse = ++useN; used.add(r.id); };
     W.report = x => self.postMessage({ t: 'progress', req: m.req, x: codec!.encode(x) });
     const ctx = makeCtx(m, versions, used, extra);
     if (L) L.resetOps();
@@ -767,9 +768,8 @@ function dispatch(s: PoolSlot, job: PoolJob) {
   const ms = job.timeout ? (job.kind === 'eval' ? job.timeout + 1000 : job.timeout) : 0;
   if (ms) job.timer = setTimeout(() => { if (pending.get(job.req) === job) terminateSlot(s, 'thread-timeout', 'the job ran for more than ' + Math.round(ms / 1000) + ' s', false); }, ms);
 }
-const toVersions = (o: Record<string, number> | undefined): PoolVersions => new Map(Object.keys(o || {}).map(k => [+k, o![k]]));
 function settleDone(s: PoolSlot, job: PoolJob, m: Extract<PoolFromWorker, { t: 'done' }>) {
-  const versions = toVersions(m.versions);
+  const versions = m.versions;
   let val = m.val;
   if (job.kind === 'eval') { try { val = codec.decode(val); } catch (e) { rejectJob(job, e, versions); schedule(); return; } }
   resolveJob(job, val, versions);
@@ -785,7 +785,7 @@ function settleFail(s: PoolSlot, job: PoolJob, m: Extract<PoolFromWorker, { t: '
     return;
   }
   if (job.kind === 'eval' && job.added) for (const k of job.added) s.have.delete(k);
-  rejectJob(job, decodeError(m.error), toVersions(m.versions));
+  rejectJob(job, decodeError(m.error), m.versions);
   if (s.retired || s.k >= size) retire(s);
   schedule();
 }

@@ -141,6 +141,15 @@ test('a buffer crosses as a mirror: the thread reads its text, and reports the v
   assert.equal(ed.L.write(await ed.eval('(thread-run (lambda () (list (in-thread?) (integer? (thread-id)))))')), '(#t #t)');
 });
 
+test('a shared buffer (edwind\'s string id) reports its version under that id', async () => {
+  const b = await fresh('shared text');
+  b.id = 'notes/shared-' + n + '.md';   /* as sync.ts names a shared buffer */
+  const f = ed.eval('(define f3s (thread-run (lambda (b) (buffer-string b)) (current-buffer))) f3s');
+  assert.equal(await f, 'shared text');
+  assert.equal(f.versions.get(b.id), b.ver);
+  assert.equal(ed.eval('(eq? (car (car (future-versions f3s))) (current-buffer))'), true);
+});
+
 test('define-threaded and thread-broadcast define in every thread; output lands in *Messages*', async () => {
   ed.eval('(define-threaded (sq x) (* x x))');
   assert.equal(await ed.eval('(thread-run (lambda () (sq 7)))'), 49);
