@@ -31,6 +31,7 @@ pub const JS: &[(&str, &str)] = &[
 pub const SCM: &[(&str, &str)] = &[
     ("address.scm", include_str!("../../scm/address.scm")),
     ("ai.scm", include_str!("../../scm/ai.scm")),
+    ("babel.scm", include_str!("../../scm/babel.scm")),
     ("debug.scm", include_str!("../../scm/debug.scm")),
     ("emacs.scm", include_str!("../../scm/emacs.scm")),
     ("evil.scm", include_str!("../../scm/evil.scm")),

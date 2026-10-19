@@ -39,7 +39,7 @@ so edwind and the suites need no step. `src/host-node.cts` is checked with the s
 | Path | What |
 | --- | --- |
 | `src/*.js` | the editor, in the order `index.html` loads it: `scheme` `runtime` `text` `editor-core` `editor-prims` `evil-core` `pool` `complete` `extras` `stack` `ai` `evil-ex` `org` `markdown` `ot` `sync` `display` |
-| `scm/*.scm` | the shipped Scheme configuration (`emacs`, `evil`, `org`, `ai`, `init`), also inlined in `index.html` |
+| `scm/*.scm` | the shipped Scheme configuration (`emacs`, `evil`, `org`, `ai`, `init`, and `notes-syntax`, `address`, `markdown`, `babel` through `require`), also inlined in `index.html` |
 | `index.html` | the page: styles, the Scheme blocks and the script tags. It loads `src/*.js` relative to itself, so serving this directory runs it, and a published copy keeps the `src/` paths |
 | `src/host-browser.ts`, `src/host-node.cts` | the host layer (R4.1): storage, the shipped Scheme, page attributes, suspend, clipboard, scheduling. The core reaches the page only through it and through frame objects |
 | `test/headless.mts` | loads and boots the editor in Node on `host-node.cts` (no page objects exist in the process) and drives it with keys |
@@ -252,7 +252,8 @@ Choices E2 made where the spec left one open, and where it had to deviate:
   `debugger-continue`, `debugger-abort`, `inspect`.
 - **R4.15 amendment (decided 2026-10-14 in the hypernotes thread, for E3 and later):** forms evaluated in a
   note's environment are not definitional for the image log (not appended, not broadcast). `image.record`
-  inspects only the heads of top-level `call{form}` forms, so nothing in E2 conflicts; H1 implements it.
+  inspects only the heads of top-level `call{form}` forms, so nothing in E2 conflicts; H1 implements it (see
+  "Hypernotes H1" below).
 - **The notes index parser runs on a dedicated `worker_threads` worker** (not the pool): `notes-grep` and
   `unlinked-mentions` block the calling thread while it searches (the sync channel remains for callers outside
   a thread). The pool's Node host compiles the lexer from a source string inside the worker and duplicates the
@@ -456,6 +457,55 @@ own edwind when none answers, as `emacsclient -a ''` starts an Emacs daemon.
   `x-workbench-proxy-secret` header and `publicOrigin`), so a desktop client would need the proxy's own login;
   ssh reaches the same edwind with the user's keys and no new credential. Starting an edwind on the remote host
   (`-a` is local only), and one frame attached to two edwinds at once (`sync.ts` holds one connection per runtime).
+
+## Hypernotes H1: source blocks in notes (done)
+
+Step H1 of `docs/HYPERNOTES.md`: one block engine in edwind for Org and markdown notes (R10.8 widened to
+markdown). `server/babel.mts` reads and writes block text; `scm/babel.scm` is the engine, loaded in every runtime
+(markdown.scm requires it) so frames know its commands run in edwind. Suite: `test/babel.test.mts` (flake check
+`edit-babel`), plus a frame case in `frame.test.mts` and the frame-less case in `markdown.test.mts`.
+
+| Key (markdown-mode, org-mode) | Command | Does |
+|---|---|---|
+| `C-c C-c` (Org: through `org-ctrl-c-ctrl-c`), `C-c C-v e` | `babel-execute-src-block` | run the block at point (its lines, its `#+name:` line or its result) and store the result |
+| `C-c C-v b` | `babel-execute-buffer` | run every block in order from fresh note environments; stop at the first failure |
+| `C-c C-v t` | `babel-tangle` | write `tangle=` blocks to their files, relative to the note |
+| `C-c C-v k`, `C-c C-v r` | `babel-remove-result`, `babel-reset-environment` | drop the result at point; empty the note's environment |
+
+- **Syntax.** Markdown: ```` ```lang {#id k=v flag} ```` (backticks or tildes; `{.lang #id}` also names the
+  language), results ```` ```result {of=id} ```` (`error` marks a failure); a result without `of=` belongs to the
+  block right above it. Org: `#+name:`, `#+header:`, `#+begin_src lang :k v`, `#+RESULTS: id` followed by `:`
+  lines, a `#+begin_…` block (`#+begin_error` for a failure) or a table; `#+PROPERTY: header-args[:lang]` sets
+  defaults, `:session` is `env`. Both read `in=a,x=b` / `:var x=b`, `results=value|output|silent` (Org `table`
+  too), `env=`, `noweb`, `noweb-ref`, `tangle`, `eval=no`, `dir`. A markdown front matter `env:` names the
+  note's environment.
+- **Values.** A value result is the value as `write` prints it, so it reads back exactly; a list of lists is an
+  Org table. `in=` gives a block a data fence's value (json as `jsonToScheme` makes it: objects as alists with
+  symbol keys, arrays as lists, null as `#f`; csv and tsv as rows with numbers converted; sexp as its datum), a
+  named Org table's rows, another block's stored result (never a rerun: "run it first"), or a literal (`n=3`,
+  `s="x"`). An unspecified value removes the stale result; `silent` writes nothing.
+- **Note environments (the R4.15 amendment).** A scheme block's forms run with `eval` in its note environment,
+  a child of the global one, named by `env=`/`:session`, else the note's file. They are not top-level forms of a
+  call, so they never enter the image log or reach frames, and their definitions never reach the global
+  environment. An environment lasts until edwind restarts; `babel-execute-buffer` forgets the note's
+  environments first. The block runs with the note as its current buffer, as Org babel runs Emacs Lisp: Edwin's
+  `newline` inserts there, `display` goes to the result.
+- **Running.** Commands are server commands; a frame's `call-interactively` now sends any server command to
+  edwind (R4.27; the fast path for simple specs used to call it locally). Before the code runs, the command
+  passes a blocking point (`thread-yield`), so a long block does not hold the note (R4.41); a marker and the id
+  find the block again to store the result. A condition (or a raised object) becomes a failed result with its
+  report; quit and the frame deadline are not results. `sh`, `bash`, `zsh` blocks run through `call-process`
+  in a card-less hub PTY (R4.44) in the note's directory (`dir=` relative to it), with `in=` bindings as shell
+  variables; a non-zero status is a failed result ending in `[exit N]`. `babel-define-executor` adds languages
+  (the slot H1k's kernels would use).
+- **Tangle** writes through the shared buffer of each file (`%babel-write-file`): the text is replaced as one
+  batch and saved, so the authority's write rules apply and open frames see the new text; `tangle=yes` names the
+  file after the note (`.scm`, `.sh`, …). Noweb `<<name>>` repeats the reference's line prefix and joins every
+  block whose id or `noweb-ref` is `name`; a cycle or a missing name is an error.
+- **Agents** run notes with `wb eval '(babel-run "notes/x.md")'` (or `(babel-run FILE ID)` for one block);
+  results land in the note as C-c C-c leaves them, and autosave writes the file.
+- **Not in H1:** stale marks (a `src` hash), rich results and the display layer (H1d), kernels for other
+  languages (H1k), `define-handler` and cards that call the image (H2).
 
 ## Step DT4: Edwin from the flake (done)
 

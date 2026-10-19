@@ -486,7 +486,8 @@ D('prefix-numeric-value', 'RAW', 'Numeric value of a raw prefix argument.', ([p]
 D('call-interactively', 'COMMAND', 'Call COMMAND, reading its arguments as if invoked by a key.', ([c]) => {
   const f = L.toFn(c), spec = f.interactive;
   const codes = typeof spec === 'string' ? spec.split('\n').map(x => x.replace(/^[*^@]+/, '')[0] || '').join('') : null;
-  if (codes !== null && !/[sMnNxXCavbBfFkKc<]/.test(codes)) return L.callProc(f, syncSpec(spec as string));
+  /* A server command goes to edwind from a frame (R4.27) whatever its spec: Ed.callInteractively sends it. */
+  if (codes !== null && !/[sMnNxXCavbBfFkKc<]/.test(codes) && !(f.where === 'server' && Ed.hooks.serverCommand)) return L.callProc(f, syncSpec(spec as string));
   return Ed.callInteractively(c);
 });
 function syncSpec(spec: string) {

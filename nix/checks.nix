@@ -309,6 +309,14 @@ in
     touch $out
   '';
 
+  # Source blocks in notes (hypernotes H1: scm/babel.scm, server/babel.mts): the reader and writer, then the
+  # engine against a real edwind and the fake hub, for markdown and Org.
+  edit-babel = pkgs.runCommand "workbench-edit-babel" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+    export HOME=$TMPDIR
+    node --test ${edwind}/edwin/test/babel.test.mts
+    touch $out
+  '';
+
   # The Scheme boundary (R16.15, R4.52) and the credential rules (R16.19, in models.test.mts).
   edit-security = pkgs.runCommand "workbench-edit-security" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     export HOME=$TMPDIR
