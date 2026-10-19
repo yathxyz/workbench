@@ -802,6 +802,51 @@ body[data-mode="phone"] .rv-face { font-size: 22px; }
 .k-image .lod { background: transparent; padding: 0; }
 .k-image .lod b { display: inline-block; max-width: 100%; margin: 0; padding: 4px 12px; background: var(--panel); border-radius: var(--radius) 0 var(--radius) 0; }
 .k-image .lod pre { display: none; }
+/* PDFs (F-A40): pages on a grey ground at the card's width; the bitmap under pdf.js's text layer, which takes the selection */
+.k-pdf .body { background: var(--panel-2); }
+.pdf-pages { position: absolute; inset: 0; overflow: auto; padding: 10px; display: flex; flex-direction: column; align-items: center; gap: 10px; outline: none; overscroll-behavior: contain; }
+.pdf-pages:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+.pdf-page { position: relative; flex: none; background: #fff; box-shadow: 0 1px 3px rgb(0 0 0 / .25); --scale-round-x: 1px; --scale-round-y: 1px; }
+.pdf-bmp { position: absolute; inset: 0; width: 100%; height: 100%; display: block; user-select: none; pointer-events: none; }
+.pdf-ph { position: absolute; left: 50%; top: 40%; transform: translateX(-50%); color: #888; font-size: 12px; pointer-events: none; }
+.pdf-note { position: absolute; inset: 12px 12px auto 12px; font-size: 12px; color: var(--muted); background: var(--panel); padding: 6px 10px; border-radius: var(--radius); }
+.pdf-links { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+.pdf-link { position: absolute; pointer-events: auto; cursor: pointer; }
+.pdf-link:hover { background: rgb(53 70 194 / .12); outline: 1px solid rgb(53 70 194 / .4); }
+.textLayer { color-scheme: only light; position: absolute; text-align: initial; inset: 0; overflow: clip; opacity: 1; line-height: 1; letter-spacing: normal; word-spacing: normal; text-size-adjust: none; forced-color-adjust: none; transform-origin: 0 0; caret-color: CanvasText; z-index: 1;
+  --min-font-size: 1; --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size)); --min-font-size-inv: calc(1 / var(--min-font-size)); }
+.textLayer :is(span, br) { color: transparent; position: absolute; white-space: pre; cursor: text; transform-origin: 0% 0%; user-select: text; }
+.textLayer > :not(.markedContent), .textLayer .markedContent span:not(.markedContent) { z-index: 1; --font-height: 0; font-size: calc(var(--text-scale-factor) * var(--font-height)); --scale-x: 1; --rotate: 0deg; transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv)); }
+.textLayer .markedContent { display: contents; }
+.textLayer span[role="img"] { user-select: none; cursor: default; }
+.textLayer ::selection { background: rgb(0 0 255 / .25); background: color-mix(in srgb, AccentColor, transparent 50%); color: transparent; }
+.textLayer br::selection { background: transparent; }
+.textLayer .endOfContent { display: block; position: absolute; inset: 100% 0 0; z-index: 0; cursor: default; user-select: none; }
+.textLayer.selecting .endOfContent { top: 0; }
+.textLayer .pdf-hit { background: rgb(255 200 0 / .45); border-radius: 2px; transition: background .6s; }
+/* far out a PDF is its LOD text like any card: no bitmaps are kept then */
+.k-pdf .lod { background: var(--panel-2); }
+/* media cards (F-A41): settings, prompt, inputs piped in, result; amber while stale */
+.k-op .body { display: flex; flex-direction: column; background: var(--buf-bg); }
+.op-bar { display: flex; gap: 4px; padding: 5px 6px; background: var(--panel); border-bottom: 1px solid var(--line); align-items: center; flex-wrap: wrap; }
+.op-bar select { font: inherit; font-size: 12px; padding: 2px 4px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg); color: var(--fg); max-width: 12em; }
+.op-bar select[hidden] { display: none; }
+.op-bar .go { margin-left: auto; border: 1px solid var(--accent); background: var(--accent); color: var(--panel); border-radius: var(--radius); padding: 3px 12px; cursor: pointer; font-weight: 500; font-size: 12px; }
+.op-bar .go:disabled { opacity: .6; cursor: default; }
+.op-prompt { flex: none; margin: 6px; resize: vertical; min-height: 3.2em; font: 13px var(--ui); padding: 6px 8px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--buf-bg); color: var(--fg); }
+.op-ins { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 6px 6px; font-size: 11.5px; color: var(--muted); }
+.op-in { font: inherit; font-size: 11.5px; border: 1px solid var(--pipe); color: var(--pipe); background: var(--pipe-bg); border-radius: 10px; padding: 1px 8px; cursor: pointer; max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.op-out { flex: 1; min-height: 0; overflow: auto; border-top: 1px solid var(--line); padding: 6px; }
+.op-grid { display: grid; gap: 6px; grid-template-columns: 1fr; height: 100%; }
+.op-grid[data-n="2"], .op-grid[data-n="3"], .op-grid[data-n="4"] { grid-template-columns: 1fr 1fr; }
+.op-var { padding: 0; border: 2px solid transparent; border-radius: var(--radius); background: var(--panel-2); cursor: pointer; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.op-var.on { border-color: var(--accent); }
+.op-var img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; pointer-events: none; }
+.op-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; user-select: text; }
+.op-note { font-size: 12px; color: var(--muted); }
+.op-err { color: var(--err); }
+.node.op-stale { box-shadow: 0 0 0 2px var(--warn); }
+.node.op-stale .op-bar .go { background: var(--warn); border-color: var(--warn); }
 .k-term.emacs .hdr .name::before { content: "ε "; color: var(--muted); }
 
 /* ---- v9: tags, filter */

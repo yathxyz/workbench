@@ -1,4 +1,4 @@
-//! `POST /api/blob` and `GET /blob/{hash}`: images on the canvas (F-A32).
+//! `POST /api/blob` and `GET /blob/{hash}`: images and PDFs on the canvas (F-A32, F-A40).
 
 mod common;
 
@@ -87,7 +87,7 @@ async fn only_raster_images_are_taken_and_only_hashes_are_served() {
         assert_eq!(res.status, 415, "{body:?}");
         assert_eq!(
             res.json(),
-            json!({"error": "not an image: PNG, JPEG, GIF, WebP or AVIF"})
+            json!({"error": "not an image or a PDF: PNG, JPEG, GIF, WebP, AVIF or PDF"})
         );
     }
     let res = web.req("POST", "/api/blob").send().await;
@@ -114,4 +114,27 @@ async fn only_raster_images_are_taken_and_only_hashes_are_served() {
     }
     // A GET on the upload path is not a download.
     assert_eq!(web.req("GET", "/api/blob").send().await.status, 405);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pdf_is_stored_and_served_as_an_attachment() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = Web::start(&dir.path().join("hub.sock"));
+    let pdf = b"%PDF-1.4\n%\xe2\xe3\n1 0 obj << >> endobj\ntrailer << >>\n%%EOF\n";
+    let res = web.req("POST", "/api/blob").body(&pdf[..]).send().await;
+    assert_eq!(res.status, 200, "{:?}", String::from_utf8_lossy(&res.body));
+    let v = res.json();
+    assert_eq!(v["type"], "application/pdf");
+    let res = web
+        .req("GET", &format!("/blob/{}", v["hash"].as_str().unwrap()))
+        .send()
+        .await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body, pdf);
+    assert_eq!(res.header("content-type"), Some("application/pdf"));
+    assert_eq!(res.header("content-disposition"), Some("attachment"));
+    assert_eq!(
+        res.header("content-security-policy"),
+        Some("default-src 'none'; sandbox")
+    );
 }

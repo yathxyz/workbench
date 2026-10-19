@@ -115,6 +115,20 @@ let
       inherit editSocket;
       frames = edit.frames;
     }
+    // lib.optionalAttrs (cfg.media.providers != { }) {
+      media.providers = lib.mapAttrs (
+        name: p:
+        {
+          inherit (p) api baseUrl models;
+        }
+        // lib.optionalAttrs (p.apiKeyFile != null) {
+          keyFile = "/run/credentials/workbench-web.service/media-${name}";
+        }
+      ) cfg.media.providers;
+    }
+  );
+  mediaCredentials = lib.mapAttrsToList (name: p: "media-${name}:${p.apiKeyFile}") (
+    lib.filterAttrs (_: p: p.apiKeyFile != null) cfg.media.providers
   );
 
   # edwind (edwin/server, the edwind spec §15). `~` in writablePaths is the service user's home.
@@ -394,6 +408,45 @@ in
       description = "RUST_LOG for both units. Never passed to children.";
     };
 
+    # Image providers for the canvas's media cards (F-A41): wb-web calls them, so their keys stay on the server.
+    media.providers = mkOption {
+      default = { };
+      description = "Image providers for media cards, by name. A key file is loaded with LoadCredential as media-NAME and web.json names only its credential path. Describe and expand cards use edit.models (`sample`) instead.";
+      example = lib.literalExpression ''
+        {
+          openai = { api = "openai"; baseUrl = "https://api.openai.com/v1"; apiKeyFile = "/run/secrets/openai"; models = [ "gpt-image-1" ]; };
+          xai = { api = "openai"; baseUrl = "https://api.x.ai/v1"; apiKeyFile = "/run/secrets/xai"; models = [ "grok-2-image" ]; };
+          hf = { api = "huggingface"; baseUrl = "https://router.huggingface.co/hf-inference"; apiKeyFile = "/run/secrets/hf"; models = [ "black-forest-labs/FLUX.1-schnell" ]; };
+        }
+      '';
+      type = types.attrsOf (
+        types.submodule {
+          options = {
+            api = mkOption {
+              type = types.enum [
+                "openai"
+                "huggingface"
+              ];
+              description = "openai: the OpenAI image API (OpenAI, xAI, LocalAI and others that copy it). huggingface: Hugging Face Inference.";
+            };
+            baseUrl = mkOption {
+              type = types.str;
+              description = "https, or http to loopback; the key is sent only here.";
+            };
+            apiKeyFile = mkOption {
+              type = types.nullOr types.path;
+              default = null;
+              description = "Root-readable key file, sent as a bearer token; null for a local server that takes none.";
+            };
+            models = mkOption {
+              type = types.nonEmptyListOf types.str;
+              description = "Models the card offers; the first is the default.";
+            };
+          };
+        }
+      );
+    };
+
     # edwind, the text daemon (edwin/server). Spec: the edwind artifact, §15.2.
     edit = {
       enable = mkOption {
@@ -537,6 +590,14 @@ in
           && (edit.models.openai.baseUrl == null || isLoopbackHttp edit.models.openai.baseUrl)
           && lib.all (c: isLoopbackHttp c.origin) (lib.attrValues edit.credentials);
         message = "services.workbench.edit.models.*.baseUrl and edit.credentials.*.origin must be https, or http to loopback.";
+      }
+      {
+        assertion = lib.all (p: isLoopbackHttp p.baseUrl) (lib.attrValues cfg.media.providers);
+        message = "services.workbench.media.providers.*.baseUrl must be https, or http to loopback.";
+      }
+      {
+        assertion = lib.all isName (lib.attrNames cfg.media.providers);
+        message = "services.workbench.media.providers: names must match ^[a-z0-9-]{1,32}$.";
       }
       {
         assertion = lib.all isName (lib.attrNames edit.credentials);
@@ -712,7 +773,7 @@ in
         UMask = "0077";
         RuntimeDirectory = "workbench-web";
         RuntimeDirectoryMode = "0700";
-        LoadCredential = [ "proxy-secret:${cfg.proxySecretFile}" ];
+        LoadCredential = [ "proxy-secret:${cfg.proxySecretFile}" ] ++ mediaCredentials;
         Restart = "always";
         RestartSec = 2;
         OOMScoreAdjust = 100;

@@ -163,7 +163,7 @@ def can_connect_unix(path):
 
 
 class Harness:
-    def __init__(self, web_root, bin_dir=None, dogfood=False, tcp=False, frames=False, board=None):
+    def __init__(self, web_root, bin_dir=None, dogfood=False, tcp=False, frames=False, board=None, media=None):
         self.web_root = str(Path(web_root).resolve())
         self.bin_dir = bin_dir
         self.dogfood = dogfood
@@ -234,6 +234,9 @@ class Harness:
         }
         if frames:
             self.web_config["frames"] = True
+        if media:
+            # one image provider on the OpenAI protocol at MEDIA (a stub the suite runs), no key
+            self.web_config["media"] = {"providers": {"stub": {"api": "openai", "baseUrl": media, "models": ["stub-image"]}}}
         # edwin/server/main.mts loadConfig: unknown fields are refused, notesDir is required, the socket's
         # directory must be 0700 and owned by this user. configDir is private to the run: the user's own
         # init.scm never reaches a test.
@@ -452,6 +455,7 @@ def main():
     p.add_argument("--dogfood", action="store_true", help="real HOME, no canaries, ignore stdin")
     p.add_argument("--frames", action="store_true", help="web.json frames: true (pages as Edwin frames)")
     p.add_argument("--board", help="a board JSON file to install as <boardsDir>/<host>.json before the start")
+    p.add_argument("--media", help="web.json media: an OpenAI-compatible image provider \"stub\" at this base URL")
     a = p.parse_args()
     if not a.web_root:
         p.error("--web-root or $WB_WEB_ROOT is required")
@@ -468,7 +472,7 @@ def main():
 
     try:
         h = Harness(a.web_root, a.bin_dir, a.dogfood, tcp=os.environ.get("WB_HARNESS_TCP") == "1", frames=a.frames,
-                    board=a.board)
+                    board=a.board, media=a.media)
     except (RuntimeError, OSError, ValueError) as e:
         print(f"harness: {e}", file=sys.stderr)
         return 1

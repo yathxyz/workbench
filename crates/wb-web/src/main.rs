@@ -14,6 +14,7 @@ mod host;
 mod http;
 mod hub;
 mod info;
+mod media;
 mod notes;
 mod relay_acp;
 mod relay_edit;

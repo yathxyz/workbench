@@ -21,7 +21,7 @@ interface BoardSize { w: number; h: number }
 // ---- the persisted board: S (app.ts line 29)
 
 /* Every node kind on the board (the `kind` tag of BoardNode). */
-type NodeKind = 'term' | 'repl' | 'buffer' | 'ref' | 'agent' | 'acp' | 'frame' | 'artifact' | 'web' | 'sketch' | 'image' | 'ghost';
+type NodeKind = 'term' | 'repl' | 'buffer' | 'ref' | 'agent' | 'acp' | 'frame' | 'artifact' | 'web' | 'sketch' | 'image' | 'pdf' | 'op' | 'ghost';
 
 /* The persisted board, S: what /api/board and localStorage hold (v 5; a reset writes {"v":0}). Keys starting with _ are never saved. */
 interface Board {
@@ -132,7 +132,7 @@ interface PageAnchor { id: string; label?: string | null; pos: number; quote?: s
 interface RefNode extends BoardNodeBase {
   kind: 'ref';
   text: string;
-  src: { node: string; aid?: string; line?: number; lines?: number };
+  src: { node: string; aid?: string; line?: number; lines?: number; page?: number; prefix?: string; suffix?: string };   // page, prefix, suffix: a quote from a PDF (W3C TextQuoteSelector)
   srcLabel: string;
 }
 /* The legacy in-page agent card (kind 'agent'). */
@@ -200,7 +200,29 @@ interface ImageNode extends BoardNodeBase {
   kind: 'image';
   blob?: string;                       // sha256 of the stored image
   src?: string; mime?: string; iw?: number; ih?: number;
+  at?: { node: string; page: number; y: number };   // a peek: the PDF card, page (from 1) and point (PDF units from the top) it shows
 }
+/* A PDF card (F-A40): a file on the serving host (`path`), or bytes in the blob store (`blob`; `src`, a data: URL, in the demo). */
+interface PdfNode extends BoardNodeBase {
+  kind: 'pdf';
+  path?: string; blob?: string; src?: string;
+  pos?: { page: number; y: number };   // the reading position, shared like a bookmark: page from 1, fraction of it scrolled past
+  pages?: number;                      // the page count, once known
+}
+/* What a media card does (F-A41): images from text, an image from an image and text (a provider of the server's), or
+ * text from an image or from text (`sample`). */
+type OpKind = 'imagine' | 'edit' | 'describe' | 'expand';
+/* A media card: a prompt and settings; its inputs come along the pipe edges into it, its output stays in the card. */
+interface OpNode extends BoardNodeBase {
+  kind: 'op';
+  op: OpKind;
+  prompt: string;
+  provider?: string; model?: string; size?: string; n?: number;
+  out?: OpOut;
+}
+/* A media card's last run: the signature of what it ran on, and its images or text, or the error. */
+interface OpOut { sig: string; at: number; images?: OpImage[]; pick?: number; text?: string; err?: string }
+interface OpImage { blob?: string; src?: string; mime?: string }
 /* A ghost: a perspective's stand-in for something not on the board (a file, a session, a process, a unit). */
 interface GhostNode extends BoardNodeBase {
   kind: 'ghost';
@@ -214,7 +236,7 @@ interface GhostNode extends BoardNodeBase {
   tmuxTarget?: string; procPid?: number; cmd?: string; unitName?: string; unitState?: string;
 }
 /* Any node on the board: a union tagged on `kind`. */
-type BoardNode = TermNode | ReplNode | PageNode | RefNode | LegacyAgentNode | AcpNode | FrameNode | ArtifactNode | WebNode | SketchNode | ImageNode | GhostNode;
+type BoardNode = TermNode | ReplNode | PageNode | RefNode | LegacyAgentNode | AcpNode | FrameNode | ArtifactNode | WebNode | SketchNode | ImageNode | PdfNode | OpNode | GhostNode;
 /* The node type for one kind, e.g. NodeOfKind<'frame'> is FrameNode. */
 type NodeOfKind<K extends NodeKind> = Extract<BoardNode, { kind: K }>;
 /* What addNode takes: a kind and any of that kind's fields (the rest get defaults). */
@@ -310,6 +332,8 @@ interface LiveEntry {
   urlInput?: HTMLInputElement;
   note?: HTMLElement;
   img?: HTMLImageElement;
+  pdf?: PdfLive;                       // a PDF card's document and pages
+  op?: OpLive;                         // a media card's controls
   // runtime objects
   term?: XtermTerminal;
   fit?: XtermFitAddon;
@@ -339,6 +363,54 @@ interface LiveEntry {
   _doc?: { ver: number; doc: BoardTextDoc };
   _blocks?: { ver: number; blocks: unknown[] };
 }
+/* A PDF card's runtime: the document, a box per page, and the scroller that holds them. */
+interface PdfLive {
+  doc: PdfJsDocument | null;
+  load: Promise<PdfJsDocument | null> | null;
+  task?: PdfJsLoadingTask | null;      // pdf.js's loading task: destroying it lets go of the document and its worker
+  err: string;
+  scroll: HTMLElement;                 // the card body's scroller (.pdf-pages), which takes the keyboard
+  pages: PdfPageLive[];
+  w: number;                           // the page width in CSS px the boxes were laid out for
+  texts: (string | null)[];            // each page's text, once read
+  posT?: number;                       // the reading position's save timer
+}
+interface PdfPageLive {
+  i: number;                           // from 0
+  page: PdfJsPage | null;
+  el: HTMLElement;
+  pw: number; ph: number;              // the page's size in PDF units
+  canvas: HTMLCanvasElement | null; r: number;   // the drawn bitmap and its pixels per PDF unit
+  task: PdfJsRenderTask | null; taskR?: number;  // the bitmap being drawn and its pixels per PDF unit
+  textReady?: Promise<void>;           // the text layer, once its spans are in
+  text: HTMLElement | null; links: boolean; used: number;
+}
+/* A media card's controls. */
+interface OpLive { prompt: HTMLTextAreaElement; out: HTMLElement; ins: HTMLElement; run: HTMLButtonElement; busy: boolean }
+// pdf.js (vendor/pdfjs/pdf.min.mjs, loaded on demand): the part of its API the pdf card uses.
+interface PdfJsLib {
+  GlobalWorkerOptions: { workerSrc: string };
+  getDocument(src: { url?: string; data?: Uint8Array; enableXfa?: boolean; stopAtErrors?: boolean }): PdfJsLoadingTask;
+  TextLayer: new (o: { textContentSource: unknown; container: HTMLElement; viewport: PdfJsViewport }) => { render(): Promise<void>; cancel(): void };
+  version: string;
+}
+interface PdfJsLoadingTask { promise: Promise<PdfJsDocument>; destroy(): Promise<void> }
+interface PdfJsDocument {
+  numPages: number;
+  getPage(n: number): Promise<PdfJsPage>;
+  getDestination(name: string): Promise<unknown[] | null>;
+  getPageIndex(ref: unknown): Promise<number>;
+  getMetadata(): Promise<{ info?: { Title?: string } }>;
+}
+interface PdfJsPage {
+  getViewport(o: { scale: number }): PdfJsViewport;
+  render(o: { canvasContext: CanvasRenderingContext2D; viewport: PdfJsViewport }): PdfJsRenderTask;
+  getTextContent(): Promise<{ items: { str?: string; hasEOL?: boolean }[] }>;
+  streamTextContent(): unknown;
+  getAnnotations(): Promise<{ subtype: string; rect: number[]; dest?: unknown; url?: string }[]>;
+}
+interface PdfJsViewport { width: number; height: number; scale: number; convertToViewportPoint(x: number, y: number): number[] }
+interface PdfJsRenderTask { promise: Promise<void>; cancel(): void }
 /* xterm's Terminal, from the vendored bundle. */
 type XtermTerminal = InstanceType<Vendor['Terminal']>;
 /* xterm's FitAddon, from the vendored bundle. */
@@ -424,11 +496,15 @@ interface BootError { kind: 'net' | 'signed_out' | 'forbidden' | 'http' | 'not_j
 interface DaemonInfo {
   host: string; home: string;
   edit?: boolean; editUp?: boolean; sample?: boolean; models?: unknown; notes?: string; notesExists?: boolean;
+  media?: MediaProviderInfo[];         // the image providers media cards can use (F-A41)
   state?: string; dist?: string; tmux?: string | null; artifactOrigin?: string;
   agents?: { name: string; label: string }[];
   shells?: string[]; defaultShell?: string;
   hub?: { status: HubStatus; version?: string; build?: string; proto?: number; startedAt?: number; stale?: boolean };
 }
+
+/* An image provider as /api/info lists it, without its key. */
+interface MediaProviderInfo { name: string; api: 'openai' | 'huggingface'; models: string[]; ops: OpKind[] }
 
 // ---- sessions: what the hub knows (SESS line 366)
 

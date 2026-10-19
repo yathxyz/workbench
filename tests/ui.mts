@@ -18,9 +18,11 @@
 // take that port; the forwarder stays because N6 cuts it.
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 // Types only: the globals the checks set in the page, and the artifact runtime's `claude` inside artifact frames.
 declare global { interface Window { __got: number; __cm: boolean[]; __rcCam: Cam; __pastes: number; __xss?: number; __n56: Element | null; __n62menus: number; __n32?: number; __xss31?: number } }
 declare const claude: { use(name: string): Promise<any> };   // any: each capability's namespace has its own shape (web/bridge.ts)
@@ -1065,7 +1067,28 @@ const EXIT_HUB = 'the Workbench hub restarted';   // app.js EXIT_TEXT.hub_restar
 const { WB_HARNESS_TCP, ...harnessEnv } = process.env;
 // WB_FRAMES=1: pages are Edwin frames (web.json frames: true); the same checks run on either implementation (R16.8).
 const FRAMES = process.env.WB_FRAMES === '1';
-const harness = spawn('python3', ['-I', HARNESS, '--web-root', ROOT, ...(FRAMES ? ['--frames'] : [])], { stdio: ['pipe', 'pipe', 'pipe'], env: harnessEnv });
+// N74: an image provider on the OpenAI protocol (web.json media, harness --media). Each call answers solid PNGs, one
+// colour per variation, so variations differ by hash; MEDIA keeps what each call asked for.
+const MEDIA: { path: string; body: string }[] = [];
+function solidPng(rgb: [number, number, number], w = 4, h = 4): Buffer {
+  const chunk = (type: string, data: Buffer) => { const t = Buffer.from(type), len = Buffer.alloc(4), crc = Buffer.alloc(4); len.writeUInt32BE(data.length); crc.writeUInt32BE(zlib.crc32(Buffer.concat([t, data]))); return Buffer.concat([len, t, data, crc]); };
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr.set([8, 2, 0, 0, 0], 8);
+  const row = Buffer.from([0, ...Array.from({ length: w }, () => rgb).flat()]), raw = Buffer.concat(Array.from({ length: h }, () => row));
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+}
+const MEDIA_COLOURS: [number, number, number][] = [[200, 0, 40], [0, 90, 200], [0, 150, 60], [220, 160, 0]];
+const media = http.createServer((req, res) => {
+  let body = ''; req.setEncoding('latin1'); req.on('data', d => { body += d; });
+  req.on('end', () => {
+    MEDIA.push({ path: req.url || '', body });
+    let n = 1; if (req.url === '/v1/images/generations') { try { n = JSON.parse(body).n || 1; } catch {} }
+    else if (req.url !== '/v1/images/edits') { res.writeHead(404).end(); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data: Array.from({ length: n }, (_, i) => ({ b64_json: solidPng(MEDIA_COLOURS[(i + (req.url === '/v1/images/edits' ? 3 : 0)) % 4]).toString('base64') })) }));
+  });
+});
+await new Promise<void>(r => media.listen(0, '127.0.0.1', () => r()));
+const MEDIA_URL = `http://127.0.0.1:${(media.address() as net.AddressInfo).port}/v1`;
+const harness = spawn('python3', ['-I', HARNESS, '--web-root', ROOT, '--media', MEDIA_URL, ...(FRAMES ? ['--frames'] : [])], { stdio: ['pipe', 'pipe', 'pipe'], env: harnessEnv });
 let hlog = ''; harness.stderr.on('data', d => { hlog += d; });
 // The harness's stdout is JSON lines: the info line first, then one {event, what} per control line sent to its stdin.
 /* The harness's info line (harness.py info()) and its answers to control lines. */
@@ -3386,6 +3409,201 @@ await section('N63', async () => {
   } finally { await D?.close(); }
 });
 
+// N73 (F-A40): PDFs on the canvas. A two-page PDF with a link from page 1 to page 2, written here by hand.
+function testPdf(): Buffer {
+  const s1 = 'BT /F1 18 Tf 72 700 Td (Alpha section of the paper) Tj 0 -30 Td (The quote target sits here for N73.) Tj 0 -30 Td (See page two for more.) Tj ET';
+  const s2 = 'BT /F1 18 Tf 72 700 Td (Beta section on page two) Tj 0 -30 Td (Second page text is here.) Tj ET';
+  const objs = ['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R /Annots [8 0 R] >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    `<< /Length ${s1.length} >>\nstream\n${s1}\nendstream`, `<< /Length ${s2.length} >>\nstream\n${s2}\nendstream`,
+    '<< /Type /Annot /Subtype /Link /Rect [72 634 300 658] /Border [0 0 0] /Dest [4 0 R /XYZ 0 720 0] >>'];
+  let out = '%PDF-1.4\n'; const at: number[] = [];
+  objs.forEach((o, i) => { at.push(out.length); out += `${i + 1} 0 obj\n${o}\nendobj\n`; });
+  const xref = out.length;
+  out += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n` + at.map(o => String(o).padStart(10, '0') + ' 00000 n \n').join('');
+  return Buffer.from(out + `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`, 'latin1');
+}
+await section('N73', async () => {
+  let D: TailPage | undefined;
+  const file = path.join(TMP, 'n68 paper.pdf'), bytes = testPdf(); fs.writeFileSync(file, bytes); fs.writeFileSync(path.join(TMP, 'n68.txt'), 'not a pdf');
+  try {
+    const whole = await api('/api/raw?path=' + encodeURIComponent(file)), part = await api('/api/raw?path=' + encodeURIComponent(file), { headers: { Range: 'bytes=0-4' } });
+    const raw = { status: whole.status, type: whole.headers.get('content-type'), disp: whole.headers.get('content-disposition'), csp: whole.headers.get('content-security-policy'), len: (await whole.arrayBuffer()).byteLength,
+      part: part.status, range: part.headers.get('content-range'), head: await part.text(),
+      txt: (await api('/api/raw?path=' + encodeURIComponent(path.join(TMP, 'n68.txt')))).status,
+      past: (await api('/api/raw?path=' + encodeURIComponent(file), { headers: { Range: `bytes=${bytes.length + 10}-` } })).status };
+    const up = await api('/api/blob', { method: 'POST', headers: { 'Content-Type': 'application/pdf' }, body: new Uint8Array(bytes) }), upj = await up.json();
+    const got = await api('/blob/' + upj.hash), blob = { status: up.status, type: upj.type, served: got.headers.get('content-type'), disp: got.headers.get('content-disposition') };
+    D = await dpage(); await settled(D);
+    const st = await D.evaluate(async (file: string) => {
+      const C = window.__canvas, S = C.S, out: Record<string, any> = {}; // any: each step's findings, read by the checks below
+      if (C.WS.cur) C.wsLeave(); if (C.DESK.cur) C.deskGo(0, true); C.pickClear();
+      const until = async <T,>(f: () => T, n = 150) => { for (let i = 0; i < n; i++) { const v = f(); if (v) return v; await new Promise(r => setTimeout(r, 100)); } return null; };
+      const n = C.pdfFromPath(file), L = () => C.live[n.id]?.pdf;
+      C.jumpNode(n); await new Promise(r => setTimeout(r, 900));
+      await until(() => L()?.doc && L().pages.length === 2);
+      const p0 = await until(() => L().pages[0].canvas && L().pages[0].text?.querySelector('span') && L().pages[0].el.querySelector('.pdf-link') ? L().pages[0] : null);
+      out.open = { name: n.name, pages: n.pages, drawn: !!p0?.canvas?.width, text: !!p0?.text, link: !!p0?.el.querySelector('.pdf-link'), badge: C.badgeOf(n), ident: C.fsIdent(n)?.path === file };
+      out.text = await C.pdfText(n, 1, 2);
+      // select "quote target" on page 1 and quote it
+      const span = [...(p0?.text?.querySelectorAll('span') || [])].find((x: Element) => /quote target/.test(x.textContent!)) as HTMLElement | undefined;
+      if (span) { const t = span.firstChild!, i = t.textContent!.indexOf('quote target'), r = document.createRange(); r.setStart(t, i); r.setEnd(t, i + 12); getSelection()!.removeAllRanges(); getSelection()!.addRange(r); }
+      out.sel = C.pdfSel(n)?.text; out.selOf = C.selectionOf(n);
+      const q = await C.pdfQuote(n);
+      out.quote = q && { text: q.text, src: q.src, label: q.srcLabel, edge: S.edges.some((e: Edge) => e.from === n.id && e.to === q.id && e.type === 'ref') };
+      out.find = await C.pdfFind(n, 'quote target', 1, 'The ', ' sits');   // asked on page 2, found on page 1
+      out.hit = !!L().pages[0].text?.querySelector('.pdf-hit');
+      out.miss = await C.pdfFind(n, 'no such words anywhere', 0);
+      // the link opens a peek of page 2; its ⤴ is there
+      const before = Object.keys(S.nodes).length;
+      (L().pages[0].el.querySelector('.pdf-link') as HTMLElement).click();
+      const peek = await until(() => Object.values<BoardNode>(S.nodes).find(m => m.kind === 'image' && m.at?.node === n.id) as ImageNode | undefined);
+      out.peek = peek && { page: peek.at!.page, blob: /^[0-9a-f]{64}$/.test(peek.blob || ''), edge: S.edges.some((e: Edge) => e.from === n.id && e.to === peek.id), btn: [...C.live[peek.id].hdr.querySelectorAll('.hb')].some((b: Element) => b.textContent === '⤴'), more: Object.keys(S.nodes).length - before };
+      // the reading position lives in the card
+      C.pdfGo(n, 1, 0, true);
+      out.pos = await until(() => n.pos?.page === 2 ? { ...n.pos, badge: C.badgeOf(n) } : null, 30);
+      // keys: the pages take j/k/G…; G goes to the last page, g to the first
+      L().scroll.focus();
+      out.keys = { interior: C.keyContext().interior, j: window.WBKeys.resolve(C.keyContext(), 'j')[0]?.cmd, q: window.WBKeys.resolve(C.keyContext(), 'q')[0]?.cmd };
+      document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 'g', code: 'KeyG', bubbles: true, cancelable: true }));
+      out.keys.g = await until(() => C.pdfWhere(n).page === 1 && L().scroll.scrollTop === 0 ? 1 : 0, 30) || C.pdfWhere(n).page;   // a smooth scroll
+      document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 'G', code: 'KeyG', shiftKey: true, bubbles: true, cancelable: true }));
+      out.keys.G = await until(() => C.pdfWhere(n).page === 2 ? 2 : 0, 30) || C.pdfWhere(n).page;
+      (document.activeElement as HTMLElement).blur();
+      // an agent reads it, and opens another
+      const tool = (name: string) => C.AGENT_TOOLS.find((t: AgentTool) => t.name === name);
+      out.read = await tool('read_pdf').run({ path: n.name, from: 2, to: 2 });
+      out.readNode = await tool('read_node').run({ path: n.name });
+      const p2 = C.findNode(await tool('open_pdf').run({ file }));
+      out.opened = p2 && { kind: p2.kind, path: p2.path, other: p2.id !== n.id };
+      // a dropped PDF is a card on its bytes in the blob store
+      const dt = new DataTransfer(); dt.items.add(new File([await (await fetch('/api/raw?path=' + encodeURIComponent(file))).blob()], 'dropped.pdf', { type: 'application/pdf' }));
+      const vp = document.querySelector('#viewport')!.getBoundingClientRect();
+      document.querySelector('#viewport')!.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, clientX: vp.left + 300, clientY: vp.top + 300, bubbles: true, cancelable: true }));
+      const dropped = await until(() => Object.values<BoardNode>(S.nodes).find(m => m.kind === 'pdf' && m.name === 'dropped') as PdfNode | undefined);
+      await until(() => C.live[dropped!.id]?.pdf?.doc);
+      out.dropped = dropped && { blob: dropped.blob, path: dropped.path, pages: dropped.pages, url: C.pdfUrl(dropped) };
+      out.made = [n.id, q?.id, peek?.id, p2?.id, dropped?.id].filter(Boolean);
+      // a card that goes takes its document with it
+      const P = L(); C.removeNode(n.id); out.closed = !C.live[n.id] && P.doc === null && P.pages.length === 0;
+      return out;
+    }, file);
+    check('N73: /api/raw serves a PDF on the host whole and one range (206, Content-Range), as an attachment under a sandbox CSP, and refuses a file that is not a PDF (400) and a range past the end (416); the blob store takes PDF bytes and serves them as an attachment',
+      raw.status === 200 && raw.type === 'application/pdf' && /attachment/.test(raw.disp || '') && /sandbox/.test(raw.csp || '') && raw.len === bytes.length && raw.part === 206 && raw.range === `bytes 0-4/${bytes.length}` && raw.head === '%PDF-' && raw.txt === 400 && raw.past === 416
+      && blob.status === 200 && blob.type === 'application/pdf' && blob.served === 'application/pdf' && /attachment/.test(blob.disp || ''), JSON.stringify({ raw, blob }));
+    check('N73: a PDF on the host opens as a pdf card: two pages, the one in view drawn with a text layer and its link, "p. 1 / 2" on the badge; pdfText reads pages with markers; agents read it (read_pdf; read_node from the reading page, by then page 2) and open another (open_pdf)',
+      st.open.pages === 2 && st.open.drawn && st.open.text && st.open.link && st.open.badge === 'p. 1 / 2' && st.open.ident && /--- n68 paper p\. 1 ---[\s\S]*quote target[\s\S]*--- n68 paper p\. 2 ---[\s\S]*Second page text/.test(st.text)
+      && /p\. 2 ---[\s\S]*Beta section/.test(st.read) && !/Alpha/.test(st.read) && /p\. 2 ---[\s\S]*Beta section/.test(st.readNode) && st.opened?.kind === 'pdf' && st.opened.path === file && st.opened.other, JSON.stringify(st.open) + st.text.slice(0, 300));
+    check('N73: the selection quotes as a ref card holding the page and the text around it (TextQuoteSelector), linked to the PDF; the quote is found again (asked on page 2, found on page 1, lit up), a text that is not there is not',
+      st.sel === 'quote target' && st.selOf === 'quote target' && st.quote?.text === 'quote target' && st.quote.src.page === 1 && /The $/.test(st.quote.src.prefix) && /^ sits/.test(st.quote.src.suffix) && st.quote.label === 'n68 paper › p. 1' && st.quote.edge
+      && st.find === true && st.hit && st.miss === false, JSON.stringify({ sel: st.sel, quote: st.quote, find: st.find, hit: st.hit, miss: st.miss }));
+    check('N73: a link to page 2 opens a peek, an image card of that place in the blob store with ⤴ back; the reading position is saved in the card; on the pages j and q are the pdf keymap\'s, g and G go to the first and last page',
+      st.peek?.page === 2 && st.peek.blob && st.peek.edge && st.peek.btn && st.pos?.page === 2 && st.pos.badge === 'p. 2 / 2' && st.keys.interior === 'pdf' && st.keys.j === 'pdf.down' && st.keys.q === 'pdf.quote' && st.keys.g === 1 && st.keys.G === 2,
+      JSON.stringify({ peek: st.peek, pos: st.pos, keys: st.keys }));
+    check('N73: a PDF dropped on the canvas is a pdf card on its sha256 in the blob store, and it opens; a removed card lets go of its document',
+      /^[0-9a-f]{64}$/.test(st.dropped?.blob || '') && !st.dropped.path && st.dropped.pages === 2 && st.dropped.url === '/blob/' + st.dropped.blob && st.closed, JSON.stringify({ dropped: st.dropped, closed: st.closed }));
+    await D.evaluate((ids: string[]) => { for (const id of ids) if (window.__canvas.S.nodes[id]) window.__canvas.removeNode(id); window.__canvas.pickClear(); }, st.made);
+    await settled(D);
+  } finally { await D?.close(); }
+});
+
+// N74 (F-A41): media cards against the stub provider (harness --media). imagine with two variations lands both in the
+// blob store; text piped in leads the prompt; edit gets the picked variation as multipart; a moved input or setting makes
+// a card stale (amber) and "run stale" runs the chain in order; → takes the pick out; describe without a model says so.
+await section('N74', async () => {
+  let D: TailPage | undefined;
+  try {
+    D = await dpage(); await settled(D);
+    MEDIA.length = 0;
+    const st = await D.evaluate(async () => {
+      const C = window.__canvas, S = C.S, out: Record<string, any> = {}; // any: each step's findings, read by the checks below
+      if (C.WS.cur) C.wsLeave(); if (C.DESK.cur) C.deskGo(0, true); C.pickClear();
+      out.info = C.INFO.media;
+      const a = C.opNew('imagine'); a.prompt = 'a red square'; a.n = 2; C.live[a.id].op.prompt.value = a.prompt;
+      out.a = { ok: await C.opRun(a, true), images: a.out?.images?.map((i: OpImage) => i.blob), pick: a.out?.pick, stale: C.opStale(a), cls: C.live[a.id].el.classList.contains('op-stale'), thumbs: C.live[a.id].op.out.querySelectorAll('.op-var img').length };
+      // a page piped in leads the prompt
+      const pg = C.addNode({ kind: 'buffer', name: 'n69 context', text: 'in the style of a woodcut', x: a.x - 500, y: a.y, w: 300, h: 200 });
+      const b = C.opNew('imagine'); b.prompt = 'a lighthouse';
+      S.edges.push({ id: 'n69e1', from: pg.id, to: b.id, type: 'pipe' }); C.dirty();
+      out.b = { ins: C.opInputs(b).map((i: { from: BoardNode; text?: string }) => i.from.name + ':' + (i.text || '')), ok: await C.opRun(b, true) };
+      // edit fed by a: the picked variation
+      const e = C.opNew('edit', a); e.prompt = 'make it blue'; C.live[e.id].op.prompt.value = e.prompt;
+      out.e = { input: C.opInputs(e)[0]?.image?.blob === a.out.images[0].blob, ok: await C.opRun(e, true), images: e.out?.images?.length };
+      // a new pick upstream makes the edit stale; run stale runs it again
+      a.out.pick = 1; C.dirty();
+      out.stale = { e: C.opStale(e), a: C.opStale(a), input: C.opInputs(e)[0]?.image?.blob === a.out.images[1].blob };
+      await C.opRunStale();
+      out.after = { e: C.opStale(e), err: e.out?.err };
+      // a changed prompt is stale; the old prompt is not
+      a.prompt = 'a red circle'; out.prompt = C.opStale(a); a.prompt = 'a red square'; out.back = C.opStale(a);
+      // → takes the pick out as an image card on the same bytes
+      const had = new Set(Object.keys(S.nodes)); await C.opExtract(a);
+      const x = Object.values<BoardNode>(S.nodes).find(m => !had.has(m.id) && m.kind === 'image') as ImageNode | undefined;
+      out.extract = x && { blob: x.blob === a.out.images[1].blob, edge: S.edges.some((ed: Edge) => ed.from === a.id && ed.to === x.id && ed.type === 'spawn') };
+      // describe has no model in the harness: it says so on the card
+      const d = C.opNew('describe', x); out.d = { ok: await C.opRun(d, true), err: d.out?.err };
+      // a card with no provider chosen yet, no image for edit: told, not sent
+      const e2 = C.opNew('edit'); out.e2 = { ok: await C.opRun(e2, true), err: e2.out?.err };
+      out.made = [a.id, pg.id, b.id, e.id, x?.id, d.id, e2.id].filter(Boolean);
+      return out;
+    });
+    const sent = MEDIA.map(m => m.path), gen = MEDIA.filter(m => m.path === '/v1/images/generations').map(m => JSON.parse(m.body)), edits = MEDIA.filter(m => m.path === '/v1/images/edits');
+    check('N74: /api/info lists the stub provider; imagine with two variations calls the provider once and keeps two blob hashes, shown as thumbnails, not stale',
+      st.info?.[0]?.name === 'stub' && st.info[0].models[0] === 'stub-image' && st.a.ok && st.a.images?.length === 2 && st.a.images.every((h: string) => /^[0-9a-f]{64}$/.test(h)) && st.a.images[0] !== st.a.images[1] && st.a.pick === 0 && !st.a.stale && !st.a.cls && st.a.thumbs === 2
+      && gen[0]?.model === 'stub-image' && gen[0].prompt === 'a red square' && gen[0].n === 2, JSON.stringify({ st: st.a, info: st.info, sent, gen }));
+    check('N74: text piped in from a page leads the prompt; edit sends the picked variation as multipart; a new pick upstream makes the edit stale and "run stale" runs it again; a changed prompt is stale, the old one is not; → takes the pick out as an image card on the same bytes',
+      st.b.ok && gen[1]?.prompt === 'in the style of a woodcut\n\na lighthouse' && st.e.input && st.e.ok && st.e.images === 1 && edits.length === 2 && /name="model"\r\n\r\nstub-image/.test(edits[0].body) && /filename="image\.png"/.test(edits[0].body)
+      && st.stale.e && !st.stale.a && st.stale.input && !st.after.e && !st.after.err && st.prompt && !st.back && st.extract?.blob && st.extract.edge, JSON.stringify({ b: st.b, e: st.e, stale: st.stale, after: st.after, prompt: st.prompt, back: st.back, extract: st.extract, sent }));
+    check('N74: describe without a model on the server fails on the card and says why; edit with no image piped in says so and sends nothing',
+      !st.d.ok && /language model/.test(st.d.err || '') && !st.e2.ok && /needs an image/.test(st.e2.err || '') && edits.length === 2, JSON.stringify({ d: st.d, e2: st.e2 }));
+    await D.evaluate((ids: string[]) => { for (const id of ids) if (window.__canvas.S.nodes[id]) window.__canvas.removeNode(id); window.__canvas.pickClear(); }, st.made);
+    await settled(D);
+  } finally { await D?.close(); }
+});
+
+// N75 (F-A42): Copy as PNG / Copy as SVG of a sketch card's ink and of selected strokes, for Krita and other programs.
+await section('N75', async () => {
+  let D: TailPage | undefined;
+  try {
+    await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: ORIGIN });
+    D = await dpage(); await settled(D);
+    const st = await D.evaluate(async () => {
+      const C = window.__canvas, S = C.S, out: Record<string, any> = {}; // any: each step's findings, read by the checks below
+      if (C.WS.cur) C.wsLeave(); if (C.DESK.cur) C.deskGo(0, true); C.pickClear();
+      const n = C.newSketch(); C.setTool('select');
+      S.strokes.push({ id: 'n70a', color: 'red', size: 8, sim: true, owner: n.id, pts: [[20, 40, .5], [80, 70, .5], [160, 50, .5]] }, { id: 'n70b', color: 'ink', size: 6, sim: true, owner: n.id, pts: [[30, 120, .5], [140, 140, .5]] });
+      C.renderInk(n.id);
+      const svg = C.sketchSvg(C.sketchInk(n)), doc = new DOMParser().parseFromString(svg, 'image/svg+xml'), root = doc.documentElement;
+      out.svg = { paths: doc.querySelectorAll('path').length, fills: [...doc.querySelectorAll('path')].map(p => p.getAttribute('fill')), w: +root.getAttribute('width')!, h: +root.getAttribute('height')!, vb: root.getAttribute('viewBox'), ns: root.namespaceURI, err: !!doc.querySelector('parsererror') };
+      const png = await C.sketchPng(C.sketchInk(n)), bmp = await createImageBitmap(png), cv = document.createElement('canvas'); cv.width = bmp.width; cv.height = bmp.height;
+      const g = cv.getContext('2d')!; g.drawImage(bmp, 0, 0); const px = g.getImageData(0, 0, cv.width, cv.height).data;
+      let inked = 0; for (let i = 3; i < px.length; i += 4) if (px[i] > 0) inked++;
+      out.png = { type: png.type, w: bmp.width, h: bmp.height, corner: px[3], inked };
+      // only the selected stroke when strokes are selected
+      C.SEL.strokes.add('n70b'); C.pickChip(); out.sel = C.sketchInk(null).map((s: Stroke) => s.id); out.chip = !(document.querySelector('#pick-chip [data-act=svg]') as HTMLElement).hidden || null;
+      C.pickClear(); out.chipOff = (document.querySelector('#pick-chip [data-act=svg]') as HTMLElement).hidden;
+      // the header buttons copy: SVG lands on the clipboard (as image/svg+xml where Chromium writes it, else as text)
+      out.btns = [...C.live[n.id].hdr.querySelectorAll('.hb')].map((b: Element) => b.textContent);
+      await C.sketchCopy('svg', n);
+      try { const items = await navigator.clipboard.read(); out.clip = await Promise.all(items[0].types.map(async t => [t, (await (await items[0].getType(t)).text()).slice(0, 60)])); } catch (e) { out.clip = String(e); }
+      await C.sketchCopy('png', n);
+      try { const items = await navigator.clipboard.read(); out.clipPng = items[0].types; } catch (e) { out.clipPng = String(e); }
+      out.made = [n.id];
+      return out;
+    });
+    check('N75: a sketch card\'s ink copies as SVG: one filled path per stroke in the light theme\'s ink colours, cut to the ink with a margin; and as PNG at twice the size with a transparent ground',
+      !st.svg.err && st.svg.ns === 'http://www.w3.org/2000/svg' && st.svg.paths === 2 && st.svg.fills.join() === '#a60000,#000000' && st.svg.w > 140 && st.svg.w < 200 && st.svg.vb === `0 0 ${st.svg.w} ${st.svg.h}`
+      && st.png.type === 'image/png' && Math.abs(st.png.w - 2 * st.svg.w) <= 1 && st.png.corner === 0 && st.png.inked > 200, JSON.stringify({ svg: st.svg, png: st.png }));
+    check('N75: with strokes selected the copy is theirs only, and the selection chip offers PNG and SVG; the sketch header has PNG and SVG; both reach the system clipboard',
+      st.sel.join() === 'n70b' && st.chip && st.chipOff && st.btns.includes('PNG') && st.btns.includes('SVG') && Array.isArray(st.clip) && st.clip.some((c: string[]) => /^<svg/.test(c[1])) && Array.isArray(st.clipPng) && st.clipPng.includes('image/png'),
+      JSON.stringify({ sel: st.sel, chip: st.chip, chipOff: st.chipOff, btns: st.btns, clip: st.clip, clipPng: st.clipPng }));
+    await D.evaluate((ids: string[]) => { for (const id of ids) if (window.__canvas.S.nodes[id]) window.__canvas.removeNode(id); window.__canvas.pickClear(); }, st.made);
+    await settled(D);
+  } finally { await D?.close(); await ctx.clearPermissions(); }
+});
+
 // N11: over the whole daemon phase's request log
 // fix 6 and M5-W3 (N12-N15, N33): artifacts in server mode. wb-web keeps the versions and the db; the page runs the
 // head in an opaque-origin srcdoc frame with the bridge, as block cards and the demo do.
@@ -3452,7 +3670,7 @@ await section('N11', async () => {
 });
 
 await ctx.close(); await browser.close();
-harness.stdin.end(); fwd.close();
+harness.stdin.end(); fwd.close(); media.close();
 // serviceWorkers: 'block' is an init script that touches navigator.serviceWorker in every frame; in a sandboxed web or
 // artifact frame without allow-same-origin that read throws. The error is Playwright's, not the page's.
 const realErrors = errors.filter(e => !/favicon|net::ERR|Failed to load resource|WebSocket connection to|Refused to (connect|frame|load)|Content Security Policy|manifest|sw\.js|ERR_FILE_NOT_FOUND|Failed to read the 'serviceWorker' property from 'Navigator'/.test(e));

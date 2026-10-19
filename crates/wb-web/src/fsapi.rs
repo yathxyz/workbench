@@ -1,5 +1,5 @@
-//! `ls`, `stat`, `cat` and `mv` (design §3.5.5, 20-web §5.3). Paths are relative to
-//! `/api`.
+//! `ls`, `stat`, `cat`, `raw` and `mv` (design §3.5.5, 20-web §5.3). Paths are relative
+//! to `/api`. `raw` serves a PDF's bytes, with ranges, for the canvas's `pdf` card (F-A40).
 //!
 //! These act with the logged-in user's full authority; the floor is the boundary. A path
 //! is `~`, `~/…` (from `$HOME`) or absolute, and its `.` and `..` are resolved lexically.
@@ -18,9 +18,14 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
+use axum::body::Body as ResponseBody;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::header::{
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_SECURITY_POLICY,
+    CONTENT_TYPE, RANGE,
+};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -46,12 +51,15 @@ const PROTECTED: [&str; 3] = [".ssh", ".config/systemd", ".local/share/systemd"]
 const REFUSED: &str =
     "refused: the destination is in or above ~/.ssh or a systemd user-unit directory";
 const NOT_REGULAR: &str = "not a regular file";
+/// `raw` reads a file in pieces of this size.
+const RAW_CHUNK: usize = 64 << 10;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/ls", get(ls))
         .route("/stat", get(stat))
         .route("/cat", get(cat))
+        .route("/raw", get(raw))
         .route("/mv", post(mv))
 }
 
@@ -102,6 +110,137 @@ async fn cat(query: Result<Query<FsQuery>, QueryRejection>) -> Response {
         .limit
         .map_or(CAT_DEFAULT, |l| l.clamp(1, CAT_MAX as i64) as u64);
     run(move |home| read_file(&expand(&raw, home)?, limit)).await
+}
+
+/// A PDF's bytes: the whole file (200), or the one range a `Range: bytes=` header asks
+/// for (206), streamed. Only a regular file that starts with `%PDF-` is served, as an
+/// attachment with a sandboxing CSP, so a tab that opens the URL downloads it and never
+/// renders it in this origin. Several ranges in one header get the whole file.
+async fn raw(query: Result<Query<FsQuery>, QueryRejection>, headers: HeaderMap) -> Response {
+    let Ok(Query(q)) = query else {
+        return bad_query();
+    };
+    let raw = q.path.unwrap_or_default();
+    let range = headers
+        .get(RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let home = home_dir();
+    let opened = tokio::task::spawn_blocking(move || -> Result<(File, u64), String> {
+        let path = resolve(&expand(&raw, home.as_deref())?);
+        let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOCTTY;
+        let mut file = File::from(rustix::fs::open(&path, flags, Mode::empty()).map_err(os_error)?);
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err(NOT_REGULAR.into());
+        }
+        let mut head = [0u8; 5];
+        if file.read_exact(&mut head).is_err() || &head != b"%PDF-" {
+            return Err("only PDF files are served raw".into());
+        }
+        Ok((file, meta.len()))
+    })
+    .await;
+    let (file, size) = match opened {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(message)) => return ApiError::new(StatusCode::BAD_REQUEST, message).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "filesystem request failed");
+            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
+    };
+    let (status, start, len) = match range.as_deref().map(|r| byte_range(r, size)) {
+        None | Some(Range::Whole) => (StatusCode::OK, 0, size),
+        Some(Range::Part(a, b)) => (StatusCode::PARTIAL_CONTENT, a, b - a + 1),
+        Some(Range::Unsatisfiable) => {
+            let mut res = ApiError::new(StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable")
+                .into_response();
+            if let Ok(v) = HeaderValue::try_from(format!("bytes */{size}")) {
+                res.headers_mut().insert(CONTENT_RANGE, v);
+            }
+            return res;
+        }
+    };
+    let mut file = tokio::fs::File::from_std(file);
+    if let Err(e) = tokio::io::AsyncSeekExt::seek(&mut file, io::SeekFrom::Start(start)).await {
+        return ApiError::new(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    let stream = futures_util::stream::unfold((file, len), |(mut file, left)| async move {
+        if left == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; RAW_CHUNK.min(left as usize)];
+        match tokio::io::AsyncReadExt::read(&mut file, &mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok::<_, io::Error>(buf), (file, left - n as u64)))
+            }
+            Err(e) => Some((Err(e), (file, 0))),
+        }
+    });
+    let mut res = Response::new(ResponseBody::from_stream(stream));
+    *res.status_mut() = status;
+    let h = res.headers_mut();
+    h.insert(CONTENT_TYPE, HeaderValue::from_static("application/pdf"));
+    h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    h.insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
+    h.insert(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; sandbox"),
+    );
+    h.insert(CONTENT_LENGTH, HeaderValue::from(len));
+    if status == StatusCode::PARTIAL_CONTENT
+        && let Ok(v) = HeaderValue::try_from(format!("bytes {start}-{}/{size}", start + len - 1))
+    {
+        h.insert(CONTENT_RANGE, v);
+    }
+    res
+}
+
+/// What a `Range` header asks of a file of `size` bytes.
+#[derive(Debug, PartialEq)]
+enum Range {
+    /// No usable single range: serve the whole file.
+    Whole,
+    /// Bytes `a..=b`.
+    Part(u64, u64),
+    Unsatisfiable,
+}
+
+/// One `bytes=a-b`, `bytes=a-` or `bytes=-n`; anything else (another unit, several
+/// ranges, garbage) is the whole file, as RFC 9110 allows a server to answer.
+fn byte_range(header: &str, size: u64) -> Range {
+    let Some(spec) = header.trim().strip_prefix("bytes=") else {
+        return Range::Whole;
+    };
+    if spec.contains(',') {
+        return Range::Whole;
+    }
+    let Some((a, b)) = spec.trim().split_once('-') else {
+        return Range::Whole;
+    };
+    let num = |s: &str| s.trim().parse::<u64>().ok();
+    match (a.trim().is_empty(), b.trim().is_empty()) {
+        (true, true) => Range::Whole,
+        (true, false) => match num(b) {
+            Some(0) => Range::Unsatisfiable,
+            Some(n) if size > 0 => Range::Part(size.saturating_sub(n), size - 1),
+            Some(_) => Range::Unsatisfiable,
+            None => Range::Whole,
+        },
+        (false, open) => match (num(a), if open { Some(u64::MAX) } else { num(b) }) {
+            (Some(a), Some(b)) if a <= b => {
+                if a >= size {
+                    Range::Unsatisfiable
+                } else {
+                    Range::Part(a, b.min(size - 1))
+                }
+            }
+            _ => Range::Whole,
+        },
+    }
 }
 
 async fn mv(State(app): State<AppState>, Body(body): Body) -> Response {
@@ -480,6 +619,27 @@ mod tests {
         for (path, want) in rows {
             assert_eq!(denied(&protected, Path::new(path)), want, "{path}");
             assert_eq!(denied(&configured, Path::new(path)), want, "{path}");
+        }
+    }
+
+    #[test]
+    fn byte_ranges() {
+        let rows = [
+            ("bytes=0-99", 1000, Range::Part(0, 99)),
+            ("bytes=900-", 1000, Range::Part(900, 999)),
+            ("bytes=900-5000", 1000, Range::Part(900, 999)),
+            ("bytes=-100", 1000, Range::Part(900, 999)),
+            ("bytes=-5000", 1000, Range::Part(0, 999)),
+            ("bytes=1000-", 1000, Range::Unsatisfiable),
+            ("bytes=-0", 1000, Range::Unsatisfiable),
+            ("bytes=5-1", 1000, Range::Whole),
+            ("bytes=0-1,5-9", 1000, Range::Whole),
+            ("items=0-1", 1000, Range::Whole),
+            ("bytes=x-1", 1000, Range::Whole),
+            ("bytes=-", 1000, Range::Whole),
+        ];
+        for (header, size, want) in rows {
+            assert_eq!(byte_range(header, size), want, "{header}");
         }
     }
 

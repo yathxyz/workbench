@@ -153,6 +153,14 @@
       ['H', 'arrange.narrower', 'resize', 'H J K L'], ['J', 'arrange.taller', 'resize', 'H J K L'], ['K', 'arrange.shorter', 'resize', 'H J K L'], ['L', 'arrange.wider', 'resize', 'H J K L'],
       ['RET', 'arrange.done', 'done'], ['m', 'arrange.done', 'done'], ['ESC', 'arrange.cancel', 'put it back'],
     ],
+    // a PDF card's pages (F-A40): reading keys; the rest go on to the canvas, so h and l still select a neighbour
+    pdf: [
+      ['j', 'pdf.down', 'scroll down', 'j k'], ['k', 'pdf.up', 'scroll up', 'j k'], ['<down>', 'pdf.down', 'scroll', 'arrows'], ['<up>', 'pdf.up', 'scroll', 'arrows'],
+      ['SPC', 'pdf.screen', 'a screen down'], ['S-SPC', 'pdf.screenBack', 'a screen up'], ['<next>', 'pdf.screen', 'a screen down'], ['<prior>', 'pdf.screenBack', 'a screen up'],
+      ['n', 'pdf.next', 'next page'], ['p', 'pdf.prev', 'previous page'], ['g', 'pdf.first', 'first page'], ['G', 'pdf.last', 'last page'],
+      ['<home>', 'pdf.first', 'first page'], ['<end>', 'pdf.last', 'last page'],
+      ['q', 'pdf.quote', 'quote the selection as a card'], ['/', 'pdf.find', 'find text'], ['#', 'pdf.goto', 'go to page n'],
+    ],
     // places: keys that hold only on the Board, in a workspace or in a focus tab
     board: [], workspace: [], tab: [],
   };
@@ -174,6 +182,8 @@
     control: { needs: k => k === 'RET' || k === 'SPC', label: 'button' },
     // a frame (web card, artifact) receives keys itself; the board never sees them (artifacts forward the leader)
     frame: { needs: ALL, label: 'web or artifact frame' },
+    // a PDF card's pages: its own keymap, and the board's for every other key (nothing for the browser to keep)
+    pdf: { map: 'pdf', needs: () => false, label: 'PDF' },
   };
   const TRANSIENTS: Record<WBKeyTransientName, WBKeyTransient> = {
     palette: { map: 'palette', needs: ALL },
@@ -201,7 +211,7 @@
   function stack(ctx: WBKeyContext): WBKeyLayer[] {
     const out: WBKeyLayer[] = [];
     if (ctx.transient) { const t = TRANSIENTS[ctx.transient]; out.push({ kind: 'transient', name: ctx.transient, map: t.map, needs: t.needs, rest: t.rest, swallow: t.swallow }); }
-    else if (ctx.interior) { const i = INTERIORS[ctx.interior]; out.push({ kind: 'interior', name: ctx.interior, map: null, needs: i.needs }); }
+    else if (ctx.interior) { const i = INTERIORS[ctx.interior]; out.push({ kind: 'interior', name: ctx.interior, map: i.map || null, needs: i.needs }); }
     if (ctx.view && VIEW_FN[ctx.view]) out.push({ kind: 'view', name: ctx.view, fn: VIEW_FN[ctx.view].fn, claims: new Set(VIEW_FN[ctx.view].claims) });
     if (ctx.view && MAPS[ctx.view]) out.push({ kind: 'view', name: ctx.view, map: ctx.view });
     if (ctx.place && MAPS[ctx.place]) out.push({ kind: 'place', name: ctx.place, map: ctx.place });
