@@ -6272,13 +6272,16 @@ function frAdopt(n: PageNode): Promise<string | null> {
       b = await frOpenCreate(id);
       if (b!.id !== id) continue;   // a file renamed from this name: edwind sent the open on to it, which stays as it is
       const text = n.text || '', cur = b!.text;
-      if (cur === '') {   // the node keeps its text unless the file has it on disk (an empty page too: a new buffer has no file yet)
-        if (text) frReplaceAll(b!, text);
+      if (cur !== '' && cur !== text) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} continue; }   // R8.18: another text, next suffix
+      // the node keeps its text unless the file has it on disk (an empty page too: a new buffer has no file yet)
+      if (cur === '' && text) frReplaceAll(b!, text);
+      // A buffer with this text that is still modified (a failed first save: edwind keeps the shared buffer after this
+      // replica closes) is saved too, so no page is adopted before its file holds the text.
+      if (cur === '' || b!.modified) {
         const r = await Ed.sync.save(b!);
         // the replica closes as it is (other clients may have edited it meanwhile); a later try that finds this text there takes it (R8.18)
         if (r.error) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} throw new Error(`${id} could not be saved: ${r.error.report}`); }
       }
-      else if (cur !== '' && cur !== text) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} continue; }   // R8.18: another text, next suffix
       chosen = id;
     }
     if (!chosen || !S.nodes[n.id]) return null;
