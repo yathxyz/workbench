@@ -303,16 +303,20 @@ function boardAdopt(b: Board): void {
     const p = perspCur(); if (p !== 'manual') { perspClear(); S.persp = 'manual'; }
     ovlHide();
     const dk = deskAt(DESK.cur); if (dk) deskUnapply();   // the same for a desk: take the Board, then stand the desk up again
-    const cur = S.nodes; let roChanged = false;
+    const cur = S.nodes; let roChanged = false, edStale: PageNode | null = null;
     for (const id of Object.keys(cur)) if (!b.nodes?.[id] || b.nodes[id].kind !== cur[id].kind) { unmountQuiet(id); delete cur[id]; }
     for (const [id, nn] of Object.entries(b.nodes || {})) {
       const o = cur[id];
       if (!o) { cur[id] = nn; continue; }
       for (const k of Object.keys(o)) if (!k.startsWith('_') && !(k in nn)) delete (o as Partial<BoardNode>)[k as keyof BoardNode];
-      const was = o.kind === 'buffer' ? o.text : undefined;
+      const was = o.kind === 'buffer' ? o.text : undefined, wasSnap = o.kind === 'buffer' ? o.snap : undefined, wasBuf = o.kind === 'buffer' ? o.buf : undefined;
       Object.assign(o, nn);   // in place: the mounted card's closures hold this object
       if (o.kind === 'op' && live[id]?.op) { live[id].op!.prompt.value = o.prompt || ''; opRender(o); }
       if (o.kind === 'buffer' && !FR.on) { roChanged ||= was !== o.text; if (live[id]) roRender(o); }   // a read-only page shows the text the other tab saved
+      else if (o.kind === 'buffer' && (was !== o.text || wasSnap !== o.snap || wasBuf !== o.buf)) {   // frames: a closed replica's snapshot, a read-only Editor
+        roChanged = true; if (live[id]) frSnapRefresh(o);
+        if (ED.node === o && ED.pre) edStale = o;
+      }
     }
     S.edges = b.edges || []; S.strokes = b.strokes || []; S.shapes = b.shapes || []; if (Array.isArray(b.desks)) S.desks = b.desks; else delete S.desks; if (Array.isArray(b.sticky)) S.sticky = b.sticky; else delete S.sticky; BOARD_CAM = b.cam;
     deskSlotsFix();
@@ -327,6 +331,7 @@ function boardAdopt(b: Board): void {
     if (roChanged) { scheduleCrossRefresh(); if (VIEW === 'tasks') renderTasks(); }   // backlinks and the views over the pages, as a local edit does
     restack(); updateAllTitles(); renderTree(); renderLinks(); renderInk(null);
     SAVE.lastJson = serialize();
+    if (edStale) { const e = edStale; setTimeout(() => { if (ED.node === e && ED.pre && VIEW === 'editor') frEdLoad(e); }); }   // the read-only Editor shows the newer text
   } finally { ADOPTING = false; }
 }
 function unmountQuiet(id: string): void {   // the card went in another tab: drop it here without killing its session
@@ -6283,22 +6288,34 @@ function frAdopt(n: PageNode): Promise<string | null> {
       // with this text that is still modified (a failed first save: edwind keeps the shared buffer after this replica
       // closes) is saved too, so no page is adopted before its file holds the text. A text the node took while a save
       // ran (pageSetText on the unmigrated page) is written and saved again.
-      let saved = !(cur === '' || b!.modified);
-      while (!saved || (n.text || '') !== text) {
-        text = n.text || '';
-        if (b!.text !== text) frReplaceAll(b!, text);
-        const r = await Ed.sync.save(b!);
+      let saved = !(cur === '' || b!.modified), failed: unknown[] = [];
+      const added = new Set((b!.meta.anchors as PageAnchor[]).map(a => a.id));
+      for (;;) {
+        while (!saved || (n.text || '') !== text) {
+          text = n.text || '';
+          if (b!.text !== text) frReplaceAll(b!, text);
+          const r = await Ed.sync.save(b!);
+          if (adopted()) return quit(id);
+          // the replica closes as it is (other clients may have edited it meanwhile); a later try that finds this text there takes it (R8.18)
+          if (r.error) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} throw new Error(`${id} could not be saved: ${r.error.report}`); }
+          saved = true;
+        }
+        // the node's anchors go onto the buffer under their own ids (labels, ink and references use them); one already there is not added again
+        const todo = (n.anchors || []).filter(a => !added.has(a.id));
+        const res = await Promise.allSettled(todo.map(a => Ed.sync.anchorAdd(id, relocate(text, a), a.label || null, a.id)));
         if (adopted()) return quit(id);
-        // the replica closes as it is (other clients may have edited it meanwhile); a later try that finds this text there takes it (R8.18)
-        if (r.error) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} throw new Error(`${id} could not be saved: ${r.error.report}`); }
-        saved = true;
+        res.forEach((r, i) => { if (r.status === 'fulfilled') added.add(todo[i].id); });
+        failed = res.flatMap(r => (r.status === 'rejected' ? [r.reason] : []));
+        if (failed.length || (n.text || '') === text) break;   // a text the node took meanwhile is saved again, with the anchors it moved
       }
+      // the node keeps its text and anchors until every anchor is on the buffer; a later try finds this text and adds the rest (R8.18)
+      if (failed.length) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} throw new Error(`${id}: ${failed.length} anchor(s) could not be added: ${(failed[0] as Error)?.message || failed[0]}`); }
       chosen = id;
     }
     if (!chosen || !S.nodes[n.id]) return null;
     const L = live[n.id]; if (L) L.buf = b;
     const text = b!.text;
-    for (const a of n.anchors || []) { const pos = relocate(text, a); FR.localAnchors[a.id] = { buf: chosen, pos, label: a.label || undefined }; Ed.sync.anchorAdd(chosen, pos, a.label || null, a.id).catch(e => console.warn('edwin anchor', a.id, e)); }
+    for (const a of n.anchors || []) FR.localAnchors[a.id] = { buf: chosen, pos: relocate(text, a), label: a.label || undefined };   // until the buffer's meta lists them
     n.buf = chosen; n.snap = text.split('\n').slice(0, 12).join('\n'); delete n.text; delete n.anchors;
     console.log(`edwin: migrated page ${n.name} -> ${chosen}`);
     frHold(n, chosen); clearTimeout(saveT); saveT = null; save(); frSnapRefresh(n); scheduleCrossRefresh(); frSchedule();
