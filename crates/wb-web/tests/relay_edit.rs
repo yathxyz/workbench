@@ -198,7 +198,7 @@ async fn a_frame_or_a_line_over_max_line_closes_1009() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_edwind_closes_1013_and_info_says_so() {
-    // No editSocket at all, frames or not.
+    // No editSocket at all, whatever an old web.json says about frames.
     let dir = tempfile::tempdir().unwrap();
     let web = Web::start_with(&dir.path().join("hub.sock"), |cfg| {
         cfg["frames"] = json!(true);
@@ -219,14 +219,15 @@ async fn no_edwind_closes_1013_and_info_says_so() {
     assert_eq!(info["edit"], true);
     assert_eq!(info["editUp"], false);
 
-    // The frames flag is off unless web.json says so.
+    // Frames are the only page editor (R9.21): an editSocket turns them on, and the
+    // frames key an older web.json carries changes nothing.
     let edit = FakeEdit::start();
     let web = web_with_edit(&edit.path, None);
     let info = wait_edit_up(&web, true).await;
-    assert_eq!(info["edit"], false);
+    assert_eq!(info["edit"], true);
     assert_eq!(info["editUp"], true);
     let web = web_with_edit(&edit.path, Some(false));
-    assert_eq!(wait_edit_up(&web, true).await["edit"], false);
+    assert_eq!(wait_edit_up(&web, true).await["edit"], true);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -240,7 +241,7 @@ async fn info_reports_frames_on_and_edwind_up_and_down() {
     edit.stop();
     assert_eq!(read_to_close(&mut ws).await.0, 1011);
     let info = wait_edit_up(&web, false).await;
-    // The flag stays what the config says; only editUp follows edwind.
+    // edit stays what the config says; only editUp follows edwind.
     assert_eq!(info["edit"], true);
     let mut ws = web.ws("/edit").await;
     assert_eq!(read_to_close(&mut ws).await.0, 1013);

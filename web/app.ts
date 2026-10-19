@@ -29,7 +29,7 @@ const MOTION = { fast: 120, mid: 200, slow: 320 };
 
 // ------------------------------------------------------------------ state
 let S: Board = null!;         // persisted board
-const live: Record<string, LiveEntry> = {};   // id -> runtime objects (DOM, xterm, CodeMirror view, backend)
+const live: Record<string, LiveEntry> = {};   // id -> runtime objects (DOM, xterm, Edwin frame, backend)
 let DAEMON = false, BOOTED = false, BOARD_ETAG: string | null = null, HUB_STARTED: number | null | undefined = null, BOARD_CAM: Cam | undefined;   // BOARD_CAM: the board's stored camera, written back untouched (F-A7)
 const SERVED = /^https?:$/.test(location.protocol) && !window.CANVAS_HOSTED;   // served by wb-web: never the demo, never localStorage
 let tool = 'select', inkColor = 'ink', penSeen = false, activeId: string | null = null, topZ = 10, focusedBuf: string | null = null;
@@ -207,15 +207,17 @@ function winSave() {
 // The recent-places ring (desks, focus tabs, views) and the scratch overlay's cards are this device's too (D2).
 const RING = { list: [] as PlaceKey[], on: false, sel: 1 };
 const OVL = { ids: [] as string[], on: false, saved: {} as Record<string, { x: number; y: number; w: number; h: number; in: string | null }> };
+// A read-only page (no edwind: roMountPage) keeps its text and anchors on the node; each save refreshes the anchors'
+// quotes, which relocate() reads when the board loads, and drops the unlabelled ones no ink or reference uses.
 function syncBuffers() {
+  if (FR.on) return;
   for (const n of nodeList()) {
-    if (n.kind !== 'buffer' || !live[n.id]?.view) continue;
-    const st = live[n.id].view!.state, doc = st.doc, f = st.field(anchorField);
+    if (n.kind !== 'buffer' || n.buf || !n.anchors?.length) continue;
+    const doc = n.text || '';
     const used = new Set(S.strokes.filter(s => s.owner === n.id && s.aid).map(s => s.aid));
     for (const r of S.nodes ? Object.values(S.nodes) : []) if (r.kind === 'ref' && r.src?.node === n.id && r.src.aid) used.add(r.src.aid);
-    n.text = doc.toString();
-    n.anchors = Object.entries(f).filter(([id, a]) => a.label || used.has(id)).map(([id, a]) => ({
-      id, label: a.label, pos: a.pos, quote: doc.sliceString(a.pos, a.pos + 24), prefix: doc.sliceString(Math.max(0, a.pos - 16), a.pos),
+    n.anchors = n.anchors.filter(a => a.label || used.has(a.id)).map(a => ({
+      id: a.id, label: a.label, pos: a.pos, quote: doc.slice(a.pos, a.pos + 24), prefix: doc.slice(Math.max(0, a.pos - 16), a.pos),
     }));
   }
 }
@@ -301,16 +303,16 @@ function boardAdopt(b: Board): void {
     const p = perspCur(); if (p !== 'manual') { perspClear(); S.persp = 'manual'; }
     ovlHide();
     const dk = deskAt(DESK.cur); if (dk) deskUnapply();   // the same for a desk: take the Board, then stand the desk up again
-    const cur = S.nodes;
+    const cur = S.nodes; let roChanged = false;
     for (const id of Object.keys(cur)) if (!b.nodes?.[id] || b.nodes[id].kind !== cur[id].kind) { unmountQuiet(id); delete cur[id]; }
     for (const [id, nn] of Object.entries(b.nodes || {})) {
       const o = cur[id];
       if (!o) { cur[id] = nn; continue; }
       for (const k of Object.keys(o)) if (!k.startsWith('_') && !(k in nn)) delete (o as Partial<BoardNode>)[k as keyof BoardNode];
+      const was = o.kind === 'buffer' ? o.text : undefined;
       Object.assign(o, nn);   // in place: the mounted card's closures hold this object
       if (o.kind === 'op' && live[id]?.op) { live[id].op!.prompt.value = o.prompt || ''; opRender(o); }
-      const v = live[id]?.view;
-      if (o.kind === 'buffer' && v && v.state.doc.toString() !== (o.text || '')) v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: o.text || '' } });
+      if (o.kind === 'buffer' && !FR.on) { roChanged ||= was !== o.text; if (live[id]) roRender(o); }   // a read-only page shows the text the other tab saved
     }
     S.edges = b.edges || []; S.strokes = b.strokes || []; S.shapes = b.shapes || []; if (Array.isArray(b.desks)) S.desks = b.desks; else delete S.desks; if (Array.isArray(b.sticky)) S.sticky = b.sticky; else delete S.sticky; BOARD_CAM = b.cam;
     deskSlotsFix();
@@ -322,13 +324,14 @@ function boardAdopt(b: Board): void {
     if (dk) { const d = dk.smart ? dk : deskList().find(x => x === dk || (deskPinned(x) && x.slot === dk.slot)); if (d) { if (d.smart) DESK.smart = d; deskApply(d); } }   // a pinned desk comes back as the other device saved it
     deskRefresh(true);
     refreshBlockCards();   // a page the other tab removed, restored or rewrote
+    if (roChanged) { scheduleCrossRefresh(); if (VIEW === 'tasks') renderTasks(); }   // backlinks and the views over the pages, as a local edit does
     restack(); updateAllTitles(); renderTree(); renderLinks(); renderInk(null);
     SAVE.lastJson = serialize();
   } finally { ADOPTING = false; }
 }
 function unmountQuiet(id: string): void {   // the card went in another tab: drop it here without killing its session
   const L = live[id]; if (!L) return;
-  pdfClose(L); L.backend?.dispose?.(); L.ro?.disconnect(); L.view?.destroy(); L.term?.dispose(); if (L.frame?.contentWindow) HOSTS.delete(L.frame.contentWindow);
+  pdfClose(L); L.backend?.dispose?.(); L.ro?.disconnect(); L.term?.dispose(); if (L.frame?.contentWindow) HOSTS.delete(L.frame.contentWindow);
   if (FR.on) frUnmount(id);
   L.el.remove(); delete live[id];
 }
@@ -496,31 +499,10 @@ function confirmDel(btn: HTMLElement, fn: () => void): void {
   setTimeout(() => btn.classList.remove('armed'), 2200);
 }
 
-// ------------------------------------------------------------------ CodeMirror anchors
-// Anchors are document positions mapped through every edit, so they survive typing.
-// Labeled anchors render as chips; unlabeled ones hold ink and reference cards to their text.
-interface PageAnchorMark { pos: number; label?: string | null }
-const anchorAdd = V.StateEffect.define<{ id: string; pos: number; label?: string | null }>(), anchorDel = V.StateEffect.define<string>();
-class AnchorWidget extends V.WidgetType {
-  declare label: string;
-  constructor(label: string) { super(); this.label = label; }
-  eq(o: AnchorWidget): boolean { return o.label === this.label; }
-  toDOM(): HTMLElement { const s = document.createElement('span'); s.className = 'anchor-chip'; s.textContent = '⚓' + this.label; return s; }
-}
-const anchorField = V.StateField.define<Record<string, PageAnchorMark>>({
-  create: () => ({}),
-  update(val, tr) {
-    let out = val;
-    if (tr.docChanged) { out = {}; for (const k in val) out[k] = { ...val[k], pos: tr.changes.mapPos(val[k].pos, 1) }; }
-    for (const e of tr.effects) {
-      if (e.is(anchorAdd)) out = { ...out, [e.value.id]: { pos: e.value.pos, label: e.value.label } };
-      if (e.is(anchorDel)) { out = { ...out }; delete out[e.value]; }
-    }
-    return out;
-  },
-  provide: f => V.EditorView.decorations.from(f, val => V.Decoration.set(
-    Object.values(val).filter(a => a.label).map(a => V.Decoration.widget({ widget: new AnchorWidget(a.label!), side: -1 }).range(a.pos)), true)),
-});
+// ------------------------------------------------------------------ page anchors
+// Anchors are document positions mapped through every edit, so they survive typing: edwind's shared markers on a page
+// in a file (R9.12), the node's anchors on a read-only page. Labeled anchors render as chips; unlabeled ones hold ink
+// and reference cards to their text. A board saved without positions that fit finds them again by quote.
 function relocate(doc: string, a: Pick<PageAnchor, 'pos' | 'quote' | 'prefix'>): number {
   if (a.quote) {
     for (const [needle, off] of [[(a.prefix || '') + a.quote, (a.prefix || '').length], [a.quote, 0]] as [string, number][]) {
@@ -531,39 +513,6 @@ function relocate(doc: string, a: Pick<PageAnchor, 'pos' | 'quote' | 'prefix'>):
   }
   return clamp(a.pos || 0, 0, doc.length);
 }
-const bufTheme = V.EditorView.theme({
-  '&': { height: '100%', fontSize: '13px', backgroundColor: 'var(--buf-bg)', color: 'var(--fg)' },
-  '.cm-scroller': { fontFamily: MONO, lineHeight: '1.55' },
-  '.cm-content': { padding: '8px 0 40px' },
-  '.cm-gutters': { backgroundColor: 'var(--buf-bg)', color: 'var(--muted)', border: 'none', opacity: '.7' },
-  '.cm-activeLine': { backgroundColor: 'var(--active-line)' },
-  '.cm-activeLineGutter': { backgroundColor: 'transparent', color: 'var(--fg)' },
-  '&.cm-focused': { outline: 'none' },
-  '.cm-cursor': { borderLeftColor: 'var(--cursor)', borderLeftWidth: '2px' },
-  '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': { backgroundColor: 'var(--sel) !important' },
-  '.cm-foldGutter': { display: 'none' },
-});
-const T = V.tags;
-const bufHighlight = V.HighlightStyle.define([
-  { tag: [T.heading1, T.heading2, T.heading3, T.heading4, T.heading], color: 'var(--heading)', fontWeight: '600' },
-  { tag: T.heading1, fontSize: '1.18em' },
-  { tag: T.emphasis, fontStyle: 'italic' },
-  { tag: T.strong, fontWeight: '600' },
-  { tag: [T.link, T.url], color: 'var(--link)' },
-  { tag: T.monospace, color: 'var(--code)' },
-  { tag: [T.processingInstruction, T.list, T.quote, T.meta, T.contentSeparator], color: 'var(--muted)' },
-  // code: Modus's mappings (keyword, string, comment, builtin, function name, variable, constant, type, docstring)
-  { tag: [T.keyword, T.controlKeyword, T.definitionKeyword, T.moduleKeyword], color: 'var(--syn-keyword)' },
-  { tag: [T.string, T.special(T.string), T.regexp], color: 'var(--syn-string)' },
-  { tag: [T.comment, T.lineComment, T.blockComment], color: 'var(--syn-comment)' },
-  { tag: [T.docString, T.docComment], color: 'var(--syn-docstring)' },
-  { tag: [T.standard(T.name), T.standard(T.variableName)], color: 'var(--syn-builtin)' },
-  { tag: [T.function(T.variableName), T.function(T.definition(T.variableName)), T.function(T.propertyName)], color: 'var(--syn-fnname)' },
-  { tag: T.definition(T.variableName), color: 'var(--syn-variable)' },
-  { tag: [T.constant(T.name), T.constant(T.variableName), T.bool, T.null, T.atom], color: 'var(--syn-constant)' },
-  { tag: [T.typeName, T.className, T.namespace], color: 'var(--syn-type)' },
-]);
-
 // ------------------------------------------------------------------ addresses
 function colName(i: number): string { let s = ''; i++; while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; }
 function colIndex(s: string): number { let n = 0; for (const ch of s.toUpperCase()) n = n * 26 + (ch.charCodeAt(0) - 64); return n - 1; }
@@ -583,7 +532,7 @@ function nodeAt(x: number, y: number): BoardNode | null {
 // Buffer address: heading path + paragraph number + a short quote. Readable, sayable, survives line shifts.
 interface BufAddr { name: string; path: string[]; para: number; quote: string }
 type AddrDoc = Pick<BoardTextDoc, 'length' | 'lines' | 'line' | 'lineAt' | 'sliceString' | 'toString'>;
-interface AddrState { doc: AddrDoc }   // a CodeMirror EditorState, or pageState's {doc} over a TextDoc
+interface AddrState { doc: AddrDoc }   // pageState's {doc} over a TextDoc
 function bufferAddress(n: BoardNode, state: AddrState, pos: number): BufAddr {
   const doc = state.doc, ln = doc.lineAt(pos).number;
   let stack: { lvl: number; title: string }[] = [], para = 0, inPara = false, isHeading = false;
@@ -2399,38 +2348,8 @@ function mountTerm(n: TermNode | ReplNode, L: LiveEntry) {
 }
 
 function mountBuffer(n: PageNode, L: MountedLive) {
-  if (FR.on) return frMountPage(n, L);   // frames mode: an Edwin frame on the page's shared buffer (F-A27)
-  const text = n.text || '', init: Record<string, { pos: number; label?: string | null }> = {};
-  for (const a of n.anchors || []) init[a.id] = { pos: relocate(text, a), label: a.label };
-  const state = V.EditorState.create({
-    doc: text,
-    extensions: [
-      vimComp.of(vimExt(false)), V.basicSetup, V.markdown(), wikiCompletion, V.EditorView.lineWrapping, bufTheme, V.syntaxHighlighting(bufHighlight),
-      anchorField.init(() => init), linkField, outlineKeys,
-      V.EditorView.updateListener.of(u => {
-        if (u.docChanged && ED.node === n) mirrorTo(ED.view, u, u.view);
-        if (u.docChanged) { n.text = u.state.doc.toString(); dirty(); scheduleCrossRefresh(); blockCardsChanged(n); }
-        if ((u.docChanged || u.selectionSet) && focusedBuf === n.id) scheduleBufAddr(n);
-        if (u.docChanged || u.geometryChanged || u.viewportChanged) scheduleLineInk(n.id);
-      }),
-      V.EditorView.domEventHandlers({
-        focus: () => { focusedBuf = n.id; showBufAddr(n); },
-        mousedown: e => {
-          const link = (e.target as Element).closest<HTMLElement>('.cm-wikilink');
-          if (link && !e.shiftKey) { e.preventDefault(); openPage(link.dataset.page, n); return true; }
-          const tear = (e.target as Element).closest('.cm-tear');
-          if (tear) { e.preventDefault(); tearOutBlock(n, L.view!.posAtDOM(tear)); return true; }
-          const ref = (e.target as Element).closest<HTMLElement>('.blockref');
-          if (ref) { e.preventDefault(); const r = resolveRef(ref.dataset.ref); if (r) jumpBuffer(r.node, r.pos); return true; }
-          return false;
-        },
-      }),
-    ],
-  });
-  L.view = new V.EditorView({ state, parent: L.body });
-  L.backlinks = el('div', 'backlinks'); L.body.append(L.backlinks);
-  L.inkLines = svgEl('svg', { class: 'ink-lines' }); L.body.append(L.inkLines);
-  L.view.scrollDOM.addEventListener('scroll', () => scheduleLineInk(n.id), { passive: true });
+  if (FR.on) return frMountPage(n, L);   // an Edwin frame on the page's shared buffer (F-A27)
+  roMountPage(n, L);   // no edwind: the page's text, read-only
 }
 function mountRef(n: RefNode, L: MountedLive) {
   const src = el('div', 'ref-src'); src.textContent = '↗ ' + (n.srcLabel || 'source'); src.title = 'Jump to the source';
@@ -2584,7 +2503,7 @@ function removeNode(id: string) {
     for (const k of kidsOf(id)) { if (parent) k.in = parent.id; else delete k.in; }
   }
   const L = live[id];
-  if (L) { pdfClose(L); L.backend?.kill?.(); L.ro?.disconnect(); L.view?.destroy(); L.term?.dispose(); if (L.frame?.contentWindow) { HOSTS.delete(L.frame.contentWindow); frameTouchDrop(id); } if (FR.on) frUnmount(id); cardGhost(L.el!); L.el!.remove(); delete live[id]; }
+  if (L) { pdfClose(L); L.backend?.kill?.(); L.ro?.disconnect(); L.term?.dispose(); if (L.frame?.contentWindow) { HOSTS.delete(L.frame.contentWindow); frameTouchDrop(id); } if (FR.on) frUnmount(id); cardGhost(L.el!); L.el!.remove(); delete live[id]; }
   delete S.nodes[id]; DESK.mem.delete(id); for (const d of [...deskList(), DESK.smart].filter(Boolean) as Desk[]) { delete d.members[id]; if (d.saved) delete d.saved.members[id]; }
   if (S.sticky) { S.sticky = S.sticky.filter(x => x !== id); if (!S.sticky.length) delete S.sticky; } if (ovlHas({ id })) { OVL.ids = OVL.ids.filter(x => x !== id); delete OVL.saved[id]; viewSave(); }
   S.edges = S.edges.filter(e => e.from !== id && e.to !== id);
@@ -2615,23 +2534,25 @@ type SpawnChildInit = Pick<BoardNodeBase, 'id' | 'name' | 'x' | 'y' | 'w' | 'h' 
 function selectionOf(n: BoardNode): string {
   const L = live[n.id];
   if (L.term) return L.term.getSelection();
-  if (L.view) { const st = L.view.state, s = st.selection.main; return s.empty ? st.doc.lineAt(s.head).text : st.sliceDoc(s.from, s.to); }
-  if (n.kind === 'buffer' && FR.on) { const b = frBufOf(n); if (!b) return ''; if (b.markActive && b.mark != null && b.mark !== b.pt) return b.text.slice(Math.min(b.pt, b.mark), Math.max(b.pt, b.mark)); return new TextDoc(b.text).lineAt(b.pt).text; }
+  if (n.kind === 'buffer' && !FR.on) { const t = roText(n), r = roSelection(n as PageNode);   // the shown text: a file page shows its snap
+    return !r ? '' : r[0] !== r[1] ? t.slice(r[0], r[1]) : new TextDoc(t).lineAt(r[0]).text; }
+  if (n.kind === 'buffer') { const b = frBufOf(n); if (!b) return ''; if (b.markActive && b.mark != null && b.mark !== b.pt) return b.text.slice(Math.min(b.pt, b.mark), Math.max(b.pt, b.mark)); return new TextDoc(b.text).lineAt(b.pt).text; }
   if (n.kind === 'acp') { const s = getSelection(); return s && L.body!.contains(s.anchorNode) ? String(s) : ''; }
   if (n.kind === 'pdf') return pdfSel(n)?.text || '';
   return '';
 }
-function pipeFrom(n: BoardNode) {
+async function pipeFrom(n: BoardNode) {
   const text = selectionOf(n);
   if (!text || !text.trim()) return toast(n.kind === 'buffer' ? 'Nothing to send on this line.' : n.kind === 'pdf' ? 'Select some text in the PDF first.' : 'Select some output in the terminal first.');
   const targets = childrenOf(n.id, 'pipe');
   if (!targets.length) return toast('No pipes from here yet. Drag the ● at the bottom edge onto another node.');
+  const sent: BoardNode[] = [], refused: BoardNode[] = [];
   for (const t of targets) {
     const L = live[t.id]; if (!L) continue;
-    if (t.kind === 'buffer') {
+    if (t.kind === 'buffer') {   // a page that takes no edit (a file page with no edwind, a save still held) is not sent
       const ins = `\n*from ${pathOf(n.id)}:*\n\`\`\`\n${text.replace(/\s+$/, '')}\n\`\`\`\n`;
-      if (L.view) { const doc = L.view.state.doc; L.view.dispatch({ changes: { from: doc.length, insert: ins }, scrollIntoView: true }); }
-      else frWhenWritable(t).then(b => b && frEdit(b, [[b.text.length, '', ins]]));
+      const b = FR.on ? await frWhenWritable(t) : null;
+      if (!(FR.on ? b && frEdit(b, [[b.text.length, '', ins]]) : pageEdit(t, pageText(t).length, pageText(t).length, ins))) { refused.push(t); continue; }
     } else if ((t.kind === 'agent' || t.kind === 'acp') && L.ta) {   // drafts into the composer, never sends
       L.ta.value = (L.ta.value ? L.ta.value + '\n' : '') + text; L.ta.focus();
     } else if (t.kind === 'op' && L.op) {   // into the media card's prompt; it runs when asked
@@ -2639,10 +2560,12 @@ function pipeFrom(n: BoardNode) {
     } else if (L.backend) {
       L.backend.input(text.replace(/\r?\n/g, '\r').replace(/\r$/, '') + (n.kind === 'buffer' ? '\r' : ''));
     }
+    sent.push(t);
     L.el!.classList.remove('pulse'); void L.el!.offsetWidth; L.el!.classList.add('pulse');
     for (const e of S.edges) if (e.type === 'pipe' && e.from === n.id && e.to === t.id) flowPipe(e);
   }
-  toast(`Sent ${text.split('\n').length} line(s) to ${targets.map(t => pathOf(t.id)).join(', ')}`);
+  const no = refused.length ? `${sent.length ? '; ' : ''}not sent to ${refused.map(t => pathOf(t.id)).join(', ')}: ${FR.on ? 'it takes no edit yet' : RO_FILE}` : '';
+  toast((sent.length ? `Sent ${text.split('\n').length} line(s) to ${sent.map(t => pathOf(t.id)).join(', ')}` : '') + no);
 }
 function refFrom(n: BoardNode) {
   const L = live[n.id]; let text = '', src: RefNode['src'], label: string;
@@ -2651,12 +2574,13 @@ function refFrom(n: BoardNode) {
     const p = L.term.getSelectionPosition();
     const line = p ? p.start.y : 0, lines = p ? p.end.y - p.start.y + 1 : 1;
     src = { node: n.id, line, lines }; label = `${pathOf(n.id)} › L${line + 1}${lines > 1 ? '–' + (line + lines) : ''}`;
-  } else if (L.view) {
-    const st = L.view.state, s = st.selection.main;
-    if (s.empty) return toast('Select some text first.');
-    text = st.sliceDoc(s.from, s.to);
-    const aid = uid('a'); L.view.dispatch({ effects: anchorAdd.of({ id: aid, pos: s.from, label: null }) });
-    src = { node: n.id, aid }; label = fmtAddr(bufferAddress(n, st, s.from));
+  } else if (n.kind === 'buffer' && !FR.on) {   // a read-only page: the text selected in it
+    if (n.buf) return toast('A ref from this page needs edwind: its anchors live there.');   // only its snap is here
+    const r = roSelection(n), st = pageState(n);
+    if (!r || r[0] === r[1] || !st) return toast('Select some text first.');
+    text = (n.text || '').slice(r[0], r[1]);
+    const aid = roAnchorAdd(n, r[0], null);
+    src = { node: n.id, aid }; label = fmtAddr(bufferAddress(n, st, r[0]));
   } else {
     const b = frBufOf(n), st = pageState(n);
     if (!b || !st || !b.markActive || b.mark == null || b.mark === b.pt) return toast('Select some text first.');
@@ -2671,12 +2595,11 @@ function refFrom(n: BoardNode) {
   addNode(r);
 }
 function anchorAtCursor(n: PageNode) {
-  const v = live[n.id].view;
-  if (!v && !(FR.on && n.buf)) return;
+  if (!(FR.on ? n.buf : !n.buf)) return;
   ask('Name this anchor (address becomes ' + n.name + '#name)', '', name => {
     name = name.replace(/[^\w-]/g, '-');
-    if (v) { v.dispatch({ effects: anchorAdd.of({ id: uid('a'), pos: v.state.selection.main.head, label: name }) }); dirty(); }
-    else frAnchorAdd(n, pagePoint(n), name);   // a shared marker (R9.12)
+    if (FR.on) frAnchorAdd(n, pagePoint(n), name);   // a shared marker (R9.12)
+    else roAnchorAdd(n, pagePoint(n), name);
     toast(`Anchor ${n.name}#${name} set. It moves with the text.`);
   });
 }
@@ -2686,9 +2609,8 @@ function jumpNode(n: BoardNode, maxZ = 1, done?: () => unknown) { if (VIEW !== '
 function jumpBuffer(n: PageNode, pos: number) {
   if (VIEW === 'editor') return edOpen(n, pos);
   jumpNode(n, 1, () => {
-    const v = live[n.id]?.view;
-    if (!v) { if (FR.on && n.buf) frFocus(n, (f, b) => f.setPoint(Math.min(pos, b.text.length))); return; }
-    v.dispatch({ selection: { anchor: pos, head: Math.min(pos + 1, v.state.doc.length) }, scrollIntoView: true }); v.focus();
+    if (FR.on) { if (n.buf) frFocus(n, (f, b) => f.setPoint(Math.min(pos, b.text.length))); return; }
+    roScrollTo(n, pos);
   });
 }
 function jumpRef(r: RefNode) {
@@ -2784,16 +2706,11 @@ function strokePath(s: Stroke): SVGPathElement {
 }
 // Top of the anchored line, in the buffer body's own (unscaled) coordinates.
 function lineTopBody(id: string, aid: string): number | null {
-  const L = live[id], v = L?.view;
-  if (!v) {
-    if (!L?.frame || !S.nodes[id]) return null;
-    const a = frAnchors(S.nodes[id] as PageNode).find(x => x.id === aid); if (!a) return null;
-    const top = (L.frame as EdwinFrame).lineTop(a.pos); return top == null ? null : top + L.host!.offsetTop;   // null when the line is not drawn
-  }
-  const a = v.state.field(anchorField)[aid]; if (!a) return null;
-  const r = v.coordsAtPos(Math.min(a.pos, v.state.doc.length), 1);  // null when the line is outside CodeMirror's rendered viewport
-  if (!r) return null;
-  return (r.top - L.body!.getBoundingClientRect().top) / cam().z;
+  const L = live[id], n = S.nodes[id] as PageNode | undefined; if (!L || n?.kind !== 'buffer') return null;
+  const a = pageAnchors(n).find(x => x.id === aid); if (!a) return null;
+  if (!FR.on) return roLineTop(n, a.pos);
+  if (!L.frame) return null;
+  const top = (L.frame as EdwinFrame).lineTop(a.pos); return top == null ? null : top + L.host!.offsetTop;   // null when the line is not drawn
 }
 const lineInkQueued = new Set<string>();
 function scheduleLineInk(id: string) {
@@ -2830,18 +2747,13 @@ function commitStroke(pts: [number, number, number][], sim: boolean, size: numbe
   const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cy = (Math.min(...ys) + Math.max(...ys)) / 2;
   const s = { id: uid('s'), color: inkColor, size, sim, owner: null } as Stroke;
   const node = nodeAt(cx, cy);
-  const fr = node && node.kind === 'buffer' && FR.on ? live[node.id]?.frame as EdwinFrame | undefined : null, frPos = fr ? (() => { const r = viewport.getBoundingClientRect(), sc = w2s(cx, cy); return fr.posFromPoint(sc.x + r.left, sc.y + r.top); })() : null;
-  if (node && node.kind === 'buffer' && cy > node.y + HDR && (live[node.id].view || frPos != null)) {
-    // Anchor to the line under the stroke's centre so the ink follows the text through edits and scrolling.
-    const v = live[node.id].view, aid = 'ink-' + s.id;
-    if (v) {
-      const r = viewport.getBoundingClientRect(), sc = w2s(cx, cy);
-      const pos = v.posAtCoords({ x: sc.x + r.left, y: sc.y + r.top }, false);
-      v.dispatch({ effects: anchorAdd.of({ id: aid, pos: v.state.doc.lineAt(pos).from, label: null }) });
-    } else {   // frames: a shared marker at the line start (R9.12), drawn at the frame's line top
-      const text = live[node.id].buf!.text, ls = text.lastIndexOf('\n', frPos! - 1) + 1;
-      frAnchorAdd(node, ls, null, aid);
-    }
+  const sc = w2s(cx, cy), vr = viewport.getBoundingClientRect();
+  const pos = node && node.kind === 'buffer' && cy > node.y + HDR ? pagePosAt(node, sc.x + vr.left, sc.y + vr.top) : null;
+  if (node && node.kind === 'buffer' && pos != null && (FR.on || !node.buf)) {   // a file page's anchors are edwind's
+    // Anchor to the line under the stroke's centre so the ink follows the text through edits and scrolling: a shared
+    // marker at the line start (R9.12) drawn at the frame's line top, or the read-only page's own anchor.
+    const aid = 'ink-' + s.id, text = pageText(node), ls = text.lastIndexOf('\n', pos - 1) + 1;
+    if (FR.on) frAnchorAdd(node, ls, null, aid); else roAnchorAdd(node, ls, null, aid);
     const top = lineTopBody(node.id, aid);
     Object.assign(s, { owner: node.id, aid, pts: pts.map(([x, y, p]) => [x - node.x, y - node.y - HDR - top!, p]) });
   } else if (node) {
@@ -2914,7 +2826,7 @@ function termLines(L: LiveEntry, max: number): string[] {
 function snapshotText(n: BoardNode, max = 12): string {
   const L = live[n.id]; if (!L) return '';
   if (L.term) return termLines(L, max).join('\n');
-  if (n.kind === 'buffer') return (FR.on && n.buf ? frSnapText(n) : n.text || '').split('\n').slice(0, max).join('\n');
+  if (n.kind === 'buffer') return (FR.on && n.buf ? frSnapText(n) : roText(n)).split('\n').slice(0, max).join('\n');
   if (n.kind === 'acp') return L.backend?.text!(max) || '';
   if (n.kind === 'agent') return (n.log || []).filter(m => m.text).slice(-6).map(m => (m.t === 'user' ? '› ' : '') + m.text).join('\n');
   if (n.kind === 'web') return n.url || '';
@@ -2931,8 +2843,8 @@ function refreshSnapshots() { for (const n of nodeList()) { const L = live[n.id]
 let bufAddrT = 0;
 function scheduleBufAddr(n: BoardNode) { clearTimeout(bufAddrT); bufAddrT = setTimeout(() => { if (focusedBuf === n.id) showBufAddr(n); }, 120); }
 function showBufAddr(n: BoardNode) {
-  const v = live[n.id]?.view; if (!v) return;
-  const t = $('#st-buf-text')!; t.textContent = fmtAddr(bufferAddress(n, v.state, v.state.selection.main.head)); t.classList.add('live');
+  const st = pageState(n); if (!st) return;
+  const t = $('#st-buf-text')!; t.textContent = fmtAddr(bufferAddress(n, st, pagePoint(n))); t.classList.add('live');
   $('#st-copy')!.hidden = false;
 }
 $('#st-copy')!.onclick = () => copyText($('#st-buf-text')!.textContent);
@@ -3173,7 +3085,7 @@ viewport.addEventListener('dblclick', ev => {
   const r = viewport.getBoundingClientRect(), w = s2w(ev.clientX - r.left, ev.clientY - r.top);
   const count = nodeList().filter(m => m.kind === 'buffer').length + 1;
   const n = addNode({ kind: 'buffer', name: 'note' + count, x: Math.round(w.x - 20), y: Math.round(w.y - 20), w: 420, h: 260, text: '# note' + count + '\n\n- ' });
-  setTimeout(() => { const v = live[n.id]?.view; if (!v) return focusEnd(n); v.dispatch({ selection: { anchor: v.state.doc.length } }); v.focus(); }, 30);
+  setTimeout(() => focusEnd(n), 30);
 });
 
 // ------------------------------------------------------------------ toolbar
@@ -3201,7 +3113,7 @@ function pickShell(then: (shell?: string) => unknown) {
   const d = shellDefault(), order = sh.includes(d!) ? [d!, ...sh.filter(x => x !== d)] : sh;
   openPicker('Shell', order.map(x => ({ k: 'shell', l: x, s: x === INFO!.defaultShell ? 'default' : '', run: () => { store.set(SHELL_KEY, x); then(x); } })));
 }
-$('#add-buffer')!.onclick = () => { const n = newAt('buffer', { text: '# untitled\n\n- ' }); const t = `# ${n.name}\n\n- `; if (live[n.id].view) { n.text = t; live[n.id].view!.dispatch({ changes: { from: 0, to: live[n.id].view!.state.doc.length, insert: n.text } }); } else pageSetText(n, t); };
+$('#add-buffer')!.onclick = () => { const n = newAt('buffer', { text: '# untitled\n\n- ' }); pageSetText(n, `# ${n.name}\n\n- `); };
 $('#add-frame')!.onclick = () => {
   if (VIEW !== 'canvas') setView('canvas');
   const n = newAt('frame', { mode: 'free', shape: 'folder' });
@@ -3238,10 +3150,12 @@ $('#reset-board')!.onclick = ev => confirmDel(ev.currentTarget as HTMLElement, (
 type JsonCanvasNode = { id: string; type: 'group' | 'text' | 'link'; x: number; y: number; width: number; height: number; label?: string; text?: string; url?: string; color?: string }; async function toJsonCanvas(): Promise<string> {
   const nodes: JsonCanvasNode[] = [], edges: { id: string; fromNode: string; toNode: string; label: string; color?: string }[] = [];
   const all = [...frameList(), ...nodeList()];
+  const texts = new Map(await Promise.all(all.filter(n => n.kind === 'buffer').map(async n =>   // at once: one wait for the board, not one per page
+    [n.id, await pageTextFull(n).catch(() => `> ${n.buf}: only its first lines are here (${RO_FILE})\n\n${roText(n)}`)] as const)));
   for (const n of all) {
     const base = { id: n.id, x: Math.round(n.x), y: Math.round(n.y), width: Math.round(n.w), height: Math.round(n.h) };
     if (n.kind === 'frame') nodes.push({ ...base, type: 'group', label: n.name });
-    else if (n.kind === 'buffer') nodes.push({ ...base, type: 'text', text: await pageTextFull(n) });
+    else if (n.kind === 'buffer') nodes.push({ ...base, type: 'text', text: texts.get(n.id)! });
     else if (n.kind === 'image' && n.blob) nodes.push({ ...base, type: 'link', url: location.origin + imgUrl(n) });
     else if (n.kind === 'ref') nodes.push({ ...base, type: 'text', text: `> from ${n.srcLabel}\n\n\`\`\`\n${n.text}\n\`\`\``, color: '6' });
     else nodes.push({ ...base, type: 'text', text: `**${pathOf(n.id)}** · ${badgeOf(n)}\n\n\`\`\`\n${snapshotText(n, 30)}\n\`\`\``, color: '4' });
@@ -3411,7 +3325,7 @@ const hasChat = () => !!(S.chat && live.chat);
 cmd('Assistant: new conversation', () => { S.chat!.turns = []; S.chat!.log = [{ t: 'note', text: CHAT_HELLO }]; renderAgentLog(S.chat!); dirty(); toggleSide(true); }, '', hasChat);
 cmd('Assistant: fork the conversation onto the canvas', () => $('#chat-fork')!.click(), '', hasChat);
 cmd('Assistant: talk (hold-to-talk mic)', () => { toggleSide(true, true); sideTab('chat'); $('.mic', live.chat.body)!.dispatchEvent(new PointerEvent('pointerdown', { button: 0 })); }, '', hasChat);
-cmd('Dictate into the page', () => { if (VIEW === 'editor' && ED.view) dictateInto('editor'); else if (focusedBuf && S.nodes[focusedBuf]) dictateInto(S.nodes[focusedBuf] as PageNode); else toast('Click into a page first.'); }, '@dictate');
+cmd('Dictate into the page', () => { if (VIEW === 'editor' && ED.node) dictateInto('editor'); else if (focusedBuf && S.nodes[focusedBuf]) dictateInto(S.nodes[focusedBuf] as PageNode); else toast('Click into a page first.'); }, '@dictate');
 for (const [t, name, key] of [['select', 'select and move', 'V'], ['area', 'select an area (ink, shapes, cards)', 'S'], ['rect', 'rectangle', 'R'], ['diamond', 'diamond', 'D'], ['ellipse', 'ellipse', 'O'], ['arrow', 'arrow', 'A'], ['pen', 'pen', 'P'], ['text', 'text', 'T'], ['erase', 'eraser', 'E']])
   cmd(`Tool: ${name}`, onCanvas(() => setTool(t)), '@tool.' + t);
 cmd('Selection: remove it (ink, shapes, cards)', onCanvas(() => removeSelection()), '@selection.remove', () => PICKED.size > 0 || SEL.strokes.size > 0 || SEL.shapes.size > 0);
@@ -3467,19 +3381,17 @@ cmd('Export as JSON Canvas', async () => { syncBuffers(); ($('#ex-text') as HTML
 cmd('Theme: Modus Operandi (light)', () => setTheme('light'));
 cmd('Theme: Modus Vivendi (dark)', () => setTheme('dark'));
 cmd('Theme: follow the system', () => setTheme('auto'));
-cmd('Pages: vim keys on or off', () => setVim(!S.vim));
 cmd('Help: keys and gestures', () => { $('#help')!.hidden = false; }, '@help');
 
 // ------------------------------------------------------------------ keyboard (DESIGN §6.4)
 // One capture listener walks the layers of web/keys.ts, innermost first: leader, transient (an overlay, hints, arrange),
 // interior (the card or field that has the keyboard), view, place, global. A card gets every key it needs before the
 // board looks at it (K2), and leader Esc takes the keyboard back out of any card (K3).
-const typing = () => { const a = document.activeElement; return a && (a.matches('input, textarea, [contenteditable="true"]') || a.closest('.cm-editor, .xterm, .edwin-frame')); };
+const typing = () => { const a = document.activeElement; return a && (a.matches('input, textarea, [contenteditable="true"]') || a.closest('.xterm, .edwin-frame')); };
 function keyInterior(a: Element | null = document.activeElement) {
   if (!a || a === document.body || a === document.documentElement || a === viewport) return null;
   if (a.closest('.xterm')) return 'term';
   if (a.closest('.edwin-frame')) return 'edwin';   // an Edwin frame owns every key but the leader (edwind spec R9.7, F-A27)
-  if (a.closest('.cm-editor')) return 'page';
   if (a.tagName === 'IFRAME') return 'frame';
   if (a.matches('.pdf-pages')) return 'pdf';
   if (a.matches('input, textarea, select, [contenteditable="true"]')) return 'text';
@@ -3512,96 +3424,8 @@ window.addEventListener('keyup', (e: KeyboardEvent) => { if (e.key === ' ') spac
 // a keyup that happens in another window or tab, or inside a frame, never comes here: leaving the page lets go of Space
 window.addEventListener('blur', () => { space = false; }); document.addEventListener('visibilitychange', () => { space = false; });
 
-// ------------------------------------------------------------------ pages: outliner keys, [[links]], ((refs)), backlinks
-function outlineEnter(view: CmEditorView): boolean {
-  const st = view.state, sel = st.selection.main; if (!sel.empty) return false;
-  const line = st.doc.lineAt(sel.head), m = line.text.match(/^(\s*)([-*+]|\d+\.)\s(.*)$/);
-  if (!m) return false;
-  if (!m[3].trim() && sel.head === line.to) {   // Enter on an empty bullet: outdent it, or end the list
-    if (m[1].length >= 2) view.dispatch({ changes: { from: line.from, to: line.from + 2 } });
-    else view.dispatch({ changes: { from: line.from, to: line.to, insert: '' } });
-    return true;
-  }
-  const bullet = /\d+\./.test(m[2]) ? (parseInt(m[2], 10) + 1) + '.' : m[2], ins = '\n' + m[1] + bullet + ' ';
-  view.dispatch({ changes: { from: sel.head, insert: ins }, selection: { anchor: sel.head + ins.length }, scrollIntoView: true });
-  return true;
-}
-function shiftLines(view: CmEditorView, dir: number): boolean {
-  const st = view.state, changes: { from: number; to?: number; insert?: string }[] = [], seen = new Set<number>();
-  for (const r of st.selection.ranges) {
-    for (let l = st.doc.lineAt(r.from).number; l <= st.doc.lineAt(r.to).number; l++) {
-      if (seen.has(l)) continue; seen.add(l);
-      const line = st.doc.line(l);
-      if (dir > 0) changes.push({ from: line.from, insert: '  ' });
-      else { const sp = line.text.match(/^ {1,2}/); if (sp) changes.push({ from: line.from, to: line.from + sp[0].length }); }
-    }
-  }
-  if (changes.length) view.dispatch({ changes });
-  return true;
-}
-const outlineKeys = V.Prec.high(V.keymap.of([
-  { key: 'Enter', run: outlineEnter },
-  { key: 'Tab', run: v => shiftLines(v, 1) },
-  { key: 'Shift-Tab', run: v => shiftLines(v, -1) },
-]));
-class RefWidget extends V.WidgetType {
-  declare addr: string; declare text: string; declare ok: boolean;
-  constructor(addr: string, text: string, ok: boolean) { super(); this.addr = addr; this.text = text; this.ok = ok; }
-  eq(o: RefWidget) { return o.addr === this.addr && o.text === this.text; }
-  toDOM() {
-    const s = document.createElement('span'); s.className = 'blockref' + (this.ok ? '' : ' missing');
-    s.textContent = this.text; s.title = '((' + this.addr + ')) · click to jump'; s.dataset.ref = this.addr; return s;
-  }
-  ignoreEvent() { return false; }
-}
-class TearWidget extends V.WidgetType {
-  eq() { return true; }
-  toDOM() { const s = document.createElement('span'); s.className = 'cm-tear'; s.textContent = '⇱ card'; s.title = 'Tear this block out onto the canvas as a live card'; return s; }
-  ignoreEvent() { return false; }
-}
-/* CodeMirror's document, selection and decoration range, from the vendored bundle. */
-type OutlineCmText = CmEditorView['state']['doc'];
-type OutlineCmSelection = CmEditorView['state']['selection'];
-type OutlineDecoRange = import('@codemirror/state').Range<import('@codemirror/view').Decoration>;
-const refreshLinks = V.StateEffect.define();
-const REF_DOCS = new WeakMap<OutlineCmText, boolean>();   // doc (immutable) → it holds a ((ref)), so its decorations depend on the cursor line and on other pages
-const curLine = (doc: OutlineCmText, sel: OutlineCmSelection) => doc.lineAt(Math.min(sel.main.head, doc.length)).number;
-// [[links]] render as links; ((refs)) render as the referenced text, except on the line being edited.
-function linkDecos(docObj: OutlineCmText, selection: OutlineCmSelection) {
-  const out: OutlineDecoRange[] = [], doc = docObj.toString(), cur = docObj.lineAt(Math.min(selection.main.head, docObj.length));
-  REF_DOCS.set(docObj, doc.includes('(('));
-  for (const m of doc.matchAll(/\[\[([^\[\]\n]+)\]\]/g)) {
-    const a = m.index, b = a + 2 + m[1].length;
-    out.push(V.Decoration.mark({ class: 'cm-brk' }).range(a, a + 2));
-    out.push(V.Decoration.mark({ class: 'cm-wikilink', attributes: { 'data-page': m[1] } }).range(a + 2, b));
-    out.push(V.Decoration.mark({ class: 'cm-brk' }).range(b, b + 2));
-  }
-  for (const m of doc.matchAll(/^(\s*[-*+]\s+)(TODO|NEXT|WAITING|HOLD|SOMEDAY|DONE|CANCELLED|DOING|NOW|LATER)\b(.*)$/gm)) {
-    const a = m.index + m[1].length, b = a + m[2].length;
-    out.push(V.Decoration.mark({ class: 'cm-task cm-task-' + m[2].toLowerCase() }).range(a, b));
-    if ((m[2] === 'DONE' || m[2] === 'CANCELLED') && m[3].trim()) out.push(V.Decoration.mark({ class: 'cm-task-done-text' }).range(b, b + m[3].length));
-  }
-  for (const m of doc.matchAll(/\(\(([^()\n]+)\)\)/g)) {
-    const a = m.index, b = a + m[0].length;
-    if (a <= cur.to && b >= cur.from) continue;
-    const r = resolveRef(m[1]);
-    out.push(V.Decoration.replace({ widget: new RefWidget(m[1], r ? r.text : m[1] + ' · not found', !!r) }).range(a, b));
-  }
-  for (const b of htmlBlocks(doc)) out.push(V.Decoration.widget({ widget: new TearWidget(), side: 1 }).range(b.head));
-  return V.Decoration.set(out, true);
-}
-const linkField = V.StateField.define({
-  create: st => linkDecos(st.doc, st.selection),
-  // tr.state must not be read here (it is the state being built), so use newDoc/newSelection
-  // A cursor move changes only which ((ref)) shows its source: nothing in a page without refs, nor while the cursor
-  // stays on its line. Rebuilding on every move made j/k and clicks cost a pass over the whole page.
-  update(val, tr) {
-    if (tr.docChanged || tr.effects.some(e => e.is(refreshLinks))) return linkDecos(tr.newDoc, tr.newSelection);
-    if (!tr.selection || !REF_DOCS.get(tr.newDoc) || curLine(tr.newDoc, tr.newSelection) === curLine(tr.startState.doc, tr.startState.selection)) return val;
-    return linkDecos(tr.newDoc, tr.newSelection);
-  },
-  provide: f => V.EditorView.decorations.from(f),
-});
+// ------------------------------------------------------------------ pages: [[links]], ((refs)), backlinks
+// The outliner keys, link faces and ((ref)) overlays are Edwin's (markdown-mode, edwin/scm/markdown.scm).
 function findPage(name: string): PageNode | null { name = String(name).trim().toLowerCase(); return nodeList().find(n => n.kind === 'buffer' && n.name.toLowerCase() === name) as PageNode | undefined || null; }
 function resolveRef(addr: string | undefined): { node: PageNode; pos: number; text: string } | null {
   addr = String(addr).trim(); let hit: { node: PageNode; pos: number } | null = null;
@@ -3631,9 +3455,9 @@ function openPage(name: string | undefined, from?: BoardNode | null, quiet?: boo
   return n;
 }
 function focusEnd(n: BoardNode) {
-  const v = live[n.id]?.view;
-  if (!v) { if (FR.on && n.kind === 'buffer') frFocus(n, (f: EdwinFrame, b: EdwinBuffer) => f.setPoint(b.text.length)); return; }
-  v.dispatch({ selection: { anchor: v.state.doc.length }, scrollIntoView: true }); v.focus();
+  if (n.kind !== 'buffer') return;
+  if (FR.on) frFocus(n, (f: EdwinFrame, b: EdwinBuffer) => f.setPoint(b.text.length));
+  else roScrollTo(n, pageText(n).length);
 }
 function openToday() {
   if (FR.on && VIEW !== 'editor') return frOpenToday();   // journal/YYYY-MM-DD.md through edwind
@@ -3694,9 +3518,6 @@ function scheduleCrossRefresh() {
   clearTimeout(crossT as number | undefined);
   crossT = setTimeout(() => {
     updateBacklinks();
-    // Only ((refs)) show another page's text; [[links]] look the same whatever the other pages say.
-    for (const n of nodeList()) { const v = n.kind === 'buffer' && live[n.id]?.view; if (v && REF_DOCS.get(v.state.doc) !== false) v.dispatch({ effects: refreshLinks.of(null) }); }
-    if (ED.view && REF_DOCS.get(ED.view.state.doc) !== false) ED.view.dispatch({ effects: refreshLinks.of(null) });
     refreshViews();
   }, 250);
 }
@@ -3871,7 +3692,7 @@ function boardSummary(): string {
     let extra = '';
     if (n.kind === 'term') extra = n.backend === 'pty' ? ', real shell' : `, simulated shell, cwd ${n.cwd}`;
     if (n.kind === 'repl') extra = n.lang === 'js' ? ', JavaScript REPL' : `, ${n.cmd} REPL`;
-    if (n.kind === 'buffer') extra = `, ${(n.text || '').split('\n').length} lines`;
+    if (n.kind === 'buffer') extra = `, ${pageText(n).split('\n').length} lines`;
     if (n.kind === 'artifact') extra = `, artifact page, capabilities ${Object.keys(n.capabilities || {}).join('/') || 'none'}, version ${String(n.head || '').slice(0, 8)}`;
     lines.push(`- ${pathOf(n.id)} [${n.kind === 'buffer' ? 'page' : n.kind}${extra}] ${n.in ? 'in folder ' + folderPath(n) + '/' : 'loose on the canvas'}${deskOff(n) ? ' (not on this desk)' : stashed(n) ? ' (hidden in a deck)' : ''}`);
   }
@@ -3899,8 +3720,7 @@ const AGENT_TOOLS: AgentTool[] = [
     run: async ({ path }: { path: string }) => {
       const n = findNode(path); if (!n) throw new Error('no node at ' + path);
       syncBuffers();
-      if (n.kind === 'buffer' && FR.on) { const b = await frWhenBuf(n); return (b ? b.text : n.text || '').slice(0, 8000); }   // the replica is what every editor sees (R13.7)
-      if (n.kind === 'buffer') return (n.text || '').slice(0, 8000);
+      if (n.kind === 'buffer') return (await pageTextFull(n)).slice(0, 8000);   // the replica is what every editor sees (R13.7)
       if (live[n.id]?.term) return termLines(live[n.id], 80).join('\n') || '(empty)';
       if (n.kind === 'acp') return live[n.id]?.backend?.text!(40) ?? '(not mounted)';
       if (n.kind === 'agent') return (n.log || []).slice(-10).map(l => `${l.t}: ${l.text || l.name}`).join('\n');
@@ -3931,11 +3751,12 @@ const AGENT_TOOLS: AgentTool[] = [
         pulse(n.id);
         return `ok, ${pathOf(n.id)} now has ${b.text.split('\n').length} lines`;
       }
-      const v = live[n.id].view!, doc = v.state.doc, t = str(text);
-      if (mode === 'replace') v.dispatch({ changes: { from: 0, to: doc.length, insert: t } });
-      else v.dispatch({ changes: { from: doc.length, insert: (doc.length && !doc.toString().endsWith('\n') ? '\n' : '') + t }, scrollIntoView: true });
+      if (n.buf) throw new Error(path + ': page editing needs edwind');
+      const doc = n.text || '', t = str(text);
+      if (mode === 'replace') pageSetText(n, t);
+      else pageEdit(n, doc.length, doc.length, (doc.length && !doc.endsWith('\n') ? '\n' : '') + t);
       pulse(n.id);
-      return `ok, ${pathOf(n.id)} now has ${v.state.doc.lines} lines`;
+      return `ok, ${pathOf(n.id)} now has ${(n.text || '').split('\n').length} lines`;
     } },
   { name: 'create_node', description: 'Create a node. kind is page, shell or repl. parent (a node path of the same kind) makes it a spawned child that inherits context; near (a node path) places it beside that node. Returns the new path.',
     inputSchema: { type: 'object', properties: { kind: { type: 'string', enum: ['page', 'shell', 'repl'] }, name: { type: 'string' }, text: { type: 'string', description: 'initial markdown for a page' }, parent: { type: 'string' }, near: { type: 'string' } }, required: ['kind', 'name'] },
@@ -4132,10 +3953,9 @@ async function inkToText() {
     const onPage = strokes.find(s => s.aid && S.nodes[s.owner!]?.kind === 'buffer' && pageState(S.nodes[s.owner!]));
     let where: string;
     if (onPage) {
-      const n = S.nodes[onPage.owner!], v = live[n.id].view, a = pageAnchors(n as PageNode).find(x => x.id === onPage.aid), st = pageState(n)!;
+      const n = S.nodes[onPage.owner!], a = pageAnchors(n as PageNode).find(x => x.id === onPage.aid), st = pageState(n)!;
       const line = st.doc.lineAt(a ? a.pos : st.doc.length), ins = '\n' + md.replace(/^# .*\n+/, '');
-      if (v) v.dispatch({ changes: { from: line.to, insert: ins }, selection: { anchor: line.to + ins.length } });
-      else pageEdit(n, line.to, line.to, ins);
+      if (!pageEdit(n, line.to, line.to, ins)) throw Object.assign(new Error(n.name + ' takes no edit yet'), { code: n.name + ' takes no edit yet; the ink stays' });   // keep the strokes
       where = n.name;
     } else {
       const b = inkBox(ids)!, first = md.split('\n')[0].replace(/^[#\-\s]+|TODO\s+/g, '').split(/\s+/).slice(0, 3).join('-').toLowerCase().replace(/[^\w-]/g, '') || 'note';
@@ -4171,7 +3991,7 @@ $('#ink-x')!.onclick = () => { INK.ids = []; placeInkChip(); };
 // 🎙 on a page (or Alt-V) dictates at the cursor. Saying "new line" or "new bullet" breaks the line.
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const VOICE_BLOCKED = 'The microphone is not available here. On claude.ai the artifact runs in a sandboxed frame without microphone access. Use the self-hosted Workbench in Chrome, Edge or Safari, or your system dictation into any text box (macOS: press Fn twice; Windows: Win+H).';
-const VOICE: { rec: SpeechRecognitionLike | null; target: HTMLElement | CmEditorView | string | null } = { rec: null, target: null };
+const VOICE: { rec: SpeechRecognitionLike | null; target: HTMLElement | string | null } = { rec: null, target: null };
 function spoken(t: string): string { return t.replace(/\s*\bnew bullet\b\s*/gi, '\n- ').replace(/\s*\bnew (line|paragraph)\b\s*/gi, '\n'); }
 /* What listen reports to: the text so far (final and interim), and the final text with why it stopped. */
 interface VoiceListenOpts { onUpdate?: (fin: string, interim: string) => void; onEnd?: (fin: string, failed: string | null) => void; label?: string }
@@ -4220,38 +4040,22 @@ function wireMic(btn: HTMLElement, n: LegacyAgentNode) {
   };
   btn.addEventListener('pointerup', release); btn.addEventListener('pointerleave', release); btn.addEventListener('pointercancel', release);
 }
+// Dictation into a page (its card, or the Editor view's frame): the recognised text goes in at the frame's point as
+// this frame's own edit. A read-only page (no edwind) takes none.
 function dictateInto(n: 'editor' | PageNode) {
-  if (n !== 'editor' && FR.on && n.buf && !live[n.id]?.view) return frDictateInto(n);
-  const v = n === 'editor' ? ED.view : live[n.id]?.view; if (!v) return;
-  if (VOICE.rec && VOICE.target === v) { stopListening(); return; }
+  const ed = n === 'editor', page = ed ? ED.node : n, L = page && live[page.id]; if (!page || !L) return;
+  if (!FR.on || !page.buf) { toast('Dictation into a page needs edwind (workbench-edit)'); return; }
+  const key = (ed ? 'editor:' : '') + page.id;
+  if (VOICE.rec && VOICE.target === key) { stopListening(); return; }
   let done = 0;
-  VOICE.target = v;
-  const btn = n === 'editor' ? null : $$('.hb', live[n.id].hdr!).find(b => b.textContent === '🎙'); btn?.classList.add('mic', 'on');
-  v.focus();
-  listen({ label: n === 'editor' ? ED.node?.name : n.name,
+  VOICE.target = key;
+  const btn = ed ? null : $$('.hb', L.hdr!).find(b => b.textContent === '🎙'); btn?.classList.add('mic', 'on');
+  if (ed) ED.frame?.focus(); else frFocus(page);
+  listen({ label: page.name,
     onUpdate: fin => {
       const add = fin.slice(done); if (!add.trim()) return;
       done = fin.length;
-      const head = v.state.selection.main.head, prev = v.state.sliceDoc(Math.max(0, head - 1), head);
-      const text = spoken((prev && !/\s/.test(prev) ? ' ' : '') + add.trim());
-      v.dispatch({ changes: { from: head, insert: text }, selection: { anchor: head + text.length }, scrollIntoView: true });
-    },
-    onEnd: () => { VOICE.target = null; } });
-}
-
-// Dictation into a frame: the recognised text goes in at the frame's point as this frame's own edit.
-function frDictateInto(n: PageNode) {
-  const L = live[n.id]; if (!L) return;
-  if (VOICE.rec && VOICE.target === n.id) { stopListening(); return; }
-  let done = 0;
-  VOICE.target = n.id;
-  const btn = $$('.hb', L.hdr!).find(b => b.textContent === '🎙'); btn?.classList.add('mic', 'on');
-  frFocus(n);
-  listen({ label: n.name,
-    onUpdate: fin => {
-      const add = fin.slice(done); if (!add.trim()) return;
-      done = fin.length;
-      const b = frBufOf(n), f = L.frame as EdwinFrame | undefined; if (!b) return;
+      const b = frBufOf(page), f = (ed ? ED.frame : L.frame) as EdwinFrame | null | undefined; if (!b) return;
       const head = f ? f.point() : b.pt, prev = b.text.slice(Math.max(0, head - 1), head);
       const text = spoken((prev && !/\s/.test(prev) ? ' ' : '') + add.trim());
       frEdit(b, [[head, '', text]]);
@@ -4338,7 +4142,7 @@ function rgBacklinks(box: HTMLElement, title: string) {
   const h = el('div', 'rg-meta', '← ' + bl.length + ' backlink' + (bl.length === 1 ? '' : 's')); box.append(h);
   for (const b of bl.slice(0, 40)) { const r = el('div', 'rg-row rg-bl'); r.innerHTML = '<span class="rg-nm"></span><span class="rg-meta2"></span>'; $('.rg-nm', r)!.textContent = b.title + ':' + b.line; $('.rg-meta2', r)!.textContent = b.text.slice(0, 80); r.onclick = () => b.page ? edOpen(b.page, lineFrom(b.page, b.line)) : b.note ? noteOpen({ ...b.note, line: b.line }) : null; box.append(r); }
 }
-const lineFrom = (n: BoardNode, line: number) => { const v = live[n.id]?.view; if (!v) return undefined; const doc = v.state.doc; return doc.line(clamp(line, 1, doc.lines)).from; };
+const lineFrom = (n: BoardNode, line: number) => { const st = pageState(n); if (!st) return undefined; const doc = st.doc; return doc.line(clamp(line, 1, doc.lines)).from; };
 function rgPreview(e: RgEntry | undefined) {
   const box = $('#rg-prev')!; box.replaceChildren();
   if (!e) return;
@@ -4496,7 +4300,7 @@ function toggleDockTerm() {
 }
 $$('.side-tabs button').forEach(b => b.onclick = () => sideTab(b.dataset.side as Board['sideTab']));
 
-// ------------------------------------------------------------------ chrome: docks, theme, vim
+// ------------------------------------------------------------------ chrome: docks, theme
 function toggleDock(which: string, open?: boolean) {
   const d = $('#dock-' + which)!; open = open ?? d.hidden as boolean; d.hidden = !open;
   $('#toggle-' + which)!.classList.toggle('on', open);
@@ -4516,35 +4320,20 @@ function setTheme(t: BoardTheme) {
   });
 }
 matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', () => { if (!S?.theme || S.theme === 'auto') setTheme('auto'); });
-const vimComp = new V.Compartment();
-const vimExt = (status: boolean) => (S?.vim ?? true) ? V.vim({ status }) : [];
-function setVim(on: boolean) {
-  S.vim = on; dirty();
-  for (const id in live) live[id].view?.dispatch({ effects: vimComp.reconfigure(vimExt(false)) });
-  ED.view?.dispatch({ effects: vimComp.reconfigure(vimExt(true)) });
-  toast(on ? 'Vim keys on in pages (Esc for normal mode, i to insert)' : 'Vim keys off in pages');
+// [[ completes to any page, folder, shell, REPL or agent: notes link to anything (zettelkasten). Edwin's popup offers the
+// notes and open pages; the board adds its own cards and folders (Ed.hooks.linkNames, markdown.ts).
+function boardLinkNames(): { name: string; ann: string }[] {
+  return [...nodeList().map(n => ({ name: n.name, ann: n.kind === 'buffer' ? 'page' : badgeOf(n) })), ...frameList().map(f => ({ name: f.name, ann: 'folder' }))];
 }
-// [[ completes to any page, folder, shell, REPL or agent: notes link to anything (zettelkasten).
-/* The parts of CodeMirror's CompletionContext and Completion that wikiComplete uses (the vendored bundle does not export @codemirror/autocomplete). */
-interface WikiCompleteCtx { matchBefore(expr: RegExp): { from: number; to: number; text: string } | null }
-function wikiComplete(ctx: WikiCompleteCtx) {
-  const m = ctx.matchBefore(/\[\[[^\]\n]*/); if (!m) return null;
-  const opts = [...nodeList().map(n => ({ label: n.name, detail: n.kind === 'buffer' ? 'page' : badgeOf(n), type: n.kind === 'buffer' ? 'text' : 'variable' })),
-    ...frameList().map(f => ({ label: f.name, detail: 'folder', type: 'namespace' }))];
-  const seen = new Set();
-  const apply = (view: CmEditorView, c: { label: string }, from: number, to: number) => { const close = view.state.sliceDoc(to, to + 2) === ']]', ins = c.label + (close ? '' : ']]'); view.dispatch({ changes: { from, to, insert: ins }, selection: { anchor: from + ins.length + (close ? 2 : 0) } }); };
-  return { from: m.from + 2, options: opts.filter(o => !seen.has(o.label) && seen.add(o.label)).map(o => ({ ...o, apply })), validFor: /^[^\]\n]*$/ };
-}
-const wikiCompletion = V.EditorState.languageData.of(() => [{ autocomplete: wikiComplete }]);
 
 // ------------------------------------------------------------------ views: one board, several ways to look at it
-// Every view reads and writes the same S (nodes, edges, shapes) and the same CodeMirror documents,
+// Every view reads and writes the same S (nodes, edges, shapes) and the same page buffers,
 // so switching never copies or forks data. The canvas stays mounted underneath the other views.
 let VIEW: ViewName = 'canvas';
 const VIEWS: ViewName[] = ['canvas', 'ranger', 'graph', 'editor', 'outline', 'tasks', 'review'];
 const VIEW_NAMES: Record<ViewName, string> = { canvas: 'Canvas', ranger: 'Navigator', graph: 'Graph', editor: 'Editor', outline: 'Outline', tasks: 'Tasks', review: 'Review' };
 const pages = () => nodeList().filter(n => n.kind === 'buffer');
-const pageText = (n: PageNode): string => live[n.id]?.view ? live[n.id]!.view!.state.doc.toString() : FR.on && n.buf ? (frBufOf(n)?.text ?? n.snap ?? '') : (n.text || '');
+const pageText = (n: PageNode): string => FR.on && n.buf ? (frBufOf(n)?.text ?? n.snap ?? '') : roText(n);
 const isJournal = (n: BoardNode): boolean => /^\d{4}-\d\d-\d\d$/.test(n.name);
 function sortPages(list: PageNode[]): PageNode[] { return list.sort((a, b) => (isJournal(b) as unknown as number - (isJournal(a) as unknown as number)) || (isJournal(a) ? b.name.localeCompare(a.name) : a.name.localeCompare(b.name))); }
 function setView(v: string) {
@@ -4579,25 +4368,10 @@ function refreshViews() {
 }
 
 // ------------------------------------------------------------------ editor view: one page as a full text editor
-// The editor holds its own EditorView. Edits are mirrored, as ChangeSets, into the page's canvas editor
-// (and back), so anchors, ink and backlinks on the canvas follow edits made here.
-// The editor view: the page it shows, in its own CodeMirror view or an Edwin frame (frames mode).
-interface EdViewState { node: PageNode | null; view: CmEditorView | null; next?: PageNode | null; frame?: EdwinFrame | null }
-const ED: EdViewState = { node: null, view: null };
-let mirroring = false;
-function mirrorTo(target: CmEditorView | null | undefined, u: import('@codemirror/view').ViewUpdate, src: CmEditorView): void {
-  if (mirroring || !target) return;
-  mirroring = true;
-  try { for (const tr of u.transactions) if (tr.docChanged) target.dispatch({ changes: tr.changes }); }
-  catch { target.dispatch({ changes: { from: 0, to: target.state.doc.length, insert: src.state.doc.toString() } }); }
-  finally { mirroring = false; }
-}
-const edTheme = V.EditorView.theme({
-  '&': { fontSize: '14px' },
-  '.cm-scroller': { fontFamily: MONO, lineHeight: '1.6' },
-  '.cm-content': { maxWidth: '72ch', margin: '0 auto', padding: '28px 24px 40vh' },
-  '.cm-gutters': { display: 'none' },
-});
+// The editor is a second Edwin frame on the page's shared buffer (R9.14), so anchors, ink and backlinks on the canvas
+// follow edits made here. A read-only page (no edwind) shows its text.
+interface EdViewState { node: PageNode | null; next?: PageNode | null; frame?: EdwinFrame | null; pre?: HTMLElement | null }
+const ED: EdViewState = { node: null };
 function edEnsure() {
   const n = (ED.node && S.nodes[ED.node.id]) ? ED.node : (S.nodes[S.edPage!] as PageNode | undefined || findPage(TODAY) || sortPages(pages())[0]);
   if (n) edLoad(n); else renderEdList();
@@ -4609,47 +4383,13 @@ function edOpen(n: BoardNode | null | undefined, pos?: number) {
   edLoad(n, pos);
 }
 function edLoad(n: PageNode, pos?: number) {
-  if (FR.on && n.buf) return frEdLoad(n, pos);   // a second frame on the shared buffer (R9.14)
-  ED.next = null;
-  if (ED.frame) { ED.frame.destroy(); ED.frame = null; $('#ed-host')!.replaceChildren(); }
-  if (ED.node !== n || !ED.view || !S.nodes[n.id]) {
-    ED.view?.destroy();
-    ED.node = n; S.edPage = n.id; dirty();
-    const state = V.EditorState.create({
-      doc: pageText(n),
-      extensions: [
-        vimComp.of(vimExt(true)), edTheme, V.basicSetup, V.markdown(), wikiCompletion, V.EditorView.lineWrapping, bufTheme, V.syntaxHighlighting(bufHighlight), linkField, outlineKeys,
-        V.EditorView.updateListener.of(u => {
-          if (u.docChanged) mirrorTo(live[n.id]?.view, u, u.view);
-          if (u.docChanged || u.selectionSet) edStatus();
-        }),
-        V.EditorView.domEventHandlers({
-          mousedown: e => {
-            const link = (e.target as Element).closest('.cm-wikilink') as HTMLElement | null;
-            if (link && !e.shiftKey) { e.preventDefault(); const t = openPage(link.dataset.page!, n, true); t.kind === 'buffer' ? edOpen(t) : t.kind === 'frame' ? jumpFolder(t) : jumpNode(t); return true; }
-            const tear = (e.target as Element).closest('.cm-tear');
-            if (tear) { e.preventDefault(); const pos = ED.view!.posAtDOM(tear); setView('canvas'); tearOutBlock(n, pos); return true; }
-            const ref = (e.target as Element).closest('.blockref') as HTMLElement | null;
-            if (ref) { e.preventDefault(); const r = resolveRef(ref.dataset.ref!); if (r) edOpen(r.node, r.pos); return true; }
-            return false;
-          },
-          focus: () => edStatus(),
-        }),
-      ],
-    });
-    ED.view = new V.EditorView({ state, parent: $('#ed-host')! });
-    $('#ed-host')!.replaceChildren(ED.view.dom);
-  }
-  const v = ED.view!;
-  if (pos != null) v.dispatch({ selection: { anchor: Math.min(pos, v.state.doc.length) }, scrollIntoView: true });
-  requestAnimationFrame(() => v.focus());
+  if (FR.on) return frEdLoad(n, pos);   // a second frame on the shared buffer (R9.14)
+  ED.next = null; ED.node = n; S.edPage = n.id; dirty();
+  ED.pre = el('pre', 'ro-text ed-ro', roText(n));
+  $('#ed-host')!.replaceChildren(ED.pre, el('div', 'fr-off', roNotice(n)));
+  if (pos != null) roScrollTo(n, pos);
   $('#ed-crumb')!.textContent = pathOf(n.id);
-  renderEdList(); edInfo(); edStatus(); updateSideCtx();
-}
-function edStatus() {
-  if (VIEW !== 'editor' || !ED.view) return;
-  const t = $('#st-buf-text')!; t.textContent = fmtAddr(bufferAddress(ED.node!, ED.view.state, ED.view.state.selection.main.head)); t.classList.add('live');
-  $('#st-copy')!.hidden = false;
+  renderEdList(); edInfo(); updateSideCtx();
 }
 function renderEdList() {
   const q = ($('#ed-filter') as HTMLInputElement).value.trim().toLowerCase(), list = $('#ed-list')!;
@@ -4666,7 +4406,7 @@ function renderEdList() {
 $('#ed-filter')!.addEventListener('input', renderEdList);
 $('#ed-new')!.onclick = () => ask('New page name', '', name => edOpen(openPage(name, ED.node, true)));
 $('#ed-today')!.onclick = () => edOpen(openPage(TODAY, null, true));
-$('#ed-canvas')!.onclick = () => { const n = ED.node; if (!n) return; const pos = ED.view!.state.selection.main.head; setView('canvas'); jumpBuffer(n, pos); };
+$('#ed-canvas')!.onclick = () => { const n = ED.node; if (!n) return; const pos = ED.frame ? ED.frame.point() : 0; setView('canvas'); jumpBuffer(n, pos); };
 function headingsOf(text: string) {
   const out: { level: number; text: string; pos: number }[] = []; let pos = 0;
   for (const line of text.split('\n')) { const m = line.match(/^(#{1,6})\s+(.*)$/); if (m) out.push({ level: m[1].length, text: m[2], pos }); pos += line.length + 1; }
@@ -4676,7 +4416,7 @@ function backlinksOf(p: PageNode) {
   const name = p.name.toLowerCase(), hits = [];
   for (const q of pages()) {
     if (q === p) continue;
-    const st = pageState(q); if (!st) continue;   // a CodeMirror state, or the replica's text (frames mode)
+    const st = pageState(q); if (!st) continue;   // the replica's text, or a read-only page's
     for (let i = 1; i <= st.doc.lines; i++) {
       const t = st.doc.line(i).text, low = t.toLowerCase();
       if (low.includes('[[' + name + ']]') || low.includes('((' + name + '#') || low.includes('((' + name + ' ›')) hits.push({ q, pos: st.doc.line(i).from, t, st });
@@ -4688,12 +4428,12 @@ let edInfoT: number | null = null;
 function edInfo() {
   clearTimeout(edInfoT);
   edInfoT = setTimeout(() => {
-    const n = ED.node; if (!n || (!ED.view && !ED.frame)) return;
-    const edText = () => (ED.view ? ED.view.state.doc.toString() : pageText(n));
+    const n = ED.node; if (!n || (!ED.frame && !ED.pre)) return;
+    const edText = () => pageText(n);
     const toc = $('#ed-toc')!; toc.replaceChildren();
     for (const h of headingsOf(edText())) {
       const b = el('button', 'toc-h'); b.style.paddingLeft = (h.level - 1) * 12 + 6 + 'px'; b.textContent = h.text;
-      b.onclick = () => { if (ED.view) { ED.view.dispatch({ selection: { anchor: h.pos }, effects: V.EditorView.scrollIntoView(h.pos, { y: 'start', yMargin: 24 }) }); ED.view.focus(); } else if (ED.frame) { ED.frame.setPoint(h.pos); ED.frame.focus(); } };
+      b.onclick = () => { if (ED.frame) { ED.frame.setPoint(h.pos); ED.frame.focus(); } else roScrollTo(n, h.pos); };
       toc.append(b);
     }
     if (!toc.children.length) toc.append(el('p', 'muted small', 'No headings yet. Lines that start with # show here.'));
@@ -5029,11 +4769,13 @@ const taskAddr = (t: TaskRow): string => t.idx ? 'task:' + t.id : 'board:/' + t.
 const taskOpen = (t: TaskRow) => t.idx ? noteOpen({ path: t.path, line: t.line }) : edOpen(t.node, t.pos);
 const taskText = (t: TaskRow): string => [plainTask(t.text).replace(/\s*\^[\w-]+$/, ''), ...(t.body || [])].join(' ').replace(/\s+/g, ' ').trim();
 const taskDue = (t: TaskRow): string | null => t.deadline || t.scheduled || null;
-async function taskSetKw(t: TaskRow, kw: string) {
-  if (!TASK_KWS.includes(kw)) return;
-  if (!t.idx) { setTask(t, kw); return; }
-  try { const r = await hFetch(null, '/api/task/' + encodeURIComponent(t.id), { method: 'POST', body: JSON.stringify({ kw }), headers: { 'Content-Type': 'application/json' } }); const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status); } catch (e) { toast('Could not change ' + t.text + ': ' + e.message); }
+async function taskSetKw(t: TaskRow, kw: string): Promise<boolean> {
+  if (!TASK_KWS.includes(kw)) return false;
+  if (!t.idx) return setTask(t, kw);
+  let ok = true;
+  try { const r = await hFetch(null, '/api/task/' + encodeURIComponent(t.id), { method: 'POST', body: JSON.stringify({ kw }), headers: { 'Content-Type': 'application/json' } }); const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status); } catch (e) { toast('Could not change ' + t.text + ': ' + e.message); ok = false; }
   await tasksLoad(true);
+  return ok;
 }
 function taskCycle(t: TaskRow, back?: boolean) { const i = TASK_KWS.indexOf(COL_KW[COL[t.kw]] || t.kw), order = ['TODO', 'NEXT', 'WAITING', 'DONE']; const j = order.indexOf(TASK_KWS[i] === 'DONE' ? 'DONE' : COL[t.kw]); return taskSetKw(t, order[(j + (back ? 3 : 1)) % 4]); }
 function findTask(ref: string | null | undefined): TaskRow | null {
@@ -5060,6 +4802,8 @@ async function dispatchTask(t: TaskRow, { host, shell }: { host?: string; shell?
     throw new Error('no idle agent card or shell with #agent' + (h ? ' on @' + h.name : '') + ': opened ' + pathOf(sh.id) + '. Start your agent there and dispatch again.');
   }
   const L = live[n.id], text = taskText(t); if (!L?.backend) throw new Error(n.name + ' is not running');
+  // a page task is written after the paste: a page that takes no edit yet (its board save pending) sends nothing
+  if (!t.idx && FR.on && t.node.buf && !(await frWhenWritable(t.node))) throw new Error(t.node.name + ' takes no edit until the board is saved: nothing was sent');
   L.backend.input(text + '\r'); pulse(n.id); if (VIEW === 'canvas') jumpNode(n);
   const hk = fsHostKey(n), hn = hk ? hostByUrl(hk)?.name : null, sess = tmuxTargetOf(n) ? 'tmux:' + tmuxTargetOf(n) + (hn ? '@' + hn : '') : addrOf(n);
   const stamp = new Date().toISOString().slice(0, 16), kw = ['TODO', 'SOMEDAY', 'LATER'].includes(t.kw) ? 'NEXT' : null;
@@ -5070,17 +4814,18 @@ async function dispatchTask(t: TaskRow, { host, shell }: { host?: string; shell?
     const st = pageState(t.node); if (st) { const doc = st.doc, head = doc.line(t.line), indent = (head.text.match(/^\s*/) || [''])[0] + '  ', lines: { from: number; to: number; text: string }[] = []; for (let j = t.line + 1; j <= (t.lastLine || t.line); j++) lines.push(doc.line(j));
       const changes: { from: number; to?: number; insert: string }[] = [];
       for (const [k, val] of [['session', sess], ['dispatched', stamp]]) { const ex = lines.find(l => (l.text.match(FIELD_LINE_RE) || [])[1] === k); if (ex) changes.push({ from: ex.from, to: ex.to, insert: indent + k + ':: ' + val }); else changes.push({ from: head.to, insert: '\n' + indent + k + ':: ' + val }); }
-      pageEdits(t.node, changes); if (kw) setTask(t, kw); }
+      if (!pageEdits(t.node, changes)) throw new Error('sent to ' + pathOf(n.id) + ', but session:: and dispatched:: could not be written into ' + t.node.name);
+      if (kw) setTask(t, kw); }
   }
   if (VIEW === 'tasks') renderTasks();
   return { shell: pathOf(n.id), session: sess, text };
 }
-function setTask(t: PageTask, kw: string) {
-  const st = pageState(t.node); if (!st) return;
+function setTask(t: PageTask, kw: string): boolean {
+  const st = pageState(t.node); if (!st) return false;
   const line = st.doc.line(Math.min(t.line, st.doc.lines)), m = line.text.match(TASK_RE);
-  if (!m) return toast('That task moved. Try again.');
-  pageEdit(t.node, line.from + m[1].length, line.from + m[1].length + m[2].length, kw);
-  renderTasks();
+  if (!m) { toast('That task moved. Try again.'); return false; }
+  if (!pageEdit(t.node, line.from + m[1].length, line.from + m[1].length + m[2].length, kw)) { toast(`${t.node.name} takes no edit yet: the task stays ${m[2]}`); return false; }
+  renderTasks(); return true;
 }
 function plainTask(s: string): string { return s.replace(/\[\[([^\]]+)\]\]/g, '$1').replace(/\(\(([^)]+)\)\)/g, (_, a) => resolveRef(a)?.text || a).replace(/\s*\[#[A-C]\]/, '').replace(/\s*\^[\w-]+$/, ''); }
 const TK: { sel: string | null; order: string[] } = { sel: null, order: [] };
@@ -5145,10 +4890,11 @@ $$('.tk-col').forEach(col => {
 });
 $('#tk-add')!.addEventListener('submit', async e => {
   e.preventDefault(); const i = $('#tk-in') as HTMLInputElement, text = i.value.trim(); if (!text) return;
-  const n = openPage(TODAY, null, true), st = await pageStateAsync(n); if (!st) return toast('Today\'s page is not open yet.');
+  const n = openPage(TODAY, null, true) as PageNode, st = await pageStateWritable(n); if (!st) return FR.on ? undefined : toast('Today\'s page is not open yet.');
   const doc = st.doc, last = doc.line(doc.lines);
   const ins = /^\s*[-*+]\s*$/.test(last.text) ? { from: last.from, to: last.to, insert: `- TODO ${text}` } : { from: doc.length, to: doc.length, insert: (doc.length && !doc.toString().endsWith('\n') ? '\n' : '') + `- TODO ${text}` };
-  pageEdit(n, ins.from, ins.to, ins.insert); i.value = ''; renderTasks(); toast(`Added to ${TODAY}`);
+  if (!pageEdit(n, ins.from, ins.to, ins.insert)) return toast(`${TODAY} takes no edit yet: the task was not added`);
+  i.value = ''; renderTasks(); toast(`Added to ${TODAY}`);
 });
 
 // ------------------------------------------------------------------ side pane: the general-purpose assistant
@@ -5699,8 +5445,7 @@ function artifactSourcePage(n: ArtifactNode) {
   let p = findPage(name);
   artSource(n).then(src => {
     if (!p) { p = openPage(name, n, true) as PageNode; pageSetText(p, src); p.artifactOf = n.id; }
-    else if (live[p.id]?.view && !live[p.id].view!.state.doc.length) live[p.id].view!.dispatch({ changes: { from: 0, insert: src } });
-    else if (!live[p.id]?.view && pageText(p) === '') pageSetText(p, src);
+    else if (pageText(p) === '') pageSetText(p, src);
     p.artifactOf = n.id; if (!S.edges.some(e => e.from === n.id && e.to === p!.id)) { S.edges.push({ id: uid('e'), from: n.id, to: p.id, type: 'ref' }); renderLinks(); }
     jumpNode(p); dirty(); toast('Edit the HTML here, then run "Artifact: publish from this page".');
   });
@@ -5796,7 +5541,7 @@ function jumpBlock(n: ArtifactNode) {
 // Tear the html block at POS of page P out as a card. A block without an id gets one in its info string first, so
 // the card's address survives edits around it.
 function tearOutBlock(p: PageNode, pos: number): ArtifactNode | null {
-  const st = pageState(p); if (!st) { toast('Open the page first.'); return null; }   // a CodeMirror state, or the replica's text (frames mode)
+  const st = pageState(p); if (!st) { toast('Open the page first.'); return null; }   // the replica's text, or a read-only page's
   const text = st.doc.toString(), blocks = htmlBlocks(text), b = blocks.find(b => pos >= b.from && pos <= b.to);
   if (!b) { toast('Put the cursor in a ```html block first.'); return null; }
   let id = b.id;
@@ -6035,8 +5780,7 @@ function rvOpenSource() {
   const c = RV.cur; if (!c) return;
   if (DAEMON && !String(c.file).startsWith('roam/')) { const p = `${INFO!.notes}/${c.file}`; RG.home = INFO!.notes; setView('ranger'); rgGo(FS_PREFIX + p.replace(/\/[^/]*$/, ''), FS_PREFIX + p); return; }
   const name = (c.file || 'card').replace(/^roam\//, '').replace(/\.md$/, ''); const p = findPage(name) || openPage(name, null, true);
-  if (live[p.id]?.view && !live[p.id].view!.state.doc.length) live[p.id].view!.dispatch({ changes: { from: 0, insert: `# ${name}\n\n${c.src}\n` } });
-  else if (!live[p.id]?.view && pageText(p as PageNode) === '') pageSetText(p as PageNode, `# ${name}\n\n${c.src}\n`);
+  if (pageText(p as PageNode) === '') pageSetText(p as PageNode, `# ${name}\n\n${c.src}\n`);
   jumpNode(p);
 }
 async function rvAsk() {
@@ -6074,7 +5818,7 @@ AGENT_TOOLS.push(
       const anchor = Math.random().toString(36).slice(2, 8);
       const block = `## ${str(front)} ^${anchor}\ncard:: ${kind || 'basic'}${deck ? `\ndeck:: ${deck}` : ''}${back ? `\nback:: ${str(back)}` : ''}${extra ? `\n${str(extra)}` : ''}${source ? `\nSource: ${source}` : ''}\n`;
       if (DAEMON) { const r = await fetch('/api/notes/append', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: path || 'roam/inbox/cards.md', text: block, by: 'assistant' }) }); const j = await r.json(); RV.loaded = false; return `written to ${j.path} as ^${anchor}`; }
-      const p = findPage('cards') || openPage('cards', null, true); const v = live[p.id].view!; v.dispatch({ changes: { from: v.state.doc.length, insert: (v.state.doc.length ? '\n' : '# cards\n\n') + block } });
+      const p = findPage('cards') || openPage('cards', null, true) as PageNode, t = pageText(p); pageEdit(p, t.length, t.length, (t.length ? '\n' : '# cards\n\n') + block);
       SAMPLE_CARDS.push({ id: `${p.id}#^${anchor}`, file: 'cards', deck: deck || 'inbox', kind: kind || 'basic', front: str(front), back: str(back), extra: str(extra), src: block.trim() }); RV.loaded = false;
       return `added to page cards as ^${anchor}`;
     } },
@@ -6154,10 +5898,11 @@ function seed(): Board {
 }
 // Hand-drawn ellipse around "freeze on Friday", anchored to its line, made after layout so it fits the real glyphs.
 function seedInk() {
-  const L = live.plans; if (!L?.view) return;
-  const v = L.view, i = v.state.doc.toString().indexOf('freeze on Friday'); if (i < 0) return;
-  const a = v.coordsAtPos(i), b = v.coordsAtPos(i + 16); if (!a || !b) return;
-  const r = viewport.getBoundingClientRect(), p0 = s2w(a.left - r.left, a.top - r.top), p1 = s2w(b.right - r.left, b.bottom - r.top);
+  const n = S.nodes.plans as PageNode | undefined, t = !FR.on && live.plans?.snap?.firstChild; if (!n || !t) return;   // the demo's read-only page; a served board's pages move to edwind
+  const i = (n.text || '').indexOf('freeze on Friday'); if (i < 0) return;
+  const rg = document.createRange(); rg.setStart(t, i); rg.setEnd(t, i + 16);
+  const a = rg.getBoundingClientRect(); if (!a.width) return;
+  const r = viewport.getBoundingClientRect(), p0 = s2w(a.left - r.left, a.top - r.top), p1 = s2w(a.right - r.left, a.bottom - r.top);
   const cx = (p0.x + p1.x) / 2, cy = (p0.y + p1.y) / 2, rx = (p1.x - p0.x) / 2 + 12, ry = (p1.y - p0.y) / 2 + 7;
   const pts: [number, number, number][] = [];
   for (let t = 0; t <= 1.12; t += 0.02) {
@@ -6170,13 +5915,12 @@ function seedInk() {
 }
 
 // ------------------------------------------------------------------ Edwin frames (edwind spec §9, R8.16-R8.20, R13.7; DESIGN F-A27)
-// With /api/info.edit true (web.json frames: true) a page card is an Edwin frame on a shared buffer, the page's file
-// under notesDir (n.buf), instead of a CodeMirror view on n.text. One frame runtime per tab, loaded from /edwin/src/
-// at boot, one WebSocket to /edit carrying every frame's replica (sync.js). With the flag false nothing below runs and
-// the CodeMirror path is untouched. Frames are lazy (R9.4, R9.5): a frame exists only while its card is within the
-// viewport plus one viewport of margin above the far-zoom line (or focused), at most FR_CAP per tab (least recently drawn
-// unfocused first); otherwise the card shows the 12-line snapshot from the replica text (Q8). A replica off screen for
-// FR_CLOSE_MS is closed. Pages without buf are migrated to notes/<slug>.md through the replica (R8.17, Q3).
+// With /api/info.edit true (wb-web has an editSocket) a page card is an Edwin frame on a shared buffer, the page's file
+// under notesDir (n.buf). One frame runtime per tab, loaded from /edwin/src/ at boot, one WebSocket to /edit carrying
+// every frame's replica (sync.js). With it false nothing below runs and pages are read-only (roMountPage). Frames are
+// lazy (R9.4, R9.5): a frame exists only while its card is within the viewport plus one viewport of margin above the
+// far-zoom line (or focused), at most FR_CAP per tab (least recently drawn unfocused first); otherwise the card shows the 12-line
+// snapshot from the replica text (Q8). A replica off screen for FR_CLOSE_MS is closed. Pages without buf are migrated to notes/<slug>.md through the replica (R8.17, Q3).
 /* A page card's live entry: its frame field holds an Edwin frame, never an iframe. */
 type FrPageLive = Omit<LiveEntry, 'frame'> & { frame?: EdwinFrame | null };
 /* A frame event (Ed.onFrameEvent). */
@@ -6209,6 +5953,7 @@ function frBoot(): Promise<EdwinApi> {
     Ed.hooks.openPage = name => frOpenPage(name);
     Ed.hooks.leaveFrame = f => frLeave(f);
     Ed.hooks.beforeUserInit = () => frKeymaps();   // K4: the board's keymaps exist before the user's init.scm runs
+    Ed.hooks.linkNames = boardLinkNames;
     Ed.onFrameEvent(frEvent);
     const applied = Ed.hooks.applied;   // sync.js's (local batches out, remote batches in): block cards follow every edit to a page's replica
     Ed.hooks.applied = (b, ops, origin) => { const r = applied ? applied(b, ops, origin) : undefined; frBufEdited(b, origin); return r; };
@@ -6452,13 +6197,13 @@ function frOverlays(id: string) {
     const top = L.frame.lineTop(a.pos); if (top == null) continue;
     const s = el('span', 'anchor-chip', '⚓' + a.label); s.style.top = top + 'px'; chips.push(s);
   }
-  // The tear-out button of every html fence (F-A25), on the fence line, as the CodeMirror widget is
+  // The tear-out button of every html fence (F-A25), on the fence line
   const b = L.buf;
   if (b) {
     if (!L._blocks || L._blocks.ver !== b.ver) L._blocks = { ver: b.ver, blocks: htmlBlocks(b.text) };
     for (const blk of L._blocks.blocks as HtmlBlock[]) {
       const top = L.frame.lineTop(blk.head); if (top == null) continue;
-      const s = el('span', 'cm-tear', '⇱ card'); s.title = 'Tear this block out onto the canvas as a live card'; s.style.top = top + 'px';
+      const s = el('span', 'fr-tear', '⇱ card'); s.title = 'Tear this block out onto the canvas as a live card'; s.style.top = top + 'px';
       s.addEventListener('mousedown', (e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); tearOutBlock(n, blk.head); });
       chips.push(s);
     }
@@ -6535,6 +6280,12 @@ function frRelease(json: string) {
 }
 // The replica of N for an edit: a held page waits for its board save, FR_HOLD_MS at most.
 async function frWhenWritable(n: PageNode): Promise<EdwinBuffer | null> {
+  // frWhenBuf waits for a reconnect: once edwind is known down (connected or failed once, not online now), an open
+  // replica takes the edit (it syncs on reconnect) and anything else is refused at once
+  if (FR.tried && !FR.online) {
+    const o = frBufOf(n); if (o && !FR.hold.has(n.id)) return o;
+    toast(`${n.name}: edwind is not connected`); return null;
+  }
   const b = await frWhenBuf(n), h = FR.hold.get(n.id);
   if (!b || !h) return b;
   if (await Promise.race([h.p, new Promise(r => setTimeout(r, FR_HOLD_MS, false))])) return b;
@@ -6594,11 +6345,20 @@ function frBufNow(id: string): string {
     seen.add(next); id = next;
   }
 }
-// ---- the Editor view (Alt-4) in frames mode: a second frame on the same buffer (R9.14), no CodeMirror mirror
+// ---- the Editor view (Alt-4): a second frame on the same buffer (R9.14)
 function frEdLoad(n: PageNode, pos?: number | null) {
   ED.next = null;
-  if (ED.view) { ED.view.destroy(); ED.view = null; }
   if (ED.frame && ED.node !== n) { ED.frame.destroy(); ED.frame = null; }
+  ED.pre = null;
+  if (!n.buf && FR.tried && !FR.online) {   // known offline: the snapshot, read-only; the move waits for the view to ask again
+    ED.node = n; S.edPage = n.id; dirty();
+    ED.pre = el('pre', 'ro-text ed-ro', n.text || '');
+    $('#ed-host')!.replaceChildren(ED.pre, el('div', 'fr-off', 'edwind is not connected: this page is read-only until it is back'));
+    frWhenReady().then(() => { if (ED.node === n && ED.pre && VIEW === 'editor') frEdLoad(n, pos); });
+    $('#ed-crumb')!.textContent = pathOf(n.id);
+    renderEdList(); edInfo(); updateSideCtx(); return;
+  }
+  if (!n.buf) { ED.node = n; S.edPage = n.id; $('#ed-host')!.replaceChildren(el('div', 'fr-snap', 'Moving this page to edwind…')); frAdopt(n).then(() => { if (ED.node === n && n.buf) frEdLoad(n, pos); }); return; }   // migrated first (R8.17)
   ED.node = n; S.edPage = n.id; dirty();
   const host = $('#ed-host')!;
   frWhenWritable(n).then(b => {
@@ -6611,8 +6371,8 @@ function frEdLoad(n: PageNode, pos?: number | null) {
   $('#ed-crumb')!.textContent = pathOf(n.id);
   renderEdList(); edInfo(); updateSideCtx();
 }
-// ---- page text and positions in either mode: a CodeMirror state, or a TextDoc over the replica text with the
-// subset of the Text API the address code reads (lineAt, line, lines, length, sliceString, toString).
+// ---- page text and positions: a TextDoc over the replica text (or a read-only page's) with the subset of the Text
+// API the address code reads (lineAt, line, lines, length, sliceString, toString).
 class TextDoc implements BoardTextDoc {
   declare text: string; declare length: number; declare _s: number[] | null;
   constructor(text: string) { this.text = text; this.length = text.length; this._s = null; }
@@ -6623,54 +6383,167 @@ class TextDoc implements BoardTextDoc {
   sliceString(a: number, b?: number): string { return this.text.slice(a, b); }
   toString(): string { return this.text; }
 }
-// The page's state: the CodeMirror view's, or {doc} over the replica (null while no text is at hand).
+// The page's state: {doc} over the replica, or over a read-only page's text (null while no text is at hand, and for a
+// file page with no edwind, whose snap is only its first lines: no task, backlink or address is read from it).
 function pageState(n: BoardNode): PageViewState | null {
-  const L = live[n.id]; if (!L) return null;
-  if (L.view) return L.view.state;
+  const L = live[n.id]; if (!L || n.kind !== 'buffer') return null;
+  if (!FR.on) {
+    if (n.buf) return null;
+    const t = roText(n); if (!L._doc || L._doc.doc.text !== t) L._doc = { ver: -1, doc: new TextDoc(t) };
+    return { doc: L._doc.doc };
+  }
   const b = frBufOf(n); if (!b) return null;
   if (!L._doc || L._doc.ver !== b.ver) L._doc = { ver: b.ver, doc: new TextDoc(b.text) };
   return { doc: L._doc.doc };
 }
-async function pageStateAsync(n: BoardNode): Promise<PageViewState | null> { if (live[n.id]?.view) return live[n.id].view!.state; await frWhenBuf(n); return pageState(n); }
-// The anchors of a page as {id, pos, label}: the CodeMirror field, or the shared markers.
+// The page's state for an edit: frames wait for a writable replica (refused at once while edwind is down, toasting).
+async function pageStateWritable(n: PageNode): Promise<PageViewState | null> { if (FR.on && !(await frWhenWritable(n))) return null; return pageState(n); }
+// The anchors of a page as {id, pos, label}: the shared markers, or a read-only page's own.
 function pageAnchors(n: PageNode): PageAnchor[] {
-  const v = live[n.id]?.view;
-  if (v) return Object.entries(v.state.field(anchorField)).map(([id, a]) => ({ id, pos: a.pos, label: a.label }));
-  return FR.on && n.buf ? frAnchors(n) : [];
+  if (!FR.on) return n.buf ? [] : (n.anchors || []).map(a => ({ id: a.id, pos: a.pos, label: a.label }));
+  return n.buf ? frAnchors(n) : [];
 }
-// The cursor position of a page: the CodeMirror head, or the frame's point (else the replica's).
-function pagePoint(n: BoardNode): number { const L = live[n.id] as FrPageLive | undefined; if (!L) return 0; if (L.view) return L.view.state.selection.main.head; return L.frame ? L.frame.point() : L.buf ? L.buf.pt : 0; }
-// One edit in either mode: a CodeMirror transaction, or one replica batch.
+// The cursor position of a page: the frame's point (else the replica's), or the start of what is selected in a read-only page.
+function pagePoint(n: BoardNode): number {
+  const L = live[n.id] as FrPageLive | undefined; if (!L) return 0;
+  if (!FR.on) { const r = n.kind === 'buffer' ? roSelection(n) : null; return r ? r[0] : 0; }
+  return L.frame ? L.frame.point() : L.buf ? L.buf.pt : 0;
+}
+// One edit: one replica batch, or a change to a read-only page's text.
 function pageEdit(n: BoardNode, from: number, to: number, insert: string): boolean {
-  const L = live[n.id]; if (!L) return false;
-  if (L.view) { L.view.dispatch({ changes: { from, to, insert } }); return true; }
-  const b = frBufOf(n); if (!b) return false;
-  return frEdit(b, [[from, b.text.slice(from, to), insert]]);
+  if (!live[n.id] || n.kind !== 'buffer') return false;
+  const t = pageText(n), op: FrOp = [from, t.slice(from, to), insert];
+  if (!FR.on) return roEdit(n, [op]);
+  return frEdit(frBufOf(n), [op]);
 }
-// Several changes at once, all with positions in the text as it is now (the CodeMirror change set contract); the
-// replica applies ops one after another, so they go in from the end of the text backwards.
+// Several changes at once, all with positions in the text as it is now; the replica applies ops one after another, so
+// they go in from the end of the text backwards.
 function pageEdits(n: BoardNode, changes: { from: number; to?: number; insert?: string }[]): boolean {
-  const L = live[n.id]; if (!L || !changes.length) return false;
-  if (L.view) { L.view.dispatch({ changes }); return true; }
-  const b = frBufOf(n); if (!b) return false;
-  const ops = changes.map<FrOp>(c => [c.from, b.text.slice(c.from, c.to ?? c.from), c.insert || '']).sort((x, y) => y[0] - x[0]);
-  return frEdit(b, ops);
+  if (!live[n.id] || n.kind !== 'buffer' || !changes.length) return false;
+  // From the end backwards; insertions at one position keep their given order in the text (as CodeMirror's did), so
+  // the later one is applied first.
+  const t = pageText(n), ops = changes.map((c, i) => ({ i, op: [c.from, t.slice(c.from, c.to ?? c.from), c.insert || ''] as FrOp }))
+    .sort((x, y) => y.op[0] - x.op[0] || y.i - x.i).map(x => x.op);
+  if (!FR.on) return roEdit(n, ops);
+  return frEdit(frBufOf(n), ops);
 }
 // Replace the whole text: a page still waiting for its file keeps the text on the node for the migration to write.
 async function pageSetText(n: PageNode, text: string): Promise<boolean> {
-  const L = live[n.id];
-  if (L?.view) { L.view.dispatch({ changes: { from: 0, to: L.view.state.doc.length, insert: text } }); return true; }
+  if (!FR.on) return roEdit(n, [[0, roText(n), text]]);
   if (!n.buf) { n.text = text; dirty(); return true; }
   const b = await frWhenWritable(n); return b ? frReplaceAll(b, text) : false;
 }
-// Exposed for the UI suite and debugging: the page's text in either mode, and the live frames count and timing.
+// Exposed for the UI suite and debugging: the page's text, and the live frames count and timing.
 function pageTextById(id: string): string { const n = S?.nodes[id] as PageNode | undefined; return n ? pageText(n) : ''; }
 // The whole text of a page for an export or a publish: the replica is opened when it is closed (pageText would
-// give the snapshot's first lines then); CodeMirror pages and unmigrated pages answer at once.
+// give the snapshot's first lines then); unmigrated and read-only pages answer at once.
 async function pageTextFull(n: PageNode): Promise<string> {
-  if (live[n.id]?.view) return live[n.id].view!.state.doc.toString();
-  if (FR.on && n.buf) { const b = await frWhenBuf(n); if (b) return b.text; }
-  return pageText(n);
+  if (!n.buf) return n.text || '';
+  // frWhenBuf waits for edwind to come back: known down, give up at once; still connecting, after 5 s
+  const down = FR.tried && !FR.online;
+  const b = FR.on && !down ? await Promise.race([frWhenBuf(n), new Promise<null>(r => setTimeout(() => r(null), 5000))]) : null; if (b) return b.text;
+  throw new Error(`${n.buf}: ${FR.on ? 'edwind is not connected' : RO_FILE}`);   // its snap holds only the first lines
+}
+// A page position under a point on screen: the frame's, or the read-only text's (null off the text).
+function pagePosAt(n: BoardNode, x: number, y: number): number | null {
+  const L = live[n.id]; if (!L || n.kind !== 'buffer') return null;
+  if (FR.on) { const f = L.frame as EdwinFrame | null | undefined; return f && FR.byFrame.has(f) ? f.posFromPoint(x, y) : null; }
+  const t = L.snap?.firstChild; if (!t || n.buf) return null;
+  const c = document.caretPositionFromPoint?.(x, y);
+  if (c) return c.offsetNode === t ? c.offset : null;
+  const r = document.caretRangeFromPoint?.(x, y); return r && r.startContainer === t ? r.startOffset : null;
+}
+
+// ------------------------------------------------------------------ read-only pages (no edwind)
+// Edwin frames are the only page editor (E4, edwind spec R9.21). Without edwind (the demo, or a server whose
+// edit.enable is off) a page card shows its whole text and takes no keys: "page editing needs edwind". The board's
+// own tools still change a page that keeps its text on the node (write_page, tasks, journals, pipes, ink notes,
+// tear-out), so the demo shows them working; the edit lands in n.text and the node's anchors move with it. A page whose
+// text lives in edwind (buf) shows its cached first lines (snap) and takes no edit at all.
+const RO_OFF = 'Page editing needs edwind (workbench-edit)', RO_DEMO = 'Read-only in the demo: page editing needs Workbench served with edwind';
+const RO_FILE = 'the full text of a file page needs edwind';
+const roText = (n: PageNode): string => (n.buf ? n.snap ?? '' : n.text || '');
+const roNotice = (n: PageNode): string => (DAEMON ? RO_OFF : RO_DEMO) + (n.buf ? ` · ${n.buf}` : '');
+function roMountPage(n: PageNode, L: MountedLive) {
+  L.snap = el('pre', 'ro-text'); L.off = el('div', 'fr-off ro-off', roNotice(n)); L.chips = el('div', 'fr-anchors');
+  L.body.append(L.snap, L.off, L.chips);
+  L.backlinks = el('div', 'backlinks'); L.body.append(L.backlinks);
+  L.inkLines = svgEl('svg', { class: 'ink-lines' }); L.body.append(L.inkLines);
+  const t = n.text || '';
+  if (!n.buf) for (const a of n.anchors || []) a.pos = relocate(t, a);
+  L.snap.addEventListener('scroll', () => { scheduleLineInk(n.id); roOverlays(n.id); }, { passive: true });
+  L.snap.addEventListener('mousedown', () => { focusedBuf = n.id; });
+  L.snap.addEventListener('mouseup', () => { if (focusedBuf === n.id) scheduleBufAddr(n); });
+  roRender(n);
+}
+// The text and the chips; the card's zoomed-out snapshot follows.
+function roRender(n: PageNode) {
+  const L = live[n.id]; if (!L?.snap) return;
+  const t = roText(n);
+  if (L.snap.textContent !== t) L.snap.textContent = t;
+  if (L.off) L.off.textContent = roNotice(n);
+  if (L.lod) $('pre', L.lod)!.textContent = t.split('\n').slice(0, 12).join('\n');
+  if (ED.node === n && ED.pre && ED.pre.textContent !== t) ED.pre.textContent = t;
+  requestAnimationFrame(() => roOverlays(n.id));
+}
+// Ops [pos, deleted, inserted] in the text as it is now, applied from the end backwards (pageEdits sorts them); an
+// anchor maps as edwind's after-markers do: past an insertion at its position, to the end of a deletion it was in.
+function roEdit(n: PageNode, ops: FrOp[]): boolean {
+  if (n.buf) return false;
+  let t = n.text || '';
+  for (const [pos, del, ins] of ops) {
+    if (t.slice(pos, pos + del.length) !== del) return false;
+    t = t.slice(0, pos) + ins + t.slice(pos + del.length);
+    for (const a of n.anchors || []) a.pos = a.pos < pos ? a.pos : a.pos >= pos + del.length ? a.pos + ins.length - del.length : pos + ins.length;
+  }
+  if (t === (n.text || '')) return true;
+  n.text = t; dirty(); roRender(n); scheduleCrossRefresh(); blockCardsChanged(n); scheduleLineInk(n.id);
+  if (VIEW === 'tasks') renderTasks();
+  return true;
+}
+function roAnchorAdd(n: PageNode, pos: number, label: string | null, id?: string): string {
+  const aid = id || uid('a');
+  (n.anchors ||= []).push({ id: aid, pos: clamp(pos, 0, (n.text || '').length), label });
+  dirty(); requestAnimationFrame(() => roOverlays(n.id));
+  return aid;
+}
+// The selection inside a read-only page's text as [from, to], or null when it is elsewhere.
+function roSelection(n: PageNode): [number, number] | null {
+  const t = live[n.id]?.snap?.firstChild, sel = getSelection(); if (!t || !sel || !sel.rangeCount) return null;
+  const r = sel.getRangeAt(0); if (r.startContainer !== t || r.endContainer !== t) return null;
+  return [r.startOffset, r.endOffset];
+}
+// Top of the line at POS, in the card body's own (unscaled) coordinates; null when the text is not drawn.
+function roLineTop(n: PageNode, pos: number): number | null {
+  const L = live[n.id], t = L?.snap?.firstChild as Text | null | undefined; if (!t || !L!.body || !L!.snap!.isConnected) return null;
+  const r = document.createRange(), p = clamp(pos, 0, t.length); r.setStart(t, p); r.setEnd(t, p);
+  const box = r.getClientRects()[0] || r.getBoundingClientRect(); if (!box || (!box.top && !box.height)) return null;
+  return (box.top - L!.body.getBoundingClientRect().top) / cam().z;
+}
+function roScrollTo(n: PageNode, pos: number) {
+  for (const pre of [live[n.id]?.snap, ED.node === n ? ED.pre : null]) {
+    const t = pre?.firstChild; if (!pre || !t) continue;
+    const r = document.createRange(), p = clamp(pos, 0, (t as Text).length); r.setStart(t, p); r.setEnd(t, p);
+    const box = r.getClientRects()[0] || r.getBoundingClientRect(), top = pre.getBoundingClientRect().top;
+    if (box) pre.scrollTop += (box.top - top) / (pre === ED.pre ? 1 : cam().z) - 24;
+  }
+}
+// Labelled anchors as chips and the tear-out button of every html fence (F-A25), as on a frame.
+function roOverlays(id: string) {
+  const n = S.nodes[id] as PageNode | undefined, L = live[id]; if (!n || n.kind !== 'buffer' || !L?.chips || FR.on) return;
+  const chips: HTMLElement[] = [], t = roText(n);
+  for (const a of pageAnchors(n)) {
+    if (!a.label) continue;
+    const top = roLineTop(n, a.pos); if (top == null) continue;
+    const s = el('span', 'anchor-chip', '⚓' + a.label); s.style.top = top + 'px'; chips.push(s);
+  }
+  if (!n.buf) for (const blk of htmlBlocks(t)) {
+    const top = roLineTop(n, blk.head); if (top == null) continue;
+    const s = el('span', 'fr-tear', '⇱ card'); s.title = 'Tear this block out onto the canvas as a live card'; s.style.top = top + 'px';
+    s.addEventListener('mousedown', (e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); tearOutBlock(n, blk.head); });
+    chips.push(s);
+  }
+  L.chips.replaceChildren(...chips);
 }
 window.__perf = Object.assign(window.__perf || {}, {
   frame: {
@@ -6683,7 +6556,7 @@ window.__perf = Object.assign(window.__perf || {}, {
 
 // ------------------------------------------------------------------ boot
 async function boot() {
-  // @font-face fonts load lazily: wait for the faces xterm and CodeMirror measure (at most 1.5 s)
+  // @font-face fonts load lazily: wait for the faces xterm and the Edwin frames measure (at most 1.5 s)
   try { await Promise.race([Promise.all([document.fonts.load('13px "JetBrainsMono Nerd Font Mono"'), document.fonts.load('13px "Noto Sans"')]), new Promise(r => setTimeout(r, 1500))]); } catch {}
   let board: Board | null = null;
   if (SERVED) {   // served: the board comes from the server or not at all (30 §2.1)
@@ -6715,7 +6588,7 @@ async function boot() {
   $('#help-mode')!.innerHTML = DAEMON
     ? 'Connected to wb-web: shells and agents run in wb-hub on this machine and outlive page reloads and web restarts. The board is saved in wb-web’s boards directory.'
     : 'Demo mode: shells are simulated in the browser and the board is saved in this browser only. Serve the page from wb-web (see the README) for real shells.';
-  setTheme(S.theme || 'auto'); S.vim = S.vim ?? true; setPaneW(S.paneW || PANE_W, false); setTreeW(S.treeW || TREE_W, false); wirePaneGrip();
+  setTheme(S.theme || 'auto'); setPaneW(S.paneW || PANE_W, false); setTreeW(S.treeW || TREE_W, false); wirePaneGrip();
   RG.bm = S.rgBookmarks || {};
   $('.k-pal')!.textContent = keyLabel('Mod-K');
   ($$('[data-modkey]') as HTMLElement[]).forEach(e => { e.textContent = keyLabel(e.dataset.modkey!); });
@@ -7011,7 +6884,7 @@ function copyItems(): null | { items?: undefined; skipped: BoardNode[] } | { ite
     const c: CopiedCard = { id: n.id, kind: n.kind, name: n.name, x: n.x, y: n.y, w: n.w, h: n.h };
     if (Array.isArray(n.tags)) c.tags = n.tags.slice();
     for (const k of keep) if (n[k as keyof typeof n] !== undefined) c[k] = JSON.parse(JSON.stringify(n[k as keyof typeof n]));
-    if (n.kind === 'buffer') { const t = live[n.id]?.view ? live[n.id].view!.state.doc.toString() : FR.on && n.buf ? frBufOf(n)?.text : n.text; if (t == null) { skipped.push(n); continue; } c.text = t; }
+    if (n.kind === 'buffer') { const t = FR.on && n.buf ? frBufOf(n)?.text : n.buf ? null : n.text; if (t == null) { skipped.push(n); continue; } c.text = t; }
     cards.push(c); ok.add(id);
     texts.push(n.kind === 'image' ? imgClipText(n) : n.kind === 'web' ? n.url || '' : n.kind === 'buffer' || n.kind === 'ref' ? c.text || '' : n.kind === 'pdf' ? n.path || n.name : n.kind === 'op' ? n.prompt || n.name : n.name);
   }
@@ -7552,9 +7425,9 @@ const fnv = (s: string): string => { let h = 0x811c9dc5; for (let i = 0; i < s.l
 const opProviders = (): MediaProviderInfo[] => DAEMON && Array.isArray(INFO?.media) ? INFO!.media! : [];
 /* What an op card reads from one card piped into it. */
 type OpInput = { from: BoardNode; text?: string; image?: OpImage };
-// the text a card holds now: a page's replica or editor text, a quote, an op's text result
+// the text a card holds now: a page's text at hand (a closed replica's snapshot; opRun reads the full text), a quote
 function cardText(n: BoardNode): string {
-  if (n.kind === 'buffer') { const v = live[n.id]?.view; return v ? v.state.doc.toString() : FR.on && n.buf ? frBufOf(n)?.text ?? n.text ?? '' : n.text || ''; }
+  if (n.kind === 'buffer') return pageText(n as PageNode);
   if (n.kind === 'ref') return n.text || '';
   return '';
 }
@@ -7650,9 +7523,10 @@ async function opImageBlob(i: OpImage): Promise<{ blob?: string; data?: Blob }> 
 async function opRun(n: OpNode, quiet?: boolean): Promise<boolean> {
   const L = live[n.id], O = L?.op; if (!O || O.busy) return false;
   const k = OP_KINDS[n.op] || OP_KINDS.imagine, ins = opInputs(n), sig = opSig(n, ins);
+  const fail = (msg: string) => { n.out = { sig, at: Date.now(), err: msg }; dirty(); if (!quiet) toast(`${n.name}: ${msg}`, 6000); return false; };
+  for (const i of ins) if (i.from.kind === 'buffer') { try { i.text = await pageTextFull(i.from as PageNode); } catch (e) { return fail((e as Error).message); } }   // sig stays opStale's
   const texts = ins.filter(i => i.text?.trim()).map(i => i.text!.trim()), img = ins.find(i => i.image)?.image;
   const prompt = [...texts, (n.prompt || '').trim()].filter(Boolean).join('\n\n');
-  const fail = (msg: string) => { n.out = { sig, at: Date.now(), err: msg }; dirty(); if (!quiet) toast(`${n.name}: ${msg}`, 6000); return false; };
   if (k.needs === 'image' && !img) return fail('this card needs an image piped in.');
   if (k.image) {
     if (!DAEMON) return fail('making images needs a Workbench server with an image provider; demo mode has none.');
@@ -7951,7 +7825,7 @@ function focusOpen(n: BoardNode | null | undefined) { if (!n || n.kind === 'fram
 // Enter on the active card puts the keyboard in it where it stands: a shell's cursor, an agent's composer, a page's
 // text, a web card's address. A card that is off screen, in a closed deck or drawn as a far-zoom snapshot is brought
 // into view at reading size first. A card with no text input opens as a focus tab, as Shift-Enter does for any card.
-function cardInput(n: BoardNode): { focus(): void } | null { const L = live[n.id]; return L && (L.term || L.ta || L.view || (FR.on && n.kind === 'buffer' && L.host && { focus: () => frFocus(n) }) || (n.kind === 'web' && $('.web-bar input', L.body) as HTMLInputElement | null)) || null; }
+function cardInput(n: BoardNode): { focus(): void } | null { const L = live[n.id]; return L && (L.term || L.ta || (FR.on && n.kind === 'buffer' && L.host && { focus: () => frFocus(n) }) || (n.kind === 'web' && $('.web-bar input', L.body) as HTMLInputElement | null)) || null; }
 function typeInto(n: BoardNode) {
   const t = cardInput(n); if (!t) return focusOpen(n);
   const go = () => { activate(n.id); t.focus(); };
@@ -9149,7 +9023,7 @@ const KC: Record<string, KeyCmdFn> = {
   'tree.toggle': () => toggleTree(),
   dictate: () => {
     if (VOICE.rec) return stopListening();
-    if (VIEW === 'editor' && ED.view) dictateInto('editor');
+    if (VIEW === 'editor' && ED.node) dictateInto('editor');
     else if (focusedBuf && S.nodes[focusedBuf]) dictateInto(S.nodes[focusedBuf] as PageNode);
     else toast('Dictation goes into a page: focus one first (Alt-V), or use the Review view.');
   },
@@ -10449,7 +10323,7 @@ AGENT_TOOLS.push(
   { name: 'list_tasks', description: 'Tasks on the board pages and in the notes index: one line each with its reference (task:<id> or Page:line), keyword, title, date, session. status: todo | next | waiting | done | open.', inputSchema: { type: 'object', properties: { status: { type: 'string' } } },
     run: async ({ status }: { status?: string } = {}) => { await tasksLoad(true); let ts = allTasks(); const st = (status || 'open').toLowerCase(); if (st === 'open') ts = ts.filter(t => COL[t.kw] !== 'DONE'); else if (st !== 'all') ts = ts.filter(t => COL[t.kw] === st.toUpperCase()); return ts.map(t => `${taskAddr(t)} · ${t.kw} · ${plainTask(t.text)}${t.priority ? ' [#' + t.priority + ']' : ''}${t.deadline ? ' · deadline ' + t.deadline : t.scheduled ? ' · scheduled ' + t.scheduled : ''}${t.session ? ' · ' + t.session : ''}`).join('\n') || '(no tasks)'; } },
   { name: 'set_task', description: 'Change a task\'s keyword: TODO NEXT WAITING HOLD SOMEDAY DONE CANCELLED. task: task:<id>, ^anchor, note:Title#^anchor, or Page:line.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, keyword: { type: 'string' } }, required: ['task', 'keyword'] },
-    run: async ({ task, keyword }: { task: string; keyword: string }) => { await tasksLoad(true); const t = findTask(task); if (!t) throw new Error('no task ' + task); const kw = String(keyword).toUpperCase(); if (!TASK_KWS.includes(kw)) throw new Error('keyword must be one of ' + TASK_KWS.join(' ')); await taskSetKw(t, kw); return taskAddr(t) + ' → ' + kw; } },
+    run: async ({ task, keyword }: { task: string; keyword: string }) => { await tasksLoad(true); const t = findTask(task); if (!t) throw new Error('no task ' + task); const kw = String(keyword).toUpperCase(); if (!TASK_KWS.includes(kw)) throw new Error('keyword must be one of ' + TASK_KWS.join(' ')); if (!await taskSetKw(t, kw)) throw new Error('could not write ' + kw + ' into ' + taskAddr(t)); return taskAddr(t) + ' → ' + kw; } },
   { name: 'dispatch_task', description: 'Paste a task (title and body) into a shell running an agent, then write session:: and dispatched:: into the task and move TODO to NEXT. task: task:<id>, ^anchor, note:Title#^anchor or Page:line; host: a name from hosts.json; shell: a board path to use instead of the first #agent shell.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, host: { type: 'string' }, shell: { type: 'string' } }, required: ['task'] },
     run: async ({ task, host, shell }: { task: string; host?: string; shell?: string }) => { await tasksLoad(true); const t = findTask(task); if (!t) throw new Error('no task ' + task); const r = await dispatchTask(t, { host, shell }); return `dispatched ${taskAddr(t)} to ${r.shell} (${r.session}): ${r.text.slice(0, 120)}`; } }
 );
@@ -10466,7 +10340,7 @@ AGENT_TOOLS.push(
   { name: 'host_status', description: 'Health of a host: load, memory, disk, uptime, shells, tmux sessions, unit counts (failed names). host: a name from hosts.json (empty = the serving daemon).', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
     run: async ({ host }: { host?: string } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j: HostStatusReply = await (await hFetch(h, '/api/status')).json(); const gb = (b: number) => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}` + (j.sessions?.tmux != null ? ', tmux sessions ' + j.sessions.tmux : ''), j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
-window.__canvas = { s2w, clipRecall, pasteData, pasteItems, pasteText, imagesOnCanvas, copyItems, imgUrl, typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, rgPreview, RG, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, FOCUS, LEADER, setLeader, isLeader, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, frFileOpen, fsMv, noteOpen, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
+window.__canvas = { s2w, clipRecall, pasteData, pasteItems, pasteText, imagesOnCanvas, copyItems, imgUrl, typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, rgPreview, RG, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, FOCUS, LEADER, setLeader, isLeader, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, frFileOpen, fsMv, noteOpen, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 Object.assign(window.__canvas, { reviveAll, agentsDetached, ATTN_SIG, attnFocus, attnSeen, MODE, artHead, artMount, dbLoad, keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
 Object.defineProperty(window.__canvas, 'activeId', { get: () => activeId });   // Object.assign would copy a getter's value once
 Object.defineProperty(window.__canvas, 'spaceHeld', { get: () => space });

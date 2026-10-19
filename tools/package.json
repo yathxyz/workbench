@@ -5,13 +5,8 @@
   "dependencies": {
     "@xterm/xterm": "5.5.0",
     "@xterm/addon-fit": "0.10.0",
-    "codemirror": "6.0.1",
-    "@codemirror/lang-markdown": "6.3.2",
-    "@codemirror/view": "6.43.14",
-    "@codemirror/state": "6.7.6",
     "perfect-freehand": "1.2.2",
-    "roughjs": "4.6.6",
-    "@replit/codemirror-vim": "6.3.0"
+    "roughjs": "4.6.6"
   },
   "devDependencies": {
     "fast-check": "4.3.0",

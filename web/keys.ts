@@ -167,14 +167,13 @@
 
   // ---- interiors: the card (or field) that has the keyboard, and the keys it needs
   const ALL = () => true;
-  // what a page or a text field leaves to the board: the palette, the dock, the tree, dictation, the views, the desks
+  // what a text field leaves to the board: the palette, the dock, the tree, dictation, the views, the desks
   const TEXT_LEAVES = new Set(['C-k', 's-k', 'C-S-p', 's-S-p', 'C-j', 's-j', 'C-`', 'C-M-[', 'C-M-]', 'M-b', 'M-v',
     ...range(1, 7).map(i => 'M-' + i), ...range(0, 9).map(i => 'M-' + SHIFT_DIGIT[i])]);
   const INTERIORS: Record<WBKeyInteriorName, WBKeyInterior> = {
     // a terminal needs every key (readline, Emacs, vim, tmux, agents' TUIs); Ctrl-` still closes the dock from inside it
     // (leaves: every key it gives up must do something on the board, or the card lost it for nothing)
     term: { needs: k => k !== 'C-`', leaves: true, label: 'terminal' },
-    page: { needs: k => !TEXT_LEAVES.has(k), leaves: true, label: 'page' },
     text: { needs: k => !TEXT_LEAVES.has(k), leaves: true, label: 'text field' },
     // an Edwin frame owns every key but the leader (edwind spec R9.7)
     edwin: { needs: ALL, label: 'Edwin frame' },

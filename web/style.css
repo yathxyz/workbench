@@ -292,14 +292,9 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
    every frame, so an idle board kept the main thread busy. */
 .redge.e-pipe.flowing path:first-child { animation: flow 1.2s linear infinite; }
 .text-edit { position: fixed; z-index: 150; font-family: var(--hand); background: var(--panel); color: var(--fg); border: 1.5px dashed var(--accent); border-radius: var(--radius); padding: 4px 6px; resize: none; outline: none; }
-.cm-wikilink { color: var(--link); cursor: pointer; text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--link) 40%, transparent); text-underline-offset: 3px; }
-.cm-wikilink .cm-brk, .cm-brk { opacity: .45; }
-.blockref { display: inline; font-size: 12px; background: var(--ref-bg); border-bottom: 1.5px solid var(--ref); padding: 0 3px; border-radius: var(--radius); cursor: pointer; }
-.blockref.missing { border-bottom-style: dashed; color: var(--muted); }
-.cm-tear { margin-left: 10px; font: 11px/1.4 var(--mono); padding: 0 5px; border: 1px solid var(--ref); color: var(--ref); background: var(--ref-bg); border-radius: var(--radius); cursor: pointer; user-select: none; }
-.cm-tear:hover { background: var(--ref); color: var(--panel); }
+.fr-tear { margin-left: 10px; font: 11px/1.4 var(--mono); padding: 0 5px; border: 1px solid var(--ref); color: var(--ref); background: var(--ref-bg); border-radius: var(--radius); cursor: pointer; user-select: none; }
+.fr-tear:hover { background: var(--ref); color: var(--panel); }
 .k-buffer .body { display: flex; flex-direction: column; }
-.k-buffer .body > .cm-editor { flex: 1; min-height: 0; }
 .backlinks { flex: none; max-height: 38%; overflow: auto; border-top: 1px dashed var(--line); padding: 6px 10px 8px; font-size: 12px; background: var(--panel-2); }
 .backlinks:empty { display: none; }
 .backlinks h4 { margin: 0 0 4px; font: 600 10.5px var(--mono); text-transform: uppercase; letter-spacing: .1em; color: var(--muted); }
@@ -468,7 +463,6 @@ body.side-open #side { transform: none; visibility: visible; transition: transfo
 .ed-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px 6px 18px; border-bottom: 1px solid var(--line); font: 12px var(--mono); color: var(--muted); }
 #ed-crumb { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #ed-host { flex: 1; min-height: 0; }
-#ed-host .cm-editor { height: 100%; }
 .ed-info { border-left: 1px solid var(--line); background: var(--panel-2); overflow: auto; padding: 12px 12px 24px; }
 .ed-info h4 { margin: 12px 0 4px; font: 600 10.5px var(--mono); text-transform: uppercase; letter-spacing: .1em; color: var(--muted); }
 .ed-info h4:first-child { margin-top: 0; }
@@ -484,12 +478,6 @@ body.side-open #side { transform: none; visibility: visible; transition: transfo
   .ed-side { flex-direction: row; border-right: 0; border-bottom: 1px solid var(--line); padding: 6px 8px; overflow-x: auto; }
   #ed-filter, .ed-btns { display: none; } #ed-list { display: flex; gap: 4px; } .ed-item small { display: none; }
 }
-
-/* task keywords inside pages */
-.cm-task { font: 600 10.5px var(--mono); letter-spacing: .06em; padding: 1px 4px; border-radius: var(--radius); background: var(--accent-soft); color: var(--accent); }
-.cm-task-doing, .cm-task-now, .cm-task-next { background: var(--pipe-bg); color: var(--pipe); }
-.cm-task-done, .cm-task-cancelled { background: var(--inactive-bg); color: var(--muted); }
-.cm-task-done-text { text-decoration: line-through; color: var(--muted); }
 
 /* outline */
 #v-outline { overflow: auto; }
@@ -659,11 +647,6 @@ body.listening #st-buf-text { color: var(--ink-red); }
 .side-tabs button.on { color: var(--fg); background: var(--panel-2); box-shadow: inset 0 -2px 0 var(--accent); }
 #side-term .body { background: var(--term-bg); overflow: hidden; position: relative; }
 #side-term .xterm { padding: 8px 6px 6px 10px; height: 100%; box-sizing: border-box; }
-.cm-panels { background: var(--panel-2) !important; color: var(--fg) !important; font: 12.5px var(--mono); border-top: 1px solid var(--line) !important; }
-.cm-fat-cursor { background: var(--cursor) !important; color: var(--panel) !important; }
-.cm-focused .cm-fat-cursor { background: var(--cursor) !important; }
-.cm-tooltip-autocomplete { font: 13px var(--mono); background: var(--panel) !important; border: 1px solid var(--line-strong) !important; }
-.cm-tooltip-autocomplete li[aria-selected] { background: var(--accent) !important; color: var(--panel) !important; }
 
 #v-ranger { display: flex; flex-direction: column; font: 13px var(--mono); }
 .rg-path { padding: 8px 14px; color: var(--accent); font-weight: 700; border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -965,9 +948,6 @@ body.tree-open[data-view="canvas"] #which-key { left: calc(50% + var(--tree-w, 2
 .node.t-tiny .hdr .btns .hb:not(:last-child) { display: none; }
 .node.t-tiny .hdr .path { font-size: 11.5px; }
 
-/* Vendor (CodeMirror) rules with rounded corners: square like the rest. */
-.cm-button, .cm-textfield, .cm-foldPlaceholder, .cm-diagnosticAction, .cm-tooltip { border-radius: var(--radius) !important; }
-
 /* Connection state: the alert bar, the boot screen, the status-line chip, a reconnecting card. */
 #bar { position: fixed; z-index: 310; left: 0; right: var(--side-w); top: 0; display: flex; gap: 12px; align-items: center; padding: 4px 12px;
   background: var(--warn-bg); color: var(--fg); border-bottom: 1px solid var(--warn); font: 12px var(--mono); }
@@ -999,10 +979,14 @@ body.tree-open[data-view="canvas"] #which-key { left: calc(50% + var(--tree-w, 2
 .fr-off { flex: none; padding: 3px 10px; font: 11px var(--mono); color: var(--warn); background: var(--warn-bg); border-top: 1px solid var(--warn); }
 .fr-anchors { position: absolute; left: 0; right: 0; top: 0; bottom: 0; pointer-events: none; z-index: 6; overflow: hidden; }
 .fr-anchors .anchor-chip { position: absolute; right: 8px; line-height: 1.55; }
-.fr-anchors .cm-tear { position: absolute; right: 8px; margin: 0; pointer-events: auto; }
+.fr-anchors .fr-tear { position: absolute; right: 8px; margin: 0; pointer-events: auto; }
 .k-buffer .body .edwin-frame[data-kind="card"] { --panel: var(--buf-bg); min-height: 0; }
 #ed-host .fr-ed { height: 100%; display: flex; flex-direction: column; }
 #ed-host .fr-ed .edwin-frame { flex: 1; min-height: 0; }
+/* A read-only page (no edwind, E4): its whole text, scrolled and selected but not edited, over the notice line. */
+.ro-text { flex: 1; min-height: 0; margin: 0; padding: 8px 10px 24px; font: 13px/1.55 var(--mono); color: var(--fg); white-space: pre-wrap; overflow: auto; overflow-wrap: anywhere; user-select: text; }
+#ed-host:has(> .ed-ro) { display: flex; flex-direction: column; }
+#ed-host .ed-ro { max-width: 72ch; width: 100%; margin: 0 auto; padding: 28px 24px 40vh; font-size: 14px; line-height: 1.6; box-sizing: border-box; }
 /* desks D2: pager badges and the attention desk, sticky cards, the scratch overlay, the overview, the recent-places ring */
 #st-desk .dk[data-bad]::after { content: attr(data-bad); margin-left: 3px; padding: 0 4px; border-radius: 6px; font-size: 0.85em; background: var(--err); color: var(--bg); }
 #st-desk .dk.attn { color: var(--err); font-weight: 600; }
