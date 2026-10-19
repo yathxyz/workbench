@@ -6275,7 +6275,8 @@ function frAdopt(n: PageNode): Promise<string | null> {
       if (cur === '') {   // the node keeps its text unless the file has it on disk (an empty page too: a new buffer has no file yet)
         if (text) frReplaceAll(b!, text);
         const r = await Ed.sync.save(b!);
-        if (r.error) { if (text) frReplaceAll(b!, ''); FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} throw new Error(`${id} could not be saved: ${r.error.report}`); }
+        // the replica closes as it is (other clients may have edited it meanwhile); a later try that finds this text there takes it (R8.18)
+        if (r.error) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} throw new Error(`${id} could not be saved: ${r.error.report}`); }
       }
       else if (cur !== '' && cur !== text) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} continue; }   // R8.18: another text, next suffix
       chosen = id;
