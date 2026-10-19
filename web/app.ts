@@ -133,13 +133,13 @@ function animateTo(t: Cam, done?: (() => void) | null): void {
     if (k < 1) { const [cx, cy, w] = path(e); c.z = W / w; c.x = cx - W / 2 / c.z; c.y = cy - H / 2 / c.z; }
     else { c.x = t.x; c.y = t.y; c.z = t.z; }   // land exactly on the target
     applyCam();
-    if (k < 1) anim = requestAnimationFrame(step); else { anim = null; const d = animDone; animDone = null; d?.(); lodSettle(); }
+    if (k < 1) anim = requestAnimationFrame(step); else { anim = null; const d = animDone; animDone = null; lodSettle(); d?.(); }   // the near look first: a done step may focus a card's body, which the far look hides
   };
   anim = requestAnimationFrame(step);
 }
 // stop whatever moves the camera on its own (a flight, a glide); a cut-short flight still runs its done step
 function camStop(finish = true) {
-  if (anim) { cancelAnimationFrame(anim); anim = null; const d = animDone; animDone = null; if (finish) d?.(); }
+  if (anim) { cancelAnimationFrame(anim); anim = null; const d = animDone; animDone = null; if (finish) { lodSettle(); d?.(); } }
   if (GLIDE.raf) { cancelAnimationFrame(GLIDE.raf); GLIDE.raf = 0; }
   if (WHEEL.raf) { cancelAnimationFrame(WHEEL.raf); WHEEL.raf = 0; }
 }
