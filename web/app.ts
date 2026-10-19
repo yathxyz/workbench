@@ -307,7 +307,11 @@ function unmountQuiet(id: string): void {   // the card went in another tab: dro
 
 // ------------------------------------------------------------------ toast, ask, copy
 let toastT: number | null = null;
-function toast(msg: string, ms = 2600): void { const t = $('#toast')!; t.textContent = msg; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), ms); }
+function toast(msg: string, ms = 2600, act?: [string, () => unknown]): void {
+  const t = $('#toast')!; t.textContent = msg;
+  if (act) { const b = el('button', 'mini', act[0]); b.onclick = () => { t.classList.remove('show'); act[1](); }; t.append(' ', b); }
+  t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), ms);
+}
 
 // ------------------------------------------------------------------ connection state, alert bar, sessions (30 §0)
 const backoff: (n: number) => number = n => { const d = Math.min(30000, 500 * 2 ** Math.min(n, 6)); return d / 2 + Math.random() * d / 2; };   // equal jitter
@@ -348,7 +352,7 @@ function authBar() {
 function wakeAll() { for (const w of [...WAKE]) w.wake(); }
 addEventListener('online', () => { wakeAll(); netKick(); });
 addEventListener('focus', () => { Rpc.active(); if (NET.state !== 'up') netKick(); const L = live[activeId!]; if (L?.term) L.backend?.resize?.(L.term.cols, L.term.rows); L?.backend?.maybeSeen?.(); });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { Rpc.active(); wakeAll(); if (NET.state !== 'up') netKick(); live[activeId!]?.backend?.maybeSeen?.(); } else Rpc.look(true); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { attnSeen(); Rpc.active(); wakeAll(); if (NET.state !== 'up') netKick(); live[activeId!]?.backend?.maybeSeen?.(); } else Rpc.look(true); });
 addEventListener('beforeunload', e => { if (DAEMON && !SAVE.leaving && SAVE.pending && (SAVE.paused || SAVE.err)) { e.preventDefault(); e.returnValue = ''; } });
 // One persistent strip; only the highest-priority key shows. A string action starting with / is a link.
 const BARS: Record<string, BoardBar> = {}, BAR_ORDER = ['auth', 'forbidden', 'conflict', 'save', 'hub'];
@@ -378,11 +382,11 @@ function sessShown(): void {
   (sessShown as SessShownFn).last = shown; renderTree();
   if (VIEW === 'outline') renderOutline(); else if (VIEW === 'ranger') renderRanger();
 }
-function sessPut(x: SessionSummary | undefined): void { if (x?.sid && !TOMBS.has(x.sid + ' ' + x.createdAt)) { SESS[x.sid] = x; sessChanged(x.sid); } }
+function sessPut(x: SessionSummary | undefined, was = x && SESS[x.sid]?.state): void { if (x?.sid && !TOMBS.has(x.sid + ' ' + x.createdAt)) { SESS[x.sid] = x; sessChanged(x.sid); attnSignal(x.sid, was, x.state); } }
 type RpcEventHandlers = { [K in HubMsg['t']]?: (m: Extract<HubMsg, { t: K }>) => void };
 const RPC_EVENTS: RpcEventHandlers = {
   hub: m => hubStatus(m),
-  sessions: m => { for (const k in SESS) delete SESS[k]; (m.sessions || []).forEach(sessPut); statusRender(); },
+  sessions: m => { const was: Record<string, SessionState> = {}; for (const k in SESS) { was[k] = SESS[k].state; delete SESS[k]; } (m.sessions || []).forEach(x => sessPut(x, was[x.sid])); statusRender(); },
   session: m => sessPut(m.session),
   gone: m => {
     TOMBS.add(m.sid + ' ' + m.epoch);
@@ -401,7 +405,7 @@ function hubStatus(m: Extract<HubMsg, { t: 'hub' }>): void {
 }
 function hubSeen(hub: DaemonInfo['hub']): void {
   if (!hub?.startedAt) return;   // a probe while the hub is down must not forget the start time its return is compared with
-  if (HUB_STARTED && hub.startedAt !== HUB_STARTED) toast('The Workbench hub restarted at ' + hhmm(hub.startedAt) + ': shells and agents ended. Enter restarts a shell; ↻ revives an agent.', 8000);
+  if (HUB_STARTED && hub.startedAt !== HUB_STARTED) toast('The Workbench hub restarted at ' + hhmm(hub.startedAt) + ': shells and agents ended. Enter restarts a shell; ↻ revives an agent.', 12000, S && nodeList().some(n => n.kind === 'acp') ? ['Revive all agents', reviveAll] : undefined);   // F-A14
   HUB_STARTED = hub.startedAt;
 }
 function netChip(): void {
@@ -1524,7 +1528,7 @@ function newAgentCard() {
   if (!ag.length) return toast(DAEMON ? 'No agents are configured on this server.' : 'Agent cards run on the Workbench server.');
   const go = (a: { name: string; label: string }) => askName('Folder for the agent', defaultCwd(), (cwd: string) => {
     if (!cwd.startsWith('/')) return toast('The folder must be an absolute path.');
-    newAt('acp', { agent: a.name, cwd, w: 560, h: 520 });
+    newAt('acp', { agent: a.name, cwd, w: 560, h: 520 }); notifyAsk();   // F-A12: the first card is the gesture that asks
   });
   if (ag.length === 1) return go(ag[0]);
   openPicker('Agent', ag.map(a => ({ k: 'agent', l: a.label || a.name, s: a.name, run: () => go(a) })));
@@ -4219,6 +4223,7 @@ function rgOpen(e: RgEntry | undefined, canvas?: boolean) {
   if (!e) return;
   if (e.dir && !canvas) return rgGo(e.key);
   if (e.n?.kind === 'frame') return jumpFolder(e.n);
+  if (e.n && e.kind === 'iattn' && MODE.v === 'phone') return focusOpen(e.n);   // F-A13: a full-screen card, not a pan of the canvas viewer
   if (e.n) return e.n.kind === 'buffer' && !canvas ? edOpen(e.n) : jumpNode(e.n);
   if (e.note) return noteOpen(e.note);
   if (e.tmux) return tmuxAdopt(e.tmux.target, e.tmux.h);
@@ -4294,7 +4299,7 @@ function rgKey(e: KeyboardEvent): boolean {
   }
   return false;
 }
-$('#rg-cur')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; if (!r) return; const j = rgList().findIndex(x => x.key === r.dataset.key); if (j >= 0) { RG.sel[RG.dir] = j; renderRanger(); } });
+$('#rg-cur')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; if (!r) return; const l = rgList(), j = l.findIndex(x => x.key === r.dataset.key); if (j >= 0) { RG.sel[RG.dir] = j; renderRanger(); if (MODE.v === 'phone' && l[j].kind === 'iattn' && l[j].n) rgOpen(l[j]); } });   // F-A13: on a phone one tap opens an Attention card
 $('#rg-cur')!.addEventListener('dblclick', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row'); if (r) rgOpen(rgCur().e); });
 $('#rg-parent')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; if (!r) return; const p = rgParent(RG.dir); if (p) rgGo(p, r.dataset.key); });
 $('#rg-prev')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; const cur = rgCur().e; if (r && cur?.dir) rgGo(cur.key, r.dataset.key); });
@@ -5211,7 +5216,7 @@ async function artPublish(n: ArtifactNode, { html, files }: ArtPublishInput = {}
   if (DAEMON) {
     const r = await fetch(`/api/artifact/${n.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ html, files, capabilities, ifMatch: n.head ?? null }) });
     const j = await r.json();
-    if (!r.ok) throw { code: j.error?.code || 'upstream_error', message: j.error?.message || 'publish failed' };
+    if (!r.ok) throw { code: j.error?.code || 'upstream_error', message: j.error?.code === 'conflict' ? 'another tab published a newer version; reload the card first' : j.error?.message || j.error || 'publish failed', head: j.error?.head };
     n.head = j.version; n.versions = j.meta.versions.slice(-30); n.url = j.url;
     if (capabilities) n.capabilities = capabilities;
     delete n.html; dirty(); return { version: j.version, changed: true, shas: {} };
@@ -5230,6 +5235,17 @@ async function artSource(n: ArtifactNode, sha?: string): Promise<string> {
   const c = j.content; if (!c) return n.html || '';
   return c.kind === 'page' ? c.html : (c.files['index.html']?.text || '');
 }
+// The head the server holds, and its versions into the node: another tab or a `wb` publish may have moved it.
+// null while the server holds none. A node's own head that the server never had is dropped, so its next publish
+// (ifMatch null) is not refused.
+async function artHead(n: ArtifactNode): Promise<string | null> {
+  const r = await fetch(`/api/artifact/${n.id}`, { cache: 'no-store' }); const j = await r.json();
+  if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+  const head = j.meta?.head ?? null;
+  if (head !== (n.head ?? null)) { if (head) { n.head = head; n.versions = (j.meta.versions || []).slice(-30); } else delete n.head; dirty(); }
+  const c = j.content; if (!c) return null;
+  return c.kind === 'page' ? c.html : (c.files['index.html']?.text ?? '');
+}
 async function artMount(n: ArtifactNode, L: LiveEntry) {
   const f = L.frame as HTMLIFrameElement | undefined; if (!f) return;
   f.removeAttribute('srcdoc'); f.removeAttribute('src');
@@ -5241,12 +5257,17 @@ async function artMount(n: ArtifactNode, L: LiveEntry) {
     if (!b) { L.notice!.hidden = false; L.notice!.textContent = blockMissing(n); return; }
     f.setAttribute('sandbox', 'allow-scripts allow-forms allow-pointer-lock allow-popups allow-modals');
     f.srcdoc = wrapFragment(b.code, await bridgeSrc(), artTheme());
-  } else if (DAEMON) {
-    if (n.file) { try { await artFromFile(n, L); } catch (e) { L.notice!.hidden = false; L.notice!.textContent = 'Cannot read ' + n.file + ': ' + (e?.message || e); return; } }
-    if (!n.head && n.html) { try { await artPublish(n, { html: n.html }); } catch {} }
-    if (!n.head) { L.notice!.hidden = false; L.notice!.textContent = 'Empty artifact. Publish a page from the assistant or the palette.'; return; }
-    f.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-pointer-lock allow-popups allow-modals');
-    f.src = `${INFO!.artifactOrigin}/a/${n.id}/${n.head}/?theme=${artTheme()}`;
+  } else if (DAEMON) {   // fix 6: wb-web keeps the versions and has no second origin, so the head runs in an opaque srcdoc frame too
+    let src: string | null;
+    try {
+      src = await artHead(n);
+      if (n.file) { try { if (await artFromFile(n, L)) src = await artHead(n); } catch (e) { L.notice!.hidden = false; L.notice!.textContent = 'Cannot read ' + n.file + ': ' + (e?.message || e); return; } }
+      if (src == null && n.html) { await artPublish(n, { html: n.html }); src = await artHead(n); }   // a page kept in the board from before the server held versions
+    } catch (e) { L.notice!.hidden = false; L.notice!.textContent = 'Cannot load the artifact: ' + (e?.message || e); return; }
+    if (L.frame !== f) return;
+    if (src == null) { L.notice!.hidden = false; L.notice!.textContent = 'Empty artifact. Publish a page from the assistant or the palette.'; return; }
+    f.setAttribute('sandbox', 'allow-scripts allow-forms allow-pointer-lock allow-popups allow-modals');
+    f.srcdoc = wrapFragment(src, await bridgeSrc(), artTheme());
   } else {
     if (!n.html) { L.notice!.hidden = false; L.notice!.textContent = 'Empty artifact. Publish a page from the assistant or the palette.'; return; }
     f.setAttribute('sandbox', 'allow-scripts allow-forms allow-pointer-lock allow-popups allow-modals');
@@ -5263,6 +5284,7 @@ function mountArtifact(n: ArtifactNode, L: LiveEntry) {
   const notice = el('div', 'art-notice'); notice.hidden = true;
   L.frame = f; L.notice = notice; L.body!.append(f, notice);
   f.addEventListener('load', () => { f.contentWindow && HOSTS.set(f.contentWindow, { n, L }); });
+  if (DAEMON) dbLoad(n);
   artMount(n, L);
   if (n.file) artWatch(n);
 }
@@ -5383,6 +5405,14 @@ function dbPut(n: ArtifactNode) {   // deferred while saving is paused (signed o
       n._dbErr = 0; if (!SAVE.err) barClear('save');
     })
     .catch(e => { bar('save', 'Data for ' + n.name + ' not saved: ' + e.message + '. Retrying…'); clearTimeout(n._dbT as number); n._dbT = setTimeout(() => dbPut(n), backoff(n._dbErr = (n._dbErr as number || 0) + 1)); netKick(); });
+}
+// The db wb-web holds, for a node whose board copy has none (a board saved before it, or restored from a backup).
+function dbLoad(n: ArtifactNode) {
+  if (Object.keys(n.db.docs).length) return;
+  fetch(`/api/db/${n.id}`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null).then(j => {
+    if (!j?.docs || Object.keys(n.db.docs).length || !Object.keys(j.docs).length) return;
+    n.db = { docs: j.docs }; dirty(); for (const p of Object.keys(j.docs)) dbNotify(n, p);
+  }).catch(() => {});
 }
 function dbFlush() { const q = [...SAVE.dbQueue]; SAVE.dbQueue.clear(); q.forEach(dbPut); }
 const dbGetField = (d: unknown, f: string): any => f.split('.').reduce((o: any, k) => (o == null ? undefined : o[k]), d);   // any: a field of a document the page wrote, compared with < and >
@@ -6471,6 +6501,7 @@ async function boot() {
   // only put an error in the console of every load.
   perspChip(); { const ah = $('#add-host') as HTMLButtonElement | null; if (ah) ah.disabled = !DAEMON; } acpButton();
   hashInit();
+  { const f = new URLSearchParams(location.search).get('focus'); if (f) { history.replaceState(null, '', location.pathname + location.hash); setTimeout(() => attnFocus(f), 600); } }   // opened by a notification (F-A12)
   if (separateAll()) { restack(); renderLinks(); }
   S.views = S.views || {}; S.strokes = S.strokes || []; S.fs = S.fs || seedFs(); S.shapes = S.shapes || [];
   $('#help-mode')!.innerHTML = DAEMON
@@ -6872,12 +6903,13 @@ async function artFromFile(n: ArtifactNode, L: LiveEntry): Promise<boolean> {
   const st = await (await fetch(`/api/stat?path=${encodeURIComponent(n.file!)}`)).json();
   if (!st.exists) throw new Error('no such file');
   if (st.mtime === n.fileMtime && n.head) return false;
-  const r = await fetch(`/api/cat?path=${encodeURIComponent(n.file!)}&limit=6000000`);
-  const html = await r.text();
-  const sha = await shaShort(html), changed = sha !== n.head;   // before the publish moves head
-  if (changed) await artPublish(n, { html });
+  const r = await fetch(`/api/cat?path=${encodeURIComponent(n.file!)}&limit=6000000`), j = await r.json();   // /api/cat answers {path, text, size}
+  if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+  if (j.text === '(binary file)') throw new Error('not a text file');
+  const before = n.head;
+  await artPublish(n, { html: j.text });   // the server names versions by content: an unchanged file keeps its head
   n.fileMtime = st.mtime; dirty();
-  return changed;
+  return n.head !== before;
 }
 function artWatch(n: ArtifactNode) {
   if (!DAEMON || !n.file) return;
@@ -7533,10 +7565,11 @@ function deskAttnTick() {   // new cards that need a look join the attention des
 // F-A15 across desks (leader !): the next card that needs a look, after the active one, in Attention's order. A card that
 // is not on the shown desk is shown on the first desk that holds it, else on the Board. Items that are not cards (a host,
 // a unit, a task) stay in the Attention list: stepping must not open or adopt anything.
-function attnNext() {
-  const items = attnItems().filter(it => it.attn === 'bad' && it.n && S.nodes[it.n.id] && it.n.kind !== 'frame' && !ovlOff(S.nodes[it.n.id]));
+function attnNext(only?: (n: BoardNode) => boolean) {
+  const items = attnItems().filter(it => it.attn === 'bad' && it.n && S.nodes[it.n.id] && it.n.kind !== 'frame' && !ovlOff(S.nodes[it.n.id]) && (!only || only(S.nodes[it.n.id])));
   if (!items.length) return toast(attnCount() ? 'No card needs a look; the Attention list (palette: Attention) has the rest.' : 'Nothing needs a look.');
-  const i = items.findIndex(it => it.n!.id === activeId), it = items[(i + 1) % items.length], n = S.nodes[it.n!.id];
+  const i = items.findIndex(it => it.n!.id === (FOCUS.cur || activeId)), it = items[(i + 1) % items.length], n = S.nodes[it.n!.id];
+  if (MODE.v === 'phone') { focusOpen(n); return toast(`${it.name} (${items.indexOf(it) + 1} of ${items.length})`); }   // F-A13
   if (VIEW !== 'canvas') setView('canvas');
   if (deskOff(n)) { const d = deskList().find(d => deskHolds(d, n)); deskGo(d ? d.slot : 0, true); }
   jumpNode(n); toast(`${it.name} (${items.indexOf(it) + 1} of ${items.length})` + (DESK.cur ? ' · desk ' + deskName(deskAt(DESK.cur)) : ''));
@@ -9309,6 +9342,7 @@ function attnItems(): RgEntry[] {
     else if (s.state === 'error') items.push({ ...it, name: n.name + ' failed', attn: 'bad', meta: s.fault?.message || a?.last?.error?.message || a?.last?.outcome || '' });
     else if (s.state === 'done') items.push({ ...it, name: n.name + ' finished', attn: '', meta: agentLabel(n.agent) });
   }
+  const det = agentsDetached().length; if (det) items.push({ key: 'attn:detached', name: det + ' agent' + (det === 1 ? '' : 's') + ' detached', kind: 'iattn', attn: '', dir: false, meta: 'Enter: revive all', go: reviveAll });   // F-A14
   if (DAEMON && S) for (const s of Object.values(SESS)) if (s.alive && !S.nodes[s.sid] && s.sid !== 'dock' && !String(s.sid).startsWith('ed-'))   // running invisibly otherwise; the dock is never a node; ed-* are edwind's own (R9.22)
     items.push({ key: 'orphan:' + s.sid, name: (s.kind === 'acp' ? agentLabel(s.acp?.agent) : s.pty?.fg?.comm || 'shell') + ' running without a card', kind: 'iattn', attn: 'bad', dir: false, meta: s.cwd || '', go: () => adoptOrphan(s) });
   const due = RV.loaded ? rvQueue().dueNow.length : 0; if (due) items.push({ key: 'attn:review', name: due + ' card' + (due === 1 ? '' : 's') + ' due', kind: 'iattn', dir: false, meta: 'review', go: () => setView('review') });
@@ -9316,6 +9350,39 @@ function attnItems(): RgEntry[] {
   return items;
 }
 function attnList(): RgEntry[] { return attnItems(); }
+// F-A14: agent cards whose session ended but can be revived (after a hub restart), and ↻ on every one of them.
+function agentsDetached(): BoardNode[] { return S ? nodeList().filter(n => { const s = n.kind === 'acp' && SESS[n.id]; return !!s && !s.alive && !!s.acp?.revivable; }) : []; }
+function reviveAll(): void {
+  const ns = agentsDetached(); if (!ns.length) return toast('No detached agent to revive.');
+  let k = 0; for (const n of ns) { const b = live[n.id]?.backend; if (b?.revive) { b.revive(); k++; } }
+  toast(`Reviving ${k} agent${k === 1 ? '' : 's'}` + (k < ns.length ? ` (${ns.length - k} not open in this tab)` : '') + '.');
+}
+// F-A12: the out-of-page signal. An agent card whose session turns bad while this page is hidden counts in the title
+// ("(N) "), in the app badge where there is one, and in a notification tagged with its sid, whose click focuses this
+// page (or opens one) at the card full screen. Seen again when the page is visible. Desktop only for v1.
+const ATTN_SIG = { unseen: new Set<string>(), base: document.title };
+function attnSignal(sid: string, was: SessionState | undefined, now: SessionState): void {
+  if (was === undefined || ACP_BAD.has(was) || !ACP_BAD.has(now) || !document.hidden || MODE.v === 'phone' || ATTN_SIG.unseen.has(sid)) return;   // once per card until the page is seen
+  const n = S?.nodes[sid]; if (!n || n.kind !== 'acp') return;
+  ATTN_SIG.unseen.add(sid); attnTitle();
+  try { (navigator as Navigator & { setAppBadge?: (n: number) => Promise<void> }).setAppBadge?.(ATTN_SIG.unseen.size)?.catch(() => {}); } catch {}
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted' || !navigator.serviceWorker) return;
+  const what = now === 'waiting_permission' ? 'needs permission' : now === 'waiting_input' ? 'asks a question' : 'failed';
+  navigator.serviceWorker.ready.then(r => r.showNotification(`${n.name} ${what}`, { tag: sid, body: 'Workbench · ' + (INFO?.host || location.host), data: { sid } })).catch(() => {});
+}
+function attnTitle(): void { const k = ATTN_SIG.unseen.size; document.title = (k ? `(${k}) ` : '') + ATTN_SIG.base; }
+function attnSeen(): void {
+  if (!ATTN_SIG.unseen.size) return;
+  ATTN_SIG.unseen.clear(); attnTitle();
+  try { (navigator as Navigator & { clearAppBadge?: () => Promise<void> }).clearAppBadge?.()?.catch(() => {}); } catch {}
+}
+// A notification's click (sw.ts posts {t:'focus', sid}, or opens /?focus=SID): the card full screen.
+function attnFocus(sid: string | null): void { attnSeen(); const n = sid && S?.nodes[sid]; if (n) focusOpen(n); }
+navigator.serviceWorker?.addEventListener('message', e => { if (e.data?.t === 'focus') attnFocus(String(e.data.sid)); });
+// Asked from a user gesture only (a new agent card, the chips, the palette); never on desktop-less phones.
+function notifyAsk(): void { try { if (DAEMON && MODE.v !== 'phone' && typeof Notification !== 'undefined' && Notification.permission === 'default') Notification.requestPermission().catch(() => {}); } catch {} }
+cmd('Attention: notify me when a card needs a look while this tab is hidden', () => { if (typeof Notification === 'undefined') return toast('This browser has no notifications.'); Notification.requestPermission().then(p => toast('Notifications: ' + p)); }, '', () => DAEMON);
+cmd('Agents: revive all detached agents', () => reviveAll(), '', () => agentsDetached().length > 0);
 function attnCount(): number { try { return attnItems().length; } catch { return 0; } }
 function statusCounts(): StatusCounts {
   const hosts = DAEMON ? allHosts() : [], down = hosts.filter(h => HOSTCONN[h.url]?.down).length;
@@ -9333,14 +9400,14 @@ function statusRender(): void {
   const add = (text: string, title: string, cls: string, fn: () => unknown) => { const b = el('button', 'stc' + (cls ? ' ' + cls : ''), text); b.title = title; b.onclick = fn; box.append(b); };
   if (DAEMON && c.hosts) add((c.hosts - c.down) + '/' + c.hosts + ' hosts', 'Hosts from hosts.json: reachable / all. Click: the navigator root lists them.', c.down ? 'bad' : '', () => { setView('ranger'); rgGo('root'); });
   if (DAEMON || !DAEMON) add('✗ ' + c.failed, c.failed ? c.failed + ' failed unit(s). Click: units, failed first.' : 'No failed units. Click: units.', c.failed ? 'bad' : '', () => { goAddr('unit:'); });
-  add('✦ ' + c.agents + (c.waiting ? ' · ' + c.waiting + ' waiting' : ''), c.agents + ' agent card(s) and shell(s) running an agent' + (c.waiting ? ', ' + c.waiting + ' waiting for you. Click: the first waiting card.' : '. Click: filter the canvas by #agent.'), c.waiting ? 'bad' : '', () => {
-    const w = nodeList().find(n => n.kind === 'acp' && ACP_BAD.has(SESS[n.id]?.state));
-    if (w) jumpNode(w); else { setView('canvas'); tagFilter('agent'); }
+  add('✦ ' + c.agents + (c.waiting ? ' · ' + c.waiting + ' waiting' : ''), c.agents + ' agent card(s) and shell(s) running an agent' + (c.waiting ? ', ' + c.waiting + ' waiting for you. Click: the next waiting card (F-A15).' : '. Click: filter the canvas by #agent.'), c.waiting ? 'bad' : '', () => {
+    if (c.waiting) { notifyAsk(); attnNext(n => n.kind === 'acp' && ACP_BAD.has(SESS[n.id]?.state)); } else { setView('canvas'); tagFilter('agent'); }
   });
   if (c.due != null) add('▦ ' + c.due, c.due + ' flashcard(s) due. Click: review.', c.due ? 'warn' : '', () => setView('review'));
   add('☐ ' + c.tasks + (c.dueToday ? ' (' + c.dueToday + ' due)' : ''), c.tasks + ' open task(s) on the board and in the notes' + (c.dueToday ? ', ' + c.dueToday + ' scheduled or due by today' : '') + '. Click: the tasks view.', c.dueToday ? 'warn' : '', () => setView('tasks'));
   deskAttnTick(); deskPager();
-  const a = attnCount(); add('! ' + a, a ? a + ' item(s) need a look. Click: the Attention list (addresses).' : 'Nothing needs a look.', a ? 'bad' : '', () => { setView('ranger'); rgGo('attn:'); });
+  const a = attnCount(), cards = attnBad().size;   // F-A15: with cards that need a look the chip steps through them; else it opens the list
+  add('! ' + a, a ? a + ' item(s) need a look. Click: ' + (cards ? 'the next card that needs a look (Shift-click: the Attention list).' : 'the Attention list (addresses).') : 'Nothing needs a look.', a ? 'bad' : '', ((e: MouseEvent) => { if (cards && !e.shiftKey) { notifyAsk(); attnNext(); } else { setView('ranger'); rgGo('attn:'); } }) as () => unknown);
 }
 function statusTick(): void { if (!S) return; if (DAEMON) { for (const h of [null, ...allHosts()]) if (!HOSTCONN[h ? h.url : '']?.down) unitsData(h); tasksLoad(); } else unitsData(null); statusRender(); }
 setInterval(statusTick, 20000); setTimeout(statusTick, 1500);
@@ -9373,7 +9440,7 @@ AGENT_TOOLS.push(
     run: async ({ host }: { host?: string } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j: HostStatusReply = await (await hFetch(h, '/api/status')).json(); const gb = (b: number) => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}` + (j.sessions?.tmux != null ? ', tmux sessions ' + j.sessions.tmux : ''), j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
 window.__canvas = { s2w, clipRecall, pasteData, pasteItems, pasteText, imagesOnCanvas, copyItems, imgUrl, typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, rgPreview, RG, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, FOCUS, LEADER, setLeader, isLeader, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, setVim, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, frFileOpen, fsMv, noteOpen, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
-Object.assign(window.__canvas, { keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
+Object.assign(window.__canvas, { reviveAll, agentsDetached, ATTN_SIG, attnFocus, attnSeen, MODE, artHead, artMount, dbLoad, keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
 Object.defineProperty(window.__canvas, 'activeId', { get: () => activeId });   // Object.assign would copy a getter's value once
 Object.defineProperty(window.__canvas, 'spaceHeld', { get: () => space });
 Object.assign(window.__canvas, { DESK, deskGo, deskSend, deskList, deskAt, deskPin, deskDelete, deskOff, deskPinned, serialize, activate, viewKey,

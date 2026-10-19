@@ -37,7 +37,7 @@ const until = async <T,>(f: () => T | PromiseLike<T>, ms = 10000, step = 100): P
 const browser = await chromium.launch();
 process.on('uncaughtException', e => { console.log('UNCAUGHT', e); process.exit(2); });   // the harness stops when our end of its stdin closes
 const errors: string[] = [];
-const watchErrors = (p: import('playwright-core').Page): void => { p.on('pageerror', e => errors.push(String(e))); p.on('console', m => { if (m.type() === 'error') errors.push('console: ' + m.text()); }); };
+const watchErrors = (p: import('playwright-core').Page): void => { p.on('pageerror', e => errors.push(String(e.stack || e))); p.on('console', m => { if (m.type() === 'error') errors.push('console: ' + m.text()); }); };
 async function page(url: string, w = 1500, h = 950): Promise<import('playwright-core').Page> {
   const p = await browser.newPage({ viewport: { width: w, height: h } });
   watchErrors(p);
@@ -1757,7 +1757,7 @@ await section('acp mocked', async () => {
     check('30 §1.5 (mocked): the docked terminal\'s session is not listed as running without a card; a session without a card is', orphans.includes('orphan:zz-orphan') && !orphans.includes('orphan:dock'), JSON.stringify(orphans));
   } finally { await P.close(); }
 });
-if (!STUB) for (const n of ['N17', 'N18', 'N19', 'N20', 'N21', 'N22', 'N23', 'N24', 'N25', 'N27', 'N28', 'N29', 'N39', 'N41', 'N42']) skip(n, 'no stub agent in /api/info.agents (wb-fake-acp registered as `stub` in the test hub)');
+if (!STUB) for (const n of ['N17', 'N18', 'N19', 'N20', 'N21', 'N22', 'N23', 'N24', 'N25', 'N27', 'N28', 'N29', 'N34', 'N35', 'N37', 'N38', 'N39', 'N41', 'N42']) skip(n, 'no stub agent in /api/info.agents (wb-fake-acp registered as `stub` in the test hub)');
 else {
   await section('N17', async () => {
     await AP.evaluate(() => {   // every text each acp card's badge shows, from its first paint, by card id
@@ -2060,6 +2060,77 @@ else {
       check('N42: a prompt typed before a wb-web restart, with no echo, is still in the composer after the reconnect',
         !!pending && !!back && back.ta === TEXT && !back.ro && back.go === 'Send' && g.sent.filter(m => m?.t === 'open').length >= 2, JSON.stringify({ pending: !!pending, back: back && { ta: back.ta, ro: back.ro, go: back.go } }));
     } finally { await D.close(); }
+  });
+  // N34 (F-A12): the page is made hidden and given notifications and a service worker that record their calls, since the
+  // suite's context blocks service workers. The open path of a notification's click is /?focus=SID.
+  await section('N34', async () => {
+    const id = AID; await acpIdle(AP, id);
+    await AP.evaluate(() => {
+      const w = window as unknown as Record<string, unknown>; const calls: { title: string; tag?: string }[] = []; w.__n34 = calls;
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+      Object.defineProperty(window, 'Notification', { configurable: true, writable: true, value: { permission: 'granted', requestPermission: async () => 'granted' } });
+      Object.defineProperty(navigator, 'serviceWorker', { configurable: true, value: { ready: Promise.resolve({ showNotification: (title: string, o: NotificationOptions) => { calls.push({ title, tag: o.tag }); return Promise.resolve(); } }), addEventListener() {} } });
+    });
+    await acpSay(AP, id, 'perm');
+    await until(async () => (await acpView(AP, id))!.st === 'waiting_permission', 15000);
+    const sig = await until(() => AP.evaluate(() => { const c = (window as unknown as { __n34: { tag?: string }[] }).__n34; return document.title.startsWith('(1) ') && c.length ? { title: document.title, calls: c } : null; }), 5000);
+    check('N34: a hidden page whose card turns waiting_permission titles itself (1) and shows a notification tagged with the sid', !!sig && sig.calls.length === 1 && sig.calls[0].tag === id, JSON.stringify(sig || await AP.evaluate(() => document.title)));
+    await AP.evaluate(() => { delete (document as unknown as Record<string, unknown>).hidden; delete (document as unknown as Record<string, unknown>).visibilityState; delete (navigator as unknown as Record<string, unknown>).serviceWorker; document.dispatchEvent(new Event('visibilitychange')); });
+    const back = await AP.evaluate(() => ({ title: document.title, unseen: window.__canvas.ATTN_SIG.unseen.size }));
+    const P = await ctx.newPage(); watchErrors(P);
+    try {
+      await P.goto(ORIGIN + '/?focus=' + encodeURIComponent(id)); await until(() => P.evaluate(() => window.__canvas?.BOOTED));
+      const opened = await until(() => P.evaluate((id: string) => window.__canvas.FOCUS.cur === id && document.body.classList.contains('focus') ? { search: location.search } : null, id), 8000);
+      check('N34: the page is seen again when visible (no title count), and /?focus=SID (a notification click with no open page) opens the card full screen and drops the query', !back.title.startsWith('(') && back.unseen === 0 && !!opened && opened.search === '', JSON.stringify({ back, opened }));
+    } finally { await P.close(); }
+  });
+  // N35 (F-A13): with the permission from N34 still pending.
+  await section('N35', async () => {
+    const id = AID, P = await dpage();
+    try {
+      await P.setViewportSize({ width: 390, height: 844 }); await sleep(400);
+      await until(() => P.evaluate((id: string) => window.__canvas.attnItems().some((i: RgEntry) => i.key === id && i.attn === 'bad'), id), 10000);
+      await P.evaluate(() => { const C = window.__canvas; document.body.classList.remove('side-open'); C.setView('ranger'); C.rgGo('attn:'); });   // on a phone the side pane is the whole width
+      const row = `#rg-cur .rg-row[data-key="${id}"]`; await P.waitForSelector(row, { timeout: 5000 });
+      await P.click(row);
+      const full = await until(() => P.evaluate((id: string) => window.__canvas.MODE.v === 'phone' && window.__canvas.FOCUS.cur === id && document.body.classList.contains('focus'), id), 5000);
+      await P.click(`.node[data-id="${id}"] .ag-perm button[data-kind="allow_once"]`, { timeout: 5000 });
+      const done = await until(async () => (await acpView(AP, id))!.perm === 0, 10000);
+      check('N35: on a 390×844 phone one tap on the Attention item opens the card full screen, and its permission button takes the click', !!full && !!done, JSON.stringify({ full, done, view: await acpView(AP, id) }));
+    } finally { await P.close(); }
+  });
+  let N38: string | null = null;
+  await section('N38', async () => {
+    const a = AID; await acpIdle(AP, a);
+    const b = N38 = await acpNew(AP) as string; await acpIdle(AP, b);
+    for (const id of [a, b]) await acpSay(AP, id, 'perm');
+    await until(async () => (await acpView(AP, a))!.st === 'waiting_permission' && (await acpView(AP, b))!.st === 'waiting_permission', 15000);
+    await AP.evaluate(() => window.__canvas.jumpNode(window.__canvas.addNode({ kind: 'buffer', name: 'n38', x: 3600, y: 3600, w: 300, h: 200, text: '# n38' })));
+    const seen: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      await AP.evaluate(() => window.__canvas.statusRender());
+      await AP.click('#st-host .stc:has-text("waiting")');
+      await sleep(600); seen.push(await AP.evaluate(() => window.__canvas.activeId));
+    }
+    check('N38: with two waiting cards, successive clicks on the waiting chip focus one, then the other, then the first again', seen[0] !== seen[1] && seen[2] === seen[0] && [a, b].every(id => seen.includes(id)), JSON.stringify({ seen, a, b }));
+    await AP.evaluate(() => { const C = window.__canvas, n = Object.values<BoardNode>(C.S.nodes).find(n => n.name === 'n38'); if (n) C.removeNode(n.id); });
+    for (const id of [a, b]) { await acpShow(AP, id); await acpClick(AP, id, '.ag-perm button[data-kind="allow_once"]'); await acpIdle(AP, id); }
+  });
+  await section('N37', async () => {
+    const ids = [AID, N38].filter(Boolean) as string[];
+    if (ids.length < 2) return check('N37: two stub cards to revive', false, 'N38 made no second card');
+    if (!await hubCtl('stop')) return skip('N37', 'the harness did not acknowledge "stop hub"');
+    await sleep(1000); await hubCtl('start');
+    const ready = await until(() => AP.evaluate((ids: string[]) => {
+      const C = window.__canvas, t = document.querySelector('#toast')!, det = C.agentsDetached().map((n: BoardNode) => n.id);
+      return t.classList.contains('show') && t.querySelector('button')?.textContent === 'Revive all agents' && ids.every(id => det.includes(id))
+        ? { toast: t.textContent, line: C.attnItems().find((i: RgEntry) => i.key === 'attn:detached')?.name } : null;
+    }, ids), 40000);
+    if (ready) await AP.click('#toast button');
+    const back = await until(async () => { for (const id of ids) { const v = await acpView(AP, id); if (!v?.alive || !v.promptable) return null; } return true; }, 30000);
+    check('N37: after a hub restart the toast offers Revive all agents, Attention says 2 agents detached, and the button revives both cards', !!ready && /hub restarted/.test(ready.toast) && ready.line === '2 agents detached' && !!back && ids.every(id => acpSent(AP, id, 'revive').length >= 1), JSON.stringify({ ready, back, views: await Promise.all(ids.map(id => acpView(AP, id).then(v => v && { st: v.st, alive: v.alive }))) }));
+    if (N38) await AP.evaluate((id: string) => window.__canvas.removeNode(id), N38);
   });
   await section('acp cleanup', async () => { await AP.evaluate((id: string) => window.__canvas.removeNode(id), AID); await settled(AP); });
 }
@@ -3177,6 +3248,58 @@ await section('N63', async () => {
 });
 
 // N11: over the whole daemon phase's request log
+// fix 6 and M5-W3 (N12-N15, N33): artifacts in server mode. wb-web keeps the versions and the db; the page runs the
+// head in an opaque-origin srcdoc frame with the bridge, as block cards and the demo do.
+await section('N12-N15, N33', async () => {
+  const P = await dpage();
+  try {
+    const id: string = await P.evaluate(async () => (await window.__canvas.newArtifact('n12')).id);
+    const frameOf = async () => (await P.$(`.node[data-id="${id}"] .art-frame`))?.contentFrame();
+    const live = await until(() => P.evaluate((id: string) => { const C = window.__canvas, L = C.live[id], f = L?.frame as HTMLIFrameElement; return L?.hello ? { srcdoc: f.hasAttribute('srcdoc'), src: f.getAttribute('src'), sandbox: f.getAttribute('sandbox'), notice: L.notice.hidden, head: C.S.nodes[id].head } : null; }, id), 10000);
+    const srv = await (await api('/api/artifact/' + id)).json();
+    const disk = await until(() => { const d = boardFile()?.nodes?.[id] as ArtifactNode | undefined; return d?.head ? d : undefined; }, 8000);   // the save waits out its debounce
+    check('N12: a new artifact is published to wb-web and runs its head in a srcdoc frame; the board keeps the head, not the page',
+      !!live && live.srcdoc && live.src === null && live.notice && !!live.head && srv.meta?.head === live.head && srv.content?.kind === 'page' && srv.url === null && !!disk && disk.head === live.head && disk.html === undefined, JSON.stringify({ live, head: srv.meta?.head, disk: disk && { head: disk.head, html: !!disk.html } }));
+    const fr = await frameOf();
+    const origin = await fr!.evaluate(() => self.origin);
+    await fr!.click('#count'); await sleep(600);
+    check('N33: the artifact frame\'s origin is null, it has no allow-same-origin, and the bridge answers (db)', origin === 'null' && !/allow-same-origin/.test(live?.sandbox || '') && (await fr!.textContent('#out'))!.includes('count = 1'), JSON.stringify({ origin, sandbox: live?.sandbox, out: await fr!.textContent('#out') }));
+    // N13: artifact.publish from inside the page makes a version on the server and the frame reloads; a stale writer gets 409.
+    fr!.evaluate(() => { claude.use('artifact').then(a => a.publish('<title>Hi2</title><p id=v2>second</p>')).catch(() => {}); }).catch(() => {});
+    await until(() => P.evaluate(() => !document.querySelector<HTMLElement>('#grant')!.hidden), 3000); if (await P.evaluate(() => !document.querySelector<HTMLElement>('#grant')!.hidden)) await P.click('#grant-allow');
+    const v2 = await until(async () => { const f = await frameOf(); return f && await f.$('#v2').catch(() => null) ? f : null; }, 8000);
+    const s2 = await (await api('/api/artifact/' + id)).json();
+    const stale = await api('/api/artifact/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ html: 'x', ifMatch: srv.meta.head }) });
+    const sj = await stale.json();
+    check('N13: artifact.publish makes a second version on wb-web and the frame reloads with it; a PUT naming the old head is 409 with the current head',
+      !!v2 && s2.meta.versions.length === 2 && s2.content.html.includes('second') && await P.evaluate((id: string) => window.__canvas.S.nodes[id].head, id) === s2.meta.head && stale.status === 409 && sj.error?.code === 'conflict' && sj.error?.head === s2.meta.head, JSON.stringify({ v2: !!v2, versions: s2.meta?.versions?.length, status: stale.status, sj }));
+    // N14: the db is on wb-web (N33's count): a node whose board copy lost it takes it back.
+    const db = await (await api('/api/db/' + id)).json();
+    const restored = await P.evaluate(async (id: string) => { const C = window.__canvas, n = C.S.nodes[id]; n.db = { docs: {} }; C.dbLoad(n); for (let i = 0; i < 50 && !n.db.docs['data/counter']; i++) await new Promise(r => setTimeout(r, 100)); return n.db.docs['data/counter'] || null; }, id);
+    check('N14: the db is kept by wb-web (GET /api/db), and a node without it takes it back from there', db.docs?.['data/counter']?.n === 1 && restored?.n === 1, JSON.stringify({ db, restored }));
+    // N15: another writer (another tab, wb) publishes; reloading the card shows that head and its versions.
+    const other = await api('/api/artifact/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ html: '<p id=v3>third</p>', ifMatch: s2.meta.head }) });
+    const oj = await other.json();
+    await P.evaluate((id: string) => { const C = window.__canvas; C.artMount(C.S.nodes[id], C.live[id]); }, id);
+    const v3 = await until(async () => { const f = await frameOf(); return f && await f.$('#v3').catch(() => null) ? true : null; }, 8000);
+    const node = await P.evaluate((id: string) => { const n = window.__canvas.S.nodes[id]; return { head: n.head, versions: n.versions.length }; }, id);
+    check('N15: a version published elsewhere is what a reload of the card runs, and the node takes its head and versions', other.status === 200 && !!v3 && node.head === oj.version && node.versions === 3, JSON.stringify({ status: other.status, v3, node, version: oj.version }));
+    await P.evaluate((id: string) => window.__canvas.removeNode(id), id); await settled(P);
+  } finally { await P.close(); }
+});
+// M5-W3: the host trees. A board shell's process is listed with its card; units answer their shape whatever the host has.
+await section('N68', async () => {
+  const P = await dpage();
+  try {
+    const id = await newTerm(P, 'n68');
+    const pid = await until(async () => (await sessions()).find(s => s.sid === id)?.pty?.pid, 10000);
+    const procs = (await (await api('/api/proc')).json()).procs as ProcInfo[];
+    const me = procs.find(p => p.pid === pid), units = await (await api('/api/units')).json(), stat = await (await api('/api/status')).json();
+    check('N68: /api/proc lists a board shell\'s process with its card; /api/units and /api/status.units answer their shapes',
+      !!me && me.node === id && me.ppid > 0 && typeof me.cmd === 'string' && Array.isArray(units.units) && (units.error === null || typeof units.error === 'string') && typeof stat.units?.total === 'number', JSON.stringify({ me, units: { n: units.units?.length, error: units.error }, su: stat.units }));
+    await P.evaluate((id: string) => window.__canvas.removeNode(id), id); await settled(P);
+  } finally { await P.close(); }
+});
 await section('N11', async () => {
   st = { token: REQ.filter(e => /[?&#]token=/.test(e.url)).map(e => e.url), xtoken: REQ.filter(e => 'x-token' in e.h).map(e => e.url), ws: [...new Set(WSL.map(w => w.url))] };
   const P = await dpage(false); st.manifest = await P.evaluate(() => document.querySelector('link[rel=manifest]')?.getAttribute('crossorigin')); await P.close();
