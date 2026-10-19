@@ -1358,7 +1358,7 @@ The test runs numbered steps. The steps this design pins down:
 
 **Pass criterion for "sessions survive":** steps 4, 6 and 9 all pass in one run. The hub PID is unchanged across 4 and 6, and revive succeeds in 9.
 
-### 9.5 UI checks (N27-N68, and N12-N15 written anew for M5-F; N1-N26 are the baseline checks of `tests/ui.mts`, kept with the §6.1 amendments)
+### 9.5 UI checks (N27-N67, N72, and N12-N15 written anew for M5-F; N1-N26 are the baseline checks of `tests/ui.mts`, kept with the §6.1 amendments)
 
 | # | Check |
 |---|---|
@@ -1407,7 +1407,7 @@ The test runs numbered steps. The steps this design pins down:
 | N65 | (demo) A right-click on a card's name opens the palette at the pointer with Delete, Tag and Arrange and selects the card; on a folder's name, Free, Workspace and Delete the folder without the hidden reconnect and list buttons; on the canvas, New page/shell/folder here and Fit everything; inside a free folder, New page here makes a page in that folder with its top-left at the pointer. Shift+right-click on the canvas and a right-click in a text field are not prevented and open no palette. Delete from the menu removes the card on the second pick, not the first (F-A34) |
 | N66 | (demo) Right-click fixes (F-A34). In a shell card, after a right-click the keys are back in its terminal when the menu is closed by Esc, by a press outside it, or by Copy. With a canvas shell card selected and the keys in the docked terminal, the menu key opens the Terminal menu for the dock (Copy sees the dock's selection), anchored on it. After a Shift-F10 the page did not get, a right-click on the canvas opens Canvas at the pointer. A right-click on selected ink opens Selection. A right-click on the status line is not prevented and opens nothing. In the graph view, `.` with no node selected opens no palette |
 | N67 | A save between a page's `GET /api/board` and its `/rpc` subscription (the boot GET answered with the board from before another writer's PUT): the clean page takes the newer board and its tag from the connect snapshot's `board{etag}`, with no bar |
-| N68 | `/api/proc` lists a board shell's process with `node` = its card; `/api/units` and `/api/status.units` answer their shapes whatever the host has (M5-W3) |
+| N72 | `/api/proc` lists a board shell's process with `node` = its card; `/api/units` and `/api/status.units` answer their shapes whatever the host has (M5-W3) |
 
 ### 9.6 v1 acceptance (all must hold before the dogfood clock starts)
 1. `nix flake check` is green on a kvm-capable host: package, clippy, fmt, conformance, security, ui, adapters, module and vm.
@@ -1526,7 +1526,7 @@ The test runs numbered steps. The steps this design pins down:
 
 **Superseded (2026-10-12):** M5-W1 and M5-W2 are not built in Rust. Edwin, run headless as the text daemon edwind, owns the notes index and the `sample` backend instead, with provider-agnostic model backends and keys on the server; pages become files in `notesDir`. The plan is in `edwin/README.md`. M5-W3, M5-F and the parts of M5-T and M5-N that do not depend on W1 and W2 stand.
 
-**M5-W3 and M5-F built (2026-10-19):** `artifacts.rs` (versions, the 409, `db.json`), `host.rs` (`/proc`, `systemctl` read only; control still 403), fix 6 (server-mode artifact cards run the head in an opaque `srcdoc` frame with the bridge; `artifactOrigin` stays `null`), with `crates/wb-web/tests/{artifacts,host}.rs` (the test wb-web gets a fake `systemctl` first on its `PATH`) and ui checks N12-N15, N33 and N68. Not built: `dist/canvas-workbench.html` (M5-N), so `/api/info.dist` stays `null` and "open the Workbench demo inside itself" stays hidden. The artifact db is page state, not notes or tasks, so it stays in wb-web and does not go through brain.
+**M5-W3 and M5-F built (2026-10-19):** `artifacts.rs` (versions, the 409, `db.json`), `host.rs` (`/proc`, `systemctl` read only; control still 403), fix 6 (server-mode artifact cards run the head in an opaque `srcdoc` frame with the bridge; `artifactOrigin` stays `null`), with `crates/wb-web/tests/{artifacts,host}.rs` (the test wb-web gets a fake `systemctl` first on its `PATH`) and ui checks N12-N15, N33 and N72. Not built: `dist/canvas-workbench.html` (M5-N), so `/api/info.dist` stays `null` and "open the Workbench demo inside itself" stays hidden. The artifact db is page state, not notes or tasks, so it stays in wb-web and does not go through brain.
 
 **M5 exit:** all of §9.6 holds. The **two-week dogfood clock** starts, and it ends with the removal review: every feature untouched in two weeks is listed for deletion (§1).
 
