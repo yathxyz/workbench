@@ -3,8 +3,8 @@
 // bufferAddress, fmtAddr and resolveBufferAddress in web/app.ts over generated cases.
 //
 // The three JavaScript functions are cut out of app.ts (types stripped) by their source text and run in a vm
-// context with small stand-ins for the page: nodeList() over generated buffers, live[id].view
-// .state.doc as a real CodeMirror Text, and clamp. Cases come from a seeded generator, so a
+// context with small stand-ins for the page: nodeList() over generated buffers, pageState(n).doc as app.ts's own
+// TextDoc (cut out the same way), and clamp. Cases come from a seeded generator, so a
 // failing case is one integer; those go to address-seeds.json and are replayed first (R16.1).
 // Run: node --test edwin/test/address.test.mts (ADDRESS_RUNS, ADDRESS_SEED tune fast-check).
 import { test } from 'node:test';
@@ -20,7 +20,7 @@ import type { SchemeValue } from './scheme-load.mts';
 interface Page { name: string; text: string; kind?: string }
 /* A page as the page's nodeList() gives it. */
 interface PageNode { id: string; kind: string; name: string }
-/* A CodeMirror Text from @codemirror/state, opaque here: only app.js reads it. */
+/* A TextDoc from web/app.ts, opaque here: only app.js reads it. */
 type Doc = unknown;
 /* An address as bufferAddress gives it. */
 interface JsAddress { name: string; path: string[]; para: number; quote: string }
@@ -34,9 +34,8 @@ interface Rand { next(): number; int(lo: number, hi: number): number; pick<T>(xs
 interface Case { seed: number; pages: Page[]; name: string; text: string; pos: number; q: string }
 
 const require = createRequire(import.meta.url);
-// fast-check and @codemirror/state are pinned in tools/package-lock.json; NODE_PATH names tools/node_modules.
+// fast-check is pinned in tools/package-lock.json; NODE_PATH names tools/node_modules.
 const fc = require('fast-check'); // any: fast-check's types are not resolvable from edwin/ (it lives in tools/node_modules)
-const { Text } = require('@codemirror/state'); // any: as fast-check, @codemirror/state lives in tools/node_modules
 const SEEDS: number[] = JSON.parse(readFileSync(new URL('./address-seeds.json', import.meta.url), 'utf8'));
 const RUNS = Number(process.env.ADDRESS_RUNS || 500);
 
@@ -58,22 +57,25 @@ const cut = appSource.match(/function bufferAddress\([^)]*\)[^{]*\{[\s\S]*?\n(?=
 assert.ok(cut, 'bufferAddress is in web/app.ts');
 const jsSource = cut[0];
 for (const fn of ['function fmtAddr(', 'function resolveBufferAddress(']) assert.ok(jsSource.includes(fn), `${fn} follows bufferAddress`);
+// The page's text as the address code reads it (pageState(n).doc): app.ts's TextDoc.
+const docCut = appSource.match(/\nclass TextDoc [^{]*\{[\s\S]*?\n\}\n/);
+assert.ok(docCut, 'class TextDoc is in web/app.ts');
 
-const page: { pages: PageNode[]; live: Record<string, { view: { state: { doc: Doc } } }> } = { pages: [], live: {} };
+const page: { pages: PageNode[]; docs: Record<string, Doc> } = { pages: [], docs: {} };
 const ctx = vm.createContext({
   clamp: (v: number, a: number, b: number) => Math.max(a, Math.min(b, v)),
   nodeList: () => page.pages,
-  live: page.live,
-  // the page's state in either editor mode (app.js pageState): here always the CodeMirror view's
-  pageState: (n: PageNode) => page.live[n.id]?.view?.state || null,
+  // the page's state (app.js pageState): {doc} over its text
+  pageState: (n: PageNode) => (n.id in page.docs ? { doc: page.docs[n.id] } : null),
 });
-vm.runInContext(jsSource, ctx, { filename: 'app.js (addresses)' });
+vm.runInContext(docCut[0] + '\nglobalThis.TextDoc = TextDoc;\n' + jsSource, ctx, { filename: 'app.js (addresses)' });
 const { bufferAddress, fmtAddr, resolveBufferAddress } = ctx as AppAddresses;
-const makeDoc = (text: string): Doc => Text.of(text.split('\n'));
+const TextDoc = (ctx as { TextDoc: new (text: string) => Doc }).TextDoc;
+const makeDoc = (text: string): Doc => new TextDoc(text);
 const setPages = (pages: Page[]) => {
   page.pages = pages.map((p, i) => ({ id: 'n' + i, kind: p.kind || 'buffer', name: p.name }));
-  for (const k of Object.keys(page.live)) delete page.live[k];
-  pages.forEach((p, i) => { page.live['n' + i] = { view: { state: { doc: makeDoc(p.text) } } }; });
+  for (const k of Object.keys(page.docs)) delete page.docs[k];
+  pages.forEach((p, i) => { page.docs['n' + i] = makeDoc(p.text); });
 };
 const jsFormat = (name: string, text: string, pos: number) => fmtAddr(bufferAddress({ name }, { doc: makeDoc(text) }, pos));
 const jsResolve = (q: string, pages: Page[]) => {

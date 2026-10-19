@@ -4,11 +4,10 @@
 //
 // <web-root> (or $WB_WEB_ROOT) is the built web output (`nix build .#workbench-web`: web/ plus vendor/ and fonts/). The
 // harness takes wb-hub, edwind, wb-web, wb-fake-acp and caddy from PATH (edwind falls back to edwin/server/main.mts under
-// node); the Caddy configs for the expired and login-page modes sit next to it in caddy/. WB_FRAMES=1 runs the daemon
-// phase with pages as Edwin frames (harness --frames): the same checks, with the page's text read through the board's
-// pageText and the selectors of the Q map, plus the 'frames' section (two tabs, presence, an edwind restart, the
-// offline notice, board migration, the frame cap, the console page, agent tools: R16.9-R16.11), which in CodeMirror
-// mode is one ok line, so the two modes' counts differ by that section's size by design.
+// node); the Caddy configs for the expired and login-page modes sit next to it in caddy/. Served pages are Edwin frames
+// (edwind spec R9.21): the page's text is read through the board's pageText, the frame's DOM through the Q map, and the
+// 'frames' section drives two tabs, presence, an edwind restart, the offline notice, board migration, the frame cap,
+// the console page and agent tools (R16.9-R16.11). The demo has no edwind: its pages are read-only.
 // Each check prints ok, FAIL or skip. The exit status is 0 only when every check ran and passed.
 //
 // Demo phase: the page inlined the way tools/build-artifact.py inlines it, opened from file://.
@@ -137,29 +136,31 @@ await ftouch('touchend', []); await sleep(200);
 st.end = await p.evaluate(() => ({ z: window.__canvas.S.cam.z, touching: document.querySelector('#viewport')!.classList.contains('touching'), ids: window.__canvas.FTOUCH.ids.size }));
 check('N68: two fingers in an artifact pinch the board\'s camera (spread 60 to 120 px: zoom 2x) and the page does not scroll meanwhile; lifting them ends the pinch', st.held && st.mid.panning && Math.abs(st.mid.z / st.z0 - 2) < 0.03 && !st.end.touching && st.end.ids === 0, JSON.stringify(st));
 await p.evaluate((z: number) => { const C = window.__canvas; C.S.cam.z = z; C.applyCam(); }, st.z0);
-// F-A25: an html fence in a page torn out as a block card, bound to the block (hypernotes H0)
+// F-A25: an html fence in a page torn out as a block card, bound to the block (hypernotes H0). The demo has no edwind:
+// the page is read-only, and the board's own edits (pageSetText, pageEdit, tear_out_block) change its text.
 const blockFrame = (sel: string) => until(async () => { for (const f of p.frames()) { try { if (await f.$(sel)) return f; } catch {} } return null; }, 8000);
 st = await p.evaluate(async () => {
-  const c = window.__canvas, pg = c.openPage('hn-blocks', null, true), v = c.live[pg.id].view;
-  v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: '# hn\n\n```html {#chart card=420x260}\n<p id=hnv>one</p>\n```\n\n```js\n```html\n```\n\n~~~html\n<b id=hnw>two</b>\n~~~\n' } });
-  const ids = c.htmlBlocks(v.state.doc.toString()).map((b: { id: string | null }) => b.id);
-  const tear = [...c.live[pg.id].el.querySelectorAll('.cm-tear')];
+  const c = window.__canvas, pg = c.openPage('hn-blocks', null, true);
+  await c.pageSetText(pg, '# hn\n\n```html {#chart card=420x260}\n<p id=hnv>one</p>\n```\n\n```js\n```html\n```\n\n~~~html\n<b id=hnw>two</b>\n~~~\n');
+  const ids = c.htmlBlocks(c.pageText(pg.id)).map((b: { id: string | null }) => b.id);
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));   // the chips are placed after the text is drawn
+  const tear = [...c.live[pg.id].el.querySelectorAll('.fr-tear')];
   tear[1]?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
   const byWidget = Object.values<ArtifactNode>(c.S.nodes).find(n => n.block?.page === pg.id);
   const out = await c.AGENT_TOOLS.find((t: AgentTool) => t.name === 'tear_out_block').run({ page: 'hn-blocks', block: 'chart' });
   const chart = Object.values<ArtifactNode>(c.S.nodes).find(n => n.block?.page === pg.id && n.block!.id === 'chart');
-  return { page: pg.id, ids, tears: tear.length, widget: byWidget?.block?.id, info: v.state.doc.toString().includes('~~~html {#block1}'), out, chart: chart && { id: chart.id, w: chart.w, h: chart.h, caps: Object.keys(chart.capabilities).join(), html: 'html' in chart, edge: c.S.edges.some((e: Edge) => e.from === pg.id && e.to === chart.id && e.type === 'ref') } };
+  return { page: pg.id, ids, tears: tear.length, widget: byWidget?.block?.id, info: c.pageText(pg.id).includes('~~~html {#block1}'), out, chart: chart && { id: chart.id, w: chart.w, h: chart.h, caps: Object.keys(chart.capabilities).join(), html: 'html' in chart, edge: c.S.edges.some((e: Edge) => e.from === pg.id && e.to === chart.id && e.type === 'ref') } };
 });
 check('block cards: the fence button and tear_out_block make cards bound to page blocks; an id is written for a block without one', st.ids.join() === 'chart,' && st.tears === 2 && st.widget === 'block1' && st.info && st.out.startsWith('created') && st.chart?.w === 420 && st.chart.h === 260 && st.chart.caps === 'sample,db' && !st.chart.html && st.chart.edge, JSON.stringify(st));
 let bf = await blockFrame('#hnv');
 const bfOrigin = bf && await bf.evaluate(() => origin);
 check('block card: the block renders in an opaque-origin frame', !!bf && bfOrigin === 'null' && (await bf.textContent('#hnv')) === 'one', String(bfOrigin));
-await p.evaluate(id => { const v = window.__canvas.live[id].view, d = v.state.doc.toString(), i = d.indexOf('one'); v.dispatch({ changes: { from: i, to: i + 3, insert: 'uno' } }); }, st.page);
+await p.evaluate(id => { const c = window.__canvas, d = c.pageText(id), i = d.indexOf('one'); c.pageEdit(c.S.nodes[id], i, i + 3, 'uno'); }, st.page);
 bf = await until(async () => { const f = await blockFrame('#hnv'); return f && (await f.textContent('#hnv')) === 'uno' ? f : null; }, 6000);
 check('block card: an edit to the block reloads the card', !!bf);
 const gone = await p.evaluate(async ([pid, cid]) => {
-  const c = window.__canvas, v = c.live[pid].view, d = v.state.doc.toString(), a = d.indexOf('```html {#chart'), b = d.indexOf('```\n', d.indexOf('<p id=hnv>')) + 4;
-  v.dispatch({ changes: { from: a, to: b } }); await new Promise(r => setTimeout(r, 900));
+  const c = window.__canvas, d = c.pageText(pid), a = d.indexOf('```html {#chart'), b = d.indexOf('```\n', d.indexOf('<p id=hnv>')) + 4;
+  c.pageEdit(c.S.nodes[pid], a, b, ''); await new Promise(r => setTimeout(r, 900));
   const L = c.live[cid]; return { hidden: L.notice.hidden, text: L.notice.textContent };
 }, [st.page, st.chart?.id]);
 check('block card: a removed block leaves a notice in the card', !gone.hidden && gone.text.includes('no html block #chart'), JSON.stringify(gone));
@@ -172,6 +173,21 @@ const adopted = await p.evaluate(async pid => {   // another tab removed the pag
 }, st.page);
 check('block card: a page removed in another tab leaves a notice in its cards', !adopted.page && adopted.hidden === false && adopted.text === 'The page this card came from is gone.', JSON.stringify(adopted));
 await p.evaluate(pid => { const c = window.__canvas; for (const n of Object.values<ArtifactNode>(c.S.nodes)) if (n.block?.page === pid) c.removeNode(n.id); if (c.S.nodes[pid]) c.removeNode(pid); }, st.page);
+// N71 (F-A39): with no edwind there is no page editor: a page card and the Editor view show the text read-only with a
+// notice, the text has no editable element, and no CodeMirror is left anywhere in the page
+st = await p.evaluate(async () => {
+  const c = window.__canvas, pg = c.openPage('ro-page', null, true);
+  await c.pageSetText(pg, '# ro\n\nline two\n');
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const body = c.live[pg.id].el, pre = body.querySelector('pre.ro-text') as HTMLElement | null;
+  const card = { text: pre?.textContent, editable: !!body.querySelector('[contenteditable=""], [contenteditable="true"], textarea, .cm-editor') || pre?.isContentEditable, notice: body.querySelector('.ro-off')?.textContent };
+  c.ED.node = null; c.S.edPage = pg.id; c.setView('editor');
+  const ed = { text: document.querySelector('#ed-host .ed-ro')?.textContent, notice: document.querySelector('#ed-host .fr-off')?.textContent };
+  c.setView('canvas'); c.removeNode(pg.id);
+  return { card, ed, cm: !!document.querySelector('[class^="cm-"], [class*=" cm-"]') };
+});
+check('N71: no edwind: a page card and the Editor view show the text read-only with the demo notice; no CodeMirror in the page',
+  st.card.text === '# ro\n\nline two\n' && !st.card.editable && /^Read-only in the demo/.test(st.card.notice) && st.ed.text === st.card.text && st.ed.notice === st.card.notice && !st.cm, JSON.stringify(st));
 // v8 nodes in demo mode
 st = await p.evaluate(() => { const w = window.__canvas.newWeb('example.org/a'); const s = window.__canvas.newSketch(); const L = window.__canvas.live[w.id]; return { url: w.url, name: w.name, frame: !!L.frame, bar: !!L.urlInput, sketch: s.kind, agentHidden: !document.querySelector('#add-agent'), emacsOff: document.querySelector<HTMLInputElement>('#add-emacs')!.disabled }; });
 check('web and sketch nodes, agent button hidden', st.url === 'https://example.org/a' && st.name === 'example.org' && st.frame && st.bar && st.sketch === 'sketch' && st.agentHidden && st.emacsOff, JSON.stringify(st));
@@ -825,13 +841,13 @@ st = await p.evaluate(async () => { const C = window.__canvas, S = C.S, sl = (ms
 const tk = st;
 check('tasks view: four columns over the keyword set, priority and dates as meta, overdue in red, HOLD shown in Waiting with its keyword; list_tasks addresses', st.cols.join() === 'TODO:1,NEXT:1,WAITING:1,DONE:1' && /#A/.test(st.meta) && /2026-10-01/.test(st.meta) && st.over && st.holdCol === 'WAITING' && /^HOLD Wait/.test(st.holdTitle) && st.ttext === 'Write the v15 tests cover the four columns' && st.found && st.stc.some((x: string) => /^☐ \d+ \(\d+ due\)/.test(x)) && st.attn.some((x: string) => /^overdue Write the v15 tests/.test(x)) && st.ls.some((l: string) => /^board:\/todo:3 · TODO · Write the v15 tests \[#A\] · scheduled 2026-10-01$/.test(l)), JSON.stringify(st));
 await p.keyboard.press('t'); await sleep(200);
-const pgText1 = await p.evaluate(id => window.__canvas.live[id].view.state.doc.toString(), tk.pg);
+const pgText1 = await p.evaluate(id => window.__canvas.pageText(id), tk.pg);
 await p.keyboard.press('d'); await sleep(900);
-st = await p.evaluate(({ pg, sh }) => { const C = window.__canvas; const text = C.live[pg].view.state.doc.toString(); const m = text.match(/session:: board:(\S+)/), target = m && (C.findNode(m[1]) || C.findNode(m[1].replace(/^\//, ''))), term = target ? C.termLines(C.live[target.id], 20).join('|') : '', agentTag = target && C.tagsOf(target).includes('agent'); const cols = [...document.querySelectorAll<HTMLElement>('#tk-board .tk-col')].map(c => c.dataset.col + ':' + [...c.querySelectorAll('.tk-card')].filter(x => x.querySelector<HTMLElement>('.tk-page')!.dataset.addr!.startsWith('board:/todo:')).length); const sess = [...document.querySelectorAll('.tk-card .tk-meta .sess')].map(x => x.textContent); return { text, term, agentTag, cols, sess }; }, tk);
+st = await p.evaluate(({ pg, sh }) => { const C = window.__canvas; const text = C.pageText(pg); const m = text.match(/session:: board:(\S+)/), target = m && (C.findNode(m[1]) || C.findNode(m[1].replace(/^\//, ''))), term = target ? C.termLines(C.live[target.id], 20).join('|') : '', agentTag = target && C.tagsOf(target).includes('agent'); const cols = [...document.querySelectorAll<HTMLElement>('#tk-board .tk-col')].map(c => c.dataset.col + ':' + [...c.querySelectorAll('.tk-card')].filter(x => x.querySelector<HTMLElement>('.tk-page')!.dataset.addr!.startsWith('board:/todo:')).length); const sess = [...document.querySelectorAll('.tk-card .tk-meta .sess')].map(x => x.textContent); return { text, term, agentTag, cols, sess }; }, tk);
 // st.term joins the terminal's rows with |, and a narrow card wraps the pasted line.
 check('t cycles the keyword in the page; d pastes title + body into a shell tagged #agent and writes session:: / dispatched:: under the task', /- NEXT Write the v15 tests \[#A\]/.test(pgText1) && st.agentTag && /Write the v15 tests cover the four columns/.test(st.term.replaceAll('|', '')) && /\n  session:: board:\/\S+\n  dispatched:: 20\d\d-\d\d-\d\dT\d\d:\d\d\n  SCHEDULED: <2026-10-01 Wed>/.test(st.text) && st.cols.join() === 'TODO:0,NEXT:2,WAITING:1,DONE:1' && st.sess.some((x: string) => /^⇢ board:\//.test(x)), JSON.stringify({ pgText1, st }));
 await p.keyboard.press('T'); await sleep(200);
-st = await p.evaluate(async ({ pg, sh }) => { const C = window.__canvas; const text = C.live[pg].view.state.doc.toString(); const r = await C.AGENT_TOOLS.find((x: AgentTool) => x.name === 'set_task').run({ task: 'todo:3', keyword: 'DONE' }); const text2 = C.live[pg].view.state.doc.toString(); C.setView('canvas'); C.removeNode(pg); C.removeNode(sh); return { text, r, text2 }; }, tk);
+st = await p.evaluate(async ({ pg, sh }) => { const C = window.__canvas; const text = C.pageText(pg); const r = await C.AGENT_TOOLS.find((x: AgentTool) => x.name === 'set_task').run({ task: 'todo:3', keyword: 'DONE' }); const text2 = C.pageText(pg); C.setView('canvas'); C.removeNode(pg); C.removeNode(sh); return { text, r, text2 }; }, tk);
 check('T cycles back (NEXT → TODO); set_task writes a keyword by reference', /- TODO Write the v15 tests/.test(st.text) && st.r === 'board:/todo:3 → DONE' && /- DONE Write the v15 tests/.test(st.text2), JSON.stringify(st));
 // N61 (F-A30): a long source path and a long unbroken title stay inside their column; the view (window less dock) picks 4, 2 or 1 columns
 const tkFit = async () => p.evaluate(async () => { const C = window.__canvas, sl = (ms: number) => new Promise(r => setTimeout(r, ms)); C.setView('tasks'); await sl(250);
@@ -1065,8 +1081,6 @@ const EXIT_HUB = 'the Workbench hub restarted';   // app.js EXIT_TEXT.hub_restar
 // Without WB_HARNESS_TCP: the browser goes through the forwarder below, which N6 cuts, and the harness's own TCP
 // entry would take its port.
 const { WB_HARNESS_TCP, ...harnessEnv } = process.env;
-// WB_FRAMES=1: pages are Edwin frames (web.json frames: true); the same checks run on either implementation (R16.8).
-const FRAMES = process.env.WB_FRAMES === '1';
 // N74: an image provider on the OpenAI protocol (web.json media, harness --media). Each call answers solid PNGs, one
 // colour per variation, so variations differ by hash; MEDIA keeps what each call asked for.
 const MEDIA: { path: string; body: string }[] = [];
@@ -1088,7 +1102,7 @@ const media = http.createServer((req, res) => {
 });
 await new Promise<void>(r => media.listen(0, '127.0.0.1', () => r()));
 const MEDIA_URL = `http://127.0.0.1:${(media.address() as net.AddressInfo).port}/v1`;
-const harness = spawn('python3', ['-I', HARNESS, '--web-root', ROOT, '--media', MEDIA_URL, ...(FRAMES ? ['--frames'] : [])], { stdio: ['pipe', 'pipe', 'pipe'], env: harnessEnv });
+const harness = spawn('python3', ['-I', HARNESS, '--web-root', ROOT, '--media', MEDIA_URL], { stdio: ['pipe', 'pipe', 'pipe'], env: harnessEnv });
 let hlog = ''; harness.stderr.on('data', d => { hlog += d; });
 // The harness's stdout is JSON lines: the info line first, then one {event, what} per control line sent to its stdin.
 /* The harness's info line (harness.py info()) and its answers to control lines. */
@@ -1154,7 +1168,7 @@ async function dpage(boot = true): Promise<import('playwright-core').Page> {
   const p = await ctx.newPage(); watchErrors(p); record(p);
   await p.goto(ORIGIN + '/');
   if (boot) await until(() => p.evaluate(() => window.__canvas?.BOOTED));
-  if (boot && FRAMES) await until(() => p.evaluate(() => window.__perf?.frame?.ready), 30000);   // the Scheme boot blocks the tab's main thread
+  if (boot) await until(() => p.evaluate(() => window.__perf?.frame?.ready), 30000);   // the Scheme boot blocks the tab's main thread
   return p;
 }
 const ptyOf = (p: import('playwright-core').Page, id?: string | null, since = 0) => WSL.filter(w => w.p === p && w.url.endsWith('/pty') && w.t >= since && (!id || w.open?.id === id));
@@ -1169,8 +1183,7 @@ const moveCard = (p: import('playwright-core').Page, dx = 40) => p.evaluate(dx =
 const settled = (p: import('playwright-core').Page) => until(() => p.evaluate(() => { const s = window.__canvas.SAVE; return !s.busy && !s.pending && !s.paused; }), 8000);
 const barOf = (p: import('playwright-core').Page) => p.evaluate(() => { const b = document.querySelector<HTMLElement>('#bar')!; return { hidden: b.hidden, key: b.dataset.key, text: b.querySelector('.msg')!.textContent }; });
 const palLabels = (p: import('playwright-core').Page) => p.evaluate(() => [...document.querySelectorAll('#pal-list .pi .l')].map(x => x.textContent));
-// The one place a page's text is read for an assertion: the board's pageText (the CodeMirror document, or the replica
-// text in frames mode), so the checks read the same text in either mode.
+// The one place a page's text is read for an assertion: the board's pageText (the replica text).
 const pageText = (p: import('playwright-core').Page, id: string) => p.evaluate((id): string => window.__canvas.pageText(id), id);
 // One failing step must not hide the checks after it (30 §10.1).
 async function section(name: string, f: () => unknown): Promise<void> { try { await f(); } catch (e) { check(name + ' (threw)', false, String(e?.message || e).split('\n')[0]); } }
@@ -2302,17 +2315,15 @@ await section('N49', async () => {
   } finally { await P.close(); }
 });
 
-// The page editor's DOM in either mode (R16.8: the checks name behaviours, this map names where each one shows):
-// the text to click into, a line, a completion candidate, a wiki link, the rendered ((ref)), a task keyword mark,
-// the element whose colours the theme check reads (a frame's background is the card body's: look falls back to it).
-const Q = FRAMES
-  ? { content: '.edwin-frame .text', line: '.edwin-frame .ln', opts: '.corfu .cand', link: '.markdown-wiki-link', ref: '.markdown-block-ref-display', task: '[class*="markdown-task-"]', look: '.edwin-frame' }
-  : { content: '.cm-content', line: '.cm-line', opts: '.cm-tooltip-autocomplete li[role=option]', link: '.cm-wikilink[data-page="pg-beta"]', ref: '.blockref', task: '.cm-task', look: '.cm-editor' };
-/* The page DOM's selectors for this run's page implementation. */
+// The frame's DOM (R16.8: the checks name behaviours, this map names where each one shows): the text to click into, a
+// line, a completion candidate, a wiki link, the rendered ((ref)), a task keyword mark, the element whose colours the
+// theme check reads (a frame's background is the card body's: look falls back to it).
+const Q = { content: '.edwin-frame .text', line: '.edwin-frame .ln', opts: '.corfu .cand', link: '.markdown-wiki-link', ref: '.markdown-block-ref-display', task: '[class*="markdown-task-"]', look: '.edwin-frame' };
+/* The frame DOM's selectors. */
 type PageSelectors = typeof Q;
 
 // R16.8: page cards, driven through the UI (keys, clicks, the palette, header buttons); each check names a behaviour
-// the page has today and must keep when pages become Edwin frames. The page's text is read through pageText only.
+// the page kept from its CodeMirror days, as an Edwin frame. The page's text is read through pageText only.
 // The browser's speech engine is replaced by one that says window.__speech: dictation is the page's own path from
 // a recognition result to an insertion at the cursor.
 await section('pages', async () => {
@@ -2326,7 +2337,7 @@ await section('pages', async () => {
     } as new () => SpeechRecognitionLike;
   });
   await P.goto(ORIGIN + '/'); await until(() => P.evaluate(() => window.__canvas?.BOOTED)); await P.bringToFront();
-  if (FRAMES) await until(() => P.evaluate(() => window.__perf?.frame?.online), 20000);   // replicas open once the /edit socket is up
+  await until(() => P.evaluate(() => window.__perf?.frame?.online), 20000);   // replicas open once the /edit socket is up
   try {
     const edit = (await (await api('/api/status')).json()).edit;
     check('pages: wb-web reaches the editing server the harness started (/api/status.edit.up)', edit?.up === true, JSON.stringify(edit));
@@ -2339,7 +2350,7 @@ await section('pages', async () => {
     const active = () => P.evaluate(() => document.querySelector<HTMLElement>('#world .node.active')?.dataset.id || null);
     const inPage = (id: string) => P.evaluate((id: string) => !!document.activeElement?.closest(`.node[data-id="${id}"] .body`), id);
     const leave = async () => { await P.keyboard.press('Escape'); await P.evaluate(() => (document.activeElement as HTMLElement | null)?.blur()); await sleep(100); };
-    const vim = await P.evaluate(() => window.__canvas.S.vim ?? true);
+    const vim = true;   // an Edwin frame starts in evil's normal state
     // the keyboard into the card (Enter on the active card), then to the end of the text, inserting
     const enterPage = async (id: string) => { await show(id); await P.evaluate(() => (document.activeElement as HTMLElement | null)?.blur()); await P.keyboard.press('Enter'); await sleep(300); };
     const appendAt = async () => { if (vim) { await P.keyboard.press('Shift+G'); await P.keyboard.press('Shift+A'); } else await P.keyboard.press('Control+End'); };
@@ -2351,7 +2362,7 @@ await section('pages', async () => {
 
     // typing: click into the page, type, the text is in the page
     await show(alpha);
-    if (FRAMES) await sleep(800);   // the new pages' files are being made and opened; the first click must land on a frame
+    await sleep(800);   // the new pages' files are being made and opened; the first click must land on a frame
     await P.click(card(alpha) + ' ' + Q.content); await sleep(100); await appendAt();
     await P.keyboard.type(' typed-here');
     st = { inPage: await inPage(alpha), text: await pageText(P, alpha) };
@@ -2586,9 +2597,9 @@ await section('N52', async () => {
     await P.evaluate(() => { window.__n52.length = 0; });
     await P.keyboard.press('Control+Space'); await P.keyboard.press('Control+Space'); await sleep(200);
     const nul = await P.evaluate(() => window.__n52.join('')), still2 = await inTermOf(P, id);
-    // a page leaves C-k to the board, and the leader's Esc leaves it too; in frames mode the page is an Edwin frame, which
-    // owns every key but the leader (edwind spec R9.7, the `edwin` interior of keys.js), so C-k is Edwin's and the palette stays shut
-    const pageInterior = FRAMES ? 'edwin' : 'page';
+    // a page is an Edwin frame, which owns every key but the leader (edwind spec R9.7, the `edwin` interior of keys.js), so
+    // C-k is Edwin's and the palette stays shut; the leader's Esc leaves it
+    const pageInterior = 'edwin';
     const pg = await P.evaluate(() => { const C = window.__canvas, n = Object.values<BoardNode>(C.S.nodes).find(n => n.kind === 'buffer' && !C.stashed(n)); C.typeInto(n); return n!.id; });
     // typeInto may first bring the page into view; the keyboard is in it once its element has the focus
     const inPage = () => until(() => P.evaluate(([id, k]: string[]) => !!document.activeElement?.closest(`.node[data-id="${id}"]`) && window.__canvas.keyContext().interior === k, [pg, pageInterior]));
@@ -2597,8 +2608,8 @@ await section('N52', async () => {
     await P.evaluate((id: string) => window.__canvas.typeInto(window.__canvas.S.nodes[id]), pg); await inPage();
     await P.keyboard.press('Control+Space'); await P.keyboard.press('Escape'); await sleep(200);
     const leftPage = await P.evaluate((id: string) => ({ ctx: window.__canvas.keyContext(), sel: document.querySelector<HTMLElement>('.active[data-id]')?.dataset.id === id }), pg);
-    check('N53: the leader\'s Esc leaves a shell and a page with the card still selected; the leader twice reaches the shell; C-k in a page ' + (FRAMES ? 'is Edwin\'s (the palette stays shut)' : 'opens the palette'),
-      !left.ctx.interior && left.sel && nul === '\x00' && still2 && pal === !FRAMES && !leftPage.ctx.interior && leftPage.sel, JSON.stringify({ left, nul, still2, pal, leftPage }));
+    check('N53: the leader\'s Esc leaves a shell and a page with the card still selected; the leader twice reaches the shell; C-k in a page is Edwin\'s (the palette stays shut)',
+      !left.ctx.interior && left.sel && nul === '\x00' && still2 && !pal && !leftPage.ctx.interior && leftPage.sel, JSON.stringify({ left, nul, still2, pal, leftPage }));
     await P.evaluate((id: string) => window.__canvas.removeNode(id), id); await settled(P);
   } finally { await P.close(); }
 });
@@ -2779,9 +2790,7 @@ await section('N58', async () => {
 // the console page, agent tools through the replica (R13.7), click-to-point under zoom (R9.9). Each check names a
 // behaviour; the DOM read is the frame's lines (.ln), the mode line's sync field (.ml-sync), the notice (.fr-off) and
 // the presence layer (.ed-presence). edwind is stopped and started through the harness's stdin controls.
-// In CodeMirror mode the section is one ok line: there is no frame to drive.
 await section('frames', async () => {
-  if (!FRAMES) { check('frames: pages are CodeMirror in this run (WB_FRAMES unset): the frame checks are off', true); return; }
   const card = (id: string) => `.node[data-id="${id}"]`;
   const frDom = (p: TailPage, id: string) => p.evaluate((id: string) => [...document.querySelectorAll(`.node[data-id="${id}"] .edwin-frame .ln`)].map(l => l.textContent).join('\n'), id);
   const frLive = (p: TailPage, id: string) => p.evaluate((id: string) => !!window.__canvas.live[id]?.frame, id);
@@ -2790,7 +2799,7 @@ await section('frames', async () => {
   const frPresence = (p: TailPage, id: string) => p.evaluate((id: string) => [...document.querySelectorAll(`.node[data-id="${id}"] .edwin-frame .ed-presence .pc span`)].map(s => s.textContent), id);
   const online = (p: TailPage) => until(() => p.evaluate(() => window.__perf?.frame?.online), 30000);
   const show = async (p: TailPage, id: string) => { await p.evaluate((id: string) => { const C = window.__canvas; C.jumpNode(C.S.nodes[id], 1); }, id); await sleep(700); };
-  let vim = true;
+  const vim = true;   // an Edwin frame starts in evil's normal state
   // Enter on the card puts the keyboard in its frame; then to the end of the text, inserting
   const enterPage = async (p: TailPage, id: string) => { await p.bringToFront(); await show(p, id); await p.evaluate(() => (document.activeElement as HTMLElement | null)?.blur()); await p.keyboard.press('Enter'); await until(() => frLive(p, id), 5000); await sleep(200); };
   const appendAt = async (p: TailPage) => { if (vim) { await p.keyboard.press('Shift+G'); await p.keyboard.press('Shift+A'); } else await p.keyboard.press('Control+End'); };
@@ -2811,7 +2820,6 @@ await section('frames', async () => {
 
   // (a) two tabs on one page: A makes the page, B opens the board once the page is saved with its buffer id
   const A2 = await dpage(); await A2.bringToFront(); await online(A2);
-  vim = await A2.evaluate(() => window.__canvas.S.vim ?? true);
   const two = await mk(A2, 'fr-two', '# fr-two\n\nline one\nline two', 12000, 12000);
   const twoBuf = await bufOf(A2, two); await settled(A2);
   const B2 = await dpage(); await online(B2);
@@ -2871,9 +2879,9 @@ await section('frames', async () => {
   const blk = await mk(A2, 'fr-blocks', '# fr-blocks\n\n```html {#frv card=300x200}\n<p id=frv>one</p>\n```\n\n~~~html\n<b>two</b>\n~~~\n', 12000, 13000);
   await bufOf(A2, blk); await settled(A2);
   await show(A2, blk); await until(() => frLive(A2, blk), 10000);
-  const tearChips = (id: string) => A2.evaluate((id: string) => document.querySelectorAll(`.node[data-id="${id}"] .fr-anchors .cm-tear`).length, id);
+  const tearChips = (id: string) => A2.evaluate((id: string) => document.querySelectorAll(`.node[data-id="${id}"] .fr-anchors .fr-tear`).length, id);
   const chips = await until(async () => (await tearChips(blk)) === 2 ? 2 : null, 5000);
-  await A2.evaluate((id: string) => document.querySelectorAll(`.node[data-id="${id}"] .fr-anchors .cm-tear`)[1]?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true })), blk);
+  await A2.evaluate((id: string) => document.querySelectorAll(`.node[data-id="${id}"] .fr-anchors .fr-tear`)[1]?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true })), blk);
   const torn = await until(() => A2.evaluate((id: string) => { const C = window.__canvas, n = Object.values<BoardNode & { block?: ArtifactNode['block'] }>(C.S.nodes).find(m => m.block?.page === id); return n ? { block: n.block!.id, info: C.pageText(id).includes('~~~html {#block1}'), edge: C.S.edges.some((e: Edge) => e.from === id && e.to === n.id && e.type === 'ref') } : null; }, blk), 5000);
   const tornOut = await A2.evaluate(() => window.__canvas.AGENT_TOOLS.find((t: AgentTool) => t.name === 'tear_out_block').run({ page: 'fr-blocks', block: 'frv' }).catch((e: Error) => 'error: ' + e.message));
   const blockFrameA = async () => { for (const f of A2.frames()) { try { if (await f.$('#frv')) return f; } catch {} } return null; };
@@ -3148,7 +3156,7 @@ await section('N59', async () => {
     const sent: N59Tab['sent'] = [];
     p.on('websocket', w => { if (w.url().endsWith('/rpc')) w.on('framesent', f => { let m: HubClientMsg; try { m = JSON.parse(f.payload as string); } catch { return; } if (m.t === 'active') sent.push(m); }); });
     await p.goto(ORIGIN + '/'); await until(() => p.evaluate(() => window.__canvas?.BOOTED));
-    if (FRAMES) await until(() => p.evaluate(() => window.__perf?.frame?.ready), 30000);
+    await until(() => p.evaluate(() => window.__perf?.frame?.ready), 30000);
     await until(() => sent.length, 5000);
     await p.evaluate((mark: string) => {
       const log: Window['__n58'] = window.__n58 = [], schema = { type: 'object', properties: {} };

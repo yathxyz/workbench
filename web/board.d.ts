@@ -51,7 +51,6 @@ interface Board {
   sideTab?: 'chat' | 'term';
   docks?: Record<string, boolean>;
   theme?: BoardTheme;
-  vim?: boolean;
   view?: ViewName;
   edPage?: string;                     // the page the editor view shows
   recentCmds?: string[];
@@ -118,7 +117,7 @@ interface ReplNode extends BoardNodeBase {
   inputLog?: string; _replay?: string;
   tmux?: string; cwdLive?: string;
 }
-/* A page (kind 'buffer'): Markdown text, edited in CodeMirror or an Edwin replica. */
+/* A page (kind 'buffer'): its file in edwind (buf), edited in Edwin frames; a page not yet migrated, or on a board without edwind, keeps its Markdown in text. */
 interface PageNode extends BoardNodeBase {
   kind: 'buffer';
   text?: string;
@@ -337,7 +336,6 @@ interface LiveEntry {
   // runtime objects
   term?: XtermTerminal;
   fit?: XtermFitAddon;
-  view?: CmEditorView;
   ro?: ResizeObserver;
   backend?: CardBackend;
   frame?: HTMLIFrameElement | EdwinFrame | null; // an iframe on artifact and web cards, an Edwin frame on pages
@@ -415,11 +413,8 @@ interface PdfJsRenderTask { promise: Promise<void>; cancel(): void }
 type XtermTerminal = InstanceType<Vendor['Terminal']>;
 /* xterm's FitAddon, from the vendored bundle. */
 type XtermFitAddon = InstanceType<Vendor['FitAddon']>;
-/* CodeMirror's EditorView, from the vendored bundle. */
-type CmEditorView = InstanceType<Vendor['EditorView']>;
-
-/* A page's text state (pageState): a CodeMirror state, or a TextDoc over the replica text. */
-type PageViewState = CmEditorView['state'] | { doc: BoardTextDoc };
+/* A page's text state (pageState): a TextDoc over the replica text, or over the node's text on a read-only page. */
+type PageViewState = { doc: BoardTextDoc };
 /* A line-indexed view of a string (class TextDoc, line 6191). */
 interface BoardTextDoc {
   text: string; length: number;
@@ -429,7 +424,7 @@ interface BoardTextDoc {
   sliceString(a: number, b?: number): string;
   toString(): string;
 }
-/* One line of a BoardTextDoc, shaped like CodeMirror's Line. */
+/* One line of a BoardTextDoc. */
 interface BoardTextLine { from: number; to: number; text: string; number: number }
 
 // ---- backends (PtyBackend line 791, AcpBackend line 925, FakeShell line 662, JsRepl line 747, Offline line 1497)
@@ -804,6 +799,7 @@ interface EdwinApi {
   hooks: {
     openPage?: (name: string) => unknown;
     leaveFrame?: (f: EdwinFrame) => unknown;
+    linkNames?: () => { name: string; ann: string }[];
     applied?: (b: EdwinBuffer, ops: unknown[], origin: string) => unknown;
     wireWindow?: (w: EdwinWindow) => void;
     renderOverlay?: () => void;

@@ -420,6 +420,18 @@ Choices E3 made where the spec left one open, and where it had to deviate:
 - **Not in E3**: K4 (Edwin keymaps in the board's conflict checker) waits for the keymaps PR; a display-text
   mechanism in the renderer (block-ref text is a DOM post-pass) and an `imenuItems` hook are left for later.
 
+## Step E4: Edwin is the only editor (done)
+
+E4 retires CodeMirror (spec R9.21; Workbench DESIGN F-A39). With edwind served every page card is a frame, with no
+flag: `edit.frames` and wb-web's `frames` key are ignored (the Nix option warns), and `ui-frames` and the
+harness's `--frames` are gone, since `ui` runs frames. Without edwind (the demo, `edit.enable` off) pages are
+read-only: no text authority runs there, so no editor is offered, and the board's own edits go through
+`web/app.ts`'s page API (`pageEdit`, `pageSetText`, ...) to the node's text. The vendor bundle and
+`tools/package-lock.json` no longer carry CodeMirror, `@replit/codemirror-vim` or lezer. Edwin's markdown `[[`
+completion gains the hook `linkNames`, through which the board adds its card and folder names, so wiki links to
+cards that are not files still complete. `edwin/test/address.test.mts` runs the board's buffer addresses over
+`TextDoc` (app.ts's line index) instead of `@codemirror/state`.
+
 ## Step DT3: attach anywhere (in review)
 
 A desktop frame attaches to an edwind on another machine, ex44's in particular, so its notes (and what ex44's

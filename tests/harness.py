@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Start wb-hub, edwind, wb-web and a test Caddy on loopback with temporary configs.
 
-  python3 -I tests/harness.py --web-root DIR [--bin-dir DIR] [--dogfood] [--frames] [--board FILE]
+  python3 -I tests/harness.py --web-root DIR [--bin-dir DIR] [--dogfood] [--board FILE]
 
 Prints one JSON line on stdout once everything listens:
   {web, caddy, caddySocket, hubSocket, webSocket, editSocket, caddyAdmin, stateDir, boardsDir, notesDir, host, boardFile}
@@ -58,9 +58,8 @@ sockets, the home as its writable path and the module's refusal list (so POST /a
 forwards to edwind, has the authority it has in production), and the same host as web.json, whose
 editSocket points at it. `edwind` comes from --bin-dir
 or PATH when present; otherwise the harness runs edwin/server/main.mts from this checkout with node
-and the flags of the package wrapper ($EDWIND_MAIN names another main.mts). --frames writes
-`frames: true` into web.json (ui.mts and perf.mts pass it when WB_FRAMES=1); without it the key is
-absent, so a wb-web that does not know it still starts.
+and the flags of the package wrapper ($EDWIND_MAIN names another main.mts). With editSocket set, the
+board's pages are Edwin frames (edwind spec R9.21).
 """
 
 import argparse
@@ -163,12 +162,11 @@ def can_connect_unix(path):
 
 
 class Harness:
-    def __init__(self, web_root, bin_dir=None, dogfood=False, tcp=False, frames=False, board=None, media=None):
+    def __init__(self, web_root, bin_dir=None, dogfood=False, tcp=False, board=None, media=None):
         self.web_root = str(Path(web_root).resolve())
         self.bin_dir = bin_dir
         self.dogfood = dogfood
         self.tcp = tcp
-        self.frames = frames
         self.bash = resolve_bash()
         self.agents = {}
         if not dogfood:
@@ -232,8 +230,6 @@ class Harness:
             "host": host,
             "editSocket": self.edit_sock,
         }
-        if frames:
-            self.web_config["frames"] = True
         if media:
             # one image provider on the OpenAI protocol at MEDIA (a stub the suite runs), no key
             self.web_config["media"] = {"providers": {"stub": {"api": "openai", "baseUrl": media, "models": ["stub-image"]}}}
@@ -453,7 +449,6 @@ def main():
     p.add_argument("--web-root", default=os.environ.get("WB_WEB_ROOT"))
     p.add_argument("--bin-dir", help="directory holding wb-hub and wb-web (default: PATH)")
     p.add_argument("--dogfood", action="store_true", help="real HOME, no canaries, ignore stdin")
-    p.add_argument("--frames", action="store_true", help="web.json frames: true (pages as Edwin frames)")
     p.add_argument("--board", help="a board JSON file to install as <boardsDir>/<host>.json before the start")
     p.add_argument("--media", help="web.json media: an OpenAI-compatible image provider \"stub\" at this base URL")
     a = p.parse_args()
@@ -471,7 +466,7 @@ def main():
         signal.signal(s, on_signal)
 
     try:
-        h = Harness(a.web_root, a.bin_dir, a.dogfood, tcp=os.environ.get("WB_HARNESS_TCP") == "1", frames=a.frames,
+        h = Harness(a.web_root, a.bin_dir, a.dogfood, tcp=os.environ.get("WB_HARNESS_TCP") == "1",
                     board=a.board, media=a.media)
     except (RuntimeError, OSError, ValueError) as e:
         print(f"harness: {e}", file=sys.stderr)

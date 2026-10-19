@@ -516,6 +516,7 @@ function wikiCandidates(b: EdBuffer, prefix: string) {
   const add = (n: SchemeValue, ann: string) => { if (typeof n === 'string' && n && !seen.has(n)) { seen.add(n); names.push({ n, ann }); } };
   for (const x of arr(L.get('wiki-candidates') ?? NIL)) add(x, '');
   for (const pb of mdBuffers()) add(pageName(pb), 'page');
+  if (H.linkNames) for (const x of H.linkNames()) add(x.name, x.ann);
   const lower = prefix.toLowerCase(), closes = b.rope.slice(b.pt, b.pt + 2) === ']]';
   const score = (n: string) => { const l = n.toLowerCase(); return l.startsWith(lower) ? 0 : l.includes(lower) ? 1 : -1; };
   return names.map(x => ({ x, sc: score(x.n) })).filter(y => y.sc >= 0).sort((a, c) => a.sc - c.sc || (a.x.n < c.x.n ? -1 : 1)).slice(0, 200)

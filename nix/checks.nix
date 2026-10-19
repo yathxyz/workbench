@@ -91,8 +91,7 @@ let
     '';
   };
   uiCheck =
-    frames:
-    pkgs.runCommand "workbench-ui${lib.optionalString frames "-frames"}"
+    pkgs.runCommand "workbench-ui"
       {
         nativeBuildInputs = [
           pkgs.nodejs
@@ -117,7 +116,6 @@ let
       }
       ''
         export HOME=$TMPDIR BASH=${pkgs.bashInteractive}/bin/bash
-        ${lib.optionalString frames "export WB_FRAMES=1"}
         node ${tests}/ui.mts
         touch $out
       '';
@@ -364,13 +362,10 @@ in
 
   # tests/ui.mts (the frontend's) in headless Chromium from nixpkgs. It starts the harness from
   # WB_HARNESS and imports Playwright from WB_PLAYWRIGHT. The browser reaches the harness's Caddy
-  # through ui.mts's own 127.0.0.1:18443 forwarder, which accepts only this build's uid. The suite
-  # runs once per page editor: `ui` with CodeMirror pages, `ui-frames` with pages as Edwin frames
-  # (WB_FRAMES=1: the harness writes web.json frames: true and the frames section runs; edwind comes
-  # from the workbench package on PATH). Two checks rather than one run after the other: each run
-  # takes a browser session of several minutes, and the sandbox gives each its own loopback.
-  ui = uiCheck false;
-  ui-frames = uiCheck true;
+  # through ui.mts's own 127.0.0.1:18443 forwarder, which accepts only this build's uid. Pages are
+  # Edwin frames (edwind comes from the workbench package on PATH); the demo section runs without
+  # edwind, where pages are read-only (edwind spec R9.21).
+  ui = uiCheck;
 
   # lib.adapterCheck against the stub, so the probe and its plumbing run here too; the real
   # adapters run in the consumer's flake.
@@ -454,7 +449,6 @@ in
         environmentName = [ "services.workbench.environment and agents" ];
         agentEnvName = [ "services.workbench.environment and agents" ];
         fixedName = [ "services.workbench.environment must not set" ];
-        editFrames = [ "services.workbench.edit.frames requires" ];
         editWritable = [ "services.workbench.edit.writablePaths" ];
         editUrl = [ "services.workbench.edit.models.*.baseUrl" ];
       };
@@ -471,10 +465,6 @@ in
           env."1X" = "x";
         };
         fixedName.services.workbench.environment.SHELL = "/bin/sh";
-        editFrames.services.workbench.edit = {
-          enable = false;
-          frames = true;
-        };
         editWritable.services.workbench.edit.writablePaths = [ "work/roam" ];
         editUrl.services.workbench.edit.models.openai.baseUrl = "http://api.example.org/v1";
       };

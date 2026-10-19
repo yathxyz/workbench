@@ -38,7 +38,7 @@ interface WBKeyNameEvent {
   ctrlKey?: boolean; altKey?: boolean; metaKey?: boolean; shiftKey?: boolean;
 }
 type WBKeyTransientName = 'palette' | 'dialog' | 'hints' | 'overview' | 'ring' | 'arrange';
-type WBKeyInteriorName = 'term' | 'page' | 'text' | 'edwin' | 'control' | 'frame' | 'pdf';
+type WBKeyInteriorName = 'term' | 'text' | 'edwin' | 'control' | 'frame' | 'pdf';
 type WBKeyPlace = 'board' | 'workspace' | 'tab';
 /* The views whose keys are a function of the page (VIEW_FN). */
 type WBKeyViewFnName = 'ranger' | 'tasks' | 'review';

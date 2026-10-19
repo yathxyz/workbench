@@ -27,8 +27,8 @@ test('a terminal gets the keys the board used to take (K2)', () => {
   assert.equal(outcome(t, 'C-`'), 'dock.toggle');
 });
 
-test('a page leaves the palette, the dock, the tree and the views to the board', () => {
-  const p = ctx({ interior: 'page' });
+test('a text field leaves the palette, the dock, the tree and the views to the board', () => {
+  const p = ctx({ interior: 'text' });
   assert.equal(outcome(p, 'C-k'), 'palette.open');
   assert.equal(outcome(p, 'C-j'), 'dock.toggle');
   assert.equal(outcome(p, 'M-b'), 'tree.toggle');
@@ -88,7 +88,7 @@ test('the checker catches a conflict, a reserved key, and a key a card gives up 
     K.MAPS.canvas = [...canvas, ['f', 'fit', 'twice'], ['C-w', 'fit', 'closes the tab'], ['C-SPC', 'fit', 'the leader']];
     K.MAPS.global = global.filter(r => r[0] !== 'M-v');
     const r = K.check();
-    for (const want of ['K1 canvas: f is bound twice', 'browser canvas: C-w', 'leader canvas: C-SPC', 'K2 page: leaves M-v', 'K2 text: leaves M-v'])
+    for (const want of ['K1 canvas: f is bound twice', 'browser canvas: C-w', 'leader canvas: C-SPC', 'K2 text: leaves M-v'])
       assert.ok(r.errors.some(x => x.startsWith(want)), want);
     // a key added to the board never reaches past a card that needs it: the walk stops at the card
     K.MAPS.global = [...global, ['C-l', 'fit', 'stolen']]; K.reindex();
@@ -98,9 +98,9 @@ test('the checker catches a conflict, a reserved key, and a key a card gives up 
   assert.deepEqual(K.check().errors, []);
 });
 
-test('desks (§10.8): Alt-Shift digits from the board and from a page, leader digits and the desk prefixes', () => {
+test('desks (§10.8): Alt-Shift digits from the board and from a text field, leader digits and the desk prefixes', () => {
   assert.equal(outcome(ctx(), 'M-)'), 'desk.0');
-  assert.equal(outcome(ctx({ interior: 'page' }), 'M-@'), 'desk.2');
+  assert.equal(outcome(ctx({ interior: 'text' }), 'M-@'), 'desk.2');
   assert.equal(outcome(ctx({ interior: 'term' }), 'M-@'), 'pass');
   assert.equal(K.leaderResolve('0')!.cmd, 'desk.0');
   assert.equal(K.leaderResolve('`')!.cmd, 'desk.prev');

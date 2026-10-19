@@ -110,10 +110,11 @@ let
       refusePaths = readOnlyUserPaths;
     }
     # With edwind, wb-web forwards the notes endpoints and `sample` over edit.sock (R15.5) and relays
-    # /edit to it; `frames` switches the board's page editor (R9.20), reported as /api/info `edit`.
+    # /edit to it; page cards are then Edwin frames, reported as /api/info `edit` (R9.21). `frames` is for a
+    # release profile's wb-web from before E4, which switched the board's page editor on it (R9.20).
     // lib.optionalAttrs edit.enable {
       inherit editSocket;
-      frames = edit.frames;
+      frames = true;
     }
     // lib.optionalAttrs (cfg.media.providers != { }) {
       media.providers = lib.mapAttrs (
@@ -452,12 +453,13 @@ in
       enable = mkOption {
         type = types.bool;
         default = true;
-        description = "Run edwind on edit.sock, so `wb edit`, `wb buf` and `wb eval` work. The board is unchanged.";
+        description = "Run edwind on edit.sock, so `wb edit`, `wb buf` and `wb eval` work and page cards are Edwin frames on its buffers (edwind spec R9.21). Off, page cards are read-only.";
       };
       frames = mkOption {
-        type = types.bool;
-        default = false;
-        description = "Page cards become Edwin frames over /edit, and the board migrates pages to edwind buffers (edwind spec R8.16, R9.20). Written to web.json as `frames`; /api/info reports it as `edit`. Requires edit.enable. Off by default until E4.";
+        type = types.nullOr types.bool;
+        default = null;
+        visible = false;
+        description = "Ignored since E4 (edwind spec R9.21): page cards are Edwin frames whenever edit.enable is on, and read-only without it. Kept so a configuration that still sets it evaluates, with a warning.";
       };
       memoryMiB = mkOption {
         type = types.ints.positive;
@@ -530,6 +532,7 @@ in
   };
 
   config = mkIf cfg.enable {
+    warnings = lib.optional (edit.frames != null) "services.workbench.edit.frames is ignored since E4: page cards are Edwin frames whenever edit.enable is on. Remove the setting.";
     assertions = [
       {
         assertion = !config.networking.nftables.enable;
@@ -575,10 +578,6 @@ in
           lib.attrValues childSetEnv
         );
         message = "services.workbench: the child environment must hold literal stable paths only (no /nix/store paths, no $ expansions); check nix.nixPath.";
-      }
-      {
-        assertion = !edit.frames || edit.enable;
-        message = "services.workbench.edit.frames requires services.workbench.edit.enable.";
       }
       {
         assertion = lib.all (p: p == "~" || lib.hasPrefix "~/" p || lib.hasPrefix "/" p) edit.writablePaths;

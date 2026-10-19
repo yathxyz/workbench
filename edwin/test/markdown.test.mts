@@ -404,6 +404,19 @@ test('wiki-capf: candidates from wiki-candidates and the open pages after [[, cl
   ev('(set! wiki-candidates \'()) (set! corfu-auto #f)');
 });
 
+test('wiki-capf: a host adds names through the linkNames hook (the board\'s cards and folders), once each', async () => {
+  const H = (globalThis as Globals).Ed.hooks;
+  H.linkNames = () => [{ name: 'Board Card', ann: 'shell' }, { name: 'Bookmarks', ann: 'folder' }, { name: 'Notes', ann: 'shell' }];
+  try {
+    await page();
+    await ed.type('i[[Bo'); ev('(wiki-capf)');
+    assert.deepEqual(ed.E.corfu.cands.map((c: Edwin) => [c.text, c.ann]), [['Board Card', 'shell'], ['Bookmarks', 'folder']]);
+    await ed.keys('ESC'); await ed.type('a [[No'); ev('(wiki-capf)');
+    assert.deepEqual(ed.E.corfu.cands.map((c: Edwin) => c.ann), ['page'], 'an open page keeps its own annotation');
+    await ed.keys('ESC');
+  } finally { H.linkNames = null; }
+});
+
 test('journal-today opens notes-directory/journal/YYYY-MM-DD.md, or .org when journal-format is org', async () => {
   const today = ev('(journal-day-string)');
   assert.match(today, /^\d{4}-\d{2}-\d{2}$/);

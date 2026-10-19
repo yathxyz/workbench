@@ -1361,6 +1361,8 @@ interface EdHooks {
   /* the page: open a page by name, give the keyboard back */
   openPage?: ((name: string) => unknown) | null;
   leaveFrame?: ((f: EdFrame) => void) | null;
+  /* more [[link]] targets than notes and pages: the board's cards and folders, each with its annotation (markdown.ts) */
+  linkNames?: (() => { name: string; ann: string }[]) | null;
   /* boot: before the shipped Scheme's keymaps are filled, and between it and the user's init */
   setup?: (() => void) | null;
   beforeUserInit?: (() => void) | null;

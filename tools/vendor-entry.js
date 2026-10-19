@@ -1,11 +1,4 @@
 export { Terminal } from '@xterm/xterm';
 export { FitAddon } from '@xterm/addon-fit';
-export { EditorView, basicSetup } from 'codemirror';
-export { Decoration, WidgetType, keymap } from '@codemirror/view';
-export { EditorState, StateField, StateEffect, EditorSelection, Prec, Compartment } from '@codemirror/state';
-export { markdown } from '@codemirror/lang-markdown';
 export { getStroke } from 'perfect-freehand';
-export { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
-export { tags } from '@lezer/highlight';
 export { default as rough } from 'roughjs';
-export { vim, Vim, getCM } from '@replit/codemirror-vim';

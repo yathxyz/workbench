@@ -7,7 +7,7 @@
     "lib": ["esnext", "dom", "dom.iterable"],
     "module": "esnext",
     "moduleResolution": "bundler",
-    // Library types in type positions (import('@codemirror/view').ViewUpdate) resolve from the build tools' packages.
+    // Library types in type positions (import('@xterm/xterm').Terminal) resolve from the build tools' packages.
     "paths": { "*": ["../tools/node_modules/*"] },
     "types": [],
     "strict": true,
