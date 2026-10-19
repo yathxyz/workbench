@@ -6113,6 +6113,7 @@ function frOpen(n: PageNode): Promise<EdwinBuffer | null> {
 function frCloseReplica(n: PageNode) {
   const L = live[n.id], b = L?.buf; if (!b) return;
   if (b.meta?.anchors) FR.anchorCache[n.id] = (b.meta.anchors as PageAnchor[]).map(a => ({ ...a }));
+  if (b.shared && b.sver >= 0) OP_PAGE.set(n.id, b.text);   // media cards piped from it keep its latest text
   L!.buf = null;
   try { if (b.shared) FR.L!.call('kill-buffer', [b]); } catch (e) { console.warn('edwin close', e); }
 }
@@ -6364,7 +6365,7 @@ function frEdLoad(n: PageNode, pos?: number | null) {
   if (ED.frame && ED.node !== n) { ED.frame.destroy(); ED.frame = null; }
   ED.pre = null;
   if (!n.buf && FR.tried && !FR.online) { ED.node = n; S.edPage = n.id; dirty(); frEdShut(n, pos); edCrumb(n); return; }   // the move waits for edwind
-  if (!n.buf) { ED.node = n; S.edPage = n.id; $('#ed-host')!.replaceChildren(el('div', 'fr-snap', 'Moving this page to edwind…')); frUnlessDown(frAdopt(n)).then(() => { if (ED.node !== n) return; if (n.buf) frEdLoad(n, pos); else if (FR.tried && !FR.online) frEdShut(n, pos); }); return; }   // migrated first (R8.17)
+  if (!n.buf) { ED.node = n; S.edPage = n.id; $('#ed-host')!.replaceChildren(el('div', 'fr-snap', 'Moving this page to edwind…')); frUnlessDown(frAdopt(n)).then(() => { if (ED.node !== n) return; if (n.buf) frEdLoad(n, pos); else if (FR.tried && !FR.online) frEdShut(n, pos); }, e => { if (ED.node === n) frEdShut(n, pos, `${n.name} could not be moved to edwind (${(e as Error)?.message || e}): it is read-only here; open it again to retry`); }); return; }   // migrated first (R8.17)
   ED.node = n; S.edPage = n.id; dirty();
   const host = $('#ed-host')!;
   if (!ED.frame) host.replaceChildren(el('div', 'fr-snap', 'Opening this page…'));   // not the last page's frame meanwhile
@@ -6381,10 +6382,10 @@ function frEdLoad(n: PageNode, pos?: number | null) {
 function edCrumb(n: PageNode) { $('#ed-crumb')!.textContent = pathOf(n.id); renderEdList(); edInfo(); updateSideCtx(); }
 // The Editor view on a page that has no frame now: its text read-only (a file page's 12-line snapshot) and why. While
 // edwind is down the view opens the frame once it is back, if it still shows the page.
-function frEdShut(n: PageNode, pos?: number | null) {
-  const down = FR.tried && !FR.online;
+function frEdShut(n: PageNode, pos?: number | null, why?: string) {
+  const down = !why && FR.tried && !FR.online;
   ED.pre = el('pre', 'ro-text ed-ro', (n.buf ? n.snap : n.text) || '');
-  $('#ed-host')!.replaceChildren(ED.pre, el('div', 'fr-off', down ? `edwind is not connected: this page is read-only until it is back${n.buf ? ' (its first lines)' : ''}` : 'This page takes no edit until the board is saved'));
+  $('#ed-host')!.replaceChildren(ED.pre, el('div', 'fr-off', why || (down ? `edwind is not connected: this page is read-only until it is back${n.buf ? ' (its first lines)' : ''}` : 'This page takes no edit until the board is saved')));
   if (down) frWhenReady().then(() => { if (ED.node === n && ED.pre && VIEW === 'editor') frEdLoad(n, pos); });
   edInfo();
 }
