@@ -7226,8 +7226,11 @@ function pdfBudget() {
 function pdfEvict(p: PdfPageLive) { p.task?.cancel(); p.task = null; if (p.canvas) { p.canvas.width = 0; p.canvas.remove(); } p.canvas = null; p.r = 0; }
 async function pdfPage(P: PdfLive, p: PdfPageLive): Promise<PdfJsPage | null> {
   if (p.page) return p.page;
-  if (!P.doc) return null;
-  const page = await P.doc.getPage(p.i + 1); p.page = page;
+  const doc = P.doc; if (!doc) return null;
+  // pdfClose destroys the document under a pending getPage (a card closed or remounted while it draws): no page then
+  let page: PdfJsPage; try { page = await doc.getPage(p.i + 1); } catch (e) { if (P.doc !== doc) return null; throw e; }
+  if (P.doc !== doc) return null;
+  p.page = page;
   const vp = page.getViewport({ scale: 1 });
   if (Math.abs(vp.width - p.pw) > 0.5 || Math.abs(vp.height - p.ph) > 0.5) {   // not the first page's size: this box only
     p.pw = vp.width; p.ph = vp.height; const k = P.w / p.pw;
