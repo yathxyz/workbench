@@ -5212,9 +5212,11 @@ async function artMount(n: ArtifactNode, L: LiveEntry) {
   L.hello = false; L.notice!.hidden = true; L.notice!.textContent = '';
   if (n.block) {   // a block card: the page's block is the source, in an opaque-origin frame in both modes
     let b = blockOf(n);
-    if (!b && FR.on) { const p = S.nodes[n.block.page] as PageNode | undefined; if (p?.buf && !frBufOf(p)) { await frWhenBuf(p); if (L.frame !== f) return; b = blockOf(n); } }   // frames mode: the block is in the replica, not the snapshot
+    let down = false;
+    if (!b && FR.on) { const p = S.nodes[n.block.page] as PageNode | undefined; if (p?.buf && !frBufOf(p)) { const w = frWhenBuf(p); down = !(await frUnlessDown(w).catch(() => null)); if (L.frame !== f) return; b = blockOf(n);   // frames mode: the block is in the replica, not the snapshot
+      if (down) w.then(() => { if (L.frame === f && live[n.id] === L) artMount(n, L); }, () => {}); } }   // known down: the notice now, the card once the replica opens
     L.blockCode = b?.code;
-    if (!b) { L.notice!.hidden = false; L.notice!.textContent = blockMissing(n); return; }
+    if (!b) { L.notice!.hidden = false; L.notice!.textContent = down ? `${S.nodes[n.block.page]?.name || 'The page'} shows its blocks once edwind is connected again` : blockMissing(n); return; }
     f.setAttribute('sandbox', 'allow-scripts allow-forms allow-pointer-lock allow-popups allow-modals');
     f.srcdoc = wrapFragment(b.code, await bridgeSrc(), artTheme());
   } else if (DAEMON) {   // fix 6: wb-web keeps the versions and has no second origin, so the head runs in an opaque srcdoc frame too
@@ -6290,7 +6292,8 @@ function frAdopt(n: PageNode): Promise<string | null> {
       // ran (pageSetText on the unmigrated page) is written and saved again.
       let saved = !(cur === '' || b!.modified), failed: unknown[] = [];
       const added = new Set((b!.meta.anchors as PageAnchor[]).map(a => a.id));
-      for (;;) {
+      for (let round = 0; ; round++) {
+        const before = b!.text;
         while (!saved || (n.text || '') !== text) {
           text = n.text || '';
           if (b!.text !== text) frReplaceAll(b!, text);
@@ -6299,6 +6302,15 @@ function frAdopt(n: PageNode): Promise<string | null> {
           // the replica closes as it is (other clients may have edited it meanwhile); a later try that finds this text there takes it (R8.18)
           if (r.error) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} throw new Error(`${id} could not be saved: ${r.error.report}`); }
           saved = true;
+        }
+        if (round && b!.text !== before) {   // the text was replaced as a whole: anchors placed on the old one are placed again
+          const ids = (n.anchors || []).map(a => a.id).filter(aid => added.has(aid));
+          const rm = await Promise.allSettled(ids.map(aid => Ed.sync.anchorRemove(id, aid)));
+          if (adopted()) return quit(id);
+          rm.forEach((r, i) => { if (r.status === 'fulfilled') added.delete(ids[i]); });
+          failed = rm.flatMap(r => (r.status === 'rejected' ? [r.reason] : []));
+          if (failed.length) break;
+          if ((n.text || '') !== text) continue;
         }
         // the node's anchors go onto the buffer under their own ids (labels, ink and references use them); one already there is not added again
         const todo = (n.anchors || []).filter(a => !added.has(a.id));
@@ -6309,7 +6321,7 @@ function frAdopt(n: PageNode): Promise<string | null> {
         if (failed.length || (n.text || '') === text) break;   // a text the node took meanwhile is saved again, with the anchors it moved
       }
       // the node keeps its text and anchors until every anchor is on the buffer; a later try finds this text and adds the rest (R8.18)
-      if (failed.length) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} throw new Error(`${id}: ${failed.length} anchor(s) could not be added: ${(failed[0] as Error)?.message || failed[0]}`); }
+      if (failed.length) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} throw new Error(`${id}: ${failed.length} anchor(s) could not be placed: ${(failed[0] as Error)?.message || failed[0]}`); }
       chosen = id;
     }
     if (!chosen || !S.nodes[n.id]) return null;
