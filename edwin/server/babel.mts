@@ -6,11 +6,12 @@
 // the engine proper: which executor runs a block, the note environments, where a result goes, the commands.
 //
 // Primitives (server only, R4.49): %babel-blocks, %babel-data, %babel-result-text, %babel-tangle-files,
-// %babel-write-file (blocking), %babel-note-buffer. Nothing here evaluates anything: a block runs only when a
-// command of babel.scm runs it (R14.15).
+// %babel-write-file (blocking), %babel-note-buffer, %babel-expand-home. Nothing here evaluates anything: a block
+// runs only when a command of babel.scm runs it (R14.15).
 import path from 'node:path';
 import { ProtoError } from './proto.mts';
 import { jsonToScheme } from './threads.mts';
+import { expandHome } from './paths.mts';
 import type { Server, Lisp, SchemeValue } from './main.mts';
 import type { SBuf, Moved } from './buffers.mts';
 import type { SchemeGen } from './threads.mts';
@@ -46,7 +47,7 @@ const TANGLE_EXT: Record<string, string> = { scheme: 'scm', sh: 'sh', bash: 'sh'
 /* noweb values that expand references when a block runs, and when it is tangled (Org's :noweb). */
 const NOWEB_EVAL = new Set(['yes', 'eval', 'no-export', 'strip-export', 'strip-tangle']);
 const NOWEB_TANGLE = new Set(['yes', 'tangle', 'no-export', 'strip-export']);
-const NOWEB_DEPTH = 64;
+const NOWEB_DEPTH = 64, NOWEB_MAX = 4 * 1024 * 1024;
 
 export class BabelError extends Error {}
 
@@ -183,12 +184,12 @@ function parseOrg(text: string): Parsed {
   const blocks: Block[] = [], results: Result[] = [];
   /* #+PROPERTY: header-args[:lang] … lines anywhere in the file are defaults for every block (or one language). */
   const global: Record<string, AttrValue> = {}, perLang: Record<string, Record<string, AttrValue>> = {};
-  const globalVars: [string, string][] = [];
+  const globalVars: [string, string][] = [], perLangVars: Record<string, [string, string][]> = {};
   for (const l of ls) {
-    const m = /^[ \t]*#\+property:[ \t]+header-args(?::(\S+))?\+?[ \t]+(.*)$/i.exec(l.text);
+    const m = /^[ \t]*#\+property:[ \t]+header-args(?::([^\s+]+))?\+?[ \t]+(.*)$/i.exec(l.text);
     if (!m) continue;
     const a = orgArgs(m[2]);
-    if (m[1]) Object.assign(perLang[m[1].toLowerCase()] ||= {}, a.attrs);
+    if (m[1]) { Object.assign(perLang[m[1].toLowerCase()] ||= {}, a.attrs); (perLangVars[m[1].toLowerCase()] ||= []).push(...a.vars); }
     else { Object.assign(global, a.attrs); globalVars.push(...a.vars); }
   }
   let name: string | null = null, header = '', affStart = -1;
@@ -206,7 +207,7 @@ function parseOrg(text: string): Parsed {
       const lang = (m[1] || '').toLowerCase();
       const a = orgArgs(header + ' ' + (m[2] || ''));
       const attrs = { ...global, ...(perLang[lang] || {}), ...a.attrs };
-      blocks.push({ kind: DATA_LANGS.has(lang) ? 'data' : 'src', lang, id: name, attrs, vars: [...globalVars, ...a.vars], begin: affStart >= 0 ? affStart : ls[i].start, end: closed ? ls[j].next : text.length, line: i + 1, body: orgBody(ls.slice(i + 1, j).map(l => l.text)), result: null });
+      blocks.push({ kind: DATA_LANGS.has(lang) ? 'data' : 'src', lang, id: name, attrs, vars: [...globalVars, ...(perLangVars[lang] || []), ...a.vars], begin: affStart >= 0 ? affStart : ls[i].start, end: closed ? ls[j].next : text.length, line: i + 1, body: orgBody(ls.slice(i + 1, j).map(l => l.text)), result: null });
       i = closed ? j : ls.length; reset(); continue;
     }
     if ((m = /^[ \t]*#\+results(?:\[[^\]\n]*\])?:[ \t]*(.*?)[ \t]*$/i.exec(t))) {
@@ -231,7 +232,8 @@ function parseOrg(text: string): Parsed {
   attach(text, blocks, results);
   return { syntax: 'org', blocks, results };
 }
-/* The result after a #+RESULTS: line at index I: `:` lines, a #+begin_… block, a table, or nothing. */
+/* The result after a #+RESULTS: line at index I: `:` lines, a #+begin_… block, a table, or nothing. A #+begin_src
+   right below is the next source block, not this result (babel never writes a result as one). */
 function orgResult(ls: Line[], i: number, of: string | null): { result: Result; last: number } {
   const begin = ls[i].start;
   let j = i + 1;
@@ -240,7 +242,7 @@ function orgResult(ls: Line[], i: number, of: string | null): { result: Result; 
     return { result: { begin, end: ls[j].next, text: ls.slice(i + 1, j + 1).map(l => l.text.replace(/^[ \t]*: ?/, '')).join('\n'), error: false, form: 'lines', of }, last: j };
   }
   let m: RegExpExecArray | null;
-  if (j < ls.length && (m = /^[ \t]*#\+begin_(\w+)/i.exec(ls[j].text))) {
+  if (j < ls.length && (m = /^[ \t]*#\+begin_(?!src\b)(\w+)/i.exec(ls[j].text))) {
     const endRe = new RegExp(`^[ \\t]*#\\+end_${m[1]}[ \\t]*$`, 'i');
     let k = j + 1;
     while (k < ls.length && !endRe.test(ls[k].text)) k++;
@@ -267,17 +269,26 @@ function attach(text: string, blocks: Block[], results: Result[]) {
 /* ---------- noweb (<<name>>) ---------- */
 /* The body of B with every <<name>> replaced by the bodies of the blocks named name (or whose noweb-ref is
    name), expanded in turn; a reference's line prefix is repeated on each line it brings in, as Org does. */
+const expanded = new WeakMap<Parsed, Map<Block, string>>();   // a block expands the same wherever it is referenced
 export function expand(parsed: Parsed, b: Block, depth = 0, seen: Set<Block> = new Set()): string {
   if (depth > NOWEB_DEPTH) throw new BabelError('noweb references nest too deep');
   if (seen.has(b)) throw new BabelError(`noweb reference cycle through ${b.id || 'the block at line ' + b.line}`);
+  let memo = expanded.get(parsed);
+  if (!memo) expanded.set(parsed, memo = new Map());
+  const done = memo.get(b);
+  if (done !== undefined) return done;
   seen.add(b);
   try {
-    return b.body.split('\n').map(line => line.replace(/^(.*?)<<([^<>\s()]+)>>(.*)$/, (all, pre: string, ref: string, post: string) => {
+    /* Each reference on a line expands in place; its prefix is the line's text before it. */
+    const out = b.body.split('\n').map(line => line.replace(/<<([^<>\s()]+)>>/g, (all, ref: string, at: number) => {
       const parts = parsed.blocks.filter(x => x.kind !== 'table' && (x.id === ref || x.attrs['noweb-ref'] === ref));
       if (!parts.length) throw new BabelError(`noweb: no block named ${ref}`);
-      const body = parts.map(x => expand(parsed, x, depth + 1, seen)).join('\n');
-      return body.split('\n').map(l => pre + l).join('\n') + post;
+      const pre = line.slice(0, at);
+      return parts.map(x => expand(parsed, x, depth + 1, seen)).join('\n').split('\n').join('\n' + pre);
     })).join('\n');
+    if (out.length > NOWEB_MAX) throw new BabelError(`noweb: ${b.id || 'the block at line ' + b.line} expands past ${NOWEB_MAX} characters`);
+    memo.set(b, out);
+    return out;
   } finally { seen.delete(b); }
 }
 const nowebOn = (b: Block, set: Set<string>) => { const v = b.attrs.noweb; return v === true || (typeof v === 'string' && set.has(v.toLowerCase())); };
@@ -397,15 +408,18 @@ export async function install(srv: Server): Promise<void> {
     const parsed = parse(S.str(text, '%babel-tangle-files'), syntaxArg(syn, '%babel-tangle-files'));
     return S.listOf(tangleFiles(parsed, S.str(base, '%babel-tangle-files')).map(([p, t]) => S.cons(p, t)));
   }));
+  D('%babel-expand-home', 'path', 'PATH with a leading ~/ (or a lone ~) made the home directory of the user edwind runs as.', ([p]) => expandHome(S.str(p, '%babel-expand-home')));
   /* The shared buffer of a note (an id as wb and the board name it: notes-relative, ~/… or absolute), for
      babel-run; the file is opened when no buffer has it. */
   D('%babel-note-buffer', 'file', 'The shared buffer of FILE (a notes-relative, ~/ or absolute path), opened when needed.', ([file]) => sbufOf(S.str(file, '%babel-note-buffer'), false).ed);
-  D('%babel-write-file', 'file text', 'Make FILE (absolute) hold TEXT through its shared buffer, then save it (babel-tangle): the authority\'s write rules apply.', () => {
+  D('%babel-write-file', 'file text [note]', 'Make FILE (absolute) hold TEXT through its shared buffer, then save it (babel-tangle): the authority\'s write rules apply. FILE may not be NOTE, the note that tangles.', () => {
     throw new S.SchemeError('cannot-block', '%babel-write-file: cannot wait here', []);
-  }, function* ([file, text]) {
+  }, function* ([file, text, note]) {
     const f = S.str(file, '%babel-write-file'), t = S.str(text, '%babel-write-file');
     if (!path.isAbsolute(f)) throw new S.SchemeError('error', `%babel-write-file: ${f} is not an absolute path`, []);
+    const self = typeof note === 'string' ? (() => { try { return sbufOf(note, false); } catch (e) { return null; } })() : null;
     const sb = sbufOf(f, true);
+    if (sb === self) throw new S.SchemeError('file-error', `${f}: a note cannot tangle onto itself`, []);
     const cur = srv.threads && srv.threads.current;
     const by: By = cur ? cur.by : { kind: 'server', thread: 'babel-tangle' };
     yield new S.Block((async () => { await srv.buffers.replaceText(sb, t, by); if (sb.modified) await srv.buffers.save(sb); })(), `tangling ${sb.id}`);
@@ -418,7 +432,10 @@ export async function install(srv: Server): Promise<void> {
     let id = file;
     if (path.isAbsolute(file)) {
       const nd = srv.auth.realNotesDir(), norm = path.normalize(file);
-      id = norm.startsWith(nd + '/') ? norm.slice(nd.length + 1) : norm;
+      const rel = norm.startsWith(nd + '/') ? norm.slice(nd.length + 1) : null;
+      // A notes-relative id names the same buffer the note's own links open, unless it would read as another kind
+      // of id (name:BUFFER, ~/PATH).
+      id = rel !== null && !/^(name:|~)/.test(rel) ? rel : norm;
     }
     let r: SBuf | Moved;
     try { r = srv.buffers.resolve(id, create); if ((r as Moved).moved) r = srv.buffers.resolve((r as Moved).moved, create); }
