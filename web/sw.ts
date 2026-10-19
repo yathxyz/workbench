@@ -29,3 +29,14 @@ const fontFiles = (css: string) => [...css.matchAll(/url\("([^"]+)"\)/g)].map(m 
   if (u.pathname.startsWith('/fonts/') && !shell(u.pathname)) return void e.respondWith(caches.match(e.request).then(hit => hit || fetch(e.request)));
   e.respondWith(fetch(e.request).then(r => { if (cacheable(r) && shell(u.pathname)) { const copy = r.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)); } return r; }).catch(() => caches.match(e.request) as Promise<Response>));
 });
+// F-A12: a notification names its card's sid. A click focuses an open Workbench page, which shows the card full
+// screen, or opens one at /?focus=SID.
+(self as unknown as ServiceWorkerGlobalScope).addEventListener('notificationclick', e => {
+  const sid = String(e.notification.data?.sid || e.notification.tag || ''); e.notification.close();
+  const sw = self as unknown as ServiceWorkerGlobalScope;
+  e.waitUntil(sw.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(cs => {
+    const c = cs.find(c => new URL(c.url).origin === location.origin);
+    if (c) { c.postMessage({ t: 'focus', sid }); return c.focus().then(() => undefined); }
+    return sw.clients.openWindow('/?focus=' + encodeURIComponent(sid)).then(() => undefined);
+  }));
+});

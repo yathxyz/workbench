@@ -238,6 +238,7 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 #toast { position: fixed; z-index: 300; left: calc((100% - var(--side-w)) / 2); bottom: 46px; transform: translateX(-50%); max-width: calc(100% - 32px); background: var(--fg); color: var(--bg);
   padding: 8px 14px; border-radius: var(--radius); font-size: 12.5px; box-shadow: var(--shadow); opacity: 0; pointer-events: none; transition: opacity .2s; user-select: text; }
 #toast.show { opacity: 1; pointer-events: auto; }
+#toast button { margin-left: 6px; color: inherit; background: transparent; border: 1px solid currentColor; }  /* F-A14: Revive all agents */
 @media (prefers-reduced-motion: reduce) { .e-pipe { animation: none; } .node.pulse { animation: none; } }
 @media (max-width: 640px) { #st-addr { min-width: 0; } .mode { display: none; } }
 #world.far .fcols, #world.far .frows { display: none; }
