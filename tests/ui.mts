@@ -913,7 +913,7 @@ check('N16 demo: the inlined page asks fonts.googleapis.com for nothing', !demoH
   });
   await home(); await sleep(400);
   const mid: [number, number] = [600 + 240, 300 + 190];   // the page's middle
-  const bg = await T.evaluate((): [number, number] | null => { const bare = (x: number, y: number) => ['viewport', 'world'].includes(document.elementFromPoint(x, y)?.id!); for (let y = 500; y < 860; y += 20) for (let x = 1050; x < 1460; x += 20) if (bare(x, y) && bare(x - 320, y) && bare(x - 160, y)) return [x, y]; return null; });
+  const bg = await T.evaluate((): [number, number] | null => { const bare = (x: number, y: number) => ['viewport', 'world'].includes(document.elementFromPoint(x, y)?.id!); for (let y = 500; y < 860; y += 20) for (let x = 1050; x < 1460; x += 20) if (bare(x, y) && bare(x - 320, y) && bare(x - 160, y) && [[-40, -40], [40, -40], [-40, 40], [40, 40], [-360, -40], [-360, 40]].every(([dx, dy]) => bare(x + dx, y + dy))) return [x, y]; return null; });   // 40 px clear: the browser's touch adjustment snaps a finger to a handle's hit area (F-A36 R4) nearby
   const hits = await T.evaluate(([bg, mid]) => [!!bg, !!document.elementFromPoint(...mid)?.closest('.node .body')], [bg, mid] as const);
   let c0 = await cam();
   await gesture([[mid[0] - 50, mid[1]], [mid[0] + 50, mid[1]]], [[mid[0] - 100, mid[1]], [mid[0] + 100, mid[1]]]);
@@ -2998,11 +2998,12 @@ await section('frames', async () => {
   // from the leader; which-key and the checker see both; giving the key back removes the row.
   const k4 = await A2.evaluate(async () => {
     const C = window.__canvas, L = C.FR.L, W = WBKeys, tick = () => new Promise(r => setTimeout(r, 50));
-    const out: { feat: boolean; lead: boolean; g?: WBKeyRow; y?: WBKeyRow; errs?: string[] } = { feat: L.evalString("(featurep 'wb-keys)") === true, lead: L.get('global-map').map.get(C.KM4.leader) === C.KM4.obj.get('leader') };
-    L.evalString('(define n69-hits 0)');
-    L.evalString('(define-command (n69-mark) "Count a hit for N69." (interactive) (set! n69-hits (+ n69-hits 1)))');
-    L.evalString('(define-key wb-canvas-map "g" \'wb-hints)');
-    L.evalString('(define-key wb-leader-map "y" \'n69-mark)');
+    const ev = (src: string) => { let v: unknown; for (const f of L.readAll(src)) { L.resetOps?.(); v = L.ev(f); } return v; };   // as evil-ex's : (form) does
+    const out: { feat: boolean; lead: boolean; g?: WBKeyRow; y?: WBKeyRow; errs?: string[] } = { feat: ev("(featurep 'wb-keys)") === true, lead: L.get('global-map').map.get(C.KM4.leader) === C.KM4.obj.get('leader') };
+    ev('(define n69-hits 0)');
+    ev('(define-command (n69-mark) "Count a hit for N69." (interactive) (set! n69-hits (+ n69-hits 1)))');
+    ev('(define-key wb-canvas-map "g" \'wb-hints)');
+    ev('(define-key wb-leader-map "y" \'n69-mark)');
     await tick();
     out.g = W.MAPS.canvas.find(r => r[0] === 'g'); out.y = W.MAPS.leader.find(r => r[0] === 'y');
     out.errs = W.check({ commands: new Set(Object.keys(C.KC)) }).errors;
@@ -3014,7 +3015,7 @@ await section('frames', async () => {
   await A2.keyboard.press('Control+Space'); await sleep(200);
   const k4w = await A2.evaluate(() => [...document.querySelectorAll('#which-key *')].some(e => e.children.length === 0 && /n69-mark/.test(e.textContent || '')));
   await A2.keyboard.press('y'); await sleep(400);
-  const k4n = await A2.evaluate(() => window.__canvas.FR.L.evalString('n69-hits'));
+  const k4n = await A2.evaluate(() => (() => { const L = window.__canvas.FR.L; let v: unknown; for (const f of L.readAll('n69-hits')) v = L.ev(f); return v; })());
   const k4b = await A2.evaluate(async () => { const C = window.__canvas; C.KM4.obj.get('canvas').map.delete('g'); C.KM4.obj.get('leader').map.delete('y'); await new Promise(r => setTimeout(r, 50)); return { g: !!WBKeys.MAPS.canvas.find(r => r[0] === 'g'), y: !!WBKeys.MAPS.leader.find(r => r[0] === 'y') }; });
   check('N69: wb-keys is provided and the leader is a prefix in global-map; define-key in wb-canvas-map binds g to hints on the canvas, and in wb-leader-map binds y to a Scheme command that the leader runs and which-key lists; the checker stays clean; deleting the keys removes the rows',
     k4.feat && k4.lead && JSON.stringify(k4.g?.slice(0, 2)) === '["g","hints"]' && JSON.stringify(k4.y?.slice(0, 2)) === '["y","edwin:n69-mark"]' && Array.isArray(k4.errs) && !k4.errs.length && k4h && k4w && k4n === 1 && !k4b.g && !k4b.y,
