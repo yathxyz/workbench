@@ -2855,6 +2855,7 @@ viewport.addEventListener('pointermove', e => {
   if (addrRaf) return;
   addrRaf = requestAnimationFrame(() => {
     addrRaf = 0;
+    if (!S) return;   // a pointer over the page before the board has loaded
     const w = evWorld(e), n = nodeAt(w.x, w.y);
     $('#st-addr')!.textContent = canvasAddr(w.x, w.y) + (n ? '  ·  ' + pathOf(n.id) : '');
   });
