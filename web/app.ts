@@ -6350,26 +6350,30 @@ function frEdLoad(n: PageNode, pos?: number | null) {
   ED.next = null;
   if (ED.frame && ED.node !== n) { ED.frame.destroy(); ED.frame = null; }
   ED.pre = null;
-  if (!n.buf && FR.tried && !FR.online) {   // known offline: the snapshot, read-only; the move waits for the view to ask again
-    ED.node = n; S.edPage = n.id; dirty();
-    ED.pre = el('pre', 'ro-text ed-ro', n.text || '');
-    $('#ed-host')!.replaceChildren(ED.pre, el('div', 'fr-off', 'edwind is not connected: this page is read-only until it is back'));
-    frWhenReady().then(() => { if (ED.node === n && ED.pre && VIEW === 'editor') frEdLoad(n, pos); });
-    $('#ed-crumb')!.textContent = pathOf(n.id);
-    renderEdList(); edInfo(); updateSideCtx(); return;
-  }
+  if (!n.buf && FR.tried && !FR.online) { ED.node = n; S.edPage = n.id; dirty(); frEdShut(n, pos); edCrumb(n); return; }   // the move waits for edwind
   if (!n.buf) { ED.node = n; S.edPage = n.id; $('#ed-host')!.replaceChildren(el('div', 'fr-snap', 'Moving this page to edwind…')); frAdopt(n).then(() => { if (ED.node === n && n.buf) frEdLoad(n, pos); }); return; }   // migrated first (R8.17)
   ED.node = n; S.edPage = n.id; dirty();
   const host = $('#ed-host')!;
+  if (!ED.frame) host.replaceChildren(el('div', 'fr-snap', 'Opening this page…'));   // not the last page's frame meanwhile
   frWhenWritable(n).then(b => {
-    if (!b || ED.node !== n) return;
-    if (!ED.frame) { const root = el('div', 'fr-ed'); host.replaceChildren(root); ED.frame = FR.Ed!.makeFrame(root, { buffer: b, kind: 'card', fontSize: 14 }); }
+    if (ED.node !== n) return;
+    if (!b) { if (!ED.frame) frEdShut(n, pos); return; }
+    if (!ED.frame) { ED.pre = null; const root = el('div', 'fr-ed'); host.replaceChildren(root); ED.frame = FR.Ed!.makeFrame(root, { buffer: b, kind: 'card', fontSize: 14 }); }
     if (pos != null) ED.frame.setPoint(Math.min(pos, b.text.length));
     requestAnimationFrame(() => ED.frame?.focus());
     edInfo();
   });
-  $('#ed-crumb')!.textContent = pathOf(n.id);
-  renderEdList(); edInfo(); updateSideCtx();
+  edCrumb(n);
+}
+function edCrumb(n: PageNode) { $('#ed-crumb')!.textContent = pathOf(n.id); renderEdList(); edInfo(); updateSideCtx(); }
+// The Editor view on a page that has no frame now: its text read-only (a file page's 12-line snapshot) and why. While
+// edwind is down the view opens the frame once it is back, if it still shows the page.
+function frEdShut(n: PageNode, pos?: number | null) {
+  const down = FR.tried && !FR.online;
+  ED.pre = el('pre', 'ro-text ed-ro', (n.buf ? n.snap : n.text) || '');
+  $('#ed-host')!.replaceChildren(ED.pre, el('div', 'fr-off', down ? `edwind is not connected: this page is read-only until it is back${n.buf ? ' (its first lines)' : ''}` : 'This page takes no edit until the board is saved'));
+  if (down) frWhenReady().then(() => { if (ED.node === n && ED.pre && VIEW === 'editor') frEdLoad(n, pos); });
+  edInfo();
 }
 // ---- page text and positions: a TextDoc over the replica text (or a read-only page's) with the subset of the Text
 // API the address code reads (lineAt, line, lines, length, sliceString, toString).
