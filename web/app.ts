@@ -5233,7 +5233,7 @@ async function artSource(n: ArtifactNode, sha?: string): Promise<string> {
   if (!DAEMON) { const v = sha && (n.versions || []).find(v => v.sha === sha); return v ? v.html : (n.html || ''); }
   const r = await fetch(`/api/artifact/${n.id}${sha ? '?v=' + sha : ''}`); const j = await r.json();
   const c = j.content; if (!c) return n.html || '';
-  return c.kind === 'page' ? c.html : (c.files['index.html']?.text || '');
+  return c.kind === 'page' ? c.html : (c.files['index.html']?.text || '');   // the source, as the page wrote it
 }
 // The head the server holds, and its versions into the node: another tab or a `wb` publish may have moved it.
 // null while the server holds none. A node's own head that the server never had is dropped, so its next publish
@@ -5243,8 +5243,20 @@ async function artHead(n: ArtifactNode): Promise<string | null> {
   if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
   const head = j.meta?.head ?? null;
   if (head !== (n.head ?? null)) { if (head) { n.head = head; n.versions = (j.meta.versions || []).slice(-30); } else delete n.head; dirty(); }
+  const caps = j.meta?.capabilities;   // a publish elsewhere may declare others; an empty map is a publish that named none
+  if (caps && Object.keys(caps).length && JSON.stringify(caps) !== JSON.stringify(n.capabilities)) { n.capabilities = caps; dirty(); }
   const c = j.content; if (!c) return null;
-  return c.kind === 'page' ? c.html : (c.files['index.html']?.text ?? '');
+  return c.kind === 'page' ? c.html : artInline(c.files);
+}
+// A files artifact in one srcdoc document: there is no origin to serve its other files from, so a quoted src or href
+// naming one of them (relative, `./` allowed) becomes a data: URL of that file.
+const ART_MIME: Record<string, string> = { js: 'text/javascript', mjs: 'text/javascript', css: 'text/css', svg: 'image/svg+xml', json: 'application/json', html: 'text/html', txt: 'text/plain' };
+function artInline(files: Record<string, { text: string }>): string {
+  const b64 = (t: string) => { const u = new TextEncoder().encode(t); let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000)); return btoa(s); };
+  return (files['index.html']?.text ?? '').replace(/\b(src|href)=(["'])([^"']+)\2/gi, (m, attr: string, q: string, url: string) => {
+    const p = url.replace(/^\.\//, ''), f = p !== 'index.html' && files[p]; if (!f) return m;
+    return `${attr}=${q}data:${ART_MIME[p.split('.').pop()!.toLowerCase()] || 'text/plain'};base64,${b64(f.text)}${q}`;
+  });
 }
 async function artMount(n: ArtifactNode, L: LiveEntry) {
   const f = L.frame as HTMLIFrameElement | undefined; if (!f) return;
@@ -5262,7 +5274,7 @@ async function artMount(n: ArtifactNode, L: LiveEntry) {
     try {
       src = await artHead(n);
       if (n.file) { try { if (await artFromFile(n, L)) src = await artHead(n); } catch (e) { L.notice!.hidden = false; L.notice!.textContent = 'Cannot read ' + n.file + ': ' + (e?.message || e); return; } }
-      if (src == null && n.html) { await artPublish(n, { html: n.html }); src = await artHead(n); }   // a page kept in the board from before the server held versions
+      if (src == null && n.html) { await artPublish(n, { html: n.html }, n.capabilities); src = await artHead(n); }   // a page kept in the board from before the server held versions
     } catch (e) { L.notice!.hidden = false; L.notice!.textContent = 'Cannot load the artifact: ' + (e?.message || e); return; }
     if (L.frame !== f) return;
     if (src == null) { L.notice!.hidden = false; L.notice!.textContent = 'Empty artifact. Publish a page from the assistant or the palette.'; return; }

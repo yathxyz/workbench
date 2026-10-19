@@ -3284,6 +3284,12 @@ await section('N12-N15, N33', async () => {
     const v3 = await until(async () => { const f = await frameOf(); return f && await f.$('#v3').catch(() => null) ? true : null; }, 8000);
     const node = await P.evaluate((id: string) => { const n = window.__canvas.S.nodes[id]; return { head: n.head, versions: n.versions.length }; }, id);
     check('N15: a version published elsewhere is what a reload of the card runs, and the node takes its head and versions', other.status === 200 && !!v3 && node.head === oj.version && node.versions === 3, JSON.stringify({ status: other.status, v3, node, version: oj.version }));
+    // A files publish with its own script and new capabilities (a capabilities change made elsewhere reaches the node).
+    const files = await api('/api/artifact/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ files: { 'index.html': '<p id=v4>four</p><script src="./app.js"></script>', 'app.js': "document.getElementById('v4').dataset.ran = '1';" }, capabilities: { db: {}, downloads: {} }, ifMatch: oj.version }) });
+    await P.evaluate((id: string) => { const C = window.__canvas; C.artMount(C.S.nodes[id], C.live[id]); }, id);
+    const ran = await until(async () => { const f = await frameOf(); return f && await f.evaluate(() => document.getElementById('v4')?.dataset.ran).catch(() => null); }, 8000);
+    const caps = await P.evaluate((id: string) => Object.keys(window.__canvas.S.nodes[id].capabilities).sort().join(), id);
+    check('N15: a files artifact runs its own script (inlined: there is no origin to serve it from), and capabilities published elsewhere reach the node', files.status === 200 && ran === '1' && caps === 'db,downloads', JSON.stringify({ status: files.status, ran, caps }));
     await P.evaluate((id: string) => window.__canvas.removeNode(id), id); await settled(P);
   } finally { await P.close(); }
 });
