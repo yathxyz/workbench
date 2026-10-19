@@ -6456,7 +6456,9 @@ function pageTextById(id: string): string { const n = S?.nodes[id] as PageNode |
 // give the snapshot's first lines then); unmigrated and read-only pages answer at once.
 async function pageTextFull(n: PageNode): Promise<string> {
   if (!n.buf) return n.text || '';
-  // frWhenBuf waits for edwind to come back: known down, give up at once; still connecting, after 5 s
+  // an open replica holds the full text, offline edits too; frWhenBuf waits for edwind to come back: known down, give
+  // up at once; still connecting, after 5 s
+  const o = FR.on ? frBufOf(n) : null; if (o) return o.text;
   const down = FR.tried && !FR.online;
   const b = FR.on && !down ? await Promise.race([frWhenBuf(n), new Promise<null>(r => setTimeout(() => r(null), 5000))]) : null; if (b) return b.text;
   throw new Error(`${n.buf}: ${FR.on ? 'edwind is not connected' : RO_FILE}`);   // its snap holds only the first lines
