@@ -519,16 +519,17 @@ fn parse_desk(argv: &[String]) -> Result<Args, Usage> {
         "query" => {
             s.check(&["--timeout", "--socket"])?;
             let mut words = &s.pos[..];
-            if let Some((n, rest)) = words.split_first() {
-                if n.len() == 1 && n.as_bytes()[0].is_ascii_digit() {
-                    match desk_number(n)? {
-                        Value::Number(k) if (1..=8).contains(&k.as_u64().unwrap_or(0)) => {
-                            fields.push(("desk".to_owned(), Value::Number(k)));
-                        }
-                        _ => return Err(usage("a query desk is one of desks 1-8")),
+            if let Some((n, rest)) = words.split_first()
+                && n.len() == 1
+                && n.as_bytes()[0].is_ascii_digit()
+            {
+                match desk_number(n)? {
+                    Value::Number(k) if (1..=8).contains(&k.as_u64().unwrap_or(0)) => {
+                        fields.push(("desk".to_owned(), Value::Number(k)));
                     }
-                    words = rest;
+                    _ => return Err(usage("a query desk is one of desks 1-8")),
                 }
+                words = rest;
             }
             fields.push(("query".to_owned(), Value::String(words.join(" "))));
             "query_desk"
