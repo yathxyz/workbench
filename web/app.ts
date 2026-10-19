@@ -5973,7 +5973,7 @@ function frBoot(): Promise<EdwinApi> {
     booted.then(() => { frStateChanged(Ed.sync.state); frDropSourceBuffers(); }, e => { console.warn('edwin boot', e); });
     return Ed;
   })();
-  FR.booting.catch(e => { FR.failed = e; console.warn('edwin frames: runtime not loaded', e); toast('Page editor runtime did not load: ' + (e?.message || e), 8000); });
+  FR.booting.catch(e => { FR.failed = e; frDownNow(); console.warn('edwin frames: runtime not loaded', e); toast('Page editor runtime did not load: ' + (e?.message || e), 8000); });
   return FR.booting;
 }
 // Resolves once the runtime is booted and the socket has had its first welcome (opens need it).
@@ -5985,9 +5985,13 @@ function frDropSourceBuffers() {
   for (const b of (Ed.E.buffers as EdwinBuffer[]).slice()) if (!b.shared && /\.scm$/.test(b.name) && !b.modified) { try { FR.L.call('kill-buffer', [b]); } catch (e) { /* a shown or modified buffer stays */ } }
 }
 function frWhenReady(): Promise<unknown> { if (FR.ready && FR.online) return Promise.resolve(); return new Promise(r => FR.waiters.push(r)); }
-// P, or null as soon as edwind is known down (the first connection failed, or it dropped): frWhenReady waits on.
+// edwind is known down: the first connection failed or it dropped, or the frame runtime did not load (frWhenReady
+// then waits for good)
+const frDown = (): boolean => !!FR.failed || (FR.tried && !FR.online);
+function frDownNow() { const d = [...FR.downers]; FR.downers.clear(); for (const r of d) r(); }
+// P, or null as soon as edwind is known down: frWhenReady waits on.
 function frUnlessDown<T>(p: Promise<T>): Promise<T | null> {
-  if (FR.tried && !FR.online) return Promise.resolve(null);
+  if (frDown()) return Promise.resolve(null);
   return new Promise((res, rej) => {
     const d = () => res(null); FR.downers.add(d);
     p.then(v => { FR.downers.delete(d); res(v); }, e => { FR.downers.delete(d); rej(e); });
@@ -5998,7 +6002,7 @@ function frStateChanged(s: string) {
   if (FR.state === 'connecting' && s !== 'connecting') FR.tried = true;   // the first connection was made, or failed
   FR.state = s;
   if (FR.online) { const w = FR.waiters.splice(0); for (const r of w) r(); }
-  else if (FR.tried) { const d = [...FR.downers]; FR.downers.clear(); for (const r of d) r(); }
+  else if (FR.tried) frDownNow();
   const hide = FR.failed ? false : !FR.ready || FR.online;
   for (const n of nodeList()) { const L = live[n.id]; if (L?.off) L.off.hidden = hide; }
   document.body.classList.toggle('edit-off', FR.ready && !FR.online);
@@ -6294,12 +6298,12 @@ function frRelease(json: string) {
 async function frWhenWritable(n: PageNode): Promise<EdwinBuffer | null> {
   // frWhenBuf waits for a reconnect: once edwind is known down (connected or failed once, not online now), an open
   // replica takes the edit (it syncs on reconnect) and anything else is refused at once
-  if (FR.tried && !FR.online) {
+  if (frDown()) {
     const o = frBufOf(n); if (o && !FR.hold.has(n.id)) return o;
     toast(`${n.name}: edwind is not connected`); return null;
   }
   const b = await frUnlessDown(frWhenBuf(n)), h = FR.hold.get(n.id);
-  if (!b && FR.tried && !FR.online) { toast(`${n.name}: edwind is not connected`); return null; }
+  if (!b && frDown()) { toast(`${n.name}: edwind is not connected`); return null; }
   if (!b || !h) return b;
   if (await Promise.race([h.p, new Promise(r => setTimeout(r, FR_HOLD_MS, false))])) return b;
   toast(`${n.name} can be edited once the board is saved`);
@@ -6363,8 +6367,8 @@ function frEdLoad(n: PageNode, pos?: number | null) {
   ED.next = null;
   if (ED.frame && ED.node !== n) { ED.frame.destroy(); ED.frame = null; }
   ED.pre = null;
-  if (!n.buf && FR.tried && !FR.online) { ED.node = n; S.edPage = n.id; dirty(); frEdShut(n, pos); edCrumb(n); return; }   // the move waits for edwind
-  if (!n.buf) { ED.node = n; S.edPage = n.id; dirty(); $('#ed-host')!.replaceChildren(el('div', 'fr-snap', 'Moving this page to edwind…')); edCrumb(n); frUnlessDown(frAdopt(n)).then(() => { if (ED.node !== n) return; if (n.buf) frEdLoad(n, pos); else if (FR.tried && !FR.online) frEdShut(n, pos); }, e => { if (ED.node === n) frEdShut(n, pos, `${n.name} could not be moved to edwind (${(e as Error)?.message || e}): it is read-only here; open it again to retry`); }); return; }   // migrated first (R8.17)
+  if (!n.buf && frDown()) { ED.node = n; S.edPage = n.id; dirty(); frEdShut(n, pos); edCrumb(n); return; }   // the move waits for edwind
+  if (!n.buf) { ED.node = n; S.edPage = n.id; dirty(); $('#ed-host')!.replaceChildren(el('div', 'fr-snap', 'Moving this page to edwind…')); edCrumb(n); frUnlessDown(frAdopt(n)).then(() => { if (ED.node !== n) return; if (n.buf) frEdLoad(n, pos); else if (frDown()) frEdShut(n, pos); }, e => { if (ED.node === n) frEdShut(n, pos, `${n.name} could not be moved to edwind (${(e as Error)?.message || e}): it is read-only here; open it again to retry`); }); return; }   // migrated first (R8.17)
   ED.node = n; S.edPage = n.id; dirty();
   const host = $('#ed-host')!;
   if (!ED.frame) host.replaceChildren(el('div', 'fr-snap', 'Opening this page…'));   // not the last page's frame meanwhile
@@ -6382,9 +6386,9 @@ function edCrumb(n: PageNode) { $('#ed-crumb')!.textContent = pathOf(n.id); rend
 // The Editor view on a page that has no frame now: its text read-only (a file page's 12-line snapshot) and why. While
 // edwind is down the view opens the frame once it is back, if it still shows the page.
 function frEdShut(n: PageNode, pos?: number | null, why?: string) {
-  const down = !why && FR.tried && !FR.online;
+  const down = !why && frDown();
   ED.pre = el('pre', 'ro-text ed-ro', (n.buf ? n.snap : n.text) || '');
-  $('#ed-host')!.replaceChildren(ED.pre, el('div', 'fr-off', why || (down ? `edwind is not connected: this page is read-only until it is back${n.buf ? ' (its first lines)' : ''}` : 'This page takes no edit until the board is saved')));
+  $('#ed-host')!.replaceChildren(ED.pre, el('div', 'fr-off', why || (down ? `${FR.failed ? 'The page editor runtime did not load' : 'edwind is not connected'}: this page is read-only until it is back${n.buf ? ' (its first lines)' : ''}` : 'This page takes no edit until the board is saved')));
   if (down) frWhenReady().then(() => { if (ED.node === n && ED.pre && VIEW === 'editor') frEdLoad(n, pos); });
   edInfo();
 }
@@ -6459,7 +6463,7 @@ async function pageTextFull(n: PageNode): Promise<string> {
   // an open replica holds the full text, offline edits too; frWhenBuf waits for edwind to come back: known down, give
   // up at once; still connecting, after 5 s
   const o = FR.on ? frBufOf(n) : null; if (o) return o.text;
-  const down = FR.tried && !FR.online;
+  const down = frDown();
   const b = FR.on && !down ? await Promise.race([frWhenBuf(n), new Promise<null>(r => setTimeout(() => r(null), 5000))]) : null; if (b) return b.text;
   throw new Error(`${n.buf}: ${FR.on ? 'edwind is not connected' : RO_FILE}`);   // its snap holds only the first lines
 }
