@@ -6453,7 +6453,7 @@ function pageEdits(n: BoardNode, changes: { from: number; to?: number; insert?: 
 // Replace the whole text: a page still waiting for its file keeps the text on the node for the migration to write.
 async function pageSetText(n: PageNode, text: string): Promise<boolean> {
   if (!FR.on) return roEdit(n, [[0, roText(n), text]]);
-  if (!n.buf) { n.text = text; dirty(); return true; }
+  if (!n.buf) { n.text = text; dirty(); frSnapRefresh(n); if (ED.node === n && ED.pre) ED.pre.textContent = text; scheduleCrossRefresh(); blockCardsChanged(n); if (VIEW === 'tasks') renderTasks(); return true; }
   const b = await frWhenWritable(n); return b ? frReplaceAll(b, text) : false;
 }
 // Exposed for the UI suite and debugging: the page's text, and the live frames count and timing.
@@ -7481,7 +7481,7 @@ function opSig(n: OpNode, ins = opInputs(n)): string {
 }
 // A piped file page with its replica closed shows only its first lines here, so its card's staleness is unknown and
 // the card is not shown stale; "Run stale media cards" reads such pages in full (FULL) and decides.
-const opPagesKnown = (n: OpNode): boolean => opPageIns(n).every(id => { const m = S.nodes[id] as PageNode; return !FR.on || !m.buf || !!frBufOf(m); });
+const opPagesKnown = (n: OpNode): boolean => opPageIns(n).every(id => { const m = S.nodes[id] as PageNode; return !m.buf || (FR.on && !!frBufOf(m)); });
 const opStale = (n: OpNode, full?: Map<string, string>): boolean => !!n.out && !n.out.err && (!!full || opPagesKnown(n)) && n.out.sig !== opSig(n, opInputs(n, full));
 function opProvider(n: OpNode): MediaProviderInfo | null { const ps = opProviders(); return ps.find(p => p.name === n.provider) || ps[0] || null; }
 function mountOp(n: OpNode, L: LiveEntry) {
