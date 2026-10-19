@@ -20,6 +20,9 @@
   --ansi-8: #595959; --ansi-9: #972500; --ansi-10: #00603f; --ansi-11: #894000; --ansi-12: #3546c2; --ansi-13: #531ab6; --ansi-14: #005f5f; --ansi-15: #ffffff;
   --shadow: 1px 1px 0 var(--line); --scrim: rgba(0, 0, 0, .25);
   --radius: 0;
+  /* Motion (R5): fades and hovers, panels and small moves, the camera and layout; one standard ease and one exit ease.
+     The same numbers are MOTION in app.ts. Reduced motion sets them to 0. */
+  --t-fast: 120ms; --t-mid: 200ms; --t-slow: 320ms; --ease: cubic-bezier(.2, .8, .2, 1); --ease-exit: cubic-bezier(.4, 0, 1, 1);
   --mono: "JetBrainsMono Nerd Font Mono", "JetBrains Mono", ui-monospace, monospace;
   --ui: "Noto Sans", system-ui, sans-serif;
   --hand: var(--ui);
@@ -120,7 +123,7 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 @keyframes pulse { from { box-shadow: 0 0 0 6px var(--accent-soft); } }
 .hdr { position: absolute; left: 0; right: 0; top: 0; height: 30px; display: flex; align-items: center; gap: 7px; padding: 0 6px 0 10px;
   border-bottom: 1px solid var(--line); cursor: grab; user-select: none; background: var(--panel-2); border-radius: var(--radius); }
-.hdr .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--line); flex: none; transition: background .3s; }
+.hdr .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--line); flex: none; transition: background var(--t-mid) var(--ease); }
 .hdr .dot.busy { background: var(--accent); }
 .hdr .path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12.5px var(--mono); }
 .hdr .anc { color: var(--muted); }
@@ -130,6 +133,17 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 .btns { display: flex; gap: 1px; }
 .hb { border: 0; background: transparent; width: 24px; height: 22px; border-radius: var(--radius); cursor: pointer; color: var(--muted); font-size: 13px; line-height: 1; }
 .hb:hover { background: var(--accent-soft); color: var(--fg); }
+/* R4: on a touch screen a card's small controls get an invisible hit area of at least 44 screen px. --iz is 1/zoom, so
+   44px * --iz is 44 screen px in the world's units; a folder tab is already at screen size. A header button's area takes
+   the full 44 px of height but only 4 px more on each side, so neighbouring buttons do not take each other's taps.
+   Nothing changes on screen, and nothing for a mouse. */
+@media (pointer: coarse) {
+  .hdr .hb, .flabel .hb { position: relative; }
+  .hdr .hb::before, .flabel .hb::before, .node .port::before, .node .rs::before, .frame > .rs::before { content: ''; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); }
+  .hdr .hb::before { width: calc(100% + 8px); height: max(100%, calc(44px * var(--iz, 1))); }
+  .flabel .hb::before { width: calc(100% + 8px); height: 44px; }
+  .node .port::before, .node .rs::before, .frame > .rs::before { width: max(100%, calc(44px * var(--iz, 1))); height: max(100%, calc(44px * var(--iz, 1))); }
+}
 .body { position: absolute; left: 0; right: 0; top: 30px; bottom: 0; overflow: hidden; border-radius: var(--radius); }
 .k-term .body, .k-repl .body { background: var(--term-bg); }
 .k-term .xterm, .k-repl .xterm { padding: 6px 4px 4px 8px; height: 100%; box-sizing: border-box; }
@@ -141,7 +155,7 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 .node > .ink { position: absolute; inset: 0; overflow: visible; pointer-events: none; z-index: 6; }
 .ink-lines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 6; }
 .port { position: absolute; left: 50%; bottom: 0; width: 12px; height: 12px; transform: translate(-50%, 50%); border-radius: 50%;
-  background: var(--panel); border: 2px solid var(--pipe); cursor: crosshair; opacity: 0; transition: opacity .15s; z-index: 7; }
+  background: var(--panel); border: 2px solid var(--pipe); cursor: crosshair; opacity: 0; transition: opacity var(--t-fast) var(--ease); z-index: 7; }
 .node:hover .port, .node.active .port { opacity: 1; }
 .node .rse { position: absolute; top: 28px; bottom: 16px; right: -4px; width: 8px; cursor: ew-resize; z-index: 7; }
 .node .rsb { position: absolute; left: 16px; right: 16px; bottom: -4px; height: 8px; cursor: ns-resize; z-index: 7; }
@@ -157,6 +171,17 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 #world.far .lod { display: block; }
 #world.far .body, #world.far .hdr, #world.far .port { visibility: hidden; }
 #world.far .node > .ink { display: none; }
+/* The far-zoom swap crossfades (R2): going far, the snapshot fades in over the live card; coming back, it fades out. */
+#world.lod-in .lod { animation: lodin var(--t-fast) var(--ease); }
+#world.lod-in .body, #world.lod-in .hdr { visibility: visible; }
+#world.lod-out .lod { display: block; pointer-events: none; animation: lodout var(--t-fast) var(--ease-exit) forwards; }
+@keyframes lodin { from { opacity: 0; } }
+@keyframes lodout { to { opacity: 0; } }
+/* A new card scales in from .96 and fades in; a removed one leaves a ghost that fades out (R5). */
+.node.entering { animation: cardin var(--t-mid) var(--ease); }
+@keyframes cardin { from { opacity: 0; transform: scale(.96); } }
+.node-ghost { position: absolute; background: var(--panel); border: 1px solid var(--stroke); border-radius: var(--radius); pointer-events: none; animation: cardout var(--t-fast) var(--ease-exit) forwards; }
+@keyframes cardout { to { opacity: 0; transform: scale(.98); } }
 .anchor-chip { font: 500 10.5px var(--mono); color: var(--accent); background: var(--accent-soft); border-radius: var(--radius); padding: 0 4px; margin-right: 2px; }
 
 /* ------------------------------------------------------------ edges and ink */
@@ -236,10 +261,10 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 .help dd { margin: 0; color: var(--muted); }
 .help p { margin: 2px 0 8px; max-width: 70ch; }
 #toast { position: fixed; z-index: 300; left: calc((100% - var(--side-w)) / 2); bottom: 46px; transform: translateX(-50%); max-width: calc(100% - 32px); background: var(--fg); color: var(--bg);
-  padding: 8px 14px; border-radius: var(--radius); font-size: 12.5px; box-shadow: var(--shadow); opacity: 0; pointer-events: none; transition: opacity .2s; user-select: text; }
+  padding: 8px 14px; border-radius: var(--radius); font-size: 12.5px; box-shadow: var(--shadow); opacity: 0; pointer-events: none; transition: opacity var(--t-mid) var(--ease); user-select: text; }
 #toast.show { opacity: 1; pointer-events: auto; }
 #toast button { margin-left: 6px; color: inherit; background: transparent; border: 1px solid currentColor; }  /* F-A14: Revive all agents */
-@media (prefers-reduced-motion: reduce) { .e-pipe { animation: none; } .node.pulse { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .e-pipe { animation: none; } .node.pulse { animation: none; } :root { --t-fast: 0ms; --t-mid: 0ms; --t-slow: 0ms; } }
 @media (max-width: 640px) { #st-addr { min-width: 0; } .mode { display: none; } }
 #world.far .fcols, #world.far .frows { display: none; }
 
@@ -394,8 +419,8 @@ body:not([data-view="canvas"]) .c-only { display: none !important; }
 
 /* side pane */
 #side { position: fixed; z-index: 110; top: 0; bottom: 0; right: 0; width: var(--pane-w); max-width: 100%; display: flex; flex-direction: column;
-  background: var(--panel); border-left: 1px solid var(--line); transform: translateX(100%); visibility: hidden; transition: transform .2s ease, visibility 0s .2s; }
-body.side-open #side { transform: none; visibility: visible; transition: transform .2s ease; }
+  background: var(--panel); border-left: 1px solid var(--line); transform: translateX(100%); visibility: hidden; transition: transform var(--t-mid) var(--ease-exit), visibility 0s var(--t-mid); }
+body.side-open #side { transform: none; visibility: visible; transition: transform var(--t-mid) var(--ease); }
 @media (prefers-reduced-motion: reduce) { #side, body.side-open #side { transition: none; } }
 .side-hd { flex: none; display: flex; align-items: center; gap: 6px; padding: calc(env(safe-area-inset-top, 0px) + 12px) 10px 10px 14px; border-bottom: 1px solid var(--line); }
 .side-hd b { font: 600 14px var(--mono); }
@@ -495,7 +520,7 @@ body.side-open #side { transform: none; visibility: visible; transition: transfo
 #tk-board { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; padding: 18px 20px 40px; max-width: 1400px; margin: 0 auto; align-items: start; }
 @container (max-width: 960px) { #tk-board { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @container (max-width: 560px) { #tk-board { grid-template-columns: minmax(0, 1fr); padding: 12px 16px 40px; } }
-.tk-col { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; transition: border-color .15s; }
+.tk-col { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; transition: border-color var(--t-fast) var(--ease); }
 .tk-col.over { border-color: var(--accent); background: var(--accent-soft); }
 .tk-col h3 { margin: 2px 4px; font: 600 14px var(--mono); display: flex; justify-content: space-between; }
 .tk-n { font: 500 12px var(--mono); color: var(--muted); }
@@ -528,7 +553,7 @@ body.side-open #side { transform: none; visibility: visible; transition: transfo
 .shape-round > .flabel { left: 40px; }
 .fico { font: 13px var(--mono); color: var(--accent); }
 .fcount { font: 500 11px var(--mono); color: var(--muted); }
-.fmodes { display: inline-flex; gap: 0; margin-left: 4px; opacity: .35; transition: opacity .15s; }
+.fmodes { display: inline-flex; gap: 0; margin-left: 4px; opacity: .35; transition: opacity var(--t-fast) var(--ease); }
 .frame:hover > .flabel .fmodes, .frame.active > .flabel .fmodes { opacity: 1; }
 .fmodes .hb.on { color: var(--accent); background: var(--accent-soft); }
 .frame.active { border-color: var(--accent); }
@@ -540,7 +565,9 @@ body.side-open #side { transform: none; visibility: visible; transition: transfo
 .frame.m-stack.drop-target .deck-face { border-color: var(--accent); }
 .stashed { visibility: hidden !important; pointer-events: none !important; }
 .stashed * { visibility: hidden !important; }
-#world.settle .node, #world.settle .frame { transition: left .24s cubic-bezier(.2,.8,.2,1), top .24s cubic-bezier(.2,.8,.2,1), width .24s, height .24s; }
+/* Layout moves (pack, tile, push apart, undo) are FLIP transforms set by settle() in app.ts, not transitions of left, top,
+   width and height: the cards are laid out once at their end, then slide and scale from where they were (R3). */
+#world .flip { transition: transform var(--t-slow) var(--ease); transform-origin: 0 0; }
 /* The folder tab is chrome: it keeps its screen size at every zoom, so its mode buttons stay usable when zoomed out. */
 .flabel { transform: scale(var(--iz, 1)); transform-origin: left bottom; }
 .fmodes { opacity: .6; }
@@ -616,7 +643,7 @@ body.listening #st-buf-text { color: var(--ink-red); }
 .tb { font-size: 13px; height: 28px; }
 .tb.on { background: var(--accent-soft); color: var(--fg); box-shadow: inset 0 -2px 0 var(--accent); }
 #view-name { font-weight: 600; }
-.dock { animation: dockin .12s ease-out; }
+.dock { animation: dockin var(--t-fast) var(--ease); }
 @keyframes dockin { from { opacity: 0; transform: translateY(-3px); } }
 .pal input { font: 14px var(--mono); }
 .pi { padding: 3px 8px; }
@@ -671,14 +698,14 @@ body.listening #st-buf-text { color: var(--ink-red); }
 
 /* v6.4: drag the side pane's left edge to resize it */
 #side-grip { position: absolute; z-index: 3; left: -5px; top: 0; bottom: 0; width: 10px; cursor: col-resize; touch-action: none; }
-#side-grip::after { content: ""; position: absolute; left: 4px; top: 0; bottom: 0; width: 2px; background: transparent; transition: background .12s; }
+#side-grip::after { content: ""; position: absolute; left: 4px; top: 0; bottom: 0; width: 2px; background: transparent; transition: background var(--t-fast) var(--ease); }
 #side-grip:hover::after, body.pane-drag #side-grip::after { background: var(--accent); }
 body.pane-drag, body.pane-drag * { cursor: col-resize !important; user-select: none; }
 body.pane-drag #side { transition: none; }
 @media (max-width: 760px) { #side-grip { display: none; } }
 
 #tree-grip { position: absolute; z-index: 3; right: 0; top: 0; bottom: 0; width: 10px; cursor: col-resize; touch-action: none; }
-#tree-grip::after { content: ""; position: absolute; right: 0; top: 8px; bottom: 8px; width: 2px; border-radius: var(--radius); background: transparent; transition: background .12s; }
+#tree-grip::after { content: ""; position: absolute; right: 0; top: 8px; bottom: 8px; width: 2px; border-radius: var(--radius); background: transparent; transition: background var(--t-fast) var(--ease); }
 #tree-grip:hover::after, body.pane-drag #tree-grip:active::after { background: var(--accent); }
 @media (max-width: 760px) { #tree-grip { display: none; } }
 

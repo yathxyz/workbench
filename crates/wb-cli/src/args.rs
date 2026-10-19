@@ -17,6 +17,7 @@ pub const USAGE: &str = "usage: wb buf ls [--json]
        wb tools [--socket PATH]
        wb TOOL [--json INPUT] [KEY=VALUE]... [KEY:=JSON]... [--timeout SECS] [--socket PATH]
        wb desk ls | go N | send N [PATH]... [--keep] [--follow] [--timeout SECS] [--socket PATH]
+       wb desk query [N] WORD... [--timeout SECS] [--socket PATH]
 ";
 
 /// Board tools that `wb` does not run (W-14): hosts, units and tmux.
@@ -474,13 +475,14 @@ fn desk_number(arg: &str) -> Result<Value, Usage> {
     }
 }
 
-/// `wb desk ls`, `wb desk go N` and `wb desk send N [PATH]... [--keep] [--follow]`: the
-/// board tools `list_desks`, `go_to_desk` and `send_to_desk` (DESIGN §10.8, D3), run as
-/// `wb TOOL` runs them.
+/// `wb desk ls`, `wb desk go N`, `wb desk send N [PATH]... [--keep] [--follow]` and
+/// `wb desk query [N] WORD...`: the board tools `list_desks`, `go_to_desk`, `send_to_desk`
+/// (DESIGN §10.8, D3) and `query_desk` (F-A38), run as `wb TOOL` runs them. The query's
+/// words are joined with spaces; a lone digit first is the desk.
 fn parse_desk(argv: &[String]) -> Result<Args, Usage> {
     let (sub, rest) = argv
         .split_first()
-        .ok_or_else(|| usage("desk needs ls, go or send"))?;
+        .ok_or_else(|| usage("desk needs ls, go, send or query"))?;
     refuse_url_token(rest)?;
     let s = Split::new(rest, &["--timeout", "--socket"])?;
     let mut fields = Vec::new();
@@ -514,9 +516,26 @@ fn parse_desk(argv: &[String]) -> Result<Args, Usage> {
             }
             "send_to_desk"
         }
+        "query" => {
+            s.check(&["--timeout", "--socket"])?;
+            let mut words = &s.pos[..];
+            if let Some((n, rest)) = words.split_first() {
+                if n.len() == 1 && n.as_bytes()[0].is_ascii_digit() {
+                    match desk_number(n)? {
+                        Value::Number(k) if (1..=8).contains(&k.as_u64().unwrap_or(0)) => {
+                            fields.push(("desk".to_owned(), Value::Number(k)));
+                        }
+                        _ => return Err(usage("a query desk is one of desks 1-8")),
+                    }
+                    words = rest;
+                }
+            }
+            fields.push(("query".to_owned(), Value::String(words.join(" "))));
+            "query_desk"
+        }
         other => {
             return Err(usage(format!(
-                "unknown desk command {other:?}: ls, go or send"
+                "unknown desk command {other:?}: ls, go, send or query"
             )));
         }
     };
@@ -1085,6 +1104,17 @@ mod tests {
             c.input(None).unwrap(),
             obj(serde_json::json!({"desk": 0, "keep": true}))
         );
+        let c = call(&["desk", "query", "3", "kind:agent", "-state:done"]);
+        assert_eq!(c.tool, "query_desk");
+        assert_eq!(
+            c.input(None).unwrap(),
+            obj(serde_json::json!({"desk": 3, "query": "kind:agent -state:done"}))
+        );
+        let c = call(&["desk", "query", "tag:review"]);
+        assert_eq!(
+            c.input(None).unwrap(),
+            obj(serde_json::json!({"query": "tag:review"}))
+        );
         // `--` lets a path start with a dash
         assert_eq!(
             call(&["desk", "send", "2", "--", "--odd"]).fields[1].1,
@@ -1104,6 +1134,9 @@ mod tests {
             &["desk", "send", "1", "--json", "{}"][..],
             &["desk", "send", "1", "--timeout", "0"][..],
             &["desk", "move", "1"][..],
+            &["desk", "query", "9", "kind:agent"][..],
+            &["desk", "query", "0", "kind:agent"][..],
+            &["desk", "query", "kind:agent", "--keep"][..],
             &["desk", "ls", "--url", "http://h"][..],
         ] {
             assert!(pv(argv).is_err(), "{argv:?} should be a usage error");
@@ -1114,6 +1147,7 @@ mod tests {
     fn usage_lists_the_tool_commands() {
         assert!(USAGE.contains("wb tools [--socket PATH]"));
         assert!(USAGE.contains("wb desk ls | go N | send N [PATH]..."));
+        assert!(USAGE.contains("wb desk query [N] WORD..."));
         assert!(USAGE.contains(
             "wb TOOL [--json INPUT] [KEY=VALUE]... [KEY:=JSON]... [--timeout SECS] [--socket PATH]"
         ));

@@ -24,6 +24,8 @@ const store = {
 const motionQuery = matchMedia('(prefers-reduced-motion: reduce)');
 let reduceMotion = motionQuery.matches;
 motionQuery.addEventListener?.('change', e => { reduceMotion = e.matches; });
+// Motion tokens (R5), the same three as style.css: fades and hovers, panels and small moves, the camera and layout.
+const MOTION = { fast: 120, mid: 200, slow: 320 };
 
 // ------------------------------------------------------------------ state
 let S: Board = null!;         // persisted board
@@ -65,18 +67,38 @@ function applyCam() {
   viewport.style.backgroundPosition = `${-c.x * c.z}px ${-c.y * c.z}px`;
   $('#st-zoom')!.textContent = Math.round(c.z * 100) + '%';
   if (Math.abs(c.z - chromeZ) > chromeZ * 0.04) fitChromeAll(c.z);
-  const lod = c.z < LOD_Z;
-  if (lod !== lastLod) {
-    lastLod = lod;
-    world.classList.toggle('far', lod);
-    clearInterval(lodTimer);
-    if (lod) { refreshSnapshots(); lodTimer = setInterval(refreshSnapshots, 1500); }
-    else for (const id in live) { live[id].fitNow?.(); scheduleLineInk(id); }
-  }
+  lodCheck();
   if (INK.ids.length) placeInkChip();
   if (FR.on) frSchedule();
   dirtyCam();
 }
+// Far zoom (R2): below LOD_IN every card shows its snapshot, above LOD_OUT its live body again; between the two the mode
+// stays as it is, so a zoom that rests near the line does not flicker. The swap waits while a hand, the wheel or a flight
+// moves the camera (LOD.busy) and runs when it settles (lodSettle): each swap restyles every card, which is the hitch a
+// pinch felt in the middle of the gesture. It crossfades over MOTION.fast; on the way in, the cards on screen fit at once
+// and the rest in idle time.
+const LOD_IN = 0.42, LOD_OUT = 0.48;
+const LOD: { busy: () => boolean; fadeT: number; idle: number } = { busy: () => false, fadeT: 0, idle: 0 };
+const lodWant = (z: number): boolean => lastLod === null ? z < LOD_Z : lastLod ? z < LOD_OUT : z < LOD_IN;
+function lodCheck(force = false) {
+  const lod = lodWant(cam().z);
+  if (lod === lastLod || (!force && lastLod !== null && LOD.busy())) return;
+  const first = lastLod === null; lastLod = lod;
+  world.classList.toggle('far', lod);
+  if (!first && !reduceMotion) { world.classList.remove('lod-in', 'lod-out'); void world.offsetWidth; world.classList.add(lod ? 'lod-in' : 'lod-out'); clearTimeout(LOD.fadeT); LOD.fadeT = setTimeout(() => world.classList.remove('lod-in', 'lod-out'), MOTION.fast); }
+  clearInterval(lodTimer!); cancelIdle(LOD.idle);
+  if (FR.on) frSchedule();
+  if (lod) { refreshSnapshots(); lodTimer = setInterval(refreshSnapshots, 1500); return; }
+  const ids = Object.keys(live), seen = ids.filter(id => S.nodes[id] && onScreen(S.nodes[id])), rest = ids.filter(id => !seen.includes(id));
+  for (const id of seen) { live[id].fitNow?.(); scheduleLineInk(id); }
+  const more = () => { if (lastLod) return; for (const id of rest.splice(0, 12)) if (live[id]) { live[id].fitNow?.(); scheduleLineInk(id); } if (rest.length) LOD.idle = idle(more); };
+  if (rest.length) LOD.idle = idle(more);
+}
+const lodSettle = () => { if (!LOD.busy()) lodCheck(true); };
+function onScreen(n: BoardNode): boolean { const a = w2s(n.x, n.y), b = w2s(n.x + n.w, n.y + n.h); return b.x > 0 && b.y > 0 && a.x < VW() && a.y < VH(); }
+const IDLE = 'requestIdleCallback' in window;   // Safari has none
+const idle = (f: () => void): number => IDLE ? requestIdleCallback(f, { timeout: 500 }) : setTimeout(f, 30) as unknown as number;
+const cancelIdle = (h: number) => { if (!h) return; if (IDLE) cancelIdleCallback(h); else clearTimeout(h); };
 function zoomAt(sx: number, sy: number, f: number): void {
   const w = s2w(sx, sy); const c = cam();
   c.z = clamp(c.z * f, 0.08, 3);
@@ -85,6 +107,9 @@ function zoomAt(sx: number, sy: number, f: number): void {
 }
 let anim: number | null = null, animDone: (() => void) | null = null;
 const GLIDE = { raf: 0, ok: false, trail: [] as [number, number, number][] };   // a flicked one-finger pan carrying on; trail: its last moves, [time, x, y]
+// R1: a mouse wheel's zoom notch eases to its target about the pointer over MOTION.fast; a notch during the ease adds to
+// the target. at: the last wheel event (the far-zoom swap waits for the wheel to rest, LOD.busy).
+const WHEEL = { raf: 0, z: 1, x: 0, y: 0, at: -1e9, restT: 0 };
 // A flight follows van Wijk and Nuij's smooth zoom path ("Smooth and efficient zooming and panning", 2003, as d3's
 // interpolateZoom): the zoom changes at an even rate on screen, and a long jump at one zoom pulls back and comes
 // in again rather than sliding the whole board past. Any hand on the camera (a pan, a pinch, the wheel) ends it.
@@ -99,7 +124,7 @@ function zoomPath(cx0: number, cy0: number, w0: number, cx1: number, cy1: number
 }
 function animateTo(t: Cam, done?: (() => void) | null): void {
   camStop(false);
-  const c = cam(), T = reduceMotion ? 0 : 380, t0 = performance.now(), W = VW(), H = VH();
+  const c = cam(), T = reduceMotion ? 0 : MOTION.slow, t0 = performance.now(), W = VW(), H = VH();
   // the path runs on the screen centre and the width of world in view
   const path = zoomPath(c.x + W / 2 / c.z, c.y + H / 2 / c.z, W / c.z, t.x + W / 2 / t.z, t.y + H / 2 / t.z, W / t.z);
   animDone = done || null;
@@ -108,7 +133,7 @@ function animateTo(t: Cam, done?: (() => void) | null): void {
     if (k < 1) { const [cx, cy, w] = path(e); c.z = W / w; c.x = cx - W / 2 / c.z; c.y = cy - H / 2 / c.z; }
     else { c.x = t.x; c.y = t.y; c.z = t.z; }   // land exactly on the target
     applyCam();
-    if (k < 1) anim = requestAnimationFrame(step); else { anim = null; const d = animDone; animDone = null; d?.(); }
+    if (k < 1) anim = requestAnimationFrame(step); else { anim = null; const d = animDone; animDone = null; d?.(); lodSettle(); }
   };
   anim = requestAnimationFrame(step);
 }
@@ -116,6 +141,7 @@ function animateTo(t: Cam, done?: (() => void) | null): void {
 function camStop(finish = true) {
   if (anim) { cancelAnimationFrame(anim); anim = null; const d = animDone; animDone = null; if (finish) d?.(); }
   if (GLIDE.raf) { cancelAnimationFrame(GLIDE.raf); GLIDE.raf = 0; }
+  if (WHEEL.raf) { cancelAnimationFrame(WHEEL.raf); WHEEL.raf = 0; }
 }
 function pushHistory() { camBack.push({ ...cam() }); if (camBack.length > 60) camBack.shift(); camFwd.length = 0; }
 function camArea(): { left: number; top: number; vw: number; vh: number } {   // the part of the viewport a fit aims at
@@ -1682,11 +1708,35 @@ function moveTree(n: BoardNode, dx: number, dy: number) {
   for (const sh of S.shapes) if (sh.in && ids.has(sh.in)) { sh.x! += dx; sh.y! += dy; }
 }
 function renumber(f: FrameNode) { kidsOf(f.id).sort(byOrder).forEach((k, i) => { k.order = i; }); }
-let settleT: number | null = null;
+// R3, FLIP: settle() is called before a layout change. It notes where each shown card and folder stands (First, from its
+// inline style, which reads no layout); in the next frame the change has placed them at their end (Last); each one that
+// moved starts there with a transform back to where it was (Invert) and the transform runs off on the compositor (Play).
+// The cards are laid out once, not in every frame of a left/top/width/height transition.
+const FLIP: { first: Map<HTMLElement, number[]> | null; raf: number; t: number } = { first: null, raf: 0, t: 0 };
+const boxOf = (e: HTMLElement): number[] => [parseFloat(e.style.left), parseFloat(e.style.top), parseFloat(e.style.width), parseFloat(e.style.height)];
 function settle() {
   if (reduceMotion) return;
-  world.classList.add('settle'); clearTimeout(settleT);
-  settleT = setTimeout(() => { world.classList.remove('settle'); renderLinks(); for (const id in live) live[id].fitNow?.(); }, 280);
+  if (!FLIP.first) {   // the first call of a frame takes First; nested relayouts of the same change add nothing
+    FLIP.first = new Map();
+    for (const e of [...framesEl.children, ...nodesEl.children] as HTMLElement[]) if (e.style.left && !e.classList.contains('stashed')) FLIP.first.set(e, boxOf(e));
+    FLIP.raf = requestAnimationFrame(flipPlay);
+  }
+  clearTimeout(FLIP.t);
+  FLIP.t = setTimeout(() => { renderLinks(); for (const id in live) live[id].fitNow?.(); }, MOTION.slow + 40);
+}
+function flipPlay() {
+  const first = FLIP.first!, moved: HTMLElement[] = []; FLIP.first = null; FLIP.raf = 0;
+  for (const [e, a] of first) {
+    if (!e.isConnected) continue;
+    const b = boxOf(e); if (a.some(isNaN) || b.some(isNaN) || a.every((v, i) => Math.abs(v - b[i]) < 0.5)) continue;
+    e.classList.remove('flip');
+    e.style.transform = `translate(${a[0] - b[0]}px, ${a[1] - b[1]}px) scale(${b[2] ? a[2] / b[2] : 1}, ${b[3] ? a[3] / b[3] : 1})`;
+    moved.push(e);
+  }
+  if (!moved.length) return;
+  void world.offsetWidth;   // the start lands before the transition is on
+  for (const e of moved) { e.classList.add('flip'); e.style.transform = ''; }
+  setTimeout(() => { for (const e of moved) if (!e.style.transform) e.classList.remove('flip'); }, MOTION.slow + 40);
 }
 // ---- boundaries: items on one level never overlap (user, 10:35). After a drop, a resize, an unfold or a new item, the
 // others on that level are pushed apart along the axis of least overlap, folder tabs included, and the folder grows to fit.
@@ -2484,6 +2534,8 @@ type AddNodeArg = BoardNodeInit & { name: string; x: number; y: number; w: numbe
   if (n._spawn !== false) n._spawn = true;   // made in this page: its first open may spawn (SEC-2), unless adopted; `_` keys are never saved
   deskJoin(n as BoardNode);
   S.nodes[n.id] = n as BoardNode; mount(n as BoardNode);
+  const ne = live[n.id]?.el;   // R5: a card made now scales and fades in (not the cards a perspective builds)
+  if (ne && n.kind !== 'frame' && BOOTED && !PERSP.building && !reduceMotion) { ne.classList.add('entering'); ne.addEventListener('animationend', () => ne.classList.remove('entering'), { once: true }); }
   SEP.keep = n as BoardNode; if (n.in) relayout(S.nodes[n.in] as FrameNode, true); else separate(null, n as BoardNode); SEP.keep = null;
   restack(); renderEdges(); activate(n.id); renderTree(); dirty(); return n as N & BoardNode;
 }
@@ -2500,6 +2552,12 @@ function newAt<K extends NodeKind>(kind: K, extra: Partial<NodeOfKind<K>> = {}):
   const x = at ? Math.round(at.x) : Math.round(c.x - w / 2) + jitter(), y = at ? Math.round(at.y) : Math.round(c.y - h / 2) + jitter();
   return addNode({ kind, name: names[kind] + count, x, y, w, h, ...extra }) as NodeOfKind<K>;
 }
+// R5: a removed card leaves a plain ghost of its box that fades out; the card itself is gone at once.
+function cardGhost(e: HTMLElement) {
+  if (reduceMotion || !e.isConnected || e.classList.contains('stashed') || !e.classList.contains('node') || lastLod) return;
+  const g = el('div', 'node-ghost'); for (const k of ['left', 'top', 'width', 'height', 'zIndex'] as const) g.style[k] = e.style[k];
+  nodesEl.append(g); setTimeout(() => g.remove(), MOTION.fast + 40);
+}
 function removeNode(id: string) {
   PICKED.delete(id); pickChip();
   const gone = S.nodes[id], parent = gone?.in && S.nodes[gone.in] as FrameNode;
@@ -2508,7 +2566,7 @@ function removeNode(id: string) {
     for (const k of kidsOf(id)) { if (parent) k.in = parent.id; else delete k.in; }
   }
   const L = live[id];
-  if (L) { L.backend?.kill?.(); L.ro?.disconnect(); L.view?.destroy(); L.term?.dispose(); if (L.frame?.contentWindow) HOSTS.delete(L.frame.contentWindow); if (FR.on) frUnmount(id); L.el!.remove(); delete live[id]; }
+  if (L) { L.backend?.kill?.(); L.ro?.disconnect(); L.view?.destroy(); L.term?.dispose(); if (L.frame?.contentWindow) { HOSTS.delete(L.frame.contentWindow); frameTouchDrop(id); } if (FR.on) frUnmount(id); cardGhost(L.el!); L.el!.remove(); delete live[id]; }
   delete S.nodes[id]; DESK.mem.delete(id); for (const d of [...deskList(), DESK.smart].filter(Boolean) as Desk[]) { delete d.members[id]; if (d.saved) delete d.saved.members[id]; }
   if (S.sticky) { S.sticky = S.sticky.filter(x => x !== id); if (!S.sticky.length) delete S.sticky; } if (ovlHas({ id })) { OVL.ids = OVL.ids.filter(x => x !== id); delete OVL.saved[id]; viewSave(); }
   S.edges = S.edges.filter(e => e.from !== id && e.to !== id);
@@ -2874,7 +2932,27 @@ const TOUCH = new Map<number, BoardPoint>(), CAPTURED = new Map<number, EventTar
 const holdTouch = (e: TouchEvent) => { if (pinch && e.touches.length > 1) { e.preventDefault(); e.stopPropagation(); } };   // no card scrolls under a pinch
 viewport.addEventListener('gotpointercapture', e => CAPTURED.set(e.pointerId, e.target), true);
 viewport.addEventListener('lostpointercapture', e => { if (CAPTURED.get(e.pointerId) === e.target) CAPTURED.delete(e.pointerId); }, true);
+// A double tap with one finger (the recommended answer to F-A26's open question): on bare canvas it zooms in 2× about the
+// finger, on a folder's own area it fits the folder. A touch never makes a page by double tap; "New page here" is the
+// long-press menu's (F-A34). A tap: down and up within 300 ms and 12 px; the second within 350 ms and 30 px of the first.
+const TAP = { id: -1, down: 0, x0: 0, y0: 0, on: null as Element | null, t: -1e9, x: 0, y: 0, touchAt: -1e9 };
+const tapGround = (t: Element | null): boolean => !!t && (t === viewport || t === world || t.classList.contains('fgrid') || t.classList.contains('frame'));
+function doubleTap(t: Element, sx: number, sy: number) {
+  const f = t.classList.contains('frame') ? S.nodes[(t as HTMLElement).dataset.id!] : null;
+  pushHistory();
+  if (f) { activate(f.id); return animateTo(camTarget(f.x, f.y - LABEL_H, f.w, f.h + LABEL_H, 1)); }
+  const r = viewport.getBoundingClientRect(), x = sx - r.left, y = sy - r.top, w = s2w(x, y), z = clamp(cam().z * 2, 0.08, 3);
+  animateTo({ z, x: w.x - x / z, y: w.y - y / z });
+}
 for (const t of ['pointerup', 'pointercancel'] as const) window.addEventListener(t, e => {
+  if (e.pointerType === 'touch') TAP.touchAt = performance.now();
+  if (e.pointerId === TAP.id) {
+    TAP.id = -1;
+    if (e.type === 'pointerup' && e.timeStamp - TAP.down < 300 && Math.hypot(e.clientX - TAP.x0, e.clientY - TAP.y0) < 12) {
+      if (e.timeStamp - TAP.t < 350 && Math.hypot(e.clientX - TAP.x, e.clientY - TAP.y) < 30) { TAP.t = -1e9; doubleTap(TAP.on!, e.clientX, e.clientY); }
+      else { TAP.t = e.timeStamp; TAP.x = e.clientX; TAP.y = e.clientY; }
+    } else TAP.t = -1e9;
+  }
   if (!TOUCH.delete(e.pointerId) || TOUCH.size) return;
   viewport.classList.remove('touching');
   viewport.removeEventListener('touchmove', holdTouch, { capture: true });
@@ -2883,6 +2961,8 @@ viewport.addEventListener('pointerdown', ev => {
   if (ev.pointerType !== 'touch') return;
   camStop();   // a finger down stops a flight or a glide
   TOUCH.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+  if (TOUCH.size === 1 && !FOCUS.cur && tapGround(ev.target as Element)) Object.assign(TAP, { id: ev.pointerId, down: ev.timeStamp, x0: ev.clientX, y0: ev.clientY, on: ev.target });
+  else { TAP.id = -1; TAP.t = -1e9; }   // a second finger is a pinch, not a tap
   viewport.classList.add('touching');   // a web or artifact card's frame would keep the second finger to itself
   if (FOCUS.cur || TOUCH.size !== 2) return;
   const first = [...TOUCH.keys()].find(id => id !== ev.pointerId);
@@ -2890,7 +2970,7 @@ viewport.addEventListener('pointerdown', ev => {
   ev.preventDefault(); ev.stopImmediatePropagation();
   viewport.addEventListener('touchmove', holdTouch, { capture: true, passive: false });
   for (const [id, q] of TOUCH) { if (!pointers.has(id)) pointers.set(id, { x: q.x, y: q.y }); try { viewport.setPointerCapture(id); } catch {} }
-  startPinch(); viewport.classList.add('panning');
+  startPinch(); viewport.classList.add('panning'); framePinchSay();
 }, true);
 viewport.addEventListener('pointermove', ev => { const q = TOUCH.get(ev.pointerId); if (q) { q.x = ev.clientX; q.y = ev.clientY; } }, true);
 function glide(ev: PointerEvent) {   // the pan's speed over its last 100 ms carries on and decays (time constant 325 ms)
@@ -2903,6 +2983,7 @@ function glide(ev: PointerEvent) {   // the pan's speed over its last 100 ms car
     const d = Math.min(48, now - last), f = Math.exp(-d / 325); last = now;
     cam().x -= vx * d / cam().z; cam().y -= vy * d / cam().z; vx *= f; vy *= f; applyCam();
     GLIDE.raf = Math.hypot(vx, vy) > 0.02 ? requestAnimationFrame(step) : 0;
+    if (!GLIDE.raf) lodSettle();
   };
   GLIDE.raf = requestAnimationFrame(step);
 }
@@ -2983,29 +3064,88 @@ viewport.addEventListener('pointermove', ev => {
     if (GLIDE.ok) GLIDE.trail.push([ev.timeStamp, ev.clientX, ev.clientY]);
   }
   p.x = ev.clientX; p.y = ev.clientY;
-  if (pointers.size === 2 && pinch) {
-    const [a, b] = [...pointers.values()], d = Math.hypot(a.x - b.x, a.y - b.y), mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
-    cam().x -= (mx - pinch.mx) / cam().z; cam().y -= (my - pinch.my) / cam().z;
-    zoomAt(mx, my, d / pinch.d); pinch = { d, mx, my };
-  }
+  pinchStep();
 });
+function pinchStep() {
+  if (pointers.size !== 2 || !pinch) return;
+  const [a, b] = [...pointers.values()], d = Math.hypot(a.x - b.x, a.y - b.y), mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  cam().x -= (mx - pinch.mx) / cam().z; cam().y -= (my - pinch.my) / cam().z;
+  zoomAt(mx, my, d / pinch.d); pinch = { d, mx, my };
+}
 const endPan = (ev: PointerEvent) => {
-  if (!pointers.delete(ev.pointerId)) return; pinch = null;
+  if (!pointers.delete(ev.pointerId)) return; pinch = null; if (FTOUCH.ports.size) framePinchSay();
   if (ev.pointerType === 'pen') { PEN.at = PEN.end = performance.now(); PEN.x = ev.clientX; PEN.y = ev.clientY; }   // F-A31: for penResume
-  if (!pointers.size) { viewport.classList.remove('panning'); if (GLIDE.ok) glide(ev); GLIDE.ok = false; }
+  if (!pointers.size) { viewport.classList.remove('panning'); if (GLIDE.ok) glide(ev); GLIDE.ok = false; lodSettle(); }
 };
+// Fingers inside an artifact frame (bridge.js {t:'touch'}): the frame keeps its touches, so it reports them. Each is a
+// pointer with an id of its own below zero, in TOUCH as a canvas finger is. Two in one frame pinch the camera; one in a
+// frame and one on the canvas pinch too (the canvas finger's pointerdown finds the frame's in TOUCH). While the board
+// pinches with a frame's finger, that page scrolls nothing ({t:'pinch'}). Web cards are other origins and cannot report.
+const FTOUCH = { ids: new Map<string, number>(), next: -1000, ports: new Map<number, MessagePort>() };
+function frameTouch(n: BoardNode, L: LiveEntry, port: MessagePort, m: Extract<ArtPageMsg, { t: 'touch' }>) {
+  const f = L.frame as HTMLIFrameElement | undefined; if (!f?.isConnected || !Array.isArray(m.touches)) return;
+  const r = f.getBoundingClientRect(), k = f.clientWidth ? r.width / f.clientWidth : 1, pre = n.id + ':', now = new Map<number, BoardPoint>();
+  for (const t of m.touches.slice(0, 5)) {
+    if (!Number.isFinite(t?.x) || !Number.isFinite(t?.y)) continue;
+    let id = FTOUCH.ids.get(pre + t.id); if (id === undefined) { id = FTOUCH.next--; FTOUCH.ids.set(pre + t.id, id); FTOUCH.ports.set(id, port); }
+    now.set(id, { x: r.left + t.x * k, y: r.top + t.y * k });
+  }
+  for (const [key, id] of FTOUCH.ids) if (key.startsWith(pre) && !now.has(id)) {   // a finger lifted
+    FTOUCH.ids.delete(key); FTOUCH.ports.delete(id); TOUCH.delete(id);
+    if (pointers.delete(id)) { pinch = null; framePinchSay(); if (!pointers.size) { viewport.classList.remove('panning'); lodSettle(); } }
+  }
+  if (m.phase === 'start') camStop();
+  for (const [id, q] of now) { TOUCH.set(id, q); const p = pointers.get(id); if (p) { p.x = q.x; p.y = q.y; } }
+  viewport.classList.toggle('touching', TOUCH.size > 0);
+  if (m.phase === 'start' && !FOCUS.cur && !pointers.size && now.size >= 2) {   // two fingers in this frame: a pinch
+    for (const [id, q] of [...now].slice(0, 2)) pointers.set(id, { x: q.x, y: q.y });
+    startPinch(); viewport.classList.add('panning'); framePinchSay();
+  }
+  pinchStep();
+}
+// A frame that goes away takes its fingers with it.
+function frameTouchDrop(nodeId: string) {
+  for (const [key, id] of FTOUCH.ids) if (key.startsWith(nodeId + ':')) { FTOUCH.ids.delete(key); FTOUCH.ports.delete(id); TOUCH.delete(id); if (pointers.delete(id)) pinch = null; }
+  if (!TOUCH.size) viewport.classList.remove('touching');
+  if (!pointers.size) viewport.classList.remove('panning');
+}
+// The frames whose fingers the pinch holds hear {t:'pinch', on:true}; the others, and all of them after it, on:false.
+function framePinchSay() {
+  const on = new Set([...pointers.keys()].filter(id => id < 0 && pinch).map(id => FTOUCH.ports.get(id)));
+  for (const p of new Set(FTOUCH.ports.values())) try { p.postMessage({ t: 'pinch', on: on.has(p) }); } catch {}
+}
+LOD.busy = () => !!(anim || GLIDE.raf || WHEEL.raf || pinch || pointers.size || performance.now() - WHEEL.at < 150);
 viewport.addEventListener('pointerup', endPan); viewport.addEventListener('pointercancel', endPan);
 viewport.addEventListener('wheel', e => {
   if (FOCUS.cur) return;
   const inBody = (e.target as Element).closest('.node.active .body');
   if (inBody && !e.ctrlKey && !e.metaKey) return;
-  e.preventDefault(); camStop();
-  if (e.ctrlKey || e.metaKey) zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * (e.deltaMode ? 0.05 : 0.0025) * (e.ctrlKey && !e.metaKey && Math.abs(e.deltaY) < 50 ? 4 : 1)));
+  e.preventDefault();
+  const easing = WHEEL.raf ? WHEEL.z : 0;   // the target of a notch still easing
+  camStop(); WHEEL.at = performance.now();
+  clearTimeout(WHEEL.restT); WHEEL.restT = setTimeout(lodSettle, 160);   // the far-zoom swap runs once the wheel rests
+  if (e.ctrlKey || e.metaKey) {
+    const f = Math.exp(-e.deltaY * (e.deltaMode ? 0.05 : 0.0025) * (e.ctrlKey && !e.metaKey && Math.abs(e.deltaY) < 50 ? 4 : 1));
+    if (e.deltaMode || Math.abs(e.deltaY) >= 50) wheelZoom(e.clientX, e.clientY, (easing || cam().z) * f);   // a mouse notch eases (R1)
+    else zoomAt(e.clientX, e.clientY, f);   // a trackpad pinch arrives as many small steps already
+  }
   else { const k = e.deltaMode ? 30 : 1; cam().x += e.deltaX * k / cam().z; cam().y += e.deltaY * k / cam().z; applyCam(); }
 }, { passive: false });
+function wheelZoom(sx: number, sy: number, z: number) {
+  WHEEL.z = clamp(z, 0.08, 3); WHEEL.x = sx; WHEEL.y = sy;
+  if (reduceMotion) return zoomAt(sx, sy, WHEEL.z / cam().z);
+  const z0 = cam().z, t0 = performance.now();
+  const step = (now: number) => {
+    const k = clamp((now - t0) / MOTION.fast, 0, 1), e = 1 - Math.pow(1 - k, 3);
+    zoomAt(WHEEL.x, WHEEL.y, z0 * Math.pow(WHEEL.z / z0, e) / cam().z);
+    WHEEL.raf = k < 1 ? requestAnimationFrame(step) : 0;
+    if (!WHEEL.raf) lodSettle();
+  };
+  WHEEL.raf = requestAnimationFrame(step);
+}
 viewport.addEventListener('dblclick', ev => {
   const bg = ev.target === viewport || ev.target === world || (ev.target as Element).classList.contains('fgrid');
-  if (!bg || tool !== 'select') return;
+  if (!bg || tool !== 'select' || performance.now() - TAP.touchAt < 800) return;   // a finger's double tap zooms (doubleTap)
   const r = viewport.getBoundingClientRect(), w = s2w(ev.clientX - r.left, ev.clientY - r.top);
   const count = nodeList().filter(m => m.kind === 'buffer').length + 1;
   const n = addNode({ kind: 'buffer', name: 'note' + count, x: Math.round(w.x - 20), y: Math.round(w.y - 20), w: 420, h: 260, text: '# note' + count + '\n\n- ' });
@@ -5327,6 +5467,7 @@ async function hostCall(n: ArtifactNode, L: LiveEntry, port: MessagePort, m: Art
   const key = n.id + ':' + m.id;
   if (m.t === 'cancel') { LIVE_CALLS.get(key)?.cancel?.(); LIVE_CALLS.delete(key); return; }
   if (m.t === 'key') { if (m.key === 'leader') { leaveCard(L.frame as HTMLIFrameElement); leaderOpen(); } return; }
+  if (m.t === 'touch') { frameTouch(n, L, port, m); return; }
   if (m.t === 'tool_result' || m.t === 'tool_error') { const c = LIVE_CALLS.get(key); c?.tools?.get(m.callId)?.(m); return; }
   if (m.t !== 'call') return;
   const ok = (value: unknown) => port.postMessage({ t: 'ok', id: m.id, value });
@@ -5979,7 +6120,7 @@ function seedInk() {
 // under notesDir (n.buf), instead of a CodeMirror view on n.text. One frame runtime per tab, loaded from /edwin/src/
 // at boot, one WebSocket to /edit carrying every frame's replica (sync.js). With the flag false nothing below runs and
 // the CodeMirror path is untouched. Frames are lazy (R9.4, R9.5): a frame exists only while its card is within the
-// viewport plus one viewport of margin at zoom >= LOD_Z (or focused), at most FR_CAP per tab (least recently drawn
+// viewport plus one viewport of margin above the far-zoom line (or focused), at most FR_CAP per tab (least recently drawn
 // unfocused first); otherwise the card shows the 12-line snapshot from the replica text (Q8). A replica off screen for
 // FR_CLOSE_MS is closed. Pages without buf are migrated to notes/<slug>.md through the replica (R8.17, Q3).
 /* A page card's live entry: its frame field holds an Edwin frame, never an iframe. */
@@ -6013,6 +6154,7 @@ function frBoot(): Promise<EdwinApi> {
     Ed.setLeaderKey(leaderKeyName());
     Ed.hooks.openPage = name => frOpenPage(name);
     Ed.hooks.leaveFrame = f => frLeave(f);
+    Ed.hooks.beforeUserInit = () => frKeymaps();   // K4: the board's keymaps exist before the user's init.scm runs
     Ed.onFrameEvent(frEvent);
     const applied = Ed.hooks.applied;   // sync.js's (local batches out, remote batches in): block cards follow every edit to a page's replica
     Ed.hooks.applied = (b, ops, origin) => { const r = applied ? applied(b, ops, origin) : undefined; frBufEdited(b, origin); return r; };
@@ -6182,7 +6324,7 @@ function frUpdate() {
     if (vis || focused) { FR.offAt.delete(n.id); if (!L.buf && !L.open && FR.online) frOpen(n); }
     else if (!FR.offAt.has(n.id)) FR.offAt.set(n.id, now);
     else if (L.buf && now - FR.offAt.get(n.id)! > FR_CLOSE_MS && !L.buf.inflight && !L.buf.queue?.length && ED.node !== n) frCloseReplica(n);
-    if (focused || (vis && z >= LOD_Z)) want.push({ n, L, focused });
+    if (focused || (vis && !lastLod)) want.push({ n, L, focused });   // frames live while the cards are not far-zoom snapshots (R2)
     else if (L.frame) frDrop(n);
   }
   if (want.length > FR_CAP) {
@@ -7289,13 +7431,14 @@ function deskGo(slot: number | string, quiet?: boolean) {
   const away = !WIN.swapping && WIN.who(slot);   // shown in another window: that window takes the place this one leaves
   if (away) { WIN.post({ t: 'swap', to: away, from: slot, desk: typeof fromPlace === 'number' ? fromPlace : 0 }); WIN.seen.set(away, { ...WIN.seen.get(away)!, desk: typeof fromPlace === 'number' ? fromPlace : 0 }); }
   if (d?.smart) DESK.smart = d;
+  if (d?.query) deskQueryFill(d);
   if (d) deskApply(d);
   if (d?.layout) deskArrange(true);
   deskRefresh();
   const c = DESK.cams[slot];
   if (d?.layout === 'columns') columnsShow(deskColumnOf(n0()) || deskTops()[0], c, false); else if (d?.layout === 'tile') fitAll(false); else if (c) { Object.assign(cam(), c); applyCam(); } else if (d && Object.keys(d.members).length) fitAll(false);
   dirtyCam(); ringNote();
-  if (!quiet) toast(!d ? 'Desk 0: the Board, every card where you put it.' : d.smart ? `Desk 9: ${Object.keys(d.members).length} card(s) that need a look, tiled. ${LEADERS[leaderName()].label} ! steps through them.`
+  if (!quiet) toast(!d ? 'Desk 0: the Board, every card where you put it.' : d.query ? `Desk ${deskName(d)}: ${Object.keys(d.members).length} item(s) match ${d.query}. ${LEADERS[leaderName()].label} d q changes the query.` : d.smart ? `Desk 9: ${Object.keys(d.members).length} card(s) that need a look, tiled. ${LEADERS[leaderName()].label} ! steps through them.`
     : made || !Object.keys(d.members).length
     ? `Desk ${deskName(d)}: empty. ${LEADERS[leaderName()].label} m ${slot} on the Board sends the active card here; cards you make here join it.`
     : `Desk ${deskName(d)}${deskPinned(d) ? '' : ' (this device)'}: ${Object.keys(d.members).length} item(s). ${LEADERS[leaderName()].label} 0 goes back to the Board.`);
@@ -7325,11 +7468,13 @@ function deskSend(slot: number, { follow = false, keep = false, items = null }: 
   const say = (m: string) => (toast(m), m);
   if (FOCUS.cur) focusHide();
   if (!(Number.isInteger(slot) && slot >= 0 && slot <= 9)) return say('A desk is a digit: 1-8, or 0 for the Board.');
-  if (DESK.cur === 9 && !keep && slot) keep = true;   // the attention desk is a query: sending from it copies
+  if ((DESK.cur === 9 || deskAt(DESK.cur)?.query) && !keep && slot) keep = true;   // the attention desk and a query desk are queries: sending from them copies
   const ns = items || deskTargets(); if (!ns.length) return say('Pick a card or folder first (click it, or Shift-click several).');
   if (slot === 9) return say('Desk 9 is the attention desk: it holds the cards that need a look, and nothing can be sent there.');
   if (slot === DESK.cur && slot) return say('Already on this desk.');
+  if (deskAt(slot)?.query) return say(QUERY_NO);
   if (slot === 0) {   // every item is on the Board: sending there takes it off this desk
+    if (deskAt(DESK.cur)?.query) return say(QUERY_NO);
     if (!DESK.cur || keep) return say('Every item is on the Board already; this takes items off another desk.');
     const name = deskName(deskAt(DESK.cur)), k = deskDrop(ns); deskRefresh(); if (follow) deskGo(0, true);
     return say(k ? `${k} item(s) off desk ${name}. They stay on the Board.` : `Nothing was taken off desk ${name}.`);
@@ -7574,6 +7719,82 @@ function deskAttnTick() {   // new cards that need a look join the attention des
   for (const n of add) { d.members[n.id] = null; DESK.mem.add(n.id); if (n.in && !deskShown(S.nodes[n.in])) delete n.in; }
   deskTile(); deskRefresh(true);
 }
+// Query desks (§10.8): a desk 1-8 whose members are the cards a query matches. The query is words, all of which must
+// match; a leading - negates a word, and commas give alternatives inside one (kind:term,acp). tag:T kind:K host:H
+// board:/PATH state:S name:TEXT, or a bare word for name:. Like desk 9 the members are found again each time the desk
+// is entered, cards that start to match join it while it is shown, and a card that stops matching stays until the desk
+// is left. It reads the board only: tasks and notes are brain's (brain docs/API.md), and Workbench has no brain client yet.
+const QKIND: Record<string, string[]> = { page: ['buffer'], note: ['buffer'], buffer: ['buffer'], shell: ['term'], terminal: ['term'], term: ['term'], agent: ['acp', 'agent'], acp: ['acp', 'agent'], folder: ['frame'], frame: ['frame'], repl: ['repl'], ref: ['ref'], artifact: ['artifact'], web: ['web'], sketch: ['sketch'], image: ['image'] };
+const QFIELDS = ['tag', 'kind', 'host', 'board', 'state', 'name'];
+function deskQueryParse(q: string): { neg: boolean; field: string; vals: string[] }[] | string {
+  const out: { neg: boolean; field: string; vals: string[] }[] = [];
+  for (let w of String(q || '').trim().split(/\s+/).filter(Boolean)) {
+    const neg = w.startsWith('-') && w.length > 1; if (neg) w = w.slice(1);
+    const m = /^([a-z]+):(.*)$/i.exec(w), field = m && QFIELDS.includes(m[1].toLowerCase()) ? m[1].toLowerCase() : 'name';
+    const vals = (m && QFIELDS.includes(m[1].toLowerCase()) ? m[2] : w).toLowerCase().split(',').filter(Boolean);
+    if (!vals.length) return `"${w}" has nothing after the colon.`;
+    if (field === 'kind') { const bad = vals.find(v => !QKIND[v]); if (bad) return `kind:${bad} is not a kind: ${Object.keys(QKIND).join(', ')}.`; }
+    out.push({ neg, field, vals });
+  }
+  return out.length ? out : 'A query needs at least one word, e.g. kind:agent host:ex44 or tag:review.';
+}
+const qHost = (n: BoardNode): string => (hostOf(n)?.name || (n.hostUrl ? hostByUrl(n.hostUrl)?.name || n.hostUrl : 'local')).toLowerCase();
+function deskQueryHit(n: BoardNode, field: string, v: string, bad: Set<string>): boolean {
+  switch (field) {
+    case 'tag': return tagsOf(n).includes(v.replace(/^#/, ''));
+    case 'kind': return QKIND[v].includes(n.kind);
+    case 'host': { const h = v.replace(/^@/, ''); return qHost(n) === h; }
+    case 'board': { const a = addrOf(n).toLowerCase(), p = (v.startsWith('board:') ? v : 'board:' + (v.startsWith('/') ? v : '/' + v)).replace(/\/+$/, ''); return a === p || a.startsWith(p + '/'); }
+    case 'state': return v === 'bad' || v === 'attention' ? bad.has(n.id) : (SESS[n.id]?.state || '') === v || (v === 'alive' && !!SESS[n.id]?.alive);
+    default: return n.name.toLowerCase().includes(v);
+  }
+}
+// the matching cards and folders; an item inside a matching folder goes with the folder
+function deskQuery(q: string): string[] {
+  const terms = deskQueryParse(q); if (typeof terms === 'string') return [];
+  const bad = terms.some(t => t.field === 'state') ? attnBad() : new Set<string>();
+  const board = DESK.snap ? deskBoardOf(S.nodes) : S.nodes;   // folders as the Board has them, not as the shown desk stands them
+  const hit = Object.values(S.nodes).filter(n => n.kind !== 'ghost' && !(n.kind === 'frame' && n.derived) && !ovlOff(n) && !isSticky(n)
+    && terms.every(t => t.vals.some(v => deskQueryHit(n, t.field, v, bad)) !== t.neg));
+  const ids = new Set(hit.map(n => n.id)), up = (n: BoardNode) => { const out: string[] = []; for (let c = board[n.id]?.in, g = 0; c && g++ < 32; c = board[c]?.in) out.push(c); return out; };
+  return hit.filter(n => !up(n).some(id => ids.has(id))).map(n => n.id);
+}
+// members become the matches; a card that matched before keeps the place it had on the desk
+function deskQueryFill(d: Desk) {
+  if (!d.query) return;
+  const ids = deskQuery(d.query);
+  d.members = Object.fromEntries(ids.map(id => [id, d.members[id] || null]));
+}
+function deskQueryTick() {   // new matches join the shown query desk
+  const d = deskAt(DESK.cur); if (!d?.query) return;
+  const add = deskQuery(d.query).filter(id => !(id in d.members) && !deskShown(S.nodes[id])).map(id => S.nodes[id]); if (!add.length) return;
+  for (const n of add) { d.members[n.id] = null; DESK.mem.add(n.id); if (n.in && !deskShown(S.nodes[n.in])) delete n.in; placeAny(n); }
+  deskArrange(true); deskRefresh(true);
+}
+const QUERY_NO = 'A query desk holds what its query matches: change the query (leader d q) to change what is on it.';
+function deskQueryAsk() {
+  const d = deskAt(DESK.cur);
+  if (d?.smart) return toast(SMART_NO);
+  const slot = d ? d.slot : deskFree(); if (!slot) return toast(`All ${DESK_MAX} desks are in use. ${LEADERS[leaderName()].label} d k deletes the shown one.`);
+  const edit = !!d && (!!d.query || !Object.keys(d.members).length);
+  askName(edit ? `Query for desk ${deskName(d)} (e.g. kind:agent host:ex44, tag:review -state:done; empty: a plain desk again)` : `Query for a new desk ${slot} (e.g. kind:agent host:ex44, tag:review -state:done)`, d?.query || '', v => deskQuerySet(edit ? slot : deskFree(), String(v || '').trim()));
+}
+function deskQuerySet(slot: number, q: string): string {   // returns what it said (the agent tool reads it)
+  const say = (m: string) => (toast(m), m);
+  if (!(slot >= 1 && slot <= DESK_MAX)) return say(`A query desk is one of desks 1-${DESK_MAX}.`);
+  let d = deskAt(slot);
+  if (!q) { if (d?.query) { delete d.query; deskRefresh(); return say(`Desk ${deskName(d)} is a plain desk again: it keeps the ${Object.keys(d.members).length} item(s) it has.`); } return say('No query: nothing changed.'); }
+  const err = deskQueryParse(q); if (typeof err === 'string') return say(err);
+  if (d && !d.query && Object.keys(d.members).length) return say(`Desk ${deskName(d)} holds cards put there by hand. A query desk is made on a free number (leader d q on the Board).`);
+  const fresh = !d;
+  if (!d) { d = { slot, name: q.slice(0, 40), members: {}, layout: 'tile' }; DESK.scratch.push(d); }
+  else if (d.name === String(d.slot) || d.name === (d.query || '').slice(0, 40)) d.name = q.slice(0, 40);
+  d.query = q;
+  if (DESK.cur === slot) deskGo(0, true);   // stand it down and up again, so the members are found afresh
+  deskGo(slot, true);
+  const k = Object.keys(d.members).length;
+  return say(`Desk ${deskName(d)}${fresh ? ' (new, this device)' : ''}: ${k} item(s) match ${q}.${k ? '' : ' Cards that start to match join it while it is shown.'}`);
+}
 // F-A15 across desks (leader !): the next card that needs a look, after the active one, in Attention's order. A card that
 // is not on the shown desk is shown on the first desk that holds it, else on the Board. Items that are not cards (a host,
 // a unit, a task) stay in the Attention list: stepping must not open or adopt anything.
@@ -7729,7 +7950,8 @@ function deskItems(slot: number): DeskItemBox[] {
   const all = Object.values(S.nodes).filter(n => n.kind !== 'ghost' && !ovlHas(n));   // the overlay's cards are on no desk
   if (slot === DESK.cur) return all.filter(n => !stashed(n)).map(n => ({ n, x: n.x, y: n.y, w: n.w, h: n.h }));
   if (slot === 0) return all.map(n => ({ n, ...board(n) }));
-  const d = slot === 9 ? deskAttention() : deskAt(slot); if (!d) return [];
+  let d = slot === 9 ? deskAttention() : deskAt(slot); if (!d) return [];
+  if (d.query) { const was = d.members; d = { ...d, members: Object.fromEntries(deskQuery(d.query).map(id => [id, was[id] || null])) }; }   // what entering it would show
   const out: DeskItemBox[] = [], seen = new Set<string>(), ids = Object.keys(d.members).map(id => S.nodes[id]).filter(Boolean).sort((a, b) => depthOf(a) - depthOf(b));
   const vr = slot === 9 ? tileRects(ids.length, 1600, 900, 0, 0) : null;
   ids.forEach((m, i) => {
@@ -7804,6 +8026,7 @@ cmd('Desk: go to…', () => askName('Desk number: 0 Board' + deskList().map(d =>
 cmd('Desk: previous', () => KC['desk.prev'](), '@desk.prev');
 cmd('Desk: send the selection to…', () => askName('Send to desk number (0 takes it off this desk)', '', v => deskSend(+String(v).trim())));
 cmd('Desk: new desk with the selection', () => deskNew(), '@desk.new');
+cmd('Desk: query desk: new, or change the shown one\'s query', () => deskQueryAsk(), '@desk.query');
 cmd('Desk: rename this desk', () => deskRename(), '@desk.rename', () => !!DESK.cur);
 cmd('Desk: pin or unpin this desk', () => deskPin(), '@desk.pin', () => !!DESK.cur);
 cmd('Desk: take the selection off this desk', () => deskSend(0), '@desk.off', () => !!DESK.cur);
@@ -7817,7 +8040,7 @@ function deskDescribe(): string {
   const here = deskPlace(), bad = attnBad(), out: string[] = [];
   const line = (d: Desk | null, slot: number) => {
     const ids = d ? Object.keys(d.members).filter(id => S.nodes[id]) : [];
-    const what = !d ? `0 Board: every card at its place` : d.smart ? `9 attention: ${ids.length} card(s) that need a look, tiled` : `${deskName(d)}: ${ids.length} item(s), ${deskPinned(d) ? 'pinned in the board' + (d.saved ? ', with a saved state' : '') : 'this device only'}, ${d.layout || 'free'}`;
+    const what = !d ? `0 Board: every card at its place` : d.smart ? `9 attention: ${ids.length} card(s) that need a look, tiled` : `${deskName(d)}: ${ids.length} item(s)${d.query ? ` matching the query ${d.query}` : ''}, ${deskPinned(d) ? 'pinned in the board' + (d.saved ? ', with a saved state' : '') : 'this device only'}, ${d.layout || 'free'}`;
     const k = slot === 9 ? 0 : [...bad].filter(id => deskHolds(d, S.nodes[id])).length;
     const marks = [slot === here ? 'shown' : '', WIN.others(slot) ? 'shown in another window' : '', k ? k + ' need a look' : ''].filter(Boolean);
     out.push(what + (marks.length ? ` [${marks.join('; ')}]` : ''));
@@ -7836,6 +8059,14 @@ AGENT_TOOLS.push(
     run: () => deskDescribe() },
   { name: 'go_to_desk', description: 'Show a desk in the user\'s view: 0 the Board, 1-8 a desk (an unused number makes an empty one on this device), 9 the cards that need a look.', inputSchema: { type: 'object', properties: { desk: { type: 'integer', minimum: 0, maximum: 9 } }, required: ['desk'] },
     run: ({ desk }: { desk?: unknown }) => { const k = deskArg(desk); if (k === 9 && !attnBad().size) throw new Error('nothing needs a look: desk 9 is empty'); if (k !== deskPlace()) deskGo(k, true); return 'showing desk ' + (k === 9 ? '9 attention' : deskName(deskAt(k))); } },
+  { name: 'query_desk', description: 'Make a query desk, or change one\'s query: its cards are the ones the query matches, found again each time it is shown. Words must all match; -word negates; commas give alternatives: tag:T kind:K (page, shell, agent, folder, artifact, web, sketch, image, repl, ref) host:H (local is the serving daemon) board:/PATH state:S (bad: needs a look; or a session state such as running, waiting_permission, done) name:TEXT, a bare word is name:. desk: 1-8 (default: the shown query desk, else a free number). An empty query makes it a plain desk. The desk is then shown.', inputSchema: { type: 'object', properties: { query: { type: 'string' }, desk: { type: 'integer', minimum: 1, maximum: 8 } }, required: ['query'] },
+    run: ({ query, desk }: { query?: unknown; desk?: unknown }) => {
+      const k = desk === undefined || desk === null ? (deskAt(DESK.cur)?.query ? DESK.cur : deskFree()) : deskArg(desk);
+      if (!k) throw new Error('every desk 1-8 is in use');
+      if (k === 9) throw new Error('desk 9 is the attention desk: its query is fixed');
+      const err = String(query ?? '').trim() && deskQueryParse(String(query)); if (typeof err === 'string') throw new Error(err);
+      return deskQuerySet(k, String(query ?? '').trim());
+    } },
   { name: 'send_to_desk', description: 'Put cards or folders on desk 1-8 at the places they have now; desk 0 takes them off the shown desk. items are node or folder paths (default: the user\'s selection). From a desk they move, unless keep; follow then shows that desk.', inputSchema: { type: 'object', properties: { desk: { type: 'integer', minimum: 0, maximum: 9 }, items: { type: 'array', items: { type: 'string' } }, keep: { type: 'boolean' }, follow: { type: 'boolean' } }, required: ['desk'] },
     run: ({ desk, items, keep, follow }: { desk?: unknown; items?: unknown; keep?: unknown; follow?: unknown }) => {
       const k = deskArg(desk), ns = Array.isArray(items) && items.length ? items.map(p => { const n = findNode(p) || findFolder(p); if (!n) throw new Error('nothing at ' + p); return n; }) : deskTargets();
@@ -7964,7 +8195,7 @@ const LEADERS: Record<LeaderName, { label: string; key: string }> = { 'C-SPC': {
 function leaderName(): LeaderName { return S?.leader && LEADERS[S.leader] ? S.leader : 'C-SPC'; }
 const leaderKeyName = () => LEADERS[leaderName()].key;
 function isLeader(e: KeyboardEvent): boolean { return WBKeys.keyName(e) === leaderKeyName(); }
-function setLeader(k: LeaderName) { if (!LEADERS[k]) return; S.leader = k; dirty(); keysToFrames(); if (FR.Ed) FR.Ed.setLeaderKey(leaderKeyName()); toast('Leader key: ' + LEADERS[k].label + ' (press it twice to send it to the terminal or editor).'); }
+function setLeader(k: LeaderName) { if (!LEADERS[k]) return; S.leader = k; dirty(); keysToFrames(); if (FR.Ed) { FR.Ed.setLeaderKey(leaderKeyName()); frLeaderBind(); } toast('Leader key: ' + LEADERS[k].label + ' (press it twice to send it to the terminal or editor).'); }
 // Open artifacts watch for the leader themselves (bridge.js); tell them when it changes.
 function keysToFrames() { for (const L of Object.values(live)) if (L?.port) try { L.port.postMessage({ t: 'keys', keys: { leader: leaderKeyName() } }); } catch {} }
 function folderMode(m: FrameMode, cascade?: boolean) { const n = activeId && S.nodes[activeId]; const f = n && (n.kind === 'frame' ? n : n.in && S.nodes[n.in] as FrameNode); if (f) cascade ? setModeCascade(f, m) : setMode(f, m); else toast('Pick a folder or something inside one.'); }
@@ -8244,7 +8475,7 @@ const KC: Record<string, KeyCmdFn> = {
   ...Object.fromEntries(VIEWS.map(v => ['view.' + v, () => setView(v)])),
   ...Object.fromEntries([0, 1, 2, 3, 4, 5, 6, 7, 8, 9].flatMap(i => [['desk.' + i, () => deskGo(i)], ['desk.send.' + i, () => deskSend(i)],
     ['desk.follow.' + i, () => deskSend(i, { follow: true })], ['desk.also.' + i, () => deskSend(i, { keep: true })]])),
-  'desk.prev': () => deskBack(), 'desk.new': () => deskNew(), 'desk.rename': () => deskRename(), 'desk.pin': () => deskPin(),
+  'desk.prev': () => deskBack(), 'desk.new': () => deskNew(), 'desk.query': () => deskQueryAsk(), 'desk.rename': () => deskRename(), 'desk.pin': () => deskPin(),
   'desk.off': () => deskSend(0), 'desk.which': () => deskAlso(), 'desk.delete': () => deskDelete(),
   'desk.promote': () => deskPromote(), 'desk.sticky': () => deskSticky(), 'desk.layout': () => deskLayout(), 'desk.open': () => deskOpenFolder(), 'desk.revert': () => deskRevert(), 'desk.keep': () => deskSaveState(),
   'attn.next': () => attnNext(), overlay: () => ovlToggle(), 'overlay.send': () => ovlSend(),
@@ -8297,6 +8528,107 @@ const KC: Record<string, KeyCmdFn> = {
   ...Object.fromEntries((['manual', 'process', 'fs', 'tag', 'tmux', 'proc', 'unit', 'journal', 'link'] as PerspName[]).map(p => ['persp.' + p, () => perspSet(p)])),
 };
 { const missing = [...WBKeys.commands()].filter(c => !KC[c]); if (missing.length) console.error('keys: bound but not defined: ' + missing.join(', ')); }
+
+// ---- K4 (§10.9): the board's keymaps are Edwin keymaps. When the frame runtime boots (Ed.hooks.beforeUserInit, so before
+// the user's init.scm), every keymap of web/keys.ts becomes an Edwin keymap named wb-NAME-map (wb-canvas-map, wb-global-map,
+// wb-leader-map, wb-leader-d-map …) and every board command a Scheme command wb-COMMAND (wb-hints, wb-desk-3, wb-card-left
+// …) that runs it; the leader is a prefix key of global-map bound to wb-leader-map, so describe-key, where-is and
+// describe-bindings know the board's keys from inside a page. The rows stay the board's data: a define-key on one of these
+// keymaps (in ~/.config/edwin/init.scm, or evaluated in a page later) changes the board's binding, its which-key and the
+// palette's labels at once. A binding to a wb- keymap is a prefix (under the leader only, as the board walks keys); one to
+// any other Scheme command runs that command in the frame runtime. The checker runs over the result and says what breaks.
+// Without the frame runtime (no edwind) the rows are the keys, as before.
+class WbKeyStore extends Map<string, unknown> {
+  owner = '';
+  set(k: string, v: unknown) { super.set(k, v); if (this.owner) kmChanged(this.owner); return this; }
+  delete(k: string) { const r = super.delete(k); if (this.owner) kmChanged(this.owner); return r; }
+  clear() { super.clear(); if (this.owner) kmChanged(this.owner); }
+}
+const KM4 = { obj: new Map<string, EdwinKeymap>(), name: new Map<EdwinKeymap, string>(), cmdOf: new Map<unknown, string>(), sym: new Map<string, string>(),
+  ext: new Map<string, unknown>(), dirty: new Set<string>(), t: 0, leader: '', leaderWas: undefined as unknown, made: 0 };
+const kmEdName = (map: string) => 'wb-' + map + '-map', kmCmdName = (cmd: string) => 'wb-' + cmd.replace(/\./g, '-');
+function frKeymaps() {
+  const Ed = FR.Ed!, L = FR.L!, rowOf = new Map<string, WBKeyRow>();
+  for (const rows of Object.values(WBKeys.MAPS)) for (const r of rows) if (!rowOf.has(r[1])) rowOf.set(r[1], r);
+  for (const c of [...new Set([...Object.keys(KC), ...WBKeys.commands()])].sort()) {
+    const what = rowOf.get(c)?.[2] || c;
+    const fn = L.CMD(kmCmdName(c), '', '', what[0].toUpperCase() + what.slice(1) + ` (the board's ${c}).`, () => { kmRun(c); return false; });
+    KM4.cmdOf.set(fn, c); KM4.sym.set(kmCmdName(c), c);
+  }
+  for (const name of Object.keys(WBKeys.MAPS)) kmMake(name);
+  for (const [name, km] of KM4.obj) for (const r of WBKeys.MAPS[name]) km.map.set(r[0], r[1][0] === '>' ? KM4.obj.get(r[1].slice(1)) : L.intern(kmCmdName(r[1])));
+  for (const km of KM4.obj.values()) (km.map as WbKeyStore).owner = KM4.name.get(km)!;
+  frLeaderBind();
+  L.call('provide', [L.intern('wb-keys')]);   // (when (featurep 'wb-keys) (define-key wb-canvas-map "g" 'wb-hints)): init.scm runs in edwind and Edwin on the desktop too
+}
+function kmMake(name: string): EdwinKeymap {
+  const km = new FR.Ed!.Keymap(kmEdName(name)); km.map = new WbKeyStore();
+  KM4.obj.set(name, km); KM4.name.set(km, name); FR.L!.set(kmEdName(name), km); return km;
+}
+// The leader of the board is a prefix in Edwin's global map; picking another leader moves it there and gives the old key back.
+function frLeaderBind() {
+  const L = FR.L, lm = KM4.obj.get('leader'); if (!L || !lm) return;
+  const g = L.get('global-map') as EdwinKeymap | undefined; if (!g?.map) return;
+  if (KM4.leader) { if (KM4.leaderWas === undefined) g.map.delete(KM4.leader); else g.map.set(KM4.leader, KM4.leaderWas); }
+  KM4.leader = leaderKeyName(); KM4.leaderWas = g.map.get(KM4.leader); g.map.set(KM4.leader, lm);
+}
+// A board command run from Edwin (M-x wb-hints, or a key a user bound to it): as the leader runs it, from the card that has the keys.
+function kmRun(c: string) {
+  setTimeout(() => {
+    if (c.startsWith('edwin:')) return kmRunEdwin(c);
+    if (c[0] === '>') return leaderOpen(c.slice(1));
+    LEADER.target = document.activeElement as HTMLElement | null; KC[c]?.(undefined, undefined, 'leader');
+  });
+}
+function kmRunEdwin(c: string) {
+  const Ed = FR.Ed, L = FR.L, def = KM4.ext.get(c); if (!Ed || !L) return;
+  try { if (L.Sym && def instanceof L.Sym) Ed.feedKey('<cmd:' + def.name + '>'); else L.call('call-interactively', [def]); }
+  catch (e) { toast('Edwin: ' + (e?.message || e)); }
+}
+function kmChanged(name: string) { KM4.dirty.add(name); if (!KM4.t) KM4.t = setTimeout(kmFlush) as unknown as number; }
+// What a binding in an Edwin keymap is on the board: a board command, a prefix ('>' and the keymap), or 'edwin:NAME'.
+function kmCmd(def: unknown, from: string): string | null {
+  const Ed = FR.Ed!, L = FR.L!;
+  if (def instanceof Ed.Keymap) {
+    if (KM4.name.has(def)) return '>' + KM4.name.get(def);
+    if (!from.startsWith('leader')) return null;   // the board walks a sequence of keys only after the leader
+    const name = 'leader-edwin-' + (++KM4.made), store = new WbKeyStore();   // a prefix define-key made under the leader ("y a")
+    for (const [k, v] of def.map) store.set(k, v);
+    def.map = store; KM4.obj.set(name, def); KM4.name.set(def, name); WBKeys.MAPS[name] = []; KM4.dirty.add(name); store.owner = name;
+    return '>' + name;
+  }
+  if (def instanceof L.Sym) {
+    if (KM4.sym.has(def.name)) return KM4.sym.get(def.name)!;
+    let v: unknown; try { v = L.get(def.name); } catch {}
+    if (v instanceof Ed.Keymap) return kmCmd(v, from);
+    KM4.ext.set('edwin:' + def.name, def); return 'edwin:' + def.name;
+  }
+  if (KM4.cmdOf.has(def)) return KM4.cmdOf.get(def)!;
+  if (def === undefined || def === null || def === false) return null;
+  let nm = ''; try { nm = L.cmdName(def); } catch {}
+  const key = 'edwin:' + (nm && !/[\s#<]/.test(nm) ? nm : 'lambda-' + (KM4.ext.size + 1));
+  KM4.ext.set(key, def); return key;
+}
+function kmFlush() {
+  KM4.t = 0; if (!FR.Ed) return;
+  const label = new Map<string, WBKeyRow>(); for (const rows of Object.values(WBKeys.MAPS)) for (const r of rows) if (!label.has(r[1])) label.set(r[1], r);
+  for (const name of [...KM4.dirty]) {
+    KM4.dirty.delete(name);
+    const km = KM4.obj.get(name); if (!km) continue;
+    const was = new Map(WBKeys.MAPS[name].map(r => [r[0], r])), rows: WBKeyRow[] = [];
+    for (const [key, def] of km.map) {
+      const cmd = kmCmd(def, name); if (!cmd) { FR.Ed.message(`${kmEdName(name)}: ${key} is not a board command or a wb- keymap; the board ignores it`); continue; }
+      const old = was.get(key), like = label.get(cmd);
+      rows.push(old && old[1] === cmd ? old : [key, cmd, like ? like[2] : cmd[0] === '>' ? 'prefix' : 'Edwin: ' + cmd.slice(6)]);
+    }
+    WBKeys.MAPS[name] = rows;
+  }
+  for (const [c, def] of KM4.ext) if (!KC[c]) KC[c] = () => kmRun(c);
+  WBKeys.reindex();
+  const r = WBKeys.check({ commands: new Set(Object.keys(KC)) });
+  if (r.errors.length) { console.warn('keys after define-key:', r.errors); FR.Ed.message(`Board keys: ${r.errors[0]}${r.errors.length > 1 ? ` (and ${r.errors.length - 1} more; see the console)` : ''}`); }
+  if (LEADER.on) leaderOpen(LEADER.prefix || undefined);
+}
 cmd('Workspace: enter the active folder', () => { const n = (activeId && S.nodes[activeId]) as BoardNode | null; if (n?.kind === 'frame') wsEnter(n); else toast('Pick a folder first.'); }, '@card.enter');
 cmd('Workspace: step out', () => wsLeave(), '@esc', () => !!WS.cur);
 cmd('Workspace: switch…', () => { const list = wsTop(); askName('Workspace number: ' + list.map((f, i) => (i + 1) + ' ' + f.name).join('  ·  '), '', v => wsGo(+String(v).trim())); });
@@ -9417,7 +9749,7 @@ function statusRender(): void {
   });
   if (c.due != null) add('▦ ' + c.due, c.due + ' flashcard(s) due. Click: review.', c.due ? 'warn' : '', () => setView('review'));
   add('☐ ' + c.tasks + (c.dueToday ? ' (' + c.dueToday + ' due)' : ''), c.tasks + ' open task(s) on the board and in the notes' + (c.dueToday ? ', ' + c.dueToday + ' scheduled or due by today' : '') + '. Click: the tasks view.', c.dueToday ? 'warn' : '', () => setView('tasks'));
-  deskAttnTick(); deskPager();
+  deskAttnTick(); deskQueryTick(); deskPager();
   const a = attnCount(), cards = attnBad().size;   // F-A15: with cards that need a look the chip steps through them; else it opens the list
   add('! ' + a, a ? a + ' item(s) need a look. Click: ' + (cards ? 'the next card that needs a look (Shift-click: the Attention list).' : 'the Attention list (addresses).') : 'Nothing needs a look.', a ? 'bad' : '', ((e: MouseEvent) => { if (cards && !e.shiftKey) { notifyAsk(); attnNext(); } else { setView('ranger'); rgGo('attn:'); } }) as () => unknown);
 }
@@ -9457,6 +9789,8 @@ Object.defineProperty(window.__canvas, 'activeId', { get: () => activeId });   /
 Object.defineProperty(window.__canvas, 'spaceHeld', { get: () => space });
 Object.assign(window.__canvas, { DESK, deskGo, deskSend, deskList, deskAt, deskPin, deskDelete, deskOff, deskPinned, serialize, activate, viewKey,
   OVL, RING, OVW, deskTile, deskPromote, deskSticky, deskLayout, deskOpenFolder, attnNext, attnBad, ovlToggle, ovlSend, ovwOpen, ringOpen, deskItems,
-  deskPlace, deskBack, deskColumns, columnsShow, deskColumnOf, deskRevert, deskSaveState, deskDescribe, WIN, perspSwitch });
+  deskPlace, deskBack, deskColumns, columnsShow, deskColumnOf, deskRevert, deskSaveState, deskDescribe, WIN, perspSwitch,
+  deskQuery, deskQueryParse, deskQuerySet, deskQueryTick, MOTION, LOD, WHEEL, FLIP, TAP, FTOUCH, KM4, kmFlush, frKeymaps, settle });
+Object.defineProperty(window.__canvas, 'lastLod', { get: () => lastLod });
 boot();
 })();

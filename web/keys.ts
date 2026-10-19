@@ -130,7 +130,7 @@
     'leader-m': [...range(0, 9).map<WBKeyRow>(i => [String(i), 'desk.send.' + i, 'desk n (0 takes it off this desk)', '0…9']), ['x', 'overlay.send', 'the scratch overlay (again: out of it)']],
     'leader-M': range(0, 9).map(i => [String(i), 'desk.follow.' + i, 'desk n (0: off this desk, to the Board)', '0…9']),
     'leader-da': range(1, 9).map(i => [String(i), 'desk.also.' + i, 'desk n (it stays here too)', '1…9']),
-    'leader-d': [['n', 'desk.new', 'new desk with the selection'], ['r', 'desk.rename', 'rename this desk'], ['p', 'desk.pin', 'pin / unpin: in the board or this device only'],
+    'leader-d': [['n', 'desk.new', 'new desk with the selection'], ['q', 'desk.query', 'query desk: new, or change this one\'s query'], ['r', 'desk.rename', 'rename this desk'], ['p', 'desk.pin', 'pin / unpin: in the board or this device only'],
       ['x', 'desk.off', 'take the selection off this desk'], ['a', '>leader-da', 'also on desk n (keep it here)'], ['i', 'desk.which', 'which desks hold the selected item'],
       ['k', 'desk.delete', 'delete this desk (the cards stay)'], ['b', 'desk.promote', 'promote: the Board takes their place here'],
       ['s', 'desk.sticky', 'sticky: the selected cards on every desk'], ['t', 'desk.layout', 'layout: free, tile, columns'], ['o', 'desk.open', 'open the folder as a desk'],
