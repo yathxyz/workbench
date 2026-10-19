@@ -3013,7 +3013,7 @@ await section('frames', async () => {
   await A2.keyboard.press('g'); await sleep(300);
   const k4h = await A2.evaluate(() => window.__canvas.HINTS.on); await A2.keyboard.press('Escape'); await sleep(150);
   await A2.keyboard.press('Control+Space'); await sleep(200);
-  const k4w = await A2.evaluate(() => [...document.querySelectorAll('#which-key *')].some(e => e.children.length === 0 && /n69-mark/.test(e.textContent || '')));
+  const k4w = await A2.evaluate(() => [...document.querySelectorAll('#which-key span')].some(e => e.querySelector('b')?.textContent === 'y' && /n69-mark/.test(e.textContent || '')));
   await A2.keyboard.press('y'); await sleep(400);
   const k4n = await A2.evaluate(() => (() => { const L = window.__canvas.FR.L; let v: unknown; for (const f of L.readAll('n69-hits')) v = L.ev(f); return v; })());
   const k4b = await A2.evaluate(async () => { const C = window.__canvas; C.KM4.obj.get('canvas').map.delete('g'); C.KM4.obj.get('leader').map.delete('y'); await new Promise(r => setTimeout(r, 50)); return { g: !!WBKeys.MAPS.canvas.find(r => r[0] === 'g'), y: !!WBKeys.MAPS.leader.find(r => r[0] === 'y') }; });
