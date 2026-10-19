@@ -140,7 +140,8 @@ fn edit_block(status: Option<Value>) -> Value {
 }
 
 async fn status(State(app): State<AppState>) -> Json<Value> {
-    let edit = edit_block(app.edit_status().await);
+    let (edit, units) = tokio::join!(app.edit_status(), crate::host::unit_counts());
+    let edit = edit_block(edit);
     let host = tokio::task::spawn_blocking(host_status)
         .await
         .unwrap_or_default();
@@ -170,8 +171,7 @@ async fn status(State(app): State<AppState>) -> Json<Value> {
         "uptime": host.uptime,
         "disk": host.disk,
         "sessions": sessions,
-        // The units cache arrives with the host endpoints in M5.
-        "units": {"total": 0, "active": 0, "failed": 0, "failedNames": []},
+        "units": units,
         "edit": edit,
     }))
 }
