@@ -6365,7 +6365,7 @@ function frEdLoad(n: PageNode, pos?: number | null) {
   if (ED.frame && ED.node !== n) { ED.frame.destroy(); ED.frame = null; }
   ED.pre = null;
   if (!n.buf && FR.tried && !FR.online) { ED.node = n; S.edPage = n.id; dirty(); frEdShut(n, pos); edCrumb(n); return; }   // the move waits for edwind
-  if (!n.buf) { ED.node = n; S.edPage = n.id; $('#ed-host')!.replaceChildren(el('div', 'fr-snap', 'Moving this page to edwind…')); frUnlessDown(frAdopt(n)).then(() => { if (ED.node !== n) return; if (n.buf) frEdLoad(n, pos); else if (FR.tried && !FR.online) frEdShut(n, pos); }, e => { if (ED.node === n) frEdShut(n, pos, `${n.name} could not be moved to edwind (${(e as Error)?.message || e}): it is read-only here; open it again to retry`); }); return; }   // migrated first (R8.17)
+  if (!n.buf) { ED.node = n; S.edPage = n.id; dirty(); $('#ed-host')!.replaceChildren(el('div', 'fr-snap', 'Moving this page to edwind…')); edCrumb(n); frUnlessDown(frAdopt(n)).then(() => { if (ED.node !== n) return; if (n.buf) frEdLoad(n, pos); else if (FR.tried && !FR.online) frEdShut(n, pos); }, e => { if (ED.node === n) frEdShut(n, pos, `${n.name} could not be moved to edwind (${(e as Error)?.message || e}): it is read-only here; open it again to retry`); }); return; }   // migrated first (R8.17)
   ED.node = n; S.edPage = n.id; dirty();
   const host = $('#ed-host')!;
   if (!ED.frame) host.replaceChildren(el('div', 'fr-snap', 'Opening this page…'));   // not the last page's frame meanwhile
