@@ -6308,7 +6308,7 @@ async function frWhenWritable(n: PageNode): Promise<EdwinBuffer | null> {
 // ---- the journal page through edwind (notes-journal makes journal/YYYY-MM-DD.md with its template)
 async function frOpenToday() {
   const n = findPage(TODAY); if (n) return jumpNode(n, 1, () => focusEnd(n));
-  await frWhenReady();
+  if (!(await frUnlessDown(frWhenReady().then(() => true)))) return toast(`edwind is not connected: today's page (journal/${TODAY}.md) is made once it is back`);
   const r = await FR.Ed!.sync.call({ cmd: 'notes-journal', args: [{ day: TODAY }], ctx: {} });
   const id = (r.value && r.value.path) || `journal/${TODAY}.md`;
   if (r.error) console.warn('edwin journal', r.error);
@@ -7471,7 +7471,13 @@ function opSig(n: OpNode, ins = opInputs(n)): string {
   return fnv(JSON.stringify([n.op, n.prompt || '', k.image ? [n.provider || '', n.model || '', n.size || '', n.n || 1] : 0,
     ins.map(i => i.image ? 'i' + (i.image.blob || fnv(i.image.src || '')) : 't' + fnv(i.text || ''))]));
 }
-const opStale = (n: OpNode): boolean => !!n.out && !n.out.err && n.out.sig !== opSig(n);
+// A piped page with no open replica and no full text read since the tab loaded shows only its first lines here: its
+// card's staleness is unknown until opReadPages (Run stale reads them first), so it is not shown as stale meanwhile.
+const opPagesKnown = (n: OpNode): boolean => S.edges.every(e => {
+  const m = e.type === 'pipe' && e.to === n.id ? S.nodes[e.from] : null;
+  return !m || m.kind !== 'buffer' || !FR.on || !(m as PageNode).buf || !!frBufOf(m) || OP_PAGE.has(m.id);
+});
+const opStale = (n: OpNode): boolean => !!n.out && !n.out.err && opPagesKnown(n) && n.out.sig !== opSig(n);
 function opProvider(n: OpNode): MediaProviderInfo | null { const ps = opProviders(); return ps.find(p => p.name === n.provider) || ps[0] || null; }
 function mountOp(n: OpNode, L: LiveEntry) {
   if (!OP_KINDS[n.op]) n.op = 'imagine';
@@ -7594,6 +7600,7 @@ async function opRun(n: OpNode, quiet?: boolean): Promise<boolean> {
 async function opRunStale() {
   const ops = Object.values(S.nodes).filter((m): m is OpNode => m.kind === 'op' && !!live[m.id]?.op);
   await opReadPages(ops).catch(() => {});   // a page that cannot be read fails its card's run
+  for (const m of ops) opRender(m);   // staleness is known now
   const due = new Set(ops.filter(m => !m.out || opStale(m)).map(m => m.id));
   if (!due.size) return toast('No media card is stale.');
   // anything downstream of a due card is due too
