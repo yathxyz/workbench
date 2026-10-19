@@ -5782,11 +5782,12 @@ function wireReview() {
   ['pointerup', 'pointercancel', 'pointerleave'].forEach(t => mic.addEventListener(t, () => { if (VOICE.rec) stopListening(); }));
   window.addEventListener('resize', () => { if (VIEW === 'review') rvResizeInk(); });
 }
-function rvOpenSource() {
+async function rvOpenSource() {
   const c = RV.cur; if (!c) return;
   if (DAEMON && !String(c.file).startsWith('roam/')) { const p = `${INFO!.notes}/${c.file}`; RG.home = INFO!.notes; setView('ranger'); rgGo(FS_PREFIX + p.replace(/\/[^/]*$/, ''), FS_PREFIX + p); return; }
-  const name = (c.file || 'card').replace(/^roam\//, '').replace(/\.md$/, ''); const p = findPage(name) || openPage(name, null, true);
-  if (pageText(p as PageNode) === '') pageSetText(p as PageNode, `# ${name}\n\n${c.src}\n`);
+  const name = (c.file || 'card').replace(/^roam\//, '').replace(/\.md$/, ''); const p = (findPage(name) || openPage(name, null, true)) as PageNode;
+  let t: string; try { t = await pageTextFull(p); } catch (e) { t = '-'; toast(`${p.name}: ${(e as Error).message}`); }   // a closed replica's snapshot is not the page
+  if (t === '' && !(await pageSetText(p, `# ${name}\n\n${c.src}\n`))) toast(`${p.name} takes no edit now, so the card's source was not written into it`);
   jumpNode(p);
 }
 async function rvAsk() {
@@ -6265,11 +6266,15 @@ function frAdopt(n: PageNode): Promise<string | null> {
     if (!S.nodes[n.id] || n.buf) return n.buf || null;
     const Ed = FR.Ed!, base = frSlug(n.name), taken = new Set(nodeList().map(m => (m as PageNode).buf).filter(Boolean));
     let chosen: string | null = null, b: EdwinBuffer | null = null;
+    const adopted = () => !S.nodes[n.id] || !!n.buf;
+    const quit = (id: string) => { FR.claimed.delete(id); if (b && b.id === id && id !== n.buf) try { FR.L!.call('kill-buffer', [b]); } catch {} return n.buf || null; };
     for (let i = 1; i < 200 && !chosen; i++) {
       const id = `notes/${base}${i > 1 ? '-' + i : ''}.md`;
       if (taken.has(id) || FR.claimed.has(id)) continue;
       FR.claimed.add(id);
       b = await frOpenCreate(id);
+      // another tab's board save may have adopted the page (boardAdopt set buf, dropped text) while this one waited
+      if (adopted()) return quit(id);
       if (b!.id !== id) continue;   // a file renamed from this name: edwind sent the open on to it, which stays as it is
       const text = n.text || '', cur = b!.text;
       if (cur !== '' && cur !== text) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} continue; }   // R8.18: another text, next suffix
@@ -6279,6 +6284,7 @@ function frAdopt(n: PageNode): Promise<string | null> {
       // replica closes) is saved too, so no page is adopted before its file holds the text.
       if (cur === '' || b!.modified) {
         const r = await Ed.sync.save(b!);
+        if (adopted()) return quit(id);
         // the replica closes as it is (other clients may have edited it meanwhile); a later try that finds this text there takes it (R8.18)
         if (r.error) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} throw new Error(`${id} could not be saved: ${r.error.report}`); }
       }
