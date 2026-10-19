@@ -5973,7 +5973,7 @@ function frBoot(): Promise<EdwinApi> {
     booted.then(() => { frStateChanged(Ed.sync.state); frDropSourceBuffers(); }, e => { console.warn('edwin boot', e); });
     return Ed;
   })();
-  FR.booting.catch(e => { FR.failed = e; frDownNow(); console.warn('edwin frames: runtime not loaded', e); toast('Page editor runtime did not load: ' + (e?.message || e), 8000); });
+  FR.booting.catch(e => { FR.failed = e; frDownNow(); frOffRender(); console.warn('edwin frames: runtime not loaded', e); toast('Page editor runtime did not load: ' + (e?.message || e), 8000); });
   return FR.booting;
 }
 // Resolves once the runtime is booted and the socket has had its first welcome (opens need it).
@@ -5997,14 +5997,16 @@ function frUnlessDown<T>(p: Promise<T>): Promise<T | null> {
     p.then(v => { FR.downers.delete(d); res(v); }, e => { FR.downers.delete(d); rej(e); });
   });
 }
+// the "editing is off" notice of every page card: shown while edwind is away, and for good once the runtime failed
+function frOffSet(off: HTMLElement) { off.textContent = FR.failed ? 'Editing is off: the page editor runtime did not load' : FR_OFF_TEXT; off.hidden = FR.failed ? false : !FR.ready || FR.online; }
+function frOffRender() { for (const n of nodeList()) { const L = live[n.id]; if (L?.off && n.kind === 'buffer') frOffSet(L.off); } }
 function frStateChanged(s: string) {
   FR.online = s === 'online';
   if (FR.state === 'connecting' && s !== 'connecting') FR.tried = true;   // the first connection was made, or failed
   FR.state = s;
   if (FR.online) { const w = FR.waiters.splice(0); for (const r of w) r(); }
   else if (FR.tried) frDownNow();
-  const hide = FR.failed ? false : !FR.ready || FR.online;
-  for (const n of nodeList()) { const L = live[n.id]; if (L?.off) L.off.hidden = hide; }
+  frOffRender();
   document.body.classList.toggle('edit-off', FR.ready && !FR.online);
   statusRender();
 }
@@ -6057,7 +6059,7 @@ function frBufEdited(b: EdwinBuffer, origin: string) {
 }
 // ---- the page card (mountBuffer in frames mode)
 function frMountPage(n: PageNode, L: LiveEntry) {
-  L.host = el('div', 'fr-host'); L.snap = el('pre', 'fr-snap'); L.off = el('div', 'fr-off', FR_OFF_TEXT); L.off.hidden = !FR.ready || FR.online; L.chips = el('div', 'fr-anchors');
+  L.host = el('div', 'fr-host'); L.snap = el('pre', 'fr-snap'); L.off = el('div', 'fr-off'); frOffSet(L.off); L.chips = el('div', 'fr-anchors');
   L.body!.append(L.host, L.snap, L.off, L.chips);
   L.backlinks = el('div', 'backlinks'); L.body!.append(L.backlinks);
   L.inkLines = svgEl('svg', { class: 'ink-lines' }); L.body!.append(L.inkLines);
