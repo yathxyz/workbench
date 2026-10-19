@@ -7,10 +7,15 @@
 # /etc/profiles, so an agent given by an absolute exe alone cannot run here. Example:
 #   agents.codex = { label = "Codex"; package = pkgs.codex-acp; exe = "bin/codex-acp";
 #                    env.RUST_LOG = "error"; };
-{ pkgs, agents }:
+# `edwind` is the edwin input's (flake.nix passes it).
+{
+  pkgs,
+  agents,
+  edwind,
+}:
 let
   inherit (pkgs) lib;
-  workbench = pkgs.callPackage ./package.nix { edwind = pkgs.callPackage ./edwind.nix { }; };
+  workbench = pkgs.callPackage ./package.nix { inherit edwind; };
   tests = lib.fileset.toSource {
     root = ../tests;
     fileset = lib.fileset.unions [

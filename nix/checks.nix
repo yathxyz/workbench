@@ -1,10 +1,11 @@
-# `nix flake check`: package (with cargo test), clippy, fmt, Edwin's headless core and Scheme, the black-box
-# conformance suite, the end-to-end security suite, the browser suite, the key contexts, the adapter probe against
-# the stub, the VM test, the module's assertions. The harness registers wb-fake-acp (the package's `fake` output) as
-# its `stub` agent, so every check that starts it has that output on PATH.
+# `nix flake check`: package (with cargo test), clippy, fmt, the black-box conformance suite, the end-to-end security
+# suite, the browser suite, the key contexts, the board's addresses against Edwin's, the adapter probe against the
+# stub, the VM test, the module's assertions; flake.nix adds the edwin input's own checks. The harness registers
+# wb-fake-acp (the package's `fake` output) as its `stub` agent, so every check that starts it has that output on PATH.
 {
   pkgs,
   self,
+  edwin,
   workbench,
   workbench-web,
 }:
@@ -14,59 +15,29 @@ let
     root = ../tests;
     fileset = ../tests;
   };
-  # edwin/ as the repository holds it: no in-tree build of the desktop program (edwin/native/target), and no
-  # .js stripped beside the core's .ts in a checkout (tools/strip.mts --in-place; gitignored).
-  edwinTree = lib.fileset.difference ../edwin (
-    lib.fileset.unions [
-      (lib.fileset.maybeMissing ../edwin/native/target)
-      (lib.fileset.fileFilter (f: f.hasExt "js") ../edwin/src)
-      (lib.fileset.fileFilter (f: f.hasExt "js") ../edwin/native/js)
-    ]
-  );
-  # The core and native/js run as classic scripts, which vm cannot strip: the suites get each .ts with its
-  # .js beside it, as edwind's package has them (host-node.cts would otherwise strip them in every process).
-  stripped =
-    name: src: edwinDir:
-    pkgs.runCommand name { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-      cp -r ${src} $out && chmod -R u+w $out
-      node ${../tools/strip.mts} --in-place $out/${edwinDir}src $out/${edwinDir}native/js
-    '';
-  edwin = stripped "workbench-edwin-tree" (lib.fileset.toSource {
-    root = ../edwin;
-    fileset = edwinTree;
-  }) "";
   # The address suite cuts bufferAddress and friends out of web/app.ts, so it sees that one file too.
-  edwinApp = stripped "workbench-edwin-app-tree" (lib.fileset.toSource {
+  addressTree = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      edwinTree
+      ../tests/address.test.mts
+      ../tests/address-seeds.json
       ../web/app.ts
     ];
-  }) "edwin/";
-  # The edwind suites check MAX_LINE against wb-proto's (R7.2), so they see that one file of the crates.
-  edwind = stripped "workbench-edwind-tree" (lib.fileset.toSource {
-    root = ../.;
-    fileset = lib.fileset.unions [
-      edwinTree
-      ../crates/wb-proto/src/limits.rs
-    ];
-  }) "edwin/";
+  };
   # Everything tsc reads (the typecheck check).
   typed = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      edwinTree
-      ../crates/wb-proto/src/limits.rs
       (lib.fileset.difference ../web (lib.fileset.maybeMissing ../web/vendor))
       ../tests
       ../tools/vendor-entry.js
       ../tools/strip.mts
     ];
   };
-  # fast-check for the OT properties: a dev dependency pinned in tools/package-lock.json (R15.1), installed
-  # from the lock with no scripts, as nix/vendor.nix does.
-  edwinDevDeps = pkgs.stdenv.mkDerivation {
-    pname = "workbench-edwin-dev-deps";
+  # fast-check for the address properties and the TypeScript tools: dev dependencies pinned in
+  # tools/package-lock.json (R15.1), installed from the lock with no scripts, as nix/vendor.nix does.
+  devDeps = pkgs.stdenv.mkDerivation {
+    pname = "workbench-dev-deps";
     version = (lib.importJSON ../tools/package.json).version;
     src = lib.fileset.toSource {
       root = ../tools;
@@ -153,40 +124,6 @@ in
         touch $out
       '';
 
-  # Edwin's editing core in Node with no browser and no page stand-ins (step E0 of the edwind plan).
-  edwin-headless = pkgs.runCommand "workbench-edwin-headless" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --test ${edwin}/test/headless.test.mts
-    touch $out
-  '';
-
-  # Edwin's Scheme: the language (R4.3-R4.10, R4.31-R4.34), the editor-level forms (hooks, advice,
-  # minor modes, buffer-locals, markers) and the shadow-stack cost bound (R4.34, at most 10%).
-  edwin-scheme = pkgs.runCommand "workbench-edwin-scheme" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --test ${edwin}/test/scheme*.test.mts
-    touch $out
-  '';
-
-  # The evaluator budgets (E2 gate): the shadow stack at most 10% (R4.34) and generator mode at most 3x direct
-  # (R4.38, measured 1.2x). The bench recurses 1,000 deep in both modes, so it needs more stack than Node's default.
-  edwin-bench = pkgs.runCommand "workbench-edwin-bench" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --stack-size=6900 ${edwin}/test/scheme-bench.mts
-    touch $out
-  '';
-
-  # The worker pool's Node host (E2): jobs on worker_threads, the main-thread fallback, cancellation.
-  edwin-pool = pkgs.runCommand "workbench-edwin-pool" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --test ${edwin}/test/pool.test.mts
-    touch $out
-  '';
-
-  # The OT properties (R16.1–R16.4): fast-check over random sessions, plus the undo properties and the
-  # wire checks (R7.7, R7.8, R7.14, R6.16, R6.17). OT_RUNS raises the run count; the check uses the default.
-  edwin-ot = pkgs.runCommand "workbench-edwin-ot" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    export NODE_PATH=${edwinDevDeps}/node_modules
-    node --test ${edwin}/test/ot.test.mts
-    touch $out
-  '';
-
   # The board's key contexts (DESIGN §6.4) over the shipped keys.js (stripped from web/keys.ts): one command per key in every context
   # stack, every card keeps the keys it needs, the leader's Esc leaves any card.
   web-keys = pkgs.runCommand "workbench-web-keys" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
@@ -194,131 +131,21 @@ in
     touch $out
   '';
 
-  # tsc --strict over the TypeScript: edwind and its suites (edwin/tsconfig.json), Edwin's core (edwin/src) and desktop
-  # Edwin's JavaScript (edwin/native/js), the page (web/tsconfig.json and tsconfig.sw.json) and the browser suites
-  # (tests/tsconfig.json). Node and tools/strip.mts only strip the
-  # types; this checks them. The page's library types come from the vendored packages (tools/vendor-entry.js).
+  # tsc --strict over the TypeScript: the page (web/tsconfig.json and tsconfig.sw.json) and the suites
+  # (tests/tsconfig.json). Node and tools/strip.mts only strip the types; this checks them. The page's library
+  # types come from the vendored packages (tools/vendor-entry.js).
   typecheck = pkgs.runCommand "workbench-typecheck" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     cp -r ${typed} src && chmod -R u+w src && cd src
-    ln -s ${edwinDevDeps}/node_modules tools/node_modules
-    for p in edwin edwin/src edwin/native/js web web/tsconfig.sw.json tests; do node tools/node_modules/typescript/bin/tsc -p $p; done
+    ln -s ${devDeps}/node_modules tools/node_modules
+    for p in web web/tsconfig.sw.json tests; do node tools/node_modules/typescript/bin/tsc -p $p; done
     touch $out
   '';
 
-  # The intrinsics lockdown every thread of edwind runs in place of --frozen-intrinsics (R14.11, R16.16).
-  edit-lockdown = pkgs.runCommand "workbench-edit-lockdown" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --test ${edwind}/edwin/test/lockdown.test.mts
-    touch $out
-  '';
-
-  # A real edwind in a temp directory, under bin/edwind's Node flags, over every §7 message and error code,
-  # the limits, chunking, resend, replay, the E1 server commands and the socket checks (R14.3, R16.12, R16.16, R16.17).
-  edit-conformance = pkgs.runCommand "workbench-edit-conformance" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/conformance.test.mts
-    touch $out
-  '';
-
-  # SIGKILL at 1,000 random points under a three-client load, a journal torn at every byte offset, and a
-  # full disk during save and journal append (R16.5–R16.7). About thirteen minutes.
-  edit-crash = pkgs.runCommand "workbench-edit-crash" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/crash.test.mts
-    touch $out
-  '';
-
-  # External writes, the three-way merge, the conflict and deleted marks, CRLF, atomic save (R8.12–R8.15).
-  edit-disk = pkgs.runCommand "workbench-edit-disk" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/disk.test.mts
-    touch $out
-  '';
-
-  # Shared anchors (R9.12) and the frame's small server commands (E3): the after-marker rule through every writer,
-  # relocation after a disk revert, survival across restart and compaction, user-init, capf-candidates, sel.
-  edit-anchors = pkgs.runCommand "workbench-edit-anchors" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/anchors.test.mts
-    touch $out
-  '';
-
-  # The E2 gates of the edwind spec (§17.1): the image log and its replication (edit-image), the notes index,
-  # its grammar and the /api shapes (edit-notes), the block addresses against the golden file (edit-address).
-  edit-image = pkgs.runCommand "workbench-edit-image" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/image.test.mts
-    touch $out
-  '';
-  edit-notes = pkgs.runCommand "workbench-edit-notes" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/notes.test.mts
-    touch $out
-  '';
+  # The block addresses (edwind spec §16.1 row edit-address): web/app.ts's bufferAddress, fmtAddr and
+  # resolveBufferAddress against Edwin's scm/address.scm over generated cases, with Edwin's source tree as WB_EDWIN.
   edit-address = pkgs.runCommand "workbench-edit-address" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    export NODE_PATH=${edwinDevDeps}/node_modules
-    node --test ${edwinApp}/edwin/test/address.test.mts
-    touch $out
-  '';
-
-  # markdown-mode (E3, §10.1, R10.1-R10.5): the parity table's commands, faces, overlays, folding, the keyword
-  # table shared with Org, journal-today, and the incremental font-lock budget (a keystroke in 10,000 lines
-  # re-fontifies in 2 ms), in the headless runtime.
-  edwin-markdown = pkgs.runCommand "workbench-edwin-markdown" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --test ${edwin}/test/markdown.test.mts
-    touch $out
-  '';
-
-  # The display seam (DT0 of desktop Edwin): model frames laid out on a cell grid for a backend that is not a page,
-  # and the face and palette tables checked against index.html's, markdown-mode's and Org's stylesheets.
-  edwin-display = pkgs.runCommand "workbench-edwin-display" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --test ${edwin}/test/display.test.mts
-    touch $out
-  '';
-
-  # The desktop program's JavaScript (DT1): the terminal encoder and decoder (native/js/term.ts), and the
-  # core's seams it uses (files on a disk, leaving with an exit status, input events). The program itself is
-  # tested in a pseudo-terminal by edwin/native/tests (cargo test).
-  edwin-native = pkgs.runCommand "workbench-edwin-native" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    node --test ${edwin}/test/term.test.mts ${edwin}/test/native.test.mts
-    touch $out
-  '';
-
-  # The frame runtime (E3 H1, §6.3, §7, §9.5): Edwin's core as a protocol client against a real edwind:
-  # open and snap, batches and acks, transform against pending edits, undo by group, reconnect and resend,
-  # image replication, server commands and ask, anchors, server-only stubs.
-  edit-frame = pkgs.runCommand "workbench-edit-frame" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/frame.test.mts
-    touch $out
-  '';
-
-  # The Lisp machine (E2, §4.6–§4.9): threads, held buffers, ask and answer, interrupt, timers, server
-  # commands; the debugger, the inspector, introspection and the primitive registry.
-  edit-lisp = pkgs.runCommand "workbench-edit-lisp" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/threads.test.mts ${edwind}/edwin/test/debug.test.mts
-    touch $out
-  '';
-
-  # Processes through the hub (R4.43-R4.45) and the section 5 session API, against the fake hub.
-  edit-process = pkgs.runCommand "workbench-edit-process" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/process.test.mts ${edwind}/edwin/test/wb.test.mts
-    touch $out
-  '';
-
-  # Source blocks in notes (hypernotes H1: scm/babel.scm, server/babel.mts): the reader and writer, then the
-  # engine against a real edwind and the fake hub, for markdown and Org.
-  edit-babel = pkgs.runCommand "workbench-edit-babel" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/babel.test.mts
-    touch $out
-  '';
-
-  # The Scheme boundary (R16.15, R4.52) and the credential rules (R16.19, in models.test.mts).
-  edit-security = pkgs.runCommand "workbench-edit-security" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
-    export HOME=$TMPDIR
-    node --test ${edwind}/edwin/test/security.test.mts ${edwind}/edwin/test/models.test.mts
+    export NODE_PATH=${devDeps}/node_modules WB_EDWIN=${edwin}
+    node --test ${addressTree}/tests/address.test.mts
     touch $out
   '';
 
@@ -379,41 +206,6 @@ in
   };
 
   vm = pkgs.testers.runNixOSTest (import ./vm.nix { inherit self; });
-
-  # programs.edwin (nix/edwin-module.nix) evaluates into a system: the user unit runs `edwin --fg-daemon` from the
-  # package, EDITOR is edwin. Evaluation only, so the edwin package itself is not built here.
-  edwin-module =
-    let
-      sys = pkgs.nixos {
-        imports = [ self.nixosModules.edwin ];
-        system.stateVersion = lib.trivial.release;
-        boot.isContainer = true; # no root file system or boot loader to declare
-        programs.edwin = {
-          enable = true;
-          daemon.enable = true;
-          defaultEditor = true;
-        };
-      };
-      unit = sys.config.systemd.user.services.edwind;
-      edwin = self.packages.${pkgs.stdenv.hostPlatform.system}.edwin;
-      show = v: builtins.unsafeDiscardStringContext (builtins.toJSON v);
-      got = show {
-        exec = unit.serviceConfig.ExecStart;
-        notes = unit.environment.EDWIN_NOTES_DIR;
-        wanted = unit.wantedBy;
-        editor = sys.config.environment.variables.EDITOR;
-        system = builtins.seq sys.config.system.build.toplevel.drvPath true;
-      };
-      want = show {
-        exec = "${edwin}/bin/edwin --fg-daemon";
-        notes = "%h/notes";
-        wanted = [ "default.target" ];
-        editor = "edwin";
-        system = true;
-      };
-    in
-    assert lib.assertMsg (got == want) "programs.edwin evaluated to ${got}, expected ${want}";
-    pkgs.runCommand "workbench-edwin-module" { } "touch $out";
 
   # The module's assertions refuse what wb-hub would refuse at its next start, so a bad name
   # fails the evaluation instead of the first hub restart after a deploy.

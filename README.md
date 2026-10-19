@@ -14,30 +14,37 @@ authenticates the proxy.
 
 [docs/DESIGN.md](docs/DESIGN.md) is the full design: protocol, threat model, units and tests.
 
+Pages are [Edwin](https://github.com/yathxyz/edwin) frames: edwind, Edwin's text daemon, owns every text buffer, and
+the page serves Edwin's frame runtime at `/edwin/`. Edwin is the flake input `edwin`; a path written `edwin/…` in
+this repository's documents and comments is a path in that repository.
+
 ## Build
 
 Requires Nix with flakes, on x86_64-linux.
 
 ```sh
-nix build .#workbench       # wb-hub, wb-web, wb
-nix build .#workbench-web   # the web root (SPA plus the vendored editor and terminal bundle)
-nix develop                 # cargo, clippy, rustfmt, esbuild, python3, caddy
+nix build .#workbench       # wb-hub, wb-web, wb, and edwind from the edwin input
+nix build .#workbench-web   # the web root (SPA, the vendored terminal bundle and Edwin's frame runtime)
+nix develop                 # cargo, clippy, rustfmt, esbuild, python3, caddy, edwind (and WB_EDWIND_MAIN)
+nix flake update edwin      # move to Edwin's newest commit
 ```
+
+Against a local Edwin checkout, add `--override-input edwin git+file:///path/to/edwin` to any of these.
 
 ## Test
 
 ```sh
-cargo test --workspace
-nix flake check -L          # package, clippy, fmt, security (end to end), vm (needs KVM)
+cargo test --workspace      # in nix develop: wb-cli's tests start the edwind of WB_EDWIND_MAIN
+nix flake check -L          # package, clippy, fmt, security (end to end), vm (needs KVM), and Edwin's own checks
 ```
 
 The JavaScript is TypeScript (erasable syntax only, `tsc --strict`, the flake check `typecheck`). Node 24 runs the
-`.mts` files of edwind and the suites as they are. The page's `web/*.ts` are classic scripts that the browser cannot
+`.mts` suites as they are. The page's `web/*.ts` are classic scripts that the browser cannot
 strip, so the nix web root carries them as `.js` (`tools/strip.mts`, positions kept). Without nix:
 
 ```sh
 (cd tools && npm ci)
-for p in edwin web web/tsconfig.sw.json tests; do tools/node_modules/.bin/tsc -p $p; done
+for p in web web/tsconfig.sw.json tests; do tools/node_modules/.bin/tsc -p $p; done
 node tools/strip.mts --web web /tmp/web-root   # web/ with each .ts as .js
 ```
 

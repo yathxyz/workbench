@@ -471,3 +471,26 @@ fn repl_evaluates_each_form() {
     assert!(run.stdout.starts_with("3\n"), "{}", run.stdout);
     assert!(run.stdout.ends_with("42\n"), "{}", run.stdout);
 }
+
+/// edwind's MAX_LINE (`server/proto.mts`, edwind spec R7.2) is wb-proto's: wb-web relays `/edit` lines to
+/// edit.sock unparsed, so both ends must refuse the same lengths.
+#[test]
+fn max_line_equals_wb_proto() {
+    let proto = common::main_mjs().with_file_name("proto.mts");
+    let src = std::fs::read_to_string(&proto)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", proto.display()));
+    let expr = src
+        .lines()
+        .find_map(|l| l.strip_prefix("export const MAX_LINE = "))
+        .and_then(|l| l.strip_suffix(';'))
+        .expect("proto.mts declares MAX_LINE");
+    let value: usize = expr
+        .split('*')
+        .map(|f| {
+            f.trim()
+                .parse::<usize>()
+                .expect("MAX_LINE is a product of integers")
+        })
+        .product();
+    assert_eq!(value, wb_proto::limits::MAX_LINE);
+}

@@ -1,5 +1,5 @@
 {
-  // The browser suites (ui.mts, perf.mts) and keys.test.mts: Node runs them as they are (type stripping).
+  // The browser suites (ui.mts, perf.mts), keys.test.mts and address.test.mts: Node runs them as they are (type stripping).
   // page.evaluate callbacks run in the page, so the DOM's types and the page's globals (web/*.d.ts) are in scope.
   "compilerOptions": {
     "target": "esnext",
@@ -18,5 +18,5 @@
     "noFallthroughCasesInSwitch": true,
     "useUnknownInCatchVariables": false
   },
-  "files": ["../web/globals.d.ts", "../web/board.d.ts", "ui.mts", "perf.mts", "keys.test.mts", "../tools/strip.mts"]
+  "files": ["../web/globals.d.ts", "../web/board.d.ts", "ui.mts", "perf.mts", "keys.test.mts", "address.test.mts", "../tools/strip.mts"]
 }

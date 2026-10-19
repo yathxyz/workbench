@@ -3,7 +3,3 @@
 /result-*
 __pycache__/
 /tools/node_modules
-/edwin/native/target/
-# Edwin's classic scripts stripped beside their .ts (node tools/strip.mts --in-place edwin/src edwin/native/js)
-/edwin/src/*.js
-/edwin/native/js/*.js

@@ -1,4 +1,4 @@
-//! The integration harness: a real edwind started from `edwin/server/main.mts`, the
+//! The integration harness: a real edwind started from `$WB_EDWIND_MAIN`, the
 //! `wb` binary run against its socket, and a scripted protocol client.
 // Each test crate uses a different part of this module.
 #![allow(dead_code)]
@@ -16,12 +16,9 @@ use serde_json::{Value, json};
 /// How long a test waits for the server, a message or a condition.
 pub const WAIT: Duration = Duration::from_secs(10);
 
-/// `WB_EDWIND_MAIN`, else `<repo>/edwin/server/main.mts`.
-fn main_mjs() -> PathBuf {
-    match std::env::var_os("WB_EDWIND_MAIN") {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => Path::new(env!("CARGO_MANIFEST_DIR")).join("../../edwin/server/main.mts"),
-    }
+/// `WB_EDWIND_MAIN`: edwind's `server/main.mts` (the package's check and `nix develop` set it).
+pub fn main_mjs() -> PathBuf {
+    PathBuf::from(std::env::var_os("WB_EDWIND_MAIN").unwrap_or_default())
 }
 
 /// `WB_NODE`, else `node` on PATH.
@@ -52,7 +49,7 @@ impl Edwind {
         let main = main_mjs();
         assert!(
             main.is_file(),
-            "edwind server not found at {}; set WB_EDWIND_MAIN to edwin/server/main.mts",
+            "edwind server not found at {}; set WB_EDWIND_MAIN to edwind's server/main.mts (nix develop sets it)",
             main.display()
         );
         let node = node();

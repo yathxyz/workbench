@@ -1,4 +1,4 @@
-// Golden test for edwin/scm/address.scm (spec §16.1 row `edit-address`, §10.1 "Addresses"):
+// Golden test for Edwin's scm/address.scm (edwind spec §16.1 row `edit-address`, §10.1 "Addresses"):
 // block-address, format-address and resolve-address in Scheme give the same results as
 // bufferAddress, fmtAddr and resolveBufferAddress in web/app.ts over generated cases.
 //
@@ -6,15 +6,20 @@
 // context with small stand-ins for the page: nodeList() over generated buffers, pageState(n).doc as app.ts's own
 // TextDoc (cut out the same way), and clamp. Cases come from a seeded generator, so a
 // failing case is one integer; those go to address-seeds.json and are replayed first (R16.1).
-// Run: node --test edwin/test/address.test.mts (ADDRESS_RUNS, ADDRESS_SEED tune fast-check).
+// Run: WB_EDWIN=<an edwin checkout> NODE_PATH=tools/node_modules node --test tests/address.test.mts
+// (ADDRESS_RUNS, ADDRESS_SEED tune fast-check).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire, stripTypeScriptTypes } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import vm from 'node:vm';
-import { loadScheme, MODE, ROOT } from './scheme-load.mts';
-import type { SchemeValue } from './scheme-load.mts';
+
+// Edwin's source tree: the flake check passes the edwin input.
+const EDWIN = process.env.WB_EDWIN;
+assert.ok(EDWIN, "WB_EDWIN names Edwin's source tree");
+const { loadScheme, MODE } = await import(join(EDWIN, 'test', 'scheme-load.mts')); // any: Edwin's types live in its repository
+type SchemeValue = any; // any: a value of Edwin's Scheme (scheme-load.mts there)
 
 /* A generated page: a buffer (or a frame, which addresses skip) with its name and text. */
 interface Page { name: string; text: string; kind?: string }
@@ -35,13 +40,13 @@ interface Case { seed: number; pages: Page[]; name: string; text: string; pos: n
 
 const require = createRequire(import.meta.url);
 // fast-check is pinned in tools/package-lock.json; NODE_PATH names tools/node_modules.
-const fc = require('fast-check'); // any: fast-check's types are not resolvable from edwin/ (it lives in tools/node_modules)
+const fc = require('fast-check'); // any: found through NODE_PATH, which tsc does not see
 const SEEDS: number[] = JSON.parse(readFileSync(new URL('./address-seeds.json', import.meta.url), 'utf8'));
 const RUNS = Number(process.env.ADDRESS_RUNS || 500);
 
 // ---------------------------------------------------------------- the Scheme side
 const S = loadScheme(MODE);
-S.evalString(readFileSync(join(ROOT, 'scm', 'address.scm'), 'utf8'), 'address.scm');
+S.evalString(readFileSync(join(EDWIN, 'scm', 'address.scm'), 'utf8'), 'address.scm');
 const call = (name: string, ...args: SchemeValue[]): SchemeValue => S.callProc(S.gref(name), args);
 const schemeFormat = (name: string, text: string, pos: number) => call('format-address', call('block-address', name, text, pos));
 const schemeResolve = (q: string, pages: Page[]) => {
@@ -52,7 +57,7 @@ const schemeResolve = (q: string, pages: Page[]) => {
 
 // ---------------------------------------------------------------- the JavaScript side
 // The page's source with its types stripped, as the browser gets it (tools/strip.mts).
-const appSource = stripTypeScriptTypes(readFileSync(join(ROOT, '..', 'web', 'app.ts'), 'utf8'), { mode: 'strip' });
+const appSource = stripTypeScriptTypes(readFileSync(new URL('../web/app.ts', import.meta.url), 'utf8'), { mode: 'strip' });
 const cut = appSource.match(/function bufferAddress\([^)]*\)[^{]*\{[\s\S]*?\n(?=\/\/ -{10,} )/);
 assert.ok(cut, 'bufferAddress is in web/app.ts');
 const jsSource = cut[0];
@@ -237,7 +242,7 @@ test('resolve-address round trip: an address of a position resolves inside its l
 });
 
 test('parse-address and the address alist', () => {
-  const read = (q: string) => { const a = call('parse-address', q); return a === false ? null : Object.fromEntries(S.arr(a).map(p => [p.car.name, p.cdr instanceof S.Pair || p.cdr === S.NIL ? S.arr(p.cdr) : p.cdr])); };
+  const read = (q: string) => { const a = call('parse-address', q); return a === false ? null : Object.fromEntries(S.arr(a).map((p: SchemeValue) => [p.car.name, p.cdr instanceof S.Pair || p.cdr === S.NIL ? S.arr(p.cdr) : p.cdr])); };
   assert.deepEqual(read('Notes › Plan › Step ¶2 "first words"'), { name: 'Notes', path: ['Plan', 'Step'], para: 2, quote: 'first words' });
   assert.deepEqual(read('notes ¶ 3'), { name: 'notes', path: [], para: 3, quote: '' });
   assert.deepEqual(read('Notes › Plan "unterminated'), { name: 'Notes', path: ['Plan'], para: 0, quote: 'unterminated' });

@@ -3,7 +3,7 @@
 //   WB_PLAYWRIGHT=<playwright>/index.mjs WB_HARNESS=tests/harness.py node tests/ui.mts <web-root>
 //
 // <web-root> (or $WB_WEB_ROOT) is the built web output (`nix build .#workbench-web`: web/ plus vendor/ and fonts/). The
-// harness takes wb-hub, edwind, wb-web, wb-fake-acp and caddy from PATH (edwind falls back to edwin/server/main.mts under
+// harness takes wb-hub, edwind, wb-web, wb-fake-acp and caddy from PATH (edwind falls back to $EDWIND_MAIN under
 // node); the Caddy configs for the expired and login-page modes sit next to it in caddy/. Served pages are Edwin frames
 // (edwind spec R9.21): the page's text is read through the board's pageText, the frame's DOM through the Q map, and the
 // 'frames' section drives two tabs, presence, an edwind restart, the offline notice, board migration, the frame cap,

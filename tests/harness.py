@@ -52,13 +52,13 @@ boards directory. --board FILE seeds <boardsDir>/<host>.json from FILE before an
 Binaries come from --bin-dir, else from PATH. The web root comes from --web-root or
 $WB_WEB_ROOT (for example the output of `nix build .#workbench-web`).
 
-edwind (the editing server, edwin/server/main.mts) runs beside wb-web with an edit.json: its socket
+edwind (the editing server, from the edwin input) runs beside wb-web with an edit.json: its socket
 in a 0700 directory under the temporary root, the harness's notesDir and boardsDir, the hub and web
 sockets, the home as its writable path and the module's refusal list (so POST /api/mv, which wb-web
 forwards to edwind, has the authority it has in production), and the same host as web.json, whose
 editSocket points at it. `edwind` comes from --bin-dir
-or PATH when present; otherwise the harness runs edwin/server/main.mts from this checkout with node
-and the flags of the package wrapper ($EDWIND_MAIN names another main.mts). With editSocket set, the
+or PATH when present (`nix develop` puts it there); otherwise the harness runs $EDWIND_MAIN (edwind's
+server/main.mts) with node and the flags of the package wrapper. With editSocket set, the
 board's pages are Edwin frames (edwind spec R9.21).
 """
 
@@ -300,16 +300,16 @@ class Harness:
         wait_until(lambda: can_connect_unix(self.hub_sock), "wb-hub", self.hub)
 
     def edwind_argv(self):
-        """`edwind --config edit.json` from --bin-dir or PATH; else node on this checkout's main.mts (or
-        $EDWIND_MAIN) with the flags the package wrapper uses (nix/package.nix, edwin/test/edit-client.mts)."""
+        """`edwind --config edit.json` from --bin-dir or PATH; else node on $EDWIND_MAIN with the flags the
+        package wrapper uses (edwin/nix/edwind.nix and edwin/test/edit-client.mts)."""
         try:
             return [self.bin("edwind"), "--config", self.edit_json]
         except RuntimeError:
             pass
-        main = os.environ.get("EDWIND_MAIN") or str(Path(__file__).resolve().parent.parent / "edwin" / "server" / "main.mts")
+        main = os.environ.get("EDWIND_MAIN", "")
         node = shutil.which("node")
-        if not node or not os.path.exists(main):
-            raise RuntimeError(f"edwind not found (use --bin-dir or PATH), and no node for {main}")
+        if not node or not os.path.isfile(main):
+            raise RuntimeError(f"edwind not found (use --bin-dir, PATH or $EDWIND_MAIN), and no node for {main!r}")
         return [node, "--disallow-code-generation-from-strings",
                 "--no-warnings=ExperimentalWarning", main, "--config", self.edit_json]
 

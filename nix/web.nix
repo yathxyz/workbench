@@ -1,12 +1,14 @@
 # The web root: web/ with its TypeScript stripped to JavaScript (tools/strip.mts), the vendored xterm bundle,
-# pdf.js under vendor/pdfjs/, the Edwin console and frame runtime under edwin/, and the fonts, converted to
-# woff2 from nixpkgs at build time with a generated fonts/fonts.css. No font file lives in the repo.
+# pdf.js under vendor/pdfjs/, the Edwin console and frame runtime under edwin/ (the edwin input's edwin-web), and
+# the fonts, converted to woff2 from nixpkgs at build time with a generated fonts/fonts.css. No font file lives in
+# the repo.
 {
   lib,
   runCommand,
   fetchurl,
   nodejs,
   vendor,
+  edwin-web,
   nerd-fonts,
   noto-fonts,
   woff2,
@@ -15,23 +17,6 @@ let
   web = lib.fileset.toSource {
     root = ../web;
     fileset = lib.fileset.difference ../web (lib.fileset.maybeMissing ../web/vendor);
-  };
-  # Served at /edwin/ (edwind spec R9.19): the console page as /edwin/ (wb-web aliases a directory to
-  # its index.html), the 13 core files under src/ and the Scheme sources under scm/, which the frame
-  # runtime fetches as text/plain. The console page is edwin/console/index.html; until that file
-  # exists the standalone edwin/index.html stands in for it.
-  console =
-    if builtins.pathExists ../edwin/console/index.html then
-      ../edwin/console/index.html
-    else
-      ../edwin/index.html;
-  edwinSrc = lib.fileset.toSource {
-    root = ../edwin/src;
-    fileset = lib.fileset.fileFilter (f: f.hasExt "ts" && !lib.hasSuffix ".d.ts" f.name) ../edwin/src;
-  };
-  edwinScm = lib.fileset.toSource {
-    root = ../edwin/scm;
-    fileset = lib.fileset.fileFilter (f: f.hasExt "scm") ../edwin/scm;
   };
   # pdf.js for the pdf card (F-A40), which loads it only when a card mounts. Pinned here rather than in tools/'s
   # npm lock, where the package's optional @napi-rs/canvas binaries would come along for nothing. Keep it current:
@@ -51,9 +36,9 @@ runCommand "workbench-web" { nativeBuildInputs = [ nodejs woff2 ]; } ''
   mkdir pdfjs && tar xzf ${pdfjs} -C pdfjs
   install -Dm444 -t $out/vendor/pdfjs pdfjs/package/legacy/build/pdf.min.mjs pdfjs/package/legacy/build/pdf.worker.min.mjs pdfjs/package/LICENSE
   cp -r pdfjs/package/cmaps $out/vendor/pdfjs/cmaps   # Adobe CMaps for CJK fonts that name one (getDocument's cMapUrl)
-  install -Dm444 ${console} $out/edwin/index.html
-  node ${../tools/strip.mts} $out/edwin/src ${edwinSrc}/*.ts
-  install -Dm444 -t $out/edwin/scm ${edwinScm}/*.scm
+  # Served at /edwin/ (edwind spec R9.19): the console page as /edwin/ (wb-web aliases a directory to its
+  # index.html), the core under src/ and the Scheme sources under scm/, which the frame runtime fetches as text/plain.
+  cp -r ${edwin-web} $out/edwin
 
   mkdir fonts
   cp ${mono}/JetBrainsMonoNerdFontMono-{Regular,Bold}.ttf ${noto}/NotoSans{,-Italic}.ttf fonts/

@@ -29,10 +29,6 @@ rustPlatform.buildRustPackage {
       ../Cargo.toml
       ../Cargo.lock
       ../crates
-      # wb-cli's integration tests start a real edwind (crates/wb-cli/tests/common/mod.rs).
-      (lib.fileset.difference ../edwin/src (lib.fileset.fileFilter (f: f.hasExt "js") ../edwin/src))
-      ../edwin/scm
-      ../edwin/server
     ];
   };
   cargoLock.lockFile = ../Cargo.lock;
@@ -50,8 +46,8 @@ rustPlatform.buildRustPackage {
   # Test fixtures take the shell from $BASH; the builder's bash sets it without exporting it.
   preCheck = ''
     export BASH
-    export WB_EDWIND_MAIN="$PWD/edwin/server/main.mts" WB_NODE=${nodejs}/bin/node
-    node ${../tools/strip.mts} --in-place edwin/src
+    # wb-cli's integration tests start a real edwind (crates/wb-cli/tests/common/mod.rs).
+    export WB_EDWIND_MAIN=${edwind}/share/edwin/server/main.mts WB_NODE=${nodejs}/bin/node
   '';
 
   # wb-fake-acp, the scripted test agent, goes to its own output and never to $out/bin.
@@ -63,7 +59,7 @@ rustPlatform.buildRustPackage {
     mkdir -p $fake/bin
     mv $out/bin/wb-fake-acp $fake/bin/
 
-    # edwind (nix/edwind.nix), which wb edit and the workbench-edit unit run.
+    # edwind (the edwin input), which wb edit and the workbench-edit unit run.
     ln -s ${edwind}/bin/edwind $out/bin/edwind
     mkdir -p $out/share
     ln -s ${edwind}/share/edwin $out/share/edwin
