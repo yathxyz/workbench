@@ -5445,9 +5445,13 @@ async function newArtifact(name: string, html?: string, capabilities?: Record<st
 function artifactSourcePage(n: ArtifactNode) {
   const name = n.name + '.html';
   let p = findPage(name);
-  artSource(n).then(src => {
-    if (!p) { p = openPage(name, n, true) as PageNode; pageSetText(p, src); p.artifactOf = n.id; }
-    else if (pageText(p) === '') pageSetText(p, src);
+  artSource(n).then(async src => {
+    const refused = () => toast(`${p!.name} takes no edit now, so the artifact's HTML was not written into it`);
+    if (!p) { p = openPage(name, n, true) as PageNode; p.artifactOf = n.id; if (!(await pageSetText(p, src))) return refused(); }
+    else {
+      let t: string; try { t = await pageTextFull(p); } catch (e) { return toast(`${p.name}: ${(e as Error).message}`); }   // a closed replica's snapshot is not the page
+      if (t === '' && !(await pageSetText(p, src))) return refused();
+    }
     p.artifactOf = n.id; if (!S.edges.some(e => e.from === n.id && e.to === p!.id)) { S.edges.push({ id: uid('e'), from: n.id, to: p.id, type: 'ref' }); renderLinks(); }
     jumpNode(p); dirty(); toast('Edit the HTML here, then run "Artifact: publish from this page".');
   });
@@ -6268,7 +6272,10 @@ function frAdopt(n: PageNode): Promise<string | null> {
       b = await frOpenCreate(id);
       if (b!.id !== id) continue;   // a file renamed from this name: edwind sent the open on to it, which stays as it is
       const text = n.text || '', cur = b!.text;
-      if (cur === '' && text) { frReplaceAll(b!, text); const r = await Ed.sync.save(b!); if (r.error) console.warn('edwin save', id, r.error); }
+      if (cur === '' && text) {   // the node keeps its text unless the file has it on disk
+        frReplaceAll(b!, text); const r = await Ed.sync.save(b!);
+        if (r.error) { frReplaceAll(b!, ''); FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} throw new Error(`${id} could not be saved: ${r.error}`); }
+      }
       else if (cur !== '' && cur !== text) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} continue; }   // R8.18: another text, next suffix
       chosen = id;
     }
