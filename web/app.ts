@@ -6519,6 +6519,8 @@ function roMountPage(n: PageNode, L: MountedLive) {
   const t = n.text || '';
   if (!n.buf) for (const a of n.anchors || []) a.pos = relocate(t, a);
   L.snap.addEventListener('scroll', () => { scheduleLineInk(n.id); roOverlays(n.id); }, { passive: true });
+  // a resize rewraps the text: line-anchored ink, labelled anchors and tear-out controls move with the lines
+  L.ro = new ResizeObserver(() => { scheduleLineInk(n.id); roOverlays(n.id); }); L.ro.observe(L.snap);
   L.snap.addEventListener('mousedown', () => { focusedBuf = n.id; });
   L.snap.addEventListener('mouseup', () => { if (focusedBuf === n.id) scheduleBufAddr(n); });
   roRender(n);
