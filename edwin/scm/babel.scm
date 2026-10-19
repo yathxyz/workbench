@@ -63,12 +63,19 @@ line, body, code (the body with noweb references expanded when the block asks fo
             ((or (babel--within? (car bs) p) (babel--within? (babel--get (car bs) 'result) p)) (car bs))
             (else (loop (cdr bs)))))))
 
-(define (babel--block-at blocks pos id)
-  "The block of BLOCKS that begins at POS, else the one named ID (a marker may have moved off its line)."
-  (let loop ((bs blocks))
-    (cond ((null? bs) (and id (babel--find blocks id)))
-          ((= (babel--get (car bs) 'begin) pos) (car bs))
-          (else (loop (cdr bs))))))
+(define (babel--block-at blocks pos blk)
+  "BLK again among BLOCKS after the note changed: the block of the same name, else the one that begins at POS
+(BLK's marker) with BLK's language and body. #f when it is gone."
+  (let ((id (babel--get blk 'id)))
+    (if id
+        (babel--find blocks id)
+        (let loop ((bs blocks))
+          (cond ((null? bs) #f)
+                ((and (= (babel--get (car bs) 'begin) pos)
+                      (equal? (babel--get (car bs) 'lang) (babel--get blk 'lang))
+                      (equal? (babel--get (car bs) 'body) (babel--get blk 'body)))
+                 (car bs))
+                (else (loop (cdr bs))))))))
 
 (define (babel--name blk)
   (or (babel--get blk 'id) (format #f "the block at line ~a" (babel--get blk 'line))))
@@ -174,7 +181,8 @@ results=output."
     (if i (substring file 0 (max 1 (- i 1))) #f)))
 
 (define (babel--expand-path p dir)
-  (cond ((or (string-prefix? "/" p) (string-prefix? "~/" p)) p)
+  (cond ((string-prefix? "/" p) p)
+        ((or (string=? p "~") (string-prefix? "~/" p)) (%babel-expand-home p))
         (dir (string-append dir "/" p))
         (else (user-error "~a is relative, and this buffer visits no file" p))))
 
@@ -276,10 +284,14 @@ when it ran without a condition, #f when its result is a failure."
     (when (member (babel-block-attr blk "eval") '("no" "never"))
       (user-error "~a says eval=no" (babel--name blk)))
     (when (babel--get blk 'code-error) (user-error "~a" (babel--get blk 'code-error)))
-    (let* ((id (babel--get blk 'id))
-           (marker (copy-marker (babel--get blk 'begin) #t))
+    (let* ((marker (copy-marker (babel--get blk 'begin) #t))
            (silent (member "silent" (babel--attr-words blk "results")))
-           (outcome (guard (c (#t (cons 'error (babel--condition-text c))))
+           (outcome (guard (c ((and (condition? c) (eq? (error-kind c) 'cannot-block))
+                               ;; Called where it cannot wait (a plain call on the server, not a command): an
+                               ;; error for the caller, not a result for the note.
+                               (set-marker marker #f)
+                               (raise c))
+                              (#t (cons 'error (babel--condition-text c))))
                       (let ((bindings (babel--bindings blk (babel-blocks)))
                             (env (babel-environment (babel-environment-name blk))))
                         ;; The block may take a while: let the edits that wait for this buffer in (R4.41).
@@ -289,7 +301,7 @@ when it ran without a condition, #f when its result is a failure."
            (error? (eq? (car outcome) 'error))
            (payload (babel--payload outcome)))
       (unless silent
-        (let ((now (babel--block-at (babel-blocks) (marker-position marker) id)))
+        (let ((now (babel--block-at (babel-blocks) (marker-position marker) blk)))
           (set-marker marker #f)
           (unless now (user-error "~a was removed while it ran" (babel--name blk)))
           (babel--store now payload error?)))
@@ -311,7 +323,7 @@ when it ran without a condition, #f when its result is a failure."
 the first that fails (C-c C-v b)."
   (interactive) (:where 'server)
   (let* ((runnable (filter babel--runnable? (babel-blocks)))
-         (marks (map (lambda (b) (cons (copy-marker (babel--get b 'begin) #t) (babel--get b 'id))) runnable)))
+         (marks (map (lambda (b) (cons (copy-marker (babel--get b 'begin) #t) b)) runnable)))
     (for-each (lambda (b) (babel-forget-environment (babel-environment-name b))) runnable)
     (let loop ((ms marks) (n 0))
       (if (null? ms)
@@ -359,7 +371,7 @@ files' paths."
          (files (%babel-tangle-files (buffer-string) (babel-syntax) (babel--base-name file))))
     (when (null? files) (user-error "No block of this note has tangle="))
     (thread-yield)
-    (let ((ids (map (lambda (f) (%babel-write-file (babel--expand-path (car f) dir) (cdr f))) files)))
+    (let ((ids (map (lambda (f) (%babel-write-file (babel--expand-path (car f) dir) (cdr f) file)) files)))
       (message "Tangled ~a" (string-join ids ", "))
       ids)))
 

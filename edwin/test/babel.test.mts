@@ -48,7 +48,7 @@ test('markdown: fences with attributes, data kinds, results by of= and by place,
 
 test('Org: #+name, header arguments, #+PROPERTY defaults, escaped lines, named tables, every #+RESULTS form', () => {
   const text = [
-    '#+PROPERTY: header-args :session shared', '#+property: header-args:sh :dir /tmp',
+    '#+PROPERTY: header-args :session shared', '#+property: header-args:sh :dir /tmp', '#+property: header-args:scheme :var w=4',
     '* Heading',
     '#+name: sum', '#+begin_src scheme :var x=data y=3 :results value', '  (+ (length x) y)', '  ,* not a heading', '#+end_src', '',
     '#+RESULTS: sum', ': 5', '',
@@ -65,13 +65,18 @@ test('Org: #+name, header arguments, #+PROPERTY defaults, escaped lines, named t
   assert.deepEqual(p.blocks.map(b => [b.kind, b.lang, b.id]), [['src', 'scheme', 'sum'], ['table', 'table', 'data'], ['src', 'sh', null], ['src', 'scheme', null], ['src', 'scheme', null], ['src', 'scheme', null]], 'a block inside another block is not read');
   const [sum, data, sh, bad, table, empty] = p.blocks;
   assert.equal(text.slice(sum.begin, sum.begin + 10), '#+name: su', 'the #+name: line belongs to the block');
-  assert.deepEqual(sum.vars, [['x', 'data'], ['y', '3']]);
+  assert.deepEqual(sum.vars, [['w', '4'], ['x', 'data'], ['y', '3']], 'header-args:scheme :var applies to scheme blocks');
   assert.equal(sum.attrs.env, 'shared', ':session from #+PROPERTY: header-args'); assert.equal(sum.attrs.results, 'value');
   assert.equal(sum.body, '(+ (length x) y)\n* not a heading', 'commas come off escaped lines, the shared indentation comes off');
   assert.equal(sum.result!.text, '5'); assert.equal(sum.result!.form, 'lines');
   assert.deepEqual(orgTable(data.body), [['a', 'b'], ['1', 'x']]);
   assert.equal(sh.attrs.dir, '/tmp', 'header-args:sh applies to sh blocks only'); assert.equal(sum.attrs.dir, undefined);
-  assert.deepEqual(sh.vars, [['z', '"q r"']]);
+  assert.deepEqual(sh.vars, [['z', '"q r"']], 'and not to sh blocks');
+  const plus = parse('#+property: header-args:scheme+ :results output\n#+begin_src scheme\n1\n#+end_src\n', 'org').blocks[0];
+  assert.equal(plus.attrs.results, 'output', 'header-args:LANG+ is LANG');
+  const two = parse('#+begin_src scheme\n1\n#+end_src\n#+RESULTS:\n#+begin_src scheme\n2\n#+end_src\n', 'org');
+  assert.equal(two.blocks.length, 2, 'a #+begin_src below an empty #+RESULTS: is the next block');
+  assert.equal(two.blocks[0].result!.form, 'empty');
   assert.equal(sh.result!.text, 'q r\n* line'); assert.equal(sh.result!.form, 'block');
   assert.equal(bad.result!.error, true);
   assert.equal(table.result!.form, 'table');
@@ -103,11 +108,17 @@ test('noweb: references expand with their line prefix, noweb-ref joins blocks, c
     `${fence}scheme {noweb-ref=body tangle=yes}`, '(display 3)', fence,
     `${fence}scheme {#loop noweb}`, '<<loop>>', fence,
     `${fence}scheme {#lost noweb}`, '<<nowhere>>', fence,
+    `${fence}scheme {#one}`, '1', fence,
+    `${fence}scheme {#pair noweb}`, '(+ <<one>> <<one>>)', '(list <<one>> <<body>>)', fence,
   ].join('\n');
   const p = parse(text, 'markdown');
   assert.equal(expand(p, p.blocks[0]), '(define (f)\n  (display 1)\n  (display 2)\n  (display 3))');
   assert.throws(() => expand(p, p.blocks[3]), /cycle/);
   assert.throws(() => expand(p, p.blocks[4]), /no block named nowhere/);
+  const chain = Array.from({ length: 40 }, (_, k) => [`${fence}scheme {#n${k} noweb}`, k < 39 ? `<<n${k + 1}>> <<n${k + 1}>>` : 'x', fence]).flat().join('\n');
+  assert.throws(() => expand(parse(chain, 'markdown'), parse(chain, 'markdown').blocks[0]), /expands past/, 'a doubling chain stops at the size cap, fast');
+  assert.equal(expand(p, p.blocks[6]), '(+ 1 1)\n(list 1 (display 1)\n(list <<one>> (display 2)\n(list <<one>> (display 3))',
+    'every reference on a line expands; a later one repeats the line as written before it');
   assert.deepEqual(tangleFiles(p, 'note'), [['out/main.scm', '(define (f)\n  (display 1)\n  (display 2)\n  (display 3))\n'], ['note.scm', '(display 3)\n']]);
 });
 
@@ -262,12 +273,50 @@ test('babel-tangle writes the tangled files relative to the note through the buf
   await until(() => fs.existsSync(path.join(dir.dirs.notes, 't/src/main.scm')), 'the tangled file');
   assert.equal(fs.readFileSync(path.join(dir.dirs.notes, 't/src/main.scm'), 'utf8'), '(define (main)\n  (display "hi"))\n');
   assert.equal(fs.readFileSync(path.join(dir.dirs.notes, 't/lit.sh'), 'utf8'), 'echo\n');
+  assert.equal(JSON.parse(await value(c, '(babel--expand-path "~/a/b.scm" #f)')), path.join(dir.dirs.home, 'a/b.scm'), '~/ is the home of the user edwind runs as');
   fs.mkdirSync(path.join(dir.dirs.home, '.ssh'), { recursive: true });
   note('t/bad.md', `${fence}scheme {tangle=${path.join(dir.dirs.home, '.ssh/x.scm')}}\n1\n${fence}\n`);
   await value(c, '(%babel-note-buffer "t/bad.md")');
   const bad = await ctrlC(c, 't/bad.md', '1', 'babel-tangle');
   assert.equal(bad.error!.condition, 'file-error'); assert.match(bad.error!.report, /refused/);
   c.close();
+});
+
+test('a block removed while it runs leaves the result below it alone; tangle refuses the note itself and keeps name: as a file name; a plain call that cannot wait stores nothing', async () => {
+  const c = await client(), c2 = await client();
+  let release = () => {};
+  const gate = new Promise<void>(r => { release = r; });
+  hub.programs.set('sleep 5; echo A', async (io: any) => { await gate; io.write('A-OUTPUT\r\n'); return 0; });
+  const A = `${fence}sh {#a}\nsleep 5; echo A\n${fence}\n`, B = `${fence}scheme {#b}\n(+ 1 1)\n${fence}\n\n${fence}result {of=b}\n2\n${fence}\n`;
+  const race = note('race.md', A + B);
+  await value(c, '(%babel-note-buffer "race.md")');
+  const run = ctrlC(c, race, 'sleep 5');
+  await new Promise(r => setTimeout(r, 300));
+  await value(c2, `(with-current-buffer (%babel-note-buffer "race.md") (delete-region 1 ${A.length + 1}))`);
+  release();
+  assert.match((await run).error!.report, /a was removed while it ran/);
+  assert.equal(await textOf(c, race), B, "a's output did not land on b");
+
+  note('other.md', 'precious\n');
+  await value(c, '(%babel-note-buffer "other.md")');
+  const t = note('t.md', `${fence}scheme {tangle=name:other.md}\n(clobber)\n${fence}\n`);
+  await value(c, '(%babel-note-buffer "t.md")');
+  const r = await ctrlC(c, t, '(clobber', 'babel-tangle');
+  assert.equal(r.error, undefined, JSON.stringify(r.error));
+  assert.equal(await textOf(c, 'other.md'), 'precious\n', 'the buffer named other.md is untouched');
+  assert.equal(fs.readFileSync(path.join(dir.dirs.notes, 'name:other.md'), 'utf8'), '(clobber)\n', 'the file name:other.md got the text');
+
+  const self = note('self.md', `# Prose\n\n${fence}md {tangle=yes}\nsnippet\n${fence}\n`);
+  await value(c, '(%babel-note-buffer "self.md")');
+  const s = await ctrlC(c, self, 'snippet', 'babel-tangle');
+  assert.equal(s.error!.condition, 'file-error'); assert.match(s.error!.report, /cannot tangle onto itself/);
+  assert.match(await textOf(c, self), /^# Prose/);
+
+  const o = note('plain.org', '#+begin_src scheme\n(+ 1 2)\n#+end_src\n');
+  const e = await c.form('(with-current-buffer (%babel-note-buffer "plain.org") (goto-char 20) (org-ctrl-c-ctrl-c))');
+  assert.equal(e.error!.condition, 'cannot-block', JSON.stringify(e.error));
+  assert.equal(await textOf(c, o), '#+begin_src scheme\n(+ 1 2)\n#+end_src\n', 'no result was stored');
+  c.close(); c2.close();
 });
 
 test('R14.15 nothing runs on open', async () => {
