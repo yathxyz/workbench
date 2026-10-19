@@ -124,6 +124,17 @@ st.shift = await inArt('Shift+F1'); if (st.shift) await p.keyboard.press('Escape
 st.f1 = await inArt('F1'); await p.keyboard.press('Escape');
 await p.evaluate(() => window.__canvas.setLeader('C-SPC'));
 check('N55: after the leader changes, an open artifact hands back the new one and no longer the old; Shift-F1 stays in the page', !st.old && !st.shift && st.f1, JSON.stringify(st));
+// N68 (F-A36): two fingers in an artifact pinch the board's camera. The frame keeps its touches, so bridge.js reports them
+// ({t:'touch'}) and the board pinches with them; the page's own touchmove is held (preventDefault) while two are down.
+st = { z0: await p.evaluate(() => window.__canvas.S.cam.z) };
+const ftouch = (type: string, xs: number[]) => fr!.evaluate(([type, xs]) => { const t = (x: number, i: number) => new Touch({ identifier: i + 1, target: document.body, clientX: x, clientY: 60 }); const ts = xs.map(t); const e = new TouchEvent(type, { touches: type === 'touchend' ? [] : ts, changedTouches: ts, bubbles: true, cancelable: true }); document.body.dispatchEvent(e); return e.defaultPrevented; }, [type, xs] as [string, number[]]);
+await ftouch('touchstart', [100, 160]); await sleep(150);
+st.held = await ftouch('touchmove', [70, 190]); await sleep(150);
+st.mid = await p.evaluate(() => ({ z: window.__canvas.S.cam.z, panning: document.querySelector('#viewport')!.classList.contains('panning') }));
+await ftouch('touchend', []); await sleep(200);
+st.end = await p.evaluate(() => ({ z: window.__canvas.S.cam.z, touching: document.querySelector('#viewport')!.classList.contains('touching'), ids: window.__canvas.FTOUCH.ids.size }));
+check('N68: two fingers in an artifact pinch the board\'s camera (spread 60 to 120 px: zoom 2x) and the page does not scroll meanwhile; lifting them ends the pinch', st.held && st.mid.panning && Math.abs(st.mid.z / st.z0 - 2) < 0.03 && !st.end.touching && st.end.ids === 0, JSON.stringify(st));
+await p.evaluate((z: number) => { const C = window.__canvas; C.S.cam.z = z; C.applyCam(); }, st.z0);
 // F-A25: an html fence in a page torn out as a block card, bound to the block (hypernotes H0)
 const blockFrame = (sel: string) => until(async () => { for (const f of p.frames()) { try { if (await f.$(sel)) return f; } catch {} } return null; }, 8000);
 st = await p.evaluate(async () => {
@@ -931,6 +942,67 @@ check('N16 demo: the inlined page asks fonts.googleapis.com for nothing', !demoH
   await drag(await hdr(ids.a), 40);
   const kept = await T.evaluate(() => ({ same: document.querySelector('.redge[data-edge="n56-pc"]') === window.__n56 && !!window.__n56, ab: !!document.querySelector('.redge[data-edge="n56-ab"]') }));
   check('N57: dragging a card redraws its own edges and keeps the drawing of the others', kept.same && kept.ab, JSON.stringify(kept));
+
+  // N68 (F-A36): motion and touch R1-R5. A double tap on bare canvas zooms 2x about the finger and makes no page; one
+  // finger on a page scrolls the page; a mouse notch eases the zoom while a trackpad step is at once; the far look has
+  // hysteresis; a layout change plays as a FLIP; a new card enters and a removed one leaves a fading ghost; on a coarse
+  // pointer the small handles have 44 px hit areas.
+  await home(); await sleep(400);
+  const vr = await T.evaluate(() => { const r = document.querySelector('#viewport')!.getBoundingClientRect(); return [r.left, r.top]; });
+  const under = (c: { x: number; y: number; z: number }, p: number[]) => [c.x + (p[0] - vr[0]) / c.z, c.y + (p[1] - vr[1]) / c.z];
+  const nodesN = () => T.evaluate(() => Object.keys(window.__canvas.S.nodes).length);
+  const tap = async (p: number[]) => { await touch('touchStart', [p]); await sleep(40); await touch('touchEnd', []); };
+  c0 = await cam(); const k0 = await nodesN();
+  await tap(bg!); await sleep(150); await tap(bg!); await sleep(700);
+  c1 = await cam(); const k1 = await nodesN(), w0 = under(c0, bg!), w1 = under(c1, bg!);
+  check('N68: a double tap on bare canvas zooms 2x about the finger (the point under it stays) and makes no page', Math.abs(c1.z / c0.z - 2) < 0.02 && Math.hypot(w1[0] - w0[0], w1[1] - w0[1]) < 2 && k1 === k0, JSON.stringify({ z0: c0.z, z1: c1.z, w0, w1, k0, k1 }));
+  await home(); await sleep(300); c0 = await cam();
+  const sc0 = await T.evaluate((id: string) => Math.max(...[...document.querySelectorAll(`.node[data-id="${id}"] *`)].map(e => e.scrollTop)), ids.pg);
+  await gesture([[mid[0], mid[1] + 100]], [[mid[0], mid[1] - 100]], 10, 150); await sleep(300);
+  const sc1 = await T.evaluate((id: string) => Math.max(...[...document.querySelectorAll(`.node[data-id="${id}"] *`)].map(e => e.scrollTop)), ids.pg); c1 = await cam();
+  check('N68: one finger dragged on a page scrolls the page and leaves the camera', sc1 > sc0 && c1.x === c0.x && c1.y === c0.y && c1.z === c0.z, JSON.stringify({ sc0, sc1, c0, c1 }));
+  await home(); await sleep(300);
+  const wh = await T.evaluate(async (p: number[]) => {
+    const C = window.__canvas, vp = document.querySelector('#viewport')!, z0 = C.S.cam.z;
+    const wheel = (dy: number) => vp.dispatchEvent(new WheelEvent('wheel', { deltaY: dy, ctrlKey: true, clientX: p[0], clientY: p[1], bubbles: true, cancelable: true }));
+    wheel(100); const zNow = C.S.cam.z, easing = !!C.WHEEL.raf;
+    wheel(100); wheel(100);
+    await new Promise(r => setTimeout(r, 400)); const zEnd = C.S.cam.z;
+    const zt = C.S.cam.z; wheel(4); const zPad = C.S.cam.z;
+    return { z0, zNow, easing, zEnd, want: z0 * Math.exp(-0.75), zt, zPad, padWant: zt * Math.exp(-0.04) };
+  }, bg!);
+  check('N68: a mouse notch with Ctrl eases the zoom (nothing jumps in the event) and three notches end at their product; a trackpad step zooms at once', wh.zNow === wh.z0 && wh.easing && Math.abs(wh.zEnd / wh.want - 1) < 0.005 && Math.abs(wh.zPad / wh.padWant - 1) < 0.001, JSON.stringify(wh));
+  await sleep(300);
+  const lod = await T.evaluate(() => {
+    const C = window.__canvas, far = () => document.querySelector('#world')!.classList.contains('far'), at = (z: number) => { C.S.cam.z = z; C.applyCam(); return far(); };
+    return [at(0.6), at(0.44), at(0.41), at(0.46), at(0.47), at(0.49), at(0.44)];
+  });
+  check('N68: the far look comes on below 0.42 and goes above 0.48: a camera that rests near 0.45 does not flip it', JSON.stringify(lod) === JSON.stringify([false, false, true, true, true, false, false]), JSON.stringify(lod));
+  await home(); await sleep(400);
+  const flip = await T.evaluate(async (id: string) => {
+    const C = window.__canvas, n = C.S.nodes[id], e = document.querySelector<HTMLElement>(`.node[data-id="${id}"]`)!, raf = () => new Promise(r => requestAnimationFrame(r));
+    C.settle(); n.x += 200; C.placeAny(n); const left = parseFloat(e.style.left);
+    await raf(); await raf(); const mid = { flip: e.classList.contains('flip'), x: e.getBoundingClientRect().left };
+    await new Promise(r => setTimeout(r, 500)); const end = { flip: e.classList.contains('flip'), x: e.getBoundingClientRect().left, t: e.style.transform };
+    n.x -= 200; C.placeAny(n);
+    return { left, mid, end };
+  }, ids.c);
+  check('N68: a layout change plays as a FLIP: the card is laid out at its end at once, runs there on a transform, and ends with no transform or flip class', flip.mid.flip && flip.end.x - flip.mid.x > 20 && !flip.end.flip && flip.end.t === '', JSON.stringify(flip));
+  const enter = await T.evaluate(async () => {
+    const C = window.__canvas, n = C.addNode({ kind: 'buffer', name: 'n68-new', x: 20100, y: 20500, w: 220, h: 130, text: '# new' }), e = document.querySelector(`.node[data-id="${n.id}"]`)!;
+    const entering = e.classList.contains('entering');
+    await new Promise(r => setTimeout(r, 450)); const after = e.classList.contains('entering');
+    C.removeNode(n.id); const ghost = document.querySelectorAll('.node-ghost').length;
+    await new Promise(r => setTimeout(r, 400));
+    return { entering, after, ghost, gone: document.querySelectorAll('.node-ghost').length };
+  });
+  check('N68: a new card enters (class entering, gone when its animation ends); a removed card leaves a fading ghost that goes', enter.entering && !enter.after && enter.ghost === 1 && enter.gone === 0, JSON.stringify(enter));
+  const hit = await T.evaluate((id: string) => {
+    const coarse = matchMedia('(pointer: coarse)').matches, q = (s: string) => document.querySelector<HTMLElement>(`.node[data-id="${id}"] ${s}`);
+    const h = (e: HTMLElement | null) => { if (!e) return null; const b = getComputedStyle(e, '::before'); return b.content === 'none' ? 0 : parseFloat(b.height); };
+    return { coarse, rs: h(q('.rs')), hb: h(q('.hdr .hb')) };
+  }, ids.c);
+  check('N68: on a touch screen (pointer: coarse) a card\'s resize handle and header buttons have hit areas of at least 44 px', hit.coarse ? (hit.rs ?? 0) >= 44 && (hit.hb === null || hit.hb >= 44) : true, JSON.stringify(hit));
   await tc.close();
 }
 
@@ -2383,12 +2455,12 @@ await section('pages', async () => {
     const vp = await P.locator('#viewport').boundingBox();
     await P.mouse.move(vp!.x + vp!.width / 2, vp!.y + vp!.height / 2);
     await P.keyboard.down('Control');
-    for (let i = 0; i < 40 && await P.evaluate(() => window.__canvas.S.cam.z >= 0.45); i++) { await P.mouse.wheel(0, 120); await sleep(30); }
+    for (let i = 0; i < 40 && await P.evaluate(() => window.__canvas.S.cam.z >= 0.40); i++) { await P.mouse.wheel(0, 120); await sleep(30); }   // the far look comes on below 0.42 and goes above 0.48 (F-A36)
     await P.keyboard.up('Control'); await sleep(400);
     const text = await pageText(P, alpha);
     st = await P.evaluate((id: string) => { const e = document.querySelector(`.node[data-id="${id}"] .lod`); return { z: window.__canvas.S.cam.z, shown: getComputedStyle(e!).display, title: e!.querySelector('b')!.textContent, snap: e!.querySelector('pre')!.textContent }; }, alpha);
     await P.keyboard.down('Control');
-    for (let i = 0; i < 40 && await P.evaluate(() => window.__canvas.S.cam.z < 0.45); i++) { await P.mouse.wheel(0, -120); await sleep(30); }
+    for (let i = 0; i < 40 && await P.evaluate(() => window.__canvas.S.cam.z < 0.5); i++) { await P.mouse.wheel(0, -120); await sleep(30); }
     await P.keyboard.up('Control'); await sleep(300);
     st.after = await P.evaluate((id: string) => getComputedStyle(document.querySelector(`.node[data-id="${id}"] .lod`)!).display, alpha);
     check('pages: zoomed out below reading size a page card shows its name and its first lines; zooming back in shows the text again', st.z < 0.45 && st.shown === 'block' && st.title === 'pg-alpha' && st.snap === text.split('\n').slice(0, 12).join('\n') && st.after === 'none', JSON.stringify({ ...st, snap: st.snap.slice(0, 60) }));
@@ -2920,6 +2992,33 @@ await section('frames', async () => {
   await A2.evaluate(() => { const C = window.__canvas; C.S.cam.z = 1; C.applyCam(); });
   check('frames: a click on a character in a page frame puts the point on that character at zoom 0.5, 1 and 2, and a drag selects from the pressed character to the released one', clicks.every(c => c.ok && c.focused) && !!dragSt && dragSt.mark === drag!.o + 2 && dragSt.pt === drag!.o + 6, JSON.stringify({ clicks, drag: dragSt, o: drag?.o }));
   await settled(A2);
+
+  // N69 (F-A37): the board's keymaps are Edwin keymaps. wb-keys is provided; the leader is a prefix in global-map; a
+  // define-key in wb-canvas-map binds a board command on the canvas, and one in wb-leader-map runs a Scheme command
+  // from the leader; which-key and the checker see both; giving the key back removes the row.
+  const k4 = await A2.evaluate(async () => {
+    const C = window.__canvas, L = C.FR.L, W = WBKeys, tick = () => new Promise(r => setTimeout(r, 50));
+    const out: { feat: boolean; lead: boolean; g?: WBKeyRow; y?: WBKeyRow; errs?: string[] } = { feat: L.evalString("(featurep 'wb-keys)") === true, lead: L.get('global-map').map.get(C.KM4.leader) === C.KM4.obj.get('leader') };
+    L.evalString('(define n69-hits 0)');
+    L.evalString('(define-command (n69-mark) "Count a hit for N69." (interactive) (set! n69-hits (+ n69-hits 1)))');
+    L.evalString('(define-key wb-canvas-map "g" \'wb-hints)');
+    L.evalString('(define-key wb-leader-map "y" \'n69-mark)');
+    await tick();
+    out.g = W.MAPS.canvas.find(r => r[0] === 'g'); out.y = W.MAPS.leader.find(r => r[0] === 'y');
+    out.errs = W.check({ commands: new Set(Object.keys(C.KC)) }).errors;
+    return out;
+  });
+  await A2.evaluate(() => { (document.activeElement as HTMLElement | null)?.blur(); window.__canvas.focusHide(); }); await sleep(100);
+  await A2.keyboard.press('g'); await sleep(300);
+  const k4h = await A2.evaluate(() => window.__canvas.HINTS.on); await A2.keyboard.press('Escape'); await sleep(150);
+  await A2.keyboard.press('Control+Space'); await sleep(200);
+  const k4w = await A2.evaluate(() => [...document.querySelectorAll('#which-key *')].some(e => e.children.length === 0 && /n69-mark/.test(e.textContent || '')));
+  await A2.keyboard.press('y'); await sleep(400);
+  const k4n = await A2.evaluate(() => window.__canvas.FR.L.evalString('n69-hits'));
+  const k4b = await A2.evaluate(async () => { const C = window.__canvas; C.KM4.obj.get('canvas').map.delete('g'); C.KM4.obj.get('leader').map.delete('y'); await new Promise(r => setTimeout(r, 50)); return { g: !!WBKeys.MAPS.canvas.find(r => r[0] === 'g'), y: !!WBKeys.MAPS.leader.find(r => r[0] === 'y') }; });
+  check('N69: wb-keys is provided and the leader is a prefix in global-map; define-key in wb-canvas-map binds g to hints on the canvas, and in wb-leader-map binds y to a Scheme command that the leader runs and which-key lists; the checker stays clean; deleting the keys removes the rows',
+    k4.feat && k4.lead && JSON.stringify(k4.g?.slice(0, 2)) === '["g","hints"]' && JSON.stringify(k4.y?.slice(0, 2)) === '["y","edwin:n69-mark"]' && Array.isArray(k4.errs) && !k4.errs.length && k4h && k4w && k4n === 1 && !k4b.g && !k4b.y,
+    JSON.stringify({ k4, k4h, k4w, k4n, k4b }));
   await B2.close(); await A2.close();
 
   // (e) migration: a board written by an app.js before buf (pages with text and an anchor, no buf), installed as the
@@ -2974,7 +3073,7 @@ await section('frames', async () => {
   st = await M2.evaluate(() => { const C = window.__canvas, f = window.__perf!.frame, vis = Object.values<BoardNode>(C.S.nodes).filter(n => /^cap\d+$/.test(n.name)).filter(n => { const e = document.querySelector(`.node[data-id="${n.id}"]`), r = e!.getBoundingClientRect(); return r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight; }).length; return { z: C.S.cam.z, live: f.live, cap: f.cap, inView: vis, liveEls: document.querySelectorAll('.node.fr-live').length }; });
   await M2.evaluate(() => { const C = window.__canvas; C.zoomAt(innerWidth / 2, innerHeight / 2, 0.6); C.frSchedule(); }); await sleep(800);
   const far = await M2.evaluate(() => { const C = window.__canvas, f = window.__perf!.frame, n = Object.values<BoardNode>(C.S.nodes).find(n => n.name === 'cap7'), e = document.querySelector(`.node[data-id="${n!.id}"] .lod`); return { z: C.S.cam.z, live: f.live, lod: getComputedStyle(e!).display, title: e!.querySelector('b')!.textContent, snap: e!.querySelector('pre')!.textContent, text: C.pageText(n!.id) }; });
-  await M2.evaluate(() => { const C = window.__canvas; C.zoomAt(innerWidth / 2, innerHeight / 2, 1 / 0.6); C.frSchedule(); }); await sleep(800);
+  await M2.evaluate(() => { const C = window.__canvas; C.zoomAt(innerWidth / 2, innerHeight / 2, 0.5 / C.S.cam.z); C.frSchedule(); }); await sleep(800);   // above 0.48: the far look goes (F-A36)
   const near = await M2.evaluate(() => { const C = window.__canvas, f = window.__perf!.frame, n = Object.values<BoardNode>(C.S.nodes).find(n => n.name === 'cap7'); return { z: C.S.cam.z, live: f.live, lod: getComputedStyle(document.querySelector(`.node[data-id="${n!.id}"] .lod`)!).display }; });
   check('frames: with 40 pages in view at reading zoom at most 24 frames are live; zoomed out below 0.45 every page is a snapshot of its first 12 lines and no frame is live; zooming back in brings the frames back', !!capBufs && st.inView >= 40 && liveN === 24 && st.live <= st.cap && st.live === 24 && st.liveEls === st.live && far.z < 0.45 && far.live === 0 && far.lod === 'block' && far.title === 'cap7' && far.snap === far.text.split('\n').slice(0, 12).join('\n') && near.z >= 0.45 && near.lod === 'none' && near.live === 24, JSON.stringify({ capBufs: !!capBufs, liveN, st, far: { ...far, snap: far.snap.slice(0, 30), text: far.text.slice(0, 30) }, near }));
   await settled(M2);
@@ -3139,6 +3238,45 @@ await section('N60', async () => {
     await D.evaluate(() => { const C = window.__canvas; for (const k of [3, 4]) if (C.deskAt(k)) { C.deskGo(k, true); C.deskDelete(); } C.deskGo(0, true); C.pickClear(); });
     await settled(D);
   } finally { await E?.close().catch(() => {}); await D?.close(); }
+});
+
+// N70 (F-A38): query desks. A desk whose members are the cards a query matches: words all match, -word negates, commas
+// are alternatives; a card that starts to match joins the shown desk; nothing is sent to it or taken off it; the
+// agent tool query_desk and `wb desk query` make one; list_desks and the pinned record carry the query.
+await section('N70', async () => {
+  let D: TailPage | undefined;
+  try {
+    D = await dpage(); await settled(D);
+    const q = await D.evaluate(() => {
+      const C = window.__canvas, S = C.S; C.perspSet('manual', true); C.focusHide(); if (C.WS.cur) C.wsLeave(); if (C.DESK.cur) C.deskGo(0, true);
+      for (const k of [5, 6]) if (C.deskAt(k)) { C.deskGo(k, true); C.deskDelete(); }
+      const mk = (name: string, x: number, tags: string[]) => { const n = C.addNode({ kind: 'buffer', name, x, y: 40000, w: 300, h: 200, text: '# ' + name }); n.tags = tags; return n.id; };
+      const a = mk('n70-alpha', 40000, ['n70']), b = mk('n70-beta', 40400, []), c = mk('n70-gamma', 40800, ['n70', 'old']); C.dirty();
+      const ids = (q: string) => C.deskQuery(q).sort().join();
+      return { a, b, c, tag: ids('tag:n70'), neg: ids('tag:n70 -tag:old'), bare: ids('n70-beta'), alt: ids('kind:page,shell name:n70'), board: ids('board:/n70-alpha'),
+        none: ids('kind:agent name:n70'), bad: C.deskQueryParse('kind:bogus'), empty: C.deskQueryParse('  ') };
+    });
+    const sorted = (...x: string[]) => x.sort().join();
+    check('N70: a query matches by tag, negated tag, bare name, kind alternatives with name:, board path; kind:agent matches none of the pages; a bad kind and an empty query are refused',
+      q.tag === sorted(q.a, q.c) && q.neg === q.a && q.bare === q.b && q.alt === sorted(q.a, q.b, q.c) && q.board === q.a && q.none === '' && /not a kind/.test(q.bad) && /at least one word/.test(q.empty), JSON.stringify(q));
+    const made = await D.evaluate(() => window.__canvas.AGENT_TOOLS.find((t: AgentTool) => t.name === 'query_desk').run({ query: 'tag:n70 -tag:old', desk: 5 }));
+    const on5 = await D.evaluate((ids: string[]) => { const C = window.__canvas, d = C.deskAt(5); return { cur: C.DESK.cur, layout: d?.layout, members: Object.keys(d?.members || {}).sort().join(), shown: ids.map(id => !C.deskOff(C.S.nodes[id])) }; }, [q.a, q.b, q.c]);
+    const tick = await D.evaluate((b: string) => { const C = window.__canvas; C.S.nodes[b].tags = ['n70']; C.deskQueryTick(); return { has: b in C.deskAt(5).members, shown: !C.deskOff(C.S.nodes[b]) }; }, q.b);
+    const refuse = await D.evaluate((a: string) => { const C = window.__canvas; C.pickClear(); C.activate(a); const off = C.deskSend(0); C.deskGo(0, true); C.activate(a); const to = C.deskSend(5); return { off, to, still: a in C.deskAt(5).members }; }, q.a);
+    check('N70: query_desk makes desk 5 (tiled) and shows the matching card only; a card that starts to match joins it while shown; a card is neither taken off it nor sent to it',
+      /1 item\(s\) match tag:n70 -tag:old/.test(made) && on5.cur === 5 && on5.layout === 'tile' && on5.members === q.a && on5.shown.join() === 'true,false,false' && tick.has && tick.shown
+      && /query desk holds what its query matches/.test(refuse.off) && /query desk holds what its query matches/.test(refuse.to) && refuse.still, JSON.stringify({ made, on5, tick, refuse }));
+    await D.evaluate(() => { window.__canvas.deskGo(5, true); window.__canvas.deskPin(); });
+    const rec = await D.evaluate(() => { const C = window.__canvas, s = JSON.parse(C.serialize()); return { pinned: (s.desks || []).find((d: Desk) => d.slot === 5), ls: C.AGENT_TOOLS.find((t: AgentTool) => t.name === 'list_desks').run({}) }; });
+    await D.evaluate(() => { window.__canvas.deskGo(0, true); dispatchEvent(new Event('focus')); }); await sleep(600);
+    const wb = await new Promise<{ code: number | null; out?: string; err: string }>(res => { const c = spawn('wb', ['desk', 'query', '6', 'n70-beta', '--socket', H.webSocket]); let out = '', err = ''; c.stdout.on('data', d => { out += d; }); c.stderr.on('data', d => { err += d; }); c.on('error', e => res({ code: -1, err: String(e) })); c.on('close', code => res({ code, out, err })); });
+    const on6 = await D.evaluate(() => { const C = window.__canvas, d = C.deskAt(6); return { cur: C.DESK.cur, query: d?.query, n: Object.keys(d?.members || {}).length }; });
+    check('N70: the pinned desk record keeps the query and list_desks shows it; wb desk query 6 n70-beta makes desk 6 with that card and shows it',
+      rec.pinned?.query === 'tag:n70 -tag:old' && /^5 tag:n70 -tag:old: 2 item\(s\) matching the query tag:n70 -tag:old, pinned/m.test(rec.ls) && wb.code === 0 && /Desk 6/.test(wb.out!) && on6.cur === 6 && on6.query === 'n70-beta' && on6.n === 1,
+      JSON.stringify({ rec: rec.pinned, ls: rec.ls.split('\n').filter((l: string) => /^5 /.test(l)), wb, on6 }));
+    await D.evaluate((ids: string[]) => { const C = window.__canvas; for (const k of [5, 6]) if (C.deskAt(k)) { C.deskGo(k, true); C.deskDelete(); } C.deskGo(0, true); for (const id of ids) C.removeNode(id); }, [q.a, q.b, q.c]);
+    await settled(D);
+  } finally { await D?.close(); }
 });
 
 // N63 (F-A32): images and the clipboard on the board. A PNG pasted on the board is an image card whose bytes went to

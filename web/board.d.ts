@@ -250,6 +250,7 @@ interface Desk {
   members: Record<string, BoardRect | null>;
   layout?: 'tile' | 'columns';
   smart?: 'attn';                      // a smart desk filled by the Attention query
+  query?: string;                      // a query desk: its members are the cards this query matches
   saved?: { members: Record<string, BoardRect | null>; layout?: 'tile' | 'columns' };
 }
 /* A saved arrangement: each node's folder, rectangle and order, plus derived folders (S.manual, desk snapshots). */
@@ -562,12 +563,16 @@ type ArtHostMsg =
   | { t: 'keys'; keys: { leader?: string } | null }   // the leader key changed
   | { t: 'ok'; id: string; value: unknown }
   | { t: 'err'; id: string; error: { code: string; message: string; [extra: string]: unknown } }
-  | { t: 'ev'; id: string; event: string; data: unknown };
+  | { t: 'ev'; id: string; event: string; data: unknown }
+  | { t: 'pinch'; on: boolean };   // the board pinches with a finger in this frame: the page scrolls nothing meanwhile
+/* A finger in an artifact frame, in the frame's own CSS pixels. */
+interface ArtTouch { id: number; x: number; y: number }
 /* Artifact page to host (web/bridge.ts sends these; ids are the bridge's strings). */
 type ArtPageMsg =
   | { t: 'call'; id: string; cap: string; method: string; args: unknown }   // args: one object, its shape per capability
   | { t: 'cancel'; id: string }
   | { t: 'key'; key: 'leader' }
+  | { t: 'touch'; phase: 'start' | 'move' | 'end'; touches: ArtTouch[] }   // every finger down in the frame, after this event
   | { t: 'tool_result'; id: string; callId: string; result: string }
   | { t: 'tool_error'; id: string; callId: string; message: string };
 /* The window message an artifact iframe sends to open its port. */
@@ -726,7 +731,10 @@ interface EdwinApi {
     applied?: (b: EdwinBuffer, ops: unknown[], origin: string) => unknown;
     wireWindow?: (w: EdwinWindow) => void;
     renderOverlay?: () => void;
+    beforeUserInit?: () => void;   // run by Ed.boot between the shipped Scheme files and the user's init.scm
   };
+  Keymap: new (name?: string | null) => EdwinKeymap;
+  message(text: string): void;
   makeFrame(host: HTMLElement, opts: { buffer: EdwinBuffer; kind: string; fontSize: number }): EdwinFrame;
   bootServed(opts: { sources: Record<string, string>; transport: () => WebSocket; device: string; cid?: string; pending?: unknown[] }): Promise<unknown>;
   setLeaderKey(name: string): void;
@@ -758,8 +766,18 @@ interface EdwinFrState {
   moved: Map<string, { to: string; dir: boolean }>;
   hold: Map<string, { buf: string; p: Promise<unknown>; done: (v?: unknown) => void }>;
 }
+/* An Edwin keymap: key name -> a command designator (a symbol or a procedure) or a prefix keymap. */
+interface EdwinKeymap { name: string | null; map: Map<string, unknown>; parent: EdwinKeymap | null }
 /* Edwin's Scheme bridge (window.L). */
-interface EdwinLisp { call(name: string, args?: unknown[]): any } // any: Scheme procedures return their own shapes
+interface EdwinLisp {
+  call(name: string, args?: unknown[]): any; // any: Scheme procedures return their own shapes
+  get(name: string): unknown;
+  set(name: string, v: unknown): unknown;
+  intern(name: string): { name: string };
+  Sym: new (...a: never[]) => { name: string };
+  cmdName(x: unknown): string;
+  CMD(name: string, spec: string, args: string, doc: string, fn: (args: unknown[]) => unknown): unknown;
+}
 
 /* The Edwin runtime puts these on window when its scripts load; the page reads them only after frBoot has loaded them. */
 interface Window { Ed: EdwinApi; L: EdwinLisp }

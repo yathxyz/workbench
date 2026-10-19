@@ -11,6 +11,8 @@
  *   {t:'cancel', id}                           the page's AbortSignal fired
  *   {t:'key', key:'leader'}                    the board's leader key was pressed in the page (hello.keys.leader names it)
  *   {t:'keys', keys:{leader}}   (host -> page) the leader changed; hello.keys is the first one
+ *   {t:'touch', phase, touches:[{id,x,y}]}     the fingers down in the page after a touch event (frame CSS pixels)
+ *   {t:'pinch', on}             (host -> page) the board pinches with a finger of this page: scroll nothing meanwhile
  * The host opens with {t:'hello', contract, served:[names]} on the port; without it use() resolves null after 10 s.
  */
 (() => {
@@ -24,13 +26,15 @@
     | { t: 'keys'; keys?: BridgeKeys | null }
     | { t: 'ok'; id: string; value: unknown }
     | { t: 'err'; id: string; error?: BridgeError }
-    | { t: 'ev'; id: string; event: string; data: unknown };
+    | { t: 'ev'; id: string; event: string; data: unknown }
+    | { t: 'pinch'; on: boolean };
   type BridgeHello = Extract<BridgeHostMsg, { t: 'hello' }>;
   /* Page to host, over the port. */
   type BridgePageMsg =
     | { t: 'call'; id: string; cap: string; method: string; args: unknown }
     | { t: 'cancel'; id: string }
     | { t: 'key'; key: 'leader' }
+    | { t: 'touch'; phase: 'start' | 'move' | 'end'; touches: { id: number; x: number; y: number }[] }
     | { t: 'tool_result'; id: string; callId: string; result: string }
     | { t: 'tool_error'; id: string; callId: string; message: string };
   type BridgeOnEvent = (event: string, data: any) => void; // any: each call's events carry their own shapes, read by its handler
@@ -70,7 +74,7 @@
   interface BridgeRoomEvent { type: string; payload: unknown; from: unknown }
   if (window.claude && typeof window.claude.use === 'function') return;
   const CONTRACT = '0.2.75';
-  let port: MessagePort | null = null, hello: BridgeHello | null = null, keys: BridgeKeys | null = null, seq = 0;
+  let port: MessagePort | null = null, hello: BridgeHello | null = null, keys: BridgeKeys | null = null, seq = 0, pinching = false;
   const pending = new Map<string, BridgePending>();   // id -> {resolve, reject, onEvent}
   const helloWaiters: ((h: BridgeHello | null) => void)[] = [];
 
@@ -94,6 +98,7 @@
     const m = ev.data as BridgeHostMsg | null; if (!m || typeof m !== 'object') return;
     if (m.t === 'hello') { hello = m; keys = m.keys || null; helloWaiters.splice(0).forEach(f => f(m)); return; }
     if (m.t === 'keys') { keys = m.keys || null; return; }   // the user picked another leader
+    if (m.t === 'pinch') { pinching = !!m.on; return; }
     const rec = pending.get(m.id); if (!rec) return;
     if (m.t === 'ok') { pending.delete(m.id); rec.resolve(m.value); }
     else if (m.t === 'err') { pending.delete(m.id); rec.reject(m.error || err('upstream_error', 'unknown error')); }
@@ -254,5 +259,18 @@
     const want = keys && keys.leader;
     if (want && leaderOf(e) === want) { e.preventDefault(); e.stopPropagation(); if (!e.repeat) send({ t: 'key', key: 'leader' }); }   // a held leader is one press
   }, true);
+  // Touches (Workbench DESIGN F-A26): a finger that lands in this frame belongs to the frame, so the board never sees it.
+  // The page tells the board where its fingers are. With two down here, or one here and one on the board's canvas, the
+  // board pinches its camera, and this page scrolls and zooms nothing meanwhile; one finger alone stays the page's own.
+  const fingers = (e: TouchEvent) => Array.from(e.touches, t => ({ id: t.identifier, x: t.clientX, y: t.clientY }));
+  const touch = (phase: 'start' | 'move' | 'end') => (e: TouchEvent) => {
+    if (phase === 'move' && (e.touches.length > 1 || pinching) && e.cancelable) e.preventDefault();
+    if (phase === 'end' && !e.touches.length) pinching = false;
+    send({ t: 'touch', phase, touches: fingers(e) });
+  };
+  window.addEventListener('touchstart', touch('start'), { capture: true, passive: true });
+  window.addEventListener('touchmove', touch('move'), { capture: true, passive: false });
+  window.addEventListener('touchend', touch('end'), { capture: true, passive: true });
+  window.addEventListener('touchcancel', touch('end'), { capture: true, passive: true });
   window.addEventListener('message', ev => { if (ev.data && ev.data.claude === 'ping') say(); });
 })();
