@@ -691,7 +691,7 @@ type TaskRow = PageTask | IndexTask;
 /* A row of /api/tasks. */
 interface ApiTaskRow {
   id: string; node: string; kw: string; title: string; path: string; line: number; prompt?: string; tags?: string[];
-  priority?: string; scheduled?: string; deadline?: string; session?: string; dispatched?: string; target?: string;
+  priority?: string; scheduled?: string; deadline?: string; fields?: Record<string, string>;
 }
 /* A row of the notes index (/api/nodes; NOTES line 8559). */
 interface NoteRow {

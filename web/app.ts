@@ -4766,7 +4766,7 @@ const TASKS: { rows: IndexTask[]; at: number } = { rows: [], at: 0 };
 async function tasksLoad(force?: boolean): Promise<IndexTask[]> {
   if (!DAEMON) { TASKS.rows = []; return TASKS.rows; }
   if (!force && Date.now() - TASKS.at < 20000) return TASKS.rows;
-  try { const j = await (await hFetch(null, '/api/tasks')).json(); TASKS.rows = (j.tasks || []).map((r: ApiTaskRow): IndexTask => ({ idx: true, id: r.id, nodeId: r.node, kw: r.kw, text: r.title, priority: r.priority, scheduled: r.scheduled, deadline: r.deadline, session: r.session, dispatched: r.dispatched, target: r.target, path: r.path, line: r.line, body: (r.prompt || '').split('\n').filter((l: string) => l.trim() && !FIELD_LINE_RE.test(l) && !TASK_DATE_RE.test(l)).map((l: string) => l.trim()), tags: r.tags || [] })); } catch { TASKS.rows = []; }
+  try { const j = await (await hFetch(null, '/api/tasks')).json(); TASKS.rows = (j.tasks || []).map((r: ApiTaskRow): IndexTask => ({ idx: true, id: r.id, nodeId: r.node, kw: r.kw, text: r.title, priority: r.priority, scheduled: r.scheduled, deadline: r.deadline, session: r.fields?.session, dispatched: r.fields?.dispatched, target: r.fields?.target, path: r.path, line: r.line, body: (r.prompt || '').split('\n').filter((l: string) => l.trim() && !FIELD_LINE_RE.test(l) && !TASK_DATE_RE.test(l)).map((l: string) => l.trim()), tags: r.tags || [] })); } catch { TASKS.rows = []; }
   TASKS.at = Date.now(); if (VIEW === 'tasks') renderTasks(); statusRender(); return TASKS.rows;
 }
 // A page whose text is open here (its replica) is parsed locally; the index rows of its file are the same tasks, often older.
@@ -5944,15 +5944,16 @@ interface FrFrameEvent { type: string; frame: EdwinFrame; buffer?: EdwinBuffer |
 type FrOp = [number, string, string];
 const FR: EdwinFrState = { on: false, ready: false, online: false, tried: false, state: null, Ed: null, L: null, booting: null, failed: null, byFrame: new WeakMap(), lastSeen: new Map(), offAt: new Map(), pending: new Map(), claimed: new Set(), anchorCache: {}, localAnchors: {}, perf: [], waiters: [], downers: new Set(), snapT: new Map(), snapMine: new Set(), moved: new Map(), hold: new Map() };
 const FR_CAP = 24, FR_FONT = 13, FR_CLOSE_MS = 5 * 60 * 1000, FR_HOLD_MS = 10000, FR_OFF_TEXT = 'Editing is off: workbench-edit is not running';
-// The runtime files in the order of edwin/index.html (host-browser first; markdown after org; ot and sync last).
-const FR_FILES = ['host-browser', 'scheme', 'runtime', 'text', 'editor-core', 'editor-prims', 'evil-core', 'pool', 'complete', 'extras', 'stack', 'ai', 'evil-ex', 'org', 'markdown', 'ot', 'sync', 'display'];
-const FR_SCM = ['emacs', 'evil', 'org', 'ai', 'init', 'notes-syntax', 'address', 'markdown', 'babel'];
+// What the runtime says a page loads (edwin-web's manifest.json): the scripts in order, then the Scheme sources, both
+// relative to /edwin/. A manifest of another api is a runtime this board cannot load.
+interface FrManifest { api: number; files: string[]; scm: string[] }
+const FR_API = 1;
 // This browser profile's device id (R9.16), made once; the per-tab client id lives in sessionStorage so a reload keeps it (R7.16).
 function deviceId() { let d = store.get('wb-device'); if (!d) { d = uid('d'); store.set('wb-device', d); } return d; }
 const frSession = { get(k: string): string | null { try { return sessionStorage.getItem(k); } catch { return null; } }, set(k: string, v: string) { try { sessionStorage.setItem(k, v); } catch {} }, del(k: string) { try { sessionStorage.removeItem(k); } catch {} } };
 function frLoadScript(src: string): Promise<unknown> { return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => rej(new Error('could not load ' + src)); document.head.append(s); }); }
 const frTransport = (): WebSocket => new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/edit');
-// Boot (R9.1, R9.17, R4.11): the 17 runtime files, the eight shipped Scheme sources from /edwin/scm/, then Ed.bootServed
+// Boot (R9.1, R9.17, R4.11): the runtime files and the shipped Scheme sources /edwin/manifest.json lists, then Ed.bootServed
 // with this device's id and this tab's cid; the user's init.scm and the image come from edwind, never from localStorage.
 // The runtime is usable (FR.ready) as soon as bootServed has booted the core and started the client; replicas open when
 // the socket is online, so an edwind that is down leaves the cards on their snapshots with the R9.18 notice.
@@ -5960,9 +5961,13 @@ function frBoot(): Promise<EdwinApi> {
   if (FR.booting) return FR.booting;
   FR.booting = (async () => {
     performance.mark('fr-boot-start');
-    for (const f of FR_FILES) await frLoadScript('/edwin/src/' + f + '.js');
+    const mr = await fetch('/edwin/manifest.json', { cache: 'no-cache' });
+    if (!mr.ok) throw new Error(`/edwin/manifest.json: HTTP ${mr.status}`);
+    const man = await mr.json() as FrManifest;
+    if (man.api !== FR_API || !Array.isArray(man.files) || !Array.isArray(man.scm)) throw new Error(`/edwin/manifest.json: not a runtime of api ${FR_API} (api ${man.api})`);
+    for (const f of man.files) await frLoadScript('/edwin/' + f);
     const sources: Record<string, string> = {};
-    await Promise.all(FR_SCM.map(async name => { const r = await fetch(`/edwin/scm/${name}.scm`, { cache: 'no-cache' }); if (!r.ok) throw new Error(`/edwin/scm/${name}.scm: HTTP ${r.status}`); sources[name + '.scm'] = await r.text(); }));
+    await Promise.all(man.scm.map(async f => { const r = await fetch('/edwin/' + f, { cache: 'no-cache' }); if (!r.ok) throw new Error(`/edwin/${f}: HTTP ${r.status}`); sources[f.slice(f.lastIndexOf('/') + 1)] = await r.text(); }));
     const Ed = FR.Ed = window.Ed; FR.L = window.L;
     Ed.setLeaderKey(leaderKeyName());
     Ed.hooks.openPage = name => frOpenPage(name);

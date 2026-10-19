@@ -81,7 +81,8 @@ impl Tab {
         }
         let edit = self.app.edit.as_ref()?;
         let sid = edit.next_id();
-        let mut out = json!({"t": "sample", "sid": sid, "tab": self.id});
+        // `caller` labels the board's requests in edwind's usage log.
+        let mut out = json!({"t": "sample", "sid": sid, "tab": self.id, "caller": "board"});
         for key in SAMPLE_FIELDS {
             if let Some(v) = msg.get(key) {
                 out[key] = v.clone();

@@ -158,7 +158,6 @@ let
     configDir = editConfigDir;
     inherit (cfg)
       notesDir
-      boardsDir
       host
       logLevel
       ;

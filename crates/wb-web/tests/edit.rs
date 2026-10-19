@@ -473,8 +473,8 @@ async fn sample_streams_round_trip_through_edwind() {
     assert!(!sid.is_empty() && !tab.is_empty() && sid != tab, "{fwd}");
     assert_eq!(
         fwd,
-        json!({"t": "sample", "sid": sid, "tab": tab, "input": "hello", "modelTier": "quick",
-               "model": "", "effort": "low", "images": [], "tools": tools})
+        json!({"t": "sample", "sid": sid, "tab": tab, "caller": "board", "input": "hello",
+               "modelTier": "quick", "model": "", "effort": "low", "images": [], "tools": tools})
     );
 
     // The stream comes back under the tab's id.

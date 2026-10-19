@@ -1222,6 +1222,8 @@ await section('§A.4', async () => {
       return out;
     });
     check('§A.4: the service worker caches every font file fonts.css names when it installs', want.length >= 4 && want.every(w => have.includes(w)), JSON.stringify({ want, have }));
+    const man = await (await api('/edwin/manifest.json')).json(), runtime = ['/edwin/manifest.json', ...[...man.files, ...man.scm].map((f: string) => '/edwin/' + f)];
+    check('§A.4: the service worker caches the Edwin runtime /edwin/manifest.json lists when it installs', man.api === 1 && runtime.length > 20 && runtime.every(w => have.includes(w)), JSON.stringify({ missing: runtime.filter(w => !have.includes(w)) }));
   } finally { await sctx.close(); }
 });
 

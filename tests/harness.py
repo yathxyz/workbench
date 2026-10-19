@@ -233,7 +233,7 @@ class Harness:
         if media:
             # one image provider on the OpenAI protocol at MEDIA (a stub the suite runs), no key
             self.web_config["media"] = {"providers": {"stub": {"api": "openai", "baseUrl": media, "models": ["stub-image"]}}}
-        # edwin/server/main.mts loadConfig: unknown fields are refused, notesDir is required, the socket's
+        # Edwin's server/main.mts loadConfig: unknown fields are refused, notesDir is required, the socket's
         # directory must be 0700 and owned by this user. configDir is private to the run: the user's own
         # init.scm never reaches a test.
         self.edit_config = {
@@ -242,7 +242,6 @@ class Harness:
             "webSocket": self.web_sock,
             "stateDir": str(self.root / "state" / "edit"),
             "notesDir": str(self.notes_dir),
-            "boardsDir": str(self.boards_dir),
             "configDir": str(self.root / "config" / "edwin"),
             "writablePaths": [str(self.home)],
             "refusePaths": [str(self.home / d) for d in (".ssh", ".config/systemd", ".local/share/systemd")],

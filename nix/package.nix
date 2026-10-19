@@ -38,7 +38,6 @@ rustPlatform.buildRustPackage {
   # wb-hub sends it in its hello and wb-web compares it with its own (option_env!).
   # The hash part of the hub source's store path.
   env.WB_HUB_BUILD = builtins.substring 11 32 (toString hubSrc);
-  env.WB_EDIT_BUILD = edwind.build;
 
   # Tests run in checkPhase against the release build: wb-proto, the hub and the web,
   # unit and integration. They need no network, agents or systemd; PTYs work in the sandbox.
