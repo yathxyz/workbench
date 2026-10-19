@@ -6113,7 +6113,6 @@ function frOpen(n: PageNode): Promise<EdwinBuffer | null> {
 function frCloseReplica(n: PageNode) {
   const L = live[n.id], b = L?.buf; if (!b) return;
   if (b.meta?.anchors) FR.anchorCache[n.id] = (b.meta.anchors as PageAnchor[]).map(a => ({ ...a }));
-  if (b.shared && b.sver >= 0) OP_PAGE.set(n.id, b.text);   // media cards piped from it keep its latest text
   L!.buf = null;
   try { if (b.shared) FR.L!.call('kill-buffer', [b]); } catch (e) { console.warn('edwin close', e); }
 }
@@ -7445,26 +7444,28 @@ const fnv = (s: string): string => { let h = 0x811c9dc5; for (let i = 0; i < s.l
 const opProviders = (): MediaProviderInfo[] => DAEMON && Array.isArray(INFO?.media) ? INFO!.media! : [];
 /* What an op card reads from one card piped into it. */
 type OpInput = { from: BoardNode; text?: string; image?: OpImage };
-// the text a card holds now: a page's open replica, else its full text at the last opReadPages (a closed replica's
-// snapshot is only its first lines), a quote
-const OP_PAGE = new Map<string, string>();
-function cardText(n: BoardNode): string {
-  if (n.kind === 'buffer') { const b = FR.on && n.buf ? frBufOf(n) : null; return b ? b.text : (FR.on && n.buf ? OP_PAGE.get(n.id) : null) ?? pageText(n as PageNode); }
+// the text a card holds now: a page's open replica, else FULL's text for it (opReadPages; a closed replica's snapshot
+// is only its first lines), a quote
+function cardText(n: BoardNode, full?: Map<string, string>): string {
+  if (n.kind === 'buffer') { const b = FR.on && n.buf ? frBufOf(n) : null; return b ? b.text : full?.get(n.id) ?? pageText(n as PageNode); }
   if (n.kind === 'ref') return n.text || '';
   return '';
 }
-// The full text of the pages piped into OPS, for cardText: a run and its signature read what it sends.
-async function opReadPages(ops: OpNode[]) {
+// The full text of the pages piped into OPS, read now (nothing is kept: the page may change once its replica closes),
+// so a run and its signature use what it sends; FAILED has why a page could not be read.
+async function opReadPages(ops: OpNode[]): Promise<{ texts: Map<string, string>; failed: Map<string, string> }> {
   const pages = new Set(ops.flatMap(n => S.edges.filter(e => e.type === 'pipe' && e.to === n.id).map(e => S.nodes[e.from]).filter(m => m?.kind === 'buffer')));
-  const r = await Promise.allSettled([...pages].map(async m => OP_PAGE.set(m.id, await pageTextFull(m as PageNode))));
-  const bad = r.find(x => x.status === 'rejected'); if (bad) throw (bad as PromiseRejectedResult).reason;   // the others are read
+  const texts = new Map<string, string>(), failed = new Map<string, string>();
+  await Promise.all([...pages].map(m => pageTextFull(m as PageNode).then(t => { texts.set(m.id, t); }, e => { failed.set(m.id, (e as Error)?.message || String(e)); })));
+  return { texts, failed };
 }
+const opPageIns = (n: OpNode): string[] => S.edges.filter(e => e.type === 'pipe' && e.to === n.id && S.nodes[e.from]?.kind === 'buffer').map(e => e.from);
 const opPicked = (n: OpNode): OpImage | null => n.out?.images?.[n.out.pick || 0] || null;
-function opInputs(n: OpNode): OpInput[] {
+function opInputs(n: OpNode, full?: Map<string, string>): OpInput[] {
   return S.edges.filter(e => e.type === 'pipe' && e.to === n.id).map(e => S.nodes[e.from]).filter(Boolean).map((m): OpInput => {
     if (m.kind === 'image') return { from: m, image: { blob: m.blob, src: m.src, mime: m.mime } };
     if (m.kind === 'op') { const p = opPicked(m); return p ? { from: m, image: p } : { from: m, text: m.out?.text || '' }; }
-    return { from: m, text: cardText(m) };
+    return { from: m, text: cardText(m, full) };
   });
 }
 function opSig(n: OpNode, ins = opInputs(n)): string {
@@ -7472,13 +7473,10 @@ function opSig(n: OpNode, ins = opInputs(n)): string {
   return fnv(JSON.stringify([n.op, n.prompt || '', k.image ? [n.provider || '', n.model || '', n.size || '', n.n || 1] : 0,
     ins.map(i => i.image ? 'i' + (i.image.blob || fnv(i.image.src || '')) : 't' + fnv(i.text || ''))]));
 }
-// A piped page with no open replica and no full text read since the tab loaded shows only its first lines here: its
-// card's staleness is unknown until opReadPages (Run stale reads them first), so it is not shown as stale meanwhile.
-const opPagesKnown = (n: OpNode): boolean => S.edges.every(e => {
-  const m = e.type === 'pipe' && e.to === n.id ? S.nodes[e.from] : null;
-  return !m || m.kind !== 'buffer' || !FR.on || !(m as PageNode).buf || !!frBufOf(m) || OP_PAGE.has(m.id);
-});
-const opStale = (n: OpNode): boolean => !!n.out && !n.out.err && opPagesKnown(n) && n.out.sig !== opSig(n);
+// A piped file page with its replica closed shows only its first lines here, so its card's staleness is unknown and
+// the card is not shown stale; "Run stale media cards" reads such pages in full (FULL) and decides.
+const opPagesKnown = (n: OpNode): boolean => opPageIns(n).every(id => { const m = S.nodes[id] as PageNode; return !FR.on || !m.buf || !!frBufOf(m); });
+const opStale = (n: OpNode, full?: Map<string, string>): boolean => !!n.out && !n.out.err && (!!full || opPagesKnown(n)) && n.out.sig !== opSig(n, opInputs(n, full));
 function opProvider(n: OpNode): MediaProviderInfo | null { const ps = opProviders(); return ps.find(p => p.name === n.provider) || ps[0] || null; }
 function mountOp(n: OpNode, L: LiveEntry) {
   if (!OP_KINDS[n.op]) n.op = 'imagine';
@@ -7556,11 +7554,11 @@ async function opImageBlob(i: OpImage): Promise<{ blob?: string; data?: Blob }> 
 }
 async function opRun(n: OpNode, quiet?: boolean): Promise<boolean> {
   const L = live[n.id], O = L?.op; if (!O || O.busy) return false;
-  O.busy = true; let read: string | null = null;
-  try { await opReadPages([n]); } catch (e) { read = (e as Error).message; } finally { O.busy = false; }
-  const k = OP_KINDS[n.op] || OP_KINDS.imagine, ins = opInputs(n), sig = opSig(n, ins);
+  O.busy = true; let read: Awaited<ReturnType<typeof opReadPages>>;
+  try { read = await opReadPages([n]); } finally { O.busy = false; }
+  const k = OP_KINDS[n.op] || OP_KINDS.imagine, ins = opInputs(n, read.texts), sig = opSig(n, ins);
   const fail = (msg: string) => { n.out = { sig, at: Date.now(), err: msg }; dirty(); if (!quiet) toast(`${n.name}: ${msg}`, 6000); return false; };
-  if (read) return fail(read);
+  if (read.failed.size) return fail([...read.failed.values()][0]);
   const texts = ins.filter(i => i.text?.trim()).map(i => i.text!.trim()), img = ins.find(i => i.image)?.image;
   const prompt = [...texts, (n.prompt || '').trim()].filter(Boolean).join('\n\n');
   if (k.needs === 'image' && !img) return fail('this card needs an image piped in.');
@@ -7600,9 +7598,8 @@ async function opRun(n: OpNode, quiet?: boolean): Promise<boolean> {
 // every stale (or never run) media card, upstream first, each once its inputs are fresh
 async function opRunStale() {
   const ops = Object.values(S.nodes).filter((m): m is OpNode => m.kind === 'op' && !!live[m.id]?.op);
-  await opReadPages(ops).catch(() => {});   // a page that cannot be read fails its card's run
-  for (const m of ops) opRender(m);   // staleness is known now
-  const due = new Set(ops.filter(m => !m.out || opStale(m)).map(m => m.id));
+  const read = await opReadPages(ops);   // a card whose page cannot be read is due: its run says why
+  const due = new Set(ops.filter(m => !m.out || opStale(m, read.texts) || opPageIns(m).some(id => read.failed.has(id))).map(m => m.id));
   if (!due.size) return toast('No media card is stale.');
   // anything downstream of a due card is due too
   for (let grew = true; grew;) { grew = false; for (const m of ops) if (!due.has(m.id) && opInputs(m).some(i => due.has(i.from.id))) { due.add(m.id); grew = true; } }
