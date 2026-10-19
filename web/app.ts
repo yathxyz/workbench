@@ -7559,9 +7559,10 @@ async function opRun(n: OpNode, quiet?: boolean): Promise<boolean> {
     for (let i = 0; i < 3; i++) { read = await opReadPages([n]); unread = opPageIns(n).filter(id => !read.texts.has(id) && !read.failed.has(id)); if (!unread.length) break; }
   } finally { O.busy = false; }
   const k = OP_KINDS[n.op] || OP_KINDS.imagine, ins = opInputs(n, read!.texts), sig = opSig(n, ins);
-  const fail = (msg: string) => { n.out = { sig, at: Date.now(), err: msg }; dirty(); if (!quiet) toast(`${n.name}: ${msg}`, 6000); return false; };
+  const fail = (msg: string) => { n.out = { sig, at: Date.now(), err: msg }; dirty(); opRender(n); opDownstream(n); if (!quiet) toast(`${n.name}: ${msg}`, 6000); return false; };
   if (unread.length) return fail('its piped pages kept changing while they were read: run it again.');
-  if (read!.failed.size) return fail([...read!.failed.values()][0]);
+  const bad = opPageIns(n).map(id => read!.failed.get(id)).find(Boolean);   // a pipe removed meanwhile does not count
+  if (bad) return fail(bad);
   const texts = ins.filter(i => i.text?.trim()).map(i => i.text!.trim()), img = ins.find(i => i.image)?.image;
   const prompt = [...texts, (n.prompt || '').trim()].filter(Boolean).join('\n\n');
   if (k.needs === 'image' && !img) return fail('this card needs an image piped in.');
