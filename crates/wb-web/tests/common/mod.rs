@@ -41,6 +41,32 @@ pub const WAIT: Duration = Duration::from_secs(10);
 
 pub type Ws = WebSocketStream<TcpStream>;
 
+/// A `systemctl` first on wb-web's `PATH`, so the host endpoints never reach the
+/// machine's own manager. It appends its argv to `dir/bin/argv`; `list-units` prints
+/// `dir/bin/units.json` (`[]` without one), `status` exits 3 like an inactive unit.
+fn fake_systemctl(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let shell = std::env::var("BASH").unwrap_or_else(|_| "/bin/sh".into());
+    let script = format!(
+        r#"#!{shell}
+d=$(dirname "$0")
+echo "$*" >> "$d/argv"
+for a in "$@"; do n=$a; done
+case "$1" in
+  list-units) cat "$d/units.json" 2>/dev/null || echo '[]' ;;
+  status) echo "* $n - fake unit"; exit 3 ;;
+  show) printf 'Id=%s\nActiveState=inactive\n' "$n" ;;
+  *) exit 1 ;;
+esac
+"#
+    );
+    let path = bin.join("systemctl");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// A config for a wb-web under `dir`, with the secret file and web root written.
 /// `web.sock` is `dir/web.sock`.
 pub fn fixture(dir: &Path, hub_socket: &Path) -> Value {
@@ -54,6 +80,7 @@ pub fn fixture(dir: &Path, hub_socket: &Path) -> Value {
     std::fs::write(dir.join("web/edwin/index.html"), CONSOLE).unwrap();
     std::fs::write(dir.join("web/edwin/src/scheme.js"), "let s = 2;\n").unwrap();
     std::fs::write(dir.join("web/edwin/scm/emacs.scm"), SCM).unwrap();
+    fake_systemctl(dir);
     json!({
         "listen": "127.0.0.1:0",
         "publicOrigin": ORIGIN,
@@ -102,9 +129,15 @@ impl Web {
         edit(&mut cfg);
         let cfg_path = dir.path().join("web.json");
         std::fs::write(&cfg_path, cfg.to_string()).unwrap();
+        let path = format!(
+            "{}:{}",
+            dir.path().join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
         let mut child = Command::new(env!("CARGO_BIN_EXE_wb-web"))
             .arg("--config")
             .arg(&cfg_path)
+            .env("PATH", path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -138,6 +171,11 @@ impl Web {
             dir,
             log,
         }
+    }
+
+    /// wb-web's pid.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// The fixture's `web.sock`.
