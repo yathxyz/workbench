@@ -50,6 +50,7 @@ runCommand "workbench-web" { nativeBuildInputs = [ nodejs woff2 ]; } ''
   install -Dm444 -t $out/vendor ${vendor}/vendor.js ${vendor}/xterm.css
   mkdir pdfjs && tar xzf ${pdfjs} -C pdfjs
   install -Dm444 -t $out/vendor/pdfjs pdfjs/package/legacy/build/pdf.min.mjs pdfjs/package/legacy/build/pdf.worker.min.mjs pdfjs/package/LICENSE
+  cp -r pdfjs/package/cmaps $out/vendor/pdfjs/cmaps   # Adobe CMaps for CJK fonts that name one (getDocument's cMapUrl)
   install -Dm444 ${console} $out/edwin/index.html
   node ${../tools/strip.mts} $out/edwin/src ${edwinSrc}/*.ts
   install -Dm444 -t $out/edwin/scm ${edwinScm}/*.scm

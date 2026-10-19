@@ -7204,7 +7204,7 @@ async function pdfOpen(n: PdfNode, L: LiveEntry): Promise<PdfJsDocument | null> 
   try {
     const lib = await pdfLib().catch(() => { throw new Error('pdf.js is not in this build of Workbench'); });
     const src = url.startsWith('data:') ? { data: Uint8Array.from(atob(url.slice(url.indexOf(',') + 1)), c => c.charCodeAt(0)) } : { url };
-    const task = L.pdf!.task = lib.getDocument({ ...src, enableXfa: false });
+    const task = L.pdf!.task = lib.getDocument({ ...src, enableXfa: false, cMapUrl: new URL('vendor/pdfjs/cmaps/', location.href).href, cMapPacked: true });
     doc = await task.promise;
   } catch (e) {
     const m = String(e?.message || e);
@@ -7675,7 +7675,7 @@ async function opRun(n: OpNode, quiet?: boolean): Promise<boolean> {
       if (!sample) throw new Error(DAEMON ? 'no language model on this server' : 'no language model here');
       const opts: PageSampleOpts = { modelTier: 'default', cache: false };
       let ask: string;
-      if (n.op === 'describe') { const b = await opImageBlob(img!); opts.images = [b.data || await imageBlobOf({ blob: b.blob })]; ask = (n.prompt || '').trim() ? `${n.prompt!.trim()}${texts.length ? '\n\nContext:\n' + texts.join('\n\n') : ''}` : OP_DESCRIBE; }
+      if (n.op === 'describe') { const b = await opImageBlob(img!); opts.images = [b.data || await imageBlobOf({ blob: b.blob })]; ask = ((n.prompt || '').trim() || OP_DESCRIBE) + (texts.length ? '\n\nContext:\n' + texts.join('\n\n') : ''); }
       else { if (!prompt) throw new Error('write an idea to expand first'); ask = OP_EXPAND + '\n\n' + prompt; }
       const res = await sample(ask, opts);
       const text = res.text.trim(); if (!text) throw new Error('the model answered nothing');

@@ -156,7 +156,9 @@ async fn images_come_from_the_configured_provider_and_land_in_the_blob_store() {
     }
 
     // Hugging Face: one request per image, no key, the image bytes as the answer
-    let res = run(json!({"provider": "hf", "op": "imagine", "prompt": "fog", "n": 2})).await;
+    let res =
+        run(json!({"provider": "hf", "op": "imagine", "prompt": "fog", "n": 2, "size": "512x512"}))
+            .await;
     assert_eq!(res.status, 200, "{:?}", String::from_utf8_lossy(&res.body));
     assert_eq!(res.json()["images"].as_array().unwrap().len(), 2);
     {
@@ -167,14 +169,24 @@ async fn images_come_from_the_configured_provider_and_land_in_the_blob_store() {
         let sent: Value = serde_json::from_slice(&hf[0].2).unwrap();
         assert_eq!(sent["inputs"], "fog");
         assert!(sent["parameters"]["seed"].is_u64());
+        assert_eq!(sent["parameters"]["width"], 512);
     }
-    let res = run(json!({"provider": "hf", "op": "edit", "prompt": "fog", "image": hash})).await;
+    // image to image takes the size as target_size
+    let res = run(
+        json!({"provider": "hf", "op": "edit", "prompt": "fog", "image": hash, "size": "512x512"}),
+    )
+    .await;
     assert_eq!(res.status, 200);
     {
         let seen = seen.lock().unwrap();
         let sent: Value = serde_json::from_slice(&seen.last().unwrap().2).unwrap();
         assert_eq!(sent["inputs"], PNG_B64);
         assert_eq!(sent["parameters"]["prompt"], "fog");
+        assert_eq!(
+            sent["parameters"]["target_size"],
+            json!({"width": 512, "height": 512})
+        );
+        assert!(sent["parameters"].get("width").is_none());
     }
 
     // what fails, and how it says so
