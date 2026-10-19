@@ -315,9 +315,14 @@ impl Call<'_> {
             if self.n > 1 {
                 params["seed"] = json!(seed() + u64::from(i));
             }
+            // text to image takes the size as flat fields, image to image as `target_size`
             if let Some((w, h)) = self.size {
-                params["width"] = json!(w);
-                params["height"] = json!(h);
+                if image.is_some() {
+                    params["target_size"] = json!({"width": w, "height": h});
+                } else {
+                    params["width"] = json!(w);
+                    params["height"] = json!(h);
+                }
             }
             let body = match image {
                 None => json!({"inputs": self.prompt, "parameters": params}),

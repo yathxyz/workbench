@@ -390,7 +390,7 @@ interface OpLive { prompt: HTMLTextAreaElement; out: HTMLElement; ins: HTMLEleme
 // pdf.js (vendor/pdfjs/pdf.min.mjs, loaded on demand): the part of its API the pdf card uses.
 interface PdfJsLib {
   GlobalWorkerOptions: { workerSrc: string };
-  getDocument(src: { url?: string; data?: Uint8Array; enableXfa?: boolean; stopAtErrors?: boolean }): PdfJsLoadingTask;
+  getDocument(src: { url?: string; data?: Uint8Array; enableXfa?: boolean; stopAtErrors?: boolean; cMapUrl?: string; cMapPacked?: boolean }): PdfJsLoadingTask;
   TextLayer: new (o: { textContentSource: unknown; container: HTMLElement; viewport: PdfJsViewport }) => { render(): Promise<void>; cancel(): void };
   version: string;
 }
