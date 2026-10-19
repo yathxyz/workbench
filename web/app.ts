@@ -4764,7 +4764,8 @@ async function tasksLoad(force?: boolean): Promise<IndexTask[]> {
   try { const j = await (await hFetch(null, '/api/tasks')).json(); TASKS.rows = (j.tasks || []).map((r: ApiTaskRow): IndexTask => ({ idx: true, id: r.id, nodeId: r.node, kw: r.kw, text: r.title, priority: r.priority, scheduled: r.scheduled, deadline: r.deadline, session: r.session, dispatched: r.dispatched, target: r.target, path: r.path, line: r.line, body: (r.prompt || '').split('\n').filter((l: string) => l.trim() && !FIELD_LINE_RE.test(l) && !TASK_DATE_RE.test(l)).map((l: string) => l.trim()), tags: r.tags || [] })); } catch { TASKS.rows = []; }
   TASKS.at = Date.now(); if (VIEW === 'tasks') renderTasks(); statusRender(); return TASKS.rows;
 }
-const allTasks = (): TaskRow[] => [...collectTasks(), ...TASKS.rows];
+// A page whose text is open here (its replica) is parsed locally; the index rows of its file are the same tasks, often older.
+const allTasks = (): TaskRow[] => { const here = new Set(pages().filter(p => p.buf && pageState(p)).map(p => p.buf)); return [...collectTasks(), ...TASKS.rows.filter(r => !here.has(r.path))]; };
 const taskKey = (t: TaskRow): string => t.idx ? 'idx:' + t.id : t.node.id + ':' + t.line;
 const taskWhere = (t: TaskRow): string => t.idx ? t.path + ':' + t.line : fmtAddr({ ...bufferAddress(t.node, t.st, t.pos), quote: '' });
 const taskAddr = (t: TaskRow): string => t.idx ? 'task:' + t.id : 'board:/' + t.node.name + ':' + t.line;
