@@ -792,7 +792,7 @@ interface EdwinApi {
     open(id: string, opts?: { create?: boolean }): Promise<EdwinBuffer>;
     call(req: { cmd: string; args: unknown[]; ctx: object }): Promise<any>; // any: each edwind command answers its own shape
     anchorAdd(buf: string, pos: number, label: string | null, aid: string): Promise<unknown>;
-    save(b: EdwinBuffer): Promise<{ error?: string }>;
+    save(b: EdwinBuffer): Promise<{ error?: { condition: string; report: string } }>;
     exportPending(): unknown[];
     buffers: Map<string, EdwinBuffer>; state: string; cid: string; pendingUndo: unknown;
   };
