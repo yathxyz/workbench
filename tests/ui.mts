@@ -3142,6 +3142,19 @@ await section('frames', async () => {
   st = { hInst: hInst?.event, blocked, hBuf, held, setOk, replica: replica === hText, served: { buf: servedH.buf || null, text: servedH.text === hText }, hBuf2, servedH2, shown: shown === hText, second: readNote('notes/held-one-2.md') !== null, hLog: hLog.length, setOk2, shown2: !!shown2 };
   check('frames: a migrated page takes no frame and no edit until the board save carrying its buf lands; when that save never lands, the next load links the same file again (no -2 file), and the page takes edits once its save landed', st.hInst === 'board' && blocked > 0 && hBuf === 'notes/held-one.md' && held.hold && !held.frame && held.edit === false && setOk === false && st.replica && !st.served.buf && st.served.text && hBuf2 === hBuf && servedH2 === hBuf && st.shown && !st.second && st.hLog === 1 && setOk2 === true && st.shown2, JSON.stringify(st));
   await settled(R2); await R2.close();
+
+  // (h) two tabs load a board with a page to migrate at once: both open the empty file before either fills it. edwind
+  // fills a file only while it is empty, in one step (notes-fill), so it has the page text once and both tabs link it.
+  const tText = '# Twice Loaded\n\nbody\n';
+  fs.writeFileSync(hFile, JSON.stringify({ v: 5, fs: keep.fs, views: {}, nodes: { t1: { id: 't1', kind: 'buffer', name: 'Twice Loaded', x: 100, y: 100, w: 480, h: 340, text: tText } }, edges: [], strokes: [], shapes: [], cam: { x: 0, y: 0, z: 1 } }));
+  const tInst = await harnessCtl('board ' + hFile);
+  const tabs = [await ctx.newPage(), await ctx.newPage()]; tabs.forEach(watchErrors);
+  await Promise.all(tabs.map(t => t.goto(ORIGIN + '/')));
+  const tBufs = await Promise.all(tabs.map(async t => { await until(() => t.evaluate(() => window.__canvas?.BOOTED)); return until(() => t.evaluate(() => window.__canvas.S.nodes.t1?.buf || null), 40000); }));
+  await sleep(1000);
+  const tSt = { tInst: tInst?.event, tBufs, file: readNote('notes/twice-loaded.md'), second: readNote('notes/twice-loaded-2.md') !== null };
+  check('frames: two tabs that load a board with the same page to migrate at once link the same file, which has the page text once', tSt.tInst === 'board' && tSt.tBufs.every(b => b === 'notes/twice-loaded.md') && tSt.file === tText && !tSt.second, JSON.stringify(tSt));
+  for (const t of tabs) await t.close({ runBeforeUnload: false });
   await harnessCtl('board ' + keepFile);   // the board as it was, for the sections after this one
 });
 
