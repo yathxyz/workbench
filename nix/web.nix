@@ -1,9 +1,10 @@
 # The web root: web/ with its TypeScript stripped to JavaScript (tools/strip.mts), the vendored xterm bundle,
-# the Edwin console and frame runtime under edwin/, and the fonts, converted to woff2 from nixpkgs at build
-# time with a generated fonts/fonts.css. No font file lives in the repo.
+# pdf.js under vendor/pdfjs/, the Edwin console and frame runtime under edwin/, and the fonts, converted to
+# woff2 from nixpkgs at build time with a generated fonts/fonts.css. No font file lives in the repo.
 {
   lib,
   runCommand,
+  fetchurl,
   nodejs,
   vendor,
   nerd-fonts,
@@ -32,6 +33,14 @@ let
     root = ../edwin/scm;
     fileset = lib.fileset.fileFilter (f: f.hasExt "scm") ../edwin/scm;
   };
+  # pdf.js for the pdf card (F-A40), which loads it only when a card mounts. Pinned here rather than in tools/'s
+  # npm lock, where the package's optional @napi-rs/canvas binaries would come along for nothing. Keep it current:
+  # it parses untrusted files in the page's origin (CVE-2024-4367 was a font that ran script).
+  # The legacy build: the modern one needs Map.prototype.getOrInsertComputed, which browsers from 2025 lack.
+  pdfjs = fetchurl {
+    url = "https://registry.npmjs.org/pdfjs-dist/-/pdfjs-dist-6.4.299.tgz";
+    hash = "sha512-AVl138zALtfaAPvADulE0PZThbYzCBS79nL4pOSL/6Sm/4AH5A21BD9VHt97OlCuzJuCpmeZtAtkinisF4Vb1g==";
+  };
   mono = "${nerd-fonts.jetbrains-mono}/share/fonts/truetype/NerdFonts/JetBrainsMono";
   noto = "${noto-fonts}/share/fonts/noto";
 in
@@ -39,6 +48,8 @@ runCommand "workbench-web" { nativeBuildInputs = [ nodejs woff2 ]; } ''
   node ${../tools/strip.mts} --web ${web} $out
   chmod -R u+w $out
   install -Dm444 -t $out/vendor ${vendor}/vendor.js ${vendor}/xterm.css
+  mkdir pdfjs && tar xzf ${pdfjs} -C pdfjs
+  install -Dm444 -t $out/vendor/pdfjs pdfjs/package/legacy/build/pdf.min.mjs pdfjs/package/legacy/build/pdf.worker.min.mjs pdfjs/package/LICENSE
   install -Dm444 ${console} $out/edwin/index.html
   node ${../tools/strip.mts} $out/edwin/src ${edwinSrc}/*.ts
   install -Dm444 -t $out/edwin/scm ${edwinScm}/*.scm

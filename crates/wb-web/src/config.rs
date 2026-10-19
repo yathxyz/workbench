@@ -2,6 +2,7 @@
 //!
 //! Unknown keys are refused: a misspelt auth key must stop startup, never be ignored.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
@@ -41,6 +42,40 @@ pub struct Config {
     /// The destinations `POST /api/mv` refuses, shared with edwind (R14.8). Absent
     /// means the built-in list.
     pub refuse_paths: Option<Vec<String>>,
+    /// Image providers for the canvas's media cards (F-A41). Absent means none: the
+    /// cards that make images say so, and describe and expand still use `sample`.
+    pub media: Option<MediaConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaConfig {
+    /// By name, as the card's provider menu shows it.
+    pub providers: BTreeMap<String, MediaProvider>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MediaProvider {
+    pub api: MediaApi,
+    /// https, or http to loopback; the key goes only here.
+    pub base_url: String,
+    /// The key, sent as `Authorization: Bearer`. Read at each request, so a rotated
+    /// key needs no restart. Absent for a local server that takes none.
+    pub key_file: Option<PathBuf>,
+    /// The models offered, the first being the default.
+    pub models: Vec<String>,
+}
+
+/// The protocol a provider speaks.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaApi {
+    /// The OpenAI image API (`/images/generations`, `/images/edits`), which xAI, LocalAI
+    /// and other servers also speak.
+    Openai,
+    /// Hugging Face Inference (`/models/{model}`): text to image, image to image.
+    Huggingface,
 }
 
 fn default_socket() -> PathBuf {
@@ -107,6 +142,32 @@ impl Config {
             valid_host(&self.host),
             "host must match [A-Za-z0-9][A-Za-z0-9._-]*"
         );
+        for (name, p) in self.media.iter().flat_map(|m| &m.providers) {
+            ensure!(
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+                "media provider names must match [A-Za-z0-9_-]+"
+            );
+            ensure!(
+                https_or_loopback(&p.base_url),
+                "media provider {name}: baseUrl must be https, or http to loopback"
+            );
+            ensure!(
+                !p.models.is_empty()
+                    && p.models
+                        .iter()
+                        .all(|m| !m.is_empty() && !m.chars().any(char::is_control)),
+                "media provider {name}: models must list at least one model"
+            );
+            if let Some(key) = &p.key_file {
+                ensure!(
+                    key.is_absolute(),
+                    "media provider {name}: keyFile must be an absolute path"
+                );
+            }
+        }
         for path in self.refuse_paths.iter().flatten() {
             ensure!(
                 path.starts_with('/') || path == "~" || path.starts_with("~/"),
@@ -114,6 +175,28 @@ impl Config {
             );
         }
         Ok(())
+    }
+}
+
+/// `https://…`, or `http://` to 127.0.0.0/8, `localhost` or `[::1]`, with no user part.
+fn https_or_loopback(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    match scheme {
+        "https" => true,
+        "http" => {
+            let host = match authority.strip_prefix('[') {
+                Some(v6) => v6.split(']').next().unwrap_or(""),
+                None => authority.split(':').next().unwrap_or(""),
+            };
+            host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        }
+        _ => false,
     }
 }
 
@@ -329,6 +412,55 @@ mod tests {
         let (cfg, _) = f.load().unwrap();
         assert!(cfg.edit_socket.is_none());
         assert!(cfg.refuse_paths.is_none());
+    }
+
+    #[test]
+    fn media_providers_load_and_are_checked() {
+        let mut f = Fixture::new();
+        f.cfg["media"] = json!({"providers": {
+            "openai": {"api": "openai", "baseUrl": "https://api.openai.com/v1", "keyFile": "/run/k", "models": ["gpt-image-1"]},
+            "local": {"api": "huggingface", "baseUrl": "http://127.0.0.1:7860", "models": ["flux"]},
+        }});
+        let (cfg, _) = f.load().unwrap();
+        let p = &cfg.media.as_ref().unwrap().providers;
+        assert_eq!(p.keys().collect::<Vec<_>>(), ["local", "openai"]);
+        assert_eq!(p["openai"].api, MediaApi::Openai);
+        assert!(p["local"].key_file.is_none());
+        let bad = [
+            json!({"x y": {"api": "openai", "baseUrl": "https://a.example", "models": ["m"]}}),
+            json!({"p": {"api": "openai", "baseUrl": "http://api.example.org", "models": ["m"]}}),
+            json!({"p": {"api": "openai", "baseUrl": "http://user@127.0.0.1/", "models": ["m"]}}),
+            json!({"p": {"api": "openai", "baseUrl": "https://a.example", "models": []}}),
+            json!({"p": {"api": "openai", "baseUrl": "https://a.example", "models": ["m"], "keyFile": "k"}}),
+            json!({"p": {"api": "comfy", "baseUrl": "https://a.example", "models": ["m"]}}),
+            json!({"p": {"api": "openai", "baseUrl": "https://a.example", "models": ["m"], "key": "sk-1"}}),
+        ];
+        for providers in bad {
+            let mut f = Fixture::new();
+            f.cfg["media"] = json!({ "providers": providers });
+            assert!(f.load().is_err(), "{providers}");
+        }
+    }
+
+    #[test]
+    fn loopback_urls() {
+        for ok in [
+            "https://api.x.ai/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://localhost/x",
+            "http://[::1]:9/",
+        ] {
+            assert!(https_or_loopback(ok), "{ok}");
+        }
+        for no in [
+            "http://10.0.0.1/",
+            "ftp://a/",
+            "https://",
+            "http://127.0.0.1.example.org/",
+            "file:///x",
+        ] {
+            assert!(!https_or_loopback(no), "{no}");
+        }
     }
 
     #[test]

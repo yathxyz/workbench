@@ -70,6 +70,7 @@ function applyCam() {
   lodCheck();
   if (INK.ids.length) placeInkChip();
   if (FR.on) frSchedule();
+  for (const id in live) if (live[id].pdf) { pdfSoon(200); break; }   // the pages in view, drawn again at the new zoom
   dirtyCam();
 }
 // Far zoom (R2): below LOD_IN every card shows its snapshot, above LOD_OUT its live body again; between the two the mode
@@ -307,6 +308,7 @@ function boardAdopt(b: Board): void {
       if (!o) { cur[id] = nn; continue; }
       for (const k of Object.keys(o)) if (!k.startsWith('_') && !(k in nn)) delete (o as Partial<BoardNode>)[k as keyof BoardNode];
       Object.assign(o, nn);   // in place: the mounted card's closures hold this object
+      if (o.kind === 'op' && live[id]?.op) { live[id].op!.prompt.value = o.prompt || ''; opRender(o); }
       const v = live[id]?.view;
       if (o.kind === 'buffer' && v && v.state.doc.toString() !== (o.text || '')) v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: o.text || '' } });
     }
@@ -326,7 +328,7 @@ function boardAdopt(b: Board): void {
 }
 function unmountQuiet(id: string): void {   // the card went in another tab: drop it here without killing its session
   const L = live[id]; if (!L) return;
-  L.backend?.dispose?.(); L.ro?.disconnect(); L.view?.destroy(); L.term?.dispose(); if (L.frame?.contentWindow) HOSTS.delete(L.frame.contentWindow);
+  pdfClose(L); L.backend?.dispose?.(); L.ro?.disconnect(); L.view?.destroy(); L.term?.dispose(); if (L.frame?.contentWindow) HOSTS.delete(L.frame.contentWindow);
   if (FR.on) frUnmount(id);
   L.el.remove(); delete live[id];
 }
@@ -1674,7 +1676,7 @@ type SepDir = 'l' | 'r' | 'u' | 'd';
 interface FolderAspect { name: string; r?: number; lh?: number }
 const PAD = 28, GAP = 24, LABEL_H = 32, DECK = { w: 300, h: 230 };
 const FSHAPES: FrameNode['shape'][] = ['folder', 'box', 'round'], FICON: Record<FrameMode, string> = { free: '◻', pack: '▦', tile: '⊞', stack: '❐' };   // v18.1: ribbon (PaperWM row) removed; old boards' ribbon folders load as tile
-const KIND_GLYPH: Record<NodeKind, string> = { term: '$', repl: '›', buffer: '¶', agent: '✦', acp: '✦', ref: '❝', frame: '▭', artifact: '◧', web: '⌾', sketch: '✎', image: '▣', ghost: '◌' };
+const KIND_GLYPH: Record<NodeKind, string> = { term: '$', repl: '›', buffer: '¶', agent: '✦', acp: '✦', ref: '❝', frame: '▭', artifact: '◧', web: '⌾', sketch: '✎', image: '▣', ghost: '◌', pdf: '▤', op: '✺' };
 const kidsOf = (fid: string): BoardNode[] => Object.values(S.nodes).filter(m => m.in === fid);
 const byOrder = (a: BoardNode, b: BoardNode): number => (a.order ?? 0) - (b.order ?? 0) || a.y - b.y || a.x - b.x;
 function descendants(fid: string, out: BoardNode[] = []): BoardNode[] { for (const k of kidsOf(fid)) { out.push(k); if (k.kind === 'frame') descendants(k.id, out); } return out; }
@@ -1941,7 +1943,7 @@ function pickChip() {
   const parts = []; if (ids.length) parts.push(ids.length + (ids.length === 1 ? ' card' : ' cards')); if (ns) parts.push(ns + (ns === 1 ? ' stroke' : ' strokes')); if (nh) parts.push(nh + (nh === 1 ? ' shape' : ' shapes'));
   $('#pick-n', c)!.textContent = parts.join(' · ') + ' selected';
   const show = (act: string, on: boolean) => { const b = $(`[data-act=${act}]`, c); if (b) b.hidden = !on; };
-  show('compact', ids.length > 0); show('sketch', ns > 0); show('read', ns > 0);
+  show('compact', ids.length > 0); show('sketch', ns > 0); show('read', ns > 0); show('png', ns > 0); show('svg', ns > 0);
 }
 // Hidden ink is not picked or erased: the Board's loose ink on a desk, a hidden card's ink.
 const inkHidden = (st: Stroke) => st.owner ? !!S.nodes[st.owner] && stashed(S.nodes[st.owner]) : !!DESK.cur;
@@ -2290,11 +2292,23 @@ type MountedLive = LiveEntry & { el: HTMLElement; hdr: HTMLElement; body: HTMLEl
     B('↗', 'Open in a browser tab', () => { if (webUrlOk(n.url)) window.open(n.url, '_blank', 'noopener'); else toast('Only http and https URLs open in a tab.'); });
   } else if (n.kind === 'sketch') {
     B('Aa', 'Turn the ink on this card into a page (needs a model that reads images)', () => sketchToPage(n));
+    B('PNG', 'Copy as PNG: the ink on the clipboard (transparent, 2×), for Krita or another program', () => sketchCopy('png', n));
+    B('SVG', 'Copy as SVG: the ink on the clipboard as vector paths, for Krita, Inkscape or another program', () => sketchCopy('svg', n));
     B('⌫', 'Clear the ink on this card', () => sketchClear(n));
   } else if (n.kind === 'image') {
     B('↗', 'Open the image in a browser tab', () => imageOpen(n));
     B('⧉', 'Copy the image to the clipboard, for another program (PNG)', () => imageCopy(n));
     B('1:1', 'Natural size: the card shows the image at its own size', () => imageNatural(n));
+    B('✦', 'Media card: edit or describe this image (a new card it pipes into)', () => opNew(opProviders().length ? 'edit' : 'describe', n));
+    if (n.at) B('⤴', 'Go to the place in the PDF this peek shows', () => peekGo(n));
+  } else if (n.kind === 'pdf') {
+    B('❝', 'Quote the selected text as a card that finds it again (q)', () => pdfQuote(n));
+    B('⇢', 'Send the selected text along pipe edges', () => pipeFrom(n));
+    B('⌕', 'Find in the PDF (/)', () => pdfFindAsk(n));
+    B('↗', 'Open the PDF in a browser tab (downloads it)', () => { const u = pdfUrl(n); if (u && !u.startsWith('data:')) window.open(u, '_blank', 'noopener'); else toast('This PDF lives only in the board (demo mode).'); });
+  } else if (n.kind === 'op') {
+    B('→', 'Take the picked result out as its own card (an image, or a page for text)', () => opExtract(n));
+    B('✦', 'New media card fed by this one', () => opNew(opPicked(n) ? 'edit' : 'imagine', n));
   } else if (n.kind === 'ghost') {
     B('↗', n.alias ? 'Jump to the real node' : n.tmuxTarget ? 'Adopt: a card attached to this tmux session' : n.dir ? 'Open: this directory becomes a folder' : 'Open: make it real (a page on the file when edwind edits it, else Emacs; a page in demo mode)', () => ghostOpen(n));
   }
@@ -2310,6 +2324,8 @@ type MountedLive = LiveEntry & { el: HTMLElement; hdr: HTMLElement; body: HTMLEl
   else if (n.kind === 'web') mountWeb(n, L);
   else if (n.kind === 'sketch') mountSketch(n, L);
   else if (n.kind === 'image') mountImage(n, L);
+  else if (n.kind === 'pdf') mountPdf(n, L);
+  else if (n.kind === 'op') mountOp(n, L);
   else if (n.kind === 'ghost') mountGhost(n, L);
   wireNode(n, L, port, rs);
   renderInk(n.id);
@@ -2334,6 +2350,8 @@ function badgeOf(n: BoardNode): string {
   if (n.kind === 'term') return n.backend === 'pty' ? shellName(n) || 'shell' : 'sim shell';
   if (n.kind === 'repl') return n.lang === 'js' ? 'js' : (n.cmd || '').split(' ')[0].replace('python3', 'py');
   if (n.kind === 'acp') return agentLabel(n.agent) + ' · ' + (live[n.id]?.backend?.stateText!() || (SESS[n.id]?.state || '…').replace(/_/g, ' '));
+  if (n.kind === 'pdf') return n.pages ? `p. ${n.pos?.page || 1} / ${n.pages}` : 'pdf';
+  if (n.kind === 'op') return (OP_KINDS[n.op]?.label || 'media') + (live[n.id]?.op?.busy ? ' · running' : n.out?.err ? ' · failed' : opStale(n) ? ' · stale' : '');
   return ({ buffer: 'page', ref: 'ref', agent: 'agent' } as Record<string, string>)[n.kind] || n.kind;
 }
 function updateTitle(n: BoardNode) {
@@ -2548,7 +2566,7 @@ function newAt<K extends NodeKind>(kind: K, extra: Partial<NodeOfKind<K>> = {}):
   const c = viewCenterWorld(), w = extra.w || (kind === 'frame' ? 760 : kind === 'buffer' ? 460 : 560), h = extra.h || (kind === 'frame' ? 460 : 320);
   const jitter = () => Math.round((Math.random() - .5) * 60);
   const count = Object.values(S.nodes).filter(m => m.kind === kind).length + 1;
-  const names: Record<string, string> = { term: 'shell', repl: 'repl', buffer: 'page', frame: 'folder', agent: 'agent', acp: 'agent', artifact: 'artifact', web: 'web', sketch: 'sketch', image: 'image' };
+  const names: Record<string, string> = { term: 'shell', repl: 'repl', buffer: 'page', frame: 'folder', agent: 'agent', acp: 'agent', artifact: 'artifact', web: 'web', sketch: 'sketch', image: 'image', pdf: 'paper', op: 'media' };
   const x = at ? Math.round(at.x) : Math.round(c.x - w / 2) + jitter(), y = at ? Math.round(at.y) : Math.round(c.y - h / 2) + jitter();
   return addNode({ kind, name: names[kind] + count, x, y, w, h, ...extra }) as NodeOfKind<K>;
 }
@@ -2566,7 +2584,7 @@ function removeNode(id: string) {
     for (const k of kidsOf(id)) { if (parent) k.in = parent.id; else delete k.in; }
   }
   const L = live[id];
-  if (L) { L.backend?.kill?.(); L.ro?.disconnect(); L.view?.destroy(); L.term?.dispose(); if (L.frame?.contentWindow) { HOSTS.delete(L.frame.contentWindow); frameTouchDrop(id); } if (FR.on) frUnmount(id); cardGhost(L.el!); L.el!.remove(); delete live[id]; }
+  if (L) { pdfClose(L); L.backend?.kill?.(); L.ro?.disconnect(); L.view?.destroy(); L.term?.dispose(); if (L.frame?.contentWindow) { HOSTS.delete(L.frame.contentWindow); frameTouchDrop(id); } if (FR.on) frUnmount(id); cardGhost(L.el!); L.el!.remove(); delete live[id]; }
   delete S.nodes[id]; DESK.mem.delete(id); for (const d of [...deskList(), DESK.smart].filter(Boolean) as Desk[]) { delete d.members[id]; if (d.saved) delete d.saved.members[id]; }
   if (S.sticky) { S.sticky = S.sticky.filter(x => x !== id); if (!S.sticky.length) delete S.sticky; } if (ovlHas({ id })) { OVL.ids = OVL.ids.filter(x => x !== id); delete OVL.saved[id]; viewSave(); }
   S.edges = S.edges.filter(e => e.from !== id && e.to !== id);
@@ -2600,11 +2618,12 @@ function selectionOf(n: BoardNode): string {
   if (L.view) { const st = L.view.state, s = st.selection.main; return s.empty ? st.doc.lineAt(s.head).text : st.sliceDoc(s.from, s.to); }
   if (n.kind === 'buffer' && FR.on) { const b = frBufOf(n); if (!b) return ''; if (b.markActive && b.mark != null && b.mark !== b.pt) return b.text.slice(Math.min(b.pt, b.mark), Math.max(b.pt, b.mark)); return new TextDoc(b.text).lineAt(b.pt).text; }
   if (n.kind === 'acp') { const s = getSelection(); return s && L.body!.contains(s.anchorNode) ? String(s) : ''; }
+  if (n.kind === 'pdf') return pdfSel(n)?.text || '';
   return '';
 }
 function pipeFrom(n: BoardNode) {
   const text = selectionOf(n);
-  if (!text || !text.trim()) return toast(n.kind === 'buffer' ? 'Nothing to send on this line.' : 'Select some output in the terminal first.');
+  if (!text || !text.trim()) return toast(n.kind === 'buffer' ? 'Nothing to send on this line.' : n.kind === 'pdf' ? 'Select some text in the PDF first.' : 'Select some output in the terminal first.');
   const targets = childrenOf(n.id, 'pipe');
   if (!targets.length) return toast('No pipes from here yet. Drag the ● at the bottom edge onto another node.');
   for (const t of targets) {
@@ -2615,6 +2634,8 @@ function pipeFrom(n: BoardNode) {
       else frWhenWritable(t).then(b => b && frEdit(b, [[b.text.length, '', ins]]));
     } else if ((t.kind === 'agent' || t.kind === 'acp') && L.ta) {   // drafts into the composer, never sends
       L.ta.value = (L.ta.value ? L.ta.value + '\n' : '') + text; L.ta.focus();
+    } else if (t.kind === 'op' && L.op) {   // into the media card's prompt; it runs when asked
+      t.prompt = (t.prompt ? t.prompt + '\n' : '') + text.trim(); L.op.prompt.value = t.prompt; dirty(); opRender(t);
     } else if (L.backend) {
       L.backend.input(text.replace(/\r?\n/g, '\r').replace(/\r$/, '') + (n.kind === 'buffer' ? '\r' : ''));
     }
@@ -2672,6 +2693,7 @@ function jumpBuffer(n: PageNode, pos: number) {
 }
 function jumpRef(r: RefNode) {
   const n = S.nodes[r.src?.node]; if (!n) return toast('The source node is gone.');
+  if (n.kind === 'pdf') return pdfJumpQuote(r, n);
   if (r.src.aid) {
     const a = pageAnchors(n as PageNode).find(x => x.id === r.src.aid);
     return a ? jumpBuffer(n as PageNode, a.pos) : jumpNode(n);
@@ -2898,6 +2920,8 @@ function snapshotText(n: BoardNode, max = 12): string {
   if (n.kind === 'web') return n.url || '';
   if (n.kind === 'sketch') return `${S.strokes.filter(x => x.owner === n.id).length} strokes`;
   if (n.kind === 'image') return `image · ${n.iw || '?'} × ${n.ih || '?'}`;
+  if (n.kind === 'pdf') return `PDF · ${n.pages ? `p. ${n.pos?.page || 1} of ${n.pages}` : 'not opened yet'}\n${n.path || ''}`;
+  if (n.kind === 'op') return `${n.op} · ${n.prompt || ''}\n${n.out?.text || (n.out?.images ? n.out.images.length + ' image(s)' : '')}`;
   if (n.kind === 'artifact') return `artifact · ${Object.keys(n.capabilities || {}).join(', ') || 'no capabilities'}\nversion ${String(n.head || '').slice(0, 8) || '(none)'}`;
   return (n as RefNode).text || '';
 }
@@ -3410,6 +3434,14 @@ cmd('New browser window…', onCanvas(() => $('#add-web')!.click()));
 cmd('New sketch (write on it with the pen)', onCanvas(() => newSketch()));
 cmd('Paste onto the canvas: an image, text or copied cards', onCanvas(() => pasteFromClipboard()), '@clip.paste');
 cmd('New image from a file…', onCanvas(() => imageFromFile()));
+cmd('Open a PDF from this device…', onCanvas(() => pdfFromDevice()));
+cmd('Open a PDF on the host…', () => askName('Path of the PDF on the host', '', p => pdfFromPath(p.trim())), '', () => DAEMON);
+for (const op of ['imagine', 'edit', 'describe', 'expand'] as OpKind[]) cmd(`New media card: ${op}`, onCanvas(() => opNew(op, op === 'edit' || op === 'describe' ? (S.nodes[activeId!]?.kind === 'image' || S.nodes[activeId!]?.kind === 'op' ? S.nodes[activeId!] : null) : null)));
+cmd('Run the stale media cards', () => opRunStale(), '', () => Object.values(S.nodes).some(n => n.kind === 'op'));
+cmd('Ink: copy as PNG (the selected strokes, or the active sketch card)', () => sketchCopy('png', SEL.strokes.size ? null : S.nodes[activeId!]), '', () => SEL.strokes.size > 0 || S.nodes[activeId!]?.kind === 'sketch');
+cmd('Ink: copy as SVG (the selected strokes, or the active sketch card)', () => sketchCopy('svg', SEL.strokes.size ? null : S.nodes[activeId!]), '', () => SEL.strokes.size > 0 || S.nodes[activeId!]?.kind === 'sketch');
+cmd('PDF: find in the active PDF…', () => pdfFindAsk(S.nodes[activeId!] as PdfNode), '', () => S.nodes[activeId!]?.kind === 'pdf');
+cmd('PDF: quote the selection', () => pdfQuote(S.nodes[activeId!] as PdfNode), '', () => S.nodes[activeId!]?.kind === 'pdf');
 cmd('New shell', onCanvas(() => $('#add-shell')!.click()));
 cmd('New JavaScript REPL', onCanvas(() => newAt('repl', { lang: 'js', history: [] })));
 cmd('New Python REPL', onCanvas(() => newAt('repl', { lang: 'cmd', backend: 'pty', cmd: 'python3 -q', name: 'py' + (nodeList().length + 1) })), '', () => DAEMON);
@@ -3449,6 +3481,7 @@ function keyInterior(a: Element | null = document.activeElement) {
   if (a.closest('.edwin-frame')) return 'edwin';   // an Edwin frame owns every key but the leader (edwind spec R9.7, F-A27)
   if (a.closest('.cm-editor')) return 'page';
   if (a.tagName === 'IFRAME') return 'frame';
+  if (a.matches('.pdf-pages')) return 'pdf';
   if (a.matches('input, textarea, select, [contenteditable="true"]')) return 'text';
   if (a.matches('button, a[href], summary')) return 'control';
   return null;
@@ -3871,6 +3904,8 @@ const AGENT_TOOLS: AgentTool[] = [
       if (live[n.id]?.term) return termLines(live[n.id], 80).join('\n') || '(empty)';
       if (n.kind === 'acp') return live[n.id]?.backend?.text!(40) ?? '(not mounted)';
       if (n.kind === 'agent') return (n.log || []).slice(-10).map(l => `${l.t}: ${l.text || l.name}`).join('\n');
+      if (n.kind === 'pdf') return pdfText(n, n.pos?.page || 1, (n.pos?.page || 1) + 1, 8000);   // read_pdf reads any pages
+      if (n.kind === 'op') return `media card: ${n.op}\nprompt: ${n.prompt || ''}\n` + (n.out?.err ? 'failed: ' + n.out.err : n.out?.text || (n.out?.images ? `${n.out.images.length} image(s), picked ${(n.out.pick || 0) + 1}` : 'not run yet')) + (opStale(n) ? '\n(stale: the inputs changed since)' : '');
       return (n as RefNode).text || '';
     } },
   { name: 'run_in_shell', description: 'Type a command into a shell or REPL node and press Enter. Returns the new output, up to 60 lines.',
@@ -5166,6 +5201,8 @@ function wirePaneGrip() {
   $('#pick-chip [data-act=delete]')!.onclick = () => removeSelection();
   $('#pick-chip [data-act=sketch]')!.onclick = () => sketchFromSelection();
   $('#pick-chip [data-act=read]')!.onclick = () => { INK.ids = [...SEL.strokes]; INK.t = Date.now(); inkToText(); };
+  $('#pick-chip [data-act=png]')!.onclick = () => sketchCopy('png');
+  $('#pick-chip [data-act=svg]')!.onclick = () => sketchCopy('svg');
 }
 function focusLabel() {
   if (VIEW === 'editor' && ED.node) return 'page ' + ED.node.name;
@@ -5201,6 +5238,23 @@ if ($('#chat-fork')) $('#chat-fork')!.onclick = () => {
     turns: c.turns.map(t => ({ ...t })), log: [...c.log.filter(m => !m.live).map(m => ({ ...m })), { t: 'note', text: `Forked from the assistant after ${c.turns.length} turn(s). This branch continues on its own.` }] });
   jumpNode(n); toast(`Forked into ${n.name} on the canvas`);
 };
+AGENT_TOOLS.push({
+  name: 'read_pdf', description: 'Read the text of a PDF card, with "--- name p. N ---" page markers. from and to are page numbers (from 1; default: the page the reader is on and the nine after it). Scanned pages have no text.',
+  inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'the PDF card, as read_node takes it' }, from: { type: 'number' }, to: { type: 'number' } }, required: ['path'] },
+  run: async ({ path, from, to }: { path: string; from?: number; to?: number }) => {
+    const n = findNode(path); if (!n || n.kind !== 'pdf') throw new Error('no PDF card at ' + path);
+    if (!live[n.id]?.pdf) throw new Error(n.name + ' is not open in this tab');
+    const a = Number(from) || n.pos?.page || 1; return pdfText(n, a, Number(to) || a + 9);
+  },
+}, {
+  name: 'open_pdf', description: 'Open a PDF file on this host as a PDF card on the canvas (a path; ~ is the home directory). Answers the card\'s path for read_pdf.',
+  inputSchema: { type: 'object', properties: { file: { type: 'string' } }, required: ['file'] },
+  run: ({ file }: { file: string }) => {
+    if (!DAEMON) throw new Error('PDFs on the host need a Workbench server');
+    if (!/\.pdf$/i.test(str(file))) throw new Error('not a .pdf file: ' + file);
+    return pathOf(pdfFromPath(str(file)).id);
+  },
+});
 AGENT_TOOLS.push({
   name: 'open_view', description: 'Switch the main area to a view: canvas, graph, editor, outline or tasks. With editor, page opens that page (created if missing). With canvas, target is anything move_view accepts. With graph, target selects that node.',
   inputSchema: { type: 'object', properties: { view: { type: 'string', enum: VIEWS }, page: { type: 'string' }, target: { type: 'string' } }, required: ['view'] },
@@ -6751,6 +6805,55 @@ async function sketchToPage(n: SketchNode) {
     toast('Page ' + page.name + ' written from the ink.');
   } catch (e) { toast('Could not read the ink: ' + (e?.message || e), 6000); }
 }
+// Copy as PNG / Copy as SVG (F-A42): a sketch card's ink, or the selected strokes, on the system clipboard for another
+// program (Krita takes either; Inkscape and the browser take the SVG). Both draw the ink as the board draws it (the
+// perfect-freehand outline of each stroke) in the light theme's ink colours, on a transparent ground, cut to the ink
+// with a margin. The PNG is drawn at twice the board's scale. An SVG goes as image/svg+xml where the browser writes
+// that type, else as its text.
+const SK_INK: Record<string, string> = { ink: '#000000', red: '#a60000', blue: '#0031a9' }, SK_PAD = 16;
+// the ink to copy: the selected strokes, else card N's own ink
+function sketchInk(n?: BoardNode | null): Stroke[] {
+  if (!n && SEL.strokes.size) return S.strokes.filter(s => SEL.strokes.has(s.id) && !s.aid);
+  return n ? S.strokes.filter(s => s.owner === n.id && !s.aid) : [];
+}
+function sketchShape(list: Stroke[]): { box: { x0: number; y0: number; w: number; h: number }; polys: { color: string; pts: number[][] }[] } | null {
+  const polys = list.map(s => ({ color: SK_INK[s.color] || SK_INK.ink, pts: V.getStroke(strokeWorldPts(s).map((p, i) => [p[0], p[1], s.pts[i]?.[2] ?? 0.5]), strokeOpts(s)) as number[][] })).filter(p => p.pts.length > 1);
+  if (!polys.length) return null;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const p of polys) for (const [x, y] of p.pts) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+  x0 = Math.floor(x0 - SK_PAD); y0 = Math.floor(y0 - SK_PAD);
+  return { box: { x0, y0, w: Math.ceil(x1 + SK_PAD) - x0, h: Math.ceil(y1 + SK_PAD) - y0 }, polys };
+}
+function sketchSvg(list: Stroke[]): string | null {
+  const sh = sketchShape(list); if (!sh) return null;
+  const { x0, y0, w, h } = sh.box, local = (pts: number[][]) => pts.map(([x, y]) => [x - x0, y - y0]);
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">\n`
+    + sh.polys.map(p => `<path fill="${p.color}" d="${pathD(local(p.pts))}"/>`).join('\n') + '\n</svg>\n';
+}
+async function sketchPng(list: Stroke[], k = 2): Promise<Blob | null> {
+  const sh = sketchShape(list); if (!sh) return null;
+  const { x0, y0, w, h } = sh.box, s = Math.min(k, 8192 / Math.max(w, h)), cv = document.createElement('canvas');
+  cv.width = Math.max(1, Math.round(w * s)); cv.height = Math.max(1, Math.round(h * s));
+  const g = cv.getContext('2d')!; g.setTransform(s, 0, 0, s, -x0 * s, -y0 * s);
+  for (const p of sh.polys) { g.fillStyle = p.color; g.fill(new Path2D(pathD(p.pts))); }
+  return new Promise(res => cv.toBlob(res, 'image/png'));
+}
+async function sketchCopy(as: 'png' | 'svg', n?: BoardNode | null) {
+  const list = sketchInk(n), what = n ? n.name : list.length + (list.length === 1 ? ' stroke' : ' strokes');
+  if (!list.length) return toast(n ? 'Nothing drawn on this card yet.' : 'Select some ink first (the area tool).');
+  try {
+    if (as === 'svg') {
+      const svg = sketchSvg(list)!;
+      const rich = typeof navigator.clipboard?.write === 'function' && typeof ClipboardItem !== 'undefined' && (ClipboardItem as unknown as { supports?: (t: string) => boolean }).supports?.('image/svg+xml');
+      if (rich) await navigator.clipboard.write([new ClipboardItem({ 'image/svg+xml': new Blob([svg], { type: 'image/svg+xml' }), 'text/plain': new Blob([svg], { type: 'text/plain' }) })]);
+      else await navigator.clipboard.writeText(svg);
+      return toast(`${what}: the ink is on the clipboard as SVG${rich ? '' : ' text'}.`);
+    }
+    if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') return toast('This browser cannot put images on the clipboard; Copy as SVG works.', 5000);
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': sketchPng(list).then(b => { if (!b) throw new Error('could not draw the ink'); return b; }) })]);
+    toast(`${what}: the ink is on the clipboard as PNG (transparent, 2×).`);
+  } catch (e) { toast('Could not copy the ink: ' + (e?.message || e), 5000); }
+}
 // ================================================================ images and the clipboard on the canvas (F-A32)
 // An image pasted or dropped on the canvas is an `image` card. Served by wb-web, the bytes go to POST /api/blob and the
 // card keeps only their sha256 (`blob`), shown from /blob/<hash>; in demo mode the card keeps a data: URL (`src`). PNG,
@@ -6867,14 +6970,16 @@ function imageNatural(n: ImageNode) {
   if (!n.iw || !n.ih) return toast('The image has not loaded yet.');
   n.w = n.iw; n.h = n.ih + HDR; place(n); if (n.in && S.nodes[n.in]) relayout(S.nodes[n.in], true); renderEdges(); dirty();
 }
-// drop image files on the canvas; any other file is refused here, not opened by the browser in place of the board
+// drop image and PDF files on the canvas; any other file is refused here, not opened by the browser in place of the board
 viewport.addEventListener('dragover', e => { if (VIEW === 'canvas' && [...(e.dataTransfer?.types || [])].includes('Files')) { e.preventDefault(); e.dataTransfer!.dropEffect = 'copy'; } });
 viewport.addEventListener('drop', e => {
   if (VIEW !== 'canvas' || ![...(e.dataTransfer?.types || [])].includes('Files')) return;
   e.preventDefault();
-  const files = [...e.dataTransfer!.files].filter(f => /^image\//.test(f.type));
-  if (!files.length) return toast('Only images can be dropped on the canvas.');
-  const r = viewport.getBoundingClientRect(); imagesOnCanvas(files, s2w(e.clientX - r.left, e.clientY - r.top));
+  const files = [...e.dataTransfer!.files].filter(f => /^image\//.test(f.type)), docs = [...e.dataTransfer!.files].filter(isPdfFile);
+  if (!files.length && !docs.length) return toast('Only images and PDFs can be dropped on the canvas.');
+  const r = viewport.getBoundingClientRect(), at = s2w(e.clientX - r.left, e.clientY - r.top);
+  if (docs.length) pdfsOnCanvas(docs, at);
+  if (files.length) imagesOnCanvas(files, docs.length ? { x: at.x + 40, y: at.y + 40 } : at);
 });
 
 // Copy, cut and paste on the board. Ctrl-C/V/X (Cmd on a Mac) are canvas keymap rows whose commands give the key back
@@ -6882,7 +6987,8 @@ viewport.addEventListener('drop', e => {
 // board: a shell, a page, a text field or a frame keeps its own clipboard.
 const WB_MIME = 'application/x-workbench-items';
 // kinds a copy duplicates, and the fields each keeps; a live card (shell, agent, artifact) or a folder is not copied
-const COPY_FIELDS: { image: string[]; sketch: string[]; web: string[]; ref: string[]; buffer: string[] } & Partial<Record<NodeKind, string[]>> = { image: ['blob', 'src', 'mime', 'iw', 'ih'], sketch: [], web: ['url'], ref: ['text', 'src', 'srcLabel'], buffer: ['text'] };
+const COPY_FIELDS: { image: string[]; sketch: string[]; web: string[]; ref: string[]; buffer: string[] } & Partial<Record<NodeKind, string[]>> = { image: ['blob', 'src', 'mime', 'iw', 'ih', 'at'], sketch: [], web: ['url'], ref: ['text', 'src', 'srcLabel'], buffer: ['text'],
+  pdf: ['path', 'blob', 'src', 'pos', 'pages'], op: ['op', 'prompt', 'provider', 'model', 'size', 'n', 'out'] };
 // The last copy, by its text side, for the clipboards that carry no board items: the async clipboard (the palette's paste)
 // and the system clipboard after an image copy, which holds the PNG and the text only. Per device, so another tab of
 // this browser pastes it too; a text that matches nothing pastes as text.
@@ -6907,7 +7013,7 @@ function copyItems(): null | { items?: undefined; skipped: BoardNode[] } | { ite
     for (const k of keep) if (n[k as keyof typeof n] !== undefined) c[k] = JSON.parse(JSON.stringify(n[k as keyof typeof n]));
     if (n.kind === 'buffer') { const t = live[n.id]?.view ? live[n.id].view!.state.doc.toString() : FR.on && n.buf ? frBufOf(n)?.text : n.text; if (t == null) { skipped.push(n); continue; } c.text = t; }
     cards.push(c); ok.add(id);
-    texts.push(n.kind === 'image' ? imgClipText(n) : n.kind === 'web' ? n.url || '' : n.kind === 'buffer' || n.kind === 'ref' ? c.text || '' : n.name);
+    texts.push(n.kind === 'image' ? imgClipText(n) : n.kind === 'web' ? n.url || '' : n.kind === 'buffer' || n.kind === 'ref' ? c.text || '' : n.kind === 'pdf' ? n.path || n.name : n.kind === 'op' ? n.prompt || n.name : n.name);
   }
   // ink: the copied cards' own (not ink anchored to a page's lines), and the selected loose ink in board coordinates
   const ink: Stroke[] = [];
@@ -6965,8 +7071,10 @@ function pasteData(dt: DataTransfer, at = pastePoint()): boolean {
   if (items) { try { if (pasteItems(JSON.parse(items), at)) return true; } catch {} }
   const text = dt.getData('text/plain'), mine = clipRecall(text);
   if (mine && pasteItems(mine, at)) return true;
-  const files = [...(dt.files || [])].filter(f => /^image\//.test(f.type));
-  if (files.length) { imagesOnCanvas(files, at); return true; }
+  const files = [...(dt.files || [])].filter(f => /^image\//.test(f.type)), docs = [...(dt.files || [])].filter(isPdfFile);
+  if (docs.length) pdfsOnCanvas(docs, at);
+  if (files.length) imagesOnCanvas(files, at);
+  if (files.length || docs.length) return true;
   if (text && text.trim()) { pasteText(text, at); return true; }
   return false;
 }
@@ -7006,6 +7114,7 @@ function pasteItems(p: ClipItems | null, at = pastePoint()) {
     if (Array.isArray(c.tags)) n.tags = c.tags.filter(t => typeof t === 'string');
     for (const k of COPY_FIELDS[c.kind]!) if (c[k] !== undefined) n[k] = c[k];
     if (n.kind === 'image' && !imgUrl(n)) continue;
+    if (n.kind === 'pdf' && !pdfUrl(n as PdfNode)) continue;
     if (n.kind === 'web' && !webUrlOk(n.url!)) n.url = '';
     if ((n.kind === 'buffer' || n.kind === 'ref') && typeof n.text !== 'string') n.text = '';
     addNode(n as AddNodeArg); map.set(c.id, n.id!); pickToggle(n.id!, true);
@@ -7051,6 +7160,577 @@ function imageFromFile() {
   const inp = Object.assign(el('input'), { type: 'file', accept: 'image/*', multiple: true });
   inp.onchange = () => { if (inp.files!.length) imagesOnCanvas(inp.files!, viewCenterWorld()); };
   inp.click();
+}
+// ================================================================ PDFs on the canvas (F-A40)
+// A `pdf` card draws a PDF with pdf.js inside the page itself: a web card on the browser's viewer would hide the
+// selection, the page and the links, and swallow pinches and keys. The bytes come from /api/raw (a file on this host,
+// read in ranges) or /blob/<hash> (a file dropped or opened from this device; a data: URL in the demo). pdf.js loads
+// with the first card, from vendor/pdfjs/; since v5 it has no eval path, and the build pins it (nix/web.nix).
+// Pages are boxes at the card's width, sized from the first page until each is read. Those in view (and half a card
+// around) get a bitmap at the camera's zoom, drawn again when the zoom settles; at most PDF_LIVE bitmaps stay per card
+// and PDF_LIVE_ALL in the tab, least recently seen first, and none at far zoom or off the desk. A text layer makes the
+// text selectable. A link to a place in the file opens a peek: an image card of that place, which ⤴ takes back to it.
+// ❝ (q) makes the selection a quote card: a ref holding the page and the text around the quote (W3C TextQuoteSelector),
+// whose ↗ finds the text again, on another page too when the file changed. The reading position is in the card, so
+// every device opens it where it was left.
+const PDF_PAD = 10, PDF_LIVE = 6, PDF_LIVE_ALL = 18, PDF_MAXPX = 4096, PDF_DEMO_MAX = 2 << 20, PDF_CTX = 32;
+const PDFJS: { p: Promise<PdfJsLib> | null; tick: number; t: number | null } = { p: null, tick: 0, t: null };
+function pdfLib(): Promise<PdfJsLib> {
+  if (!PDFJS.p) {
+    const url = new URL('vendor/pdfjs/pdf.min.mjs', location.href).href;
+    PDFJS.p = (import(url) as Promise<PdfJsLib>).then(m => { m.GlobalWorkerOptions.workerSrc = new URL('vendor/pdfjs/pdf.worker.min.mjs', location.href).href; return m; });
+    PDFJS.p.catch(() => { PDFJS.p = null; });
+  }
+  return PDFJS.p;
+}
+const pdfUrl = (n: PdfNode): string => typeof n.blob === 'string' && /^[0-9a-f]{64}$/.test(n.blob) ? '/blob/' + n.blob
+  : typeof n.path === 'string' && n.path ? '/api/raw?path=' + encodeURIComponent(n.path)
+  : typeof n.src === 'string' && /^data:application\/pdf;base64,[A-Za-z0-9+/=]+$/.test(n.src) ? n.src : '';
+const pdfs = (): PdfNode[] => Object.values(S.nodes).filter((n): n is PdfNode => n.kind === 'pdf' && !!live[n.id]?.pdf);
+function mountPdf(n: PdfNode, L: LiveEntry) {
+  const scroll = el('div', 'pdf-pages'), note = el('div', 'pdf-note', 'Opening…');
+  scroll.tabIndex = 0; scroll.setAttribute('aria-label', 'PDF ' + n.name);
+  L.body!.append(scroll, note); L.note = note;
+  const P: PdfLive = L.pdf = { doc: null, load: null, err: '', scroll, pages: [], w: 0, texts: [] };
+  scroll.addEventListener('scroll', () => { pdfSoon(80); pdfPosSave(n); }, { passive: true });
+  scroll.addEventListener('pointerdown', () => activate(n.id));
+  L.ro = new ResizeObserver(() => { if (pdfLayout(n)) pdfSoon(60); }); L.ro.observe(L.body!);
+  P.load = pdfOpen(n, L);
+}
+function pdfFail(L: LiveEntry, msg: string) { if (L.pdf) L.pdf.err = msg; if (L.note) { L.note.hidden = false; L.note.textContent = msg; } }
+async function pdfOpen(n: PdfNode, L: LiveEntry): Promise<PdfJsDocument | null> {
+  const url = pdfUrl(n); if (!url) { pdfFail(L, 'This card names no PDF.'); return null; }
+  let doc: PdfJsDocument;
+  try {
+    const lib = await pdfLib().catch(() => { throw new Error('pdf.js is not in this build of Workbench'); });
+    const src = url.startsWith('data:') ? { data: Uint8Array.from(atob(url.slice(url.indexOf(',') + 1)), c => c.charCodeAt(0)) } : { url };
+    const task = L.pdf!.task = lib.getDocument({ ...src, enableXfa: false });
+    doc = await task.promise;
+  } catch (e) {
+    const m = String(e?.message || e);
+    pdfFail(L, /Missing PDF|Unexpected server response \((400|404)\)/.test(m) ? `Cannot open ${n.path || 'the PDF'}: the file is missing or not a PDF.` : 'Cannot open the PDF: ' + m);
+    return null;
+  }
+  if (live[n.id] !== L) return null;   // the card went while the file loaded (pdfClose destroyed the task)
+  const P = L.pdf!, first = await doc.getPage(1), vp = first.getViewport({ scale: 1 });
+  P.doc = doc; P.texts = new Array(doc.numPages).fill(null);
+  P.pages = Array.from({ length: doc.numPages }, (_, i) => {
+    const box = el('div', 'pdf-page'); box.dataset.page = String(i + 1);
+    box.append(el('span', 'pdf-ph', 'p. ' + (i + 1)));
+    P.scroll.append(box);
+    return { i, page: i ? null : first, el: box, pw: vp.width, ph: vp.height, canvas: null, r: 0, task: null, text: null, links: false, used: 0 };
+  });
+  if (n.pages !== doc.numPages) { n.pages = doc.numPages; dirty(); }
+  L.note!.hidden = true; P.w = 0; pdfLayout(n);
+  if (n.pos && n.pos.page > 1 || (n.pos?.y || 0) > 0) pdfGo(n, (n.pos!.page || 1) - 1, n.pos!.y || 0, true);
+  updateTitle(n); pdfSoon(0);
+  return doc;
+}
+function pdfClose(L: LiveEntry) {
+  const P = L.pdf; if (!P) return;
+  for (const p of P.pages) { p.task?.cancel(); if (p.canvas) p.canvas.width = 0; }
+  P.task?.destroy(); P.task = null; P.doc = null; P.pages = []; clearTimeout(P.posT);
+}
+// the page boxes at the card's width; true when it changed (the text layers and links are made again at the new scale)
+function pdfLayout(n: PdfNode): boolean {
+  const P = live[n.id]?.pdf; if (!P?.pages.length) return false;
+  const w = Math.max(80, Math.floor(P.scroll.clientWidth - 2 * PDF_PAD));
+  if (!P.scroll.clientWidth || w === P.w) return false;
+  const at = P.w ? pdfWhere(n) : null;
+  P.w = w;
+  for (const p of P.pages) {
+    const k = w / p.pw;
+    Object.assign(p.el.style, { width: w + 'px', height: Math.round(p.ph * k) + 'px' });
+    p.el.style.setProperty('--total-scale-factor', String(k));
+    p.text?.remove(); p.text = null; p.el.querySelector('.pdf-links')?.remove(); p.links = false;
+  }
+  if (at) pdfGo(n, at.page - 1, at.y, true);
+  return true;
+}
+// where the reading is: the page at the top of the card (from 1) and how far down it, as a fraction
+function pdfWhere(n: PdfNode): { page: number; y: number } {
+  const P = live[n.id]?.pdf; if (!P?.pages.length) return { page: 1, y: 0 };
+  const top = P.scroll.scrollTop + PDF_PAD;
+  let p = P.pages[0];
+  for (const q of P.pages) { if (q.el.offsetTop <= top + 1) p = q; else break; }
+  return { page: p.i + 1, y: clamp((top - p.el.offsetTop) / (p.el.offsetHeight || 1), 0, 1) };
+}
+function pdfGo(n: PdfNode, i: number, y = 0, instant?: boolean) {
+  const P = live[n.id]?.pdf, p = P?.pages[clamp(i, 0, (P?.pages.length || 1) - 1)]; if (!P || !p) return;
+  const top = p.el.offsetTop - PDF_PAD + y * p.el.offsetHeight;
+  if (instant) P.scroll.scrollTop = top;
+  else P.scroll.scrollTo({ top, behavior: reduceMotion ? 'auto' : 'smooth' });
+  pdfSoon(instant ? 0 : 200);
+}
+function pdfPosSave(n: PdfNode) {
+  const P = live[n.id]?.pdf; if (!P) return;
+  clearTimeout(P.posT);
+  P.posT = setTimeout(() => {
+    if (!S.nodes[n.id]) return;
+    const w = pdfWhere(n), pos = { page: w.page, y: Math.round(w.y * 1000) / 1000 };
+    const turned = pos.page !== n.pos?.page;
+    if (turned || Math.abs(pos.y - (n.pos?.y || 0)) > 0.02) { n.pos = pos; dirty(); }
+    if (turned) updateTitle(n);
+  }, 700);
+}
+// one update for every pdf card, soon: after a scroll, a zoom, a resize, a desk change
+function pdfSoon(ms = 120) { clearTimeout(PDFJS.t); PDFJS.t = setTimeout(() => { PDFJS.t = null; PDFJS.tick++; for (const n of pdfs()) pdfUpdate(n); pdfBudget(); }, ms); }
+function pdfUpdate(n: PdfNode) {
+  const P = live[n.id]?.pdf; if (!P?.doc || !P.pages.length || !P.w) return;
+  const off = lastLod || VIEW !== 'canvas' || stashed(n);
+  const sr = P.scroll.getBoundingClientRect(), vr = viewport.getBoundingClientRect(), z = cam().z;
+  const a = Math.max(sr.top, vr.top), b = Math.min(sr.bottom, vr.bottom);
+  if (off || b <= a || sr.right <= vr.left || sr.left >= vr.right) return;
+  const m = P.scroll.clientHeight / 2, top = P.scroll.scrollTop + (a - sr.top) / z - m, bot = P.scroll.scrollTop + (b - sr.top) / z + m, t = PDFJS.tick;
+  for (const p of P.pages) {
+    const y0 = p.el.offsetTop, y1 = y0 + p.el.offsetHeight;
+    if (y1 < top) continue; if (y0 > bot) break;
+    p.used = t; pdfDraw(n, P, p);
+  }
+}
+// the bitmaps over the budget go, least recently seen first; a page in view now is never taken
+function pdfBudget() {
+  const all: [PdfLive, PdfPageLive][] = [];
+  for (const n of pdfs()) {
+    const P = live[n.id].pdf!, mine = P.pages.filter(p => p.canvas || p.task).sort((x, y) => x.used - y.used);
+    const off = lastLod || VIEW !== 'canvas' || stashed(n);
+    while (mine.length && (off || mine.length > PDF_LIVE) && (off || mine[0].used !== PDFJS.tick)) pdfEvict(mine.shift()!);
+    for (const p of mine) all.push([P, p]);
+  }
+  all.sort((x, y) => x[1].used - y[1].used);
+  while (all.length > PDF_LIVE_ALL && all[0][1].used !== PDFJS.tick) pdfEvict(all.shift()![1]);
+}
+function pdfEvict(p: PdfPageLive) { p.task?.cancel(); p.task = null; if (p.canvas) { p.canvas.width = 0; p.canvas.remove(); } p.canvas = null; p.r = 0; }
+async function pdfPage(P: PdfLive, p: PdfPageLive): Promise<PdfJsPage | null> {
+  if (p.page) return p.page;
+  if (!P.doc) return null;
+  const page = await P.doc.getPage(p.i + 1); p.page = page;
+  const vp = page.getViewport({ scale: 1 });
+  if (Math.abs(vp.width - p.pw) > 0.5 || Math.abs(vp.height - p.ph) > 0.5) {   // not the first page's size: this box only
+    p.pw = vp.width; p.ph = vp.height; const k = P.w / p.pw;
+    p.el.style.height = Math.round(p.ph * k) + 'px'; p.el.style.setProperty('--total-scale-factor', String(k));
+  }
+  return page;
+}
+async function pdfDraw(n: PdfNode, P: PdfLive, p: PdfPageLive) {
+  const page = await pdfPage(P, p); if (!page || !P.doc) return;
+  const k = P.w / p.pw, r = Math.min(k * cam().z * Math.min(devicePixelRatio || 1, 3), PDF_MAXPX / p.pw, PDF_MAXPX / p.ph);
+  if (!(p.canvas && Math.abs(p.r - r) / r < 0.12) && !(p.task && p.taskR && Math.abs(p.taskR - r) / r < 0.12)) {
+    p.task?.cancel();
+    const vp = page.getViewport({ scale: r }), c = document.createElement('canvas');
+    c.width = Math.floor(vp.width); c.height = Math.floor(vp.height); c.className = 'pdf-bmp';
+    const task = page.render({ canvasContext: c.getContext('2d')!, viewport: vp }); p.task = task; p.taskR = r;
+    task.promise.then(() => {
+      if (p.task !== task) { c.width = 0; return; }
+      p.task = null; if (p.canvas) { p.canvas.width = 0; p.canvas.remove(); }
+      p.el.querySelector('.pdf-ph')?.remove(); p.el.prepend(c); p.canvas = c; p.r = r;
+    }, () => { c.width = 0; });
+  }
+  if (!p.text) pdfTextLayer(P, p, page);
+  if (!p.links) pdfLinks(n, P, p, page);
+}
+function pdfTextLayer(P: PdfLive, p: PdfPageLive, page: PdfJsPage) {
+  const div = el('div', 'textLayer'); p.text = div; p.el.append(div);
+  p.textReady = pdfLib().then(lib => new lib.TextLayer({ textContentSource: page.streamTextContent(), container: div, viewport: page.getViewport({ scale: P.w / p.pw }) }).render()).catch(() => {});
+}
+async function pdfLinks(n: PdfNode, P: PdfLive, p: PdfPageLive, page: PdfJsPage) {
+  p.links = true;
+  const box = el('div', 'pdf-links'), vp = page.getViewport({ scale: P.w / p.pw });
+  let anns: Awaited<ReturnType<PdfJsPage['getAnnotations']>> = [];
+  try { anns = await page.getAnnotations(); } catch {}
+  for (const a of anns) {
+    if (a.subtype !== 'Link' || !(a.dest || (a.url && /^https?:\/\//i.test(a.url)))) continue;
+    const [x1, y1] = vp.convertToViewportPoint(a.rect[0], a.rect[1]), [x2, y2] = vp.convertToViewportPoint(a.rect[2], a.rect[3]), l = el('a', 'pdf-link');
+    Object.assign(l.style, { left: Math.min(x1, x2) + 'px', top: Math.min(y1, y2) + 'px', width: Math.abs(x2 - x1) + 'px', height: Math.abs(y2 - y1) + 'px' });
+    if (a.dest) { l.title = 'Peek: show this place in a card beside the PDF'; l.onclick = e => { e.preventDefault(); pdfPeek(n, a.dest, p.i); }; }
+    else { l.title = a.url!; l.onclick = e => { e.preventDefault(); window.open(a.url!, '_blank', 'noopener'); }; }
+    box.append(l);
+  }
+  if (p.text?.isConnected || p.el.isConnected) p.el.append(box);
+}
+// a page's text, whitespace made single spaces: what quotes are anchored in and agents read
+async function pdfPageText(n: PdfNode, i: number): Promise<string> {
+  const L = live[n.id], P = L?.pdf; if (!P) return '';
+  if (!P.doc) await P.load;
+  if (!P.doc || i < 0 || i >= P.pages.length) return '';
+  if (P.texts[i] == null) {
+    const page = await pdfPage(P, P.pages[i]); if (!page) return '';
+    const tc = await page.getTextContent();
+    P.texts[i] = tc.items.map(t => (t.str || '') + (t.hasEOL ? '\n' : '')).join(' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/[ \t]+/g, ' ').trim();
+  }
+  return P.texts[i]!;
+}
+const flat = (s: string) => s.replace(/\s+/g, ' ').trim();
+// pages FROM..TO (from 1) as text with page markers, for agents and the ⇢ pipe: plain text works with every model
+async function pdfText(n: PdfNode, from = 1, to = from + 9, max = 60000): Promise<string> {
+  const P = live[n.id]?.pdf; if (!P) return '';
+  if (!P.doc) await P.load;
+  if (!P.doc) throw new Error(P.err || 'the PDF did not open');
+  const a = clamp(Math.floor(from), 1, P.pages.length), b = clamp(Math.floor(to), a, P.pages.length), out: string[] = [];
+  let size = 0;
+  for (let i = a; i <= b; i++) {
+    const t = `--- ${n.name} p. ${i} ---\n${await pdfPageText(n, i - 1) || '(no text on this page: a scan or a figure)'}`;
+    if (size + t.length > max) { out.push(`--- cut at ${max} characters: ask for p. ${i}–${b} ---`); break; }
+    out.push(t); size += t.length;
+  }
+  return out.join('\n\n') + (b < P.pages.length && size < max ? `\n\n(${P.pages.length} pages; this was p. ${a}–${b})` : '');
+}
+// the selected text in a pdf card, and the page it starts on
+function pdfSel(n: PdfNode): { text: string; p: PdfPageLive } | null {
+  const P = live[n.id]?.pdf, sel = getSelection(); if (!P || !sel || sel.isCollapsed || !sel.rangeCount) return null;
+  const a = sel.anchorNode, pg = (a?.nodeType === 1 ? a as Element : a?.parentElement)?.closest('.pdf-page'), p = pg && P.pages.find(q => q.el === pg);
+  const text = flat(String(sel)); if (!p || text.length < 2) return null;
+  return { text, p };
+}
+async function pdfQuote(n: PdfNode) {
+  const s = pdfSel(n); if (!s) return toast('Select some text in the PDF first.');
+  const full = flat(await pdfPageText(n, s.p.i)), k = full.indexOf(s.text);
+  const prefix = k > 0 ? full.slice(Math.max(0, k - PDF_CTX), k) : '', suffix = k >= 0 ? full.slice(k + s.text.length, k + s.text.length + PDF_CTX) : '';
+  const kids = childrenOf(n.id, 'ref').filter(c => c.kind === 'ref'), lines = Math.ceil(s.text.length / 44);
+  const r: RefNode = { id: uid('n'), kind: 'ref', in: n.in, name: uniqueName(`${n.name}-q${kids.length + 1}`, 'ref'), text: s.text, src: { node: n.id, page: s.p.i + 1, prefix, suffix },
+    srcLabel: `${n.name} › p. ${s.p.i + 1}`, x: n.x + n.w + 60, y: n.y + kids.length * 40, w: 340, h: clamp(70 + lines * 18, 110, 320) };
+  S.edges.push({ id: uid('e'), from: n.id, to: r.id, type: 'ref' });
+  getSelection()?.removeAllRanges();
+  addNode(r);
+  toast(`${r.name}: a quote from p. ${s.p.i + 1}. Its ↗ finds the text in the PDF again.`);
+  return r;
+}
+// Finds TEXT (with its prefix and suffix, when given) on page I first, then on every page; scrolls there and lights the
+// text up. False when the text is nowhere in the file.
+async function pdfFind(n: PdfNode, text: string, i: number, prefix = '', suffix = ''): Promise<boolean> {
+  const P = live[n.id]?.pdf; if (!P) return false;
+  if (!P.doc) await P.load;
+  if (!P.doc) return false;
+  const want = flat(text), order = [i, ...P.pages.map(p => p.i).filter(j => j !== i)];
+  for (const j of order) {
+    if (j < 0 || j >= P.pages.length) continue;
+    const t = flat(await pdfPageText(n, j)); let k = t.indexOf(flat(prefix) + want + flat(suffix));
+    k = k >= 0 ? k + flat(prefix).length : t.indexOf(want);
+    if (k < 0) continue;
+    pdfGo(n, j, 0, true);
+    const p = P.pages[j]; await pdfDraw(n, P, p); await p.textReady;
+    const spans = [...(p.text?.querySelectorAll<HTMLElement>('span:not(.markedContent)') || [])];
+    // the text layer's spans as one flat string, each character remembering its span
+    let s = '', own: number[] = [];
+    spans.forEach((sp, si) => { for (const ch of sp.textContent!.replace(/\s+/g, ' ')) { if (ch === ' ' && (!s || s.endsWith(' '))) continue; s += ch; own.push(si); } if (s && !s.endsWith(' ')) { s += ' '; own.push(-1); } });
+    let h = s.indexOf(want); if (h < 0) h = s.indexOf(want.slice(0, 40));
+    const hit = new Set<number>(); if (h >= 0) for (let c = h; c < h + want.length && c < own.length; c++) if (own[c] >= 0) hit.add(own[c]);
+    const firstHit = [...hit][0];
+    if (firstHit != null) P.scroll.scrollTop = p.el.offsetTop - PDF_PAD + Math.max(0, spans[firstHit].offsetTop - 60);
+    hit.forEach(si => spans[si].classList.add('pdf-hit')); setTimeout(() => hit.forEach(si => spans[si].classList.remove('pdf-hit')), 2200);
+    return true;
+  }
+  return false;
+}
+function pdfJumpQuote(r: RefNode, n: PdfNode) {
+  jumpNode(n, 1, async () => {
+    if (!await pdfFind(n, r.text, (r.src.page || 1) - 1, r.src.prefix, r.src.suffix)) { pdfGo(n, (r.src.page || 1) - 1); toast('The quote is no longer in the PDF; here is the page it came from.'); }
+    live[n.id]?.pdf?.scroll.focus({ preventScroll: true });
+  });
+}
+const PDF_FIND: { q: string; id: string; page: number } = { q: '', id: '', page: -1 };
+function pdfFindAsk(n: PdfNode) {
+  ask('Find in ' + n.name, PDF_FIND.id === n.id ? PDF_FIND.q : '', async q => {
+    q = flat(q); if (!q) return;
+    const P = live[n.id]?.pdf; if (!P?.doc) return;
+    const again = PDF_FIND.id === n.id && PDF_FIND.q === q, start = again ? PDF_FIND.page + 1 : pdfWhere(n).page - 1;
+    Object.assign(PDF_FIND, { q, id: n.id });
+    for (let s = 0; s < P.pages.length; s++) {
+      const j = (start + s) % P.pages.length;
+      if (flat(await pdfPageText(n, j)).toLowerCase().includes(q.toLowerCase())) {
+        PDF_FIND.page = j;
+        const t = flat(await pdfPageText(n, j)), k = t.toLowerCase().indexOf(q.toLowerCase());
+        await pdfFind(n, t.slice(k, k + q.length), j);
+        P.scroll.focus({ preventScroll: true });
+        return toast(`p. ${j + 1}: found. / and Enter again for the next one.`);
+      }
+    }
+    toast(`"${q}" is not in ${n.name}.`);
+  });
+}
+// A peek: the place a link points at, drawn into an image card beside the PDF (so it can be kept, moved, copied or sent on)
+async function pdfPeek(n: PdfNode, dest: unknown, from: number) {
+  const P = live[n.id]?.pdf; if (!P?.doc) return;
+  try {
+    const d = typeof dest === 'string' ? await P.doc.getDestination(dest) : dest as unknown[]; if (!Array.isArray(d)) return;
+    const idx = typeof d[0] === 'object' && d[0] ? await P.doc.getPageIndex(d[0]) : Number(d[0]);
+    const p = P.pages[idx]; if (!p) return;
+    const page = await pdfPage(P, p); if (!page) return;
+    const vp1 = page.getViewport({ scale: 1 }), xyz = (d[1] as { name?: string } | null)?.name === 'XYZ' && typeof d[3] === 'number';
+    const y = xyz ? vp1.convertToViewportPoint(0, d[3] as number)[1] : 0, y0 = Math.max(0, Math.round(y - 14)), h = Math.min(280, p.ph - y0);
+    const old = Object.values(S.nodes).find((m): m is ImageNode => m.kind === 'image' && m.at?.node === n.id && m.at.page === idx + 1 && Math.abs(m.at.y - y0) < 4);
+    if (old) { jumpNode(old); return; }
+    const sc = Math.min(3, 1400 / p.pw), vp = page.getViewport({ scale: sc }), full = document.createElement('canvas');
+    full.width = Math.floor(vp.width); full.height = Math.floor(vp.height);
+    await page.render({ canvasContext: full.getContext('2d')!, viewport: vp }).promise;
+    const cut = document.createElement('canvas'); cut.width = full.width; cut.height = Math.max(1, Math.floor(h * sc));
+    cut.getContext('2d')!.drawImage(full, 0, Math.floor(y0 * sc), full.width, cut.height, 0, 0, cut.width, cut.height); full.width = 0;
+    const blob = await new Promise<Blob | null>(r => cut.toBlob(r, 'image/png')); if (!blob) throw new Error('could not draw the page');
+    const stored = await imgStore({ data: blob, type: 'image/png', iw: cut.width, ih: cut.height }), sz = imgSize(cut.width, cut.height);
+    const peeks = childrenOf(n.id, 'ref').filter(c => c.kind === 'image').length, w = 340, hh = Math.round(w * cut.height / cut.width) + HDR;
+    const fromTop = P.pages[from] ? P.pages[from].el.offsetTop - P.scroll.scrollTop : 0;
+    const img = addNode({ kind: 'image', name: uniqueName(`${n.name}-p${idx + 1}`, 'image'), ...stored, iw: cut.width, ih: cut.height, at: { node: n.id, page: idx + 1, y: y0 },
+      in: n.in, x: n.x + n.w + 60, y: Math.round(n.y + HDR + clamp(fromTop, 0, n.h - 80) + peeks * 12), w: sz.w > w ? w : sz.w, h: sz.w > w ? hh : sz.h });
+    S.edges.push({ id: uid('e'), from: n.id, to: img.id, type: 'ref' }); renderEdges(); dirty();
+    toast(`${img.name}: a peek at p. ${idx + 1}. ⤴ goes there in the PDF.`);
+  } catch (e) { toast('Could not show that place: ' + (e?.message || e)); }
+}
+function peekGo(n: ImageNode) {
+  const p = n.at && S.nodes[n.at.node] as PdfNode | undefined; if (!p || p.kind !== 'pdf') return toast('The PDF this peek came from is gone.');
+  jumpNode(p, 1, () => { const P = live[p.id]?.pdf, pg = P?.pages[n.at!.page - 1]; pdfGo(p, n.at!.page - 1, pg ? n.at!.y / pg.ph : 0); P?.scroll.focus({ preventScroll: true }); });
+}
+// the keys of a pdf card (keys.ts map `pdf`): the card that has the keyboard, else the selected one
+function pdfKeyCard(): PdfNode | null {
+  const a = document.activeElement?.closest('.node') as HTMLElement | null, n = (a && S.nodes[a.dataset.id!]) || activeNode();
+  return n?.kind === 'pdf' ? n : null;
+}
+function pdfKey(f: (n: PdfNode, P: PdfLive) => unknown) { return () => { const n = pdfKeyCard(), P = n && live[n.id]?.pdf; if (!n || !P) return false; f(n, P); }; }
+const PDF_KC: Record<string, KeyCmdFn> = {
+  'pdf.down': pdfKey((n, P) => P.scroll.scrollBy({ top: 60 })), 'pdf.up': pdfKey((n, P) => P.scroll.scrollBy({ top: -60 })),
+  'pdf.screen': pdfKey((n, P) => P.scroll.scrollBy({ top: P.scroll.clientHeight * 0.9, behavior: reduceMotion ? 'auto' : 'smooth' })),
+  'pdf.screenBack': pdfKey((n, P) => P.scroll.scrollBy({ top: -P.scroll.clientHeight * 0.9, behavior: reduceMotion ? 'auto' : 'smooth' })),
+  'pdf.next': pdfKey(n => pdfGo(n, pdfWhere(n).page)), 'pdf.prev': pdfKey(n => { const w = pdfWhere(n); pdfGo(n, w.y > 0.05 ? w.page - 1 : w.page - 2); }),
+  'pdf.first': pdfKey(n => pdfGo(n, 0)), 'pdf.last': pdfKey((n, P) => pdfGo(n, P.pages.length - 1)),
+  'pdf.quote': pdfKey(n => pdfQuote(n)), 'pdf.find': pdfKey(n => pdfFindAsk(n)),
+  'pdf.goto': pdfKey((n, P) => ask(`Go to page (1–${P.pages.length})`, '', v => { const k = parseInt(v, 10); if (k >= 1) pdfGo(n, k - 1); })),
+};
+// a PDF onto the board: a file on this host (`path`), or bytes from this device into the blob store
+function pdfFromPath(path: string, at: BoardPoint | null = null, extra: Partial<PdfNode> = {}): PdfNode {
+  if (VIEW !== 'canvas') setView('canvas');
+  const name = uniqueName(fsBase(path).replace(/\.pdf$/i, '') || 'paper', 'pdf');
+  if (at) return addNode({ kind: 'pdf', name, path, x: Math.round(at.x - 260), y: Math.round(at.y - 340), w: 520, h: 680, ...extra });
+  return newAt('pdf', { name, path, w: 520, h: 680, ...extra });
+}
+const isPdfFile = (f: File) => f.type === 'application/pdf' || /\.pdf$/i.test(f.name || '');
+async function pdfsOnCanvas(files: Iterable<File>, at = pastePoint()): Promise<PdfNode[]> {
+  const made: PdfNode[] = [], failed: string[] = [];
+  for (const [i, f] of [...files].filter(isPdfFile).entries()) {
+    try {
+      if (f.size > IMG_MAX) throw new Error(`too large (${Math.round(f.size / 1048576)} MB, the limit is 32 MB); a file on the host opens at any size`);
+      let stored: Partial<PdfNode>;
+      if (!DAEMON) {
+        if (f.size > PDF_DEMO_MAX) throw new Error('too large for demo mode (2 MB)');
+        stored = { src: await new Promise<string>((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).replace(/^data:[^;,]*/, 'data:application/pdf')); r.onerror = () => rej(r.error); r.readAsDataURL(f); }) };
+      } else {
+        const r = await fetch('/api/blob', { method: 'POST', redirect: 'manual', cache: 'no-store', headers: { 'Content-Type': 'application/pdf' }, body: f });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || 'upload failed (HTTP ' + r.status + ')');
+        if (j.type !== 'application/pdf') throw new Error('not a PDF');
+        stored = { blob: j.hash };
+      }
+      if (VIEW !== 'canvas') setView('canvas');
+      made.push(addNode({ kind: 'pdf', name: uniqueName((f.name || 'paper').replace(/\.pdf$/i, ''), 'pdf'), ...stored, x: Math.round(at.x - 260 + i * 30), y: Math.round(at.y - 340 + i * 30), w: 520, h: 680 }));
+    } catch (e) { failed.push((f.name || 'PDF') + ': ' + (e?.message || e)); }
+  }
+  if (failed.length) toast('Not opened: ' + failed.join('; '), 6000);
+  else if (made.length) toast(made.length === 1 ? `${made[0].name}: a PDF card. Select text and press ❝ (q) to quote it; links open peeks.` : `${made.length} PDF cards.`);
+  return made;
+}
+function pdfFromDevice() {
+  const inp = Object.assign(el('input'), { type: 'file', accept: 'application/pdf,.pdf', multiple: true });
+  inp.onchange = () => { if (inp.files!.length) pdfsOnCanvas(inp.files!, viewCenterWorld()); };
+  inp.click();
+}
+// ================================================================ media cards (F-A41)
+// An `op` card is one step of a pipeline that makes or reads images. Its inputs are the cards with a pipe edge into it:
+// a page or a quote gives text, an image card its picture, another op card the variation picked on it (or its text).
+// imagine and edit go to POST /api/media, which asks the image provider web.json names (OpenAI-compatible or Hugging
+// Face; the keys stay on the server); describe and expand go to `sample`, the model the assistant uses. So no step
+// is tied to one vendor. A run keeps the result in the card with a signature of what made it (the op, its settings,
+// the prompt and the inputs); a card whose inputs or settings moved since is stale (amber) until it runs again, and
+// "Run stale media cards" runs them in pipeline order. → takes the picked result out as an image card or a page.
+const OP_KINDS: Record<OpKind, { label: string; image: boolean; needs: string; hint: string }> = {
+  imagine: { label: 'imagine', image: true, needs: '', hint: 'What to draw. Text piped in comes before it.' },
+  edit: { label: 'edit', image: true, needs: 'image', hint: 'What to change in the image piped in.' },
+  describe: { label: 'describe', image: false, needs: 'image', hint: 'What to say about the image (blank: describe it).' },
+  expand: { label: 'expand', image: false, needs: '', hint: 'An idea to grow into a detailed image prompt.' },
+};
+const OP_SIZES = ['1024x1024', '1536x1024', '1024x1536', '512x512'];
+const OP_DESCRIBE = 'Describe this image for someone who cannot see it: the subject, the composition, the style, the colours and any text in it. Be concrete and brief.';
+const OP_EXPAND = 'Rewrite the idea below as one detailed prompt for an image-generation model: subject, setting, composition, lighting, style and medium, in one paragraph. Output only the prompt.';
+const fnv = (s: string): string => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619); return (h >>> 0).toString(36); };
+const opProviders = (): MediaProviderInfo[] => DAEMON && Array.isArray(INFO?.media) ? INFO!.media! : [];
+/* What an op card reads from one card piped into it. */
+type OpInput = { from: BoardNode; text?: string; image?: OpImage };
+// the text a card holds now: a page's replica or editor text, a quote, an op's text result
+function cardText(n: BoardNode): string {
+  if (n.kind === 'buffer') { const v = live[n.id]?.view; return v ? v.state.doc.toString() : FR.on && n.buf ? frBufOf(n)?.text ?? n.text ?? '' : n.text || ''; }
+  if (n.kind === 'ref') return n.text || '';
+  return '';
+}
+const opPicked = (n: OpNode): OpImage | null => n.out?.images?.[n.out.pick || 0] || null;
+function opInputs(n: OpNode): OpInput[] {
+  return S.edges.filter(e => e.type === 'pipe' && e.to === n.id).map(e => S.nodes[e.from]).filter(Boolean).map((m): OpInput => {
+    if (m.kind === 'image') return { from: m, image: { blob: m.blob, src: m.src, mime: m.mime } };
+    if (m.kind === 'op') { const p = opPicked(m); return p ? { from: m, image: p } : { from: m, text: m.out?.text || '' }; }
+    return { from: m, text: cardText(m) };
+  });
+}
+function opSig(n: OpNode, ins = opInputs(n)): string {
+  const k = OP_KINDS[n.op] || OP_KINDS.imagine;
+  return fnv(JSON.stringify([n.op, n.prompt || '', k.image ? [n.provider || '', n.model || '', n.size || '', n.n || 1] : 0,
+    ins.map(i => i.image ? 'i' + (i.image.blob || fnv(i.image.src || '')) : 't' + fnv(i.text || ''))]));
+}
+const opStale = (n: OpNode): boolean => !!n.out && !n.out.err && n.out.sig !== opSig(n);
+function opProvider(n: OpNode): MediaProviderInfo | null { const ps = opProviders(); return ps.find(p => p.name === n.provider) || ps[0] || null; }
+function mountOp(n: OpNode, L: LiveEntry) {
+  if (!OP_KINDS[n.op]) n.op = 'imagine';
+  const bar = el('div', 'op-bar'), kind = el('select'), prov = el('select'), size = el('select'), count = el('select'), run = el('button', 'go', 'Run');
+  kind.title = 'What this card does'; prov.title = 'Who makes the image: the providers this server names (services.workbench.media)'; size.title = 'Image size'; count.title = 'Variations';
+  for (const k of Object.keys(OP_KINDS)) kind.append(Object.assign(el('option', null, OP_KINDS[k as OpKind].label), { value: k }));
+  for (const s of OP_SIZES) size.append(Object.assign(el('option', null, s.replace('x', '×')), { value: s }));
+  for (const c of [1, 2, 3, 4]) count.append(Object.assign(el('option', null, '×' + c), { value: String(c) }));
+  bar.append(kind, prov, size, count, run);
+  const prompt = el('textarea', 'op-prompt'), ins = el('div', 'op-ins'), out = el('div', 'op-out');
+  prompt.rows = 3; prompt.spellcheck = true;
+  L.body!.append(bar, prompt, ins, out);
+  L.op = { prompt, out, ins, run, busy: false };
+  const fill = () => {
+    kind.value = n.op;
+    prov.replaceChildren();
+    const ps = opProviders();
+    for (const p of ps) for (const m of p.models) prov.append(Object.assign(el('option', null, `${p.name} · ${m}`), { value: p.name + '\n' + m }));
+    if (!ps.length) prov.append(Object.assign(el('option', null, DAEMON ? 'no image provider' : 'demo: no provider'), { value: '' }));
+    const p = opProvider(n); prov.value = p ? p.name + '\n' + (p.models.includes(n.model!) ? n.model : p.models[0]) : '';
+    size.value = OP_SIZES.includes(n.size!) ? n.size! : OP_SIZES[0]; count.value = String(clamp(n.n || 1, 1, 4));
+    const img = OP_KINDS[n.op].image; prov.hidden = size.hidden = count.hidden = !img;
+    prompt.placeholder = OP_KINDS[n.op].hint;
+  };
+  fill(); prompt.value = n.prompt || '';
+  const set = () => {
+    n.op = kind.value as OpKind; const [pn, pm] = prov.value.split('\n'); if (pn) { n.provider = pn; n.model = pm; }
+    n.size = size.value; n.n = +count.value; fill(); dirty(); opRender(n);
+  };
+  for (const s of [kind, prov, size, count]) { s.onchange = set; s.addEventListener('pointerdown', e => e.stopPropagation()); }
+  prompt.addEventListener('input', () => { n.prompt = prompt.value; dirty(); opRender(n); });
+  prompt.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); opRun(n); } });
+  prompt.addEventListener('pointerdown', e => e.stopPropagation());
+  run.onclick = e => { e.stopPropagation(); opRun(n); };
+  L.el!.addEventListener('pointerenter', () => opRender(n));
+  opRender(n);
+}
+function opRender(n: OpNode) {
+  const L = live[n.id], O = L?.op; if (!O) return;
+  const ins = opInputs(n), k = OP_KINDS[n.op] || OP_KINDS.imagine;
+  O.ins.replaceChildren();
+  if (!ins.length) O.ins.append(el('span', 'op-none', k.needs === 'image' ? 'No image yet: drag the ● of an image card (or another media card) onto this one.' : 'Pipe in a page, a quote or another media card for more context (optional).'));
+  for (const i of ins) {
+    const chip = el('button', 'op-in', (i.image ? '▣ ' : '¶ ') + i.from.name);
+    chip.title = i.image ? 'An image from ' + pathOf(i.from.id) : (i.text || '').slice(0, 300) || '(empty)';
+    chip.onclick = e => { e.stopPropagation(); jumpNode(i.from); };
+    O.ins.append(chip);
+  }
+  O.out.replaceChildren();
+  const o = n.out;
+  if (O.busy) O.out.append(el('div', 'op-note', 'Running…'));
+  else if (o?.err) O.out.append(el('div', 'op-note op-err', o.err));
+  else if (o?.images?.length) {
+    const grid = el('div', 'op-grid'); grid.dataset.n = String(o.images.length);
+    o.images.forEach((im, i) => {
+      const b = el('button', 'op-var' + (i === (o.pick || 0) ? ' on' : '')), img = el('img');
+      img.src = imgUrl(im); img.alt = `${n.name} ${i + 1}`; img.draggable = false; b.append(img);
+      b.title = o.images!.length > 1 ? 'Pick this one: the cards this one pipes into take it' : n.name;
+      b.onclick = e => { e.stopPropagation(); if ((o.pick || 0) !== i) { o.pick = i; dirty(); opRender(n); opDownstream(n); } };
+      b.ondblclick = e => { e.stopPropagation(); opExtract(n); };
+      grid.append(b);
+    });
+    O.out.append(grid);
+  } else if (o?.text) O.out.append(el('div', 'op-text', o.text));
+  else O.out.append(el('div', 'op-note', 'Ctrl-Enter or Run.'));
+  const stale = opStale(n);
+  L.el!.classList.toggle('op-stale', stale); O.run.textContent = O.busy ? '…' : stale ? 'Run again' : 'Run'; O.run.disabled = O.busy;
+  $('.badge', L.hdr!)!.textContent = badgeOf(n);
+}
+// the cards an op pipes into show what changed (stale) at once
+function opDownstream(n: BoardNode) { for (const t of childrenOf(n.id, 'pipe')) if (t.kind === 'op') opRender(t); }
+async function opImageBlob(i: OpImage): Promise<{ blob?: string; data?: Blob }> {
+  if (i.blob && /^[0-9a-f]{64}$/.test(i.blob)) return { blob: i.blob };
+  return { data: await imageBlobOf(i) };
+}
+async function opRun(n: OpNode, quiet?: boolean): Promise<boolean> {
+  const L = live[n.id], O = L?.op; if (!O || O.busy) return false;
+  const k = OP_KINDS[n.op] || OP_KINDS.imagine, ins = opInputs(n), sig = opSig(n, ins);
+  const texts = ins.filter(i => i.text?.trim()).map(i => i.text!.trim()), img = ins.find(i => i.image)?.image;
+  const prompt = [...texts, (n.prompt || '').trim()].filter(Boolean).join('\n\n');
+  const fail = (msg: string) => { n.out = { sig, at: Date.now(), err: msg }; dirty(); if (!quiet) toast(`${n.name}: ${msg}`, 6000); return false; };
+  if (k.needs === 'image' && !img) return fail('this card needs an image piped in.');
+  if (k.image) {
+    if (!DAEMON) return fail('making images needs a Workbench server with an image provider; demo mode has none.');
+    const p = opProvider(n); if (!p) return fail('this server names no image provider (services.workbench.media.providers).');
+    if (!prompt) return fail('write what to draw first.');
+    if (n.op === 'edit' && !img!.blob) return fail('the image to edit is not on this server.');
+  }
+  O.busy = true; opRender(n);
+  try {
+    if (k.image) {
+      const p = opProvider(n)!, model = p.models.includes(n.model!) ? n.model : p.models[0];
+      const body: Record<string, unknown> = { provider: p.name, model, op: n.op, prompt, n: clamp(n.n || 1, 1, 4), size: OP_SIZES.includes(n.size!) ? n.size : OP_SIZES[0] };
+      if (n.op === 'edit') body.image = img!.blob;
+      const r = await fetch('/api/media', { method: 'POST', cache: 'no-store', redirect: 'manual', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+      n.out = { sig, at: Date.now(), images: (j.images || []).map((x: { hash: string; type: string }) => ({ blob: x.hash, mime: x.type })), pick: 0 };
+    } else {
+      const sample = n.op === 'describe' ? await canSeeImages() : await getSample();
+      if (!sample) throw new Error(DAEMON ? 'no language model on this server' : 'no language model here');
+      const opts: PageSampleOpts = { modelTier: 'default', cache: false };
+      let ask: string;
+      if (n.op === 'describe') { const b = await opImageBlob(img!); opts.images = [b.data || await imageBlobOf({ blob: b.blob })]; ask = (n.prompt || '').trim() ? `${n.prompt!.trim()}${texts.length ? '\n\nContext:\n' + texts.join('\n\n') : ''}` : OP_DESCRIBE; }
+      else { if (!prompt) throw new Error('write an idea to expand first'); ask = OP_EXPAND + '\n\n' + prompt; }
+      const res = await sample(ask, opts);
+      const text = res.text.trim(); if (!text) throw new Error('the model answered nothing');
+      n.out = { sig, at: Date.now(), text };
+    }
+    dirty();
+    if (!quiet) toast(`${n.name}: done.${n.out.images && n.out.images.length > 1 ? ' Click a variation to pick it; → takes it out as a card.' : ''}`);
+    return true;
+  } catch (e) { return fail(String(e?.message || e)); }
+  finally { O.busy = false; opRender(n); opDownstream(n); }
+}
+// every stale (or never run) media card, upstream first, each once its inputs are fresh
+async function opRunStale() {
+  const ops = Object.values(S.nodes).filter((m): m is OpNode => m.kind === 'op' && !!live[m.id]?.op);
+  const due = new Set(ops.filter(m => !m.out || opStale(m)).map(m => m.id));
+  if (!due.size) return toast('No media card is stale.');
+  // anything downstream of a due card is due too
+  for (let grew = true; grew;) { grew = false; for (const m of ops) if (!due.has(m.id) && opInputs(m).some(i => due.has(i.from.id))) { due.add(m.id); grew = true; } }
+  toast(`Running ${due.size} media card${due.size === 1 ? '' : 's'}…`);
+  let ok = 0, failed = 0;
+  for (let left = due.size; left;) {
+    const ready = ops.filter(m => due.has(m.id) && !opInputs(m).some(i => due.has(i.from.id)));
+    if (!ready.length) { toast('A loop of pipes between media cards: nothing more runs.'); break; }
+    for (const m of ready) { due.delete(m.id); left--; if (await opRun(m, true)) ok++; else failed++; }
+  }
+  toast(`Media cards: ${ok} ran${failed ? `, ${failed} failed (the card says why)` : ''}.`, failed ? 6000 : 2600);
+}
+// the picked result as its own card: an image card (the same blob) or a page, with a spawn edge from the op
+async function opExtract(n: OpNode) {
+  const o = n.out, im = opPicked(n);
+  if (im) {
+    let iw = 0, ih = 0; try { const i = await imgLoad(imgUrl(im)); iw = i.naturalWidth; ih = i.naturalHeight; } catch {}
+    const sz = imgSize(iw, ih);
+    const c = addNode({ kind: 'image', name: uniqueName(n.name + '-' + ((o!.pick || 0) + 1), 'image'), blob: im.blob, src: im.src, mime: im.mime, iw, ih, in: n.in, x: n.x + n.w + 60, y: n.y, w: sz.w, h: sz.h });
+    S.edges.push({ id: uid('e'), from: n.id, to: c.id, type: 'spawn' }); renderEdges(); dirty();
+    return toast(`${c.name}: an image card from ${n.name}.`);
+  }
+  if (o?.text) {
+    const c = addNode({ kind: 'buffer', name: uniqueName(n.name + '-text', 'buffer'), text: o.text + '\n', in: n.in, x: n.x + n.w + 60, y: n.y, w: 420, h: 300 });
+    S.edges.push({ id: uid('e'), from: n.id, to: c.id, type: 'spawn' }); renderEdges(); dirty();
+    return toast(`${c.name}: a page from ${n.name}.`);
+  }
+  toast('Nothing to take out yet: run the card first.');
+}
+// a new media card; FROM (an image or another card) is piped into it
+function opNew(op: OpKind, from?: BoardNode | null): OpNode {
+  const p = opProviders()[0], base = { op, prompt: '', provider: p?.name, model: p?.models[0], size: OP_SIZES[0], n: 1, w: 380, h: 420 };
+  let n: OpNode;
+  if (from) {
+    n = addNode({ kind: 'op', name: uniqueName(from.name + '-' + op, 'op'), ...base, in: from.in, x: from.x + from.w + 70, y: from.y });
+    S.edges.push({ id: uid('e'), from: from.id, to: n.id, type: 'pipe' }); renderEdges(); dirty(); opRender(n);
+  } else n = newAt('op', { name: uniqueName(op, 'op'), ...base });
+  if (OP_KINDS[op].image && !p) toast(DAEMON ? 'This server names no image provider yet (services.workbench.media.providers); describe and expand still work.' : 'Demo mode has no image provider; describe and expand work where a model is.', 6000);
+  setTimeout(() => live[n.id]?.op?.prompt.focus({ preventScroll: true }), 50);
+  return n;
 }
 // File-backed artifact: the HTML file is the source of truth; any agent (claude code, oh-my-pi, a script) writes it and the node republishes and reloads.
 async function artFromFile(n: ArtifactNode, L: LiveEntry): Promise<boolean> {
@@ -8460,6 +9140,7 @@ function graphOpen() { const b = G.sel && $('#g-card .ex-btns button') as HTMLBu
 /* A command: the key event, the key's name, and 'leader' when the leader ran it. */
 type KeyCmdFn = (e?: KeyboardEvent, k?: string, via?: string) => unknown;
 const KC: Record<string, KeyCmdFn> = {
+  ...PDF_KC,
   'palette.open': () => { PICK = null; openPalette(''); },
   'palette.commands': () => { PICK = null; openPalette('>'); },
   'dock.toggle': () => toggleDockTerm(),
@@ -8957,6 +9638,7 @@ function fsIdent(n: BoardNode): FsIdent | null {
     if (!d) return null; return { host, dir: fsTilde(fsNorm(d), host) };
   }
   if (n.kind === 'artifact' && n.file) { const f = fsTilde(fsNorm(n.file, '~'), ''); return { host: '', dir: fsDirname(f), path: f }; }
+  if (n.kind === 'pdf' && n.path) { const f = fsTilde(fsNorm(n.path, '~'), ''); return { host: '', dir: fsDirname(f), path: f }; }
   // A frames-mode page is its file on this host: buf is an id of edwind's (R6.1), notesDir-relative, ~/… or absolute.
   if (n.kind === 'buffer' && FR.on && n.buf && !n.buf.startsWith('name:')) {
     const abs = /^[/~]/.test(n.buf); if (!abs && !INFO?.notes) return null;
@@ -9021,6 +9703,7 @@ function ghostOpen(n: BoardNode | null | undefined) {
   if (n.dir) { const d = fsFrameFor(host, n.link ? target : n.path!, n); if (n.mount) { d.mount = true; placeFrame(d); } removeGhost(n); if (f) relayout(f, true); restack(); renderTree(); renderLinks(); dirty(); fsExpand(d); activate(d.id); return d; }
   const place = { in: f ? f.id : undefined, x: n.x, y: n.y };
   const done = (real: BoardNode | null | undefined) => { if (!real) return null; removeGhost(n); if (f) { renumber(f); relayout(f, true); } restack(); renderTree(); perspEdgesRebuild(); renderLinks(); dirty(); return real; };
+  if (DAEMON && !host && /\.pdf$/i.test(target)) return done(addNode({ kind: 'pdf', name: uniqueName(n.name.replace(/\.pdf$/i, ''), 'pdf'), path: target, ...place, w: 520, h: 680 }));   // a PDF reads as a pdf card (F-A40)
   if (!DAEMON) { const file = fsGet(target.replace(/^~/, '/home/me')); return done(addNode({ kind: 'buffer', name: n.name, text: file?.t === 'f' ? file.d : '# ' + n.name + '\n', ...place, w: 460, h: 320 })); }
   const emacs = () => { const real = addNode({ kind: 'term', backend: 'pty', cmd: emacsCmd(target), emacs: target, name: n.name, ...place, w: 640, h: 440, env: { TERM: 'xterm-256color', COLORTERM: 'truecolor' } }); live[real.id]?.el!.classList.add('emacs'); return real; };
   // A file on this host opens as a page when edwind edits it (frFileOpen); the /edit socket reaches this host's edwind only.
@@ -9792,5 +10475,6 @@ Object.assign(window.__canvas, { DESK, deskGo, deskSend, deskList, deskAt, deskP
   deskPlace, deskBack, deskColumns, columnsShow, deskColumnOf, deskRevert, deskSaveState, deskDescribe, WIN, perspSwitch,
   deskQuery, deskQueryParse, deskQuerySet, deskQueryTick, MOTION, LOD, WHEEL, FLIP, TAP, FTOUCH, KM4, kmFlush, frKeymaps, settle });
 Object.defineProperty(window.__canvas, 'lastLod', { get: () => lastLod });
+Object.assign(window.__canvas, { pickChip, pdfFromPath, pdfsOnCanvas, pdfText, pdfSel, pdfQuote, pdfFind, pdfGo, pdfWhere, pdfPeek, peekGo, pdfUrl, jumpRef, selectionOf, pipeFrom, opNew, opRun, opRunStale, opSig, opStale, opInputs, opExtract, sketchSvg, sketchPng, sketchCopy, sketchInk, badgeOf });
 boot();
 })();

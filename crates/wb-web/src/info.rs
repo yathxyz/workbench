@@ -23,7 +23,7 @@ use crate::edit_client::EditHandle;
 use crate::http::{ApiError, ApiQuery, Param};
 use crate::hub::{CallError, HubStatus, with_state};
 use crate::util::sanitize_sid;
-use crate::{notes, sample};
+use crate::{media, notes, sample};
 
 /// Lines a capture returns when the request does not say.
 const CAPTURE_DEFAULT: usize = 200;
@@ -78,6 +78,7 @@ async fn info(State(app): State<AppState>) -> Json<Value> {
         }),
         "notes": app.cfg.notes_dir,
         "notesExists": notes::exists(&app).await,
+        "media": media::catalog(&app),
         "state": app.cfg.state_dir,
         "dist": null,
         "tmux": false,

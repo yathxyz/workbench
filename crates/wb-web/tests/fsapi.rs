@@ -1,4 +1,4 @@
-//! `GET /api/ls`, `/api/stat`, `/api/cat` and `POST /api/mv` against the real binary
+//! `GET /api/ls`, `/api/stat`, `/api/cat`, `/api/raw` and `POST /api/mv` against the real binary
 //! (design §3.5.5, 20-web §5.3).
 //!
 //! wb-web inherits this process's `$HOME`, which these tests cannot change, so they use
@@ -220,6 +220,74 @@ async fn cat_reads_regular_files_up_to_the_clamped_limit() {
         (cat(&root.join("missing"), ""), "No such file"),
         (cat(&text, "&limit=lots"), "bad query"),
         ("/api/cat?path=t.txt".to_owned(), "must be absolute"),
+    ] {
+        let (status, body) = get(&web, &target).await;
+        assert_eq!(status, 400, "{target}");
+        assert!(
+            body["error"].as_str().unwrap().contains(needle),
+            "{target}: {body}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_serves_pdfs_whole_or_one_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = Web::start(&dir.path().join("hub.sock"));
+    let (_tmp, root) = scratch();
+    let pdf: Vec<u8> = b"%PDF-1.7\n"
+        .iter()
+        .copied()
+        .chain((0..200_000u32).map(|i| (i % 251) as u8))
+        .collect();
+    let file = root.join("paper.pdf");
+    fs::write(&file, &pdf).unwrap();
+    fs::write(root.join("page.html"), "<script>alert(1)</script>").unwrap();
+    let raw = |path: &Path| format!("/api/raw?path={}", q(&s(path)));
+
+    let res = web.req("GET", &raw(&file)).send().await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body, pdf);
+    assert_eq!(res.header("content-type"), Some("application/pdf"));
+    assert_eq!(res.header("accept-ranges"), Some("bytes"));
+    assert_eq!(res.header("content-disposition"), Some("attachment"));
+    assert_eq!(
+        res.header("content-security-policy"),
+        Some("default-src 'none'; sandbox")
+    );
+    assert_eq!(res.header("content-length"), Some(&*pdf.len().to_string()));
+
+    let size = pdf.len();
+    for (range, from, to) in [
+        ("bytes=0-4", 0, 4),
+        ("bytes=70000-70009", 70_000, 70_009),
+        ("bytes=-10", size - 10, size - 1),
+        ("bytes=199990-", 199_990, size - 1),
+    ] {
+        let res = web.req("GET", &raw(&file)).set("Range", range).send().await;
+        assert_eq!(res.status, 206, "{range}");
+        assert_eq!(res.body, &pdf[from..=to], "{range}");
+        assert_eq!(
+            res.header("content-range"),
+            Some(&*format!("bytes {from}-{to}/{size}")),
+            "{range}"
+        );
+    }
+    let res = web
+        .req("GET", &raw(&file))
+        .set("Range", "bytes=999999-")
+        .send()
+        .await;
+    assert_eq!(res.status, 416);
+    assert_eq!(
+        res.header("content-range"),
+        Some(&*format!("bytes */{size}"))
+    );
+
+    for (target, needle) in [
+        (raw(&root.join("page.html")), "only PDF files"),
+        (raw(&root), "not a regular file"),
+        (raw(&root.join("missing.pdf")), "No such file"),
     ] {
         let (status, body) = get(&web, &target).await;
         assert_eq!(status, 400, "{target}");

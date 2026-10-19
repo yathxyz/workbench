@@ -38,7 +38,7 @@ interface WBKeyNameEvent {
   ctrlKey?: boolean; altKey?: boolean; metaKey?: boolean; shiftKey?: boolean;
 }
 type WBKeyTransientName = 'palette' | 'dialog' | 'hints' | 'overview' | 'ring' | 'arrange';
-type WBKeyInteriorName = 'term' | 'page' | 'text' | 'edwin' | 'control' | 'frame';
+type WBKeyInteriorName = 'term' | 'page' | 'text' | 'edwin' | 'control' | 'frame' | 'pdf';
 type WBKeyPlace = 'board' | 'workspace' | 'tab';
 /* The views whose keys are a function of the page (VIEW_FN). */
 type WBKeyViewFnName = 'ranger' | 'tasks' | 'review';
@@ -50,7 +50,7 @@ interface WBKeyContext {
   place: WBKeyPlace;
 }
 /* A card (or field) that has the keyboard: the keys it needs; leaves: every key it gives up must be bound globally. */
-interface WBKeyInterior { needs: (key: string) => boolean; leaves?: boolean; label: string }
+interface WBKeyInterior { needs: (key: string) => boolean; leaves?: boolean; label: string; map?: string }
 /* An overlay's layer: its keymap, the keys its input needs, the command for any other single character, and
  * whether it swallows the rest. */
 interface WBKeyTransient { map: string; needs?: (key: string) => boolean; rest?: string; swallow?: boolean }

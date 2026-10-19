@@ -1,12 +1,13 @@
-//! Images on the canvas (F-A32): content-addressed files in `<stateDir>/blobs/`, named
-//! by the sha256 of their bytes. The board keeps only the hash, so a pasted photo does
-//! not grow the board file or its every save.
+//! Images and PDFs on the canvas (F-A32, F-A40): content-addressed files in
+//! `<stateDir>/blobs/`, named by the sha256 of their bytes. The board keeps only the
+//! hash, so a pasted photo does not grow the board file or its every save.
 //!
 //! `POST /api/blob` takes the raw bytes and answers `{hash, type, size}`;
 //! `GET /blob/{hash}` serves them. Only raster images whose first bytes say so are
-//! taken (PNG, JPEG, GIF, WebP, AVIF): never SVG or HTML, which would run as this
-//! origin when opened in a tab. The type is read from the bytes, on the way in and on
-//! the way out; the request's `Content-Type` is not trusted.
+//! taken (PNG, JPEG, GIF, WebP, AVIF), and PDFs: never SVG or HTML, which would run as
+//! this origin when opened in a tab. A PDF is served as an attachment, so a tab
+//! downloads it instead of opening it in this origin. The type is read from the bytes,
+//! on the way in and on the way out; the request's `Content-Type` is not trusted.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -16,7 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::Body as ResponseBody;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG,
+};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -27,7 +30,7 @@ use sha2::{Digest, Sha256};
 use crate::AppState;
 use crate::http::{ApiError, Body, Param};
 
-/// The largest image taken, in bytes.
+/// The largest image or PDF taken, in bytes.
 pub const BLOB_MAX: usize = 32 << 20;
 
 /// `POST /blob`, relative to `/api`.
@@ -66,6 +69,11 @@ pub fn sniff(b: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// The type of a blob the store takes: an image (`sniff`) or a PDF.
+pub fn sniff_blob(b: &[u8]) -> Option<&'static str> {
+    sniff(b).or_else(|| b.starts_with(b"%PDF-").then_some("application/pdf"))
+}
+
 /// 64 lowercase hex digits.
 fn is_hash(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
@@ -84,19 +92,27 @@ async fn put_blob(State(app): State<AppState>, Body(body): Body) -> Response {
     if body.is_empty() {
         return ApiError::new(StatusCode::BAD_REQUEST, "empty body").into_response();
     }
-    let Some(kind) = sniff(&body) else {
+    let Some(kind) = sniff_blob(&body) else {
         return ApiError::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "not an image: PNG, JPEG, GIF, WebP or AVIF",
+            "not an image or a PDF: PNG, JPEG, GIF, WebP, AVIF or PDF",
         )
         .into_response();
     };
-    let hash = hex(&Sha256::digest(&body));
-    let dir = blob_dir(&app);
-    let name = hash.clone();
     let size = body.len();
+    match store(&app, body.to_vec()).await {
+        Ok(hash) => Json(json!({"hash": hash, "type": kind, "size": size})).into_response(),
+        Err(e) => io_failure("cannot store the image", &e),
+    }
+}
+
+/// Stores `body` under its hash and answers the hash. The caller has sniffed it.
+pub async fn store(app: &AppState, body: Vec<u8>) -> io::Result<String> {
+    let hash = hex(&Sha256::digest(&body));
+    let dir = blob_dir(app);
+    let name = hash.clone();
     // Same bytes, same name: a second paste of one image writes nothing.
-    let wrote = tokio::task::spawn_blocking(move || -> io::Result<()> {
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
         let path = dir.join(&name);
         if path.try_exists()? {
             return Ok(());
@@ -104,12 +120,23 @@ async fn put_blob(State(app): State<AppState>, Body(body): Body) -> Response {
         fs::create_dir_all(&dir)?;
         install_blob(&dir, &name, &body)
     })
-    .await;
-    match wrote {
-        Ok(Ok(())) => Json(json!({"hash": hash, "type": kind, "size": size})).into_response(),
-        Ok(Err(e)) => io_failure("cannot store the image", &e),
-        Err(e) => io_failure("cannot store the image", &e),
+    .await
+    .map_err(io::Error::other)??;
+    Ok(hash)
+}
+
+/// A stored image's bytes and type; `None` for a bad hash, a missing blob or a PDF.
+pub async fn read_image(app: &AppState, hash: &str) -> Option<(Vec<u8>, &'static str)> {
+    if !is_hash(hash) {
+        return None;
     }
+    let path = blob_dir(app).join(hash);
+    let bytes = tokio::task::spawn_blocking(move || fs::read(path))
+        .await
+        .ok()?
+        .ok()?;
+    let kind = sniff(&bytes)?;
+    Some((bytes, kind))
 }
 
 /// Writes `body` to `dir/name` without a window where the name holds part of it. Each
@@ -155,7 +182,7 @@ async fn get_blob(State(app): State<AppState>, Param(hash): Param<String>) -> Re
         Ok(Err(e)) => return io_failure("cannot read the image", &e),
         Err(e) => return io_failure("cannot read the image", &e),
     };
-    let Some(kind) = sniff(&bytes) else {
+    let Some(kind) = sniff_blob(&bytes) else {
         return ApiError::new(StatusCode::NOT_FOUND, "not found").into_response();
     };
     let mut res = Response::new(ResponseBody::from(bytes));
@@ -169,6 +196,9 @@ async fn get_blob(State(app): State<AppState>, Param(hash): Param<String>) -> Re
         CONTENT_SECURITY_POLICY,
         HeaderValue::from_static("default-src 'none'; sandbox"),
     );
+    if kind == "application/pdf" {
+        h.insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
+    }
     if let Ok(tag) = HeaderValue::try_from(format!("\"{hash}\"")) {
         h.insert(ETAG, tag);
     }
@@ -195,6 +225,15 @@ mod tests {
             b"%PDF-1.7",
         ] {
             assert_eq!(sniff(no), None, "{no:?}");
+        }
+    }
+
+    #[test]
+    fn the_store_takes_pdfs_besides_images() {
+        assert_eq!(sniff_blob(b"%PDF-1.7\n"), Some("application/pdf"));
+        assert_eq!(sniff_blob(b"GIF89a\x01\0"), Some("image/gif"));
+        for no in [&b"%PD"[..], b" %PDF-1.7", b"<!doctype html>", b"<svg/>"] {
+            assert_eq!(sniff_blob(no), None, "{no:?}");
         }
     }
 
