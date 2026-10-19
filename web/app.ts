@@ -6276,17 +6276,21 @@ function frAdopt(n: PageNode): Promise<string | null> {
       // another tab's board save may have adopted the page (boardAdopt set buf, dropped text) while this one waited
       if (adopted()) return quit(id);
       if (b!.id !== id) continue;   // a file renamed from this name: edwind sent the open on to it, which stays as it is
-      const text = n.text || '', cur = b!.text;
+      let text = n.text || ''; const cur = b!.text;
       if (cur !== '' && cur !== text) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} continue; }   // R8.18: another text, next suffix
-      // the node keeps its text unless the file has it on disk (an empty page too: a new buffer has no file yet)
-      if (cur === '' && text) frReplaceAll(b!, text);
-      // A buffer with this text that is still modified (a failed first save: edwind keeps the shared buffer after this
-      // replica closes) is saved too, so no page is adopted before its file holds the text.
-      if (cur === '' || b!.modified) {
+      // The node keeps its text unless the file has it on disk (an empty page too: a new buffer has no file yet). A buffer
+      // with this text that is still modified (a failed first save: edwind keeps the shared buffer after this replica
+      // closes) is saved too, so no page is adopted before its file holds the text. A text the node took while a save
+      // ran (pageSetText on the unmigrated page) is written and saved again.
+      let saved = !(cur === '' || b!.modified);
+      while (!saved || (n.text || '') !== text) {
+        text = n.text || '';
+        if (b!.text !== text) frReplaceAll(b!, text);
         const r = await Ed.sync.save(b!);
         if (adopted()) return quit(id);
         // the replica closes as it is (other clients may have edited it meanwhile); a later try that finds this text there takes it (R8.18)
         if (r.error) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} throw new Error(`${id} could not be saved: ${r.error.report}`); }
+        saved = true;
       }
       chosen = id;
     }
