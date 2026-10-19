@@ -834,6 +834,7 @@ interface EdwinFrState {
   localAnchors: Record<string, { buf: string; pos: number; label?: string }>;
   perf: number[];
   waiters: ((v?: unknown) => void)[];
+  downers: Set<() => void>;              // frUnlessDown's waits, ended when edwind is known down
   snapT: Map<string, ReturnType<typeof setTimeout>>; snapMine: Set<string>;
   moved: Map<string, { to: string; dir: boolean }>;
   hold: Map<string, { buf: string; p: Promise<unknown>; done: (v?: unknown) => void }>;
