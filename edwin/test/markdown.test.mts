@@ -36,7 +36,7 @@ const line = () => { const t = ed.text(), p = ed.point(); return t.slice(t.lastI
 
 test('the shipped Scheme in scm/ is what index.html carries, markdown.js loads after org.js in both hosts', () => {
   const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
-  for (const name of ['emacs', 'evil', 'org', 'ai', 'init', 'notes-syntax', 'address', 'markdown']) {
+  for (const name of ['emacs', 'evil', 'org', 'ai', 'init', 'notes-syntax', 'address', 'markdown', 'babel']) {
     const m = new RegExp(`<script type="text/x-scheme" id="${name}-scm">\\n([\\s\\S]*?)</script>`).exec(html);
     assert.ok(m, name);
     assert.equal(m[1], readFileSync(new URL(`../scm/${name}.scm`, import.meta.url), 'utf8'), name + '.scm');
@@ -494,3 +494,21 @@ test('R10.5 font-lock is incremental: a keystroke in a 10,000-line page re-fonti
 });
 const Ed_bol = (b: Edwin, p: number) => (globalThis as Globals).Ed.bol(b.rope, p), Ed_eol = (b: Edwin, p: number) => (globalThis as Globals).Ed.eol(b.rope, p);
 const stats = () => Object.fromEntries((globalThis as Globals).L.arr(ev('(markdown-stats)')).map((p: Edwin) => [p.car.name, p.cdr]));
+
+test('hypernotes H1: C-c C-c on a source block reaches babel-execute-src-block in markdown and Org; without edwind it says where blocks run', async () => {
+  const b = await page('```scheme {#n}\n(+ 1 2)\n```\n');
+  ev('(goto-char 15)');
+  await ed.keys('C-c C-c');
+  assert.equal(ed.E.echo, 'Blocks run in edwind; this Edwin has no server');
+  assert.equal(b.text, '```scheme {#n}\n(+ 1 2)\n```\n', 'nothing ran');
+  await ed.type(':e babel.org\n');
+  ev('(insert "* H\\n#+name: n\\n#+begin_src scheme\\n(+ 1 2)\\n#+end_src\\n\\n- [ ] item\\n")');
+  for (const p of ['#+name', '(+ 1', '#+end_src']) {
+    ev(`(goto-char ${ed.text().indexOf(p) + 2})`); ed.E.echo = '';
+    await ed.keys('C-c C-c');
+    assert.equal(ed.E.echo, 'Blocks run in edwind; this Edwin has no server', p);
+  }
+  ev(`(goto-char ${ed.text().indexOf('item') + 1})`);
+  await ed.keys('C-c C-c');
+  assert.match(ed.text(), /- \[X\] item/, 'after the block, C-c C-c toggles the checkbox as before');
+});

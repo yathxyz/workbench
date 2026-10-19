@@ -1,11 +1,11 @@
 // Shell-only service worker: caches the app shell so the PWA opens offline; API calls, boards and pages are never cached.
 // Only a plain same-origin 200 is cached: after a sign-in expiry a subresource fetch follows the redirect to the IdP's
 // login page, and caching that as /app.js would break the PWA until the cache name changes.
-const CACHE = 'workbench-shell-v5';   // v5: the Edwin runtime gains display.js (DT0); v4: app.js knows buf (edwind spec R8.20), the Edwin runtime joins the shell
+const CACHE = 'workbench-shell-v6';   // v6: the frame runtime loads babel.scm (hypernotes H1); v5: the Edwin runtime gains display.js (DT0); v4: app.js knows buf (edwind spec R8.20), the Edwin runtime joins the shell
 // The Edwin frame runtime and console live under /edwin/ and are part of the shell (edwind spec R9.19): the page editor
 // works offline-first like the rest of the app; pages themselves (buffers over /edit) are never cached.
 const EDWIN = ['/edwin/', '/edwin/index.html', '/edwin/src/host-browser.js', '/edwin/src/scheme.js', '/edwin/src/runtime.js', '/edwin/src/text.js', '/edwin/src/editor-core.js', '/edwin/src/editor-prims.js', '/edwin/src/evil-core.js', '/edwin/src/pool.js', '/edwin/src/complete.js', '/edwin/src/extras.js', '/edwin/src/stack.js', '/edwin/src/ai.js', '/edwin/src/evil-ex.js', '/edwin/src/org.js', '/edwin/src/markdown.js', '/edwin/src/ot.js', '/edwin/src/sync.js', '/edwin/src/display.js',
-  '/edwin/scm/emacs.scm', '/edwin/scm/evil.scm', '/edwin/scm/org.scm', '/edwin/scm/ai.scm', '/edwin/scm/init.scm', '/edwin/scm/notes-syntax.scm', '/edwin/scm/address.scm', '/edwin/scm/markdown.scm'];
+  '/edwin/scm/emacs.scm', '/edwin/scm/evil.scm', '/edwin/scm/org.scm', '/edwin/scm/ai.scm', '/edwin/scm/init.scm', '/edwin/scm/notes-syntax.scm', '/edwin/scm/address.scm', '/edwin/scm/markdown.scm', '/edwin/scm/babel.scm'];
 const SHELL = ['/', '/index.html', '/style.css', '/app.js', '/keys.js', '/bridge.js', '/vendor/vendor.js', '/vendor/xterm.css', '/fonts/fonts.css', '/manifest.webmanifest', '/icon.svg'];
 const shell = (p: string) => SHELL.includes(p) || EDWIN.includes(p);
 const cacheable = (r: Response) => r.ok && !r.redirected && r.type === 'basic';

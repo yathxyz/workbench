@@ -62,3 +62,21 @@ The edwind phases (E0–E4) keep their order; H1 and later start after E3.
   block cards do not wait for M5's artifact origin.
 - 400 ms after an edit to the page, every card whose block changed reloads. A removed block or page leaves a notice
   in the card; putting the block back restores it.
+
+## H1 as built
+
+- `scheme`, `sh`, `bash` and `zsh` blocks run in edwind on `C-c C-c` (markdown-mode, and Org through
+  `org-ctrl-c-ctrl-c`), `C-c C-v b` (run all) or `wb eval '(babel-run "notes/x.md")'`. Nothing runs on open.
+  The engine is `edwin/scm/babel.scm` over the reader in `edwin/server/babel.mts`; `edwin/README.md`
+  ("Hypernotes H1") lists the keys and the rules.
+- The result goes under the block: ```` ```result {of=id} ```` in markdown, `#+RESULTS: id` in Org. A value is
+  stored as `write` prints it, so `in=` reads it back exactly; a failure is stored too, as
+  ```` ```result {of=id error} ```` or an Org `#+begin_error` block, with the condition's report. An
+  unspecified value leaves no result.
+- `in=` takes `json`, `csv`, `tsv` and `sexp` fences, named Org tables, other blocks' stored results and
+  literals. A stored result is never rerun to feed another block (decision 5: explicit runs only).
+- A note's scheme blocks share one environment (`env=`, `:session`, front matter `env:`, else the note's file).
+  Its forms stay out of the image log and out of frames (decision 4); run all starts from a fresh environment.
+- `noweb`, `noweb-ref` and `tangle=` (`C-c C-v t`) follow Org babel. Tangled files are written through
+  edwind's buffers, so the authority's write rules apply.
+- `html` fences stay as H0 left them: cards, with no executor.

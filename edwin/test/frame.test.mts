@@ -413,6 +413,25 @@ test('R4.27, R4.28 a :where server command runs on edwind; its edits come back a
   c.close();
 });
 
+test('hypernotes H1: C-c C-c in a frame runs the block in edwind, in Org and markdown; the result arrives as this frame\'s edit', async () => {
+  const id = note('h1.org', '#+begin_src scheme\n(* 6 7)\n#+end_src\n');
+  const b = await sync.open(id); show(b);
+  b.pt = b.text.indexOf('(* 6');
+  await keys('C-c C-c');
+  await until(() => /#\+RESULTS:\n: 42\n/.test(b.text), 'the Org result');
+  assert.equal(b.text, '#+begin_src scheme\n(* 6 7)\n#+end_src\n\n#+RESULTS:\n: 42\n');
+  assert.equal(b.hist[b.hist.length - 1].cid, sync.cid, 'the result is this frame\'s edit');
+  assert.equal(await serverText(id), b.text);
+  const md = await sync.open(note('h1.md', '```scheme {#a}\n(define h1-x (string-append "x" "y"))\nh1-x\n```\n')); show(md);
+  md.pt = 18;
+  await keys('C-c C-c');
+  await until(() => /```result \{of=a\}\n"xy"\n```\n$/.test(md.text), 'the markdown result');
+  await until(() => /a: "xy"/.test(messages()), 'the message');
+  /* The note's definition stayed in edwind's note environment: no image message brought it to this frame. */
+  await sleep(100);
+  assert.equal(L.get('h1-x'), undefined);
+});
+
 test('R4.29 ask reaches the minibuffer of the frame and the answer goes back; C-g answers quit', async () => {
   const c = await client();
   const r = await c.form('(define-command (greet2 n) (interactive "sName: ") (:where (quote server)) (message "hi ~a" n) n)');

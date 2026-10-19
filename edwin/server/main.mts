@@ -29,6 +29,7 @@ import * as hubModule from './hub.mts';
 import * as processModule from './process.mts';
 import * as wbModule from './wb.mts';
 import * as anchorsModule from './anchors.mts';
+import * as babelModule from './babel.mts';
 import { lockdown, lockdownState } from './lockdown.mts';
 import type { By, CallCtx, CallResult, Condition, WireMessage } from './proto.mts';
 import type { HistEntry, Moved, SBuf } from './buffers.mts';
@@ -82,7 +83,7 @@ export interface ServerModule { install(server: Server): Promise<void>; shutdown
 const require = createRequire(import.meta.url);
 /* The E2 modules, installed in this order after the buffers are loaded; each exports install(server) and
    may export shutdown(server) and name. */
-const MODULES: ServerModule[] = [imageModule, notesModule, threadsModule, debugModule, modelsModule, hubModule, processModule, wbModule, anchorsModule];
+const MODULES: ServerModule[] = [imageModule, notesModule, threadsModule, debugModule, modelsModule, hubModule, processModule, wbModule, anchorsModule, babelModule];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EDWIN = path.join(HERE, '..');
 export const BUILD = process.env.WB_EDIT_BUILD || 'dev';

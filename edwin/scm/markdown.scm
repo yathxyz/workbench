@@ -198,4 +198,7 @@ a URL or [label](target) through org-open-at-point."
 
 (provide 'markdown)
 
+;; Source blocks in notes, for markdown and Org alike (babel.scm, hypernotes H1).
+(require 'babel)
+
 ;;; markdown.scm ends here

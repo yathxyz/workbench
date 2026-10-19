@@ -895,9 +895,23 @@ CMD('org-toggle-checkbox', '', '', 'Toggle the checkbox of the item at point, ad
   if (!toggleCheckbox(b, bol(r, b.pt), true)) signal('user-error', 'Not at a list item');
   return false;
 });
-CMD('org-ctrl-c-ctrl-c', '', '', 'Do what the context asks: finish a capture, toggle a checkbox, set the tags of a headline (C-c C-c).', () => {
+/* Point is on a source block (its #+begin_src or #+end_src line, a line between them, or a #+name:, #+header:
+   or #+RESULTS: line): C-c C-c runs the block (babel.scm, hypernotes H1). */
+function atSrcBlock(b: EdBuffer, ls: number) {
+  const r = b.rope, line = (s: number) => r.slice(s, eol(r, s));
+  if (/^[ \t]*#\+(begin_src|end_src|name:|header:|results(\[[^\]\n]*\])?:)/i.test(line(ls))) return true;
+  for (let s = ls, n = 0; s > 0 && n < 10000; n++) {
+    s = bol(r, s - 1);
+    const t = line(s);
+    if (/^[ \t]*#\+end_src\b/i.test(t)) return false;
+    if (/^[ \t]*#\+begin_src\b/i.test(t)) return true;
+  }
+  return false;
+}
+CMD('org-ctrl-c-ctrl-c', '', '', 'Do what the context asks: finish a capture, run the source block at point, toggle a checkbox, set the tags of a headline (C-c C-c).', () => {
   const b = cur(), ls = bol(b.rope, b.pt);
   if (b.capture) return L.call('org-capture-finalize', []);
+  if (atSrcBlock(b, ls) && L.get('babel-execute-src-block') !== undefined) return L.call('call-interactively', [intern('babel-execute-src-block')]);
   if (itemAt(b, ls) && itemAt(b, ls)!.box !== undefined) { toggleCheckbox(b, ls, false); return false; }
   if (levelAt(b, ls)) return L.call('org-set-tags-command', []);
   signal('user-error', 'C-c C-c can do nothing useful here');
