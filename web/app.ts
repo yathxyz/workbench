@@ -4041,12 +4041,14 @@ function wireMic(btn: HTMLElement, n: LegacyAgentNode) {
   btn.addEventListener('pointerup', release); btn.addEventListener('pointerleave', release); btn.addEventListener('pointercancel', release);
 }
 // Dictation into a page (its card, or the Editor view's frame): the recognised text goes in at the frame's point as
-// this frame's own edit. A read-only page (no edwind) takes none.
-function dictateInto(n: 'editor' | PageNode) {
+// this frame's own edit. A read-only page (no edwind) takes none, nor one whose replica is not writable yet; words that
+// do not go in are tried again with the next result.
+async function dictateInto(n: 'editor' | PageNode) {
   const ed = n === 'editor', page = ed ? ED.node : n, L = page && live[page.id]; if (!page || !L) return;
   if (!FR.on || !page.buf) { toast('Dictation into a page needs edwind (workbench-edit)'); return; }
   const key = (ed ? 'editor:' : '') + page.id;
   if (VOICE.rec && VOICE.target === key) { stopListening(); return; }
+  if (!(await frWhenWritable(page))) return;
   let done = 0;
   VOICE.target = key;
   const btn = ed ? null : $$('.hb', L.hdr!).find(b => b.textContent === '🎙'); btn?.classList.add('mic', 'on');
@@ -4054,11 +4056,11 @@ function dictateInto(n: 'editor' | PageNode) {
   listen({ label: page.name,
     onUpdate: fin => {
       const add = fin.slice(done); if (!add.trim()) return;
-      done = fin.length;
       const b = frBufOf(page), f = (ed ? ED.frame : L.frame) as EdwinFrame | null | undefined; if (!b) return;
       const head = f ? f.point() : b.pt, prev = b.text.slice(Math.max(0, head - 1), head);
       const text = spoken((prev && !/\s/.test(prev) ? ' ' : '') + add.trim());
-      frEdit(b, [[head, '', text]]);
+      if (!frEdit(b, [[head, '', text]])) return;
+      done = fin.length;
       if (f) f.setPoint(head + text.length); else b.pt = head + text.length;
     },
     onEnd: () => { VOICE.target = null; } });
@@ -6276,6 +6278,7 @@ function frHold(n: PageNode, buf: string) { let done!: (v?: unknown) => void; co
 function frRelease(json: string) {
   const nodes: Record<string, { buf?: string } | undefined> = JSON.parse(json).nodes || {};
   for (const [id, h] of FR.hold) if (nodes[id]?.buf || !S.nodes[id]) { FR.hold.delete(id); h.done(true); }   // saved with its buf, or gone
+  const e = ED.node; if (e?.buf && ED.pre && !FR.hold.has(e.id) && VIEW === 'editor') frEdLoad(e);   // an Editor view that gave up on the hold
   frSchedule();
 }
 // The replica of N for an edit: a held page waits for its board save, FR_HOLD_MS at most.
