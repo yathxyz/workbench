@@ -6289,7 +6289,15 @@ function frAdopt(n: PageNode): Promise<string | null> {
       // another tab's board save may have adopted the page (boardAdopt set buf, dropped text) while this one waited
       if (adopted()) return quit(id);
       if (b!.id !== id) continue;   // a file renamed from this name: edwind sent the open on to it, which stays as it is
-      let text = n.text || ''; const cur = b!.text;
+      let text = n.text || ''; let cur = b!.text;
+      if (cur === '' && text) {
+        // edwind fills the file only while it is empty, in one step: two tabs migrating this page at once fill it once.
+        // Its edit reaches this replica before the answer, so cur is the file's text after it.
+        const r = await Ed.sync.call({ cmd: 'notes-fill', args: [{ path: id, text }], ctx: {} });
+        if (adopted()) return quit(id);
+        if (r.error) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} throw new Error(`${id} could not be filled: ${r.error.report}`); }
+        cur = b!.text;
+      }
       if (cur !== '' && cur !== text) { FR.claimed.delete(id); try { FR.L!.call('kill-buffer', [b]); } catch {} continue; }   // R8.18: another text, next suffix
       // The node keeps its text unless the file has it on disk (an empty page too: a new buffer has no file yet). A buffer
       // with this text that is still modified (a failed first save: edwind keeps the shared buffer after this replica
