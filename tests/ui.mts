@@ -1180,7 +1180,8 @@ async function newTerm(p: import('playwright-core').Page, name: string): Promise
 }
 const typeIn = (p: import('playwright-core').Page, id: string, s: string) => p.evaluate(({ id, s }) => window.__canvas.live[id].backend.input(s), { id, s });
 const moveCard = (p: import('playwright-core').Page, dx = 40) => p.evaluate(dx => { const C = window.__canvas, n = Object.values<BoardNode>(C.S.nodes).find(n => n.kind === 'buffer')!; C.moveTree(n, dx, 0); C.dirty(); return { id: n.id, x: n.x }; }, dx);
-const settled = (p: import('playwright-core').Page) => until(() => p.evaluate(() => { const s = window.__canvas.SAVE; return !s.busy && !s.pending && !s.paused; }), 8000);
+// Every change of the page is on disk: none in flight, none still inside the 500 ms save debounce (unsaved).
+const settled = (p: import('playwright-core').Page) => until(() => p.evaluate(() => { const C = window.__canvas, s = C.SAVE; return !s.busy && !s.pending && !C.unsaved(); }), 8000);
 const barOf = (p: import('playwright-core').Page) => p.evaluate(() => { const b = document.querySelector<HTMLElement>('#bar')!; return { hidden: b.hidden, key: b.dataset.key, text: b.querySelector('.msg')!.textContent }; });
 const palLabels = (p: import('playwright-core').Page) => p.evaluate(() => [...document.querySelectorAll('#pal-list .pi .l')].map(x => x.textContent));
 // The one place a page's text is read for an assertion: the board's pageText (the replica text).
@@ -1865,6 +1866,7 @@ await section('acp mocked', async () => {
       delete C.SESS.dock; delete C.SESS['zz-orphan']; return keys;
     }, ACWD);
     check('30 §1.5 (mocked): the docked terminal\'s session is not listed as running without a card; a session without a card is', orphans.includes('orphan:zz-orphan') && !orphans.includes('orphan:dock'), JSON.stringify(orphans));
+    await settled(P);
   } finally { await P.close(); }
 });
 if (!STUB) for (const n of ['N17', 'N18', 'N19', 'N20', 'N21', 'N22', 'N23', 'N24', 'N25', 'N27', 'N28', 'N29', 'N34', 'N35', 'N37', 'N38', 'N39', 'N41', 'N42']) skip(n, 'no stub agent in /api/info.agents (wb-fake-acp registered as `stub` in the test hub)');
@@ -1906,7 +1908,8 @@ else {
   await section('N18', async () => {
     const id = AID, s0 = (await acpView(AP, id))!.seq;
     await acpSay(AP, id, 'tool');
-    const v = await acpIdle(AP, id);
+    // The card can read idle between the prompt's echo and the turn's info: idle counts once turn_end is folded.
+    const v = await until(async () => { const v = await acpView(AP, id), end = acpEvs(AP, id, 'turn_end', s0)[0]; return end && v?.promptable && v.seq >= end.seq ? v : null; }, 20000);
     const sts = acpEvs(AP, id, 'update', s0).map(e => e.update).filter(u => /^tool_call/.test(u?.sessionUpdate || '')).map(u => u.status || (u.sessionUpdate === 'tool_call' ? 'pending' : '')).filter((x, i, a) => x && x !== a[i - 1]);
     st = await AP.evaluate((id: string) => { const t = [...window.__canvas.live[id].body.querySelectorAll('.ag-log .ag-tool')].at(-1); return t && { status: t.dataset.status, glyph: t.querySelector('.tg').textContent, add: t.querySelectorAll('.ag-diff .add').length, del: t.querySelectorAll('.ag-diff .del').length }; }, id);
     check('N18: "tool" goes pending → in_progress → completed and its diff has .add and .del rows', !!v && sts.join() === 'pending,in_progress,completed' && st?.status === 'completed' && st.glyph === '✓' && st.add > 0 && st.del > 0, JSON.stringify({ sts, st }));
@@ -2116,9 +2119,9 @@ else {
       const t1 = Date.now();
       await AP.evaluate((id: string) => { const C = window.__canvas; C.jumpNode(C.S.nodes[id]); C.CMDS.find((c: PaletteItem) => c.l.startsWith('Agent: start a new session')).run(); }, id);
       const fresh = await until(async () => { const v = await acpView(AP, id); return v!.promptable && v!.epoch !== old ? v : null; }, 30000);
-      const opens = g.sent.filter(m => m?.t === 'open').length;
+      const opensOf = () => g.sent.filter(m => m?.t === 'open' && m.id === id).length, opens = opensOf();
       g.hold = true; g.refuse = false;   // it reconnects, but hears nothing before it answers the old request
-      await until(() => g.sent.filter(m => m?.t === 'open').length > opens, 40000);
+      await until(() => opensOf() > opens, 40000);
       const clicked = await acpClick(S2, id, '.ag-perm button[data-kind="allow_once"]');
       await until(() => g.sent.some(m => m?.t === 'permission'), 5000); await sleep(800); g.release();
       const toast = await until(async () => /belongs to an ended session/.test(await toastOf(S2)), 10000);
