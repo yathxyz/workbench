@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::ws::{CloseFrame, Message, WebSocket};
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request};
 use axum::http::header::CACHE_CONTROL;
 use axum::http::request::Parts;
@@ -16,6 +17,8 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::time::{Instant, Interval, MissedTickBehavior, Sleep, interval_at, sleep, timeout};
 use wb_proto::limits::{WS_DEAD, WS_PING};
+
+use crate::AppState;
 
 /// `{"error": message}` with `Cache-Control: no-store`.
 pub struct ApiError {
@@ -102,6 +105,47 @@ pub async fn not_found() -> ApiError {
 /// The answer to a plain GET on a socket route.
 pub fn upgrade_required() -> Response {
     ApiError::new(StatusCode::BAD_REQUEST, "websocket upgrade required").into_response()
+}
+
+/// Answers a socket route: messages and frames are capped at `max`, and `run` drives the
+/// socket while it counts as running (`AppState::socket`). A plain GET is answered 400.
+pub fn upgrade<F, Fut>(
+    app: AppState,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+    max: usize,
+    run: F,
+) -> Response
+where
+    F: FnOnce(AppState, WebSocket) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let Ok(ws) = ws else {
+        return upgrade_required();
+    };
+    let running = app.socket();
+    ws.max_message_size(max)
+        .max_frame_size(max)
+        .on_upgrade(move |socket| async move {
+            run(app, socket).await;
+            drop(running);
+        })
+}
+
+/// Why a relay stopped.
+pub enum End {
+    /// Close the browser socket with this code.
+    Close(u16, &'static str),
+    /// The browser socket is already gone.
+    Gone,
+}
+
+impl End {
+    /// Closes the browser socket with this end's code, unless it is already gone.
+    pub async fn close(self, ws: WebSocket, route: &str) {
+        if let End::Close(code, reason) = self {
+            ws_close(ws, route, code, reason).await;
+        }
+    }
 }
 
 /// Close codes wb-web sends (design §3.5.4).

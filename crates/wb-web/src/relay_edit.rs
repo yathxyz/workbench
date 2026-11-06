@@ -25,7 +25,7 @@ use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 use wb_proto::limits::MAX_LINE;
 
 use crate::AppState;
-use crate::http::{Keepalive, Tick, close, upgrade_required, ws_close, ws_too_big};
+use crate::http::{self, End, Keepalive, Tick, close, ws_close, ws_too_big};
 
 const ROUTE: &str = "/edit";
 /// Largest browser message on `/edit`: the `edit.sock` line cap, so a frame that fits
@@ -42,24 +42,7 @@ async fn upgrade(
     State(app): State<AppState>,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    let Ok(ws) = ws else {
-        return upgrade_required();
-    };
-    let running = app.socket();
-    ws.max_message_size(WS_MAX_EDIT)
-        .max_frame_size(WS_MAX_EDIT)
-        .on_upgrade(move |socket| async move {
-            run(app, socket).await;
-            drop(running);
-        })
-}
-
-/// Why the relay stopped.
-enum End {
-    /// Close the browser socket with this code.
-    Close(u16, &'static str),
-    /// The browser socket is already gone.
-    Gone,
+    http::upgrade(app, ws, WS_MAX_EDIT, run)
 }
 
 const EDWIND_LOST: End = End::Close(close::HUB_LOST, "edwind connection lost");
@@ -134,9 +117,7 @@ async fn run(app: AppState, mut ws: WebSocket) {
             break end;
         }
     };
-    if let End::Close(code, reason) = end {
-        ws_close(ws, ROUTE, code, reason).await;
-    }
+    end.close(ws, ROUTE).await;
 }
 
 /// One text frame as one line. The frame already fits `MAX_LINE` (the socket's

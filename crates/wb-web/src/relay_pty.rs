@@ -16,8 +16,8 @@ use wb_proto::hub::{ErrorCode, HubMessage, HubRequest, PtyOpenReply, Resume, Spa
 use wb_proto::limits::{CARD_OPEN_DEADLINE, PTY_INPUT_FRAME, WS_MAX_PTY};
 
 use crate::AppState;
-use crate::http::{Keepalive, Tick, close, send_json, upgrade_required, ws_close, ws_too_big};
-use crate::hub::{HubConn, HubStatus, REPLY_TIMEOUT};
+use crate::http::{self, End, Keepalive, Tick, close, send_json, ws_close, ws_too_big};
+use crate::hub::{HUB_LOST, HubConn, REPLY_TIMEOUT, connect_relay};
 use crate::util::{sanitize_sid, split_utf8};
 
 const ROUTE: &str = "/pty";
@@ -31,41 +31,13 @@ async fn upgrade(
     State(app): State<AppState>,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    let Ok(ws) = ws else {
-        return upgrade_required();
-    };
-    let running = app.socket();
-    ws.max_message_size(WS_MAX_PTY)
-        .max_frame_size(WS_MAX_PTY)
-        .on_upgrade(move |socket| async move {
-            run(app, socket).await;
-            drop(running);
-        })
+    http::upgrade(app, ws, WS_MAX_PTY, run)
 }
-
-/// Why the relay stopped.
-enum End {
-    /// Close the browser socket with this code.
-    Close(u16, &'static str),
-    /// The browser socket is already gone.
-    Gone,
-}
-
-const HUB_LOST: End = End::Close(close::HUB_LOST, "hub connection lost");
 
 async fn run(app: AppState, mut ws: WebSocket) {
-    let status = app.hub.status.borrow().clone();
-    let reason = match status {
-        HubStatus::Up(_) => None,
-        HubStatus::Down => Some("hub unavailable"),
-        HubStatus::Incompatible { .. } => Some("hub incompatible"),
-    };
-    if let Some(reason) = reason {
-        return ws_close(ws, ROUTE, close::HUB_UNAVAILABLE, reason).await;
-    }
-    let (hub, info) = match HubConn::connect(&app.cfg.hub_socket).await {
+    let (hub, info) = match connect_relay(&app).await {
         Ok(conn) => conn,
-        Err(_) => return ws_close(ws, ROUTE, close::HUB_UNAVAILABLE, "hub unavailable").await,
+        Err(reason) => return ws_close(ws, ROUTE, close::HUB_UNAVAILABLE, reason).await,
     };
     let stop = app.stopped();
     tokio::pin!(stop);
@@ -113,9 +85,7 @@ async fn run(app: AppState, mut ws: WebSocket) {
             break end;
         }
     };
-    if let End::Close(code, reason) = end {
-        ws_close(ws, ROUTE, code, reason).await;
-    }
+    end.close(ws, ROUTE).await;
 }
 
 struct Relay {

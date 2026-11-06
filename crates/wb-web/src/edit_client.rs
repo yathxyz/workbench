@@ -23,6 +23,7 @@ use wb_proto::limits::{HELLO_TIMEOUT, MAX_LINE};
 
 use crate::FeedMsg;
 use crate::http::ApiError;
+use crate::util::{jitter, next_backoff};
 
 /// The edit protocol version this client speaks (§7.2).
 const PROTO: u64 = 1;
@@ -365,12 +366,12 @@ impl Control {
                     if since.elapsed() >= STABLE {
                         backoff = BACKOFF_MIN;
                     }
-                    jitter(next_backoff(&mut backoff))
+                    jitter(next_backoff(&mut backoff, BACKOFF_MAX))
                 }
                 Err(why) => {
                     tracing::debug!(why, "edwind not reachable");
                     self.set(EditStatus::Down).await;
-                    jitter(next_backoff(&mut backoff))
+                    jitter(next_backoff(&mut backoff, BACKOFF_MAX))
                 }
             };
             sleep(wait).await;
@@ -578,21 +579,6 @@ impl Control {
     }
 }
 
-/// Returns the current backoff and doubles the next one, up to the maximum.
-fn next_backoff(backoff: &mut Duration) -> Duration {
-    let current = *backoff;
-    *backoff = (current * 2).min(BACKOFF_MAX);
-    current
-}
-
-/// ±25 %, so restarted webs do not reconnect in lockstep.
-fn jitter(d: Duration) -> Duration {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |t| t.subsec_nanos());
-    d.mul_f64(0.75 + f64::from(nanos % 1000) / 2000.0)
-}
-
 /// A random 128-bit client id as 32 hex digits, fixed for this process (§7.2).
 fn random_cid() -> String {
     let mut bytes = [0u8; 16];
@@ -665,12 +651,5 @@ mod tests {
             let res = axum::response::IntoResponse::into_response(err.clone().into_api());
             assert_eq!(res.status(), want, "{err:?}");
         }
-    }
-
-    #[test]
-    fn backoff_doubles_to_the_cap() {
-        let mut b = BACKOFF_MIN;
-        let seq: Vec<_> = (0..7).map(|_| next_backoff(&mut b).as_millis()).collect();
-        assert_eq!(seq, [250, 500, 1000, 2000, 4000, 5000, 5000]);
     }
 }

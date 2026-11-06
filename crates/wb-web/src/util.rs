@@ -4,6 +4,7 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Longest sid, in bytes.
 const SID_MAX: usize = 64;
@@ -65,6 +66,21 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<Metadata> {
     Ok(meta)
 }
 
+/// Returns the current backoff and doubles the next one, up to `max`.
+pub fn next_backoff(backoff: &mut Duration, max: Duration) -> Duration {
+    let current = *backoff;
+    *backoff = (current * 2).min(max);
+    current
+}
+
+/// ±25 %, so restarted webs do not reconnect in lockstep.
+pub fn jitter(d: Duration) -> Duration {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |t| t.subsec_nanos());
+    d.mul_f64(0.75 + f64::from(nanos % 1000) / 2000.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +117,25 @@ mod tests {
         assert_ne!(first.ino(), second.ino());
         assert_eq!(second.mode() & 0o777, 0o600);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn backoff_doubles_to_the_cap() {
+        let mut b = Duration::from_millis(250);
+        let seq: Vec<_> = (0..7)
+            .map(|_| next_backoff(&mut b, Duration::from_secs(5)).as_millis())
+            .collect();
+        assert_eq!(seq, [250, 500, 1000, 2000, 4000, 5000, 5000]);
+    }
+
+    #[test]
+    fn jitter_stays_within_a_quarter() {
+        for _ in 0..100 {
+            let j = jitter(Duration::from_secs(4));
+            assert!(
+                j >= Duration::from_secs(3) && j < Duration::from_secs(5),
+                "{j:?}"
+            );
+        }
     }
 }
