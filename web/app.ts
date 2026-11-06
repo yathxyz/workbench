@@ -1,7 +1,8 @@
-/* Canvas Workbench prototype.
-   One pannable world. Node kinds: term (shell), repl, buffer, ref, agent, frame (a folder: a container that holds items through `in`).
+/* Workbench: the board page. One pannable world of cards (shells, pages, refs, ACP agents, folders, artifacts, web,
+   sketch, image, PDF and media cards; a folder holds items through `in`).
    Edges: spawn (tree lineage), pipe (dataflow), ref (pinned excerpt).
-   Runs in two modes: with canvasd (real PTYs) or in-browser demo (simulated shell, JS REPL). */
+   Served by wb-web, cards run in wb-hub and pages are Edwin frames; opened from a file or a hosted artifact, it is the
+   demo (simulated shell, JS REPL, the board in localStorage). */
 (() => {
 'use strict';
 const V = window.V;
@@ -771,7 +772,7 @@ class JsRepl implements CardBackend {
   kill(): void { this.frame.remove(); }
 }
 
-// Real PTY through canvasd. The daemon keeps the session alive across reloads and replays recent output.
+// Real PTY through wb-hub. The hub keeps the session alive across reloads and replays recent output.
 // A real shell on the server (/pty, §3.5.1). Nothing auto-runs: `spawn` is true only on the first open of a card made in
 // this page and on Enter on an ended or not-found card, and only until that open is sent; page loads and reconnects attach
 // with `resume` (SEC-2, F-A6).
@@ -1629,8 +1630,8 @@ type SepDir = 'l' | 'r' | 'u' | 'd';
 /* A tiled folder's aspect ratio: a fixed ratio r, or the screen's (counting lh, the tab row). */
 interface FolderAspect { name: string; r?: number; lh?: number }
 const PAD = 28, GAP = 24, LABEL_H = 32, DECK = { w: 300, h: 230 };
-const FSHAPES: FrameNode['shape'][] = ['folder', 'box', 'round'], FICON: Record<FrameMode, string> = { free: '◻', pack: '▦', tile: '⊞', stack: '❐' };   // v18.1: ribbon (PaperWM row) removed; old boards' ribbon folders load as tile
-const KIND_GLYPH: Record<NodeKind, string> = { term: '$', repl: '›', buffer: '¶', agent: '✦', acp: '✦', ref: '❝', frame: '▭', artifact: '◧', web: '⌾', sketch: '✎', image: '▣', ghost: '◌', pdf: '▤', op: '✺' };
+const FSHAPES: FrameNode['shape'][] = ['folder', 'box', 'round'], FICON: Record<FrameMode, string> = { free: '◻', pack: '▦', tile: '⊞', stack: '❐' };   // ribbon (PaperWM row) removed; old boards' ribbon folders load as tile
+const KIND_GLYPH: Record<NodeKind, string> = { term: '$', repl: '›', buffer: '¶', acp: '✦', ref: '❝', frame: '▭', artifact: '◧', web: '⌾', sketch: '✎', image: '▣', ghost: '◌', pdf: '▤', op: '✺' };
 const kidsOf = (fid: string): BoardNode[] => Object.values(S.nodes).filter(m => m.in === fid);
 const byOrder = (a: BoardNode, b: BoardNode): number => (a.order ?? 0) - (b.order ?? 0) || a.y - b.y || a.x - b.x;
 function descendants(fid: string, out: BoardNode[] = []): BoardNode[] { for (const k of kidsOf(fid)) { out.push(k); if (k.kind === 'frame') descendants(k.id, out); } return out; }
@@ -1880,7 +1881,7 @@ function restack() {
 // Compact (c, or the palette) packs the selection, or with nothing selected the whole board, into tight rows.
 // Ctrl-Z undoes the last compact or tile change (layout only).
 const PICKED = new Set<string>();                                   // cards and folders
-const SEL = { strokes: new Set<string>(), shapes: new Set<string>() };     // v19: ink and drawn shapes picked by the area tool
+const SEL = { strokes: new Set<string>(), shapes: new Set<string>() };     // ink and drawn shapes picked by the area tool
 function renderPicked() {
   document.querySelectorAll<SVGPathElement>('path.stroke[data-id]').forEach(p => p.classList.toggle('picked', SEL.strokes.has(p.dataset.id!)));
   shapesSvg.querySelectorAll<SVGGElement>('g.shape').forEach(g => g.classList.toggle('picked', SEL.shapes.has(g.dataset.id!)));
@@ -2157,7 +2158,7 @@ function renderTree() {
     r.append(tw, ic, nm, mt);
     r.onclick = () => (owner ? jumpNode(owner) : isF ? jumpFolder(n) : jumpNode(n));
     rows.push(r);
-    if (n.kind === 'buffer' && (n.id === activeId || (VIEW === 'editor' && ED.node === n))) {   // v16: the focused page's heading tree
+    if (n.kind === 'buffer' && (n.id === activeId || (VIEW === 'editor' && ED.node === n))) {   // the focused page's heading tree
       const lines = pageText(n).split('\n'), stack: number[] = [];
       lines.forEach((ln, i) => { const m = ln.match(/^(#{1,6}) (.*)$/); if (!m) return; const lv = m[1].length; while (stack.length && stack[stack.length - 1] >= lv) stack.pop(); const depth = stack.length; stack.push(lv);
         const h = el('div', 'tp-row tp-h'); h.style.setProperty('--d', d + 1 + depth as unknown as string); h.dataset.id = n.id; h.dataset.line = i + 1 as unknown as string;
@@ -2228,8 +2229,6 @@ type MountedLive = LiveEntry & { el: HTMLElement; hdr: HTMLElement; body: HTMLEl
     B('❝', 'Pin the selection as a reference card', () => refFrom(n));
   } else if (n.kind === 'ref') {
     B('↗', 'Jump to the source', () => jumpRef(n));
-  } else if (n.kind === 'agent') {
-    B('⑂', 'Branch: fork this conversation into a child agent', () => spawnChild(n));
   } else if (n.kind === 'acp') {
     B('⑂', 'New session: same agent, same folder (a new conversation, not a fork)', () => spawnChild(n));
     B('⇢', 'Send the selected text along pipe edges', () => pipeFrom(n));
@@ -2272,7 +2271,6 @@ type MountedLive = LiveEntry & { el: HTMLElement; hdr: HTMLElement; body: HTMLEl
   if (n.kind === 'term' || n.kind === 'repl') mountTerm(n, L);
   else if (n.kind === 'buffer') mountBuffer(n, L);
   else if (n.kind === 'ref') mountRef(n, L);
-  else if (n.kind === 'agent') mountAgent(n, L);
   else if (n.kind === 'acp') mountAcp(n, L);
   else if (n.kind === 'artifact') mountArtifact(n, L);
   else if (n.kind === 'web') mountWeb(n, L);
@@ -2372,7 +2370,7 @@ function dragWith(ev: PointerEvent, handle: HTMLElement, items: { x: number; y: 
   handle.addEventListener('pointermove', mv); handle.addEventListener('pointerup', up); handle.addEventListener('pointercancel', up);
 }
 const RESIZING = { n: null } as { n: BoardNode | null; w0: number; h0: number; w: number; h: number };
-// v17: resizing a card. Free/pack: its own size. Tile: the drag changes that pane's share of the split it sits in (dwm's
+// resizing a card. Free/pack: its own size. Tile: the drag changes that pane's share of the split it sits in (dwm's
 // mfact for the first pane, its own factor for the others), the folder retiles live. Ribbon: width only.
 function nodeResized(n: BoardNode) {
   const f = n.in && S.nodes[n.in] as FrameNode;
@@ -2419,7 +2417,6 @@ function activate(id: string) {
   if (L.term) L.backend?.resize?.(L.term.cols, L.term.rows);   // the card the user looks at sizes its PTY
   if (L.el!.parentNode === nodesEl && +L.el!.style.zIndex < topZ) L.el!.style.zIndex = ++topZ as unknown as string;
   $$('#tp-list .tp-row').forEach(r => r.classList.toggle('on', r.dataset.id === id));
-  updateSideCtx();
   L.backend?.maybeSeen?.();
   if (DESK.cur && VIEW === 'canvas' && !FOCUS.cur) {   // a columns desk scrolls to the selected column; under a pointer, once it is up (a drag first)
     const go = () => { if (activeId === id) columnsShow(deskColumnOf(S.nodes[id])); };
@@ -2517,7 +2514,7 @@ function removeNode(id: string) {
   if (gone?.kind === 'buffer') blockCardsChanged(gone);
   restack(); renderEdges(); updateAllTitles(); renderTree(); dirty();
 }
-type SpawnChildInit = Pick<BoardNodeBase, 'id' | 'name' | 'x' | 'y' | 'w' | 'h' | 'in' | 'spawnFrom'> & { kind: NodeKind } & Partial<Pick<TermNode, 'backend' | 'cmd' | 'cwd' | 'env' | 'spawnNote' | 'shell'> & Pick<ReplNode, 'lang' | 'history' | 'replayFrom' | '_replay'> & Pick<LegacyAgentNode, 'turns' | 'log' | 'tier'> & Pick<AcpNode, 'agent'>>; function spawnChild(n: BoardNode, name?: string): SpawnChildInit {
+type SpawnChildInit = Pick<BoardNodeBase, 'id' | 'name' | 'x' | 'y' | 'w' | 'h' | 'in' | 'spawnFrom'> & { kind: NodeKind } & Partial<Pick<TermNode, 'backend' | 'cmd' | 'cwd' | 'env' | 'spawnNote' | 'shell'> & Pick<ReplNode, 'lang' | 'history' | 'replayFrom' | '_replay'> & Pick<AcpNode, 'agent'>>; function spawnChild(n: BoardNode, name?: string): SpawnChildInit {
   const kids = childrenOf(n.id, 'spawn'), k = kids.length, w = Math.min(n.w, 440), h = Math.min(n.h, 300);
   const child: SpawnChildInit = { id: uid('n'), kind: n.kind, backend: (n as TermNode).backend, lang: (n as ReplNode).lang, cmd: (n as TermNode).cmd, name: name ? clean(name) : 'b' + (k + 1),
     x: n.x + k * (w + 40), y: n.y + n.h + 90, w, h, spawnFrom: n.id, in: n.agg && S.nodes[n.agg] ? n.agg : n.in };
@@ -2529,7 +2526,6 @@ type SpawnChildInit = Pick<BoardNodeBase, 'id' | 'name' | 'x' | 'y' | 'w' | 'h' 
   if (n.kind === 'repl' && n.lang === 'js') { child.history = [...(n.history || [])]; child.replayFrom = pathOf(n.id); }
   if (n.kind === 'repl' && n.lang !== 'js') child._replay = n.inputLog || '';
   if (n.kind === 'acp') { child.agent = n.agent; child.cwd = n.cwd; }   // a new session in the same folder, not a fork
-  if (n.kind === 'agent') { child.turns = (n.turns || []).map(t => ({ ...t })); child.log = [...(n.log || []).filter(m => !m.live).map(m => ({ ...m })), { t: 'note', text: `Forked from ${pathOf(n.id)} after ${child.turns.length} turn(s). This branch continues on its own.` }]; child.tier = n.tier; }
   S.edges.push({ id: uid('e'), from: n.id, to: child.id, type: 'spawn' });
   addNode(child as AddNodeArg);
   const vis = w2s(child.x + child.w, child.y + child.h);
@@ -2558,7 +2554,7 @@ async function pipeFrom(n: BoardNode) {
       const ins = `\n*from ${pathOf(n.id)}:*\n\`\`\`\n${text.replace(/\s+$/, '')}\n\`\`\`\n`;
       const b = FR.on ? await frWhenWritable(t) : null;
       if (!(FR.on ? b && frEdit(b, [[b.text.length, '', ins]]) : pageEdit(t, pageText(t).length, pageText(t).length, ins))) { refused.push(t); continue; }
-    } else if ((t.kind === 'agent' || t.kind === 'acp') && L.ta) {   // drafts into the composer, never sends
+    } else if (t.kind === 'acp' && L.ta) {   // drafts into the composer, never sends
       L.ta.value = (L.ta.value ? L.ta.value + '\n' : '') + text; L.ta.focus();
     } else if (t.kind === 'op' && L.op) {   // into the media card's prompt; it runs when asked
       t.prompt = (t.prompt ? t.prompt + '\n' : '') + text.trim(); L.op.prompt.value = t.prompt; dirty(); opRender(t);
@@ -2833,7 +2829,6 @@ function snapshotText(n: BoardNode, max = 12): string {
   if (L.term) return termLines(L, max).join('\n');
   if (n.kind === 'buffer') return (FR.on && n.buf ? frSnapText(n) : roText(n)).split('\n').slice(0, max).join('\n');
   if (n.kind === 'acp') return L.backend?.text!(max) || '';
-  if (n.kind === 'agent') return (n.log || []).filter(m => m.text).slice(-6).map(m => (m.t === 'user' ? '› ' : '') + m.text).join('\n');
   if (n.kind === 'web') return n.url || '';
   if (n.kind === 'sketch') return `${S.strokes.filter(x => x.owner === n.id).length} strokes`;
   if (n.kind === 'image') return `image · ${n.iw || '?'} × ${n.ih || '?'}`;
@@ -2959,13 +2954,13 @@ viewport.addEventListener('pointerdown', ev => {
   const eraserButton = pen && (ev.button === 5 || (ev.buttons & 32));
   const drawTool = tool === 'pen' || tool === 'erase';
   const onNode = (ev.target as Element).closest('.node');
-  if (WS.cur && ev.button === 0 && (ev.target as Element).closest('.outside')) {   // v19.1: a dimmed item outside the workspace is the way out: click it to leave and go there
+  if (WS.cur && ev.button === 0 && (ev.target as Element).closest('.outside')) {   // a dimmed item outside the workspace is the way out: click it to leave and go there
     ev.preventDefault(); ev.stopPropagation();
     const o = (ev.target as Element).closest<HTMLElement>('.outside')!, n = S.nodes[o.dataset.id!]; wsLeave();
     if (n) { activate(n.id); animateTo(camTarget(n.x, n.kind === 'frame' ? n.y - LABEL_H : n.y, n.w, n.h + (n.kind === 'frame' ? LABEL_H : 0), 1)); }
     return;
   }
-  if (tool === 'area' && ev.button === 0 && !eraserButton && !isChrome(ev.target)) { ev.preventDefault(); ev.stopPropagation(); marquee(ev); return; }   // v19: the rectangle wins over cards and the pen
+  if (tool === 'area' && ev.button === 0 && !eraserButton && !isChrome(ev.target)) { ev.preventDefault(); ev.stopPropagation(); marquee(ev); return; }   // the rectangle wins over cards and the pen
   let draw: boolean | number = false;
   if (pen) draw = drawTool || eraserButton || (!onNode && !isChrome(ev.target));
   else if (drawTool && ev.button === 0) draw = ev.pointerType === 'mouse' || (ev.pointerType === 'touch' && !penSeen);
@@ -3106,7 +3101,6 @@ $('#add-emacs')!.onclick = () => askName('File to open in Emacs', INFO?.notes ? 
 $('#add-web')!.onclick = () => askName('Address', 'https://', u => newWeb(u));
 $('#add-acp')!.onclick = () => newAgentCard();
 $('#add-sketch')!.onclick = () => newSketch();
-if ($('#add-agent')) $('#add-agent')!.onclick = () => { const n = newAt('agent', { w: 520, h: 440, log: [{ t: 'note', text: 'Ask me about the board, or tell me what to change.' }], turns: [], tier: 'quick' }); setTimeout(() => live[n.id]?.ta?.focus(), 50); };
 $('#open-today')!.onclick = () => openToday();
 $('#add-shell')!.onclick = () => pickShell(shell => newAt('term', { backend: DAEMON ? 'pty' : 'fake', cwd: DAEMON ? undefined : '/home/me', env: {}, ...(shell ? { shell } : {}) }));
 // The server's shells (/api/info.shells); the default is the last one picked on this device, else the server's default.
@@ -3322,14 +3316,9 @@ function pickFolder(prompt: string, cb: (f: FrameNode | null) => unknown) {
 }
 cmd('Toggle folder tree', () => toggleTree(), '@tree.toggle');
 cmd('Toggle the docked terminal', () => toggleDockTerm(), '@dock.toggle');
-cmd('Side pane: wider', () => { toggleSide(true, true); setPaneW((S.paneW || PANE_W) + 80, true); }, '@pane.wider');
-cmd('Side pane: narrower', () => { toggleSide(true, true); setPaneW((S.paneW || PANE_W) - 80, true); }, '@pane.narrower');
+cmd('Side pane: wider', () => { toggleSide(true); setPaneW((S.paneW || PANE_W) + 80, true); }, '@pane.wider');
+cmd('Side pane: narrower', () => { toggleSide(true); setPaneW((S.paneW || PANE_W) - 80, true); }, '@pane.narrower');
 cmd('Side pane: reset width', () => setPaneW(PANE_W, true));
-// Listed only while the assistant pane exists (initChat mounts none since v9): run without it, they threw.
-const hasChat = () => !!(S.chat && live.chat);
-cmd('Assistant: new conversation', () => { S.chat!.turns = []; S.chat!.log = [{ t: 'note', text: CHAT_HELLO }]; renderAgentLog(S.chat!); dirty(); toggleSide(true); }, '', hasChat);
-cmd('Assistant: fork the conversation onto the canvas', () => $('#chat-fork')!.click(), '', hasChat);
-cmd('Assistant: talk (hold-to-talk mic)', () => { toggleSide(true, true); sideTab('chat'); $('.mic', live.chat.body)!.dispatchEvent(new PointerEvent('pointerdown', { button: 0 })); }, '', hasChat);
 cmd('Dictate into the page', () => { if (VIEW === 'editor' && ED.node) dictateInto('editor'); else if (focusedBuf && S.nodes[focusedBuf]) dictateInto(S.nodes[focusedBuf] as PageNode); else toast('Click into a page first.'); }, '@dictate');
 for (const [t, name, key] of [['select', 'select and move', 'V'], ['area', 'select an area (ink, shapes, cards)', 'S'], ['rect', 'rectangle', 'R'], ['diamond', 'diamond', 'D'], ['ellipse', 'ellipse', 'O'], ['arrow', 'arrow', 'A'], ['pen', 'pen', 'P'], ['text', 'text', 'T'], ['erase', 'eraser', 'E']])
   cmd(`Tool: ${name}`, onCanvas(() => setTool(t)), '@tool.' + t);
@@ -3339,7 +3328,6 @@ cmd('Selection → text (read the handwriting)', () => { INK.ids = [...SEL.strok
 cmd('Undo the last removal', () => removeUndo(), '', () => !!REMOVE_UNDO);
 for (const c of ['ink', 'red', 'blue']) cmd(`Ink colour: ${c}`, onCanvas(() => { $(`.sw[data-color="${c}"]`)!.click(); }));
 cmd('Handwriting → text', () => inkToText(), '', () => INK.ids.length > 0);
-cmd('Handwriting → ask the assistant', () => inkAsk(), '', () => INK.ids.length > 0 && hasChat());
 cmd('Show or hide drawing tools', () => toggleDock('draw'));
 cmd('Show or hide the add bar', () => toggleDock('new'));
 cmd('New Emacs buffer…', onCanvas(() => $('#add-emacs')!.click()), '', () => DAEMON);
@@ -3690,34 +3678,6 @@ function findNode(p: string | null | undefined): BoardNode | null {
   if (hit) return hit;
   return boardAt(p.replace(/^board:/, '').replace(/^\/+/, '')) || null;   // folder path as addresses write it (board:/folder/name)
 }
-function boardSummary(): string {
-  const lines: string[] = [];
-  for (const f of frameList()) lines.push(`folder ${fullPath(f)}/ [${f.mode || 'free'}${f.mode === 'stack' ? ', collapsed into a deck' : ''}, ${f.shape || 'folder'} shape, ${kidsOf(f.id).length} item(s)]`);
-  for (const n of nodeList()) {
-    let extra = '';
-    if (n.kind === 'term') extra = n.backend === 'pty' ? ', real shell' : `, simulated shell, cwd ${n.cwd}`;
-    if (n.kind === 'repl') extra = n.lang === 'js' ? ', JavaScript REPL' : `, ${n.cmd} REPL`;
-    if (n.kind === 'buffer') extra = `, ${pageText(n).split('\n').length} lines`;
-    if (n.kind === 'artifact') extra = `, artifact page, capabilities ${Object.keys(n.capabilities || {}).join('/') || 'none'}, version ${String(n.head || '').slice(0, 8)}`;
-    lines.push(`- ${pathOf(n.id)} [${n.kind === 'buffer' ? 'page' : n.kind}${extra}] ${n.in ? 'in folder ' + folderPath(n) + '/' : 'loose on the canvas'}${deskOff(n) ? ' (not on this desk)' : stashed(n) ? ' (hidden in a deck)' : ''}`);
-  }
-  for (const e of S.edges) if (S.nodes[e.from] && S.nodes[e.to]) lines.push(`edge ${e.type}: ${pathOf(e.from)} -> ${pathOf(e.to)}`);
-  const labeled = S.shapes.filter(s => s.text);
-  if (S.shapes.length) lines.push(`${S.shapes.length} sketch shape(s)` + (labeled.length ? ': ' + labeled.slice(0, 12).map(s => `${s.type} "${s.text!.replace(/\n/g, ' ')}"`).join(', ') : ''));
-  return lines.join('\n');
-}
-function agentRules(n: LegacyAgentNode): string {
-  if (n.id === 'chat') return chatRules();
-  const act = activeId && activeId !== n.id && S.nodes[activeId] ? pathOf(activeId) : 'nothing in particular';
-  return `You are "${pathOf(n.id)}", an agent node on a canvas workbench: a pannable board of shells, REPLs, markdown outline pages, reference cards, folders and hand-drawn shapes. Spawn edges form trees; pipe edges carry data. Folders are containers on the canvas that hold nodes and other folders. A folder is free (items stay where placed; it stretches to hold them), pack (items flow into rows in order) or stack (collapsed into a deck of cards). Use make_folder and put_in_folder to organise; reading or running something inside a deck works without spreading it. Pages follow Logseq conventions: "- " bullets, [[page]] links, ((address)) block references. Addresses look like "plans › Rollout ¶2", "plans#freeze" or folder cells like "machines/B2".
-
-Look before you answer and act when asked, using the tools: read nodes, run commands in shells or REPLs, write pages, create nodes and edges, draw shapes, move the view. Shells here are simulated (ls, cd, cat, echo, mkdir, touch, tree, env, export, pwd); REPLs run JavaScript. Keep replies short and concrete, refer to nodes by path, and say what you changed.
-
-Board now:
-${boardSummary()}
-
-The user last focused: ${act}.`;
-}
 const str = (v: unknown) => (v == null ? '' : String(v));
 const AGENT_TOOLS: AgentTool[] = [
   { name: 'read_node', description: 'Read a node by path. A page returns its markdown; a shell or REPL returns its last 80 lines of output; a ref returns its text.',
@@ -3728,7 +3688,6 @@ const AGENT_TOOLS: AgentTool[] = [
       if (n.kind === 'buffer') return (await pageTextFull(n)).slice(0, 8000);   // the replica is what every editor sees (R13.7)
       if (live[n.id]?.term) return termLines(live[n.id], 80).join('\n') || '(empty)';
       if (n.kind === 'acp') return live[n.id]?.backend?.text!(40) ?? '(not mounted)';
-      if (n.kind === 'agent') return (n.log || []).slice(-10).map(l => `${l.t}: ${l.text || l.name}`).join('\n');
       if (n.kind === 'pdf') return pdfText(n, n.pos?.page || 1, (n.pos?.page || 1) + 1, 8000);   // read_pdf reads any pages
       if (n.kind === 'op') return `media card: ${n.op}\nprompt: ${n.prompt || ''}\n` + (n.out?.err ? 'failed: ' + n.out.err : n.out?.text || (n.out?.images ? `${n.out.images.length} image(s), picked ${(n.out.pick || 0) + 1}` : 'not run yet')) + (opStale(n) ? '\n(stale: the inputs changed since)' : '');
       return (n as RefNode).text || '';
@@ -3828,87 +3787,10 @@ const AGENT_TOOLS: AgentTool[] = [
 ];
 const n0 = () => (activeId && S.nodes[activeId]) || null;
 function pulse(id: string) { const L = live[id]; if (!L) return; L.el!.classList.remove('pulse'); void L.el!.offsetWidth; L.el!.classList.add('pulse'); }
-function mountAgent(n: LegacyAgentNode, L: LiveEntry) {
-  n.log = n.log || []; n.turns = n.turns || []; n.tier = n.tier || 'quick';
-  for (const m of n.log) if (m.live) { m.live = false; if (m.text === 'Thinking…') m.text = '(interrupted)'; }
-  L.body!.innerHTML = '<div class="ag-log" aria-live="polite"></div><form class="ag-in"><textarea rows="2" placeholder="Ask about the board, or tell the agent what to do…"></textarea>'
-    + '<div class="ag-row"><span class="seg" role="group" aria-label="Model"><button type="button" data-t="quick" title="Fastest model">Fast</button><button type="button" data-t="default" title="Balanced model that thinks first">Expert</button><button type="button" data-t="complex" title="Most capable model, slowest">Heavy</button></span>'
-    + '<button type="button" class="mic" title="Hold to talk, release to send. Tap to dictate without sending.">🎙</button><button type="button" class="stop" hidden>Stop</button><button type="submit" class="go">Send</button></div></form>';
-  L.logEl = $('.ag-log', L.body)!; L.ta = $('textarea', L.body) as HTMLTextAreaElement;
-  const seg = () => $$('.seg button', L.body).forEach(b => b.classList.toggle('on', b.dataset.t === n.tier));
-  $$('.seg button', L.body).forEach(b => b.onclick = () => { n.tier = b.dataset.t as LegacyAgentNode['tier']; seg(); dirty(); });
-  seg();
-  $('.ag-in', L.body)!.addEventListener('submit', e => { e.preventDefault(); agentSend(n); });
-  L.ta.addEventListener('keydown', (e: KeyboardEvent) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); agentSend(n); } });
-  $('.stop', L.body)!.onclick = () => L.ctl?.abort();
-  wireMic($('.mic', L.body)!, n);
-  renderAgentLog(n);
-}
-function renderAgentLog(n: LegacyAgentNode) {
-  const L = live[n.id]; if (!L?.logEl) return;
-  L.logEl.replaceChildren(...n.log.map(m => {
-    const d = el('div', 'ag-msg ag-' + (m.t === 'assistant' ? 'asst' : m.t));
-    if (m.t === 'tool') {
-      d.innerHTML = '<b></b> <span class="args"></span><span class="res"></span>';
-      $('b', d)!.textContent = '⚙ ' + m.name; $('.args', d)!.textContent = m.args as string || ''; $('.res', d)!.textContent = m.res as string ?? '…';
-    } else d.textContent = m.text!;
-    if (m.live) d.classList.add('thinking');
-    return d;
-  }));
-  L.logEl.scrollTop = L.logEl.scrollHeight;
-  if (lastLod) refreshSnapshots();
-}
-/* What agentSend may be given besides the box's text: text to send instead, a note for the model, images. */
-interface AgentSendOpts { text?: string; note?: string; images?: Blob[] }
-async function agentSend(n: LegacyAgentNode, opt: AgentSendOpts = {}) {
-  const L = live[n.id]; if (!L || L.busy) return;
-  const text = (opt.text ?? L.ta!.value).trim(); if (!text) return;
-  if (opt.text == null) L.ta!.value = '';
-  n.log.push({ t: 'user', text }); n.turns.push({ role: 'user', content: opt.note ? `${opt.note}\n${text}` : text }); renderAgentLog(n);
-  const sample = await getSample();
-  if (!sample) {
-    n.log.push({ t: 'note', text: DAEMON ? SAMPLE_OFF : 'The agent needs a language model: Claude inside the hosted artifact on claude.ai, or a Workbench server that serves one. It is not available in this copy.' });
-    renderAgentLog(n); dirty(); return;
-  }
-  L.busy = true; $('.stop', L.body)!.hidden = false; ($('.go', L.body) as HTMLButtonElement).disabled = true; activity(n.id);
-  const reply: LegacyAgentLogItem = { t: 'assistant', text: 'Thinking…', live: true }; n.log.push(reply); renderAgentLog(n);
-  const ctl = L.ctl = new AbortController();
-  const tools = AGENT_TOOLS.map((t): PageSampleTool => ({
-    name: t.name, description: t.description, inputSchema: t.inputSchema,
-    execute: async (input, ctx) => {
-      const entry: LegacyAgentLogItem = { t: 'tool', name: t.name, args: JSON.stringify(input || {}).slice(0, 180) };
-      n.log.splice(n.log.indexOf(reply), 0, entry); renderAgentLog(n); activity(n.id);
-      try {
-        const r = await t.run(input || {}, ctx), out = typeof r === 'string' ? r : JSON.stringify(r);
-        entry.res = out.split('\n').slice(0, 4).join('\n'); renderAgentLog(n); dirty();
-        return out.slice(0, 30000);
-      } catch (e) { entry.res = 'error: ' + (e.message || e); renderAgentLog(n); throw e; }
-    },
-  }));
-  try {
-    const res = await sample([{ role: 'user', content: agentRules(n) }, ...n.turns.slice(-16)], {
-      modelTier: n.tier, tools, signal: ctl.signal, ...(opt.images ? { images: opt.images } : {}),
-      onText: ({ text: t }) => { reply.text = t; reply.live = false; renderAgentLog(n); },
-    });
-    reply.text = res.text; reply.live = false; n.turns.push({ role: 'assistant', content: res.text });
-    if (res.truncated) n.log.push({ t: 'note', text: 'The answer was cut short. Ask for less at a time.' });
-  } catch (e) {
-    reply.live = false; reply.text = e?.text || '';
-    if (reply.text) n.turns.push({ role: 'assistant', content: reply.text }); else n.log.splice(n.log.indexOf(reply), 1);
-    const msg = ({ cancelled: 'Stopped.', not_granted: 'The agent needs permission to use Claude. Allow it from the artifact’s permissions, then send again.',
-      rate_limited: 'Too many requests right now. Wait a moment, then send again.', tools_unavailable: 'This view cannot run agent tools.',
-      sampling_disabled: 'Claude is not available for this account.', session_expired: 'Sign in to claude.ai again, then send again.' } as Record<string, string>)[e?.code] || `The request failed (${e?.code || 'error'}). Send again to retry.`;
-    n.log.push({ t: 'note', text: msg });
-  } finally {
-    L.busy = false; $('.stop', L.body)!.hidden = true; ($('.go', L.body) as HTMLButtonElement).disabled = false;
-    if (n.log.length > 80) n.log.splice(0, n.log.length - 80);
-    renderAgentLog(n); dirty();
-  }
-}
 
-// ------------------------------------------------------------------ pen: handwriting becomes text, or a question
+// ------------------------------------------------------------------ pen: handwriting becomes text
 // Strokes written close together in time and space form one note. A chip beside it turns the note into text
-// (Claude reads the ink as an image) or sends it to the assistant. Ink on a page turns into text at its line.
+// (Claude reads the ink as an image). Ink on a page turns into text at its line.
 const INK: { ids: string[]; t: number } = { ids: [], t: 0 };
 function inkBox(ids: string[]): { x0: number; y0: number; x1: number; y1: number } | null {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -3977,17 +3859,7 @@ async function inkToText() {
     toast(e?.code === 'not_granted' ? 'Allow this page to use Claude (with images), then try again.' : `Could not read the handwriting (${e?.code || e?.message || 'error'}).`, 6000);
   } finally { chip.classList.remove('busy'); }
 }
-async function inkAsk() {
-  const ids = [...INK.ids]; if (!ids.length || !hasChat()) return;   // v9: no assistant pane, nothing to ask
-  if (!(await canSeeImages())) return;
-  const img = await inkImage(ids);
-  toggleSide(true, true);
-  const ta = live.chat.ta!, typed = ta.value.trim(); ta.value = '';
-  agentSend(S.chat!, { text: typed || '✎ (handwritten note)', images: [img], note: '[The user wrote this by hand on the canvas; the handwriting is attached as an image. Read it and respond to it.]' });
-  INK.ids = []; placeInkChip();
-}
 $('#ink-text')!.onclick = inkToText;
-if ($('#ink-ask')) $('#ink-ask')!.onclick = inkAsk;
 $('#ed-mic')!.onclick = () => dictateInto('editor');
 $('#ink-x')!.onclick = () => { INK.ids = []; placeInkChip(); };
 
@@ -4027,24 +3899,6 @@ function listen({ onUpdate, onEnd, label }: VoiceListenOpts): boolean {
   return true;
 }
 function stopListening() { const r = VOICE.rec; VOICE.rec = null; try { r?.stop(); } catch {} }
-function wireMic(btn: HTMLElement, n: LegacyAgentNode) {
-  let t0 = 0, held = false;
-  btn.addEventListener('pointerdown', ev => {
-    if (ev.button !== 0) return; ev.preventDefault();
-    if (VOICE.rec && VOICE.target === btn) { stopListening(); return; }
-    t0 = performance.now(); held = true;
-    const L = live[n.id], base = L.ta!.value ? L.ta!.value.replace(/\s*$/, ' ') : '';
-    VOICE.target = btn; btn.classList.add('on');
-    listen({ label: n.id === 'chat' ? 'the assistant' : n.name,
-      onUpdate: (fin, interim) => { L.ta!.value = base + spoken(fin + interim); },
-      onEnd: (fin, failed) => { L.ta!.value = base + spoken(fin); if (btn.dataset.send === '1' && fin && !failed) agentSend(n); btn.dataset.send = ''; } });
-  });
-  const release = () => {
-    if (!held) return; held = false;
-    if (performance.now() - t0 > 400) { btn.dataset.send = '1'; stopListening(); }  // held: release sends; tapped: keep dictating until tapped again
-  };
-  btn.addEventListener('pointerup', release); btn.addEventListener('pointerleave', release); btn.addEventListener('pointercancel', release);
-}
 // Dictation into a page (its card, or the Editor view's frame): the recognised text goes in at the frame's point as
 // this frame's own edit. A read-only page (no edwind) takes none, nor one whose replica is not writable yet; words that
 // do not go in are tried again with the next result.
@@ -4072,7 +3926,7 @@ async function dictateInto(n: 'editor' | PageNode) {
 }
 
 // ------------------------------------------------------------------ navigator: ranger-style Miller columns over folders and files
-// Workspace folders and items, plus "~ files" (the real file system with canvasd, the simulated one otherwise).
+// Workspace folders and items, plus "~ files" (the real file system when served, the simulated one in the demo).
 // Keys follow ranger: h j k l, gg G, / filter, space mark, dd cut, pp paste, yp copy path, r rename, S shell here.
 /* The navigator's state: the directory shown, the selection in each, the filter, marks, the cut list, a pending key
    sequence, a cache of listings and previews (null while loading), the home directory and the bookmarks. */
@@ -4169,7 +4023,6 @@ function rgPreview(e: RgEntry | undefined) {
     if (n.kind === 'buffer') pre.textContent = pageText(n);
     else if (L?.term) pre.textContent = termLines(L, 60).join('\n');
     else if (n.kind === 'acp') pre.textContent = L?.backend?.text!(60) || '';
-    else if (n.kind === 'agent') pre.textContent = (n.log || []).filter(m => m.text).slice(-12).map(m => (m.t === 'user' ? '› ' : m.t === 'tool' ? '⚙ ' : '') + (m.text || m.name)).join('\n\n');
     else pre.textContent = (n as RefNode).text || '';
     const meta = el('div', 'rg-meta'); meta.textContent = [badgeOf(n), folderPath(n) ? 'in ' + folderPath(n) + '/' : 'loose on the canvas', (n as TermNode).cwd && n.kind === 'term' ? 'cwd ' + n.cwd : ''].filter(Boolean).join(' · ');
     box.append(meta, pre); return;
@@ -4290,11 +4143,11 @@ $('#rg-cur')!.addEventListener('dblclick', (e: MouseEvent) => { const r = (e.tar
 $('#rg-parent')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; if (!r) return; const p = rgParent(RG.dir); if (p) rgGo(p, r.dataset.key); });
 $('#rg-prev')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; const cur = rgCur().e; if (r && cur?.dir) rgGo(cur.key, r.dataset.key); });
 
-// ------------------------------------------------------------------ docked terminal: a shell in the side pane instead of the assistant
+// ------------------------------------------------------------------ docked terminal: a shell in the side pane
 function sideTab(which?: Board['sideTab']) {
   which = 'term'; S.sideTab = which; dirty();
   $$('.side-tabs button').forEach(b => b.classList.toggle('on', b.dataset.side === which));
-  { const sc = $('#side-chat'); if (sc) sc.hidden = true; } $('#side-term')!.hidden = false;
+  $('#side-term')!.hidden = false;
   if (which === 'term') {
     if (!S.dockTerm) { S.dockTerm = { id: 'dock', kind: 'term', name: 'dock', backend: DAEMON ? 'pty' : 'fake', cwd: DAEMON ? undefined : '/home/me', env: {}, _spawn: BOOTED } as TermNode; if (shellDefault()) S.dockTerm.shell = shellDefault(); dirty(); }
     if (!live.dock) { live.dock = { el: $('#side-term')!, body: $('#side-term-body')!, hdr: null }; mountTerm(S.dockTerm, live.dock); }
@@ -4303,7 +4156,7 @@ function sideTab(which?: Board['sideTab']) {
 }
 function toggleDockTerm() {
   const open = document.body.classList.contains('side-open');
-  if (open && S.sideTab === 'term') toggleSide(false); else { toggleSide(true, true); sideTab('term'); }
+  if (open && S.sideTab === 'term') toggleSide(false); else { toggleSide(true); sideTab('term'); }
 }
 $$('.side-tabs button').forEach(b => b.onclick = () => sideTab(b.dataset.side as Board['sideTab']));
 
@@ -4362,7 +4215,7 @@ function setView(v: string) {
   if (S) placeInkChip();
   if (v !== 'canvas') { if (tool !== 'select') setTool('select'); $('#st-addr')!.textContent = VIEW_NAMES[v as ViewName]; $('#st-zoom')!.textContent = ''; }
   else { $('#st-zoom')!.textContent = Math.round(cam().z * 100) + '%'; $('#st-addr')!.textContent = '–'; }
-  updateSideCtx(); ringNote();
+  ringNote();
 }
 $$('[data-view]').forEach(b => b.onclick = () => setView(b.dataset.view!));
 // Pages changed somewhere: refresh whichever non-canvas view is showing.
@@ -4396,7 +4249,7 @@ function edLoad(n: PageNode, pos?: number) {
   $('#ed-host')!.replaceChildren(ED.pre, el('div', 'fr-off', roNotice(n)));
   if (pos != null) roScrollTo(n, pos);
   $('#ed-crumb')!.textContent = pathOf(n.id);
-  renderEdList(); edInfo(); updateSideCtx();
+  renderEdList(); edInfo();
 }
 function renderEdList() {
   const q = ($('#ed-filter') as HTMLInputElement).value.trim().toLowerCase(), list = $('#ed-list')!;
@@ -4546,7 +4399,6 @@ function graphTick() {
   G.alpha = G.drag ? Math.max(G.alpha, 0.3) : G.alpha * 0.985;
 }
 const gRadius = (g: GraphNodeG) => (g.kind === 'buffer' || g.kind === 'ghost' ? 5 : 6) + Math.sqrt(g.deg) * 2.6;
-function gToScreen(x: number, y: number) { const r = gCanvas.getBoundingClientRect(); return { x: (x - G.cam.x) * G.cam.z + r.width / 2, y: (y - G.cam.y) * G.cam.z + r.height / 2 }; }
 function gToWorld(sx: number, sy: number) { const r = gCanvas.getBoundingClientRect(); return { x: (sx - r.width / 2) / G.cam.z + G.cam.x, y: (sy - r.height / 2) / G.cam.z + G.cam.y }; }
 function graphDraw() {
   const dpr = devicePixelRatio || 1, r = gCanvas.getBoundingClientRect(), W = Math.round(r.width * dpr), H = Math.round(r.height * dpr);
@@ -4617,7 +4469,7 @@ function gHit(sx: number, sy: number) {
   return best;
 }
 function graphSelect(id: string | null) {
-  G.sel = id; const card = $('#g-card')!; updateSideCtx();
+  G.sel = id; const card = $('#g-card')!;
   if (!id) { card.hidden = true; graphKick(); return; }
   const g = G.N.get(id)!; card.hidden = false; card.replaceChildren();
   const head = el('div', 'gc-head'); head.innerHTML = '<b></b><span class="badge"></span><button class="mini gc-x" title="Show everything again (Esc, or click empty space)">✕</button>';
@@ -4634,7 +4486,6 @@ function graphSelect(id: string | null) {
   if (g.kind === 'buffer') B('Open in editor', () => edOpen(g.ref));
   if (g.ref) B('Show on canvas', () => { setView('canvas'); jumpNode(g.ref!); });
   if (g.ref) B(g.ref.kind === 'frame' ? 'Enter as workspace' : 'Open as tab', () => { setView('canvas'); g.ref!.kind === 'frame' ? wsEnter(g.ref) : focusOpen(g.ref); });
-  if (hasChat()) B('Ask assistant', () => { toggleSide(true); const ta = live.chat.ta!; ta.value = `About [[${g.label}]]: `; ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); });
   const hint = el('div', 'gc-hint', 'Neighbours of ' + g.label + ' are bright; the rest is dimmed. Esc, ✕ or a click on empty space shows all.');
   card.append(head, pre, ...(nb.length ? [links] : []), acts, hint);
   graphKick();
@@ -4711,7 +4562,6 @@ function renderOutline() {
     else if (n.kind === 'term') meta = n.backend === 'pty' ? 'real shell' : (live[n.id]?.backend?.cwd || n.cwd || '');
     else if (n.kind === 'repl') meta = n.lang === 'js' ? `JavaScript · ${(n.history || []).length} inputs` : n.cmd;
     else if (n.kind === 'acp') meta = agentLabel(n.agent) + ' · ' + (SESS[n.id]?.state || '…').replace(/_/g, ' ');
-    else if (n.kind === 'agent') meta = `${(n.turns || []).length} turns · ${({ quick: 'Fast', default: 'Expert', complex: 'Heavy' })[n.tier] || ''}`;
     else if (n.kind === 'ref') meta = 'from ' + (n.srcLabel || '?');
     const pipes = S.edges.filter(e => e.from === n.id && e.type !== 'spawn').map(e => `${e.type} → ${S.nodes[e.to]?.name}`);
     $('.ol-meta', r)!.textContent = [meta, ...pipes].filter(Boolean).join(' · ');
@@ -4905,20 +4755,10 @@ $('#tk-add')!.addEventListener('submit', async e => {
   i.value = ''; renderTasks(); toast(`Added to ${TODAY}`);
 });
 
-// ------------------------------------------------------------------ side pane: the general-purpose assistant
-const CHAT_HELLO = 'I am the general assistant. I see the view you are in and can act on the whole workspace: read and write pages, run commands in shells and REPLs, add nodes and links, draw, and switch views. ⑂ forks this conversation onto the canvas as an agent node.';
-function initChat() {
-  return; // v9: the assistant pane is gone; agents run in terminals.
-  if (!S.chat) S.chat = { id: 'chat', name: 'assistant', kind: 'agent', tier: 'quick', turns: [], log: [{ t: 'note', text: CHAT_HELLO }] } as unknown as LegacyAgentNode;
-  live.chat = { el: $('#side')!, body: $('#side-body')!, hdr: null };
-  mountAgent(S.chat!, live.chat);
-  live.chat.ta!.placeholder = 'Ask anything, or tell me what to change…';
-}
-function toggleSide(open?: boolean | null, quiet?: boolean) {
+function toggleSide(open?: boolean | null) {
   open = open ?? !document.body.classList.contains('side-open');
   document.body.classList.toggle('side-open', open);
   if (S) { S.side = open; dirty(); }
-  if (open && !quiet) setTimeout(() => live.chat?.ta?.focus(), 60);
   if (VIEW === 'graph') setTimeout(graphDraw, 220);
 }
 const PANE_W = 400, TREE_W = 240;
@@ -4958,40 +4798,7 @@ function wirePaneGrip() {
   $('#pick-chip [data-act=png]')!.onclick = () => sketchCopy('png');
   $('#pick-chip [data-act=svg]')!.onclick = () => sketchCopy('svg');
 }
-function focusLabel() {
-  if (VIEW === 'editor' && ED.node) return 'page ' + ED.node.name;
-  if (VIEW === 'graph' && G.sel) return G.N.get(G.sel)?.label;
-  if (VIEW === 'canvas' && activeId && S.nodes[activeId]) return pathOf(activeId);
-  return '';
-}
-function updateSideCtx() { const f = focusLabel(), ta = $('#side-chat textarea') as HTMLTextAreaElement | null; if (ta) ta.placeholder = f ? `Ask about ${f}, or anything on the board…` : 'Ask about the board, or tell the agent what to do…'; }
-function chatRules() {
-  const f = focusLabel();
-  return `You are the general-purpose assistant in the side pane of a personal workbench. One set of data (pages, shells, REPLs, agent nodes, reference cards, folders, edges and sketch shapes) is shown through five views the user switches between: canvas (a pannable spatial board), graph (pages and nodes as a link graph), editor (one page as a full-width text editor), outline (everything as a tree grouped by folder) and tasks (TODO / NEXT / WAITING / DONE blocks from all pages and the notes index as a board).
-
-Folders are containers on the canvas that hold nodes and other folders. A folder is free (items stay where placed; it stretches to hold them), pack (items flow into rows in order) or stack (collapsed into a deck of cards). Use make_folder and put_in_folder to organise; reading or running something inside a deck works without spreading it.
-
-Pages follow Logseq conventions: "- " bullets, [[page]] links, ((address)) block references, and tasks written as "- TODO …", "- NEXT …", "- WAITING …", "- DONE …" (also HOLD, SOMEDAY, CANCELLED), with SCHEDULED:/DEADLINE: lines and session:: fields under them. Addresses look like "plans › Rollout ¶2", "plans#freeze" or folder cells like "machines/B2". Today is ${TODAY}; today's journal page is named "${TODAY}".
-
-Artifact nodes are self-contained HTML pages (Claude artifacts) in sandboxed frames; publish_artifact creates or updates one, read_artifact reads it, and artifact_from_file shows an HTML file that any agent writes (it reloads on change). open_web opens a page as a browser-window node; open_in_emacs opens a file in an Emacs buffer node (a PTY running emacsclient). Sketch nodes are cards the user writes on with the pen. tag_node and list_nodes work with tags (#agent, #aggregator, user tags). Flashcards live as blocks in notes; list_due reads the FSRS queue and create_flashcard writes a card block; the Review view (Alt-7) is where the user reviews.\n\nLook before you answer and act when asked, using the tools. Shells are ${DAEMON ? 'real shells on the user\'s machine' : 'simulated (ls, cd, cat, echo, mkdir, touch, tree, env, export, pwd)'}; JavaScript REPLs run in the browser. Keep replies short and concrete, refer to nodes by path, and say what you changed. When the result is easier to see in another view, switch to it with open_view.
-
-The user is in the ${VIEW} view${f ? `, focused on ${f}` : ''}.
-
-Workspace now:
-${boardSummary()}`;
-}
 $('#side-close')!.onclick = () => toggleSide(false);
-if ($('#chat-clear')) $('#chat-clear')!.onclick = ev => confirmDel(ev.currentTarget as HTMLElement, () => {
-  S.chat!.turns = []; S.chat!.log = [{ t: 'note', text: CHAT_HELLO }]; renderAgentLog(S.chat!); dirty();
-});
-if ($('#chat-fork')) $('#chat-fork')!.onclick = () => {
-  const c = S.chat!; if (!c.turns.length) return toast('Nothing to fork yet. Ask the assistant something first.');
-  setView('canvas');
-  const p = viewCenterWorld(), count = nodeList().filter(n => n.kind === 'agent').length + 1;
-  const n = addNode({ kind: 'agent', name: 'chat' + count, ...freeSpot(p.x - 260, p.y - 200, 520, 420), w: 520, h: 420, tier: c.tier,
-    turns: c.turns.map(t => ({ ...t })), log: [...c.log.filter(m => !m.live).map(m => ({ ...m })), { t: 'note', text: `Forked from the assistant after ${c.turns.length} turn(s). This branch continues on its own.` }] });
-  jumpNode(n); toast(`Forked into ${n.name} on the canvas`);
-};
 AGENT_TOOLS.push({
   name: 'read_pdf', description: 'Read the text of a PDF card, with "--- name p. N ---" page markers. from and to are page numbers (from 1; default: the page the reader is on and the nine after it). Scanned pages have no text.',
   inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'the PDF card, as read_node takes it' }, from: { type: 'number' }, to: { type: 'number' } }, required: ['path'] },
@@ -5026,7 +4833,7 @@ AGENT_TOOLS.push({
   },
 });
 
-// ------------------------------------------------------------------ daemon info and RPC: Claude through canvasd
+// ------------------------------------------------------------------ daemon info and RPC
 // In the local build every `sample` call (assistant, agent nodes, handwriting, hosted artifacts) goes to the daemon over
 // one WebSocket; the key lives in the daemon's environment. In the hosted artifact the outer page's own `sample` answers.
 let INFO: DaemonInfo | null = null;
@@ -5879,8 +5686,7 @@ function seed(): Board {
   add({ id: 'plans', kind: 'buffer', name: 'plans', in: 'fCW', x: 40, y: 50, w: 560, h: 470, text: PLANS,
     anchors: [{ id: 'a-freeze', label: 'freeze', pos: PLANS.indexOf('freeze on'), quote: 'freeze on Friday', prefix: 'Code ' }] });
   add({ id: 'log', kind: 'buffer', name: 'log', in: 'fCW', x: 640, y: 50, w: 370, h: 400, text: '# log\n\n- Select text in [[ops]], then press ⇢ on ops.\n' });
-  add({ id: 'agent', kind: 'agent', name: 'agent', in: 'fCW', x: 40, y: 560, w: 560, h: 400, tier: 'quick', turns: [],
-    log: [{ t: 'note', text: 'I can read this board, run commands in the shells and REPLs, write pages, add nodes, sort things into folders and draw shapes. Try: "Put calc and what-if in a new packed folder called sums."' }] });
+  add({ id: 'agent', kind: 'term', backend: sh, cmd: real ? '' : 'claude', fg: real ? undefined : 'claude', name: 'claude', tags: ['agent'], env: {}, in: 'fCW', x: 40, y: 560, w: 560, h: 400 });
   add({ id: 'ops', kind: 'term', backend: sh, name: 'ops', in: 'fMach', x: 1090, y: 110, w: 640, h: 360, cwd: home, env: { PROJECT: 'canvas' } });
   add({ id: 'build', kind: 'term', backend: sh, name: 'build', in: 'fMach', x: 1090, y: 580, w: 440, h: 300, spawnFrom: 'ops', cwd: home, env: { PROJECT: 'canvas', STAGE: 'build' },
     spawnNote: real ? undefined : 'branched from ops: started in ' + home + ', inherited 1 env var(s)' });
@@ -5897,10 +5703,9 @@ function seed(): Board {
   add({ id: 'fLab', kind: 'frame', name: 'homelab', shape: 'folder', mode: 'stack', prevMode: 'free', x: 2250, y: 40, w: 300, h: 230, openW: 1000, openH: 560 });
   add({ id: 'hosts', kind: 'buffer', name: 'hosts', in: 'fLab', order: 0, x: 2280, y: 70, w: 420, h: 500, text: '# hosts\n\n- nas: 192.0.2.12, zfs pool `tank`\n- pi: 192.0.2.20, runs the backups\n- TODO Rotate the backup key on [[pi]]\n' });
   add({ id: 'labsh', kind: 'term', backend: sh, name: 'sh', in: 'fLab', order: 1, x: 2740, y: 70, w: 480, h: 290, cwd: real ? undefined : '/home/me', env: { SITE: 'homelab' } });
-  add({ id: 'backup', kind: 'agent', name: 'backup-rotation', in: 'fLab', order: 2, x: 2740, y: 390, w: 480, h: 180, tier: 'quick', turns: [],
-    log: [{ t: 'note', text: 'Thread for the backup rotation. Ask me to check the hosts page or run something in sh.' }] });
+  add({ id: 'backup', kind: 'buffer', name: 'backup-rotation', in: 'fLab', order: 2, x: 2740, y: 390, w: 480, h: 180, text: '# backup-rotation\n\nNotes for the backup rotation: check the hosts page, run the steps in sh.\n' });
   add({ id: 'journal', kind: 'buffer', name: TODAY, x: 2250, y: 640, w: 380, h: 470,
-    text: `# ${TODAY}\n\n- v5: folders are containers on the canvas. Drag anything by its header into a folder.\n- Each folder is ◻ free, ▦ packed or ❐ stacked: the buttons sit on its tab.\n- Freeze reminder: ((plans#freeze))\n- TODO Drag [[reading]] out of scratch and drop it in canvas-workbench\n- TODO Spread the homelab deck (double-click it), then stack it again\n- DONE Sketch the [[canvas]] layout\n- ` });
+    text: `# ${TODAY}\n\n- Folders are containers on the canvas. Drag anything by its header into a folder.\n- Each folder is ◻ free, ▦ packed or ❐ stacked: the buttons sit on its tab.\n- Freeze reminder: ((plans#freeze))\n- TODO Drag [[reading]] out of scratch and drop it in canvas-workbench\n- TODO Spread the homelab deck (double-click it), then stack it again\n- DONE Sketch the [[canvas]] layout\n- ` });
   B.edges.push({ id: 'e1', from: 'ops', to: 'build', type: 'spawn' }, { id: 'e2', from: 'ops', to: 'logs', type: 'spawn' },
     { id: 'e3', from: 'calc', to: 'whatif', type: 'spawn' }, { id: 'e4', from: 'ops', to: 'log', type: 'pipe' }, { id: 'e5', from: 'labsh', to: 'hosts', type: 'pipe' });
   B.shapes.push(
@@ -6449,7 +6254,7 @@ function frEdLoad(n: PageNode, pos?: number | null) {
   });
   edCrumb(n);
 }
-function edCrumb(n: PageNode) { $('#ed-crumb')!.textContent = pathOf(n.id); renderEdList(); edInfo(); updateSideCtx(); }
+function edCrumb(n: PageNode) { $('#ed-crumb')!.textContent = pathOf(n.id); renderEdList(); edInfo(); }
 // The Editor view on a page that has no frame now: its text read-only (a file page's 12-line snapshot) and why. While
 // edwind is down the view opens the frame once it is back, if it still shows the page.
 function frEdShut(n: PageNode, pos?: number | null, why?: string) {
@@ -6684,7 +6489,7 @@ async function boot() {
   RG.bm = S.rgBookmarks || {};
   $('.k-pal')!.textContent = keyLabel('Mod-K');
   ($$('[data-modkey]') as HTMLElement[]).forEach(e => { e.textContent = keyLabel(e.dataset.modkey!); });
-  initChat(); toggleSide(S.side ?? innerWidth >= 1500, true);
+  toggleSide(S.side ?? innerWidth >= 1500);
   for (const [k, v] of Object.entries(S.docks || {})) toggleDock(k, v);
   frameList().sort((a, b) => depthOf(a) - depthOf(b)).forEach(mount);
   nodeList().forEach(mount);
@@ -6696,7 +6501,7 @@ async function boot() {
   if (fresh) requestAnimationFrame(() => setTimeout(() => { seedInk(); dirty(); }, 60));
   if (fresh) setTimeout(() => toast(`${keyLabel('Mod-K')} finds anything and runs any command · Alt-2 navigator · drag items into folders · ? for keys`, 7000), 600);
   setView(S.view || (fresh && innerWidth < 760 ? 'ranger' : 'canvas'));
-  sideTab(S.sideTab || 'chat');
+  sideTab();
   placeInkChip();
   wireReview(); detectMode(); { const ae = $('#add-emacs') as HTMLButtonElement | null; if (ae) ae.disabled = !DAEMON; }
   if (view.persp && view.persp !== 'manual' && PERSP_NAMES[view.persp]) { perspSet(view.persp, true); if (perspCur() === 'fs') setTimeout(() => { perspEdgesRebuild(); renderLinks(); }, 300); }
@@ -6704,7 +6509,7 @@ async function boot() {
   wsRestore(); focusRestoreTabs();
   BOOTED = true; SAVE.lastJson = serialize(); viewSave();
 }
-// ================================================================ v8: node kinds around terminals, Emacs, browser, artifacts, sketch
+// ------------------------------------------------------------------ node kinds around terminals, Emacs, browser, artifacts, sketch
 // Emacs buffer: a real PTY running emacsclient -t on one file (starts a daemon if none), falling back to emacs -nw.
 function emacsCmd(file: string): string {
   const q = "'" + String(file).replace(/'/g, "'\\''") + "'";
@@ -6964,7 +6769,6 @@ function canvasClipOk(): boolean {
   if (!S || !BOOTED || VIEW !== 'canvas') return false;
   const c = keyContext(); return !c.transient && (!c.interior || c.interior === 'control');
 }
-function shapeBox(s: Shape) { return s.type === 'arrow' ? (({ x1, y1, x2, y2 }) => [Math.min(x1, x2), Math.min(y1, y2), Math.max(x1, x2), Math.max(y1, y2)])(arrowEnds(s)) : [s.x, s.y, s.x + s.w, s.y + s.h]; }
 function copyItems(): null | { items?: undefined; skipped: BoardNode[] } | { items: ClipItems; text: string; skipped: BoardNode[]; ids: string[] } {
   let ids = [...PICKED].filter(id => S.nodes[id]);
   const strokes = S.strokes.filter(x => SEL.strokes.has(x.id)), shapes = S.shapes.filter(x => SEL.shapes.has(x.id));
@@ -7759,7 +7563,7 @@ AGENT_TOOLS.push(
   { name: 'open_in_emacs', description: 'Open a file in an Emacs buffer node (local build only).', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, run: ({ path }: { path: string }) => { const n = newEmacs(path); return n ? `opened ${n.name}` : 'needs the local build'; } },
   { name: 'artifact_from_file', description: 'Show an HTML file as an artifact node that reloads whenever the file changes (local build only).', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, run: async ({ path }: { path: string }) => { const n = await newArtifactFromFile(path); return n ? `showing ${path} as ${n.name}` : 'needs the local build'; } },
 );
-// ================================================================ v9: tags on nodes; agents are terminals; no assistant pane
+// ------------------------------------------------------------------ tags on nodes; agents are terminals; no assistant pane
 // A node carries tags. Some are read off the node itself (auto), the rest are the user's. #agent: a terminal whose foreground
 // process is an agent CLI. #aggregator: the node is a container (folders always are; a tagged terminal gets a folder of its own).
 const AGENT_RE = /^(claude|claude-code|oh-my-pi|omp|aider|codex|gemini|goose|opencode|copilot|cursor-agent|amp|crush|pi)$/i;
@@ -7822,9 +7626,9 @@ function tagFilter(tag: string) {
   renderTree();
 }
 function migrateV9() {
-  for (const n of Object.values(S.nodes || {}) as { mode?: string; preTile?: unknown }[]) if (n.mode === 'ribbon') { n.mode = 'tile'; delete n.preTile; }   // v18.1: the ribbon mode is gone
+  for (const n of Object.values(S.nodes || {}) as { mode?: string; preTile?: unknown }[]) if (n.mode === 'ribbon') { n.mode = 'tile'; delete n.preTile; }   // the ribbon mode is gone
   // Agent nodes become pages holding their log; the demo's agent becomes a shell tagged #agent.
-  for (const n of Object.values(S.nodes) as Partial<LegacyAgentNode>[]) {
+  for (const n of Object.values(S.nodes) as unknown as Partial<LegacyAgentNode>[]) {
     if (n.kind !== 'agent') continue;
     if (n.id === 'agent' && !(n.turns || []).length) { Object.assign(n, { kind: 'term', backend: DAEMON ? 'pty' : 'fake', cmd: DAEMON ? '' : 'claude', fg: DAEMON ? undefined : 'claude', name: 'claude', tags: ['agent'], env: {} }); delete n.log; delete n.turns; delete n.tier; continue; }
     const text = '# ' + n.name + ' (former agent node)\n\n' + (n.log || []).filter(m => m.text).map(m => (m.t === 'user' ? '> ' : '') + m.text).join('\n\n');
@@ -7844,7 +7648,7 @@ AGENT_TOOLS.push(
   { name: 'list_tools', description: 'List the board tools and their input fields.', inputSchema: { type: 'object', properties: {} },
     run: () => AGENT_TOOLS.map(t => `${t.name}(${Object.keys(t.inputSchema?.properties || {}).join(', ')}): ${t.description}`).join('\n') },
 );
-// ================================================================ v10: workspaces, focus tabs, leader key, optimiser
+// ------------------------------------------------------------------ workspaces, focus tabs, leader key, optimiser
 // ---- workspaces: an entered aggregator is the desktop; everything outside dims; Esc steps up a level
 /* Ids are typed string & {} so that `cur && S.nodes[cur]` is a node or null, never ''. */
 const WS: { cur: (string & {}) | null; last: (string & {}) | null } = { cur: null, last: null };
@@ -7857,7 +7661,7 @@ function wsApply(animateCam = true): void {
   document.body.classList.toggle('in-ws', !!f);
   const h = f && hostOf(f), label = f ? '⌂ ' + pathOf(f.id) + (h ? ' @' + h.name : '') : '';
   const st = $('#st-ws'); if (st) st.textContent = label;
-  const bar = $('#ws-bar') as HTMLElement | null; if (bar) { bar.hidden = !f; if (f) $('#ws-name', bar)!.textContent = label; }   // v19.1: the way out stays on screen (user, 18:15)
+  const bar = $('#ws-bar') as HTMLElement | null; if (bar) { bar.hidden = !f; if (f) $('#ws-name', bar)!.textContent = label; }   // the way out stays on screen (user, 18:15)
   for (const n of Object.values(S.nodes)) if (n.kind === 'frame') live[n.id]?.el!.classList.toggle('ws-cur', !!f && n.id === f.id);
   S.ws = f ? f.id : null; viewSave();
 }
@@ -9133,8 +8937,8 @@ const KC: Record<string, KeyCmdFn> = {
   'palette.open': () => { PICK = null; openPalette(''); },
   'palette.commands': () => { PICK = null; openPalette('>'); },
   'dock.toggle': () => toggleDockTerm(),
-  'pane.wider': () => { toggleSide(true, true); setPaneW((S.paneW || PANE_W) + 80, true); },
-  'pane.narrower': () => { toggleSide(true, true); setPaneW((S.paneW || PANE_W) - 80, true); },
+  'pane.wider': () => { toggleSide(true); setPaneW((S.paneW || PANE_W) + 80, true); },
+  'pane.narrower': () => { toggleSide(true); setPaneW((S.paneW || PANE_W) - 80, true); },
   'tree.toggle': () => toggleTree(),
   dictate: () => {
     if (VOICE.rec) return stopListening();
@@ -9349,7 +9153,7 @@ cmd('Layout: push apart everything that overlaps', onCanvas(() => { layoutSnap('
 cmd('Layout: keep a boundary between items (no overlap)', () => { S.noOverlap = S.noOverlap === false ? true : false; dirty(); toast(S.noOverlap === false ? 'Items may overlap again.' : 'Items keep a boundary: the others move aside on drop, resize, unfold and new items.'); if (S.noOverlap !== false) { SEP.keep = null; for (const f of frameList()) if (!f.in) relayout(f); separate(null, null); restack(); renderLinks(); dirty(); } }, '', null);
 cmd('Fold: package the other folders on this level (focus) / unfold all', onCanvas(() => foldCycle()), '@fold.cycle');
 
-// ================================================================ v11: hosts, perspectives, cascading folder modes
+// ------------------------------------------------------------------ hosts, perspectives, cascading folder modes
 // ---- hosts: a folder may carry a host {name, url, token}. Everything inside it that needs a process (shell, Emacs, file
 // listing) runs on that host's daemon; folders without a host use the daemon that served the page. One page, one board,
 // several daemons. Sampling always goes through the serving daemon (one API key, in its environment).
@@ -9413,7 +9217,7 @@ function hostPrompt(label: string, cb: (h: FolderHost) => void): void {
   const known = HOSTLIST.map(h => h.name);
   askName(label + (known.length ? '. Known: ' + known.join(', ') : '. No hosts.json yet') + '. Or name=http://addr:port#token', known[0] || '', v => { const h = parseHost(v); if (!h) return toast('Give a host from hosts.json, or name=http://addr:port#token.'); cb(h); });
 }
-function hostFolderPrompt() { if (!DAEMON) return toast('Host folders need the local build: run canvasd and list hosts in ~/.canvas-proto/hosts.json.'); hostPrompt('Host for the new folder', h => { const f = newHostFolder(h); activate(f.id); }); }
+function hostFolderPrompt() { if (!DAEMON) return toast('Host folders need a Workbench server that lists hosts.'); hostPrompt('Host for the new folder', h => { const f = newHostFolder(h); activate(f.id); }); }
 function cwdMoved(n: TermNode): void { PERSP.onCwd?.(n); }
 $('#add-host')!.onclick = () => hostFolderPrompt();
 cmd('New host folder…', () => hostFolderPrompt(), '', () => DAEMON);
@@ -9547,7 +9351,7 @@ function perspBuild(p: PerspName): void {
 function perspSet(p: PerspName, quiet?: boolean): void {
   if (!PERSP_NAMES[p]) return;
   if (p === 'fs' && !PERSP.fsReady) { toast('The filesystem perspective comes in the next version.'); return; }
-  if (p === 'tmux' && !DAEMON) { toast('The tmux perspective needs the local build: canvasd --tmux-socket PATH.'); return; }
+  if (p === 'tmux' && !DAEMON) { toast('The tmux perspective needs a Workbench server with tmux.'); return; }
   if (p === 'link' && !PERSP.linkRoot) { const n = n0(); const e = n && n.kind === 'buffer' ? n.name : (linkEntities().map(e => [e, linkTargets(e).length] as const).sort((a, b) => b[1] - a[1])[0] || [])[0]?.title; if (!e) { toast('No page links to another yet.'); return; } PERSP.linkRoot = e; }
   const cur = perspCur(); if (cur === p) { if (!quiet) toast('Already in the ' + p + ' perspective.'); return; }
   const from = deskPlace();
@@ -9580,7 +9384,6 @@ function perspChip() {
   if (!chip) { chip = el('div'); chip.id = 'persp-chip'; document.body.append(chip); }
   chip.replaceChildren('perspective: ' + p); const x = el('button', 'mini', '✕'); x.title = 'Back to the manual perspective (folders as you made them)'; x.onclick = () => perspSet('manual'); chip.append(x);
 }
-function perspMenu() { leaderOpen('leader-v'); }
 cmd('Perspective: manual (folders as you made them)', () => perspSet('manual'), 'Ctrl-Space v m', () => perspCur() !== 'manual');
 cmd('Perspective: process (a shell and what it spawned)', () => perspSet('process'), 'Ctrl-Space v p', () => perspCur() !== 'process');
 cmd('Perspective: filesystem (directories on each host)', () => perspSet('fs'), 'Ctrl-Space v f', () => perspCur() !== 'fs');
@@ -9746,10 +9549,10 @@ PERSP.onCwd = n => {
   live[n.id]?.el!.classList.remove('persp-dim'); restack(); renderTree(); renderLinks(); dirty();
 };
 
-// ================================================================ v12: the path grammar and one navigator over every relation
+// ------------------------------------------------------------------ the path grammar and one navigator over every relation
 // Every node has an address `relation:path`: board:/Research/canvas · fs:@build1/srv (host omitted for the serving daemon) ·
 // note:Title#Heading#^anchor · tag:grc/vocab · journal:2026/10/10 · link:Page. proc:, tmux: and unit: are reserved for the
-// host's own trees (v13, v14). The navigator walks any of them with the same columns; the canvas shows the active perspective;
+// host's own trees. The navigator walks any of them with the same columns; the canvas shows the active perspective;
 // the URL hash carries the current address so that every place is a link.
 const ADDR_KINDS = ['board', 'fs', 'note', 'tag', 'journal', 'link', 'proc', 'tmux', 'unit', 'attn'];
 const ADDR_RESERVED: Record<string, string> = {};
@@ -9867,7 +9670,6 @@ const WIKI_RE = /\[\[([^\[\]\n]+)\]\]/g;
 const linkTitle = (t: string) => t.replace(/^id:/, '').split('#')[0].trim();
 // a "page-like" thing: a board page or an index file. Board pages win when a title is both.
 function linkEntity(title: string): NavLinkEntity | null { const p = findPage(title); if (p) return { title: p.name, page: p }; const r = noteFiles().find(f => f.title.toLowerCase() === String(title).toLowerCase() || f.path.replace(/\.(md|org)$/, '').toLowerCase() === String(title).toLowerCase()); return r ? { title: r.title, note: r } : null; }
-const entityKey = (e: NavLinkEntity) => e.page ? 'p:' + e.page.id : 'n:' + e.note.id;
 function linkEntities(): NavLinkEntity[] { const out: NavLinkEntity[] = pages().map(p => ({ title: p.name, page: p })), seen = new Set(out.map(e => e.title.toLowerCase())); for (const r of noteFiles()) if (!seen.has(r.title.toLowerCase())) { out.push({ title: r.title, note: r }); seen.add(r.title.toLowerCase()); } return out; }
 // titles an entity links to, with how many times (the pick rule for multi-parent nodes = the parent that links most)
 function linkTargets(e: NavLinkEntity): { title: string; n: number }[] {
@@ -9891,7 +9693,7 @@ function backlinksOfTitle(title: string): NavBacklink[] {
 }
 const JOURNAL_RE = /^(?:journal|daily|dailies)\/(\d{4})-(\d{2})-(\d{2})\.(?:md|org)$/;
 const journalRows = (): NoteJournalRow[] => noteFiles().map(r => { const m = r.path.match(JOURNAL_RE) || r.title.match(/^(\d{4})-(\d{2})-(\d{2})$/); return m ? { r, y: m[1], mo: m[2], d: m[3] } : null; }).filter(Boolean) as NoteJournalRow[];
-// v16: the heading tree of a file. A heading's parent is the nearest heading above it with a smaller level; a list item hangs under
+// the heading tree of a file. A heading's parent is the nearest heading above it with a smaller level; a list item hangs under
 // the nearest heading above it; everything else hangs from the file. Computed once per index load, per file.
 function noteTree(path: string): NoteTreeIndex {
   const t = (NOTES.tree ||= {}); if (t[path]) return t[path];
@@ -9956,7 +9758,7 @@ function rgRelParent(key: string): string {
   if (kind === 'note') { const r = noteById(rest); const p = r && r.kind !== 'file' && noteParent(r); return p ? 'note:' + p.id : 'note:'; }
   return kind + ':';
 }
-// v16: the journal as a tree (year > month > day) over journal/YYYY-MM-DD.md and board pages named by date
+// the journal as a tree (year > month > day) over journal/YYYY-MM-DD.md and board pages named by date
 const journalDays = (): JournalDayEntry[] => { const days: Record<string, JournalDayEntry> = {}; for (const p of pages()) if (isJournal(p)) days[p.name] = { day: p.name, page: p }; for (const x of journalRows()) { const d = x.y + '-' + x.mo + '-' + x.d; if (!days[d]) days[d] = { day: d, note: x.r }; } return Object.values(days).sort((a, b) => a.day.localeCompare(b.day)); };
 const journalKey = (day: string) => 'journal:' + day.replace(/-/g, '/');
 function journalCurrentDay(): string {
@@ -9991,7 +9793,7 @@ function journalPerspBuild(related: Set<string>): void {
     S.nodes[g.id] = g; mount(g); renumber(mf); relayout(mf);
   }
 }
-// v16: the link perspective, rooted at one page (the MOC view). A page sits under the parent that links to it most; other parents hold a copy.
+// the link perspective, rooted at one page (the MOC view). A page sits under the parent that links to it most; other parents hold a copy.
 function linkPerspBuild(related: Set<string>): void {
   const rootT = PERSP.linkRoot, root = rootT && linkEntity(rootT); if (!root) { PERSP.linkWait = 'no page named ' + rootT; return; }
   const best: Record<string, { parent: string; parentTitle: string; n: number; title: string }> = {}, order = [root.title.toLowerCase()], q = [root], seen = new Set(order), edges: [string, string, number][] = [];
@@ -10063,7 +9865,7 @@ function tagDrop(n: BoardNode, t: FrameNode | null | undefined, from: FrameNode 
   toast(`${real.name}: ${tagsOf(real).filter(x => x !== 'aggregator').map(x => '#' + x).join(' ') || 'no tags'}`);
   perspRebuild();
 }
-// ---- v13: tmux sessions on each host's shared socket. A terminal card is a tmux session (wb-<id>) when the daemon runs with
+// ---- tmux sessions on each host's shared socket. A terminal card is a tmux session (wb-<id>) when the daemon runs with
 // --tmux-socket: it survives daemon restarts. Sessions other programs made there (the control-panel agents) are listed under
 // tmux: and adopted as cards tagged #tmux. The tmux perspective shows one folder per session; sessions with no card are ghosts.
 /* What /api/tmux answers. */
@@ -10097,8 +9899,8 @@ function tmuxRelList(rest: string): RgEntry[] {
   if (!path) {
     if (!host && DAEMON) for (const hh of allHosts()) out.push({ key: 'tmux:@' + hh.name + ':', name: '@' + hh.name, kind: 'persp', dir: true, meta: 'tmux:@' + hh.name + '/' });
     const d = tmuxData(h);
-    if (!DAEMON) { if (!host) out.push({ key: 'tmux:_', name: 'sessions need the local build', kind: 'ghost', dir: false, reserved: 'tmux sessions show in the local build when canvasd runs with --tmux-socket PATH (shells then survive daemon restarts, and sessions made by other programs can be adopted as cards).' }); return out; }
-    if (d.socket === null && !d.loading) out.push({ key: 'tmux:' + (host ? '@' + host + ':' : '') + '_', name: 'no tmux socket on ' + (h ? '@' + h.name : 'this daemon'), kind: 'ghost', dir: false, reserved: 'Start canvasd with --tmux-socket PATH (for example /var/lib/control-panel/tmux.sock) to run shells inside tmux and adopt sessions.' });
+    if (!DAEMON) { if (!host) out.push({ key: 'tmux:_', name: 'sessions need the local build', kind: 'ghost', dir: false, reserved: 'tmux sessions show when a Workbench server runs with --tmux-socket PATH (shells then survive daemon restarts, and sessions made by other programs can be adopted as cards).' }); return out; }
+    if (d.socket === null && !d.loading) out.push({ key: 'tmux:' + (host ? '@' + host + ':' : '') + '_', name: 'no tmux socket on ' + (h ? '@' + h.name : 'this daemon'), kind: 'ghost', dir: false, reserved: 'A Workbench server started with a tmux socket runs shells inside tmux and adopts sessions.' });
     for (const s_ of d.sessions) out.push(tmuxEntry(h, s_));
     return out;
   }
@@ -10109,7 +9911,7 @@ function tmuxRelList(rest: string): RgEntry[] {
 }
 // adopt a session as a card: in the host's folder, or where a ghost stood (at = { in, x, y })
 function tmuxAdopt(target: string | null | undefined, h: Host | null, at?: { in: string | undefined; x: number; y: number }) {
-  if (!DAEMON) { toast('Adopting tmux sessions needs the local build (canvasd --tmux-socket).'); return null; }
+  if (!DAEMON) { toast('Adopting tmux sessions needs a Workbench server with tmux.'); return null; }
   const sess = String(target || '').split(':')[0]; if (!sess) return null;
   const have = tmuxNodeFor(h, sess); if (have && !at) { jumpNode(have); toast(sess + ' is already on the board as ' + have.name + '.'); return have; }
   const hf = !at && h ? hostFolder(h) : null, c = viewCenterWorld(), w = 640, hh = 400;
@@ -10170,7 +9972,7 @@ AGENT_TOOLS.push(
   { name: 'shell_detach', description: 'Remove a shell card whose tmux session keeps running (re-adopt it later from tmux:). path: board path or tmux: address.', inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
     run: ({ path }: { path?: string } = {}) => { const r = shellRef(path); if (!r.n) throw new Error(r.addr + ' has no card'); if (!tmuxTargetOf(r.n)) throw new Error(r.n.name + ' does not run in tmux'); const L = live[r.n.id]; if (L?.backend) L.backend.detachOnly = true; const t = tmuxAddr(fsHostKey(r.n), tmuxTargetOf(r.n)); removeNode(r.n.id); return 'detached; the session stays at ' + t; } },
   { name: 'list_tmux', description: 'tmux sessions on a host\'s socket (host: a name from hosts.json; empty = the serving daemon): one line per session with its address, foreground command, path, windows and its card when on the board.', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
-    run: async ({ host }: { host?: string } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); const d = await tmuxLoad(h); if (!d.socket) return 'no tmux socket on ' + (h ? '@' + h.name : 'this daemon') + ' (canvasd --tmux-socket PATH)'; return d.sessions.map(s_ => { const n = tmuxNodeFor(h, s_.name); return `${tmuxAddr(h ? h.url : '', s_.name)} · ${s_.command || '?'} · ${s_.path || ''} · ${s_.windows.length} window${s_.windows.length === 1 ? '' : 's'}${s_.attached ? ' · attached' : ''}${n ? ' · card ' + pathOf(n.id) : ''}`; }).join('\n') || '(no sessions)'; } },
+    run: async ({ host }: { host?: string } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); const d = await tmuxLoad(h); if (!d.socket) return 'no tmux socket on ' + (h ? '@' + h.name : 'this daemon') + ' (the server has no tmux)'; return d.sessions.map(s_ => { const n = tmuxNodeFor(h, s_.name); return `${tmuxAddr(h ? h.url : '', s_.name)} · ${s_.command || '?'} · ${s_.path || ''} · ${s_.windows.length} window${s_.windows.length === 1 ? '' : 's'}${s_.attached ? ' · attached' : ''}${n ? ' · card ' + pathOf(n.id) : ''}`; }).join('\n') || '(no sessions)'; } },
   { name: 'adopt_tmux', description: 'Make a card attached to a tmux session: target = session name (or tmux:[@host]/name); host = name from hosts.json when the target is a bare name.', inputSchema: { type: 'object', properties: { target: { type: 'string' }, host: { type: 'string' } }, required: ['target'] },
     run: ({ target, host }: { target: string; host?: string }) => { const a = parseAddr(target); let h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); let t = target; if (a && a.kind === 'tmux') { if (a.host) { h = hostByName(a.host); if (!h) throw new Error('unknown host @' + a.host); } t = a.path.replace(/^\/+/, ''); } const n = tmuxAdopt(t, h); if (!n) throw new Error('could not adopt ' + target); return 'adopted ' + tmuxAddr(h ? h.url : '', t.split(':')[0]) + ' as ' + pathOf(n.id); } }
 );
@@ -10180,7 +9982,7 @@ cmd('Shell: detach the active card (its tmux session keeps running)', () => { co
 cmd('Shell: scrollback of the active shell as a reference card', async () => { const n = n0(); if (!n || !(n.kind === 'term' || n.kind === 'repl')) return toast('Pick a shell first.'); const text = await shellLogs(shellRef(''), 200); const k = childrenOf(n.id, 'ref').length; const r: RefNode = { id: uid('n'), kind: 'ref', in: n.in, name: n.name + '-log' + (k + 1), text, src: { node: n.id, line: 0, lines: text.split('\n').length }, srcLabel: pathOf(n.id) + ' › scrollback', x: n.x + n.w + 70, y: n.y + k * 50, w: 420, h: 360 }; S.edges.push({ id: uid('e'), from: n.id, to: r.id, type: 'ref' }); addNode(r); }, '', () => n0()?.kind === 'term' || n0()?.kind === 'repl');
 cmd('tmux: sessions in the navigator', () => goAddr('tmux:'), '', () => DAEMON);
 cmd('tmux: adopt a session as a card…', () => askName('Session (name, or tmux:@host/name)', 'tmux:/', v => { try { const a = parseAddr(v); let h = null, t = v; if (a && a.kind === 'tmux') { h = a.host ? hostByName(a.host) : null; if (a.host && !h) return toast('unknown host @' + a.host); t = a.path.replace(/^\/+/, ''); } tmuxAdopt(t, h); } catch (e) { toast(e.message); } }), '', () => DAEMON);
-// ---- v14: the host's own trees. proc: (from /proc), unit: (systemd), the status line and the Attention query. Board
+// ---- the host's own trees. proc: (from /proc), unit: (systemd), the status line and the Attention query. Board
 // terminals are the real nodes; every other process or unit is a ghost. Data comes from each host's daemon; in demo mode
 // a small seeded host stands in.
 const SHELL_RE = /^(bash|zsh|sh|fish|dash|ksh|tmux|tmux: client|tmux: server)$/;

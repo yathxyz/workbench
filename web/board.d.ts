@@ -21,7 +21,7 @@ interface BoardSize { w: number; h: number }
 // ---- the persisted board: S (app.ts line 29)
 
 /* Every node kind on the board (the `kind` tag of BoardNode). */
-type NodeKind = 'term' | 'repl' | 'buffer' | 'ref' | 'agent' | 'acp' | 'frame' | 'artifact' | 'web' | 'sketch' | 'image' | 'pdf' | 'op' | 'ghost';
+type NodeKind = 'term' | 'repl' | 'buffer' | 'ref' | 'acp' | 'frame' | 'artifact' | 'web' | 'sketch' | 'image' | 'pdf' | 'op' | 'ghost';
 
 /* The persisted board, S: what /api/board and localStorage hold (v 5; a reset writes {"v":0}). Keys starting with _ are never saved. */
 interface Board {
@@ -134,8 +134,8 @@ interface RefNode extends BoardNodeBase {
   src: { node: string; aid?: string; line?: number; lines?: number; page?: number; prefix?: string; suffix?: string };   // page, prefix, suffix: a quote from a PDF (W3C TextQuoteSelector)
   srcLabel: string;
 }
-/* The legacy in-page agent card (kind 'agent'). */
-interface LegacyAgentNode extends BoardNodeBase {
+/* The in-page agent card of boards from before v9 (kind 'agent'): never on a board now, migrateV9 makes it a page or a shell. */
+interface LegacyAgentNode extends Omit<BoardNodeBase, 'kind'> {
   kind: 'agent';
   log: LegacyAgentLogItem[];
   turns: { role: string; content: unknown }[];
@@ -235,7 +235,7 @@ interface GhostNode extends BoardNodeBase {
   tmuxTarget?: string; procPid?: number; cmd?: string; unitName?: string; unitState?: string;
 }
 /* Any node on the board: a union tagged on `kind`. */
-type BoardNode = TermNode | ReplNode | PageNode | RefNode | LegacyAgentNode | AcpNode | FrameNode | ArtifactNode | WebNode | SketchNode | ImageNode | PdfNode | OpNode | GhostNode;
+type BoardNode = TermNode | ReplNode | PageNode | RefNode | AcpNode | FrameNode | ArtifactNode | WebNode | SketchNode | ImageNode | PdfNode | OpNode | GhostNode;
 /* The node type for one kind, e.g. NodeOfKind<'frame'> is FrameNode. */
 type NodeOfKind<K extends NodeKind> = Extract<BoardNode, { kind: K }>;
 /* What addNode takes: a kind and any of that kind's fields (the rest get defaults). */
@@ -315,11 +315,11 @@ type FakeFsEntry = FakeFsDir | FakeFsFile | FakeFsLink;
 
 // ---- live: the runtime side of each card (const live, line 30; mountNode line 2139, mountFrame line 1527)
 
-/* What a card's runtime holds: its DOM, its terminal or editor, its backend, timers and caches. Keyed by node id, plus 'dock', 'chat' and 'plans'. */
+/* What a card's runtime holds: its DOM, its terminal or editor, its backend, timers and caches. Keyed by node id, plus 'dock' and 'plans'. */
 interface LiveEntry {
   // DOM
   el: HTMLElement;
-  hdr?: HTMLElement | null;            // null for the dock and the chat pane
+  hdr?: HTMLElement | null;            // null for the dock
   body?: HTMLElement;
   lod?: HTMLElement;                   // the zoomed-out stand-in
   ink?: SVGSVGElement; inkLines?: SVGElement;
