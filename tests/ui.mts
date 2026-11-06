@@ -188,7 +188,7 @@ st = await p.evaluate(async () => {
 });
 check('N71: no edwind: a page card and the Editor view show the text read-only with the demo notice; no CodeMirror in the page',
   st.card.text === '# ro\n\nline two\n' && !st.card.editable && /^Read-only in the demo/.test(st.card.notice) && st.ed.text === st.card.text && st.ed.notice === st.card.notice && !st.cm, JSON.stringify(st));
-// v8 nodes in demo mode
+// node kinds around terminals (Emacs, web, artifacts, sketch) in demo mode
 st = await p.evaluate(() => { const w = window.__canvas.newWeb('example.org/a'); const s = window.__canvas.newSketch(); const L = window.__canvas.live[w.id]; return { url: w.url, name: w.name, frame: !!L.frame, bar: !!L.urlInput, sketch: s.kind, agentHidden: !document.querySelector('#add-agent'), emacsOff: document.querySelector<HTMLInputElement>('#add-emacs')!.disabled }; });
 check('web and sketch nodes, agent button hidden', st.url === 'https://example.org/a' && st.name === 'example.org' && st.frame && st.bar && st.sketch === 'sketch' && st.agentHidden && st.emacsOff, JSON.stringify(st));
 await p.evaluate(() => { for (const n of Object.values<BoardNode>(window.__canvas.S.nodes)) if (n.kind === 'web' || n.kind === 'sketch') window.__canvas.removeNode(n.id); });
@@ -223,7 +223,7 @@ await p.setViewportSize({ width: 1500, height: 950 }); await sleep(300);
 await p.screenshot({ path: path.join(TMP, 'wb-review.png') });
 await p.evaluate(() => window.__canvas.setView('canvas')); await sleep(300);
 await p.screenshot({ path: path.join(TMP, 'wb-canvas.png') });
-// v10: ribbon mode, workspaces, focus tabs, optimiser, leader key, neighbours
+// ribbon mode, workspaces, focus tabs, optimiser, leader key, neighbours
 let v10: any = await p.evaluate(() => {   // any: reused by each check for its own result shape
   const C = window.__canvas, S = C.S;
   const f = Object.values<BoardNode>(S.nodes).find((n): n is FrameNode => n.kind === 'frame' && !n.in && C.kidsOf(n.id).filter((k: BoardNode) => k.kind !== 'frame').length >= 2)!;
@@ -461,7 +461,7 @@ let nest: any = await p.evaluate(() => {   // any: the folders' ids, then the me
   const C = window.__canvas, S = C.S;
   const outer = Object.values<BoardNode>(S.nodes).find(n => n.name === 'canvas-workbench') as FrameNode, inner = Object.values<BoardNode>(S.nodes).find(n => n.name === 'machines') as FrameNode;
   C.setMode(outer, 'free', true);
-  outer.w = Math.max(outer.w, 1100); C.placeAny(outer);   // v18: a folder under 250 screen px drops its tab buttons, so keep the parent wide at the test's zoom
+  outer.w = Math.max(outer.w, 1100); C.placeAny(outer);   // a folder under 250 screen px drops its tab buttons, so keep the parent wide at the test's zoom
   // put the child folder right under the parent's tab row, as pack/tile/ribbon do (PAD + LABEL_H), and zoom out so the child's screen-size tab pokes into the parent's row
   const dx = (outer.x + 28 + 200) - inner.x, dy = (outer.y + 28 + 32) - inner.y;
   const moved = [inner, ...Object.values<BoardNode>(S.nodes).filter(n => n.in === inner.id)]; for (const m of moved) { m.x += dx; m.y += dy; C.placeAny(m); }
@@ -556,7 +556,7 @@ bad = await noOverlapAnywhere();
 check('separateAll cleans an overlapping board', dr > 0 && bad.length === 0, JSON.stringify({ dr, bad }));
 check('boundary toggle in the palette', sep.off && sep.on, JSON.stringify(sep));
 check('i3 neighbour picks the node to the right, none to the left of the leftmost', v10.right && v10.leftNone, JSON.stringify(v10));
-// ---- v11: cascading folder modes and the process perspective (demo mode)
+// ---- cascading folder modes and the process perspective (demo mode)
 st = await p.evaluate(() => { const C = window.__canvas, S = C.S, f = S.nodes.fCW, inner = S.nodes.fMach;
   C.setModeCascade(f, 'tile'); const a = [f.mode, inner.mode];
   document.querySelector('.frame[data-id="fCW"] .fmodes button[data-m="pack"]')!.dispatchEvent(new MouseEvent('click', { shiftKey: true, bubbles: true })); const b = [f.mode, inner.mode];
@@ -574,7 +574,7 @@ st = await p.evaluate(() => { const C = window.__canvas, S = C.S; const frames =
   return { derived, manualGone, dim, chip, persp, refused, back, inOk, posOk, noDerived }; });
 check('process perspective derives a folder per spawning shell, nested as the spawn tree', st.persp === 'process' && st.manualGone && st.chip && st.dim > 0 && st.derived.some((d: { owner?: string; derived?: string; kids: string }) => d.owner === 'ops' && d.derived === 'process' && d.kids === 'build,logs,ops') && st.derived.some((d: { owner?: string; derived?: string; kids: string }) => d.owner === 'calc' && d.kids === 'calc,whatif'), JSON.stringify(st));
 check('a drop into a derived folder is refused; back to manual restores folders, membership and positions exactly', st.refused && st.back && st.inOk && st.posOk && st.noDerived, JSON.stringify(st));
-// ---- v11 step 2: the filesystem perspective (demo mode, seed filesystem)
+// ---- the filesystem perspective (demo mode, seed filesystem)
 st = await p.evaluate(async () => { const C = window.__canvas, S = C.S, sl = (ms: number) => new Promise(r => setTimeout(r, ms));
   C.perspSet('fs');
   const frames = () => Object.values<BoardNode>(S.nodes).filter((n): n is FrameNode => n.kind === 'frame' && n.derived === 'fs').map(f => [f.fsPath, f.in ? S.nodes[f.in].fsPath : null, C.kidsOf(f.id).map((k: BoardNode) => k.name).sort().join()]);
@@ -596,7 +596,7 @@ st = await p.evaluate(() => { const C = window.__canvas, S = C.S; const gf = Obj
   const page = C.ghostOpen(gf), pageIn = S.nodes[page.in]?.fsPath, text = page.text, ghostGone = !Object.values<BoardNode>(S.nodes).some(n => n.kind === 'ghost' && n.name === 'todo.txt');
   C.perspSet('manual'); const clean = !Object.values<FrameNode | GhostNode>(S.nodes).some(n => n.kind === 'ghost' || n.derived) && !C.PERSP.edges.length && !document.querySelector('.node.k-ghost'); C.removeNode(page.id); return { moved, pageIn, text, ghostGone, clean }; });
 check('mv after the confirm; opening a ghost file makes it real in place; back to manual clears ghosts and derived folders', st.moved && st.pageIn === '/home/me/projects' && st.text.startsWith('buy pens') && st.ghostGone && st.clean, JSON.stringify(st));
-// ---- v12: addresses, one navigator over every relation, the hash, the tag perspective
+// ---- addresses, one navigator over every relation, the hash, the tag perspective
 st = await p.evaluate(async ({ y, ym }) => { const C = window.__canvas, S = C.S; await C.notesLoad(true);
   const addrs = ['fCW', 'fMach', 'build'].map(id => C.addrOf(S.nodes[id]));
   const res = Object.fromEntries(['board:/canvas-workbench/machines', 'fs:~', 'tag:agent', 'note:hosts', 'journal:' + ym, 'link:hosts', 'proc:@x/1', 'bogus'].map(a => { const r = C.resolveAddr(a); return [a, r.error ? 'ERR' : r.key + '|' + r.addr + '|' + r.entries.length]; }));
@@ -628,7 +628,7 @@ st = await p.evaluate(() => { const C = window.__canvas, S = C.S; C.setView('can
   C.perspSet('manual'); const clean = !Object.values<FrameNode>(S.nodes).some(x => x.derived || (x as BoardNode).kind === 'ghost'); C.setTags(n, ['grc/vocab', 'agent'], { remove: true }); C.setTags(sh, ['agent'], { remove: true });
   return { a, b, copyAddr, buildAddr, shTags, clean }; });
 check('tag perspective: one folder per tag nested by /, the node under its first tag, a copy under the others; drop into a tag folder tags; back to manual is clean', st.a.length === 1 && st.a[0][0] === 'agent' && st.b.some(([t, inn, k]: [string, string | null, string]) => t === 'grc/vocab' && inn === 'grc' && k === 'build') && st.b.some(([t, , k]: [string, string | null, string]) => t === 'agent' && k === 'build*,claude') && st.copyAddr === 'board:/canvas-workbench/machines/build' && st.buildAddr === st.copyAddr && st.shTags.includes('agent') && st.clean, JSON.stringify(st));
-// ---- v14 demo: the host's own trees (seeded), the status line, the Attention query, hard links and mounts
+// ---- the host's own trees (seeded), the status line, the Attention query, hard links and mounts
 await p.evaluate(() => window.__canvas.setView('canvas'));
 st = await p.evaluate(async () => { const C = window.__canvas, S = C.S, sl = (ms: number) => new Promise(r => setTimeout(r, ms));
   const roots = C.rgEntries('proc:').map((e: RgEntry) => e.name), kids = C.rgEntries('proc:800').map((e: RgEntry) => [e.name, !!e.n, e.meta]);
@@ -670,7 +670,7 @@ st = await p.evaluate(() => { const C = window.__canvas, S = C.S;
   const r = { pf: prev('fs:/tmp/lnk', 'f-link'), pd: prev('fs:/home/me', 'notes'), lsDir: run('ls /tmp/lnk/d-link'), lsFile: run('ls /tmp/lnk/f-link'), rm: run('rm /tmp/lnk/f.txt/x'), still: !!S.fs.c.tmp.c.lnk.c['f.txt'] };
   delete S.fs.c.tmp.c.lnk; C.rgPreview(undefined); C.removeNode(sh.id); return r; });
 check('symlinks: the navigator previews a link to a file as that file and a link to a directory without throwing; the simulated shell\'s ls lists a linked directory and names a linked file; rm under a file does nothing', st.pf === 'hello link\n' && !st.pd.startsWith('threw') && st.lsDir.includes('README.md') && st.lsFile === '/tmp/lnk/f-link' && st.rm === '' && st.still, JSON.stringify(st));
-// ---- v18 (tab backgrounds cut off on small items; ⊞ again cycles aspect ratios, the screen's first)
+// ---- tab backgrounds cut off on small items; ⊞ again cycles aspect ratios, the screen's first
 st = await p.evaluate(() => { const C = window.__canvas, LH = 32;
   const f = C.addNode({ kind: 'frame', name: 'aspect', mode: 'free', shape: 'folder', x: 6000, y: 6000, w: 900, h: 400 });
   [0, 1, 2].forEach(i => C.addNode({ kind: 'term', backend: 'fake', name: 'a' + i, env: {}, in: f.id, x: 6000 + 40 + i * 250, y: 6060, w: 200, h: 140 }));
@@ -695,7 +695,7 @@ st = await p.evaluate(({ fid }) => { const C = window.__canvas, f = C.S.nodes[fi
 check('a tab never runs past its folder: zoomed far out the tab is at most the folder\'s width, the mode buttons go (t-tiny), and a card\'s header keeps its buttons inside and drops its tags; zooming back restores both', st.z1.tw <= st.z1.fw + 2 && st.z1.modes !== 'none' && !st.z1.cls[0] && st.far.tw <= st.far.fw + 2 && st.far.modes === 'none' && st.far.tags === 'none' && st.far.btnsIn && st.far.cls.every(Boolean) && st.back.modes !== 'none' && st.back.tags !== 'none' && !st.back.cls[0], JSON.stringify(st));
 await p.evaluate(({ fid }) => { const C = window.__canvas; C.S.cam.z = 1; C.applyCam(); C.jumpFolder(C.S.nodes[fid]); }, st); await sleep(300);
 
-// ---- v19.1 ("no intuitive way to unfocus from a node, all other aggregators are hidden. What do I even press?")
+// ---- leaving a workspace ("no intuitive way to unfocus from a node, all other aggregators are hidden. What do I even press?")
 st = await p.evaluate(async () => { const C = window.__canvas, S = C.S, sl = (ms: number) => new Promise(r => setTimeout(r, ms));
   const tops = Object.values<BoardNode>(S.nodes).filter((n): n is FrameNode => n.kind === 'frame' && !n.in); const f = tops[0], g = tops[1];
   C.wsEnter(f, true); await sl(50);
@@ -707,7 +707,7 @@ st = await p.evaluate(async () => { const C = window.__canvas, S = C.S, sl = (ms
   return r; });
 check('workspace: a bar at the top names it with a ⇱ Leave button that works; ⌂ on the tab enters; the other folders are dimmed and a click on one leaves the workspace and activates it', st.barShown && st.name.includes('⌂') && st.wsCur && st.fws && st.outsideG && st.afterLeave === null && st.barHidden && st.viaTab && st.afterClickOutside === null && st.wentThere, JSON.stringify(st));
 
-// ---- v19 (a rectangle selection to remove handwriting and nodes; the selection can become a node)
+// ---- a rectangle selection to remove handwriting and nodes; the selection can become a node
 st = await p.evaluate(() => { const C = window.__canvas, S = C.S;
   const pg = C.addNode({ kind: 'page', name: 'selpage', x: 12000, y: 12000, w: 240, h: 140 });
   const mk = (x: number, y: number) => ({ id: 'tst' + x + '-' + y, color: 'ink', size: 4, sim: 0, owner: null, pts: [[x, y, .5], [x + 40, y + 10, .5], [x + 80, y, .5]] });
@@ -733,7 +733,7 @@ st = await p.evaluate(() => { const C = window.__canvas, S = C.S, draw = C.AGENT
   for (const x of [a0.id, a1.id, id]) if (x) C.SEL.shapes.add(x); C.removeSelection(); return r; });
 check('draw_shape from an arrow to an arrow: each end sits at that arrow\'s midpoint, unbound, and draws without NaN', !st.err && JSON.stringify(st.ends) === '[13100,13000,13100,13300]' && !st.bound && st.drawn && !st.nan, JSON.stringify(st));
 
-// ---- v18.2 (▦): a packed folder is no wider than its rows
+// ---- ▦: a packed folder is no wider than its rows
 st = await p.evaluate(() => { const C = window.__canvas;
   const f = C.addNode({ kind: 'frame', name: 'packw', mode: 'free', shape: 'folder', x: 8000, y: 8000, w: 1600, h: 400 });
   const ks = [0, 1].map(i => C.addNode({ kind: 'term', backend: 'fake', name: 'p' + i, env: {}, in: f.id, x: 8000 + 40 + i * 300, y: 8060, w: 200, h: 140 }));
@@ -743,7 +743,7 @@ st = await p.evaluate(() => { const C = window.__canvas;
   return r; });
 check('pack shrinks the folder to its widest row plus padding instead of keeping its last mode\'s width; stable on re-pack; same from tile', st.w0 === 1600 && st.w === 200 + 24 + 200 + 56 && st.oneRow && st.inside && st.w2 === st.w && st.w3 === st.w, JSON.stringify(st));
 
-// ---- v17.1 ("selected something in the graph and everything else is hidden"): Esc and ✕ clear the selection; the rest stays readable
+// ---- clearing a graph selection ("selected something in the graph and everything else is hidden"): Esc and ✕ clear the selection; the rest stays readable
 await p.evaluate(() => { const C = window.__canvas; C.setView('graph'); });
 await sleep(600);
 st = await p.evaluate(() => { const C = window.__canvas; const id = [...C.G.N.keys()][0]; C.graphSelect?.(id); return { sel: C.G.sel, card: !document.querySelector<HTMLElement>('#g-card')!.hidden, x: !!document.querySelector('#g-card .gc-x'), hint: document.querySelector('#g-card .gc-hint')?.textContent || '' }; });
@@ -753,14 +753,13 @@ const gs = await p.evaluate(() => { const C = window.__canvas; const r: Record<s
 if (gs.pal) { await p.keyboard.press('Escape'); await sleep(100); }
 await p.evaluate(() => window.__canvas.setView('canvas'));
 check('graph: a selection shows a card with ✕ and a hint; Esc clears it, so does ✕; then \'.\' opens no palette (N66)', st.sel && st.card && st.x && /Esc, ✕ or a click on empty space/.test(st.hint) && gs.sel === null && !gs.card && gs.afterX === null && !gs.pal, JSON.stringify({ st, gs }));
-// v9 removed the assistant pane (live.chat): the graph card's Ask assistant and Handwriting → ask the assistant are offered only while it exists
+// the assistant pane is gone: the graph card has no Ask assistant and the palette no Handwriting → ask the assistant
 await p.evaluate(() => window.__canvas.setView('graph')); await sleep(600);
-st = await p.evaluate(() => { const C = window.__canvas, chat = !!(C.S.chat && C.live.chat); C.graphSelect([...C.G.N.keys()][0]);
+st = await p.evaluate(() => { const C = window.__canvas; C.graphSelect([...C.G.N.keys()][0]);
   const card = !document.querySelector<HTMLElement>('#g-card')!.hidden, ask = [...document.querySelectorAll('#g-card button')].some(b => b.textContent === 'Ask assistant'); C.graphSelect(null);
-  const keep = C.INK.ids; C.INK.ids = ['x']; const ink = C.CMDS.find((c: PaletteItem) => c.l === 'Handwriting → ask the assistant'), offered = !!ink?.when?.(); C.INK.ids = keep;
-  return { chat, card, ask, ink: !!ink, offered }; });
+  return { card, ask, ink: C.CMDS.some((c: PaletteItem) => c.l === 'Handwriting → ask the assistant') }; });
 await p.evaluate(() => window.__canvas.setView('canvas'));
-check('graph: Ask assistant is on the card only while the assistant pane exists, and so is Handwriting → ask the assistant', st.card && st.ink && st.ask === st.chat && st.offered === st.chat, JSON.stringify(st));
+check('graph: the card offers no Ask assistant, and the palette no Handwriting → ask the assistant', st.card && !st.ask && !st.ink, JSON.stringify(st));
 // the palette's Fullscreen: headless Chromium refuses a request without a user gesture; that is a toast, not an unhandled rejection
 st = await p.evaluate(async () => { const C = window.__canvas; let unhandled = 0; const on = () => { unhandled++; }; addEventListener('unhandledrejection', on);
   document.querySelector('#toast')!.textContent = ''; C.CMDS.find((c: PaletteItem) => c.l === 'Fullscreen (browser)').run(); await new Promise(r => setTimeout(r, 300));
@@ -768,7 +767,7 @@ st = await p.evaluate(async () => { const C = window.__canvas; let unhandled = 0
   if (document.fullscreenElement) await document.exitFullscreen().catch(() => {}); removeEventListener('unhandledrejection', on); return r; });
 check('Fullscreen (browser): a refused request says so in a toast and leaves no unhandled rejection', st.unhandled === 0 && (st.full || st.toast === 'Fullscreen is not available here.'), JSON.stringify(st));
 
-// ---- v17 demo: spiral tiling, pane shares by dragging an edge, no ribbon ↔ tile ratchet, folder resize drives packing down to a stack
+// ---- spiral tiling, pane shares by dragging an edge, no ribbon ↔ tile ratchet, folder resize drives packing down to a stack
 await p.evaluate(() => window.__canvas.setView('canvas'));
 st = await p.evaluate(async () => { const C = window.__canvas, S = C.S;
   const f = C.addNode({ kind: 'frame', name: 'tiles', mode: 'free', shape: 'folder', x: 4000, y: 4000, w: 800, h: 500 });
@@ -799,7 +798,7 @@ await p.mouse.move(gh.x, gh.y); await p.mouse.down(); await p.mouse.move(gh.x + 
 st = await p.evaluate(({ fid }) => { const C = window.__canvas, f = C.S.nodes[fid]; const r: Record<string, unknown> = { mode: f.mode, w: f.w, h: f.h, kw: C.kidsOf(fid).map((k: BoardNode) => k.w) }; C.setMode(f, 'free', true); r.restored = C.kidsOf(fid).every((k: BoardNode) => k.w === 200 && !k.prePack); C.removeNode(fid); return r; }, tf);
 check('a deck dragged open unstacks into pack at the dragged size; back in free mode the cards have their own sizes again', st.mode === 'pack' && st.w > 300 && st.kw.every((w: number) => w > 110) && st.restored, JSON.stringify(st));
 
-// ---- v16 demo: the heading tree of a note, links with backlink counts, the journal and link perspectives, ]d / [d, the outline pane
+// ---- the heading tree of a note, links with backlink counts, the journal and link perspectives, ]d / [d, the outline pane
 await p.evaluate(() => window.__canvas.setView('canvas'));
 st = await p.evaluate(async () => { const C = window.__canvas, S = C.S, sl = (ms: number) => new Promise(r => setTimeout(r, ms)); await C.notesLoad(true);
   const top = C.rgEntries(C.addrToKey('note:plans')).map((e: RgEntry) => e.name + '|' + e.meta + '|' + e.dir), h1 = C.rgEntries(C.addrToKey('note:plans')).find((e: RgEntry) => e.dir), sub = h1 ? C.rgEntries(h1.key).map((e: RgEntry) => e.name) : [], up = h1 ? C.rgParent(C.rgEntries(h1.key)[0].key) === h1.key : false;
@@ -825,7 +824,7 @@ await p.keyboard.press(']'); await p.keyboard.press('d'); await sleep(300);
 const st3 = await p.evaluate(prev => { const C = window.__canvas; const d = C.RG.dir; C.removeNode(C.findPage(prev).id); C.setView('canvas'); return d; }, PREV);
 check('[d / ]d in the navigator step to the previous / next day that has an entry', /earlier/.test(st.toast) && st.dir === 'journal:' + DAYP && st2 === 'journal:' + PREV.replaceAll('-', '/') && st3 === 'journal:' + DAYP, JSON.stringify({ st, st2, st3 }));
 
-// ---- v15 demo: tasks are keyword blocks with planning lines under them; four columns; keys; dispatch into a shell tagged #agent
+// ---- tasks are keyword blocks with planning lines under them; four columns; keys; dispatch into a shell tagged #agent
 await p.evaluate(() => window.__canvas.setView('canvas'));
 st = await p.evaluate(async () => { const C = window.__canvas, S = C.S, sl = (ms: number) => new Promise(r => setTimeout(r, ms));
   const pg = C.addNode({ kind: 'buffer', name: 'todo', x: 1500, y: 1500, w: 420, h: 300, text: '# todo\n\n- TODO Write the v15 tests [#A]\n  SCHEDULED: <2026-10-01 Wed>\n  cover the four columns\n- NEXT Ship version 30\n  DEADLINE: <2099-01-01 Fri>\n- HOLD Wait for the build host\n- CANCELLED Old idea\n' });

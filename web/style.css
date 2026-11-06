@@ -114,7 +114,7 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 .frame .rse { position: absolute; top: 24px; bottom: 16px; right: -5px; width: 10px; cursor: ew-resize; z-index: 3; }
 .frame .rsb { position: absolute; left: 24px; right: 16px; bottom: -5px; height: 10px; cursor: ns-resize; z-index: 3; }
 .frame .rse:hover, .frame .rsb:hover { background: var(--accent-soft); }
-.frame .rs, .frame .rse, .frame .rsb { z-index: 1; }   /* v18.1: below every folder tab (z 2+), so a strip never steals the tab buttons of the folder under it when zoomed out */
+.frame .rs, .frame .rse, .frame .rsb { z-index: 1; }   /* below every folder tab (z 2+), so a strip never steals the tab buttons of the folder under it when zoomed out */
 
 /* ------------------------------------------------------------ nodes */
 .node { position: absolute; background: var(--panel); border: 1px solid var(--stroke); border-radius: var(--radius); }
@@ -268,7 +268,7 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 @media (max-width: 640px) { #st-addr { min-width: 0; } .mode { display: none; } }
 #world.far .fcols, #world.far .frows { display: none; }
 
-/* ------------------------------------------------------------ v2: tools, shapes, pages, agent */
+/* ------------------------------------------------------------ tools, shapes, pages, agent */
 .tb.ico { min-width: 34px; padding: 0 8px; font-size: 15px; position: relative; }
 .tb.ico sub { position: absolute; right: 3px; bottom: 1px; font: 8.5px var(--mono); color: var(--muted); }
 #shapes { z-index: 2; }
@@ -302,7 +302,6 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 .backlinks .bl b { font: 500 11.5px var(--mono); color: var(--link); }
 .backlinks .bl span { color: var(--muted); }
 .backlinks .bl:hover span { color: var(--fg); }
-.k-agent .body { display: flex; flex-direction: column; background: var(--buf-bg); }
 .ag-log { flex: 1; min-height: 0; overflow: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
 .ag-msg { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 92%; font-family: var(--ui); }
 .ag-user { align-self: flex-end; background: var(--accent-soft); padding: 6px 10px; border-radius: var(--radius); }
@@ -320,7 +319,6 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 .ag-row .seg button.on { background: var(--accent-soft); color: var(--accent); font-weight: 500; }
 .ag-row .go { border: 1px solid var(--accent); background: var(--accent); color: var(--panel); border-radius: var(--radius); padding: 4px 14px; cursor: pointer; font-weight: 500; }
 .ag-row .stop { border: 1px solid var(--line); background: var(--panel); border-radius: var(--radius); padding: 4px 12px; cursor: pointer; }
-.k-agent .lod { background: var(--buf-bg); }
 /* ACP agent cards (30 §1): the shared .ag-* transcript above, plus plan, tool calls, diffs, pending requests and state.
    Agent text is Noto Sans (--ui); chrome, tools and diffs stay mono. Semantic colours: running info, waiting warn,
    error err, done ok; detached and exited are a hollow dot. */
@@ -404,7 +402,7 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 .k-acp .ag-row button:disabled { opacity: .5; cursor: not-allowed; }
 .k-acp .ag-in textarea:disabled, .k-acp .ag-in textarea:read-only { color: var(--muted); background: var(--panel-2); }
 
-/* ------------------------------------------------------------ v3: app shell, views, side pane */
+/* ------------------------------------------------------------ app shell, views, side pane */
 body:not([data-view="canvas"]) .c-only { display: none !important; }
 .grp.views .tb { font-weight: 500; }
 .view { position: fixed; z-index: 60; top: var(--top); bottom: var(--bot); left: 0; right: var(--side-w); background: var(--bg); overflow: hidden; }
@@ -425,7 +423,6 @@ body.side-open #side { transform: none; visibility: visible; transition: transfo
 .side-wrap .ag-in { padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 8px); }
 .side-wrap .ag-in textarea { min-height: 64px; }
 .hb.armed { color: var(--ink-red); background: var(--accent-soft); }
-#toggle-side.on { background: var(--accent-soft); color: var(--accent); }
 @media (max-width: 760px) { #side { width: 100%; } }
 
 /* graph */
@@ -526,7 +523,7 @@ body.side-open #side { transform: none; visibility: visible; transition: transfo
 .tk-mv { display: flex; gap: 4px; flex: none; }
 #tk-in { width: 100%; box-sizing: border-box; font: 13px var(--mono); border: 1px dashed var(--line); border-radius: var(--radius); padding: 7px 9px; background: var(--panel); color: var(--fg); }
 
-/* ------------------------------------------------------------ v5: folders as containers */
+/* ------------------------------------------------------------ folders as containers */
 .frame { border: 1.5px solid var(--line); }
 .frame.shape-folder { border-radius: var(--radius); }
 .frame.shape-folder .fgrid { border-radius: var(--radius); }
@@ -602,7 +599,7 @@ body.tree-open[data-view="canvas"] #tree-pane { display: flex; }
 .frame.m-stack > .ink { display: none; }
 #world.far .lod { cursor: grab; }
 
-/* ------------------------------------------------------------ v5.1: pen and voice */
+/* ------------------------------------------------------------ pen and voice */
 .mic { border: 1px solid var(--line); background: var(--panel); border-radius: var(--radius); height: 28px; min-width: 34px; cursor: pointer; font-size: 14px; touch-action: none; user-select: none; }
 .mic.on { background: var(--listen-bg); color: var(--fg); border-color: var(--ink-red); animation: listen 1.2s ease-in-out infinite; }
 @keyframes listen { 50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--ink-red) 25%, transparent); } }
@@ -617,7 +614,7 @@ body.listening #st-buf-text { color: var(--ink-red); }
 .hb.mic { border: 0; height: 22px; min-width: 24px; font-size: 12px; background: transparent; }
 .hb.mic.on { background: var(--ink-red); }
 
-/* ------------------------------------------------------------ v6: palette-first chrome, navigator, mode line */
+/* ------------------------------------------------------------ palette-first chrome, navigator, mode line */
 .node { border-width: 1px; box-shadow: none; }
 .hdr { background: var(--panel-2); }
 .node.active .hdr { background: var(--accent-soft); }
@@ -679,7 +676,7 @@ body.listening #st-buf-text { color: var(--ink-red); }
 }
 #v-ranger { background: var(--panel); }
 
-/* v6.4: drag the side pane's left edge to resize it */
+/* drag the side pane's left edge to resize it */
 #side-grip { position: absolute; z-index: 3; left: -5px; top: 0; bottom: 0; width: 10px; cursor: col-resize; touch-action: none; }
 #side-grip::after { content: ""; position: absolute; left: 4px; top: 0; bottom: 0; width: 2px; background: transparent; transition: background var(--t-fast) var(--ease); }
 #side-grip:hover::after, body.pane-drag #side-grip::after { background: var(--accent); }
@@ -692,7 +689,7 @@ body.pane-drag #side { transition: none; }
 #tree-grip:hover::after, body.pane-drag #tree-grip:active::after { background: var(--accent); }
 @media (max-width: 760px) { #tree-grip { display: none; } }
 
-/* v6.4: selection, compact, tile */
+/* selection, compact, tile */
 .node.picked, .frame.picked { outline: 2.5px solid var(--accent); outline-offset: 4px; }
 path.stroke.picked { stroke: var(--accent); stroke-width: 2.5px; vector-effect: non-scaling-stroke; paint-order: stroke; }
 .shape.picked { filter: drop-shadow(1px 1px 0 var(--accent)) drop-shadow(-1px -1px 0 var(--accent)); }
@@ -766,7 +763,7 @@ body[data-mode="phone"] #side { width: 100vw !important; } body[data-mode="phone
 body[data-mode="phone"] .node .port, body[data-mode="phone"] .node .rs, body[data-mode="phone"] .node .rse, body[data-mode="phone"] .node .rsb, body[data-mode="phone"] .flabel .modes { display: none; }
 body[data-mode="phone"] .rv-face { font-size: 22px; }
 
-/* ---- v8 node kinds: web, sketch */
+/* ---- node kinds: web, sketch */
 .k-web .body { display: flex; flex-direction: column; background: #fff; }
 .web-bar { display: flex; gap: 4px; padding: 4px 6px; background: var(--panel); border-bottom: 1px solid var(--line); align-items: center; }
 .web-bar input { flex: 1; min-width: 0; font: inherit; font-size: 12px; padding: 3px 6px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg); color: var(--fg); }
@@ -832,14 +829,14 @@ body[data-mode="phone"] .rv-face { font-size: 22px; }
 .node.op-stale .op-bar .go { background: var(--warn); border-color: var(--warn); }
 .k-term.emacs .hdr .name::before { content: "ε "; color: var(--muted); }
 
-/* ---- v9: tags, filter */
+/* ---- tags, filter */
 .hdr .tags { font-size: 11px; color: var(--muted); margin-left: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .hdr .tags span { cursor: pointer; margin-right: 4px; } .hdr .tags span:hover { color: var(--accent); text-decoration: underline; }
 .hdr .tags span.auto { opacity: .75; }
 .node.dim, .frame.dim { opacity: .22; } .tp-row.dim { opacity: .35; }
 #tag-chip { position: fixed; left: 50%; transform: translateX(-50%); top: 44px; z-index: 30; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 4px 10px; font-size: 12px; display: flex; gap: 8px; align-items: center; }
 
-/* ---- v11: hosts and perspectives */
+/* ---- hosts and perspectives */
 .fhost { font: 600 12px var(--mono); color: var(--accent); letter-spacing: 0; }
 .frame.hdown > .flabel .fhost { color: var(--err); }
 .flabel .fre { display: none; }
@@ -859,8 +856,8 @@ body.tree-open #persp-chip, body.tree-open #tag-chip { left: calc(50% + var(--tr
 .frame.m-stack.packed .deck { display: none; }
 .frame.m-stack.packed { border-bottom: 2px solid var(--line); border-radius: var(--radius); }
 .frame.m-stack.packed > .flabel .ftab { background: var(--panel-2); }
-/* ---- v10: workspaces, focus tabs, which-key, ribbon */
-body.in-ws .node.outside, body.in-ws .frame.outside { opacity: .16; cursor: pointer; }   /* v19.1: clickable: a click leaves the workspace and goes there */
+/* ---- workspaces, focus tabs, which-key, ribbon */
+body.in-ws .node.outside, body.in-ws .frame.outside { opacity: .16; cursor: pointer; }   /* clickable: a click leaves the workspace and goes there */
 body.in-ws .node.outside *, body.in-ws .frame.outside * { pointer-events: none; }
 #ws-bar { position: fixed; top: 54px; left: calc((100% - var(--side-w, 0px)) / 2); transform: translateX(-50%); z-index: 120; display: flex; gap: 10px; align-items: center; padding: 4px 8px 4px 12px;
   background: var(--panel); border: 1.5px solid var(--accent); border-radius: var(--radius); box-shadow: var(--shadow); font: 600 13px var(--mono); color: var(--accent); white-space: nowrap; }
@@ -902,7 +899,7 @@ body.tree-open[data-view="canvas"] #which-key { left: calc(50% + var(--tree-w, 2
 /* folder tabs keep screen size, so at low zoom they reach over sibling folders' bodies: tabs always paint above frame bodies */
 .flabel { z-index: 2; } .frame.active > .flabel { z-index: 3; } .frame:hover > .flabel { z-index: 4; }
 
-/* v14: host trees and the status line */
+/* host trees and the status line */
 #st-host { display: flex; gap: 6px; align-items: center; }
 #st-host .stc { font: inherit; color: var(--muted); background: transparent; border: 1px solid transparent; border-radius: var(--radius); padding: 0 5px; cursor: pointer; }
 #st-host .stc:hover { border-color: var(--line); color: var(--fg); }
@@ -915,7 +912,7 @@ body.tree-open[data-view="canvas"] #which-key { left: calc(50% + var(--tree-w, 2
 .frame.d-mount > .flabel .fname::before { content: '⛁ '; opacity: .8; }
 .frame.u-failed > .flabel .ftab { outline: 1.5px solid var(--err); }
 
-/* v15: tasks */
+/* tasks */
 .tk-card.on { outline: 2px solid var(--accent); outline-offset: 1px; }
 .tk-meta { display: flex; flex-wrap: wrap; gap: 8px; font: 11.5px var(--mono); color: var(--muted); }
 .tk-meta > span { min-width: 0; overflow-wrap: anywhere; }
@@ -923,18 +920,18 @@ body.tree-open[data-view="canvas"] #which-key { left: calc(50% + var(--tree-w, 2
 .tk-meta .prio { color: var(--accent); }
 .tk-meta .sess { color: var(--fg); }
 
-/* v16: outline headings, backlink rows */
+/* outline headings, backlink rows */
 .tp-row.tp-h { color: var(--muted); font-size: 12px; }
 .tp-row.tp-h .tp-nm { color: var(--fg); }
 .rg-row.rg-bl { padding-left: 16px; }
 .rg-row.rg-bl .rg-meta2 { color: var(--muted); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; }
 .rg-row.rg-bl:hover { background: var(--panel-2); cursor: pointer; }
 
-/* v17.1: the graph card says what the highlight is and how to leave it */
+/* the graph card says what the highlight is and how to leave it */
 .g-card .gc-head { display: flex; align-items: center; gap: 8px; }
 .g-card .gc-head b { flex: 1; }
 .g-card .gc-hint { margin-top: 6px; font: 11.5px var(--mono); color: var(--muted); }
-/* v18: a tab or header never runs past its item. The tab is scaled by --iz (screen size), so its cap is the folder's
+/* a tab or header never runs past its item. The tab is scaled by --iz (screen size), so its cap is the folder's
    width in screen pixels; the name ellipsizes, and fitChrome (app.js) drops the rest in steps as the item narrows. */
 .flabel { max-width: calc(100% / var(--iz, 1)); }
 .ftab { max-width: 100%; min-width: 0; overflow: hidden; box-sizing: border-box; }
