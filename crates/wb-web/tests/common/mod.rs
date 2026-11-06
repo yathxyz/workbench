@@ -37,6 +37,9 @@ pub const DEFAULT_SHELL: &str = "bash";
 pub const INDEX: &str = "<!doctype html><title>t</title>";
 pub const CONSOLE: &str = "<!doctype html><title>Edwin</title>";
 pub const SCM: &str = "(define (f x) x)\n";
+/// A style sheet and what stands for its gzip encoding (wb-web does not decode it).
+pub const CSS: &str = "a { color: red }\n";
+pub const CSS_GZ: &[u8] = b"\x1f\x8b gzip of style.css";
 pub const WAIT: Duration = Duration::from_secs(10);
 
 pub type Ws = WebSocketStream<TcpStream>;
@@ -74,6 +77,8 @@ pub fn fixture(dir: &Path, hub_socket: &Path) -> Value {
     std::fs::create_dir(dir.join("web")).unwrap();
     std::fs::write(dir.join("web/index.html"), INDEX).unwrap();
     std::fs::write(dir.join("web/app.js"), "let x = 1;\n").unwrap();
+    std::fs::write(dir.join("web/style.css"), CSS).unwrap();
+    std::fs::write(dir.join("web/style.css.gz"), CSS_GZ).unwrap();
     // The Edwin console as nix/web.nix lays it out (edwind spec R9.19).
     std::fs::create_dir_all(dir.join("web/edwin/scm")).unwrap();
     std::fs::create_dir_all(dir.join("web/edwin/src")).unwrap();

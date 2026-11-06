@@ -1,7 +1,7 @@
 # The web root: web/ with its TypeScript stripped to JavaScript (tools/strip.mts), the vendored xterm bundle,
 # pdf.js under vendor/pdfjs/, the Edwin console and frame runtime under edwin/ (the edwin input's edwin-web), and
 # the fonts, converted to woff2 from nixpkgs at build time with a generated fonts/fonts.css. No font file lives in
-# the repo.
+# the repo. Text files get a gzip sibling (see the end).
 {
   lib,
   runCommand,
@@ -78,4 +78,11 @@ runCommand "workbench-web" { nativeBuildInputs = [ nodejs woff2 ]; } ''
   }
   EOF
   chmod 444 $out/fonts/fonts.css
+
+  # Each text file over 1 KiB also as <file>.gz, which wb-web sends to clients that accept gzip (3.3 of 4.6 MB
+  # saved). Fonts, images and the binary CMaps are compressed already.
+  chmod -R u+w $out
+  find $out -type f -size +1k \( -name '*.html' -o -name '*.js' -o -name '*.mjs' -o -name '*.css' -o -name '*.json' \
+    -o -name '*.map' -o -name '*.svg' -o -name '*.scm' -o -name '*.txt' -o -name '*.md' -o -name '*.wasm' \) \
+    -exec gzip -9 -n -k {} +
 ''

@@ -212,6 +212,57 @@ async fn security_headers_on_every_response_and_csp_on_html() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gz_sibling_goes_to_clients_that_accept_gzip() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = Web::start(&dir.path().join("hub.sock"));
+
+    let plain = web.req("GET", "/style.css").send().await;
+    assert_eq!(plain.status, 200);
+    assert_eq!(plain.body, common::CSS.as_bytes());
+    assert_eq!(plain.header("content-encoding"), None);
+    assert_eq!(plain.header("vary"), Some("accept-encoding"));
+
+    let gz = web
+        .req("GET", "/style.css")
+        .set("Accept-Encoding", "gzip, deflate, br, zstd")
+        .send()
+        .await;
+    assert_eq!(gz.status, 200);
+    assert_eq!(gz.body, common::CSS_GZ);
+    assert_eq!(gz.header("content-encoding"), Some("gzip"));
+    assert_eq!(gz.header("content-type"), Some("text/css; charset=utf-8"));
+    assert_eq!(gz.header("vary"), Some("accept-encoding"));
+    // Each encoding has its own tag, and a revalidation names the one it holds.
+    let tag = gz.header("etag").unwrap().to_owned();
+    assert_ne!(plain.header("etag"), Some(tag.as_str()));
+    let res = web
+        .req("GET", "/style.css")
+        .set("Accept-Encoding", "gzip")
+        .set("If-None-Match", &tag)
+        .send()
+        .await;
+    assert_eq!(res.status, 304);
+    assert_eq!(res.header("vary"), Some("accept-encoding"));
+    let res = web
+        .req("GET", "/style.css")
+        .set("If-None-Match", &tag)
+        .send()
+        .await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body, common::CSS.as_bytes());
+
+    // The encoding is not an asset of its own, and a file without one goes as it is.
+    assert_eq!(web.req("GET", "/style.css.gz").send().await.status, 404);
+    let res = web
+        .req("GET", "/app.js")
+        .set("Accept-Encoding", "gzip")
+        .send()
+        .await;
+    assert_eq!(res.header("content-encoding"), None);
+    assert_eq!(res.header("vary"), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn static_files_have_content_etags() {
     let dir = tempfile::tempdir().unwrap();
     let web = Web::start(&dir.path().join("hub.sock"));
