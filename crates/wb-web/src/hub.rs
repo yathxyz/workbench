@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -21,7 +21,9 @@ use wb_proto::limits::{HELLO_TIMEOUT, MAX_LINE};
 use wb_proto::line;
 use wb_proto::state::derive;
 
-use crate::FeedMsg;
+use crate::http::{End, close};
+use crate::util::{jitter, next_backoff};
+use crate::{AppState, FeedMsg};
 
 const CLIENT: &str = concat!("wb-web/", env!("CARGO_PKG_VERSION"));
 const WEB_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -94,6 +96,25 @@ pub enum ConnectError {
 }
 
 /// One hub connection after the handshake.
+/// The end of a relay whose hub connection closed.
+pub const HUB_LOST: End = End::Close(close::HUB_LOST, "hub connection lost");
+
+/// A hub connection of its own for one browser socket, and the hub's hello; or the close
+/// reason (with `HUB_UNAVAILABLE`) while the hub is down, incompatible or refuses it.
+pub async fn connect_relay(app: &AppState) -> Result<(HubConn, HubInfo), &'static str> {
+    let refused = match &*app.hub.status.borrow() {
+        HubStatus::Up(_) => None,
+        HubStatus::Down => Some("hub unavailable"),
+        HubStatus::Incompatible { .. } => Some("hub incompatible"),
+    };
+    if let Some(reason) = refused {
+        return Err(reason);
+    }
+    HubConn::connect(&app.cfg.hub_socket)
+        .await
+        .map_err(|_| "hub unavailable")
+}
+
 pub struct HubConn {
     rx: FramedRead<OwnedReadHalf, LinesCodec>,
     tx: OwnedWriteHalf,
@@ -276,7 +297,7 @@ impl Control {
                     if since.elapsed() >= STABLE {
                         backoff = BACKOFF_MIN;
                     }
-                    jitter(next_backoff(&mut backoff))
+                    jitter(next_backoff(&mut backoff, BACKOFF_MAX))
                 }
                 Err(ConnectError::Incompatible(proto)) => {
                     self.set(HubStatus::Incompatible { proto });
@@ -285,7 +306,7 @@ impl Control {
                 Err(ConnectError::Unavailable(why)) => {
                     tracing::debug!(why, "hub not reachable");
                     self.set(HubStatus::Down);
-                    jitter(next_backoff(&mut backoff))
+                    jitter(next_backoff(&mut backoff, BACKOFF_MAX))
                 }
             };
             sleep(wait).await;
@@ -399,31 +420,9 @@ impl Control {
     }
 }
 
-/// Returns the current backoff and doubles the next one, up to the maximum.
-fn next_backoff(backoff: &mut Duration) -> Duration {
-    let current = *backoff;
-    *backoff = (current * 2).min(BACKOFF_MAX);
-    current
-}
-
-/// ±25 %, so restarted webs do not reconnect in lockstep.
-fn jitter(d: Duration) -> Duration {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |t| t.subsec_nanos());
-    d.mul_f64(0.75 + f64::from(nanos % 1000) / 2000.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn backoff_doubles_to_the_cap() {
-        let mut b = BACKOFF_MIN;
-        let seq: Vec<_> = (0..7).map(|_| next_backoff(&mut b).as_millis()).collect();
-        assert_eq!(seq, [250, 500, 1000, 2000, 4000, 5000, 5000]);
-    }
 
     #[test]
     fn builds_decide_staleness_when_both_sides_have_one() {
@@ -441,17 +440,6 @@ mod tests {
         ];
         for (hv, hb, wv, wb, want) in table {
             assert_eq!(stale(hv, hb, wv, wb), want, "{hv} {hb:?} {wv} {wb:?}");
-        }
-    }
-
-    #[test]
-    fn jitter_stays_within_a_quarter() {
-        for _ in 0..100 {
-            let j = jitter(Duration::from_secs(4));
-            assert!(
-                j >= Duration::from_secs(3) && j < Duration::from_secs(5),
-                "{j:?}"
-            );
         }
     }
 }

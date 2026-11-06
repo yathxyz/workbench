@@ -22,8 +22,8 @@ use wb_proto::limits::{CARD_OPEN_DEADLINE, MAX_LINE, WS_MAX_ACP};
 use wb_proto::line;
 
 use crate::AppState;
-use crate::http::{Keepalive, Tick, close, send_json, upgrade_required, ws_close, ws_too_big};
-use crate::hub::{HubConn, HubStatus, REPLY_TIMEOUT, with_state};
+use crate::http::{self, End, Keepalive, Tick, close, send_json, ws_close, ws_too_big};
+use crate::hub::{HUB_LOST, HubConn, REPLY_TIMEOUT, connect_relay, with_state};
 use crate::util::sanitize_sid;
 
 const ROUTE: &str = "/acp";
@@ -36,16 +36,7 @@ async fn upgrade(
     State(app): State<AppState>,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    let Ok(ws) = ws else {
-        return upgrade_required();
-    };
-    let running = app.socket();
-    ws.max_message_size(WS_MAX_ACP)
-        .max_frame_size(WS_MAX_ACP)
-        .on_upgrade(move |socket| async move {
-            run(app, socket).await;
-            drop(running);
-        })
+    http::upgrade(app, ws, WS_MAX_ACP, run)
 }
 
 /// A browser message (§3.5.2), without its optional `rid`.
@@ -132,28 +123,10 @@ fn error(message: &str, code: ErrorCode, rid: Option<Value>) -> Value {
     e
 }
 
-/// Why the relay stopped.
-enum End {
-    /// Close the browser socket with this code.
-    Close(u16, &'static str),
-    /// The browser socket is already gone.
-    Gone,
-}
-
-const HUB_LOST: End = End::Close(close::HUB_LOST, "hub connection lost");
-
 async fn run(app: AppState, mut ws: WebSocket) {
-    let status = app.hub.status.borrow().clone();
-    let reason = match status {
-        HubStatus::Up(_) => None,
-        HubStatus::Down => Some("hub unavailable"),
-        HubStatus::Incompatible { .. } => Some("hub incompatible"),
-    };
-    if let Some(reason) = reason {
-        return ws_close(ws, ROUTE, close::HUB_UNAVAILABLE, reason).await;
-    }
-    let Ok((hub, _)) = HubConn::connect(&app.cfg.hub_socket).await else {
-        return ws_close(ws, ROUTE, close::HUB_UNAVAILABLE, "hub unavailable").await;
+    let (hub, _) = match connect_relay(&app).await {
+        Ok(conn) => conn,
+        Err(reason) => return ws_close(ws, ROUTE, close::HUB_UNAVAILABLE, reason).await,
     };
     let stop = app.stopped();
     tokio::pin!(stop);
@@ -200,9 +173,7 @@ async fn run(app: AppState, mut ws: WebSocket) {
             break end;
         }
     };
-    if let End::Close(code, reason) = end {
-        ws_close(ws, ROUTE, code, reason).await;
-    }
+    end.close(ws, ROUTE).await;
 }
 
 /// What a hub reply means to this socket.

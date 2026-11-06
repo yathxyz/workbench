@@ -27,7 +27,7 @@ use wb_proto::limits::WS_MAX_RPC;
 
 use crate::board;
 use crate::edit_client::Delivery;
-use crate::http::{Keepalive, Tick, close, send_json, upgrade_required, ws_close, ws_too_big};
+use crate::http::{self, Keepalive, Tick, close, send_json, ws_close, ws_too_big};
 use crate::hub::{HubStatus, with_state};
 use crate::sample::Tab;
 use crate::{AppState, FeedMsg};
@@ -42,16 +42,7 @@ async fn upgrade(
     State(app): State<AppState>,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    let Ok(ws) = ws else {
-        return upgrade_required();
-    };
-    let running = app.socket();
-    ws.max_message_size(WS_MAX_RPC)
-        .max_frame_size(WS_MAX_RPC)
-        .on_upgrade(move |socket| async move {
-            run(app, socket).await;
-            drop(running);
-        })
+    http::upgrade(app, ws, WS_MAX_RPC, run)
 }
 
 /// `hub{status, version?, build?, startedAt?, stale?}`.
