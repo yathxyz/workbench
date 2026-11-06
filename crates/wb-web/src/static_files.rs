@@ -2,7 +2,9 @@
 //!
 //! There is no decoding and no filesystem access per request, so traversal is
 //! impossible by construction. ETags are content hashes, because store mtimes are
-//! constant and cannot tell two builds apart.
+//! constant and cannot tell two builds apart. A `<file>.gz` beside a file is its gzip
+//! encoding (nix/web.nix writes one for each text asset), sent to clients that accept
+//! gzip; nothing is compressed per request.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -12,7 +14,9 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, ensure};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+use axum::http::header::{
+    ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, IF_NONE_MATCH, VARY,
+};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
@@ -25,10 +29,26 @@ const TOTAL_MAX: u64 = 128 << 20;
 /// Bounds the walk, which follows symlinks.
 const DEPTH_MAX: usize = 16;
 
+/// One encoding of an asset; each has its own ETag, as RFC 9110 asks of strong tags.
 #[derive(Clone)]
-struct Asset {
+struct Rep {
     body: Bytes,
     etag: HeaderValue,
+}
+
+impl Rep {
+    fn new(body: Vec<u8>) -> Self {
+        Rep {
+            etag: etag(&body),
+            body: body.into(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Asset {
+    plain: Rep,
+    gzip: Option<Rep>,
     ctype: &'static str,
 }
 
@@ -48,6 +68,20 @@ impl Assets {
             "webRoot {} has no index.html",
             root.display()
         );
+        let encoded: Vec<String> = (assets.keys())
+            .filter(|k| {
+                k.strip_suffix(".gz")
+                    .is_some_and(|f| assets.contains_key(f))
+            })
+            .cloned()
+            .collect();
+        for key in encoded {
+            let gzip = assets.remove(&key).map(|a| a.plain);
+            assets
+                .get_mut(&key[..key.len() - 3])
+                .expect("checked above")
+                .gzip = gzip;
+        }
         let indexes: Vec<(String, Asset)> = assets
             .iter()
             .filter_map(|(key, asset)| {
@@ -101,13 +135,12 @@ fn walk(
                 fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
             *total += body.len() as u64;
             ensure!(*total <= TOTAL_MAX, "webRoot holds more than 128 MiB");
-            let ctype = mime(name);
             assets.insert(
                 key,
                 Asset {
-                    etag: etag(&body),
-                    body: body.into(),
-                    ctype,
+                    plain: Rep::new(body),
+                    gzip: None,
+                    ctype: mime(name),
                 },
             );
         }
@@ -124,6 +157,29 @@ fn etag(body: &[u8]) -> HeaderValue {
     }
     tag.push('"');
     HeaderValue::try_from(tag).expect("hex is a valid header value")
+}
+
+/// `Accept-Encoding` gives gzip, or else `*`, a weight above 0 (RFC 9110 §12.5.3).
+fn accepts_gzip(req: &HeaderMap) -> bool {
+    let (mut gzip, mut star) = (None, None);
+    for coding in req
+        .get_all(ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+    {
+        let mut parts = coding.split(';');
+        let name = parts.next().unwrap_or("").trim();
+        let q = parts
+            .find_map(|p| p.trim().strip_prefix("q="))
+            .map_or(1.0, |q| q.parse::<f32>().unwrap_or(0.0));
+        if name.eq_ignore_ascii_case("gzip") {
+            gzip = Some(q);
+        } else if name == "*" {
+            star = Some(q);
+        }
+    }
+    gzip.or(star).is_some_and(|q| q > 0.0)
 }
 
 /// The content type for a file name.
@@ -177,17 +233,25 @@ pub async fn serve(
     if method != Method::GET && method != Method::HEAD {
         return ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into_response();
     }
-    let mut res = if not_modified(&headers, &asset.etag) {
+    let gzip = asset.gzip.as_ref().filter(|_| accepts_gzip(&headers));
+    let rep = gzip.unwrap_or(&asset.plain);
+    let mut res = if not_modified(&headers, &rep.etag) {
         StatusCode::NOT_MODIFIED.into_response()
     } else {
-        let mut res = Response::new(Body::from(asset.body.clone()));
-        res.headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static(asset.ctype));
+        let mut res = Response::new(Body::from(rep.body.clone()));
+        let h = res.headers_mut();
+        h.insert(CONTENT_TYPE, HeaderValue::from_static(asset.ctype));
+        if gzip.is_some() {
+            h.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        }
         res
     };
     let h = res.headers_mut();
-    h.insert(ETAG, asset.etag.clone());
+    h.insert(ETAG, rep.etag.clone());
     h.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    if asset.gzip.is_some() {
+        h.insert(VARY, HeaderValue::from_static("accept-encoding"));
+    }
     res
 }
 
@@ -232,9 +296,9 @@ mod tests {
         let mut keys: Vec<_> = assets.0.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["/", "/fonts/a.ttf", "/index.html", "/link.html"]);
-        assert_eq!(assets.0["/"].body, "<p>hi</p>");
+        assert_eq!(assets.0["/"].plain.body, "<p>hi</p>");
         assert_eq!(assets.0["/fonts/a.ttf"].ctype, "font/ttf");
-        assert_eq!(assets.0["/"].etag, etag(b"<p>hi</p>"));
+        assert_eq!(assets.0["/"].plain.etag, etag(b"<p>hi</p>"));
     }
 
     #[test]
@@ -260,9 +324,12 @@ mod tests {
                 "/index.html",
             ]
         );
-        assert_eq!(assets.0["/edwin/"].body, "console");
-        assert_eq!(assets.0["/edwin/"].etag, assets.0["/edwin/index.html"].etag);
-        assert_eq!(assets.0["/"].body, "root");
+        assert_eq!(assets.0["/edwin/"].plain.body, "console");
+        assert_eq!(
+            assets.0["/edwin/"].plain.etag,
+            assets.0["/edwin/index.html"].plain.etag
+        );
+        assert_eq!(assets.0["/"].plain.body, "root");
         assert_eq!(
             assets.0["/edwin/scm/emacs.scm"].ctype,
             "text/plain; charset=utf-8"
@@ -285,6 +352,47 @@ mod tests {
         fs::write(dir.path().join("index.html"), "x").unwrap();
         std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
         assert!(Assets::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_gz_sibling_is_the_gzip_encoding_of_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("index.html"), "x").unwrap();
+        fs::write(dir.path().join("index.html.gz"), "gz of x").unwrap();
+        fs::write(dir.path().join("app.js"), "1").unwrap();
+        fs::write(dir.path().join("lone.gz"), "an archive").unwrap();
+        let assets = Assets::load(dir.path()).unwrap();
+        let mut keys: Vec<_> = assets.0.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["/", "/app.js", "/index.html", "/lone.gz"]);
+        for key in ["/", "/index.html"] {
+            let gzip = assets.0[key].gzip.as_ref().unwrap();
+            assert_eq!(gzip.body, "gz of x");
+            assert_eq!(gzip.etag, etag(b"gz of x"));
+            assert_eq!(assets.0[key].plain.body, "x");
+        }
+        assert!(assets.0["/app.js"].gzip.is_none());
+        assert!(assets.0["/lone.gz"].gzip.is_none());
+    }
+
+    #[test]
+    fn accept_encoding_forms() {
+        let check = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(ACCEPT_ENCODING, HeaderValue::from_str(v).unwrap());
+            accepts_gzip(&h)
+        };
+        assert!(check("gzip"));
+        assert!(check("gzip, deflate, br, zstd"));
+        assert!(check("br;q=1.0, GZIP;q=0.5"));
+        assert!(check("*"));
+        assert!(!check("gzip;q=0"));
+        assert!(!check("gzip; q=0.000"));
+        assert!(!check("br, zstd"));
+        assert!(!check("identity"));
+        assert!(!check("gzip;q=0, *"));
+        assert!(check("*;q=0, gzip"));
+        assert!(!accepts_gzip(&HeaderMap::new()));
     }
 
     #[test]
