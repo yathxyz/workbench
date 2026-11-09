@@ -13,7 +13,7 @@ use crate::AppState;
 use crate::edit_client::{Delivery, EditError, Stream};
 
 /// The `error.message` of a `sample` while no model is served.
-const SAMPLE_OFF: &str = "no language model is available on this server: sample is off until workbench-edit runs with a model backend";
+const SAMPLE_OFF: &str = "no language model is available on this server: sample is off until edwind runs with a model backend";
 
 /// Fields of a `sample` the browser sends that edwind reads (§12.2).
 const SAMPLE_FIELDS: [&str; 6] = ["input", "modelTier", "model", "effort", "images", "tools"];

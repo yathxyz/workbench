@@ -3904,7 +3904,7 @@ function stopListening() { const r = VOICE.rec; VOICE.rec = null; try { r?.stop(
 // do not go in are tried again with the next result.
 async function dictateInto(n: 'editor' | PageNode) {
   const ed = n === 'editor', page = ed ? ED.node : n, L = page && live[page.id]; if (!page || !L) return;
-  if (!FR.on || !page.buf) { toast('Dictation into a page needs edwind (workbench-edit)'); return; }
+  if (!FR.on || !page.buf) { toast('Dictation into a page needs edwind'); return; }
   const key = (ed ? 'editor:' : '') + page.id;
   if (VOICE.rec && VOICE.target === key) { stopListening(); return; }
   if (!(await frWhenWritable(page)) || (ed && ED.node !== page) || !live[page.id]) return;   // the view may have moved on meanwhile
@@ -5748,7 +5748,7 @@ interface FrFrameEvent { type: string; frame: EdwinFrame; buffer?: EdwinBuffer |
 /* One replica edit: [position, deleted text, inserted text]. */
 type FrOp = [number, string, string];
 const FR: EdwinFrState = { on: false, ready: false, online: false, tried: false, state: null, Ed: null, L: null, booting: null, failed: null, byFrame: new WeakMap(), lastSeen: new Map(), offAt: new Map(), pending: new Map(), claimed: new Set(), anchorCache: {}, localAnchors: {}, perf: [], waiters: [], downers: new Set(), snapT: new Map(), snapMine: new Set(), moved: new Map(), hold: new Map() };
-const FR_CAP = 24, FR_FONT = 13, FR_CLOSE_MS = 5 * 60 * 1000, FR_HOLD_MS = 10000, FR_OFF_TEXT = 'Editing is off: workbench-edit is not running';
+const FR_CAP = 24, FR_FONT = 13, FR_CLOSE_MS = 5 * 60 * 1000, FR_HOLD_MS = 10000, FR_OFF_TEXT = 'Editing is off: edwind is not running';
 // What the runtime says a page loads (edwin-web's manifest.json): the scripts in order, then the Scheme sources, both
 // relative to /edwin/. A manifest of another api is a runtime this board cannot load.
 interface FrManifest { api: number; files: string[]; scm: string[] }
@@ -6355,7 +6355,7 @@ function pagePosAt(n: BoardNode, x: number, y: number): number | null {
 // own tools still change a page that keeps its text on the node (write_page, tasks, journals, pipes, ink notes,
 // tear-out), so the demo shows them working; the edit lands in n.text and the node's anchors move with it. A page whose
 // text lives in edwind (buf) shows its cached first lines (snap) and takes no edit at all.
-const RO_OFF = 'Page editing needs edwind (workbench-edit)', RO_DEMO = 'Read-only in the demo: page editing needs Workbench served with edwind';
+const RO_OFF = 'Page editing needs edwind', RO_DEMO = 'Read-only in the demo: page editing needs Workbench served with edwind';
 const RO_FILE = 'the full text of a file page needs edwind';
 const roText = (n: PageNode): string => (n.buf ? n.snap ?? '' : n.text || '');
 const roNotice = (n: PageNode): string => (DAEMON ? RO_OFF : RO_DEMO) + (n.buf ? ` · ${n.buf}` : '');

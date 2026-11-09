@@ -56,10 +56,11 @@ struct Asset {
 pub struct Assets(HashMap<String, Asset>);
 
 impl Assets {
-    /// Reads every file under `root`, symlinks followed, dot files skipped. The root
-    /// must hold an `index.html`; `/edwin/` and any other directory that has one gets
-    /// the same alias (edwind spec R9.19, the console page).
-    pub fn load(root: &Path) -> Result<Self> {
+    /// Reads every file under `root`, symlinks followed, dot files skipped, and every
+    /// file under `edwin` as `/edwin/…` when given (edwinWebRoot), which `root` must then
+    /// leave alone. The root must hold an `index.html`; `/edwin/` and any other directory
+    /// that has one gets the same alias (edwind spec R9.19, the console page).
+    pub fn load(root: &Path, edwin: Option<&Path>) -> Result<Self> {
         let mut assets = HashMap::new();
         let mut total = 0;
         walk(root, "", 0, &mut assets, &mut total)?;
@@ -68,6 +69,14 @@ impl Assets {
             "webRoot {} has no index.html",
             root.display()
         );
+        if let Some(edwin) = edwin {
+            ensure!(
+                !assets.keys().any(|k| k.starts_with("/edwin/")),
+                "webRoot {} has an edwin/ of its own, which edwinWebRoot would mix with",
+                root.display()
+            );
+            walk(edwin, "/edwin", 1, &mut assets, &mut total)?;
+        }
         let encoded: Vec<String> = (assets.keys())
             .filter(|k| {
                 k.strip_suffix(".gz")
@@ -292,13 +301,44 @@ mod tests {
         fs::write(dir.path().join(".hidden"), "x").unwrap();
         std::os::unix::fs::symlink(dir.path().join("index.html"), dir.path().join("link.html"))
             .unwrap();
-        let assets = Assets::load(dir.path()).unwrap();
+        let assets = Assets::load(dir.path(), None).unwrap();
         let mut keys: Vec<_> = assets.0.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["/", "/fonts/a.ttf", "/index.html", "/link.html"]);
         assert_eq!(assets.0["/"].plain.body, "<p>hi</p>");
         assert_eq!(assets.0["/fonts/a.ttf"].ctype, "font/ttf");
         assert_eq!(assets.0["/"].plain.etag, etag(b"<p>hi</p>"));
+    }
+
+    #[test]
+    fn edwin_web_root_is_served_at_edwin() {
+        let web = tempfile::tempdir().unwrap();
+        fs::write(web.path().join("index.html"), "root").unwrap();
+        let edwin = tempfile::tempdir().unwrap();
+        fs::create_dir(edwin.path().join("scm")).unwrap();
+        fs::write(edwin.path().join("index.html"), "console").unwrap();
+        fs::write(edwin.path().join("index.html.gz"), "z").unwrap();
+        fs::write(edwin.path().join("scm/emacs.scm"), "(define x 1)").unwrap();
+        let assets = Assets::load(web.path(), Some(edwin.path())).unwrap();
+        let mut keys: Vec<_> = assets.0.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "/",
+                "/edwin/",
+                "/edwin/index.html",
+                "/edwin/scm/emacs.scm",
+                "/index.html"
+            ]
+        );
+        assert_eq!(assets.0["/edwin/"].plain.body, "console");
+        assert!(assets.0["/edwin/index.html"].gzip.is_some());
+
+        // A web root with an edwin/ of its own would mix two Edwins: refused.
+        fs::create_dir(web.path().join("edwin")).unwrap();
+        fs::write(web.path().join("edwin/index.html"), "old").unwrap();
+        assert!(Assets::load(web.path(), Some(edwin.path())).is_err());
     }
 
     #[test]
@@ -310,7 +350,7 @@ mod tests {
         fs::write(dir.path().join("edwin/index.html"), "console").unwrap();
         fs::write(dir.path().join("edwin/src/scheme.js"), "1").unwrap();
         fs::write(dir.path().join("edwin/scm/emacs.scm"), "(define x 1)").unwrap();
-        let assets = Assets::load(dir.path()).unwrap();
+        let assets = Assets::load(dir.path(), None).unwrap();
         let mut keys: Vec<_> = assets.0.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
@@ -343,7 +383,7 @@ mod tests {
     fn a_missing_index_is_fatal() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("app.js"), "1").unwrap();
-        assert!(Assets::load(dir.path()).is_err());
+        assert!(Assets::load(dir.path(), None).is_err());
     }
 
     #[test]
@@ -351,7 +391,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("index.html"), "x").unwrap();
         std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
-        assert!(Assets::load(dir.path()).is_err());
+        assert!(Assets::load(dir.path(), None).is_err());
     }
 
     #[test]
@@ -361,7 +401,7 @@ mod tests {
         fs::write(dir.path().join("index.html.gz"), "gz of x").unwrap();
         fs::write(dir.path().join("app.js"), "1").unwrap();
         fs::write(dir.path().join("lone.gz"), "an archive").unwrap();
-        let assets = Assets::load(dir.path()).unwrap();
+        let assets = Assets::load(dir.path(), None).unwrap();
         let mut keys: Vec<_> = assets.0.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["/", "/app.js", "/index.html", "/lone.gz"]);

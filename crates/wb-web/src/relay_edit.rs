@@ -53,7 +53,7 @@ async fn run(app: AppState, mut ws: WebSocket) {
             ws,
             ROUTE,
             close::HUB_UNAVAILABLE,
-            "workbench-edit is not configured",
+            "edwind is not configured",
         )
         .await;
     };
@@ -61,20 +61,14 @@ async fn run(app: AppState, mut ws: WebSocket) {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "edwind connect failed");
-            return ws_close(
-                ws,
-                ROUTE,
-                close::HUB_UNAVAILABLE,
-                "workbench-edit is not running",
-            )
-            .await;
+            return ws_close(ws, ROUTE, close::HUB_UNAVAILABLE, "edwind is not running").await;
         }
         Err(_) => {
             return ws_close(
                 ws,
                 ROUTE,
                 close::HUB_UNAVAILABLE,
-                "workbench-edit did not accept the connection",
+                "edwind did not accept the connection",
             )
             .await;
         }

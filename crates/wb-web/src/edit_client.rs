@@ -28,7 +28,7 @@ use crate::util::{jitter, next_backoff};
 /// The edit protocol version this client speaks (§7.2).
 const PROTO: u64 = 1;
 /// The message of every 503 while edwind is unreachable (R11.8).
-pub const NOT_RUNNING: &str = "workbench-edit is not running";
+pub const NOT_RUNNING: &str = "edwind is not running";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const BACKOFF_MIN: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
@@ -81,7 +81,7 @@ impl EditError {
         match self {
             EditError::Down => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, NOT_RUNNING),
             EditError::Timeout => {
-                ApiError::new(StatusCode::GATEWAY_TIMEOUT, "workbench-edit did not answer")
+                ApiError::new(StatusCode::GATEWAY_TIMEOUT, "edwind did not answer")
             }
             EditError::TooLarge => ApiError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,

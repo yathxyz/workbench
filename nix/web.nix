@@ -1,14 +1,14 @@
 # The web root: web/ with its TypeScript stripped to JavaScript (tools/strip.mts), the vendored xterm bundle,
-# pdf.js under vendor/pdfjs/, the Edwin console and frame runtime under edwin/ (the edwin input's edwin-web), and
-# the fonts, converted to woff2 from nixpkgs at build time with a generated fonts/fonts.css. No font file lives in
-# the repo. Text files get a gzip sibling (see the end).
+# pdf.js under vendor/pdfjs/, and the fonts, converted to woff2 from nixpkgs at build time with a generated
+# fonts/fonts.css. No font file lives in the repo. Text files get a gzip sibling (see the end). Edwin's console
+# and frame runtime are not here: wb-web serves the host's edwin-web at /edwin/ (web.json edwinWebRoot), from
+# the Edwin whose edwind it talks to.
 {
   lib,
   runCommand,
   fetchurl,
   nodejs,
   vendor,
-  edwin-web,
   nerd-fonts,
   noto-fonts,
   woff2,
@@ -36,10 +36,6 @@ runCommand "workbench-web" { nativeBuildInputs = [ nodejs woff2 ]; } ''
   mkdir pdfjs && tar xzf ${pdfjs} -C pdfjs
   install -Dm444 -t $out/vendor/pdfjs pdfjs/package/legacy/build/pdf.min.mjs pdfjs/package/legacy/build/pdf.worker.min.mjs pdfjs/package/LICENSE
   cp -r pdfjs/package/cmaps $out/vendor/pdfjs/cmaps   # Adobe CMaps for CJK fonts that name one (getDocument's cMapUrl)
-  # Served at /edwin/ (edwind spec R9.19): the console page as /edwin/ (wb-web aliases a directory to its
-  # index.html), the core under src/ and the Scheme sources under scm/, which the frame runtime fetches as text/plain.
-  cp -r ${edwin-web} $out/edwin
-
   mkdir fonts
   cp ${mono}/JetBrainsMonoNerdFontMono-{Regular,Bold}.ttf ${noto}/NotoSans{,-Italic}.ttf fonts/
   chmod u+w fonts/*

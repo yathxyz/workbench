@@ -15,7 +15,7 @@ let
     types
     ;
   system = pkgs.stdenv.hostPlatform.system;
-  # wb-web and edwind run from the release profile when there is one; the hub always runs `package` (N-12).
+  # wb-web runs from the release profile when there is one; the hub always runs `package` (N-12).
   frontBin = if cfg.releaseProfile != null then "${cfg.releaseProfile}/bin" else "${cfg.package}/bin";
   pinnedRelease = self.packages.${system}.release;
   userCfg = config.users.users.${cfg.user};
@@ -106,15 +106,15 @@ let
       hubSocket = "/run/workbench-hub/hub.sock";
       stateDir = "${home}/.local/state/workbench/web";
       webRoot = if cfg.releaseProfile != null then "${cfg.releaseProfile}/web" else "${cfg.webPackage}";
-      # The same list edit.json carries (R14.8); wb-web's /api/mv reads it instead of its built-in copy.
+      # The same list edwind refuses (R14.8); wb-web's /api/mv reads it instead of its built-in copy.
       refusePaths = readOnlyUserPaths;
     }
-    # With edwind, wb-web forwards the notes endpoints and `sample` over edit.sock (R15.5) and relays
-    # /edit to it; page cards are then Edwin frames, reported as /api/info `edit` (R9.21). `frames` is for a
-    # release profile's wb-web from before E4, which switched the board's page editor on it (R9.20).
-    // lib.optionalAttrs edit.enable {
-      inherit editSocket;
-      frames = true;
+    # With edwind, wb-web forwards the notes endpoints and `sample` over its socket (R15.5) and relays
+    # /edit to it; page cards are then Edwin frames, reported as /api/info `edit` (R9.21), on the frame
+    # runtime of the same Edwin, served at /edwin/.
+    // lib.optionalAttrs (edit.socket != null) {
+      editSocket = edit.socket;
+      edwinWebRoot = edit.webRoot;
     }
     // lib.optionalAttrs (cfg.media.providers != { }) {
       media.providers = lib.mapAttrs (
@@ -132,44 +132,8 @@ let
     lib.filterAttrs (_: p: p.apiKeyFile != null) cfg.media.providers
   );
 
-  # edwind (edwin/server, the edwind spec §15). `~` in writablePaths is the service user's home.
   edit = cfg.edit;
-  expandHome = p: if p == "~" then home else if lib.hasPrefix "~/" p then home + lib.removePrefix "~" p else p;
-  editWritable = map expandHome edit.writablePaths;
-  editStateDir = "${home}/.local/state/workbench/edit";
-  editConfigDir = "${home}/.config/edwin";
-  editSocket = "/run/workbench-edit/edit.sock";
-  # Backends with a key file get a LoadCredential entry and name it here; the key never enters the config.
-  editBackend =
-    name: b:
-    lib.filterAttrs (_: v: v != null) {
-      inherit (b) baseUrl;
-      credential = if b.apiKeyFile != null then "${name}-api-key" else null;
-    };
-  editCredentials =
-    lib.optional (edit.models.anthropic.apiKeyFile != null) "anthropic-api-key:${edit.models.anthropic.apiKeyFile}"
-    ++ lib.optional (edit.models.openai.apiKeyFile != null) "openai-api-key:${edit.models.openai.apiKeyFile}"
-    ++ lib.mapAttrsToList (name: c: "${name}:${c.file}") edit.credentials;
-  editJson = json.generate "workbench-edit.json" {
-    socket = editSocket;
-    hubSocket = "/run/workbench-hub/hub.sock";
-    webSocket = "/run/workbench-web/web.sock";
-    stateDir = editStateDir;
-    configDir = editConfigDir;
-    inherit (cfg)
-      notesDir
-      host
-      logLevel
-      ;
-    writablePaths = editWritable;
-    refusePaths = readOnlyUserPaths;
-    models = {
-      anthropic = editBackend "anthropic" edit.models.anthropic;
-      openai = editBackend "openai" edit.models.openai;
-      tiers = edit.models.tiers;
-      credentials = lib.mapAttrs (_: c: { inherit (c) origin; }) edit.credentials;
-    };
-  };
+
   isLoopbackHttp =
     url:
     lib.hasPrefix "https://" url
@@ -235,9 +199,9 @@ in
       default = null;
       example = "/nix/var/nix/profiles/workbench";
       description = ''
-        A Nix profile holding the flake's `release` output (N-12). When set, wb-web and edwind run from
-        it and serve its web root, so a release reaches them by switching the profile and restarting
-        those two units; the hub stays on `package`, since restarting it ends every session. The module
+        A Nix profile holding the flake's `release` output (N-12). When set, wb-web runs from it and
+        serves its web root, so a release reaches it by switching the profile and restarting that one
+        unit; the hub stays on `package`, since restarting it ends every session. The module
         resets the profile to this flake's own release whenever the profile is older, so the web is never
         older than the hub. `package` and `webPackage` must then be the flake's defaults.
       '';
@@ -411,7 +375,7 @@ in
     # Image providers for the canvas's media cards (F-A41): wb-web calls them, so their keys stay on the server.
     media.providers = mkOption {
       default = { };
-      description = "Image providers for media cards, by name. A key file is loaded with LoadCredential as media-NAME and web.json names only its credential path. Describe and expand cards use edit.models (`sample`) instead.";
+      description = "Image providers for media cards, by name. A key file is loaded with LoadCredential as media-NAME and web.json names only its credential path. Describe and expand cards use edwind's models (`sample`) instead.";
       example = lib.literalExpression ''
         {
           openai = { api = "openai"; baseUrl = "https://api.openai.com/v1"; apiKeyFile = "/run/secrets/openai"; models = [ "gpt-image-1" ]; };
@@ -447,80 +411,19 @@ in
       );
     };
 
-    # edwind, the text daemon (edwin/server). Spec: the edwind artifact, §15.2.
+    # edwind, Edwin's text daemon, which the host runs (edwin's services.edwind). Spec: the edwind artifact, §15.
     edit = {
-      enable = mkOption {
-        type = types.bool;
-        default = true;
-        description = "Run edwind on edit.sock, so `wb edit`, `wb buf` and `wb eval` work and page cards are Edwin frames on its buffers (edwind spec R9.21). Off, page cards are read-only.";
-      };
-      frames = mkOption {
-        type = types.nullOr types.bool;
+      socket = mkOption {
+        type = types.nullOr types.str;
         default = null;
-        visible = false;
-        description = "Ignored since E4 (edwind spec R9.21): page cards are Edwin frames whenever edit.enable is on, and read-only without it. Kept so a configuration that still sets it evaluates, with a warning.";
+        example = lib.literalExpression "config.services.edwind.socket";
+        description = "edwind's socket, owned by services.workbench.user. Set, `wb edit`, `wb buf` and `wb eval` work, wb-web forwards the notes endpoints and `sample` to it, and page cards are Edwin frames on its buffers (edwind spec R9.21). Null, page cards are read-only.";
       };
-      memoryMiB = mkOption {
-        type = types.ints.positive;
-        default = 1024;
-        description = "V8 heap limit for edwind (--max-old-space-size); MemoryMax is this plus 25%.";
-      };
-      writablePaths = mkOption {
-        type = types.listOf types.str;
-        default = [ "~" ];
-        description = "Where edwind may write besides notesDir, its state and ~/.config/edwin. `~` is the service user's home. The refusal list (~/.ssh, ~/.config/systemd, ~/.local/share/systemd) always applies.";
-      };
-      models = {
-        anthropic = {
-          apiKeyFile = mkOption {
-            type = types.nullOr types.path;
-            default = null;
-            description = "Root-readable Anthropic key file, loaded as the credential anthropic-api-key.";
-          };
-          baseUrl = mkOption {
-            type = types.str;
-            default = "https://api.anthropic.com";
-            description = "https, or http to loopback; the credential is bound to this origin.";
-          };
-        };
-        openai = {
-          apiKeyFile = mkOption {
-            type = types.nullOr types.path;
-            default = null;
-            description = "Root-readable key file for an OpenAI-compatible backend, loaded as openai-api-key.";
-          };
-          baseUrl = mkOption {
-            type = types.nullOr types.str;
-            default = null;
-            description = "Base URL of the OpenAI-compatible backend; https, or http to loopback.";
-          };
-        };
-        tiers = mkOption {
-          type = types.attrsOf types.str;
-          default = {
-            default = "claude-opus-5-5";
-            quick = "claude-haiku-5-5";
-          };
-          description = "Model names by tier (R12.6).";
-        };
-      };
-      credentials = mkOption {
-        default = { };
-        description = "More LoadCredential entries, readable from Scheme only as (credential \"name\") handles bound to origin.";
-        type = types.attrsOf (
-          types.submodule {
-            options = {
-              file = mkOption {
-                type = types.path;
-                description = "Root-readable secret file.";
-              };
-              origin = mkOption {
-                type = types.str;
-                description = "The only origin (scheme://host[:port]) http-request may send this credential to.";
-              };
-            };
-          }
-        );
+      webRoot = mkOption {
+        type = types.nullOr types.path;
+        default = null;
+        example = lib.literalExpression "inputs.edwin.packages.\${system}.edwin-web";
+        description = "edwin-web from the same Edwin as the edwind on edit.socket, which wb-web serves at /edwin/ (the frame runtime and its Scheme). Required with edit.socket.";
       };
       setEditor = mkOption {
         type = types.bool;
@@ -531,7 +434,6 @@ in
   };
 
   config = mkIf cfg.enable {
-    warnings = lib.optional (edit.frames != null) "services.workbench.edit.frames is ignored since E4: page cards are Edwin frames whenever edit.enable is on. Remove the setting.";
     assertions = [
       {
         assertion = !config.networking.nftables.enable;
@@ -579,15 +481,8 @@ in
         message = "services.workbench: the child environment must hold literal stable paths only (no /nix/store paths, no $ expansions); check nix.nixPath.";
       }
       {
-        assertion = lib.all (p: p == "~" || lib.hasPrefix "~/" p || lib.hasPrefix "/" p) edit.writablePaths;
-        message = "services.workbench.edit.writablePaths: entries must be absolute or start with ~.";
-      }
-      {
-        assertion =
-          isLoopbackHttp edit.models.anthropic.baseUrl
-          && (edit.models.openai.baseUrl == null || isLoopbackHttp edit.models.openai.baseUrl)
-          && lib.all (c: isLoopbackHttp c.origin) (lib.attrValues edit.credentials);
-        message = "services.workbench.edit.models.*.baseUrl and edit.credentials.*.origin must be https, or http to loopback.";
+        assertion = edit.socket == null || edit.webRoot != null;
+        message = "services.workbench.edit.webRoot is required with edit.socket: page cards are Edwin frames, served from it at /edwin/.";
       }
       {
         assertion = lib.all (p: isLoopbackHttp p.baseUrl) (lib.attrValues cfg.media.providers);
@@ -596,10 +491,6 @@ in
       {
         assertion = lib.all isName (lib.attrNames cfg.media.providers);
         message = "services.workbench.media.providers: names must match ^[a-z0-9-]{1,32}$.";
-      }
-      {
-        assertion = lib.all isName (lib.attrNames edit.credentials);
-        message = "services.workbench.edit.credentials: names must match ^[a-z0-9-]{1,32}$.";
       }
       {
         assertion = lib.hasAttr cfg.defaultShell cfg.shells;
@@ -623,8 +514,7 @@ in
       "workbench/hub.json".source = hubJson;
       "workbench/web.json".source = webJson;
     }
-    // lib.optionalAttrs edit.enable {
-      "workbench/edit.json".source = editJson;
+    // lib.optionalAttrs (edit.socket != null) {
       "workbench/agents.md".source = agentsMd;
     }
     // lib.mapAttrs' (name: a: lib.nameValuePair "workbench/agents/${name}" { source = a.package; }) (
@@ -635,24 +525,12 @@ in
     # existing parent's mode alone.
     systemd.tmpfiles.rules =
       map (d: "d ${d} - ${cfg.user} ${userCfg.group} -") pinnedUserPaths
-      ++ map (d: "d ${d} 0700 ${cfg.user} ${userCfg.group} -") readOnlyUserPaths
-      # edwind's state and config directories exist before the unit starts (R14.10); the parents are the
-      # user's, left as they are when present.
-      ++ lib.optionals edit.enable (
-        map (d: "d ${d} - ${cfg.user} ${userCfg.group} -") [
-          "${home}/.local/state"
-          "${home}/.local/state/workbench"
-        ]
-        ++ map (d: "d ${d} 0700 ${cfg.user} ${userCfg.group} -") [
-          editStateDir
-          editConfigDir
-        ]
-      );
+      ++ map (d: "d ${d} 0700 ${cfg.user} ${userCfg.group} -") readOnlyUserPaths;
 
     # R13.5: only shells inside Workbench (the hub sets WB_SESSION) get the editor variables.
-    environment.interactiveShellInit = mkIf (edit.enable && edit.setEditor) ''
+    environment.interactiveShellInit = mkIf (edit.socket != null && edit.setEditor) ''
       if [ -n "$WB_SESSION" ]; then
-        export EDITOR="wb edit --wait" VISUAL="wb edit --wait" WB_EDIT_SOCK=${editSocket}
+        export EDITOR="wb edit --wait" VISUAL="wb edit --wait" WB_EDIT_SOCK=${edit.socket}
       fi
     '';
 
@@ -666,19 +544,15 @@ in
     };
 
     # N-12: the release profile is never older than the release this module pins, which is the hub's
-    # build after its next restart. Runs before wb-web and edwind at boot and again at every switch that
-    # changes the pin; --no-block, because both units are ordered after this one.
+    # build after its next restart. Runs before wb-web at boot and again at every switch that changes the
+    # pin; --no-block, because wb-web is ordered after this one.
     systemd.services.workbench-release-profile = mkIf (cfg.releaseProfile != null) {
       description = "Workbench release profile no older than the pinned release";
       wantedBy = [
         "multi-user.target"
         "workbench-web.service"
-      ]
-      ++ lib.optional edit.enable "workbench-edit.service";
-      before = [
-        "workbench-web.service"
-        "workbench-edit.service"
       ];
+      before = [ "workbench-web.service" ];
       path = [
         config.nix.package
         config.systemd.package
@@ -687,7 +561,7 @@ in
         current=$(cat ${cfg.releaseProfile}/lastModified 2>/dev/null || echo 0)
         if [ "$current" -lt "$(cat ${pinnedRelease}/lastModified)" ]; then
           nix-env -p ${cfg.releaseProfile} --set ${pinnedRelease}
-          systemctl try-restart --no-block workbench-web.service workbench-edit.service
+          systemctl try-restart --no-block workbench-web.service
         fi
       '';
       serviceConfig = {
@@ -745,18 +619,16 @@ in
       wantedBy = [ "multi-user.target" ];
       # Never Requires/BindsTo/PartOf: a web restart must not touch the hub. network-online
       # makes a first-boot failure on a missing listen address less likely; Restart=always is
-      # what guarantees wb-web comes up.
-      # wants/after edwind, never Requires or BindsTo: wb-web runs without it (R15.7).
+      # what guarantees wb-web comes up. edwind is the host's: wb-web runs without it and reconnects
+      # when it appears (R15.7).
       wants = [
         "workbench-hub.service"
         "network-online.target"
-      ]
-      ++ lib.optional edit.enable "workbench-edit.service";
+      ];
       after = [
         "workbench-hub.service"
         "network-online.target"
-      ]
-      ++ lib.optional edit.enable "workbench-edit.service";
+      ];
       stopIfChanged = false;
       restartTriggers = [ webJson ];
       startLimitIntervalSec = 0;
@@ -806,79 +678,6 @@ in
           "~@privileged"
         ];
         CapabilityBoundingSet = "";
-      };
-    };
-
-    # edwind (R14.10, R14.11, R15.3). It restarts on its own at a deploy; frames and wb ride through
-    # (R15.8). Edits and the image log are on disk before they are acknowledged, so a restart loses nothing.
-    systemd.services.workbench-edit = mkIf edit.enable {
-      description = "Workbench edwind (text buffers and the Lisp machine)";
-      wantedBy = [ "multi-user.target" ];
-      wants = [ "workbench-hub.service" ];
-      after = [ "workbench-hub.service" ];
-      stopIfChanged = false;
-      restartTriggers = [ editJson ];
-      startLimitIntervalSec = 0;
-      environment.EDWIND_MEMORY_MIB = toString edit.memoryMiB;
-      serviceConfig = {
-        Type = "exec";
-        ExecStart = "${frontBin}/edwind --config /etc/workbench/edit.json";
-        User = cfg.user;
-        Group = userCfg.group;
-        Slice = "workbench.slice";
-        UMask = "0077";
-        RuntimeDirectory = "workbench-edit";
-        RuntimeDirectoryMode = "0700";
-        # edwind is TypeScript that Node strips at load; the compile cache keeps the stripped code, so only
-        # the first start after a deploy pays for it (about 240 ms).
-        CacheDirectory = "workbench-edit";
-        CacheDirectoryMode = "0700";
-        Environment = [ "NODE_COMPILE_CACHE=%C/workbench-edit" ];
-        LoadCredential = editCredentials;
-        Restart = "always";
-        RestartSec = 1;
-        TimeoutStopSec = 10;
-        OOMScoreAdjust = 100;
-        MemoryMax = "${toString (edit.memoryMiB * 5 / 4)}M";
-        # The server runs on a worker thread whose stack main.mts sizes itself (32 MiB, the Scheme cap of
-        # 10,000 frames needs about 8 MiB); the limit only has to admit that thread's stack.
-        LimitSTACK = "64M";
-
-        NoNewPrivileges = true;
-        PrivateTmp = true;
-        PrivateDevices = true;
-        ProtectSystem = "strict";
-        # The home plus writable paths outside it; the more specific mounts below win inside the home.
-        ReadWritePaths = lib.unique (
-          [
-            home
-            cfg.notesDir
-            editStateDir
-            editConfigDir
-          ]
-          ++ lib.filter (p: !(lib.hasPrefix "${home}/" p) && p != home) editWritable
-        );
-        ReadOnlyPaths = readOnlyUserPaths ++ [ "-${cfg.boardsDir}" ];
-        BindPaths = pinnedUserPaths;
-        InaccessiblePaths = [ "-/run/user" ];
-        RestrictAddressFamilies = [
-          "AF_UNIX"
-          "AF_INET"
-          "AF_INET6"
-        ];
-        LockPersonality = true;
-        RestrictRealtime = true;
-        RestrictNamespaces = true;
-        RestrictSUIDSGID = true;
-        SystemCallArchitectures = "native";
-        ProtectClock = true;
-        ProtectHostname = true;
-        ProtectKernelTunables = true;
-        ProtectKernelModules = true;
-        ProtectKernelLogs = true;
-        ProtectControlGroups = true;
-        CapabilityBoundingSet = "";
-        # No MemoryDenyWriteExecute: V8's JIT needs it.
       };
     };
 

@@ -35,6 +35,10 @@ pub struct Config {
     /// edwind's `edit.sock`. Absent means no edwind: the notes endpoints stay stubs and
     /// `sample` stays off (edwind spec R15.5).
     pub edit_socket: Option<PathBuf>,
+    /// edwin-web (the console page, the frame runtime and its Scheme), served at
+    /// `/edwin/`. It comes from the same Edwin as the edwind on `editSocket`, so frames
+    /// and daemon match. Absent, `/edwin/` is whatever `webRoot` holds under `edwin/`.
+    pub edwin_web_root: Option<PathBuf>,
     /// Ignored since E4 (edwind spec R9.21): Edwin frames are the only page editor,
     /// on whenever `editSocket` is set. Still accepted, so a `web.json` written for an
     /// older release loads.
@@ -119,6 +123,9 @@ impl Config {
         }
         if let Some(edit) = &self.edit_socket {
             ensure!(edit.is_absolute(), "editSocket must be an absolute path");
+        }
+        if let Some(root) = &self.edwin_web_root {
+            ensure!(root.is_absolute(), "edwinWebRoot must be an absolute path");
         }
         let sockets = [
             ("socket", Some(&self.socket)),
@@ -391,12 +398,12 @@ mod tests {
     #[test]
     fn edit_socket_and_refuse_paths_load() {
         let mut f = Fixture::new();
-        f.cfg["editSocket"] = json!("/run/workbench-edit/edit.sock");
+        f.cfg["editSocket"] = json!("/run/edwind/edit.sock");
         f.cfg["refusePaths"] = json!(["/home/alice/.ssh", "~/.config/systemd"]);
         let (cfg, _) = f.load().unwrap();
         assert_eq!(
             cfg.edit_socket.as_deref(),
-            Some(Path::new("/run/workbench-edit/edit.sock"))
+            Some(Path::new("/run/edwind/edit.sock"))
         );
         assert_eq!(
             cfg.refuse_paths.as_deref(),

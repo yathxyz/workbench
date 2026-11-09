@@ -31,7 +31,10 @@ in
         ...
       }:
       {
-        imports = [ self.nixosModules.workbench ];
+        imports = [
+          self.nixosModules.workbench
+          self.inputs.edwin.nixosModules.edwind
+        ];
         virtualisation.memorySize = 2048;
         virtualisation.cores = 2;
 
@@ -54,12 +57,28 @@ in
           publicOrigin = "http://wb.test";
           firewall.interface = "eth1";
           proxySecretFile = "${pkgs.writeText "proxy-secret" secret}";
-          # edwind runs by default (edit.enable), and with it page cards are Edwin frames (R9.21).
+          # edwind is the host's (edwin's services.edwind, below); with it page cards are Edwin frames (R9.21).
+          edit = {
+            inherit (config.services.edwind) socket;
+            webRoot = self.inputs.edwin.packages.${pkgs.stdenv.hostPlatform.system}.edwin-web;
+          };
           agents.stub = {
             label = "Stub";
             package = self.packages.${pkgs.stdenv.hostPlatform.system}.fake-acp;
             exe = "bin/wb-fake-acp";
           };
+        };
+
+        services.edwind = {
+          enable = true;
+          user = "alice";
+          inherit (config.services.workbench) notesDir;
+          hubSocket = "/run/workbench-hub/hub.sock";
+          readOnlyPaths = [ "-${config.services.workbench.boardsDir}" ];
+        };
+        systemd.services.edwind = {
+          wants = [ "workbench-hub.service" ];
+          after = [ "workbench-hub.service" ];
         };
 
         # Canaries: set-environment exports (a login would pick them up) and the hub's own environment.
@@ -262,7 +281,7 @@ in
                   assert opts.split(",")[0] == want, f"{unit}: ~/{d} mount options {opts!r}"
           # T-S16 in the VM: /api/mv into ~/.ssh is refused, and the source stays put. With edit.enable the move is
           # edwind's rename-file (wb-web answers 503 until it reaches edit.sock), so wait for both first.
-          wb.wait_for_unit("workbench-edit.service")
+          wb.wait_for_unit("edwind.service")
           proxy.wait_until_succeeds("curl -sf http://wb.test/api/info | grep -q '\"editUp\":true'", timeout=60)
           wb.succeed("runuser -u alice -- sh -c 'echo key > ~/mv-key'")
           r = wbctl(f"api-mv {HOME}/mv-key {HOME}/.ssh/authorized_keys")
@@ -377,15 +396,15 @@ in
           assert last_session(r)["via"] == "resume", last_session(r)
 
       with subtest("10: edwind: the unit, wb buf and wb eval, a restart, the web restart, edit.sock peers"):
-          EDIT_SOCK = "/run/workbench-edit/edit.sock"
-          wb.wait_for_unit("workbench-edit.service")
+          EDIT_SOCK = "/run/edwind/edit.sock"
+          wb.wait_for_unit("edwind.service")
           wb.wait_until_succeeds(f"test -S {EDIT_SOCK}", timeout=30)
-          assert wb.succeed(f"stat -c %a /run/workbench-edit {EDIT_SOCK}").split() == ["700", "600"]
-          assert wb.succeed(f"stat -c %U /run/workbench-edit {EDIT_SOCK}").split() == ["alice", "alice"]
-          edit_pid = main_pid("workbench-edit")
+          assert wb.succeed(f"stat -c %a /run/edwind {EDIT_SOCK}").split() == ["700", "600"]
+          assert wb.succeed(f"stat -c %U /run/edwind {EDIT_SOCK}").split() == ["alice", "alice"]
+          edit_pid = main_pid("edwind")
           wb.succeed(f"grep -qa -- --disallow-code-generation-from-strings /proc/{edit_pid}/cmdline")
           wb.fail(f"grep -qa -- --frozen-intrinsics /proc/{edit_pid}/cmdline")
-          wb.succeed("journalctl -u workbench-edit.service -o cat | grep -q 'listen .*\"lockdown\":\"locked\"'")
+          wb.succeed("journalctl -u edwind.service -o cat | grep -q 'listen .*\"lockdown\":\"locked\"'")
 
           def wb_cli(cmd, stdin=None):
               pipe = f"printf %s {shlex.quote(stdin)} | " if stdin is not None else ""
@@ -404,9 +423,9 @@ in
           for i in range(1, 6):
               wb_cli("buf write t.md --append -", f"line {i}\n")
           hub_pid_before = main_pid("workbench-hub")
-          wb.succeed("systemctl restart workbench-edit")
+          wb.succeed("systemctl restart edwind")
           wb.wait_until_succeeds(f"test -S {EDIT_SOCK}", timeout=30)
-          assert main_pid("workbench-edit") != edit_pid, "edwind did not restart"
+          assert main_pid("edwind") != edit_pid, "edwind did not restart"
           wb.wait_until_succeeds("set -o pipefail; " + as_user("alice", f"env HOME={HOME} wb buf read t.md | grep -q 'line 5'"), timeout=30)
           wb_cli("buf write t.md --append -", "after\n")
           text = wb_cli("buf read t.md")
@@ -414,10 +433,10 @@ in
           assert main_pid("workbench-hub") == hub_pid_before, "the edwind restart touched the hub"
 
           # A web restart leaves edwind and the hub alone (R15.7, R15.8).
-          edit_pid = main_pid("workbench-edit")
+          edit_pid = main_pid("edwind")
           wb.succeed("systemctl restart workbench-web")
           wb.wait_for_open_port(8090, WB_IP)
-          assert main_pid("workbench-edit") == edit_pid, "the web restart touched edwind"
+          assert main_pid("edwind") == edit_pid, "the web restart touched edwind"
           assert main_pid("workbench-hub") == hub_pid_before, "the web restart touched the hub"
 
           # R9.21: with edwind, /api/info reports edit: true (pages are Edwin frames) and editUp: true

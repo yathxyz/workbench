@@ -57,15 +57,10 @@ rustPlatform.buildRustPackage {
   postInstall = ''
     mkdir -p $fake/bin
     mv $out/bin/wb-fake-acp $fake/bin/
-
-    # edwind (the edwin input), which wb edit and the workbench-edit unit run.
-    ln -s ${edwind}/bin/edwind $out/bin/edwind
-    mkdir -p $out/share
-    ln -s ${edwind}/share/edwin $out/share/edwin
   '';
 
   meta = {
-    description = "Workbench hub, web front, edwind and the wb CLI";
+    description = "Workbench hub, web front and the wb CLI";
     mainProgram = "wb";
     platforms = [ "x86_64-linux" ];
   };

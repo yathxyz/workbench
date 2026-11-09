@@ -16,7 +16,7 @@ use crate::fail::Fail;
 use crate::text::{Batch, Op, len16};
 
 /// The default socket when `WB_EDIT_SOCK` is unset (R13.3).
-const DEFAULT_SOCKET: &str = "/run/workbench-edit/edit.sock";
+const DEFAULT_SOCKET: &str = "/run/edwind/edit.sock";
 /// Longest raw text of one op piece; even fully escaped it fits a line with room.
 const PIECE: usize = MAX_LINE / 8;
 /// Bytes kept free in an `edit` line for its fields other than `ops`.

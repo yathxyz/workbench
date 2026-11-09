@@ -50,7 +50,9 @@ HOME, no canaries, ignores stdin, and still uses a temporary state directory and
 boards directory. --board FILE seeds <boardsDir>/<host>.json from FILE before anything starts.
 
 Binaries come from --bin-dir, else from PATH. The web root comes from --web-root or
-$WB_WEB_ROOT (for example the output of `nix build .#workbench-web`).
+$WB_WEB_ROOT (for example the output of `nix build .#workbench-web`). Edwin's web root
+(edwin-web: the console page and the frame runtime, served at /edwin/) comes from
+$WB_EDWIN_WEB_ROOT as web.json's edwinWebRoot, as the module passes the host's edwin-web.
 
 edwind (the editing server, from the edwin input) runs beside wb-web with an edit.json: its socket
 in a 0700 directory under the temporary root, the harness's notesDir and boardsDir, the hub and web
@@ -230,6 +232,8 @@ class Harness:
             "host": host,
             "editSocket": self.edit_sock,
         }
+        if os.environ.get("WB_EDWIN_WEB_ROOT"):
+            self.web_config["edwinWebRoot"] = str(Path(os.environ["WB_EDWIN_WEB_ROOT"]).resolve())
         if media:
             # one image provider on the OpenAI protocol at MEDIA (a stub the suite runs), no key
             self.web_config["media"] = {"providers": {"stub": {"api": "openai", "baseUrl": media, "models": ["stub-image"]}}}

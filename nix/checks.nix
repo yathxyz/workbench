@@ -1,11 +1,14 @@
 # `nix flake check`: package (with cargo test), clippy, fmt, the black-box conformance suite, the end-to-end security
 # suite, the browser suite, the key contexts, the board's addresses against Edwin's, the adapter probe against the
-# stub, the VM test, the module's assertions; flake.nix adds the edwin input's own checks. The harness registers
-# wb-fake-acp (the package's `fake` output) as its `stub` agent, so every check that starts it has that output on PATH.
+# stub, the VM test, the module's assertions. The harness registers wb-fake-acp (the package's `fake` output) as its
+# `stub` agent, so every check that starts it has that output on PATH; edwind and edwin-web (WB_EDWIN_WEB_ROOT) are
+# the edwin input's, which only the tests use.
 {
   pkgs,
   self,
   edwin,
+  edwind,
+  edwin-web,
   workbench,
   workbench-web,
 }:
@@ -72,10 +75,12 @@ let
           pkgs.caddy
           workbench
           workbench.fake
+          edwind
         ];
         WB_PLAYWRIGHT = "${pkgs.playwright-driver}/index.mjs";
         WB_HARNESS = "${tests}/harness.py";
         WB_WEB_ROOT = "${workbench-web}";
+        WB_EDWIN_WEB_ROOT = "${edwin-web}";
         # Chromium and its headless shell; the default launch uses the headless shell.
         PLAYWRIGHT_BROWSERS_PATH = pkgs.playwright-driver.browsers.override {
           withFirefox = false;
@@ -160,7 +165,9 @@ in
           pkgs.caddy
           workbench
           workbench.fake
+          edwind
         ];
+        WB_EDWIN_WEB_ROOT = "${edwin-web}";
       }
       ''
         export HOME=$TMPDIR BASH=${pkgs.bashInteractive}/bin/bash
@@ -179,7 +186,9 @@ in
           pkgs.caddy
           workbench
           workbench.fake
+          edwind
         ];
+        WB_EDWIN_WEB_ROOT = "${edwin-web}";
       }
       ''
         export HOME=$TMPDIR BASH=${pkgs.bashInteractive}/bin/bash
@@ -190,7 +199,7 @@ in
   # tests/ui.mts (the frontend's) in headless Chromium from nixpkgs. It starts the harness from
   # WB_HARNESS and imports Playwright from WB_PLAYWRIGHT. The browser reaches the harness's Caddy
   # through ui.mts's own 127.0.0.1:18443 forwarder, which accepts only this build's uid. Pages are
-  # Edwin frames (edwind comes from the workbench package on PATH); the demo section runs without
+  # Edwin frames (edwind from the edwin input on PATH); the demo section runs without
   # edwind, where pages are read-only (edwind spec R9.21).
   ui = uiCheck;
 
@@ -241,8 +250,7 @@ in
         environmentName = [ "services.workbench.environment and agents" ];
         agentEnvName = [ "services.workbench.environment and agents" ];
         fixedName = [ "services.workbench.environment must not set" ];
-        editWritable = [ "services.workbench.edit.writablePaths" ];
-        editUrl = [ "services.workbench.edit.models.*.baseUrl" ];
+        editWebRoot = [ "services.workbench.edit.webRoot is required" ];
       };
       got = lib.mapAttrs (_: failing) {
         valid = { };
@@ -257,8 +265,7 @@ in
           env."1X" = "x";
         };
         fixedName.services.workbench.environment.SHELL = "/bin/sh";
-        editWritable.services.workbench.edit.writablePaths = [ "work/roam" ];
-        editUrl.services.workbench.edit.models.openai.baseUrl = "http://api.example.org/v1";
+        editWebRoot.services.workbench.edit.socket = "/run/edwind/edit.sock";
       };
       matches = lib.mapAttrs (
         case: prefixes:

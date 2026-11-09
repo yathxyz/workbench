@@ -12,7 +12,7 @@ use common::{FakeEdit, FakeHub, Web, Ws, edit_status, next_json, read_to_close, 
 use serde_json::{Value, json};
 use wb_proto::limits::MAX_LINE;
 
-const NOT_RUNNING: &str = "workbench-edit is not running";
+const NOT_RUNNING: &str = "edwind is not running";
 
 /// A web with the hub up and `editSocket` set to `edit`.
 fn web_with_edit(hub: &FakeHub, edit: &Path) -> Web {

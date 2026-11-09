@@ -156,7 +156,7 @@ async fn main() -> ExitCode {
 /// Nothing listens until every startup step has passed.
 async fn run(config: &Path) -> Result<()> {
     let (cfg, floor) = config::load(config)?;
-    let assets = Assets::load(&cfg.web_root)?;
+    let assets = Assets::load(&cfg.web_root, cfg.edwin_web_root.as_deref())?;
     let listener = TcpListener::bind(cfg.listen)
         .await
         .with_context(|| format!("cannot listen on {}", cfg.listen))?;
