@@ -378,15 +378,16 @@ async fn the_api_surface_of_m0() {
     assert_eq!(sessions.status, 200);
     assert_eq!(sessions.json(), json!({"host": "testhost", "sessions": []}));
 
-    for path in [
-        "/api/nodes",
-        "/api/links",
-        "/api/cards",
-        "/api/tasks",
-        "/api/proc",
+    // Without editSocket the notes routes are 503, as while edwind is down.
+    for (path, status) in [
+        ("/api/nodes", 503),
+        ("/api/links", 503),
+        ("/api/cards", 503),
+        ("/api/tasks", 503),
+        ("/api/proc", 200),
     ] {
         let res = web.req("GET", path).send().await;
-        assert_eq!(res.status, 200, "{path}");
+        assert_eq!(res.status, status, "{path}");
         assert_eq!(res.header("cache-control"), Some("no-store"), "{path}");
     }
     assert_eq!(

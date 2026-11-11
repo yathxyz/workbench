@@ -400,19 +400,25 @@ async fn everything_is_503_until_edwind_listens_and_again_after_it_stops() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn without_edit_socket_the_stubs_stay_and_writes_are_503() {
+async fn without_edit_socket_every_notes_route_is_503() {
     let hub = FakeHub::start();
     let web = Web::start(&hub.path);
     web.wait_hub("up").await;
-    let notes = web.dir.path().join("notes");
-    let res = web.req("GET", "/api/nodes").send().await;
-    assert_eq!(res.json(), json!({"root": notes, "nodes": []}));
-    let res = web.req("GET", "/api/cards").send().await;
-    assert_eq!(
-        res.json(),
-        json!({"root": notes, "exists": false, "cards": []})
-    );
-    assert_eq!(web.req("GET", "/api/task/t1").send().await.status, 404);
+    for path in [
+        "/api/nodes",
+        "/api/links",
+        "/api/cards",
+        "/api/reviews",
+        "/api/tasks",
+        "/api/task/t1",
+    ] {
+        let res = web.req("GET", path).send().await;
+        assert_eq!(
+            (res.status, res.json()),
+            (503, json!({"error": NOT_RUNNING})),
+            "{path}"
+        );
+    }
     for (path, body) in [
         ("/api/journal", json!({"day": "2026-10-14"})),
         ("/api/notes/append", json!({"path": "a.md", "text": "x"})),

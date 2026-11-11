@@ -15,7 +15,7 @@ Edwin (edwind, its frame runtime and "the edwind spec") lives in its own reposit
 | `N-n` | Nix and deploy design points (§7) |
 | `T-Sn` | Security regression cases (§9.3) |
 | `Nn` | Frontend `tests/ui.mts` checks. N1-N26 are the baseline checks of that file; N27-N50 are listed in §9.5. |
-| `Mn-X` | Build-plan work packages (§10) |
+| `Mn-X` | Build-plan work packages of v1 (§10; the list is in git history) |
 
 ---
 
@@ -24,7 +24,6 @@ Edwin (edwind, its frame runtime and "the edwind spec") lives in its own reposit
 **Goal.** Run one Workbench instance on a server that is good enough to use every day with many agent sessions and shells running at once.
 - It answers "which session needs me now?" at a glance, including when the tab is not in front of the user.
 - Sessions survive restarts of the web daemon without tmux.
-- **Success test:** two weeks of daily dogfooding. Afterwards, any feature that went untouched is a candidate for removal.
 
 **Quality bar:** performance and robustness.
 - **Robustness:** no single bad input, slow viewer, full disk, panic or corrupt file takes down more than one session. The hub is never killed by the OOM killer while a child is available instead.
@@ -840,7 +839,7 @@ Server to client:
 | `/api/tmux*`, `/api/hosts`, `POST /api/cmd`, `/api/backlinks`, `POST /api/index/rescan`, `POST /api/tasks`, `POST /api/task/{id}/dispatch`, `DELETE /api/artifact/{n}`, `GET /api/journal`, `/mcp` | 404 |
 | `OPTIONS`, wrong methods | 405, no CORS headers |
 
-**Stubs before M5:** the artifact, db, proc and unit endpoints returned the shapes of no artifacts and an idle host until M5-W3 (2026-10); the notes, task and review endpoints do the same for an empty `notesDir` only while `web.json` has no `editSocket`, and `/api/info` then reports `notesExists:false, sample:false`.
+**Without edwind:** the notes, task and review endpoints answer 503 `{error}` when `web.json` has no `editSocket`, as they do while edwind is down, and `/api/info` reports `notesExists:false, sample:false`. (Until 2026-11-11 they answered the shapes of an empty `notesDir` then; every deploy runs edwind.)
 
 **Images:** `GET /blob/{hash}` (outside `/api`) serves `<stateDir>/blobs/{hash}` when `hash` is 64 lowercase hex digits and the file's first bytes are one of the five image types or a PDF (then with `Content-Disposition: attachment`), with that type, `Cache-Control: private, max-age=31536000, immutable`, `ETag: "<hash>"` and `Content-Security-Policy: default-src 'none'; sandbox`; anything else is 404. Nothing deletes a blob: an image card removed, cut or undone may still be named by another board, a copy on the clipboard or a backup, so the files stay (a sweep against every board is future work).
 
@@ -1071,7 +1070,7 @@ Nothing else is inherited: no `NOTIFY_SOCKET`, `INVOCATION_ID`, `JOURNAL_STREAM`
 | W-9 | Per-route WebSocket caps: `/pty` 2 MiB, `/acp` 9 MiB, `/rpc` 32 MiB; close 1009. Re-encoding can make an `/acp` request longer than the browser's message, so the web measures the hub line and refuses one longer than `MAX_LINE` + 1 with `error{"message too large", bad_request}`; the socket stays and the hub connection is never ended by a browser message. | `relay_*.rs`, `rpc.rs` |
 | W-10 | Unit control (`POST /api/unit/…`) gives 403 (§3.5.5). | `host.rs` |
 | W-11 | Fixtures take the shell from `$BASH`; the harness falls back to `/run/current-system/sw/bin/bash` if that exists, then to `PATH`. The harness env names are `WB_HARNESS` and `WB_PLAYWRIGHT`. | tests |
-| W-12 | Stubs before M5 return the empty-`notesDir` shapes with `notesExists:false` (the artifact and host stubs are gone with M5-W3). | `notes/mod.rs`, `artifacts.rs`, `host.rs` |
+| W-12 | Without `editSocket` the notes routes are 503, as while edwind is down, with `notesExists:false` (the empty-shape stubs went 2026-11-11). | `notes/mod.rs` |
 | W-13 | `/rpc` sends `hub{…}`, `board{etag}` and `sessions` on connect, then `session`, `gone{sid, epoch}`, `hub{…}` and `board{etag}`. | `rpc.rs`, `hub.rs` |
 | W-14 | `wb` drops `hosts`, `host`, `unit start\|stop\|restart`, `tmux`, `adopt` and `create_node kind=agent`. | `wb-cli` |
 | W-15 | Shutdown: axum stops tracking a connection once it is upgraded, so each WebSocket holds a guard (`App::socket()`) and `run()` waits for the count to reach 0 inside a 5 s grace. That is what lets the 1012 close frames go out. | `main.rs` |
@@ -1434,7 +1433,7 @@ The test runs numbered steps. The steps this design pins down:
 | N75 | Copy as PNG / SVG (F-A42). A sketch card with a red and a black stroke: the SVG parses, has two paths filled `#a60000` and `#000000`, a width between 140 and 200 and a matching `viewBox`; the PNG is twice as wide, its corner transparent, over 200 inked pixels. With one stroke selected only it is copied and the chip shows SVG; cleared, it hides. The header has PNG and SVG; with clipboard permissions, Copy as SVG puts the SVG on the clipboard (as `image/svg+xml` or text) and Copy as PNG an `image/png`. |
 | N76 | Server-only paths (F-A43). The palette has no `#add-emacs` button; the navigator root ends `# tags,¶ notes,▦ journal,⇄ links,⚙ processes,⊙ units,! attention` (no `⌗ tmux`); `noteOpen` of a not-UTF-8 file returns null, adds no node and toasts "… does not open as a page"; with edwind down `noteOpen` returns null in under 1 s and toasts "edwind is not running". |
 
-### 9.6 v1 acceptance (all must hold before the dogfood clock starts)
+### 9.6 v1 acceptance
 1. `nix flake check` is green on a kvm-capable host: package, clippy, fmt, conformance, security, ui, adapters, module and vm.
 2. The offline adapter check (`lib.adapterCheck`) is green for the configured agents.
 3. A deployed instance behind the reverse proxy passes its smoke checks, including:
@@ -1452,108 +1451,7 @@ The test runs numbered steps. The steps this design pins down:
 
 ## 10. Build plan
 
-### 10.1 Rules for parallel work
-- **Worktrees:** every work package (WP) is one git worktree and one branch off the milestone base. The **milestone base** is main after the previous milestone's integration plus that milestone's `-P` package, if it has one.
-- **Exclusive file ownership.** Within a milestone, each file belongs to exactly one WP. A file no WP lists is **frozen** for that milestone. If a WP needs a frozen or foreign file changed, it records the request in its pull-request description and the integrator schedules it. It never edits the file itself.
-- **Cargo manifests.**
-  - M0-A writes every `Cargo.toml` with the **complete** v1 dependency set of §3.1 and commits `Cargo.lock`. Unused dependencies are harmless (`unused_crate_dependencies` is allow-by-default).
-  - Afterwards, only a milestone's `-P` package may touch `Cargo.toml`/`Cargo.lock`.
-- **Interface-first inside a milestone.** When two WPs share an internal Rust interface (M1-H1 → M1-H2, M3-H1 → M3-H2), the provider's **first commit** is the public signatures with `todo!()` bodies, exactly as listed here. The consumer branches after that commit.
-- **Integration order per milestone:** `-P` → hub WPs → web WPs → `-N` → `-F` → the integrator runs the milestone acceptance. Frontend acceptance (ui checks) is evaluated at integration, because it needs the merged binaries.
-- **The hub changes only in M0, M1 and M3.** M2 is deployment. M4 and M5 must not touch `crates/wb-hub/**` or `crates/wb-proto/**`, which are covered by `WB_HUB_BUILD`. After the first deployment the hub restarts exactly once, at the M3 deploy.
-- **Done means** the WP's listed acceptance tests pass in its worktree (`cargo test -p …`, or the named check), `clippy -D warnings` and `fmt` are clean, and the pull-request description says what changed, which interfaces were touched and what requests are open.
-
-### 10.2 M0: walking skeleton
-**Goal:** repo, flake, a hub spawning PTYs, and the web serving the **unchanged** prototype SPA behind the full auth floor, all proven by a VM test.
-
-**Dogfood:** on the target host, `python3 -I tests/harness.py --web-root <web output> --dogfood` (the real home directory and no canaries, but a temp `stateDir` and a fresh `boardsDir`, never the real boards directory) plus `ssh -L 18443:<caddySocket> <host>`, then open `http://127.0.0.1:18443`. The harness prints the socket path in its JSON line and the ssh command on stderr; its Caddy listens only on that 0600 unix socket, so no other local user can reach the injected secret. Terminal cards work, and `kill -HUP <harness>` restarts wb-web while the shells survive. The M0 web treats a missing `spawn` as true, because the unchanged SPA sends none. That is why dogfood uses a fresh board (the nothing-auto-runs rule of §3.4.1 takes effect in M1).
-
-| WP | Owns | Inputs | Outputs | Acceptance |
-|---|---|---|---|---|
-| **M0-A** workspace + proto (lands first) | `Cargo.toml`, `Cargo.lock`, `.gitignore`, `crates/*/Cargo.toml`, `crates/wb-proto/**`, placeholder `src/main.rs` in wb-hub/wb-web/wb-cli and `crates/wb-hub/src/bin/wb-fake-acp.rs` (each placeholder passes to its crate's owner after merge) | §3.1-§3.3 | `line`, `limits` (all of §3.2.9), `hub` (handshake, `ok`/`err`, `list`, `watch`, `pty.*`, `Summary` with all fields incl. `acp` and `fault`, `SpawnPty`, `Resume`), `websock` (complete §3.3) | `cargo test -p wb-proto`: every JSON example of §3.2/§3.3 round-trips; an unknown `t` → `Unknown`; unknown fields are ignored |
-| **M0-B** hub skeleton | `crates/wb-hub/src/**` (except `bin/`), `crates/wb-hub/tests/**` | M0-A | `wb-hub --config`:<br>- full `config.rs` (H-18), `env.rs`, `conn.rs` (hello with `build`, peer-cred, OutQ, 8 in flight);<br>- in-memory `registry.rs`;<br>- `pty/{mod,spawn,io,out}.rs` with the UTF-8 decoder and the ring;<br>- `list`, `pty.open` (spawn / attach with `replay` = whole ring), input, resize, kill (forget ok-after), `gone`;<br>- SIGTERM → SIGHUP the PTYs, exit.<br>No vt100, no persistence, no ACP. | `tests/pty.rs`: spawn+echo; second connection attaches and its replay contains `MARK`; kill-forget then reopen gives a new `createdAt`; env canaries absent; a different uid gets 0 bytes (`unshare -U`, skip if unavailable); a 16 MiB+1 line closes the connection |
-| **M0-C** web skeleton | `crates/wb-web/src/**`, `crates/wb-web/tests/**` | M0-A | - full `auth.rs` (§3.6) and security headers, `static_files.rs` (in memory, sha256 ETag), `http.rs`, `config.rs` (§3.7.1);<br>- `routes.rs`, with every other module present as a stub exposing `routes()` (stubs return §3.5.5's empty shapes, unit control 403, tmux 404) plus `notes::exists()` and `sample::enabled()`;<br>- `hub.rs` (control connection, hub status), `relay_pty.rs` (absent `spawn` = true), `/rpc` sending `hub{…}`, `/acp` → 404;<br>- board GET/PUT last-writer-wins (returns an ETag, `If-Match` optional);<br>- minimal `/api/info`;<br>- per-route WebSocket caps. | unit: the floor `check()` table (every row of §3.6) and the static ETag; integration with a fake hub: `/pty` open/in/out/exit relay, 1013 when the hub is down, 1009 above 2 MiB |
-| **M0-D** nix + test infra | `flake.nix`, `flake.lock`, `nix/**`, `tests/harness.py`, `tests/wbctl.py`, `tests/test_security.py`, `tests/caddy/live.Caddyfile`, `tools/**`, `web/**` (the prototype files imported unchanged), `README.md` | M0-A | - `package.nix` (`out` only), `vendor.nix`, `web.nix` (web + vendor), `module.nix` (both units with full hardening, N-1/N-2, `agents` option, no `tmuxSocket`), `checks.nix` (package, clippy, fmt, security, vm);<br>- `harness.py` (JSON line, `--dogfood`, SIGHUP restarts the web);<br>- `wbctl.py` (`pty-open [--spawn]`, `pty-attach [--resume]`, `sessions`, `raw`);<br>- VM subset. | at integration: `nix flake check` green on a kvm-capable host with security T-S1-T-S15 and VM steps 1, 2, 3/4 (PTY only: MARK1 in the replay, same shell PID after a web restart), 5, 8 (0666 socket), 9 (stop half only: the unit cgroup is empty, the shell PID is gone, and the restarted hub has an empty `list`; the corpse and snapshot assertions belong to M1-N) |
-
-**M0 exit:** `nix flake check` is green on a kvm-capable host, and one hour of dogfooding terminals through the harness passes without a lost shell.
-
-### 10.3 M1: terminals solid (this is the first hub that is deployed)
-**Goal:** the PTY contract complete: snapshots, persistence, corpses, the ring resume, the resize rules, nothing auto-runs. Frontend fixes 2, 3 and 5, XSS and camera handling, the look and typography of §6.2 (with self-hosted fonts) and shell choice (§6.3). Board `If-Match`, the frontend's `If-Match` and the SW cache bump all ship together here.
-
-**Dogfood:** the harness on the target host for all shell work for at least two working days.
-
-| WP | Owns | Inputs | Outputs | Acceptance |
-|---|---|---|---|---|
-| **M1-P** proto | `crates/wb-proto/**`, `Cargo.toml`, `Cargo.lock` | M0 | the full PTY part of §3.2 (`resume`, `stream`/`out`, `epoch`, `exit.reason`, `stale`/`faulted` codes) and shell choice (`SpawnPty.shell`, `hello.shells`, `hello.defaultShell`); `state::derive` complete (PTY and ACP rules) with its table tests | `cargo test -p wb-proto`; the derive table covers every row of §3.4.6 including `fault`; the shell fields round-trip |
-| **M1-H1** VT + output (pure) | `crates/wb-hub/src/pty/vt.rs`, `crates/wb-hub/src/pty/out.rs`, `crates/wb-hub/tests/fixtures/vt/**` | M1-P | First commit: `Vt::{new(cols,rows), feed(&str), resize(cols,rows), snapshot()->String, capture(lines)->String, to_snap()->Vec<u8>, from_snap(&[u8])->Result<Vt>}`, `OutStream::{new(), push(&[u8])->Option<String>, flush()->Option<String>}`, `Ring::{new(cap), push(&str)->u64, since(u64)->Option<String>, end()->u64}`. Then the implementations: snapshot per §3.4.3 (including focus reporting 1004), shrink rule (H-5), holdback (H-6), `catch_unwind` in `feed`. | unit: fixture round trips (SGR truecolor, wide CJK, a 3000-line scrollback, soft wraps, alt screen with the primary kept, mouse/paste modes); shrink keeps the newest rows; a held escape tail is never split; ring wrap and U+FFFD offsets; `SNAPSHOT_MAX` halving |
-| **M1-H2** hub lifecycle | the rest of `crates/wb-hub/src/**` (`main, config, env, procfs, store, outq, conn, registry, shutdown, pty/{mod,spawn,io}.rs`), `crates/wb-hub/tests/pty.rs`, `crates/wb-hub/tests/common/**` | M1-P, M1-H1 signatures | - persistence (`.json`, `.snap`, 30 s timer), corpses, respawn, `resume`, `hub_restart` exits;<br>- quarantine (PTY), panic supervisor and reload with `err{internal}`, poison handling;<br>- sole-viewer size, nudge cancel, fg poll;<br>- SIGTERM sequence (§3.4.5);<br>- shell choice: `shells`/`defaultShell` config, the first existing executable path re-checked at every spawn, `bad_request` for an unknown name, child `SHELL` = the resolved path (ACP agents keep bash's), the shell name persisted in `pty/<sid>.json`;<br>- H-1, H-2, H-3, H-7, H-10, H-13, H-14, H-19 | `tests/pty.rs` inventory of §4 (PTY part), including SIGTERM then restart: the corpse snapshot contains the last output; `kill -9` then restart: snapshot ≤ 30 s stale; shell choice: spawn with `shell:"sh"` shows it in `echo $0`, an unknown name gives `bad_request`, `SHELL` in the child equals the resolved path, a respawn keeps the shell |
-| **M1-W1** board + fs | `crates/wb-web/src/board.rs`, `crates/wb-web/src/fsapi.rs`, `crates/wb-web/tests/board.rs`, `crates/wb-web/tests/fsapi.rs`, `tests/test_daemon.py` | M1-P | `If-Match` (428/412/204, `"empty"`), atomic write, `FeedMsg::Board{etag}` on `AppState.feed`; `ls/stat/cat/mv` with the W-6 denylist | unit + integration: ETag rows, a concurrent PUT race (one 204, one 412), `mv` refusals incl. a symlinked parent, `EXDEV`→400; `test_daemon.py` board and fs sections against harness |
-| **M1-W2** hub client, relays, feed | `crates/wb-web/src/{main,config,routes,hub,relay_pty,rpc,info,http,util}.rs`, `crates/wb-web/tests/{relay_pty,rpc}.rs`, `crates/wb-web/tests/common/**` | M1-P | - `/pty` per §3.5.1 (absent `spawn` = false, `resume`, `out`, `gone`→1000, `shell` passed through on an explicit spawn only);<br>- `/rpc` feed (`sessions`, `session` + `state`, `gone`, `hub`, `board`);<br>- `/api/info` full (W-7, with `shells` and `defaultShell` from the hub's `hello`), `/api/sessions`, `/api/status`, capture;<br>- `hub.stale` | fake-hub integration: no `SpawnPty` without `spawn`; `resume` passes through; `gone{epoch}`→1000; `board{etag}` reaches two `/rpc` clients; `/api/info.hub.stale` true on a build mismatch; `shell` passes through; `/api/info.shells` comes from the hub |
-| **M1-F** frontend | `web/app.ts`, `web/index.html`, `web/style.css`, `web/sw.ts`, `tests/ui.mts` | M1-P contract | fixes 2, 3 and 5, F-A4 (PTY), F-A6, F-A7, F-A8, F-A9, F-A10, F-A18; the look and typography of §6.2; the shell picker of §6.3 | at integration: ui baseline checks plus N1-N7, N8 (amended), N11, N16, N30-N32, N36, N40, N43-N48 (N9/N10 are fix 4, owned by M4-F) |
-| **M1-N** nix + tests | `nix/**`, `flake.nix`, `tests/harness.py`, `tests/wbctl.py`, `tests/test_security.py`, `tests/caddy/**` | M1-P | - N-3 fonts (the build converts them and generates `fonts.css`; none is committed), N-6 harness JSON + Caddy admin socket + `expired`/`loginpage` Caddyfiles, bash resolution and the `sh` test shell;<br>- N-10 shell options (`services.workbench.shells`, `defaultShell`); `workbench-web` ordered after `network-online.target` (best effort, §7);<br>- `ui` check wiring (`WB_PLAYWRIGHT`, `WB_HARNESS`);<br>- VM: all PTY steps incl. 5b, the PTY kill-forget reopen (5c), resume, the OOM step and the `nu` shell-choice step (§9.4);<br>- T-S16, T-S17, T-S21 hook, T-S23;<br>- `wbctl bench` (echo latency, flood isolation; see §9.6) | at integration: `nix flake check` green incl. `ui` and `vm` |
-
-**M1 exit:** green checks, two days of terminal dogfood without a lost session or a corrupted screen after reattach.
-
-### 10.4 M2: first deployment (terminals)
-**Goal:** serve M1 on the target host behind the authenticating reverse proxy, with the shared secret, the firewall rule and the proxy configuration in place (§3.6, §7). There are no workbench code changes. Deployment configuration lives with the deployer, so M2 has no work packages in this repository.
-
-**Dogfood:** daily terminal use through the public origin from desktop and phone.
-
-**M2 exit:** deployed, the performance budgets of §9.6 recorded, and terminals dogfooded for three days.
-
-### 10.5 M3: agent cards end to end (the one planned hub restart)
-**Goal:** ACP cards with permissions, elicitation, revive and a fail-closed journal. Frontend fix 1.
-
-**Dogfood:** all agent work moves to Workbench cards.
-
-| WP | Owns | Inputs | Outputs | Acceptance |
-|---|---|---|---|---|
-| **M3-P** proto | `crates/wb-proto/**`, Cargo files | M2 | the `journal` module (`EventBody`, every row of §3.4.4), the ACP requests and events of §3.2.7/§3.2.8, `AcpSessionInfo` | round-trip tests for every event kind; unknown `e` → `Unknown` |
-| **M3-H1** journal, fold, replay | `crates/wb-hub/src/acp/{journal,facts,replay}.rs` | M3-P | First commit: `Journal::{open(path)->Result<(Journal, Vec<JournalEvent>)>, append(&EventBody, ts)->Result<JournalEvent, WriteFault>, sync(), len()}`, `Facts::{default(), apply(&JournalEvent)}`, `replay::scan(path, since, head, pending:&[u64], cap)->Result<Replay>` (a read error must reach the viewer as `err{internal}`, not as an empty transcript); `sync()` returns a `JoinHandle` so that the actor never blocks on the disk. Then: fail-closed append with ftruncate (H-9), torn-tail repair, `Journal::normalise` (startup normalisation, not fsynced: the caller awaits `sync()`), `Facts::revivable` (H-12), ascending pinned ∪ kept (H-8). | unit: journal, facts and replay tests, including write-fault truncation, no seq reuse, ascending order with a pinned event below `from`, `revive_failed` |
-| **M3-H2** ACP actor | `crates/wb-hub/src/acp/{mod,rpc,lines,agent}.rs`, `crates/wb-hub/src/{registry,conn,main,shutdown}.rs`, `crates/wb-hub/src/pty/spawn.rs` | M3-P, M3-H1 signatures | setup, prompt, cancel, permission/elicitation (epoch), set_mode, seen, revive, authenticate, teardown (§3.4.5, H-11), fault and probe, quarantine (ACP), `acp.info` coalescing, SIGTERM integration | `cargo test -p wb-hub` unit: `rpc.rs` round-trip conformance (H-17), `lines.rs` |
-| **M3-H3** fake agent + ACP tests | `crates/wb-hub/src/bin/wb-fake-acp.rs`, `crates/wb-hub/tests/acp.rs`, `crates/wb-hub/tests/common/**` | M3-P | every scenario of §9.2 plus the prompt keywords | `tests/acp.rs`: every scenario row, "fold == live", hub `kill -9` |
-| **M3-W** ACP relay | `crates/wb-web/src/{relay_acp,hub,info,routes}.rs`, `crates/wb-web/tests/relay_acp.rs` | M3-P | `/acp` per §3.5.2 (W-3); agents in `/api/info` | fake-hub integration: spawn fields only with agent+cwd; `info.session` omitted when unchanged; 1000 after kill-forget `ok` and after `not_found`; 1009 above 9 MiB |
-| **M3-F** frontend | `web/app.ts`, `web/index.html`, `web/style.css`, `tests/ui.mts` | M3-P contract | fix 1, F-A1, F-A2, F-A3, F-A4 (ACP), F-A5, F-A16, F-A17, F-A19 | at integration: N17-N29, N39, N41, N42 |
-| **M3-N** nix + tests | `nix/**`, `flake.nix`, `tests/harness.py`, `tests/wbctl.py`, `tests/test_security.py`, `tests/adapter_probe.py` | M3-P | N-4 (`fake` output, `WB_HUB_BUILD`), N-5, N-9 (`lib.adapterCheck` in `nix/adapter-check.nix`, and `checks.adapters` against the stub); VM ACP steps (3, 4, 5c, 6, and 9 with its third session `a3`); `wbctl acp-*`; the `/acp` half of T-S17, T-S22, T-S24 | at integration: `nix flake check` green |
-
-
-**M3 exit:** v1 acceptance items 1-4 of §9.6 hold.
-
-### 10.6 M4: attention and multi-device (web, frontend and CLI only; no hub restart)
-**Goal:** `wb` from cards via the leader tab, the out-of-page signal, phone routing, bulk revive and the chip cycle.
-
-**Dogfood:** agents are driven from the phone and via `wb` from cards.
-
-| WP | Owns | Inputs | Outputs | Acceptance |
-|---|---|---|---|---|
-| **M4-W** leader + web.sock | `crates/wb-web/src/{rpc,websock}.rs`, `crates/wb-web/tests/{rpc,websock}.rs` | M3 | leader by `lastActive` (W-4), `cmd` relay, `page_gone`, web.sock with peer-cred | integration: the leader table (A active at T1, B never → A; reconnect keeps the order); `page_gone` on leader loss, never re-sent; a different uid gets 0 bytes |
-| **M4-C** CLI | `crates/wb-cli/src/**` | §3.3, §3.7.4 | `wb` per §3.3 and §3.7.4: the board tool commands, without the commands W-14 drops | unit: the argv grammar; integration against a fake web.sock: exit codes 0/1/2, both error messages |
-| **M4-F** frontend | `web/app.ts`, `web/sw.ts`, `web/style.css`, `web/index.html`, `tests/ui.mts` | M4 contract | fix 4, F-A11, F-A12, F-A13, F-A14, F-A15 | at integration: N9, N10, N34, N35, N37, N38 |
-| **M4-N** nix | `nix/module.nix`, `nix/vm.nix`, `nix/checks.nix` | M4-C | `/etc/workbench/bin/wb`; a VM step where a card runs `wb read_node` with a page open (result) and without one (`no_page`, exit 1) | at integration: `nix flake check` green; a deploy shows `hub.stale:false` and an unchanged hub PID |
-
-**M4 exit:** a deploy with no hub restart, and an agent card successfully drives `wb run_in_shell` in the focused tab.
-
-**Built with edwind's EW-M4 (2026-10):** M4-W (`rpc.rs` leader registry, `websock.rs`), M4-C's board tool commands (`wb tools`, `wb TOOL [--json INPUT] [KEY=VALUE]… [KEY:=JSON]… [--timeout S]`; W-14 tools and `create_node kind=agent` are usage errors; no page exits 7), F-A11 and M4-N's VM step (`nix/vm.nix` step 11, with `wbctl page` as the page). F-A12 to F-A15 and their checks (N9, N10, N34, N35, N37, N38) are not part of it.
-
-**F-A12 to F-A15 built (2026-10-19):** the out-of-page signal (title count, app badge, service-worker notification and its click, `/?focus=SID`), phone routing to `focusOpen`, Revive all agents and the `detached` Attention line, and the chip cycle (the `!` chip steps through cards that need a look, Shift-click opens the list; the `✦ … waiting` chip steps through waiting agent cards; leader `!` as in F-A28). Checks N34, N35, N37, N38. N9 and N10 (fix 4, the leader tab) are covered by N59 and the `rpc.rs` leader tests built with EW-M4.
-
-### 10.7 M5: notes, review, `sample`, artifacts (web and frontend only)
-**Goal:** the remaining prototype surface ported. Fix 6 frames.
-
-| WP | Owns | Inputs | Outputs | Acceptance |
-|---|---|---|---|---|
-| **M5-W1** notes | `crates/wb-web/src/notes/**`, `crates/wb-web/tests/notes.rs`, `crates/wb-web/tests/golden/**` | M4 | the notes surface of the prototype (in-memory index, incremental stat walk, tasks, journal, append, reviews, cards) | golden parser tests from the Python prototype; refresh after an external edit; the web's own writes re-parse |
-| **M5-W2** sample | `crates/wb-web/src/sample.rs`, `crates/wb-web/tests/sample.rs`, `tests/mock_api.py` | M4 | the `sample` client (tool rounds, limits, cancel) | integration against `mock_api.py`: verbatim block replay over tool rounds, the enforced limits, cancel |
-| **M5-W3** artifacts, db, host | `crates/wb-web/src/{artifacts,host}.rs`, `crates/wb-web/tests/{artifacts,host}.rs` | M4 | srcdoc artifact versions, the 409 shape, `db.json`, read-only proc and units | integration: version conflict 409; db get/put; unit control still 403 |
-| **M5-F** frontend | `web/app.ts`, `web/bridge.ts`, `tools/build-artifact.py`, `tests/ui.mts` | M4 | fix 6 (srcdoc artifact frames and the bridge) | at integration: N12-N15, N33 |
-| **M5-T** conformance | `tests/test_daemon.py`, `crates/wb-web/examples/dump-index.rs` | M5-W1/W2/W3 | `test_daemon.py` complete; `dump-index` | `conformance` green; a one-off parity run of `dump-index` against the Python prototype on a real notes directory (read-only), with any differences recorded |
-| **M5-N** nix | `nix/web.nix`, `nix/checks.nix`, `nix/module.nix` | M5-W2/F | `dist/canvas-workbench.html` built; `conformance` with `mock_api.py`; `anthropic-api-key` credential | at integration: `nix flake check` green; deploy without a hub restart |
-
-**Superseded (2026-10-12):** M5-W1 and M5-W2 are not built in Rust. Edwin, run headless as the text daemon edwind, owns the notes index and the `sample` backend instead, with provider-agnostic model backends and keys on the server; pages become files in `notesDir`. The plan is in `edwin/README.md`. M5-W3, M5-F and the parts of M5-T and M5-N that do not depend on W1 and W2 stand.
-
-**M5-W3 and M5-F built (2026-10-19):** `artifacts.rs` (versions, the 409, `db.json`), `host.rs` (`/proc`, `systemctl` read only; control still 403), fix 6 (server-mode artifact cards run the head in an opaque `srcdoc` frame with the bridge; `artifactOrigin` stays `null`), with `crates/wb-web/tests/{artifacts,host}.rs` (the test wb-web gets a fake `systemctl` first on its `PATH`) and ui checks N12-N15, N33 and N72. Not built: `dist/canvas-workbench.html` (M5-N), so `/api/info.dist` stays `null` and "open the Workbench demo inside itself" stays hidden. The artifact db is page state, not notes or tasks, so it stays in wb-web and does not go through brain.
-
-**M5 exit:** all of §9.6 holds. The **two-week dogfood clock** starts, and it ends with the removal review: every feature untouched in two weeks is listed for deletion (§1).
+v1 was built in milestones M0 to M5 between 2026-10-11 and 2026-10-19. Their work packages (`Mn-X` in this document: file ownership, interfaces, exit criteria) are history now; they are in `git show 03cad1e:docs/DESIGN.md`, §10.1 to §10.7. The dogfood period that M5's exit started was dropped on 2026-10-16. §10.8 and §10.9 keep their numbers.
 
 ### 10.8 Desks: the canvas as a multi-desktop (frontend only, after v1's fixes)
 **Goal:** temporary arrangements of cards, switched from the keyboard as desktops are in KDE or i3, without moving anything on the board. Decided by the user on 2026-10-14 from the exploration page "Canvas Desks" (https://claude.ai/artifact/HmeEVCYMGFriqeRT3YTmrh).
