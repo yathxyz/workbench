@@ -16,13 +16,10 @@ use wb_proto::limits::MAX_LINE;
 const SECRET_HEADER: &str = "X-Workbench-Proxy-Secret";
 
 /// A web with `editSocket` set to `edit`; the hub is down, which `/edit` never minds.
-fn web_with_edit(edit: &Path, frames: Option<bool>) -> Web {
+fn web_with_edit(edit: &Path) -> Web {
     let edit = edit.to_path_buf();
     Web::start_with(&edit.with_file_name("hub.sock"), move |cfg| {
         cfg["editSocket"] = json!(edit);
-        if let Some(frames) = frames {
-            cfg["frames"] = json!(frames);
-        }
     })
 }
 
@@ -80,7 +77,7 @@ async fn wait_edit_up(web: &Web, up: bool) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frames_are_lines_both_ways_and_edwind_closing_is_1011() {
     let edit = FakeEdit::start();
-    let web = web_with_edit(&edit.path, None);
+    let web = web_with_edit(&edit.path);
     let mut ws = connected(&web).await;
     // The hello went through as the browser wrote it, kind and all.
     assert!(
@@ -128,7 +125,7 @@ async fn frames_are_lines_both_ways_and_edwind_closing_is_1011() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_binary_frame_or_an_embedded_newline_closes_1003() {
     let edit = FakeEdit::start();
-    let web = web_with_edit(&edit.path, None);
+    let web = web_with_edit(&edit.path);
 
     let mut ws = connected(&web).await;
     ws.send(Message::Binary(vec![1, 2, 3].into()))
@@ -151,7 +148,7 @@ async fn a_binary_frame_or_an_embedded_newline_closes_1003() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frame_or_a_line_over_max_line_closes_1009() {
     let edit = FakeEdit::start();
-    let web = web_with_edit(&edit.path, None);
+    let web = web_with_edit(&edit.path);
 
     // Exactly MAX_LINE passes in both directions.
     let mut ws = connected(&web).await;
@@ -198,11 +195,9 @@ async fn a_frame_or_a_line_over_max_line_closes_1009() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_edwind_closes_1013_and_info_says_so() {
-    // No editSocket at all, whatever an old web.json says about frames.
+    // No editSocket at all.
     let dir = tempfile::tempdir().unwrap();
-    let web = Web::start_with(&dir.path().join("hub.sock"), |cfg| {
-        cfg["frames"] = json!(true);
-    });
+    let web = Web::start(&dir.path().join("hub.sock"));
     let mut ws = web.ws("/edit").await;
     let (code, texts) = read_to_close(&mut ws).await;
     assert_eq!(code, 1013);
@@ -212,28 +207,25 @@ async fn no_edwind_closes_1013_and_info_says_so() {
     assert_eq!(info["editUp"], false);
 
     // An editSocket nobody listens on.
-    let web = web_with_edit(&dir.path().join("edit.sock"), Some(true));
+    let web = web_with_edit(&dir.path().join("edit.sock"));
     let mut ws = web.ws("/edit").await;
     assert_eq!(read_to_close(&mut ws).await.0, 1013);
     let info = web.req("GET", "/api/info").send().await.json();
     assert_eq!(info["edit"], true);
     assert_eq!(info["editUp"], false);
 
-    // Frames are the only page editor (R9.21): an editSocket turns them on, and the
-    // frames key an older web.json carries changes nothing.
+    // Frames are the only page editor (R9.21): an editSocket turns them on.
     let edit = FakeEdit::start();
-    let web = web_with_edit(&edit.path, None);
+    let web = web_with_edit(&edit.path);
     let info = wait_edit_up(&web, true).await;
     assert_eq!(info["edit"], true);
     assert_eq!(info["editUp"], true);
-    let web = web_with_edit(&edit.path, Some(false));
-    assert_eq!(wait_edit_up(&web, true).await["edit"], true);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn info_reports_frames_on_and_edwind_up_and_down() {
     let edit = FakeEdit::start();
-    let web = web_with_edit(&edit.path, Some(true));
+    let web = web_with_edit(&edit.path);
     let info = wait_edit_up(&web, true).await;
     assert_eq!(info["edit"], true);
     // A frame socket works while edwind is up.
@@ -250,7 +242,7 @@ async fn info_reports_frames_on_and_edwind_up_and_down() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigterm_closes_1012_and_exits() {
     let edit = FakeEdit::start();
-    let mut web = web_with_edit(&edit.path, Some(true));
+    let mut web = web_with_edit(&edit.path);
     let mut ws = connected(&web).await;
     let started = Instant::now();
     web.sigterm();
@@ -262,7 +254,7 @@ async fn sigterm_closes_1012_and_exits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_floor_guards_edit_as_it_guards_pty() {
     let edit = FakeEdit::start();
-    let web = web_with_edit(&edit.path, Some(true));
+    let web = web_with_edit(&edit.path);
     let wrong = common::SECRET.replace('0', "1");
     let refused = [
         upgrade(&web, "/edit").without("Origin"),
