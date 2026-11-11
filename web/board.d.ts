@@ -487,7 +487,7 @@ interface DaemonInfo {
   host: string; home: string;
   edit?: boolean; editUp?: boolean; sample?: boolean; models?: unknown; notes?: string; notesExists?: boolean;
   media?: MediaProviderInfo[];         // the image providers media cards can use (F-A41)
-  state?: string; dist?: string; artifactOrigin?: string;
+  state?: string; artifactOrigin?: string;
   agents?: { name: string; label: string }[];
   shells?: string[]; defaultShell?: string;
   hub?: { status: HubStatus; version?: string; build?: string; proto?: number; startedAt?: number; stale?: boolean };

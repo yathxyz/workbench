@@ -6,7 +6,6 @@ type Vendor = typeof import('../tools/vendor-entry.js');
 
 interface Window {
   V: Vendor;
-  CANVAS_HOSTED?: boolean;
   CLAUDE_BRIDGE_SRC?: string;
   claude?: { use(name: string): Promise<unknown> }; // the artifact runtime: web/bridge.ts in a hosted page, claude.ai's around the board
   __canvas: Record<string, any>; // any: the suites' debug surface; each entry is typed where app.ts defines it
