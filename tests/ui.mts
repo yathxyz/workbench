@@ -188,9 +188,9 @@ st = await p.evaluate(async () => {
 });
 check('N71: no edwind: a page card and the Editor view show the text read-only with the demo notice; no CodeMirror in the page',
   st.card.text === '# ro\n\nline two\n' && !st.card.editable && /^Read-only in the demo/.test(st.card.notice) && st.ed.text === st.card.text && st.ed.notice === st.card.notice && !st.cm, JSON.stringify(st));
-// node kinds around terminals (Emacs, web, artifacts, sketch) in demo mode
-st = await p.evaluate(() => { const w = window.__canvas.newWeb('example.org/a'); const s = window.__canvas.newSketch(); const L = window.__canvas.live[w.id]; return { url: w.url, name: w.name, frame: !!L.frame, bar: !!L.urlInput, sketch: s.kind, agentHidden: !document.querySelector('#add-agent'), emacsOff: document.querySelector<HTMLInputElement>('#add-emacs')!.disabled }; });
-check('web and sketch nodes, agent button hidden', st.url === 'https://example.org/a' && st.name === 'example.org' && st.frame && st.bar && st.sketch === 'sketch' && st.agentHidden && st.emacsOff, JSON.stringify(st));
+// node kinds around terminals (web, artifacts, sketch) in demo mode; there is no Emacs card
+st = await p.evaluate(() => { const w = window.__canvas.newWeb('example.org/a'); const s = window.__canvas.newSketch(); const L = window.__canvas.live[w.id]; return { url: w.url, name: w.name, frame: !!L.frame, bar: !!L.urlInput, sketch: s.kind, agentHidden: !document.querySelector('#add-agent'), emacsGone: !document.querySelector('#add-emacs') }; });
+check('web and sketch nodes, agent button hidden', st.url === 'https://example.org/a' && st.name === 'example.org' && st.frame && st.bar && st.sketch === 'sketch' && st.agentHidden && st.emacsGone, JSON.stringify(st));
 await p.evaluate(() => { for (const n of Object.values<BoardNode>(window.__canvas.S.nodes)) if (n.kind === 'web' || n.kind === 'sketch') window.__canvas.removeNode(n.id); });
 // review view
 await p.evaluate(() => window.__canvas.setView('review')); await sleep(600);
@@ -585,7 +585,7 @@ st = await p.evaluate(async () => { const C = window.__canvas, S = C.S, sl = (ms
   C.ghostOpen(Object.values<BoardNode>(S.nodes).find((n): n is GhostNode => n.kind === 'ghost' && n.name === 'projects')); await sl(50);
   C.ghostOpen(Object.values<BoardNode>(S.nodes).find((n): n is GhostNode => n.kind === 'ghost' && n.name === 'canvas')); await sl(50);
   const edges = C.PERSP.edges.map((e: Edge) => S.nodes[e.from]?.name + '>' + S.nodes[e.to]?.fsPath), proj = Object.values<FrameNode>(S.nodes).find(f => f.derived === 'fs' && f.fsPath === '/home/me/projects');
-  const sh = Object.values<BoardNode>(S.nodes).find((n): n is TermNode => n.kind === 'term' && n.backend !== 'pty' && !n.emacs && S.nodes[n.in!]?.fsPath === '/home/me')!; C.adopt(sh, proj, null, true); const shIn = S.nodes[sh.in!]?.fsPath, cwd = sh.cwd;
+  const sh = Object.values<BoardNode>(S.nodes).find((n): n is TermNode => n.kind === 'term' && n.backend !== 'pty' && S.nodes[n.in!]?.fsPath === '/home/me')!; C.adopt(sh, proj, null, true); const shIn = S.nodes[sh.in!]?.fsPath, cwd = sh.cwd;
   C.adopt(Object.values<BoardNode>(S.nodes).find((n): n is GhostNode => n.kind === 'ghost' && n.name === 'todo.txt'), proj, null, true);
   return { a, listed, listedAgain, ghosts, edges0, edges, shIn, cwd, asked: !document.querySelector<HTMLElement>('#ask')!.hidden && document.querySelector('#ask-label')!.textContent }; });
 check('filesystem perspective: directory folders nested by path, shells in their cwd', st.a.some(([pth, inn, kids]: [string, string | null, string]) => pth === '/home/me' && inn === null && kids.includes('sh')) && st.a.some(([pth, inn, kids]: [string, string | null, string]) => pth === '/home/me/projects/canvas' && inn === '/home/me/projects' && kids === 'build,ops'), JSON.stringify(st.a));
@@ -610,7 +610,7 @@ st = await p.evaluate(async ({ y, ym }) => { const C = window.__canvas, S = C.S;
   const cd = await C.AGENT_TOOLS.find((t: AgentTool) => t.name === 'cd_shell').run({ addr: 'fs:/home/me/projects', shell: 'sh' });
   return { addrs, res, root, tags, agent, notes, plans, journal, links, lh, v1, v2, ls, cd }; }, { y: Y, ym: YM.replace('-', '/') });
 check('addresses: board paths; resolve finds folders, files, tags, notes, journal days and links; reserved and bogus refused', st.addrs.join() === 'board:/canvas-workbench,board:/canvas-workbench/machines,board:/canvas-workbench/machines/build' && st.res['board:/canvas-workbench/machines'].startsWith('fMach|') && +st.res['fs:~'].split('|')[2] >= 2 && st.res['tag:agent'] === 'tag:agent|tag:agent|1' && st.res['note:hosts'].startsWith('note:hosts|note:hosts|') && st.res['journal:' + YM.replace('-', '/')].endsWith('|1') && st.res['link:hosts'].endsWith('|1') && st.res['proc:@x/1'] === 'ERR' && st.res['bogus'] === 'ERR', JSON.stringify(st.res));
-check('navigator root lists every relation; tag, note, journal and link trees list', st.root.slice(-8).join() === '# tags,¶ notes,▦ journal,⇄ links,⌗ tmux,⚙ processes,⊙ units,! attention' && st.tags.join() === '#agent:1' && st.agent.join() === 'claude' && st.notes.some((x: string) => x.startsWith('plans:')) && st.plans.length > 0 && st.plans.every((x: string) => x.startsWith('iblock:')) && st.journal.join('|') === `${Y}|${YM}|${DAY}` && st.links.some((x: string) => x.startsWith('hosts:')) && st.lh.join() === 'pi:ghost', JSON.stringify(st));
+check('navigator root lists every relation; tag, note, journal and link trees list', st.root.slice(-7).join() === '# tags,¶ notes,▦ journal,⇄ links,⚙ processes,⊙ units,! attention' && st.tags.join() === '#agent:1' && st.agent.join() === 'claude' && st.notes.some((x: string) => x.startsWith('plans:')) && st.plans.length > 0 && st.plans.every((x: string) => x.startsWith('iblock:')) && st.journal.join('|') === `${Y}|${YM}|${DAY}` && st.links.some((x: string) => x.startsWith('hosts:')) && st.lh.join() === 'pi:ghost', JSON.stringify(st));
 check('goAddr opens the navigator or the canvas and writes the hash; wb-style ls and cd work', st.v1 === 'tag:agent #tag:agent' && st.v2 === '#board:/canvas-workbench/machines canvas' && st.ls.includes('journal:' + DAYP) && st.cd === 'sh: cd /home/me/projects', JSON.stringify({ v1: st.v1, v2: st.v2, ls: st.ls, cd: st.cd }));
 st = await p.evaluate(() => { const C = window.__canvas, cd = C.AGENT_TOOLS.find((t: AgentTool) => t.name === 'cd_shell'), H = { name: 'cdhost', url: 'https://cdhost.invalid' };
   C.HOSTLIST.push(H); const sh = C.addNode({ kind: 'term', backend: 'fake', name: 'cdsh', env: {}, hostUrl: H.url, x: 14000, y: 14400, w: 300, h: 200 });   // runs on cdhost, in no host folder
@@ -642,11 +642,11 @@ st = await p.evaluate(async () => { const C = window.__canvas, S = C.S, sl = (ms
   const failedGhost = Object.values<BoardNode>(S.nodes).find((x): x is GhostNode => x.kind === 'ghost' && x.unitState === 'failed'), gaddr = failedGhost && C.addrOf(failedGhost);
   C.perspSet('manual', true);
   C.statusRender(); const stc = [...document.querySelectorAll('#st-host .stc')].map(b => b.textContent + (b.classList.contains('bad') ? '!' : ''));
-  const attn = C.rgEntries('attn:').map((e: RgEntry) => e.name), wbls = (await C.AGENT_TOOLS.find((t: AgentTool) => t.name === 'list_addr').run({ addr: 'attn:' })).split('\n'), would = await C.AGENT_TOOLS.find((t: AgentTool) => t.name === 'unit_control').run({ unit: 'unit:/caddy.service', verb: 'restart' }), did = await C.AGENT_TOOLS.find((t: AgentTool) => t.name === 'unit_control').run({ unit: 'caddy.service', verb: 'restart', confirm: true });
-  return { roots, kids, units, uprocs, r1: r1.error || r1.addr, r2: r2.error || r2.addr, k, parent, ulabel, pf, dimmed, uf, gaddr, stc, attn, wbls, would, did }; });
+  const attn = C.rgEntries('attn:').map((e: RgEntry) => e.name), wbls = (await C.AGENT_TOOLS.find((t: AgentTool) => t.name === 'list_addr').run({ addr: 'attn:' })).split('\n');
+  return { roots, kids, units, uprocs, r1: r1.error || r1.addr, r2: r2.error || r2.addr, k, parent, ulabel, pf, dimmed, uf, gaddr, stc, attn, wbls }; });
 check('proc: and unit: in the navigator: process tree with the card marked, units failed first with their processes; addresses resolve', st.roots.includes('systemd 1') && st.kids.some(([n, hasN, m]: [string, boolean, string]) => n === 'bash 1000' && hasN && /card /.test(m)) && st.units[0] === '✗ postgresql.service' && st.uprocs.join() === 'caddy 611' && st.r1 === 'proc:/800' && st.r2 === 'unit:/postgresql.service' && st.k === null && st.parent === 'proc:800' && st.ulabel === 'unit:/caddy.service', JSON.stringify(st));
 check('processes perspective: each shell in a folder with its OS processes as ghosts; units perspective: a folder per host with unit ghosts, shells under their unit', st.pf.some(([n, k]: [string, string]) => k.startsWith('term:') && /ghost:node 1002\|ghost:chromium 1003/.test(k)) && st.pf.length >= 3 && st.dimmed > 0 && st.uf.some(([n, t, c, f]: [string, string, number, string]) => n === 'units' && f === 'postgresql.service' && c >= 5) && st.uf.some(([n, t, c]: [string, string, number, string]) => n === 'workbench.service' && t.includes('active') && c >= 1) && st.gaddr === 'unit:/postgresql.service', JSON.stringify({ pf: st.pf, uf: st.uf, dimmed: st.dimmed, gaddr: st.gaddr }));
-check('status line counts (failed units red) and the Attention query with one address per item; unit control asks for a confirm', st.stc.includes('✗ 1!') && st.stc.some((x: string) => /^✦ \d/.test(x)) && st.attn.includes('postgresql.service failed') && st.wbls.some((l: string) => l.startsWith('unit:/postgresql.service')) && /^would restart caddy.service/.test(st.would) && /^restart caddy.service: ok/.test(st.did), JSON.stringify({ stc: st.stc, attn: st.attn, wbls: st.wbls, would: st.would, did: st.did }));
+check('status line counts (failed units red) and the Attention query with one address per item', st.stc.includes('✗ 1!') && st.stc.some((x: string) => /^✦ \d/.test(x)) && st.attn.includes('postgresql.service failed') && st.wbls.some((l: string) => l.startsWith('unit:/postgresql.service')), JSON.stringify({ stc: st.stc, attn: st.attn, wbls: st.wbls }));
 st = await p.evaluate(async () => { const C = window.__canvas, S = C.S, sl = (ms: number) => new Promise(r => setTimeout(r, ms));
   C.perspSet('fs', true); const home = Object.values<FrameNode>(S.nodes).find(f => f.derived === 'fs' && f.fsPath === '/home/me'); await C.fsExpand(home);
   const g1 = Object.values<BoardNode>(S.nodes).find((n): n is GhostNode => n.kind === 'ghost' && n.name === 'canvas-readme.md'), ghost1 = g1 && [g1.nlink, g1.hardlink || null, C.live[g1.id].body.textContent];
@@ -2906,23 +2906,21 @@ await section('frames', async () => {
   await A2.evaluate((id: string) => { const C = window.__canvas; for (const n of Object.values<BoardNode & { block?: ArtifactNode['block'] }>(C.S.nodes)) if (n.block?.page === id) C.removeNode(n.id); C.removeNode(id); }, blk);
   await settled(A2); await settled(B2);
 
-  // (j) notes and files open as Edwin pages (noteOpen, ghostOpen), not as Emacs cards; the frame starts at the note's
-  // line. A file edwind will not edit (here: not UTF-8 text) still opens in an Emacs card.
+  // (j) notes and files open as Edwin pages (noteOpen, ghostOpen); the frame starts at the note's line. A file edwind
+  // will not edit (here: not UTF-8 text) opens nothing: no card, and a toast says why.
   fs.writeFileSync(noteFile('open-me.md'), '# open me\n\nsecond body line\nthird');
   fs.writeFileSync(noteFile('ghost-me.md'), '# ghost me\n');
   fs.writeFileSync(noteFile('bin.md'), Buffer.from([0xff, 0xfe, 0x00, 0x41]));
   await A2.bringToFront();
-  const opened = await A2.evaluate(async () => { const n = await window.__canvas.noteOpen({ path: 'open-me.md', line: 3 }); return n && { id: n.id, kind: n.kind, buf: n.buf || null, emacs: n.emacs || null }; });
+  const opened = await A2.evaluate(async () => { const n = await window.__canvas.noteOpen({ path: 'open-me.md', line: 3 }); return n && { id: n.id, kind: n.kind, buf: n.buf || null }; });
   const openPt = opened && await until(() => A2.evaluate((id: string) => { const L = window.__canvas.live[id]; return L?.frame?.focused ? L.frame.point() : null; }, opened.id), 10000);
   await leave(A2);
   const ghost = await A2.evaluate((abs: string) => window.__canvas.addNode({ kind: 'ghost', ghost: true, name: 'ghost-me.md', path: abs, in: undefined, x: 12000, y: 14500, w: 220, h: 54 }).id, noteFile('ghost-me.md'));
   const fromGhost = await A2.evaluate(async (id: string) => { const C = window.__canvas, n = await C.ghostOpen(C.S.nodes[id]); return n && { id: n.id, kind: n.kind, buf: n.buf || null, ghostGone: !C.S.nodes[id] }; }, ghost);
   await leave(A2);
-  const bin = await A2.evaluate(async () => { const n = await window.__canvas.noteOpen({ path: 'bin.md' }); return n && { id: n.id, kind: n.kind, emacs: n.emacs || null, buf: n.buf || null }; });
-  // the terminal settles before it goes: xterm disposed right after it opened throws from its next render
-  if (bin?.id) { await until(() => A2.evaluate((id: string) => !!window.__canvas.live[id]?.term?.element || null, bin.id), 5000); await sleep(500); await A2.evaluate((id: string) => window.__canvas.removeNode(id), bin.id); }
-  check('frames: a note and a file ghost open as Edwin page cards on their files, the frame at the note\'s line; a file edwind will not edit (not UTF-8) opens in an Emacs card',
-    opened?.kind === 'buffer' && opened.buf === 'open-me.md' && !opened.emacs && openPt === '# open me\n\n'.length && fromGhost?.kind === 'buffer' && fromGhost.buf === 'ghost-me.md' && fromGhost.ghostGone && bin?.kind === 'term' && /bin\.md$/.test(bin.emacs || '') && !bin.buf,
+  const bin = await A2.evaluate(async () => { const before = Object.keys(window.__canvas.S.nodes).length; const n = await window.__canvas.noteOpen({ path: 'bin.md' }); return { opened: !!n, added: Object.keys(window.__canvas.S.nodes).length - before, toast: document.querySelector('#toast')?.textContent || '' }; });
+  check('frames: a note and a file ghost open as Edwin page cards on their files, the frame at the note\'s line; a file edwind will not edit (not UTF-8) opens no card and says why',
+    opened?.kind === 'buffer' && opened.buf === 'open-me.md' && openPt === '# open me\n\n'.length && fromGhost?.kind === 'buffer' && fromGhost.buf === 'ghost-me.md' && fromGhost.ghostGone && !bin.opened && bin.added === 0 && /bin\.md does not open as a page/.test(bin.toast),
     JSON.stringify({ opened, openPt, fromGhost, bin }));
 
   // (k) a page whose file moves through POST /api/mv (edwind's rename-file) keeps editing the same text: the node and the
@@ -2969,10 +2967,9 @@ await section('frames', async () => {
   const offB = await until(async () => /⚠ offline/.test(await frSync(B2, two) || ''), 10000);
   await A2.keyboard.type(' while-down');
   st = { stopped, offA, offB, notice: await frOff(A2, two), noticeB: await frOff(B2, two), text: await pageText(A2, two), sync: await frSync(A2, two), body: await A2.evaluate(() => document.body.classList.contains('edit-off')), status: (await (await api('/api/status')).json()).edit, info: (await (await api('/api/info')).json()) };
-  // A note opened while edwind is down falls back to the Emacs card at once (no wait for a connection that was up before).
-  const downOpen = await A2.evaluate(async () => { const t0 = performance.now(); const n = await window.__canvas.noteOpen({ path: 'ghost-me.md' }); return n && { id: n.id, kind: n.kind, ms: performance.now() - t0 }; });
-  if (downOpen?.id) { await until(() => A2.evaluate((id: string) => !!window.__canvas.live[id]?.term?.element || null, downOpen.id), 5000); await sleep(500); await A2.evaluate((id: string) => window.__canvas.removeNode(id), downOpen.id); }
-  check('frames: with edwind down a note opens in an Emacs card at once', downOpen?.kind === 'term' && downOpen.ms < 1000, JSON.stringify(downOpen));
+  // A note opened while edwind is down says so at once (no wait for a connection that was up before) and opens nothing.
+  const downOpen = await A2.evaluate(async () => { const t0 = performance.now(); const n = await window.__canvas.noteOpen({ path: 'ghost-me.md' }); return { opened: !!n, ms: performance.now() - t0, toast: document.querySelector('#toast')?.textContent || '' }; });
+  check('frames: with edwind down a note opens nothing at once and the toast says edwind is not running', !downOpen.opened && downOpen.ms < 1000 && /edwind is not running/.test(downOpen.toast), JSON.stringify(downOpen));
   check('frames: with edwind down the page card shows the notice that editing is off, the mode line says offline and typing still goes into the page (unacked)', st.stopped?.event === 'stopped' && st.offA && st.offB && st.notice?.shown && !st.notice.hidden && st.notice.text === 'Editing is off: edwind is not running' && st.noticeB?.shown && /while-down$/.test(st.text) && /•/.test(st.sync) && /⚠ offline/.test(st.sync) && st.body && !st.status?.up && st.info.edit === true && st.info.editUp === false, JSON.stringify({ ...st, text: st.text.slice(-30), info: { edit: st.info.edit, editUp: st.info.editUp } }));
 
   // (c) edwind back: both tabs reconnect, the unacked edit is acked, reaches the other tab and the file on disk

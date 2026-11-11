@@ -827,7 +827,6 @@ body[data-mode="phone"] .rv-face { font-size: 22px; }
 .op-err { color: var(--err); }
 .node.op-stale { box-shadow: 0 0 0 2px var(--warn); }
 .node.op-stale .op-bar .go { background: var(--warn); border-color: var(--warn); }
-.k-term.emacs .hdr .name::before { content: "ε "; color: var(--muted); }
 
 /* ---- tags, filter */
 .hdr .tags { font-size: 11px; color: var(--muted); margin-left: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

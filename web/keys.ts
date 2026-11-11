@@ -135,7 +135,7 @@
       ['k', 'desk.delete', 'delete this desk (the cards stay)'], ['b', 'desk.promote', 'promote: the Board takes their place here'],
       ['s', 'desk.sticky', 'sticky: the selected cards on every desk'], ['t', 'desk.layout', 'layout: free, tile, columns'], ['o', 'desk.open', 'open the folder as a desk'],
       ['u', 'desk.revert', 'revert to its saved state (pinned)'], ['w', 'desk.keep', 'make this its saved state (pinned)']],
-    'leader-v': [['m', 'persp.manual', 'manual'], ['p', 'persp.process', 'process'], ['f', 'persp.fs', 'filesystem'], ['t', 'persp.tag', 'tags'], ['x', 'persp.tmux', 'tmux'],
+    'leader-v': [['m', 'persp.manual', 'manual'], ['p', 'persp.process', 'process'], ['f', 'persp.fs', 'filesystem'], ['t', 'persp.tag', 'tags'],
       ['c', 'persp.proc', 'processes'], ['u', 'persp.unit', 'units'], ['j', 'persp.journal', 'journal'], ['l', 'persp.link', 'links']],
     // transients: the palette and the dialogs keep every key for their own inputs, except Esc
     palette: [['ESC', 'overlay.close', 'close']],

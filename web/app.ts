@@ -790,16 +790,16 @@ function plain(s: unknown): string {
 }
 // A card's shell is a name in the hub's syntax for one (DELTA-1 §B.5); anything else on a board is never shown or sent.
 const shellName: (n: { shell?: string }) => string = n => /^[a-z0-9-]{1,32}$/.test(n.shell || '') ? n.shell! : '';
-type PtyCardNode = TermNode | (ReplNode & Pick<TermNode, 'cwd' | 'tmux' | 'env' | 'shell' | 'tmuxSess' | 'tmuxAdopted' | 'cwdLive' | 'fg'>);
+type PtyCardNode = TermNode | (ReplNode & Pick<TermNode, 'cwd' | 'env' | 'shell' | 'cwdLive' | 'fg'>);
 class PtyBackend implements CardBackend, Wakeable {
   declare n: PtyCardNode; declare t: XtermTerminal; declare L: LiveEntry; declare spawn: boolean; declare tries: number;
   declare resume?: { stream: number; out: number }; declare disposed?: boolean; declare timer?: number; declare waitHub: boolean;
   declare host: Host | null; declare parked: boolean; declare final: boolean; declare helloSeen: boolean; declare ws: WebSocket;
   declare dead?: boolean; declare exitReason?: PtyExitReason | null; declare epoch?: number; declare lost?: boolean; declare helloed?: boolean;
-  declare respawning?: boolean; declare shellOffer?: boolean; declare detachOnly?: boolean;
+  declare respawning?: boolean; declare shellOffer?: boolean;
   constructor(n: PtyCardNode, term: XtermTerminal, L: LiveEntry) { this.n = n; this.t = term; this.L = L; this.spawn = !!n._spawn; delete n._spawn; this.tries = 0; this.connect(); }
   openMsg(): string {
-    const n = this.n, m: Extract<PtyClientMsg, { t: 'open' }> = { t: 'open', id: n.id, cmd: n.cmd || '', parent: n.spawnFrom || '', cwd: n.cwd || '', tmux: n.tmux || '', cols: this.t.cols, rows: this.t.rows, env: { CANVAS_NODE: pathOf(n.id), ...(n.env || {}) }, spawn: this.spawn };
+    const n = this.n, m: Extract<PtyClientMsg, { t: 'open' }> = { t: 'open', id: n.id, cmd: n.cmd || '', parent: n.spawnFrom || '', cwd: n.cwd || '', cols: this.t.cols, rows: this.t.rows, env: { CANVAS_NODE: pathOf(n.id), ...(n.env || {}) }, spawn: this.spawn };
     if (this.spawn && shellName(n)) m.shell = n.shell;
     if (!this.spawn && this.resume) m.resume = this.resume;
     return JSON.stringify(m);
@@ -819,7 +819,6 @@ class PtyBackend implements CardBackend, Wakeable {
         this.final = false;   // a respawn on the socket a failed open left open is live again
         this.L?.el.classList.remove('net-wait');
         if (m.stream != null) this.resume = { stream: m.stream, out: m.out! };
-        if (m.tmux) { if (this.n.tmuxSess !== m.tmux || !!this.n.tmuxAdopted !== !!m.adopted) { this.n.tmuxSess = m.tmux; this.n.tmuxAdopted = !!m.adopted; retag(this.n); } if (m.attached && m.cwd) this.n.cwdLive = m.cwd; }
         if (m.new) {
           if (this.lost || (this.helloed && !this.respawning)) this.t.write('\r\n\x1b[33m[new shell: the server had no session for this card]\x1b[0m\r\n');
           if (this.n._replay) {   // set only by spawnChild in this page, never saved: a board cannot type into a new shell
@@ -903,17 +902,16 @@ class PtyBackend implements CardBackend, Wakeable {
   }
   // only the tab the user is looking at sizes the PTY (ROB-8): the active card, or a terminal holding the keyboard (the dock is never a card)
   resize(cols: number, rows: number): void { if (this.ws?.readyState === 1 && document.visibilityState === 'visible' && document.hasFocus() && (activeId === this.n.id || this.L?.body?.contains(document.activeElement))) this.ws.send(JSON.stringify({ t: 'resize', cols, rows })); }
-  // the card goes: a wb-* tmux session dies with it, an adopted one is only detached (the daemon decides); detachOnly forces a detach.
+  // the card goes, and its session with it (a kill without `session` forgets it).
   // Without an open socket the kill waits for the server; a connecting socket is dropped before it can send its open.
   kill(): void {
     this.disposed = true; clearTimeout(this.timer); WAKE.delete(this);
-    const session = this.detachOnly ? false : undefined;
-    if (this.ws?.readyState === 1) { this.ws.send(JSON.stringify({ t: 'kill', session })); setTimeout(() => this.ws?.close(), 50); }
-    else { try { this.ws?.close(); } catch {} new Reap('/pty', { t: 'open', id: this.n.id, spawn: false }, { t: 'kill', session }, undefined, this.host); }
+    if (this.ws?.readyState === 1) { this.ws.send(JSON.stringify({ t: 'kill' })); setTimeout(() => this.ws?.close(), 50); }
+    else { try { this.ws?.close(); } catch {} new Reap('/pty', { t: 'open', id: this.n.id, spawn: false }, { t: 'kill' }, undefined, this.host); }
   }
   // the card went in another tab: close here, the session is not ours to end
   dispose(): void { this.disposed = true; clearTimeout(this.timer); WAKE.delete(this); try { this.ws?.close(); } catch {} }
-  // end the process (session=true also kills a tmux session) but keep the card: it shows the exit and Enter starts anew
+  // end the process but keep the card (session: true keeps the session record): it shows the exit and Enter starts anew
   end(session?: boolean): void { if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ t: 'kill', session })); }
 }
 // ------------------------------------------------------------------ agent cards: the `acp` kind (30 §1, DESIGN §3.5.2)
@@ -2039,7 +2037,6 @@ function adopt(n: BoardNode, t: FrameNode | null, w?: BoardPoint | null, quiet?:
   if (t && (t === n || (n.kind === 'frame' && descendants(n.id).includes(t)))) return;
   if (!PERSP.building && t?.derived === 'process' && !(t.owner && S.edges.some(e => e.type === 'spawn' && e.from === t.owner && e.to === n.id))) { toast('In the process perspective a folder is a shell and what it spawned. Spawn from the shell (⑂), or switch to the manual perspective.'); return; }
   if (!PERSP.building && t?.derived === 'fs') { fsDrop(n, t); return; }
-  if (!PERSP.building && t?.derived === 'tmux') { toast('In the tmux perspective a folder is a session on the socket. Adopt sessions from the navigator (tmux:), or switch to the manual perspective.'); return; }
   if (!PERSP.building && (t?.derived === 'proc' || t?.derived === 'unit')) { toast('This folder is the host\'s own tree (' + t.derived + '); it is read from the host, not arranged by hand.'); return; }
   if (!PERSP.building && (t?.derived === 'tag' || (perspCur() === 'tag' && from?.derived === 'tag'))) { tagDrop(n, t, from); return; }
   if (!PERSP.building && perspCur() === 'fs' && from?.derived === 'fs' && !(t?.derived === 'fs')) { toast('In the filesystem perspective everything lives in a directory: drop it into another directory to move it.'); return; }
@@ -2217,7 +2214,6 @@ type MountedLive = LiveEntry & { el: HTMLElement; hdr: HTMLElement; body: HTMLEl
   const btns = $('.btns', hdr)!;
   const B = (label: string, title: string, fn: (b: HTMLButtonElement) => unknown) => { const b = el('button', 'hb'); b.textContent = label; b.title = title; b.onclick = ev => { ev.stopPropagation(); fn(b); }; btns.append(b); return b; };
   if (n.kind === 'term' || n.kind === 'repl') {
-    if ((n as TermNode).tmux) B('⇠', 'Adopted tmux session ' + (n as TermNode).tmux + ': detach (the card goes, the session keeps running)', () => removeNode(n.id));
     B('⑂', 'Branch: spawn a child that inherits this node’s context', () => spawnChild(n));
     B('⇢', 'Send the selected output along pipe edges', () => pipeFrom(n));
     B('❝', 'Pin the selected output as a reference card', () => refFrom(n));
@@ -2263,11 +2259,10 @@ type MountedLive = LiveEntry & { el: HTMLElement; hdr: HTMLElement; body: HTMLEl
     B('→', 'Take the picked result out as its own card (an image, or a page for text)', () => opExtract(n));
     B('✦', 'New media card fed by this one', () => opNew(opPicked(n) ? 'edit' : 'imagine', n));
   } else if (n.kind === 'ghost') {
-    B('↗', n.alias ? 'Jump to the real node' : n.tmuxTarget ? 'Adopt: a card attached to this tmux session' : n.dir ? 'Open: this directory becomes a folder' : 'Open: make it real (a page on the file when edwind edits it, else Emacs; a page in demo mode)', () => ghostOpen(n));
+    B('↗', n.alias ? 'Jump to the real node' : n.dir ? 'Open: this directory becomes a folder' : 'Open: make it real (a page on the file when edwind edits it; a page in demo mode)', () => ghostOpen(n));
   }
   B('✕', 'Delete (click twice)', b => confirmDel(b, () => removeNode(n.id))).classList.add('hdel');
   place(n); updateTitle(n);
-  if ((n as TermNode).emacs) L.el.classList.add('emacs');
   if (n.kind === 'term' || n.kind === 'repl') mountTerm(n, L);
   else if (n.kind === 'buffer') mountBuffer(n, L);
   else if (n.kind === 'ref') mountRef(n, L);
@@ -2298,7 +2293,7 @@ function fitChromeAll(z = cam().z) { chromeZ = z; for (const id in live) if (S.n
 function badgeOf(n: BoardNode): string {
   if (n.kind === 'frame' && n.owner && S.nodes[n.owner]) return '✦ ' + S.nodes[n.owner].name;
   if (n.kind === 'artifact') return n.head ? 'v ' + String(n.head).slice(0, 6) : '';
-  if (n.kind === 'ghost') return n.alias ? 'copy' : n.journalDay && !n.noteId ? 'journal' : n.noteId ? 'note' : n.linkTitle ? 'link' : n.tmuxTarget ? 'tmux' : n.procPid ? 'process' : n.unitName ? (n.unitState || 'unit') : n.hardlink ? 'hardlink' : n.link ? 'symlink' : n.mount ? 'mount' : n.dir ? 'directory' : 'file';
+  if (n.kind === 'ghost') return n.alias ? 'copy' : n.journalDay && !n.noteId ? 'journal' : n.noteId ? 'note' : n.linkTitle ? 'link' : n.procPid ? 'process' : n.unitName ? (n.unitState || 'unit') : n.hardlink ? 'hardlink' : n.link ? 'symlink' : n.mount ? 'mount' : n.dir ? 'directory' : 'file';
   if (n.kind === 'term') return n.backend === 'pty' ? shellName(n) || 'shell' : 'sim shell';
   if (n.kind === 'repl') return n.lang === 'js' ? 'js' : (n.cmd || '').split(' ')[0].replace('python3', 'py');
   if (n.kind === 'acp') return agentLabel(n.agent) + ' · ' + (live[n.id]?.backend?.stateText!() || (SESS[n.id]?.state || '…').replace(/_/g, ' '));
@@ -3097,7 +3092,6 @@ function setTool(t: string) {
 $$('[data-tool]').forEach(b => b.onclick = () => setTool(b.dataset.tool!));
 $$('.sw').forEach(b => b.onclick = () => { inkColor = b.dataset.color!; $$('.sw').forEach(x => x.classList.toggle('on', x === b)); if (tool === 'select') setTool('pen'); });
 $('#add-artifact')!.onclick = () => newArtifact('artifact' + (nodeList().filter(n => n.kind === 'artifact').length + 1));
-$('#add-emacs')!.onclick = () => askName('File to open in Emacs', INFO?.notes ? INFO.notes + '/' : '~/', f => newEmacs(f));
 $('#add-web')!.onclick = () => askName('Address', 'https://', u => newWeb(u));
 $('#add-acp')!.onclick = () => newAgentCard();
 $('#add-sketch')!.onclick = () => newSketch();
@@ -3124,7 +3118,6 @@ $('#add-repl')!.onclick = ev => {
   const r = (ev.currentTarget as HTMLElement).getBoundingClientRect();
   replMenu.style.left = r.left + 'px'; replMenu.style.top = r.bottom + 'px';
   $$('.needs-daemon', replMenu).forEach(b => (b as HTMLButtonElement).disabled = !DAEMON);
-  const ae = $('#add-emacs') as HTMLButtonElement | null; if (ae) ae.disabled = !DAEMON;
   replMenu.hidden = !replMenu.hidden;
 };
 $$('#repl-menu button').forEach(b => b.onclick = () => {
@@ -3330,7 +3323,6 @@ for (const c of ['ink', 'red', 'blue']) cmd(`Ink colour: ${c}`, onCanvas(() => {
 cmd('Handwriting → text', () => inkToText(), '', () => INK.ids.length > 0);
 cmd('Show or hide drawing tools', () => toggleDock('draw'));
 cmd('Show or hide the add bar', () => toggleDock('new'));
-cmd('New Emacs buffer…', onCanvas(() => $('#add-emacs')!.click()), '', () => DAEMON);
 cmd('New agent card…', onCanvas(() => newAgentCard()), '', () => DAEMON && (INFO?.agents || []).length);
 {
   const acpActive = () => S.nodes[activeId!]?.kind === 'acp' ? live[activeId!]?.backend : null;
@@ -3950,7 +3942,7 @@ function rgEntries(key: string): RgEntry[] {
       ...rgPerspRoots()];
   }
   if (isFs(key)) return rgFsList(key.slice(FS_PREFIX.length));
-  if (/^(tag|note|journal|link|proc|tmux|unit|attn):/.test(key)) return rgRelList(key);
+  if (/^(tag|note|journal|link|proc|unit|attn):/.test(key)) return rgRelList(key);
   return S.nodes[key] ? rgSort(kidsOf(key).map(rgEntryOf)) : [];
 }
 function rgFsList(path: string): RgEntry[] {
@@ -3974,19 +3966,19 @@ function rgFsList(path: string): RgEntry[] {
 }
 function rgParent(key: string): string | null {
   if (key === 'root') return null;
-  if (/^(tag|note|journal|link|proc|tmux|unit|attn):/.test(key)) return rgRelParent(key);
+  if (/^(tag|note|journal|link|proc|unit|attn):/.test(key)) return rgRelParent(key);
   if (isFs(key)) { const raw = key.slice(FS_PREFIX.length), m = raw.match(/^(@[^:]+:)?([\s\S]*)$/)!, pre = m[1] || '', p = m[2]; if (p === '/' || p === '~' || p === rgHome() && !DAEMON) return 'root'; const up = p.replace(/\/[^/]+\/?$/, '') || '/'; return FS_PREFIX + pre + up; }
   const n = S.nodes[key]; return n?.in && S.nodes[n.in] ? n.in : 'root';
 }
 function rgLabel(key: string): string {
   if (key === 'root') return 'workspace';
-  if (/^(tag|note|journal|link|proc|tmux|unit|attn):/.test(key)) return keyToAddr(key);
+  if (/^(tag|note|journal|link|proc|unit|attn):/.test(key)) return keyToAddr(key);
   if (isFs(key)) return keyToAddr(key);
   return S.nodes[key] ? fullPath(S.nodes[key]) : '?';
 }
 const rgList = () => { const all = rgEntries(RG.dir), f = RG.filter.toLowerCase(); return f ? all.filter(e => fuzzy(f, e.name)) : all; };
 function rgCur() { const l = rgList(); const i = clamp(RG.sel[RG.dir] ?? 0, 0, Math.max(0, l.length - 1)); RG.sel[RG.dir] = i; return { list: l, i, e: l[i] }; }
-const RG_GLYPH: Record<string, string> = { frame: '▸', fsdir: '▸', file: '·', buffer: '¶', term: '$', repl: '›', agent: '✦', acp: '✦', ref: '❝', artifact: '◧', persp: '⊳', itag: '#', inote: '¶', iblock: '§', ijournal: '▸', ghost: '◌', itmux: '⌗', itmuxw: '▭', iproc: '⚙', iunit: '⊙', iattn: '!' };
+const RG_GLYPH: Record<string, string> = { frame: '▸', fsdir: '▸', file: '·', buffer: '¶', term: '$', repl: '›', agent: '✦', acp: '✦', ref: '❝', artifact: '◧', persp: '⊳', itag: '#', inote: '¶', iblock: '§', ijournal: '▸', ghost: '◌', iproc: '⚙', iunit: '⊙', iattn: '!' };
 function rgRow(e: RgEntry, on: boolean, cur?: boolean): HTMLElement {
   const r = el('div', 'rg-row' + (on ? ' on' : '') + (e.dir ? ' dir' : '') + (RG.marks.has(e.key) ? ' marked' : '') + (RG.clip?.keys.includes(e.key) ? ' cut' : '') + (e.n && stashed(e.n) ? ' dim' : ''));
   r.innerHTML = '<span class="g"></span><span class="nm"></span><span class="mt"></span>';
@@ -4016,8 +4008,6 @@ function rgPreview(e: RgEntry | undefined) {
   if (e.proc) { const p = e.proc, meta = el('div', 'rg-meta'); meta.textContent = [keyToAddr(e.key), p.state, p.unit ? 'unit ' + p.unit : '', p.rss ? fmtSize(p.rss) : ''].filter(Boolean).join(' · '); pre.textContent = [p.cmd || p.comm, p.cwd ? 'cwd ' + p.cwd : '', p.start ? 'started ' + new Date(p.start * 1000).toLocaleString() : '', 'pid ' + p.pid + ' · parent ' + p.ppid, e.kids ? e.kids + ' child process' + (e.kids === 1 ? '' : 'es') : ''].filter(Boolean).join('\n'); box.append(meta, pre); return; }
   if (e.unit) { const k = 'unitst:' + e.key; if (RG.fs[k] === undefined) { RG.fs[k] = null; unitShow(e.unit.h, e.unit.name).then(j => { RG.fs[k] = j.status || j.error || ''; setTimeout(() => { delete RG.fs[k]; }, 10000); if (rgCur().e?.key === e.key) rgPreview(e); }).catch(() => { RG.fs[k] = '(cannot read)'; }); }
     const meta = el('div', 'rg-meta'); meta.textContent = [keyToAddr(e.key), e.unit.u.active + '/' + e.unit.u.sub, e.unit.u.description].filter(Boolean).join(' · '); pre.textContent = RG.fs[k] as string | null ?? 'loading…'; box.append(meta, pre); return; }
-  if (e.tmux) { const k = 'tmuxcap:' + e.key; if (RG.fs[k] === undefined) { RG.fs[k] = null; hFetch(e.tmux.h, '/api/tmux/capture?lines=60&target=' + encodeURIComponent(e.tmux.target)).then(r => r.json()).then(j => { RG.fs[k] = j.text || j.error || ''; setTimeout(() => { delete RG.fs[k]; }, 4000); if (rgCur().e?.key === e.key) rgPreview(e); }).catch(() => { RG.fs[k] = '(cannot read)'; }); }
-    const meta = el('div', 'rg-meta'); meta.textContent = [keyToAddr(e.key), e.meta].filter(Boolean).join(' · '); pre.textContent = RG.fs[k] as string | null ?? 'loading…'; box.append(meta, pre); return; }
   if (e.n) {
     const n = e.n, L = live[n.id];
     if (n.kind === 'buffer') pre.textContent = pageText(n);
@@ -4065,7 +4055,6 @@ function rgOpen(e: RgEntry | undefined, canvas?: boolean) {
   if (e.n && e.kind === 'iattn' && MODE.v === 'phone') return focusOpen(e.n);   // F-A13: a full-screen card, not a pan of the canvas viewer
   if (e.n) return e.n.kind === 'buffer' && !canvas ? edOpen(e.n) : jumpNode(e.n);
   if (e.note) return noteOpen(e.note);
-  if (e.tmux) return tmuxAdopt(e.tmux.target, e.tmux.h);
   if (e.go) return e.go();
   if (e.proc) return toast(e.proc.cmd || e.proc.comm);
   if (e.reserved) return toast(e.reserved);
@@ -4075,10 +4064,9 @@ const rgTargets = () => { const { e } = rgCur(); return RG.marks.size ? [...RG.m
 function rgShellHere() {
   const { e } = rgCur(), fsh = isFs(RG.dir) ? fsSplit(RG.dir.slice(3)) : null, fsDir = fsh ? fsh.p : null, folder = !isFs(RG.dir) && RG.dir !== 'root' ? S.nodes[RG.dir] : null;
   setView('canvas');
-  const c = viewCenterWorld(), w = 560, h = 320, hf = fsh?.h ? hostFolder(fsh.h) : null;
+  const c = viewCenterWorld(), w = 560, h = 320;
   const n = addNode({ kind: 'term', backend: DAEMON ? 'pty' : 'fake', shell: shellDefault(), name: 'sh' + (nodeList().filter(m => m.kind === 'term').length + 1), env: {}, ...freeSpot(c.x - w / 2, c.y - h / 2, w, h), w, h,
-    cwd: fsDir ? fsDir.replace(/^~/, DAEMON ? '~' : '/home/me') : DAEMON ? undefined : '/home/me', in: folder ? folder.id : hf ? hf.id : undefined });
-  if (hf) adopt(n, hf, null, true);
+    cwd: fsDir ? fsDir.replace(/^~/, DAEMON ? '~' : '/home/me') : DAEMON ? undefined : '/home/me', in: folder ? folder.id : undefined });
   jumpNode(n, 1, () => live[n.id]?.term?.focus());
 }
 function rgKey(e: KeyboardEvent): boolean {
@@ -4588,7 +4576,7 @@ function renderOutline() {
 
 // ------------------------------------------------------------------ tasks view: TODO / DOING / DONE bullets from every page
 // Tasks are blocks whose first word is a keyword (the user's Org set; DOING/NOW/LATER read as aliases). Planning lines and
-// key:: value fields sit right under the task line, Logseq-style: SCHEDULED: <2026-10-11 Sat>, session:: tmux:agent-x.
+// key:: value fields sit right under the task line, Logseq-style: SCHEDULED: <2026-10-11 Sat>, session:: board:/agents/x.
 const TASK_KWS = ['TODO', 'NEXT', 'WAITING', 'HOLD', 'SOMEDAY', 'DONE', 'CANCELLED'];
 const TASK_RE = /^(\s*[-*+]\s+)(TODO|NEXT|WAITING|HOLD|SOMEDAY|DONE|CANCELLED|DOING|NOW|LATER)(\s+)(.*)$/;
 const COL: Record<string, string> = { TODO: 'TODO', SOMEDAY: 'TODO', LATER: 'TODO', NEXT: 'NEXT', DOING: 'NEXT', NOW: 'NEXT', WAITING: 'WAITING', HOLD: 'WAITING', DONE: 'DONE', CANCELLED: 'DONE' };
@@ -4654,16 +4642,15 @@ async function dispatchTask(t: TaskRow, { host, shell }: { host?: string; shell?
   if (!n) n = nodeList().find(m => m.kind === 'acp' && ['idle', 'done'].includes(SESS[m.id]?.state) && live[m.id]?.backend?.promptable!()) || null;   // an idle agent card first
   if (!n) n = nodeList().find(m => m.kind === 'term' && tagsOf(m).includes('agent') && (!h || fsHostKey(m) === h.url) && live[m.id]?.backend && !live[m.id].backend!.dead && !live[m.id].backend!.parked) || null;
   if (!n) {
-    const hf = h ? hostFolder(h) : null, c = viewCenterWorld(), w = 640, hh = 400;
-    const sh = addNode({ kind: 'term', backend: DAEMON ? 'pty' : 'fake', shell: shellDefault(), name: 'agent' + (nodeList().filter(m => m.kind === 'term').length + 1), env: {}, in: hf ? hf.id : undefined, ...freeSpot(c.x - w / 2, c.y - hh / 2, w, hh), w, h: hh });
-    if (hf) adopt(sh, hf, null, true);
+    const c = viewCenterWorld(), w = 640, hh = 400;
+    const sh = addNode({ kind: 'term', backend: DAEMON ? 'pty' : 'fake', shell: shellDefault(), name: 'agent' + (nodeList().filter(m => m.kind === 'term').length + 1), env: {}, ...freeSpot(c.x - w / 2, c.y - hh / 2, w, hh), w, h: hh });
     throw new Error('no idle agent card or shell with #agent' + (h ? ' on @' + h.name : '') + ': opened ' + pathOf(sh.id) + '. Start your agent there and dispatch again.');
   }
   const L = live[n.id], text = taskText(t); if (!L?.backend) throw new Error(n.name + ' is not running');
   // a page task is written after the paste: a page that takes no edit yet (its board save pending) sends nothing
   if (!t.idx && FR.on && t.node.buf && !(await frWhenWritable(t.node))) throw new Error(t.node.name + ' takes no edit until the board is saved: nothing was sent');
   L.backend.input(text + '\r'); pulse(n.id); if (VIEW === 'canvas') jumpNode(n);
-  const hk = fsHostKey(n), hn = hk ? hostByUrl(hk)?.name : null, sess = tmuxTargetOf(n) ? 'tmux:' + tmuxTargetOf(n) + (hn ? '@' + hn : '') : addrOf(n);
+  const sess = addrOf(n);
   const stamp = new Date().toISOString().slice(0, 16), kw = ['TODO', 'SOMEDAY', 'LATER'].includes(t.kw) ? 'NEXT' : null;
   if (t.idx) {
     const r = await hFetch(null, '/api/task/' + encodeURIComponent(t.id), { method: 'POST', body: JSON.stringify({ kw, set: { session: sess, dispatched: stamp } }), headers: { 'Content-Type': 'application/json' } });
@@ -4710,7 +4697,7 @@ function renderTasks() {
       const bits = [];
       if (t.priority) bits.push(['#' + t.priority, 'prio']);
       if (t.deadline) bits.push(['⏰ ' + t.deadline, over ? 'over' : '']); else if (t.scheduled) bits.push(['▸ ' + t.scheduled, over ? 'over' : '']);
-      if (t.session) bits.push(['⇢ ' + t.session.replace(/^tmux:/, ''), 'sess']);
+      if (t.session) bits.push(['⇢ ' + t.session, 'sess']);
       if (t.idx && t.tags?.length) bits.push([t.tags.map(x => '#' + x).join(' '), '']);
       for (const [txt, cls] of bits) { const sp = el('span', cls, txt); meta.append(sp); }
       if (!bits.length) meta.remove();
@@ -6195,16 +6182,16 @@ async function frOpenToday() {
   toast(`Created page ${TODAY}`);
   jumpNode(p, 1, () => focusEnd(p));
 }
-// ---- notes and files open as pages (noteOpen, ghostOpen). This reverses the spec's NG5/D6, where the Emacs card stayed
-// the opener of notes and files: edwind's visit-id names the id it would visit FILE under, or refuses it (the refusal
-// list, not UTF-8 text, missing) or answers read-only (outside its writable paths, over 32 MiB). Then, and while edwind is
-// down, EMACS() opens the file in an Emacs card as before. LINE > 1 puts the frame's point at the start of that line.
+// ---- notes and files open as pages (noteOpen, ghostOpen): edwind's visit-id names the id it would visit FILE under, or
+// refuses it (the refusal list, not UTF-8 text, missing) or answers read-only (outside its writable paths, over 32 MiB).
+// Then, and while edwind is down, nothing opens and a toast says why (the host has no other editor for a card).
+// LINE > 1 puts the frame's point at the start of that line.
 // Only the first connection attempt is waited for (3 s at most); once it was made or failed, edwind down falls back at once.
-async function frFileOpen<R>(file: string, props: { x?: number; y?: number; w?: number; h?: number }, line: number, emacs: () => R) {
+async function frFileOpen(file: string, props: { x?: number; y?: number; w?: number; h?: number }, line: number): Promise<PageNode | null> {
   if (!FR.tried && !FR.failed) await Promise.race([frWhenReady(), new Promise(r => setTimeout(r, 3000))]);
   const r = FR.online ? await FR.Ed!.sync.call({ cmd: 'visit-id', args: [file], ctx: {} }) : null;
   const id = r && !r.error && r.value && !r.value.readOnly ? r.value.buf : null;
-  if (!id) return emacs();
+  if (!id) { toast(`${file} does not open as a page: ${!r ? 'edwind is not running' : r.error ? (r.error.message || r.error) : r.value?.readOnly ? 'edwind has it read-only' : 'edwind refused it'}.`, 6000); return null; }
   const n = nodeList().find(m => m.kind === 'buffer' && m.buf && frBufNow(m.buf) === id) as PageNode | undefined || addNode({ kind: 'buffer', name: clean(id.replace(/^.*\//, '').replace(/\.(md|org)$/, '')), w: 420, h: 300, ...props, buf: id } as AddNodeArg) as PageNode;
   const at = line > 1 ? (f: EdwinFrame, b: EdwinBuffer) => { const d = new TextDoc(b.text); f.setPoint(d.line(Math.min(line, d.lines)).from); } : undefined;
   jumpNode(n, 1, () => frFocus(n, at));
@@ -6477,7 +6464,7 @@ async function boot() {
   migrateV9();
   // No /api/hosts at boot: wb-web answers it 404 by design (multi-host is a v1 non-goal; DESIGN §3.5.5), so the call
   // only put an error in the console of every load.
-  perspChip(); { const ah = $('#add-host') as HTMLButtonElement | null; if (ah) ah.disabled = !DAEMON; } acpButton();
+  perspChip(); acpButton();
   hashInit();
   { const f = new URLSearchParams(location.search).get('focus'); if (f) { history.replaceState(null, '', location.pathname + location.hash); setTimeout(() => attnFocus(f), 600); } }   // opened by a notification (F-A12)
   if (separateAll()) { restack(); renderLinks(); }
@@ -6503,26 +6490,13 @@ async function boot() {
   setView(S.view || (fresh && innerWidth < 760 ? 'ranger' : 'canvas'));
   sideTab();
   placeInkChip();
-  wireReview(); detectMode(); { const ae = $('#add-emacs') as HTMLButtonElement | null; if (ae) ae.disabled = !DAEMON; }
+  wireReview(); detectMode();
   if (view.persp && view.persp !== 'manual' && PERSP_NAMES[view.persp]) { perspSet(view.persp, true); if (perspCur() === 'fs') setTimeout(() => { perspEdgesRebuild(); renderLinks(); }, 300); }
   deskRestore(view); winInit();
   wsRestore(); focusRestoreTabs();
   BOOTED = true; SAVE.lastJson = serialize(); viewSave();
 }
-// ------------------------------------------------------------------ node kinds around terminals, Emacs, browser, artifacts, sketch
-// Emacs buffer: a real PTY running emacsclient -t on one file (starts a daemon if none), falling back to emacs -nw.
-function emacsCmd(file: string): string {
-  const q = "'" + String(file).replace(/'/g, "'\\''") + "'";
-  return `f=${q}; if command -v emacsclient >/dev/null 2>&1; then emacsclient -t -a '' "$f"; else emacs -nw "$f"; fi`;
-}
-function newEmacs(file: string) {
-  if (!DAEMON) { toast('Emacs buffers need the self-hosted Workbench (wb-web).'); return null; }
-  file = String(file || '').trim(); if (!file) return null;
-  const base = file.replace(/\/+$/, '').split('/').pop() || 'scratch';
-  const n = newAt('term', { backend: 'pty', cmd: emacsCmd(file), emacs: file, name: base, w: 640, h: 440, env: { TERM: 'xterm-256color', COLORTERM: 'truecolor' } });
-  live[n.id]?.el!.classList.add('emacs');
-  return n;
-}
+// ------------------------------------------------------------------ node kinds around terminals: browser, artifacts, sketch
 // Browser window: a page in a frame. Sites that send X-Frame-Options or a frame-ancestors CSP stay blank; ↗ opens them outside.
 // Only http(s) pages: a javascript: or data: URL from a board or a tool would run script (SEC-1).
 const webUrlOk = (u: string): boolean => { try { return /^https?:$/.test(new URL(u).protocol); } catch { return false; } };
@@ -7560,7 +7534,6 @@ async function newArtifactFromFile(file: string) {
 // start watching file-backed artifacts that were on the board at load, and new ones as they mount
 AGENT_TOOLS.push(
   { name: 'open_web', description: 'Open a web page as a browser-window node on the canvas.', inputSchema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }, run: ({ url }: { url: string }) => { if (!normUrl(url)) throw new Error('only http and https URLs open in a web node'); const n = newWeb(url); return `opened ${n.name}`; } },
-  { name: 'open_in_emacs', description: 'Open a file in an Emacs buffer node (local build only).', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, run: ({ path }: { path: string }) => { const n = newEmacs(path); return n ? `opened ${n.name}` : 'needs the local build'; } },
   { name: 'artifact_from_file', description: 'Show an HTML file as an artifact node that reloads whenever the file changes (local build only).', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, run: async ({ path }: { path: string }) => { const n = await newArtifactFromFile(path); return n ? `showing ${path} as ${n.name}` : 'needs the local build'; } },
 );
 // ------------------------------------------------------------------ tags on nodes; agents are terminals; no assistant pane
@@ -7568,12 +7541,11 @@ AGENT_TOOLS.push(
 // process is an agent CLI. #aggregator: the node is a container (folders always are; a tagged terminal gets a folder of its own).
 const AGENT_RE = /^(claude|claude-code|oh-my-pi|omp|aider|codex|gemini|goose|opencode|copilot|cursor-agent|amp|crush|pi)$/i;
 let TAG_FILTER = '';
-function autoTags(n: BoardNode & { emacs?: string }): string[] {
+function autoTags(n: BoardNode): string[] {
   const t: string[] = [];
-  if (n.kind === 'frame') { t.push('aggregator'); if (n.host) t.push('host'); if (n.unitState) t.push(n.unitState); if (n.tmuxState) t.push(n.tmuxState); }
-  if (n.kind === 'term') { const first = (n.cmd || '').trim().split(/\s+/)[0]?.split('/').pop() || ''; if ((n.fg && AGENT_RE.test(n.fg)) || AGENT_RE.test(first)) t.push('agent'); if (n.tmux) t.push('tmux'); }
+  if (n.kind === 'frame') { t.push('aggregator'); if (n.host) t.push('host'); if (n.unitState) t.push(n.unitState); }
+  if (n.kind === 'term') { const first = (n.cmd || '').trim().split(/\s+/)[0]?.split('/').pop() || ''; if ((n.fg && AGENT_RE.test(n.fg)) || AGENT_RE.test(first)) t.push('agent'); }
   if (n.kind === 'acp') t.push('agent');   // the state is never a tag: tags write the board
-  if (n.emacs) t.push('emacs');
   return t;
 }
 function tagsOf(n: BoardNode | null | undefined): string[] { return n ? [...new Set([...autoTags(n), ...(n.tags || [])])] : []; }
@@ -8999,7 +8971,7 @@ const KC: Record<string, KeyCmdFn> = {
   fullscreen: () => toggleFullscreen(),
   leave: () => leaveCard(LEADER.target),
   cancel: () => {},
-  ...Object.fromEntries((['manual', 'process', 'fs', 'tag', 'tmux', 'proc', 'unit', 'journal', 'link'] as PerspName[]).map(p => ['persp.' + p, () => perspSet(p)])),
+  ...Object.fromEntries((['manual', 'process', 'fs', 'tag', 'proc', 'unit', 'journal', 'link'] as PerspName[]).map(p => ['persp.' + p, () => perspSet(p)])),
 };
 { const missing = [...WBKeys.commands()].filter(c => !KC[c]); if (missing.length) console.error('keys: bound but not defined: ' + missing.join(', ')); }
 
@@ -9154,10 +9126,10 @@ cmd('Layout: keep a boundary between items (no overlap)', () => { S.noOverlap = 
 cmd('Fold: package the other folders on this level (focus) / unfold all', onCanvas(() => foldCycle()), '@fold.cycle');
 
 // ------------------------------------------------------------------ hosts, perspectives, cascading folder modes
-// ---- hosts: a folder may carry a host {name, url, token}. Everything inside it that needs a process (shell, Emacs, file
+// ---- hosts: a folder may carry a host {name, url, token}. Everything inside it that needs a process (shell, file
 // listing) runs on that host's daemon; folders without a host use the daemon that served the page. One page, one board,
 // several daemons. Sampling always goes through the serving daemon (one API key, in its environment).
-let HOSTLIST: Host[] = [];           // from the serving daemon's /api/hosts (its hosts.json: name, url, token)
+let HOSTLIST: Host[] = [];           // known hosts; empty since wb-web serves no /api/hosts (multi-host is a non-goal)
 const HOSTCONN: Record<string, HostConn & { rpc?: Rpc }> = {};         // url -> { rpc, down, since }
 const hostKey = (h: Host | null | undefined): string => h ? h.url : '';
 function hostRes(h: Partial<Host> | null | undefined): Host | null {        // a folder's host record resolved against hosts.json (the file wins on name; a typed URL stands alone)
@@ -9191,46 +9163,7 @@ function hostRetry(url: string, loud?: boolean): number {
   if (loud) toast(k ? `Reconnecting ${k} shell(s)…` : 'No parked shell on that host.');
   return k;
 }
-async function hostsLoad(): Promise<Host[]> {
-  try { const j: { hosts?: { name: string; url: unknown; token?: string; sample?: unknown }[] } = await (await hFetch(null, '/api/hosts')).json(); HOSTLIST = (j.hosts || []).map(h => ({ name: h.name, url: String(h.url).replace(/\/$/, ''), token: h.token || '', sample: !!h.sample })); } catch { HOSTLIST = []; }
-  for (const f of frameList()) if (f.host) placeFrame(f);
-  if (VIEW === 'ranger') renderRanger();
-  return HOSTLIST;
-}
-function parseHost(v: string): FolderHost | null {       // "build1" (from hosts.json) · "build1=http://192.0.2.7:7970#token" · "http://192.0.2.7:7970"
-  v = String(v || '').trim(); if (!v) return null;
-  const m = v.match(/^([\w.-]+)\s*=\s*(\S+)$/); let name = m ? m[1] : null, rest = m ? m[2] : v, token = '';
-  const t = rest.match(/^(.*)#([\w-]+)$/); if (t) { rest = t[1]; token = t[2]; }
-  if (/^https?:\/\/\S+$/.test(rest)) { const url = rest.replace(/\/$/, ''); return { name: name || url.replace(/^https?:\/\//, '').split(/[/:]/)[0], url, token }; }
-  if (!name && HOSTLIST.find(h => h.name === rest)) return { name: rest };
-  return null;
-}
-function setHost(f: BoardNode | null | undefined, h: FolderHost | null, quiet?: boolean): void {
-  if (!f || f.kind !== 'frame') return;
-  if (h) { const r = hostRes(h); f.host = r && HOSTLIST.includes(r) ? { name: r.name } : { name: h.name, url: h.url, ...(h.token ? { token: h.token } : {}) }; } else delete f.host;
-  placeFrame(f); renderTree(); wsApply(false); if (VIEW === 'ranger') renderRanger(); dirty();
-  if (!quiet) toast(h ? `${f.name} runs on @${hostRes(f.host)?.name || h.name}: new shells inside start there.` : `${f.name} runs on this machine again.`);
-}
-function newHostFolder(h: FolderHost): FrameNode { const n = newAt('frame', { mode: 'free', shape: 'folder' }) as FrameNode; n.name = hostRes(h)?.name || h.name || 'host'; setHost(n, h, true); return n; }
-function hostFolder(h: FolderHost): FrameNode | null { const r = hostRes(h); if (!r) return null; return hostFrames(r.url).find(f => !f.in) || hostFrames(r.url)[0] || newHostFolder(r); }
-function hostPrompt(label: string, cb: (h: FolderHost) => void): void {
-  const known = HOSTLIST.map(h => h.name);
-  askName(label + (known.length ? '. Known: ' + known.join(', ') : '. No hosts.json yet') + '. Or name=http://addr:port#token', known[0] || '', v => { const h = parseHost(v); if (!h) return toast('Give a host from hosts.json, or name=http://addr:port#token.'); cb(h); });
-}
-function hostFolderPrompt() { if (!DAEMON) return toast('Host folders need a Workbench server that lists hosts.'); hostPrompt('Host for the new folder', h => { const f = newHostFolder(h); activate(f.id); }); }
 function cwdMoved(n: TermNode): void { PERSP.onCwd?.(n); }
-$('#add-host')!.onclick = () => hostFolderPrompt();
-cmd('New host folder…', () => hostFolderPrompt(), '', () => DAEMON);
-cmd('Folder: bind the active folder to a host…', () => { const f = foldTarget(); if (!f) return toast('Pick a folder first.'); hostPrompt('Host for ' + f.name, h => setHost(f, h)); }, '', () => DAEMON && !!activeId);
-cmd('Folder: unbind from its host', () => { const f = foldTarget(); if (f?.host) setHost(f, null); }, '', () => !!foldTarget()?.host);
-cmd('Host: reconnect the parked shells of the active folder', () => { const f = foldTarget(), h = f && hostOf(f); if (h) hostRetry(h.url, true); else toast('Pick a host folder first.'); }, '', () => !!(foldTarget() && hostOf(foldTarget())));
-cmd('Host: reload hosts.json', () => hostsLoad().then(l => toast(l.length ? l.length + ' host(s): ' + l.map(h => h.name).join(', ') : 'No hosts in ' + (INFO?.state || '~/.canvas-proto') + '/hosts.json')), '', () => DAEMON);
-AGENT_TOOLS.push(
-  { name: 'list_hosts', description: 'List the hosts this Workbench can bind folders to (from hosts.json) and which folders use them.', inputSchema: { type: 'object', properties: {} },
-    run: () => allHosts().map(h => `@${h.name} ${h.url}${HOSTCONN[h.url]?.down ? ' (down)' : ''}: ${hostFrames(h.url).map(f => fullPath(f)).join(', ') || 'no folder'}`).join('\n') || '(no hosts: add ~/.canvas-proto/hosts.json on the serving daemon)' },
-  { name: 'host_folder', description: 'Make a folder bound to a host (its shells run there). host: a name from hosts.json or name=http://addr:port#token.', inputSchema: { type: 'object', properties: { host: { type: 'string' } }, required: ['host'] },
-    run: ({ host }: { host: string }) => { const h = parseHost(host); if (!h) throw new Error('unknown host ' + host); const f = newHostFolder(h); return `folder ${f.name} on @${hostRes(f.host)?.name}`; } },
-);
 
 // ---- cascading folder modes (user, 11:26): Shift-click a mode button, leader E B T R S, or the palette
 function setModeCascade(f: BoardNode | null | undefined, m: FrameMode, quiet?: boolean): void {
@@ -9249,9 +9182,9 @@ AGENT_TOOLS.push({ name: 'folder_mode', description: 'Set a folder\'s mode: free
 // perspective derives folders from a different relation and shows them with the same layout engine. While a derived
 // perspective is shown, the manual relation and every position are kept in S.manual and restored exactly on return.
 /* The perspectives' state: whether one is being built, the fs hook on a cd, its edges, the link root and pending loads. */
-interface PerspState { building: boolean; onCwd: ((n: TermNode) => void) | null; fsReady: boolean; edges: Edge[]; linkRoot?: string; linkWait?: string; tmuxWait?: boolean; unitWait?: boolean }
+interface PerspState { building: boolean; onCwd: ((n: TermNode) => void) | null; fsReady: boolean; edges: Edge[]; linkRoot?: string; linkWait?: string; unitWait?: boolean }
 const PERSP: PerspState = { building: false, onCwd: null, fsReady: true, edges: [] };
-const PERSP_NAMES: Record<string, string | undefined> & Record<PerspName, string> = { manual: 'manual: folders as you made them', process: 'process: a shell and what it spawned', fs: 'filesystem: directories on each host', tag: 'tags: one folder per tag, copies under the others', tmux: 'tmux: one folder per session on each host\'s socket', proc: 'processes: each shell with the OS processes under it', unit: 'units: systemd services on each host, shells under their unit', journal: 'journal: year › month › day over the dated pages and journal files', link: 'links: pages under the page that links to them (from one root)' };
+const PERSP_NAMES: Record<string, string | undefined> & Record<PerspName, string> = { manual: 'manual: folders as you made them', process: 'process: a shell and what it spawned', fs: 'filesystem: directories on each host', tag: 'tags: one folder per tag, copies under the others', proc: 'processes: each shell with the OS processes under it', unit: 'units: systemd services on each host, shells under their unit', journal: 'journal: year › month › day over the dated pages and journal files', link: 'links: pages under the page that links to them (from one root)' };
 const perspCur = (): PerspName => S.persp || 'manual';
 function perspSnapshot(): void {
   const snap: Required<PerspSnapshot> = { in: {}, pos: {}, order: {}, frames: {} };   // order: a derived folder renumbers what it takes in
@@ -9330,7 +9263,6 @@ function perspBuild(p: PerspName): void {
       for (const t of tags.slice(1)) { const g = { id: uid('n'), kind: 'ghost', ghost: true, alias: n.id, name: n.name, in: tagFrame(t, n).id, order: 1e9, x: n.x, y: n.y, w: 220, h: 54 } satisfies GhostNode; S.nodes[g.id] = g; mount(g); renumber(S.nodes[g.in] as FrameNode); relayout(S.nodes[g.in]); }
     }
   }
-  if (p === 'tmux') tmuxPerspBuild(related);
   if (p === 'journal') journalPerspBuild(related);
   if (p === 'link') linkPerspBuild(related);
   if (p === 'proc') procPerspBuild(related);
@@ -9351,7 +9283,6 @@ function perspBuild(p: PerspName): void {
 function perspSet(p: PerspName, quiet?: boolean): void {
   if (!PERSP_NAMES[p]) return;
   if (p === 'fs' && !PERSP.fsReady) { toast('The filesystem perspective comes in the next version.'); return; }
-  if (p === 'tmux' && !DAEMON) { toast('The tmux perspective needs a Workbench server with tmux.'); return; }
   if (p === 'link' && !PERSP.linkRoot) { const n = n0(); const e = n && n.kind === 'buffer' ? n.name : (linkEntities().map(e => [e, linkTargets(e).length] as const).sort((a, b) => b[1] - a[1])[0] || [])[0]?.title; if (!e) { toast('No page links to another yet.'); return; } PERSP.linkRoot = e; }
   const cur = perspCur(); if (cur === p) { if (!quiet) toast('Already in the ' + p + ' perspective.'); return; }
   const from = deskPlace();
@@ -9388,7 +9319,6 @@ cmd('Perspective: manual (folders as you made them)', () => perspSet('manual'), 
 cmd('Perspective: process (a shell and what it spawned)', () => perspSet('process'), 'Ctrl-Space v p', () => perspCur() !== 'process');
 cmd('Perspective: filesystem (directories on each host)', () => perspSet('fs'), 'Ctrl-Space v f', () => perspCur() !== 'fs');
 cmd('Perspective: tags (one folder per tag, copies under the others)', () => perspSet('tag'), 'Ctrl-Space v t', () => perspCur() !== 'tag');
-cmd('Perspective: tmux (one folder per session on each host\'s socket)', () => perspSet('tmux'), 'Ctrl-Space v x', () => perspCur() !== 'tmux' && DAEMON && !!INFO?.tmux);   // tmux:false: /api/tmux is 404 in wb-web
 cmd('Perspective: processes (each shell with the OS processes under it)', () => perspSet('proc'), 'Ctrl-Space v c', () => perspCur() !== 'proc');
 cmd('Perspective: units (systemd services on each host)', () => perspSet('unit'), 'Ctrl-Space v u', () => perspCur() !== 'unit');
 cmd('Perspective: journal (year › month › day)', () => perspSet('journal'), 'Ctrl-Space v j', () => perspCur() !== 'journal');
@@ -9398,12 +9328,12 @@ cmd('Journal: next day (]d in the navigator)', () => journalStep(1), '', () => t
 cmd('Journal: previous day ([d in the navigator)', () => journalStep(-1), '', () => true);
 cmd('Perspective: rebuild the derived folders', () => perspRebuild(), '', () => perspCur() !== 'manual');
 cmd('Filesystem: list the active directory as ghost entries', () => { const f = foldTarget(); if (f?.derived === 'fs') fsExpand(f); else toast('Pick a directory folder in the filesystem perspective (Ctrl-Space v f).'); }, '', () => perspCur() === 'fs');
-AGENT_TOOLS.push({ name: 'set_perspective', description: 'Switch the board perspective: manual (stored folders), process (spawn tree), fs (directories on each host), tag (one folder per tag), tmux (one folder per tmux session).', inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
-  run: ({ name }: { name: PerspName }) => { if (!PERSP_NAMES[name]) throw new Error('perspective must be manual, process, fs, tag, tmux, proc or unit'); perspSet(name, true); return 'perspective: ' + perspCur(); } });
+AGENT_TOOLS.push({ name: 'set_perspective', description: 'Switch the board perspective: manual (stored folders), process (spawn tree), fs (directories on each host), tag (one folder per tag), proc (processes), unit (systemd units), journal, link.', inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
+  run: ({ name }: { name: PerspName }) => { if (!PERSP_NAMES[name]) throw new Error('perspective must be manual, process, fs, tag, proc, unit, journal or link'); perspSet(name, true); return 'perspective: ' + perspCur(); } });
 
 // ---- filesystem perspective (user, 09:36): the host's directory tree is one more relation, tagged as its own edge kind.
 // A directory is a derived folder (`derived: 'fs'`, `fsHost`, `fsPath`); a node sits in the directory it lives in: a shell in
-// its cwd (it moves when the daemon reports a cd), an Emacs buffer or file artifact beside its file. Nothing lists a whole
+// its cwd (it moves when the daemon reports a cd), a file artifact beside its file. Nothing lists a whole
 // host: ☰ on a directory lists it once, as ghost cards; a ghost becomes real when opened. Symlinks: a ghost under its own
 // directory with a dashed `symlink` edge to the target when that target is on the board. Dropping into a directory: a shell
 // cd's there; a file is moved on the host (mv) after a confirm.
@@ -9426,7 +9356,6 @@ function fsIdent(n: BoardNode): FsIdent | null {
   if (n.kind === 'ghost') return n.path ? { host: n.host || '', dir: fsDirname(n.path), path: n.path } : null;
   if (n.kind === 'term') {
     const host = fsHostKey(n), d = n.cwdLive || n.cwd;
-    if (n.emacs) { const f = fsTilde(fsNorm(n.emacs, d || '~'), host); return { host, dir: fsDirname(f), path: f }; }
     if (!d) return null; return { host, dir: fsTilde(fsNorm(d), host) };
   }
   if (n.kind === 'artifact' && n.file) { const f = fsTilde(fsNorm(n.file, '~'), ''); return { host: '', dir: fsDirname(f), path: f }; }
@@ -9452,10 +9381,9 @@ function fsFrameFor(host: string, dir: string, near?: BoardPoint | null): FrameN
 function mountGhost(n: GhostNode, L: LiveEntry): void {
   L.body!.classList.add('ghost-body');
   if (n.journalDay && !n.noteId) { L.body!.textContent = '▦ ' + n.name; L.body!.title = 'No entry for ' + n.journalDay + ' yet. Double-click or ↗ creates it.'; L.body!.ondblclick = ev => { ev.stopPropagation(); ghostOpen(n); }; return; }
-  if (n.noteId && !n.alias) { L.body!.textContent = '¶ ' + n.name + (n.meta ? '  ' + n.meta : ''); L.body!.title = 'A note in the index, not on the board. Double-click or ↗ opens it' + (DAEMON ? (FR.on ? ' as a page.' : ' in Emacs.') : '.'); L.body!.ondblclick = ev => { ev.stopPropagation(); ghostOpen(n); }; return; }
+  if (n.noteId && !n.alias) { L.body!.textContent = '¶ ' + n.name + (n.meta ? '  ' + n.meta : ''); L.body!.title = 'A note in the index, not on the board. Double-click or ↗ opens it' + (DAEMON ? (FR.on ? ' as a page.' : ' once edwind runs.') : '.'); L.body!.ondblclick = ev => { ev.stopPropagation(); ghostOpen(n); }; return; }
   if (n.linkTitle && !n.alias) { L.body!.textContent = '[[' + n.name + ']]  ' + (n.meta || 'no page yet'); L.body!.title = 'Linked, but no page or note has this title. Double-click or ↗ creates the page.'; L.body!.ondblclick = ev => { ev.stopPropagation(); ghostOpen(n); }; return; }
   if (n.alias) { const r = S.nodes[n.alias]; L.body!.textContent = '≡ ' + (r?.name || n.name) + '  (' + (n.meta || 'also here') + ')'; L.body!.title = 'A copy: the real node sits under its first tag. Double-click or ↗ jumps to it.'; L.body!.ondblclick = ev => { ev.stopPropagation(); ghostOpen(n); }; return; }
-  if (n.tmuxTarget) { L.body!.textContent = '⌗ ' + n.name + (n.meta ? '  ' + n.meta : ''); L.body!.title = 'tmux session ' + n.tmuxTarget + ' with no card yet. Double-click or ↗ adopts it.'; L.body!.ondblclick = ev => { ev.stopPropagation(); ghostOpen(n); }; return; }
   if (n.procPid) { L.body!.textContent = '⚙ ' + n.name + (n.meta ? '  ' + n.meta : ''); L.body!.title = 'Process ' + n.procPid + (n.cmd ? ': ' + n.cmd : '') + '. Double-click or ↗ shows it in the navigator.'; L.body!.ondblclick = ev => { ev.stopPropagation(); ghostOpen(n); }; return; }
   if (n.unitName) { L.body!.textContent = (n.unitState === 'failed' ? '✗ ' : n.unitState === 'active' ? '● ' : '○ ') + n.name + (n.meta ? '  ' + n.meta : ''); L.body!.title = n.unitName + ': ' + (n.unitState || '') + '. Double-click or ↗ shows its status in the navigator.'; L.body!.classList.toggle('bad', n.unitState === 'failed'); L.body!.ondblclick = ev => { ev.stopPropagation(); ghostOpen(n); }; return; }
   L.body!.textContent = (n.hardlink ? '⧉ ' : n.mount ? '⛁ ' : n.dir ? '▸ ' : '· ') + n.name + (n.link ? '  →  ' + n.link : n.hardlink ? '  (also ' + ((S.nodes[n.hardlink] as GhostNode | undefined)?.path || 'elsewhere') + ')' : n.nlink! > 1 ? '  ×' + n.nlink : n.mount ? '  mount' : '');
@@ -9490,17 +9418,15 @@ function ghostOpen(n: BoardNode | null | undefined) {
   if (n.linkTitle) { const f = n.in && S.nodes[n.in] as FrameNode; const p = addNode({ kind: 'buffer', name: n.linkTitle, text: '# ' + n.linkTitle + '\n\n- ', in: f ? f.id : undefined, x: n.x, y: n.y, w: 420, h: 300 }); removeGhost(n); if (f) { renumber(f); relayout(f, true); } restack(); renderTree(); dirty(); return p; }
   if (n.procPid) { goAddr('proc:' + (n.host && hostByUrl(n.host) ? '@' + hostByUrl(n.host)!.name : '') + '/' + n.procPid); return null; }
   if (n.unitName) { goAddr('unit:' + (n.host && hostByUrl(n.host) ? '@' + hostByUrl(n.host)!.name : '') + '/' + n.unitName); return null; }
-  if (n.tmuxTarget) { const f = n.in && S.nodes[n.in] as FrameNode; const real = tmuxAdopt(n.tmuxTarget, n.host ? hostByUrl(n.host) : null, { in: f ? f.id : undefined, x: n.x, y: n.y }); if (real) { removeGhost(n); if (f) { renumber(f); relayout(f, true); } restack(); renderTree(); dirty(); } return real; }
   const f = n.in && S.nodes[n.in] as FrameNode, host = n.host || '', target = n.link ? fsNorm(n.link, fsDirname(n.path!)) : n.path!;
   if (n.dir) { const d = fsFrameFor(host, n.link ? target : n.path!, n); if (n.mount) { d.mount = true; placeFrame(d); } removeGhost(n); if (f) relayout(f, true); restack(); renderTree(); renderLinks(); dirty(); fsExpand(d); activate(d.id); return d; }
   const place = { in: f ? f.id : undefined, x: n.x, y: n.y };
   const done = (real: BoardNode | null | undefined) => { if (!real) return null; removeGhost(n); if (f) { renumber(f); relayout(f, true); } restack(); renderTree(); perspEdgesRebuild(); renderLinks(); dirty(); return real; };
   if (DAEMON && !host && /\.pdf$/i.test(target)) return done(addNode({ kind: 'pdf', name: uniqueName(n.name.replace(/\.pdf$/i, ''), 'pdf'), path: target, ...place, w: 520, h: 680 }));   // a PDF reads as a pdf card (F-A40)
   if (!DAEMON) { const file = fsGet(target.replace(/^~/, '/home/me')); return done(addNode({ kind: 'buffer', name: n.name, text: file?.t === 'f' ? file.d : '# ' + n.name + '\n', ...place, w: 460, h: 320 })); }
-  const emacs = () => { const real = addNode({ kind: 'term', backend: 'pty', cmd: emacsCmd(target), emacs: target, name: n.name, ...place, w: 640, h: 440, env: { TERM: 'xterm-256color', COLORTERM: 'truecolor' } }); live[real.id]?.el!.classList.add('emacs'); return real; };
   // A file on this host opens as a page when edwind edits it (frFileOpen); the /edit socket reaches this host's edwind only.
-  if (FR.on && !host) return frFileOpen(target, { ...place, w: 460, h: 320 }, 0, emacs).then(done);
-  return done(emacs());
+  if (!FR.on || host) { toast(host ? 'Files on another host do not open here.' : 'Files open as pages, which need edwind.'); return null; }
+  return frFileOpen(target, { ...place, w: 460, h: 320 }, 0).then(done);
 }
 function perspEdgesRebuild(): void {
   PERSP.edges = []; if (perspCur() !== 'fs') return;
@@ -9513,7 +9439,7 @@ function fsDrop(n: BoardNode, t: FrameNode) {
   const host = t.fsHost || '', dst = t.fsPath!, hn = host ? hostByUrl(host) : null, where = dst + (hn ? ' @' + hn.name : ''), i = fsIdent(n);
   const settle = () => { PERSP.building = true; adopt(n, t, null, true); PERSP.building = false; perspEdgesRebuild(); renderLinks(); updateTitle(n); dirty(); };
   if (n.kind === 'frame') return toast('Directories are moved from a shell (mv); these folders mirror the host.');
-  if (n.kind === 'term' && !n.emacs) {   // a shell lives in its cwd: dropping it into a directory is cd
+  if (n.kind === 'term') {   // a shell lives in its cwd: dropping it into a directory is cd
     if ((i?.host || '') !== host) return toast('That directory is on another host; open a shell there instead.');
     if (n.backend === 'pty') { live[n.id]?.backend?.input?.(` cd '${dst.replace(/'/g, "'\\''")}'\r`); toast(`${n.name}: cd ${dst}. It moves when the shell reports its new directory.`); }
     else { n.cwd = dst.replace(/^~/, '/home/me'); settle(); toast(`${n.name}: cd ${dst}`); }
@@ -9527,9 +9453,9 @@ function fsDrop(n: BoardNode, t: FrameNode) {
     if (!/^y/i.test(v)) return;
     if (DAEMON) { try { await fsMv(hn, i.path!, newPath); } catch (e) { toast('mv failed: ' + (e.message || e)); return; } }
     else { const src = fsGet(i.path!.replace(/^~/, '/home/me')), dd = fsGet(dst.replace(/^~/, '/home/me')), parent = fsGet(fsDirname(i.path!).replace(/^~/, '/home/me')); if (!src || !dd || dd.t !== 'd' || !parent) return toast('mv failed in the demo filesystem.'); delete (parent as FakeFsDir).c[fsBase(i.path!)]; dd.c[fsBase(i.path!)] = src; }
-    if (n.kind === 'ghost') { n.path = newPath; const L = live[n.id]; if (L) mountGhost(n, L); } else if ((n as TermNode).emacs) (n as TermNode).emacs = newPath; else if ((n as ArtifactNode).file) (n as ArtifactNode).file = newPath;
+    if (n.kind === 'ghost') { n.path = newPath; const L = live[n.id]; if (L) mountGhost(n, L); } else if ((n as ArtifactNode).file) (n as ArtifactNode).file = newPath;
     settle();
-    toast(`Moved to ${newPath}${hn ? ' on @' + hn.name : ''}.${(n as TermNode).emacs ? ' Emacs still shows the old buffer; revert it there.' : ''}`);
+    toast(`Moved to ${newPath}${hn ? ' on @' + hn.name : ''}.`);
   });
 }
 // POST /api/mv on host HN (null: this one). Through edwind the answer names the buffer ids of both ends: pages on the file,
@@ -9541,7 +9467,7 @@ async function fsMv(hn: Host | null, src: string, dst: string) {
   return j;
 }
 PERSP.onCwd = n => {
-  if (perspCur() !== 'fs' || n.emacs) return;
+  if (perspCur() !== 'fs') return;
   const i = fsIdent(n); if (!i) return;
   const cur = (n.in && S.nodes[n.in]) as FrameNode | null | undefined; if (cur?.derived === 'fs' && cur.fsPath === i.dir && (cur.fsHost || '') === i.host) return;
   const f = fsFrameFor(i.host, i.dir, n);
@@ -9551,17 +9477,17 @@ PERSP.onCwd = n => {
 
 // ------------------------------------------------------------------ the path grammar and one navigator over every relation
 // Every node has an address `relation:path`: board:/Research/canvas · fs:@build1/srv (host omitted for the serving daemon) ·
-// note:Title#Heading#^anchor · tag:grc/vocab · journal:2026/10/10 · link:Page. proc:, tmux: and unit: are reserved for the
+// note:Title#Heading#^anchor · tag:grc/vocab · journal:2026/10/10 · link:Page. proc: and unit: are reserved for the
 // host's own trees. The navigator walks any of them with the same columns; the canvas shows the active perspective;
 // the URL hash carries the current address so that every place is a link.
-const ADDR_KINDS = ['board', 'fs', 'note', 'tag', 'journal', 'link', 'proc', 'tmux', 'unit', 'attn'];
+const ADDR_KINDS = ['board', 'fs', 'note', 'tag', 'journal', 'link', 'proc', 'unit', 'attn'];
 const ADDR_RESERVED: Record<string, string> = {};
 /* What resolveAddr finds at an address: the navigator key with its node, entries and canonical address; or only an error. */
 interface AddrResolution { error?: string; key: string; n: BoardNode | null; entries: RgEntry[]; addr: string }
 function parseAddr(a: string | null | undefined): BoardAddr | null {
   const m = String(a || '').trim().match(/^([a-z]+):([\s\S]*)$/); if (!m || !ADDR_KINDS.includes(m[1])) return null;
   let rest = m[2], host = null;
-  if (['fs', 'proc', 'tmux', 'unit'].includes(m[1])) { const hm = rest.match(/^@([\w.-]+)(.*)$/); if (hm) { host = hm[1]; rest = hm[2]; } }
+  if (['fs', 'proc', 'unit'].includes(m[1])) { const hm = rest.match(/^@([\w.-]+)(.*)$/); if (hm) { host = hm[1]; rest = hm[2]; } }
   return { kind: m[1], host, path: rest };
 }
 function fsAddr(hostUrl: string | undefined, path: string | undefined): string { const h = hostUrl ? hostByUrl(hostUrl) : null; return 'fs:' + (h ? '@' + h.name : '') + (path || '~'); }
@@ -9570,12 +9496,10 @@ function addrOf(n: BoardNode | null | undefined): string {
   if (n.kind === 'frame' && n.derived === 'fs') return fsAddr(n.fsHost, n.fsPath);
   if (n.kind === 'frame' && n.derived === 'tag') return 'tag:' + n.tag;
   if (n.kind === 'ghost' && n.alias) return addrOf(S.nodes[n.alias]);
-  if (n.kind === 'ghost' && n.tmuxTarget) return tmuxAddr(n.host, n.tmuxTarget);
   if (n.kind === 'ghost' && n.procPid) return 'proc:' + (n.host && hostByUrl(n.host) ? '@' + hostByUrl(n.host)!.name : '') + '/' + n.procPid;
   if (n.kind === 'ghost' && n.unitName) return 'unit:' + (n.host && hostByUrl(n.host) ? '@' + hostByUrl(n.host)!.name : '') + '/' + n.unitName;
   if (n.kind === 'frame' && n.derived === 'proc') return S.nodes[n.owner!] ? addrOf(S.nodes[n.owner!]) : 'proc:' + (n.procHost && hostByUrl(n.procHost) ? '@' + hostByUrl(n.procHost)!.name : '') + '/' + n.procPid;
   if (n.kind === 'frame' && n.derived === 'unit') return 'unit:' + (n.unitHost && hostByUrl(n.unitHost) ? '@' + hostByUrl(n.unitHost)!.name : '') + '/' + (n.unitName || '');
-  if (n.kind === 'frame' && n.derived === 'tmux') return tmuxAddr(n.tmuxHost, n.tmuxSess);
   if (n.kind === 'ghost') return fsAddr(n.host, n.path);
   if (n.kind === 'frame' && n.derived === 'process') return S.nodes[n.owner!] ? addrOf(S.nodes[n.owner!]) : 'board:/' + n.name;
   if (S.manual && perspCur() !== 'manual') {   // inside a derived perspective the board address is still the manual one
@@ -9590,8 +9514,7 @@ function keyToAddr(key: string): string {
   if (key === 'root') return 'board:/';
   if (isFs(key)) { const { h, p } = fsSplit(key.slice(FS_PREFIX.length)); return 'fs:' + (h ? '@' + h.name : '') + p; }
   if (key.startsWith('note:')) { const r = noteById(key.slice(5)); return r ? 'note:' + noteAddrPath(r) : key; }
-  if (key.startsWith('tmux:')) { const t = tmuxSplitKey(key.slice(5)); return 'tmux:' + (t.host ? '@' + t.host + '/' : t.path ? '/' : '') + t.path; }
-  if (key.startsWith('proc:') || key.startsWith('unit:')) { const k = key.slice(0, 4), t = tmuxSplitKey(key.slice(5)); return k + ':' + (t.host ? '@' + t.host + '/' : t.path ? '/' : '') + t.path; }
+  if (key.startsWith('proc:') || key.startsWith('unit:')) { const k = key.slice(0, 4), t = splitHostKey(key.slice(5)); return k + ':' + (t.host ? '@' + t.host + '/' : t.path ? '/' : '') + t.path; }
   if (/^(tag|journal|link|attn):/.test(key)) return key;
   return S.nodes[key] ? addrOf(S.nodes[key]) : key;
 }
@@ -9602,7 +9525,6 @@ function addrToKey(addr: string): string | null {
   if (a.kind === 'note') { if (!a.path) return 'note:'; const r = noteByAddrPath(a.path); return r ? 'note:' + r.id : null; }
   if (a.kind === 'journal') { let p = a.path.replace(/^\/+|\/+$/g, ''); if (p === 'today') p = TODAY.replace(/-/g, '/'); else if (/^\d{4}-\d{2}-\d{2}$/.test(p)) p = p.replace(/-/g, '/'); return 'journal:' + p; }
   if (a.kind === 'link') return 'link:' + a.path.replace(/^\/+|\/+$/g, '');
-  if (a.kind === 'tmux') { if (a.host && !hostByName(a.host)) return null; return 'tmux:' + (a.host ? '@' + a.host + ':' : '') + a.path.replace(/^\/+|\/+$/g, ''); }
   if (a.kind === 'proc') { if (a.host && !hostByName(a.host)) return null; const pid = a.path.replace(/^\/+|\/+$/g, '').split('/').pop(); if (pid && !/^\d+$/.test(pid)) return null; return 'proc:' + (a.host ? '@' + a.host + ':' : '') + pid; }
   if (a.kind === 'unit') { if (a.host && !hostByName(a.host)) return null; return 'unit:' + (a.host ? '@' + a.host + ':' : '') + a.path.replace(/^\/+|\/+$/g, ''); }
   if (a.kind === 'attn') return 'attn:' + a.path.replace(/^\/+|\/+$/g, '');
@@ -9712,14 +9634,13 @@ function noteEntry(r: NoteRow): RgEntry { const kids = noteKids(r), bl = r.kind 
 function rgPerspRoots(): RgEntry[] {
   if (!NOTES.at) notesLoad();
   const out: RgEntry[] = [{ key: 'tag:', name: '# tags', kind: 'persp', dir: true, meta: 'tag:' }, { key: 'note:', name: '¶ notes', kind: 'persp', dir: true, meta: 'note:' }, { key: 'journal:', name: '▦ journal', kind: 'persp', dir: true, meta: 'journal:' }, { key: 'link:', name: '⇄ links', kind: 'persp', dir: true, meta: 'link:' }];
-  out.push({ key: 'tmux:', name: '⌗ tmux', kind: 'persp', dir: true, meta: 'tmux:' }, { key: 'proc:', name: '⚙ processes', kind: 'persp', dir: true, meta: 'proc:' }, { key: 'unit:', name: '⊙ units', kind: 'persp', dir: true, meta: 'unit:' }, { key: 'attn:', name: '! attention', kind: 'persp', dir: true, meta: attnCount() ? String(attnCount()) : '' });
+  out.push({ key: 'proc:', name: '⚙ processes', kind: 'persp', dir: true, meta: 'proc:' }, { key: 'unit:', name: '⊙ units', kind: 'persp', dir: true, meta: 'unit:' }, { key: 'attn:', name: '! attention', kind: 'persp', dir: true, meta: attnCount() ? String(attnCount()) : '' });
   return out;
 }
 function allTags(): string[] { const t = new Set<string>(); for (const n of nodeList()) for (const x of tagsOf(n)) if (x !== 'aggregator') t.add(x); for (const r of NOTES.rows) for (const x of r.tags || []) t.add(String(x).toLowerCase()); return [...t].sort(); }
 function rgRelList(key: string): RgEntry[] {
   const [kind, rest] = [key.slice(0, key.indexOf(':')), key.slice(key.indexOf(':') + 1)];
   if (ADDR_RESERVED[kind]) return [];
-  if (kind === 'tmux') return tmuxRelList(rest);
   if (kind === 'proc') return procRelList(rest);
   if (kind === 'unit') return unitRelList(rest);
   if (kind === 'attn') return attnList();
@@ -9749,9 +9670,8 @@ function rgRelList(key: string): RgEntry[] {
 function rgRelParent(key: string): string {
   const [kind, rest] = [key.slice(0, key.indexOf(':')), key.slice(key.indexOf(':') + 1)];
   if (!rest) return 'root';
-  if (kind === 'tmux') { const t = tmuxSplitKey(rest), pre = t.host ? '@' + t.host + ':' : ''; if (!t.path) return 'tmux:'; const parts = t.path.split(':'); parts.pop(); return 'tmux:' + (parts.length ? pre + parts.join(':') : t.host ? pre : ''); }
-  if (kind === 'proc') { const t = tmuxSplitKey(rest), pre = t.host ? '@' + t.host + ':' : ''; if (!t.path) return 'proc:'; const p = procData(t.h).byPid[+t.path], up = p && procData(t.h).byPid[p.ppid]; return 'proc:' + (up ? pre + up.pid : t.host ? pre : ''); }
-  if (kind === 'unit') { const t = tmuxSplitKey(rest), pre = t.host ? '@' + t.host + ':' : ''; return 'unit:' + (t.path && t.host ? pre : ''); }
+  if (kind === 'proc') { const t = splitHostKey(rest), pre = t.host ? '@' + t.host + ':' : ''; if (!t.path) return 'proc:'; const p = procData(t.h).byPid[+t.path], up = p && procData(t.h).byPid[p.ppid]; return 'proc:' + (up ? pre + up.pid : t.host ? pre : ''); }
+  if (kind === 'unit') { const t = splitHostKey(rest), pre = t.host ? '@' + t.host + ':' : ''; return 'unit:' + (t.path && t.host ? pre : ''); }
   if (kind === 'attn') return 'attn:';
   if (kind === 'tag') return rest.includes('/') ? 'tag:' + rest.slice(0, rest.lastIndexOf('/')) : 'tag:';
   if (kind === 'journal') { const parts = rest.split('/').filter(Boolean); parts.pop(); return 'journal:' + parts.join('/'); }
@@ -9815,10 +9735,8 @@ function linkPerspFrom(title: string): void { const e = title && linkEntity(titl
 function noteOpen(r: { path: string; line: number; board?: PageNode }) {
   if (r.board) { edOpen(r.board, r.line > 1 ? r.line : undefined); return r.board; }
   if (!DAEMON) { toast('That note is not on the board.'); return null; }
-  const f = INFO?.notes ? INFO.notes.replace(/\/$/, '') + '/' + r.path : r.path;
-  const emacs = () => { const n = newEmacs(f); if (n && r.line > 1) n.cmd = n.cmd!.replace(/emacsclient -t -a '' "\$f"/, `emacsclient -t -a '' +${r.line} "$f"`).replace(/emacs -nw "\$f"/, `emacs -nw +${r.line} "$f"`); return n; };
-  if (FR.on) { const c = viewCenterWorld(); return frFileOpen(r.path, freeSpot(c.x - 210, c.y - 150, 420, 300), r.line, emacs); }   // a page when edwind edits it
-  return emacs();
+  if (!FR.on) { toast('Notes open as pages, which need edwind.'); return null; }
+  const c = viewCenterWorld(); return frFileOpen(r.path, freeSpot(c.x - 210, c.y - 150, 420, 300), r.line);   // a page when edwind edits it
 }
 // go to an address: board nodes on the canvas, everything else in the navigator
 function goAddr(addr: string, push = true): boolean {
@@ -9843,10 +9761,10 @@ function hashInit(): void {
   addEventListener('hashchange', () => { if (HASH.busy) return; const a = decodeURIComponent(location.hash.slice(1)); if (a && parseAddr(a) && a !== HASH.last) { HASH.last = a; goAddr(a, false); } });
   setInterval(() => { if (!HASH.busy && !document.hidden) hashSync(); }, 1500);
 }
-cmd('Go to address…', () => askName('Address (board:/path · fs:@host/dir · note:Title#Heading · tag:x · journal:2026/10/10 · link:Page · tmux:@host/session)', currentAddr(), v => goAddr(v)), 'Ctrl-Space a · ga in the navigator');
+cmd('Go to address…', () => askName('Address (board:/path · fs:@host/dir · note:Title#Heading · tag:x · journal:2026/10/10 · link:Page · proc:@host/PID · unit:@host/NAME)', currentAddr(), v => goAddr(v)), 'Ctrl-Space a · ga in the navigator');
 cmd('Copy the address of the active node', () => { const n = activeId && S.nodes[activeId]; if (n) { copyText(addrOf(n)); toast(addrOf(n)); } else toast('Pick a node first.'); });
 AGENT_TOOLS.push(
-  { name: 'list_addr', description: 'List what an address holds: board:/folder, fs:@host/dir, note:Title (its headings), tag:x, journal:2026/10, link:Page, tmux:@host/ (sessions). Returns one entry per line with its own address.', inputSchema: { type: 'object', properties: { addr: { type: 'string' } }, required: ['addr'] },
+  { name: 'list_addr', description: 'List what an address holds: board:/folder, fs:@host/dir, note:Title (its headings), tag:x, journal:2026/10, link:Page, proc:@host/, unit:@host/. Returns one entry per line with its own address.', inputSchema: { type: 'object', properties: { addr: { type: 'string' } }, required: ['addr'] },
     run: async ({ addr }: { addr: string }) => { if (/^(note|tag|journal):/.test(addr)) await notesLoad(); const r = resolveAddr(addr); if (r.error) throw new Error(r.error); if (isFs(r.key)) { rgEntries(r.key); await new Promise(res => setTimeout(res, 700)); } const es = rgEntries(r.key); return es.map(e => `${keyToAddr(e.key)}${e.dir ? '/' : ''}${e.n ? ' · ' + (e.n.kind === 'frame' ? 'folder' : e.n.kind) : e.note ? ' · ' + e.note.kind : e.kind === 'file' ? ' · file' : ''}${e.meta ? ' · ' + e.meta : ''}`).join('\n') || '(empty)'; } },
   { name: 'open_addr', description: 'Go to an address: a board node is shown on the canvas, anything else opens in the navigator.', inputSchema: { type: 'object', properties: { addr: { type: 'string' } }, required: ['addr'] },
     run: async ({ addr }: { addr: string }) => { if (/^(note|tag|journal):/.test(addr)) await notesLoad(); const r = resolveAddr(addr); if (r.error) throw new Error(r.error); goAddr(addr); return 'at ' + r.addr; } },
@@ -9865,133 +9783,40 @@ function tagDrop(n: BoardNode, t: FrameNode | null | undefined, from: FrameNode 
   toast(`${real.name}: ${tagsOf(real).filter(x => x !== 'aggregator').map(x => '#' + x).join(' ') || 'no tags'}`);
   perspRebuild();
 }
-// ---- tmux sessions on each host's shared socket. A terminal card is a tmux session (wb-<id>) when the daemon runs with
-// --tmux-socket: it survives daemon restarts. Sessions other programs made there (the control-panel agents) are listed under
-// tmux: and adopted as cards tagged #tmux. The tmux perspective shows one folder per session; sessions with no card are ghosts.
-/* What /api/tmux answers. */
-interface TmuxReply { socket?: string | null; sessions?: TmuxSession[]; error?: string }
-/* The shell a shell_* tool acts on: its card when on the board, its tmux target, its host and its address. */
-interface ShellTarget { n: TermNode | ReplNode | null; target: string | null; h: Host | null; addr: string }
-const TMUX: { data: Record<string, TmuxData> } = { data: {} };   // host url ('' = the serving daemon) -> { at, socket, sessions, loading }
-const tmuxHostKey = (h: Host | null | undefined) => h ? h.url : '';
-function tmuxAddr(hostUrl: string | undefined, target: string | null | undefined): string { const h = hostUrl ? hostByUrl(hostUrl) : null; return 'tmux:' + (h ? '@' + h.name + '/' : '/') + (target || ''); }
-function tmuxSplitKey(rest: string): { host: string | null; h: Host | null; path: string } { const m = rest.match(/^@([^:]+):([\s\S]*)$/); return m ? { host: m[1], h: hostByName(m[1]), path: m[2] } : { host: null, h: null, path: rest }; }
-function tmuxTargetOf(n: BoardNode | null | undefined): string | null { return n && n.kind === 'term' ? (n.tmux ? n.tmux.split(':')[0] : n.tmuxSess || null) : null; }
-function tmuxNodeFor(h: Host | null, target: string | null | undefined): TermNode | null { const sess = String(target || '').split(':')[0], k = tmuxHostKey(h); return nodeList().find(n => tmuxTargetOf(n) === sess && fsHostKey(n) === k) as TermNode | undefined || null; }
-function tmuxStore(h: Host | null, j: TmuxReply): TmuxData { const d = TMUX.data[tmuxHostKey(h)] = { at: Date.now(), socket: j.socket || null, sessions: j.sessions || [], err: !!j.error }; if (VIEW === 'ranger') renderRanger(); if (perspCur() === 'tmux' && !PERSP.building && PERSP.tmuxWait) { PERSP.tmuxWait = false; perspClear(); perspBuild('tmux'); restack(); renderTree(); renderLinks(); dirty(); } return d; }
-function tmuxData(h: Host | null, force?: boolean): TmuxData {
-  const k = tmuxHostKey(h), d = TMUX.data[k];
-  if (!DAEMON) return { at: 1, socket: null, sessions: [] };
-  if (d && (d.loading || (!force && Date.now() - d.at < 8000))) return d;
-  TMUX.data[k] = { ...(d || { sessions: [], socket: null }), at: d?.at || 0, loading: true };
-  hFetch(h, '/api/tmux').then(r => r.json()).then(j => tmuxStore(h, j)).catch(() => tmuxStore(h, { error: 'unreachable' }));
-  return TMUX.data[k];
-}
-async function tmuxLoad(h: Host | null): Promise<{ socket: string | null; sessions: TmuxSession[] }> { if (!DAEMON) return { socket: null, sessions: [] }; const r = await hFetch(h, '/api/tmux'); return tmuxStore(h, await r.json()); }
-function tmuxEntry(h: Host | null, s: TmuxSession): RgEntry {
-  const pre = h ? '@' + h.name + ':' : '', n = tmuxNodeFor(h, s.name);
-  return { key: 'tmux:' + pre + s.name, name: s.name, kind: 'itmux', dir: s.windows.length > 1, n: n || undefined, tmux: { target: s.name, h },
-    meta: [s.command, s.windows.length > 1 ? s.windows.length + ' windows' : '', s.attached ? 'attached' : '', n ? 'card ' + n.name : ''].filter(Boolean).join(' · ') };
-}
-function tmuxRelList(rest: string): RgEntry[] {
-  const { host, h, path } = tmuxSplitKey(rest); if (host && !h) return [];
-  const out: RgEntry[] = [];
-  if (!path) {
-    if (!host && DAEMON) for (const hh of allHosts()) out.push({ key: 'tmux:@' + hh.name + ':', name: '@' + hh.name, kind: 'persp', dir: true, meta: 'tmux:@' + hh.name + '/' });
-    const d = tmuxData(h);
-    if (!DAEMON) { if (!host) out.push({ key: 'tmux:_', name: 'sessions need the local build', kind: 'ghost', dir: false, reserved: 'tmux sessions show when a Workbench server runs with --tmux-socket PATH (shells then survive daemon restarts, and sessions made by other programs can be adopted as cards).' }); return out; }
-    if (d.socket === null && !d.loading) out.push({ key: 'tmux:' + (host ? '@' + host + ':' : '') + '_', name: 'no tmux socket on ' + (h ? '@' + h.name : 'this daemon'), kind: 'ghost', dir: false, reserved: 'A Workbench server started with a tmux socket runs shells inside tmux and adopts sessions.' });
-    for (const s_ of d.sessions) out.push(tmuxEntry(h, s_));
-    return out;
-  }
-  const d = tmuxData(h), [sname, win] = path.split(':'), s_ = d.sessions.find(x => x.name === sname); if (!s_) return [];
-  const pre = h ? '@' + h.name + ':' : '';
-  if (win === undefined) return s_.windows.map(w => ({ key: 'tmux:' + pre + sname + ':' + w.index, name: w.index + ' ' + w.name, kind: 'itmuxw', dir: false, tmux: { target: sname, h }, meta: [(w.panes.find(p => p.active) || w.panes[0] || {} as { command?: string }).command, w.panes.length > 1 ? w.panes.length + ' panes' : '', w.active ? 'current' : ''].filter(Boolean).join(' · ') }));
-  const w = s_.windows.find(w => String(w.index) === win); return w ? w.panes.map(p => ({ key: 'tmux:' + pre + sname + ':' + w.index + '.' + p.index, name: w.index + '.' + p.index + ' ' + p.command, kind: 'itmuxw', dir: false, tmux: { target: sname, h }, meta: p.path })) : [];
-}
-// adopt a session as a card: in the host's folder, or where a ghost stood (at = { in, x, y })
-function tmuxAdopt(target: string | null | undefined, h: Host | null, at?: { in: string | undefined; x: number; y: number }) {
-  if (!DAEMON) { toast('Adopting tmux sessions needs a Workbench server with tmux.'); return null; }
-  const sess = String(target || '').split(':')[0]; if (!sess) return null;
-  const have = tmuxNodeFor(h, sess); if (have && !at) { jumpNode(have); toast(sess + ' is already on the board as ' + have.name + '.'); return have; }
-  const hf = !at && h ? hostFolder(h) : null, c = viewCenterWorld(), w = 640, hh = 400;
-  const n = addNode({ kind: 'term', backend: 'pty', name: clean(sess.replace(/^wb-/, '')), tmux: sess, env: {}, in: at ? at.in : hf ? hf.id : undefined, hostUrl: h ? h.url : undefined,
-    ...(at ? { x: at.x, y: at.y } : freeSpot(c.x - w / 2, c.y - hh / 2, w, hh)), w, h: hh });
-  if (hf) adopt(n, hf, null, true);
-  if (!at) jumpNode(n, 1, () => live[n.id]?.term?.focus());
-  return n;
-}
-function tmuxPerspBuild(related: Set<string>): void {
-  const frames: Record<string, FrameNode> = {};
-  const sessFrame = (hostUrl: string, sname: string, near: BoardPoint) => {
-    const k = hostUrl + '|' + sname; if (frames[k]) return frames[k];
-    const h = hostUrl ? hostByUrl(hostUrl) : null;
-    const d = TMUX.data[hostUrl], s_ = d?.sessions.find(x => x.name === sname);
-    const f = addNode({ kind: 'frame', name: sname + (h ? ' @' + h.name : ''), mode: 'pack', shape: 'folder', derived: 'tmux', tmuxSess: sname, tmuxHost: hostUrl, host: h ? { name: h.name, url: h.url, token: h.token } : undefined, tmuxState: s_ ? (SHELL_RE.test(s_.command || '') ? 'idle' : 'running') : undefined, in: null, x: near.x - PAD, y: near.y - PAD - LABEL_H, w: 520, h: 300 });
-    return frames[k] = f;
-  };
-  for (const n of nodeList()) { const t = tmuxTargetOf(n); if (!t) continue; related.add(n.id); adopt(n, sessFrame(fsHostKey(n), t, n), null, true); }
-  let gx = 100, gy = 100;
-  for (const h of [null, ...allHosts()]) {
-    const d = tmuxData(h); if (d.loading && !d.at) { PERSP.tmuxWait = true; continue; }
-    for (const s_ of d.sessions) {
-      const hostUrl = h ? h.url : '', f = sessFrame(hostUrl, s_.name, { x: gx, y: gy }); gy += 360;
-      if (kidsOf(f.id).some(k => k.kind === 'term')) continue;
-      const g: GhostNode = { id: uid('n'), kind: 'ghost', ghost: true, tmuxTarget: s_.name, host: hostUrl, name: s_.name, meta: [s_.command, s_.windows.length > 1 ? s_.windows.length + ' windows' : ''].filter(Boolean).join(' · '), in: f.id, order: 1e9, x: f.x + PAD, y: f.y + PAD, w: 260, h: 54 };
-      S.nodes[g.id] = g; mount(g); renumber(f); relayout(f);
-    }
-  }
-}
-// shell commands: a board path, a tmux:[@host]/session address, or nothing for the active shell
+// ---- shells by address: the shell_* tools and commands act on a board shell (a path) or the active one.
+/* The shell a shell_* tool acts on: its card, its host and its address. */
+interface ShellTarget { n: TermNode | ReplNode; h: Host | null; addr: string }
+function splitHostKey(rest: string): { host: string | null; h: Host | null; path: string } { const m = rest.match(/^@([^:]+):([\s\S]*)$/); return m ? { host: m[1], h: hostByName(m[1]), path: m[2] } : { host: null, h: null, path: rest }; }
 function shellRef(p: string | undefined): ShellTarget {
-  const a = p && parseAddr(p);
-  if (a && a.kind === 'tmux') {
-    const h = a.host ? hostByName(a.host) : null; if (a.host && !h) throw new Error('unknown host @' + a.host);
-    const target = a.path.replace(/^\/+/, ''); if (!target) throw new Error('give a session: tmux:[@host]/NAME');
-    const n = tmuxNodeFor(h, target); return { n, target, h, addr: tmuxAddr(h ? h.url : '', target) };
-  }
   const n = p ? findNode(p) : activeId && S.nodes[activeId];
   if (!n || !(n.kind === 'term' || n.kind === 'repl')) throw new Error('no shell at ' + (p || '(active)'));
-  return { n, target: tmuxTargetOf(n), h: n.hostUrl ? hostByUrl(n.hostUrl) : hostOf(n), addr: addrOf(n) };
+  return { n, h: n.hostUrl ? hostByUrl(n.hostUrl) : hostOf(n), addr: addrOf(n) };
 }
-async function tmuxApi(h: Host | null, op: string, body: object) { const r = await hFetch(h, '/api/tmux/' + op, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } }); const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || ('tmux ' + op + ' failed: ' + r.status)); return j; }
 async function shellLogs(r: ShellTarget, lines: number): Promise<string> {
-  if (r.n && DAEMON && r.n.backend === 'pty') { try { const j = await (await hFetch(r.h, '/api/pty/' + r.n.id + '/capture?lines=' + lines)).json(); if (j.text != null) return j.text; } catch {} }
-  if (r.n) { const L = live[r.n.id]; return L?.term ? termLines(L, lines).join('\n') : '(not a running shell)'; }
-  return (await (await hFetch(r.h, '/api/tmux/capture?lines=' + lines + '&target=' + encodeURIComponent(r.target!))).json()).text || '';
+  if (DAEMON && r.n.backend === 'pty') { try { const j = await (await hFetch(r.h, '/api/pty/' + r.n.id + '/capture?lines=' + lines)).json(); if (j.text != null) return j.text; } catch {} }
+  const L = live[r.n.id]; return L?.term ? termLines(L, lines).join('\n') : '(not a running shell)';
 }
 AGENT_TOOLS.push(
-  { name: 'shell_send', description: 'Type text into a shell and (by default) press Enter. path: a board path, a tmux:[@host]/session address (a session need not be on the board), or empty for the active shell.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, text: { type: 'string' }, enter: { type: 'boolean' } }, required: ['text'] },
-    run: async ({ path, text, enter = true }: { path?: string; text: string; enter?: boolean }) => { const r = shellRef(path); const L = r.n && live[r.n.id]; if (L?.backend) { L.backend.input(str(text).replace(/\n/g, '\r') + (enter ? '\r' : '')); pulse(r.n!.id); } else await tmuxApi(r.h, 'send', { target: r.target, text, enter }); return 'sent to ' + r.addr; } },
-  { name: 'shell_interrupt', description: 'Send Ctrl-C to a shell (board path, tmux: address, or the active shell).', inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
-    run: async ({ path }: { path?: string } = {}) => { const r = shellRef(path); const L = r.n && live[r.n.id]; if (L?.backend) L.backend.input('\x03'); else await tmuxApi(r.h, 'interrupt', { target: r.target }); return 'interrupted ' + r.addr; } },
-  { name: 'shell_logs', description: 'The last lines of a shell: tmux scrollback when the shell runs in tmux, else the terminal buffer. path: board path, tmux: address, or empty for the active shell.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, lines: { type: 'number' } } },
+  { name: 'shell_send', description: 'Type text into a shell and (by default) press Enter. path: a board path, or empty for the active shell.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, text: { type: 'string' }, enter: { type: 'boolean' } }, required: ['text'] },
+    run: async ({ path, text, enter = true }: { path?: string; text: string; enter?: boolean }) => { const r = shellRef(path); const L = live[r.n.id]; if (!L?.backend) throw new Error(r.addr + ' is not running'); L.backend.input(str(text).replace(/\n/g, '\r') + (enter ? '\r' : '')); pulse(r.n.id); return 'sent to ' + r.addr; } },
+  { name: 'shell_interrupt', description: 'Send Ctrl-C to a shell (board path, or the active shell).', inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
+    run: async ({ path }: { path?: string } = {}) => { const r = shellRef(path); const L = live[r.n.id]; if (!L?.backend) throw new Error(r.addr + ' is not running'); L.backend.input('\x03'); return 'interrupted ' + r.addr; } },
+  { name: 'shell_logs', description: 'The last lines of a shell: the server\'s scrollback for a PTY, else the terminal buffer. path: board path, or empty for the active shell.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, lines: { type: 'number' } } },
     run: async ({ path, lines = 200 }: { path?: string; lines?: number } = {}) => shellLogs(shellRef(path), Math.max(1, Math.min(+lines || 200, 5000))) },
-  { name: 'shell_kill', description: 'End a shell\'s process; a tmux session dies with it. The card stays and shows the exit. path: board path, tmux: address, or the active shell.', inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
-    run: async ({ path }: { path?: string } = {}) => { const r = shellRef(path); const L = r.n && live[r.n.id]; if (L?.backend?.end) L.backend.end(true); else if (L?.backend) throw new Error(r.n!.name + ' is a simulated shell'); else await tmuxApi(r.h, 'kill', { target: r.target }); return 'killed ' + r.addr; } },
-  { name: 'shell_detach', description: 'Remove a shell card whose tmux session keeps running (re-adopt it later from tmux:). path: board path or tmux: address.', inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
-    run: ({ path }: { path?: string } = {}) => { const r = shellRef(path); if (!r.n) throw new Error(r.addr + ' has no card'); if (!tmuxTargetOf(r.n)) throw new Error(r.n.name + ' does not run in tmux'); const L = live[r.n.id]; if (L?.backend) L.backend.detachOnly = true; const t = tmuxAddr(fsHostKey(r.n), tmuxTargetOf(r.n)); removeNode(r.n.id); return 'detached; the session stays at ' + t; } },
-  { name: 'list_tmux', description: 'tmux sessions on a host\'s socket (host: a name from hosts.json; empty = the serving daemon): one line per session with its address, foreground command, path, windows and its card when on the board.', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
-    run: async ({ host }: { host?: string } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); const d = await tmuxLoad(h); if (!d.socket) return 'no tmux socket on ' + (h ? '@' + h.name : 'this daemon') + ' (the server has no tmux)'; return d.sessions.map(s_ => { const n = tmuxNodeFor(h, s_.name); return `${tmuxAddr(h ? h.url : '', s_.name)} · ${s_.command || '?'} · ${s_.path || ''} · ${s_.windows.length} window${s_.windows.length === 1 ? '' : 's'}${s_.attached ? ' · attached' : ''}${n ? ' · card ' + pathOf(n.id) : ''}`; }).join('\n') || '(no sessions)'; } },
-  { name: 'adopt_tmux', description: 'Make a card attached to a tmux session: target = session name (or tmux:[@host]/name); host = name from hosts.json when the target is a bare name.', inputSchema: { type: 'object', properties: { target: { type: 'string' }, host: { type: 'string' } }, required: ['target'] },
-    run: ({ target, host }: { target: string; host?: string }) => { const a = parseAddr(target); let h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); let t = target; if (a && a.kind === 'tmux') { if (a.host) { h = hostByName(a.host); if (!h) throw new Error('unknown host @' + a.host); } t = a.path.replace(/^\/+/, ''); } const n = tmuxAdopt(t, h); if (!n) throw new Error('could not adopt ' + target); return 'adopted ' + tmuxAddr(h ? h.url : '', t.split(':')[0]) + ' as ' + pathOf(n.id); } }
+  { name: 'shell_kill', description: 'End a shell\'s process. The card stays and shows the exit. path: board path, or the active shell.', inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
+    run: async ({ path }: { path?: string } = {}) => { const r = shellRef(path); const L = live[r.n.id]; if (L?.backend?.end) L.backend.end(true); else if (L?.backend) throw new Error(r.n.name + ' is a simulated shell'); else throw new Error(r.addr + ' is not running'); return 'killed ' + r.addr; } }
 );
-cmd('Shell: interrupt the active shell (Ctrl-C)', () => { try { const r = shellRef(''); live[r.n!.id]?.backend?.input('\x03'); } catch (e) { toast(e.message); } }, '', () => n0()?.kind === 'term' || n0()?.kind === 'repl');
-cmd('Shell: kill the active shell\'s process (its tmux session too)', () => { try { const r = shellRef(''); const L = live[r.n!.id]; if (L?.backend?.end) L.backend.end(true); else toast('Simulated shell.'); } catch (e) { toast(e.message); } }, '', () => n0()?.kind === 'term' || n0()?.kind === 'repl');
-cmd('Shell: detach the active card (its tmux session keeps running)', () => { const n = n0(); if (!n || !tmuxTargetOf(n)) return toast('The active node is not a tmux-backed shell.'); const L = live[n.id]; if (L?.backend) L.backend.detachOnly = true; const t = tmuxAddr(fsHostKey(n), tmuxTargetOf(n)); removeNode(n.id); toast('Detached. The session stays at ' + t + '.'); }, '', () => !!tmuxTargetOf(n0()));
+cmd('Shell: interrupt the active shell (Ctrl-C)', () => { try { const r = shellRef(''); live[r.n.id]?.backend?.input('\x03'); } catch (e) { toast(e.message); } }, '', () => n0()?.kind === 'term' || n0()?.kind === 'repl');
+cmd('Shell: kill the active shell\'s process', () => { try { const r = shellRef(''); const L = live[r.n.id]; if (L?.backend?.end) L.backend.end(true); else toast('Simulated shell.'); } catch (e) { toast(e.message); } }, '', () => n0()?.kind === 'term' || n0()?.kind === 'repl');
 cmd('Shell: scrollback of the active shell as a reference card', async () => { const n = n0(); if (!n || !(n.kind === 'term' || n.kind === 'repl')) return toast('Pick a shell first.'); const text = await shellLogs(shellRef(''), 200); const k = childrenOf(n.id, 'ref').length; const r: RefNode = { id: uid('n'), kind: 'ref', in: n.in, name: n.name + '-log' + (k + 1), text, src: { node: n.id, line: 0, lines: text.split('\n').length }, srcLabel: pathOf(n.id) + ' › scrollback', x: n.x + n.w + 70, y: n.y + k * 50, w: 420, h: 360 }; S.edges.push({ id: uid('e'), from: n.id, to: r.id, type: 'ref' }); addNode(r); }, '', () => n0()?.kind === 'term' || n0()?.kind === 'repl');
-cmd('tmux: sessions in the navigator', () => goAddr('tmux:'), '', () => DAEMON);
-cmd('tmux: adopt a session as a card…', () => askName('Session (name, or tmux:@host/name)', 'tmux:/', v => { try { const a = parseAddr(v); let h = null, t = v; if (a && a.kind === 'tmux') { h = a.host ? hostByName(a.host) : null; if (a.host && !h) return toast('unknown host @' + a.host); t = a.path.replace(/^\/+/, ''); } tmuxAdopt(t, h); } catch (e) { toast(e.message); } }), '', () => DAEMON);
 // ---- the host's own trees. proc: (from /proc), unit: (systemd), the status line and the Attention query. Board
 // terminals are the real nodes; every other process or unit is a ghost. Data comes from each host's daemon; in demo mode
 // a small seeded host stands in.
-const SHELL_RE = /^(bash|zsh|sh|fish|dash|ksh|tmux|tmux: client|tmux: server)$/;
 /* What /api/units answers. */
 interface UnitsReply { units?: SystemdUnit[]; error?: string | null }
 /* What /api/unit/NAME answers: systemctl status text, or the unit's properties. */
 interface UnitShowReply { unit?: string; status?: string; error?: string | null; props?: unknown }
 /* What /api/unit/NAME/VERB answers. */
-interface UnitControlReply { ok?: boolean; unit?: string; verb?: string; output?: string; error?: string }
 const PROC: { data: Record<string, ProcData> } = { data: {} }, UNITS: { data: Record<string, UnitsData | undefined> } = { data: {} }, STATUS = { data: {}, at: 0 };
 function demoProcs(): ProcInfo[] {
   const shells = nodeList().filter(n => n.kind === 'term' && n.backend !== 'pty') as TermNode[];
@@ -9999,7 +9824,7 @@ function demoProcs(): ProcInfo[] {
     { pid: 611, ppid: 1, comm: 'caddy', state: 'S', cwd: '/', cmd: 'caddy run --config /etc/caddy/Caddyfile', start: 1791600100, rss: 48e6, unit: 'caddy.service' }, { pid: 640, ppid: 1, comm: 'sshd', state: 'S', cwd: '/', cmd: 'sshd: /usr/sbin/sshd -D', start: 1791600100, rss: 9e6, unit: 'sshd.service' },
     { pid: 700, ppid: 1, comm: 'tmux: server', state: 'S', cwd: '/home/me', cmd: 'tmux -S /var/lib/control-panel/tmux.sock', start: 1791600200, rss: 6e6, unit: 'control-panel.service' },
     { pid: 702, ppid: 700, comm: 'codex', state: 'S', cwd: '/home/me/computer', cmd: 'codex --full-auto', start: 1791600300, rss: 310e6, unit: 'control-panel.service' },
-    { pid: 800, ppid: 1, comm: 'python3', state: 'S', cwd: '/home/me', cmd: 'python3 canvasd.py --tmux-socket /var/lib/control-panel/tmux.sock', start: 1791600400, rss: 60e6, unit: 'workbench.service' }];
+    { pid: 800, ppid: 1, comm: 'python3', state: 'S', cwd: '/home/me', cmd: 'python3 control-panel.py --tmux-socket /var/lib/control-panel/tmux.sock', start: 1791600400, rss: 60e6, unit: 'workbench.service' }];
   shells.forEach((n, i) => { const pid = 1000 + i * 10; ps.push({ pid, ppid: 800, comm: 'bash', state: 'S', cwd: n.cwd || '/home/me', cmd: 'bash', start: 1791600500 + i, rss: 4e6, unit: 'workbench.service', node: n.id });
     if (n.fg && n.fg !== 'bash') ps.push({ pid: pid + 1, ppid: pid, comm: n.fg, state: 'S', cwd: n.cwd || '/home/me', cmd: n.fg, start: 1791600600 + i, rss: 120e6, unit: 'workbench.service' });
     if (i === 0) { ps.push({ pid: pid + 2, ppid: pid, comm: 'node', state: 'S', cwd: '/home/me/projects/canvas', cmd: 'node tests/ui.mjs', start: 1791600700, rss: 90e6, unit: 'workbench.service' }, { pid: pid + 3, ppid: pid + 2, comm: 'chromium', state: 'S', cwd: '/home/me/projects/canvas', cmd: 'chromium --headless', start: 1791600701, rss: 400e6, unit: 'workbench.service' }); } });
@@ -10008,14 +9833,14 @@ function demoProcs(): ProcInfo[] {
 const demoUnits = (): SystemdUnit[] => [{ unit: 'caddy.service', load: 'loaded', active: 'active', sub: 'running', description: 'Caddy web server' }, { unit: 'workbench.service', load: 'loaded', active: 'active', sub: 'running', description: 'Workbench daemon (canvasd)' }, { unit: 'control-panel.service', load: 'loaded', active: 'active', sub: 'running', description: 'Agent sessions on a shared tmux socket' }, { unit: 'sshd.service', load: 'loaded', active: 'active', sub: 'running', description: 'OpenSSH server' }, { unit: 'postgresql.service', load: 'loaded', active: 'failed', sub: 'failed', description: 'PostgreSQL (retired: the daemon indexes in SQLite)' }, { unit: 'borgbackup-job-home.timer', load: 'loaded', active: 'active', sub: 'waiting', description: 'Nightly backup' }, { unit: 'example-idp.service', load: 'loaded', active: 'inactive', sub: 'dead', description: 'Identity provider (runs elsewhere)' }];
 function procIndex(list: ProcInfo[]) { const byPid: Record<number, ProcInfo> = {}, kids: Record<number, ProcInfo[]> = {}; for (const p of list) { byPid[p.pid] = p; (kids[p.ppid] ||= []).push(p); } for (const k of Object.values(kids)) k.sort((a, b) => a.pid - b.pid); return { byPid, kids }; }
 function procData(h: Host | null, force?: boolean): ProcData {
-  const k = tmuxHostKey(h), d = PROC.data[k];
+  const k = hostKey(h), d = PROC.data[k];
   if (!DAEMON) { if (!d || force) { const list = demoProcs(); PROC.data[k] = { at: Date.now(), list, ...procIndex(list) }; } return PROC.data[k]; }
   if (d && (d.loading || (!force && Date.now() - d.at < 8000))) return d;
   PROC.data[k] = { ...(d || { list: [], byPid: {}, kids: {} }), at: d?.at || 0, loading: true };
   hFetch(h, '/api/proc').then(r => r.json()).then(j => procStore(h, j.procs || [])).catch(() => procStore(h, [], true));
   return PROC.data[k];
 }
-function procStore(h: Host | null, list: ProcInfo[], err?: boolean): ProcData { const d = PROC.data[tmuxHostKey(h)] = { at: Date.now(), list, err: !!err, ...procIndex(list) }; if (VIEW === 'ranger') renderRanger(); if (perspCur() === 'proc' && !PERSP.building) procPerspRefresh(h); return d; }
+function procStore(h: Host | null, list: ProcInfo[], err?: boolean): ProcData { const d = PROC.data[hostKey(h)] = { at: Date.now(), list, err: !!err, ...procIndex(list) }; if (VIEW === 'ranger') renderRanger(); if (perspCur() === 'proc' && !PERSP.building) procPerspRefresh(h); return d; }
 async function procLoad(h: Host | null): Promise<ProcData> { if (!DAEMON) return procData(h, true); const r = await hFetch(h, '/api/proc'); const j = await r.json(); return procStore(h, j.procs || []); }
 function procShellPid(n: BoardNode | null | undefined, d: ProcData | null | undefined): number | null { if (!n || n.kind !== 'term' || !d) return null; if (!DAEMON) return d.list.find(p => p.node === n.id)?.pid || null; return d.list.find(p => p.node === n.id)?.pid || null; }
 function procEntry(h: Host | null, p: ProcInfo, d: ProcData): RgEntry {
@@ -10023,7 +9848,7 @@ function procEntry(h: Host | null, p: ProcInfo, d: ProcData): RgEntry {
   return { key: 'proc:' + pre + p.pid, name: p.comm + ' ' + p.pid, kind: 'iproc', dir: kids > 0, kids, proc: p, n: n || undefined, meta: [n ? 'card ' + n.name : '', p.unit || '', p.cwd && !n ? p.cwd : ''].filter(Boolean).join(' · ') };
 }
 function procRelList(rest: string): RgEntry[] {
-  const { host, h, path } = tmuxSplitKey(rest); if (host && !h) return [];
+  const { host, h, path } = splitHostKey(rest); if (host && !h) return [];
   const d = procData(h), out: RgEntry[] = [];
   if (!path) {
     if (!host && DAEMON) for (const hh of allHosts()) out.push({ key: 'proc:@' + hh.name + ':', name: '@' + hh.name, kind: 'persp', dir: true, meta: 'proc:@' + hh.name + '/' });
@@ -10034,24 +9859,24 @@ function procRelList(rest: string): RgEntry[] {
   return (d.kids[+path] || []).map(p => procEntry(h, p, d));
 }
 function unitsData(h: Host | null, force?: boolean): UnitsData {
-  const k = tmuxHostKey(h), d = UNITS.data[k];
+  const k = hostKey(h), d = UNITS.data[k];
   if (!DAEMON) { if (!d) UNITS.data[k] = { at: Date.now(), units: demoUnits() }; return UNITS.data[k]!; }
   if (d && (d.loading || (!force && Date.now() - d.at < 10000))) return d;
   UNITS.data[k] = { ...(d || { units: [] }), at: d?.at || 0, loading: true };
   hFetch(h, '/api/units').then(r => r.json()).then(j => unitsStore(h, j)).catch(() => unitsStore(h, { units: [], error: 'unreachable' }));
   return UNITS.data[k]!;
 }
-function unitsStore(h: Host | null, j: UnitsReply): UnitsData { const d = UNITS.data[tmuxHostKey(h)] = { at: Date.now(), units: j.units || [], error: j.error || null }; if (VIEW === 'ranger') renderRanger(); if (perspCur() === 'unit' && !PERSP.building && PERSP.unitWait) { PERSP.unitWait = false; perspClear(); perspBuild('unit'); restack(); renderTree(); renderLinks(); dirty(); } statusRender(); return d; }
+function unitsStore(h: Host | null, j: UnitsReply): UnitsData { const d = UNITS.data[hostKey(h)] = { at: Date.now(), units: j.units || [], error: j.error || null }; if (VIEW === 'ranger') renderRanger(); if (perspCur() === 'unit' && !PERSP.building && PERSP.unitWait) { PERSP.unitWait = false; perspClear(); perspBuild('unit'); restack(); renderTree(); renderLinks(); dirty(); } statusRender(); return d; }
 async function unitsLoad(h: Host | null): Promise<UnitsData> { if (!DAEMON) return unitsData(h); const r = await hFetch(h, '/api/units'); return unitsStore(h, await r.json()); }
 async function unitShow(h: Host | null, name: string): Promise<UnitShowReply> { if (!DAEMON) { const u = demoUnits().find(u => u.unit === name); return { unit: name, status: u ? `● ${name} - ${u.description}\n   Loaded: ${u.load}\n   Active: ${u.active} (${u.sub})\n(demo host)` : '', error: u ? null : 'no such unit' }; } const r = await hFetch(h, '/api/unit/' + encodeURIComponent(name)); return r.json(); }
 const unitOrder = (u: SystemdUnit) => u.active === 'failed' ? 0 : u.active === 'active' ? 1 : u.active === 'activating' || u.active === 'deactivating' ? 2 : 3;
 const unitGlyph = (u: SystemdUnit) => u.active === 'failed' ? '✗ ' : u.active === 'active' ? '● ' : '○ ';
 function unitEntry(h: Host | null, u: SystemdUnit): RgEntry {
-  const pre = h ? '@' + h.name + ':' : '', d = PROC.data[tmuxHostKey(h)], procs = d ? d.list.filter(p => p.unit === u.unit) : [];
+  const pre = h ? '@' + h.name + ':' : '', d = PROC.data[hostKey(h)], procs = d ? d.list.filter(p => p.unit === u.unit) : [];
   return { key: 'unit:' + pre + u.unit, name: unitGlyph(u) + u.unit, kind: 'iunit', dir: procs.length > 0, unit: { name: u.unit, u, h }, meta: [u.active + (u.sub && u.sub !== u.active ? '/' + u.sub : ''), procs.length ? procs.length + ' proc' : '', u.description].filter(Boolean).join(' · ') };
 }
 function unitRelList(rest: string): RgEntry[] {
-  const { host, h, path } = tmuxSplitKey(rest); if (host && !h) return [];
+  const { host, h, path } = splitHostKey(rest); if (host && !h) return [];
   const d = unitsData(h), out: RgEntry[] = []; procData(h);
   if (!path) {
     if (!host && DAEMON) for (const hh of allHosts()) out.push({ key: 'unit:@' + hh.name + ':', name: '@' + hh.name, kind: 'persp', dir: true, meta: 'unit:@' + hh.name + '/' });
@@ -10119,29 +9944,12 @@ function unitPerspBuild(related: Set<string>): void {
     renumber(f); relayout(f, true);
   }
 }
-// unit control: the only mutating verbs on the host trees; always behind a confirm
-async function unitControl(h: Host | null, name: string, verb: string): Promise<UnitControlReply> {
-  if (!DAEMON) { const u = demoUnits().find(u => u.unit === name); if (!u) throw new Error('no such unit: ' + name); return { ok: true, unit: name, verb, output: '(demo host) ' + verb + ' ' + name }; }
-  const r = await hFetch(h, '/api/unit/' + encodeURIComponent(name) + '/' + verb, { method: 'POST', body: '{}', headers: { 'Content-Type': 'application/json' } });
-  const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || (verb + ' failed: ' + r.status));
-  UNITS.data[tmuxHostKey(h)] = undefined; unitsData(h, true); return j;
-}
 /* What /api/status answers: a host's health. */
 interface HostStatusReply {
   host: string; load?: number[]; mem?: { available: number; total: number }; disk?: { free: number; total: number }; uptime?: number | null;
-  sessions?: { alive?: number; tmux?: number | null };
+  sessions?: { alive?: number };
   units: { error?: string; active: number; total: number; failed: number; failedNames?: string[] };
 }
-function unitPrompt(verb: string): void {
-  askName(verb[0].toUpperCase() + verb.slice(1) + ' which unit? (name, or unit:@host/name)', 'unit:/', v => {
-    const a = parseAddr(v); let h = null, name = v; if (a && a.kind === 'unit') { h = a.host ? hostByName(a.host) : null; if (a.host && !h) return toast('unknown host @' + a.host); name = a.path.replace(/^\/+/, ''); }
-    if (!name) return;
-    ask(`${verb} ${name}${h ? ' on @' + h.name : ''}? Type yes`, '', ans => { if (!/^y(es)?$/i.test(ans)) return toast('Left ' + name + ' alone.'); unitControl(h, name, verb).then(j => toast(`${name}: ${verb} ok${j.output ? ' · ' + j.output.slice(0, 120) : ''}`)).catch(e => toast(e.message)); });
-  });
-}
-cmd('Unit: restart a systemd unit… (asks first)', () => unitPrompt('restart'));
-cmd('Unit: stop a systemd unit… (asks first)', () => unitPrompt('stop'));
-cmd('Unit: start a systemd unit… (asks first)', () => unitPrompt('start'));
 cmd('Units: list in the navigator', () => goAddr('unit:'));
 cmd('Processes: list in the navigator', () => goAddr('proc:'));
 // the status line: counts that are each a click to the matching place; the Attention query lists the same items
@@ -10252,12 +10060,10 @@ AGENT_TOOLS.push(
     run: async ({ host }: { host?: string } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); const d = await unitsLoad(h); if (d.error && !d.units.length) throw new Error(d.error); return [...d.units].sort((a, b) => unitOrder(a) - unitOrder(b) || a.unit.localeCompare(b.unit)).map(u => `unit:${h ? '@' + h.name : ''}/${u.unit} · ${u.active}${u.sub && u.sub !== u.active ? '/' + u.sub : ''} · ${u.description}`).join('\n') || '(no units)'; } },
   { name: 'unit_status', description: 'systemctl status of one unit (unit:@host/name or a bare name with host).', inputSchema: { type: 'object', properties: { unit: { type: 'string' }, host: { type: 'string' } }, required: ['unit'] },
     run: async ({ unit, host }: { unit: string; host?: string }) => { const a = parseAddr(unit); let h = host ? hostByName(host) : null, name = unit; if (a && a.kind === 'unit') { h = a.host ? hostByName(a.host) : h; if (a.host && !h) throw new Error('unknown host @' + a.host); name = a.path.replace(/^\/+/, ''); } const j = await unitShow(h, name); if (j.error && !j.status) throw new Error(j.error); return j.status || JSON.stringify(j.props || {}); } },
-  { name: 'unit_control', description: 'start | stop | restart a systemd unit. Mutating: needs confirm=true, otherwise it only says what it would do. unit: unit:@host/name or a name with host.', inputSchema: { type: 'object', properties: { unit: { type: 'string' }, verb: { type: 'string' }, host: { type: 'string' }, confirm: { type: 'boolean' } }, required: ['unit', 'verb'] },
-    run: async ({ unit, verb, host, confirm }: { unit: string; verb: string; host?: string; confirm?: boolean }) => { if (!['start', 'stop', 'restart'].includes(verb)) throw new Error('verb must be start, stop or restart'); const a = parseAddr(unit); let h = host ? hostByName(host) : null, name = unit; if (a && a.kind === 'unit') { h = a.host ? hostByName(a.host) : h; if (a.host && !h) throw new Error('unknown host @' + a.host); name = a.path.replace(/^\/+/, ''); } if (!name) throw new Error('which unit?'); if (!confirm) return `would ${verb} ${name}${h ? ' on @' + h.name : ''}. Add confirm=true (wb unit ${verb} ${name}${h ? ' ' + h.name : ''} yes) to do it.`; const j = await unitControl(h, name, verb); return `${verb} ${name}${h ? ' on @' + h.name : ''}: ok${j.output ? '\n' + j.output : ''}`; } },
-  { name: 'host_status', description: 'Health of a host: load, memory, disk, uptime, shells, tmux sessions, unit counts (failed names). host: a name from hosts.json (empty = the serving daemon).', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
-    run: async ({ host }: { host?: string } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j: HostStatusReply = await (await hFetch(h, '/api/status')).json(); const gb = (b: number) => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}` + (j.sessions?.tmux != null ? ', tmux sessions ' + j.sessions.tmux : ''), j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
+  { name: 'host_status', description: 'Health of a host: load, memory, disk, uptime, shells, unit counts (failed names). host: a name from hosts.json (empty = the serving daemon).', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
+    run: async ({ host }: { host?: string } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j: HostStatusReply = await (await hFetch(h, '/api/status')).json(); const gb = (b: number) => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}`, j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
-window.__canvas = { s2w, clipRecall, pasteData, pasteItems, pasteText, imagesOnCanvas, copyItems, imgUrl, typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, unitControl, attnItems, statusCounts, statusRender, procRelList, unitRelList, TMUX, tmuxData, tmuxLoad, tmuxAdopt, tmuxNodeFor, tmuxTargetOf, tmuxAddr, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, rgPreview, RG, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, setHost, newHostFolder, hostRetry, hostsLoad, parseHost, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, FOCUS, LEADER, setLeader, isLeader, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newEmacs, newWeb, newSketch, newArtifactFromFile, emacsCmd, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, unsaved, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, frFileOpen, fsMv, noteOpen, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
+window.__canvas = { s2w, clipRecall, pasteData, pasteItems, pasteText, imagesOnCanvas, copyItems, imgUrl, typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, attnItems, statusCounts, statusRender, procRelList, unitRelList, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, rgPreview, RG, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, hostRetry, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, FOCUS, LEADER, setLeader, isLeader, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newWeb, newSketch, newArtifactFromFile, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, unsaved, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, frFileOpen, fsMv, noteOpen, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 Object.assign(window.__canvas, { reviveAll, agentsDetached, ATTN_SIG, attnFocus, attnSeen, MODE, artHead, artMount, dbLoad, keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
 Object.defineProperty(window.__canvas, 'activeId', { get: () => activeId });   // Object.assign would copy a getter's value once
 Object.defineProperty(window.__canvas, 'spaceHeld', { get: () => space });
