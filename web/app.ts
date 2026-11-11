@@ -32,7 +32,7 @@ const MOTION = { fast: 120, mid: 200, slow: 320 };
 let S: Board = null!;         // persisted board
 const live: Record<string, LiveEntry> = {};   // id -> runtime objects (DOM, xterm, Edwin frame, backend)
 let DAEMON = false, BOOTED = false, BOARD_ETAG: string | null = null, HUB_STARTED: number | null | undefined = null, BOARD_CAM: Cam | undefined;   // BOARD_CAM: the board's stored camera, written back untouched (F-A7)
-const SERVED = /^https?:$/.test(location.protocol) && !window.CANVAS_HOSTED;   // served by wb-web: never the demo, never localStorage
+const SERVED = /^https?:$/.test(location.protocol);   // served by wb-web: never the demo, never localStorage
 let tool = 'select', inkColor = 'ink', penSeen = false, activeId: string | null = null, topZ = 10, focusedBuf: string | null = null;
 const camBack: Cam[] = [], camFwd: Cam[] = [];
 
@@ -3157,7 +3157,6 @@ type JsonCanvasNode = { id: string; type: 'group' | 'text' | 'link'; x: number; 
 }
 $('#ex-close')!.onclick = () => { $('#export-box')!.hidden = true; };
 $('#ex-copy')!.onclick = () => { const t = $('#ex-text') as HTMLTextAreaElement; try { navigator.clipboard.writeText(t.value).then(() => toast('Copied JSON Canvas'), () => { t.select(); toast('Press Ctrl-C to copy'); }); } catch { t.select(); } };
-if (window.CANVAS_HOSTED) $('#ex-dl')!.hidden = true;  // the hosted viewer blocks downloads
 $('#ex-dl')!.onclick = () => {
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([($('#ex-text') as HTMLTextAreaElement).value], { type: 'application/json' }));
   a.download = 'board.canvas'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
@@ -5030,9 +5029,7 @@ async function artMount(n: ArtifactNode, L: LiveEntry) {
     f.srcdoc = wrapFragment(n.html, await bridgeSrc(), artTheme());
   }
   clearTimeout(L.helloT);
-  L.helloT = setTimeout(() => { if (!L.hello && live[n.id] === L) { L.notice!.hidden = false; L.notice!.textContent = window.CANVAS_HOSTED
-    ? 'The page did not start. On claude.ai the viewer blocks frames inside an artifact; artifact nodes run on the self-hosted Workbench.'
-    : 'The page did not answer the bridge within 6 s. It still runs, but window.claude.use() resolves null for it.'; } }, 6000);
+  L.helloT = setTimeout(() => { if (!L.hello && live[n.id] === L) { L.notice!.hidden = false; L.notice!.textContent = 'The page did not answer the bridge within 6 s. It still runs, but window.claude.use() resolves null for it.'; } }, 6000);
 }
 function mountArtifact(n: ArtifactNode, L: LiveEntry) {
   n.capabilities = n.capabilities || { ...DEFAULT_CAPS }; n.grants = n.grants || {}; n.db = n.db || { docs: {} };
@@ -5105,7 +5102,6 @@ async function hostCall(n: ArtifactNode, L: LiveEntry, port: MessagePort, m: Art
     }
     if (cap === 'db') return dbCall(n, L, port, m, ok, err, ev, key);
     if (cap === 'downloads') {
-      if (window.CANVAS_HOSTED) return err({ code: 'not_allowed', message: 'downloads are blocked in the hosted demo' });
       const { filename, data } = (m.args || {}) as { filename?: string; data?: unknown }; const blob = data instanceof Blob ? data : new Blob([typeof data === 'string' ? data : JSON.stringify(data)]);
       const a = el('a'); a.href = URL.createObjectURL(blob); a.download = filename || 'download'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000); return ok({ saved: true });
     }
@@ -5269,12 +5265,6 @@ async function artifactVersions(n: ArtifactNode) {
   if (!list.length) return toast('No versions yet.');
   openPicker(`${n.name}: versions (head ${String(n.head).slice(0, 8)})`, list.map(v => ({ l: `${v.sha === n.head ? '● ' : '○ '}${v.sha.slice(0, 8)} · ${v.at.replace('T', ' ')}`, run: async () => { if (v.sha === n.head) return; const src = await artSource(n, v.sha); await artPublish(n, { html: src }); artMount(n, live[n.id]); toast(`Rolled ${n.name} to ${v.sha.slice(0, 8)} (as a new version)`); } })));
 }
-async function openWorkbenchInside() {
-  if (!DAEMON) return toast('Needs the local build: the demo page is 1.3 MB and cannot embed itself here.');
-  const r = await fetch(`/api/cat?path=${encodeURIComponent(INFO!.dist!)}&limit=6000000`); const j = await r.json();
-  if (!r.ok || j.text?.startsWith('(binary')) return toast('dist/canvas-workbench.html not found. Run python3 tools/build-artifact.py first.');
-  const n = await newArtifact('workbench-inside', j.text, { sample: { images: true }, artifact: {}, db: {} }); n.w = 1100; n.h = 720; place(n); jumpNode(n);
-}
 AGENT_TOOLS.push(
   { name: 'publish_artifact', description: 'Create or update a Claude artifact node: a self-contained HTML page (fragment: no doctype/html/head/body; first element a <title>; CSS tokens on :root with a dark variant; scripts only inline or from cdnjs/jsdelivr/unpkg; no fetch) that may call window.claude.use("sample"|"db"|"artifact"). name identifies the node; an existing artifact of that name gets a new version.',
     inputSchema: { type: 'object', properties: { name: { type: 'string' }, html: { type: 'string' }, capabilities: { type: 'object', description: 'e.g. {"sample":{"images":true},"db":{}}' } }, required: ['name', 'html'] },
@@ -5296,7 +5286,6 @@ cmd('Artifact: publish from this page', () => publishFromPage(S.nodes[activeId!]
 cmd('Artifact: reload', () => artMount(S.nodes[activeId!] as ArtifactNode, live[activeId!]), '', () => S.nodes[activeId!]?.kind === 'artifact');
 cmd('Artifact: versions…', () => artifactVersions(S.nodes[activeId!] as ArtifactNode), '', () => S.nodes[activeId!]?.kind === 'artifact' && !(S.nodes[activeId!] as ArtifactNode).block);
 cmd('Artifact: permissions…', () => artifactPermissions(S.nodes[activeId!] as ArtifactNode), '', () => S.nodes[activeId!]?.kind === 'artifact');
-cmd('Artifact: open the Workbench demo inside itself', () => openWorkbenchInside(), '', () => DAEMON && !!INFO?.dist);   // wb-web reports dist:null until M5
 cmd('Artifact: paste HTML from the clipboard as a new artifact', async () => { try { const t = await navigator.clipboard.readText(); if (!t.trim()) return toast('Clipboard is empty.'); askName('Artifact name', 'pasted', name => newArtifact(name, t)); } catch { toast('Clipboard read is not allowed here. Use "New artifact from HTML…" and paste into the page.'); } });
 
 // ------------------------------------------------------------------ block cards: ```html fences in a page as live cards
@@ -6524,7 +6513,6 @@ function webGo(n: WebNode, L: LiveEntry) {
   const ok = webUrlOk(n.url);
   L.note!.textContent = n.url && !ok ? 'Refused: only http and https pages open in a web card.' : 'Blank? That site refuses to be framed; ↗ opens it in a tab.';
   if (!ok) { f.removeAttribute('src'); return; }
-  if (window.CANVAS_HOSTED) { toast('On claude.ai the viewer blocks nested frames; web nodes work in the local build. ↗ opens the page in a tab.', 5000); }
   f.src = n.url;
 }
 // Sketch: a card the pen writes on. Ink attaches to the node (existing stroke model), so it moves and nests with it.

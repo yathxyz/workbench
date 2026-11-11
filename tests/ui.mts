@@ -10,7 +10,7 @@
 // the console page and agent tools (R16.9-R16.11). The demo has no edwind: its pages are read-only.
 // Each check prints ok, FAIL or skip. The exit status is 0 only when every check ran and passed.
 //
-// Demo phase: the page inlined the way tools/build-artifact.py inlines it, opened from file://.
+// Demo phase: the page with its scripts and styles inlined, opened from file://.
 // Daemon phase: the harness's Caddy listens only on a unix socket. A forwarder on 127.0.0.1:18443 (the harness's
 // publicOrigin) joins the browser to it and drops connections from every other local user, who would otherwise
 // reach a shell through the proxy secret Caddy adds. The harness runs without WB_HARNESS_TCP, whose TCP entry would
@@ -46,8 +46,8 @@ async function page(url: string, w = 1500, h = 950): Promise<import('playwright-
 }
 
 // ---------------- demo mode
-// tools/build-artifact.py's page, built here from the web root: the APP part of index.html with the styles,
-// the bridge source, vendor.js, keys.js and app.js inline, and no font link.
+// The demo as one file, built here from the web root: the APP part of index.html with the styles, the bridge
+// source, vendor.js, keys.js and app.js inline, and no font link.
 function demoPage() {
   const rd = (f: string) => fs.readFileSync(path.join(ROOT!, f), 'utf8'), js = (f: string) => rd(f).replaceAll('</script', '<\\/script');
   const body = rd('index.html').split('<!--APP-->')[1].split('<!--/APP-->')[0];
@@ -58,7 +58,7 @@ ${rd('vendor/xterm.css')}
 ${rd('style.css')}
 </style>
 ${body}
-<script>window.CANVAS_HOSTED = true; window.CLAUDE_BRIDGE_SRC = ${JSON.stringify(rd('bridge.js')).replaceAll('</script', '<\\/script')};</script>
+<script>window.CLAUDE_BRIDGE_SRC = ${JSON.stringify(rd('bridge.js')).replaceAll('</script', '<\\/script')};</script>
 <script>
 ${js('vendor/vendor.js')}
 </script>
