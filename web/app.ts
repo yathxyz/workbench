@@ -5447,7 +5447,8 @@ async function rvLoad(force?: boolean) {
   if (DAEMON) {
     try {
       const [c, r] = await Promise.all([fetch('/api/cards').then(x => x.json()), fetch('/api/reviews').then(x => x.json())]);
-      if (c.cards?.length) { RV.cards = c.cards.filter((x: RvCard) => x.status !== 'retired').map((x: RvCard) => ({ ...x, src: x.src || `${x.title}\n${Object.entries(x.props || {}).map(([k, v]) => `${k.toLowerCase()}:: ${v}`).join('\n')}\n${x.body || ''}`.trim() })); RV.source = c.root; }
+      if (c.error) RV.source = `sample deck (${c.error})`;
+      else if (c.cards?.length) { RV.cards = c.cards.filter((x: RvCard) => x.status !== 'retired').map((x: RvCard) => ({ ...x, src: x.src || `${x.title}\n${Object.entries(x.props || {}).map(([k, v]) => `${k.toLowerCase()}:: ${v}`).join('\n')}\n${x.body || ''}`.trim() })); RV.source = c.root; }
       else RV.source = `sample deck (no cards under ${c.root}${c.exists ? '' : ', which does not exist'})`;
       RV.log = r.reviews || [];
     } catch { RV.source = 'sample deck (daemon unreachable)'; }
