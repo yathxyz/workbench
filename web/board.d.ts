@@ -71,7 +71,7 @@ type ViewName = 'canvas' | 'ranger' | 'graph' | 'editor' | 'outline' | 'tasks' |
 /* A leader key name (LEADERS, line 7721). */
 type LeaderName = 'C-SPC' | 'C-M-SPC' | 'F1';
 /* A perspective: the manual layout or one derived from the host (PERSP). */
-type PerspName = 'manual' | 'process' | 'fs' | 'tag' | 'tmux' | 'proc' | 'unit' | 'journal' | 'link';
+type PerspName = 'manual' | 'process' | 'fs' | 'tag' | 'proc' | 'unit' | 'journal' | 'link';
 
 /* Fields every node has, whatever its kind. */
 interface BoardNodeBase {
@@ -96,16 +96,13 @@ interface BoardNodeBase {
 /* Where a card sits in a tile folder's split. */
 interface TileSlot { axis: 'x' | 'y' | null; avail: number; first?: boolean }
 
-/* A shell card: a PTY on a daemon (or tmux session), or the demo's FakeShell. */
+/* A shell card: a PTY on a daemon, or the demo's FakeShell. */
 interface TermNode extends BoardNodeBase {
   kind: 'term';
   backend: 'pty' | 'fake';
   cmd?: string; cwd?: string; env?: Record<string, string>; shell?: string; spawnNote?: string;
-  tmux?: string;                       // the tmux target it was adopted from
-  tmuxSess?: string; tmuxAdopted?: boolean; tmuxHost?: string; tmuxState?: string;
   fg?: string;                         // the foreground command
   cwdLive?: string;                    // the cwd the PTY last reported
-  emacs?: string;                      // a file an emacs card opened
   inputLog?: string;
   _replay?: string;
 }
@@ -115,7 +112,7 @@ interface ReplNode extends BoardNodeBase {
   lang: 'js' | 'cmd';
   history?: string[]; replayFrom?: string; backend?: 'pty' | 'fake'; cmd?: string;
   inputLog?: string; _replay?: string;
-  tmux?: string; cwdLive?: string;
+  cwdLive?: string;
 }
 /* A page (kind 'buffer'): its file in edwind (buf), edited in Edwin frames; a page not yet migrated, or on a board without edwind, keeps its Markdown in text. */
 interface PageNode extends BoardNodeBase {
@@ -163,14 +160,13 @@ interface FrameNode extends BoardNodeBase {
   fsHost?: string; fsPath?: string; fsListed?: boolean;      // fs folders
   procHost?: string; procPid?: number;                      // proc folders
   unitName?: string; unitState?: string; unitHost?: string; // unit folders
-  tmuxSess?: string; tmuxHost?: string; tmuxState?: string; // tmux folders
   mount?: boolean | string; linkTitle?: string;
   suspended?: boolean; buried?: boolean | number;
 }
 /* How a folder lays out its items ('ribbon' is migrated to 'tile'). */
 type FrameMode = 'free' | 'pack' | 'tile' | 'stack';
 /* Which perspective made a derived folder. */
-type FrameDerived = 'process' | 'fs' | 'tag' | 'tmux' | 'proc' | 'unit' | 'journal' | 'link';
+type FrameDerived = 'process' | 'fs' | 'tag' | 'proc' | 'unit' | 'journal' | 'link';
 /* The host a host folder stands for (a copy of a Host). */
 interface FolderHost { name: string; url?: string; token?: string }
 /* An artifact card: a sandboxed HTML page with capabilities and a small database. */
@@ -232,7 +228,7 @@ interface GhostNode extends BoardNodeBase {
   path?: string; dir?: boolean; link?: string | null; host?: string; // host: a host url, not a FolderHost
   mount?: boolean | string; nlink?: number; ino?: number; dev?: number; hardlink?: string; // hardlink: the ghost of the same inode's first name
   journalDay?: string; noteId?: string; linkTitle?: string;
-  tmuxTarget?: string; procPid?: number; cmd?: string; unitName?: string; unitState?: string;
+  procPid?: number; cmd?: string; unitName?: string; unitState?: string;
 }
 /* Any node on the board: a union tagged on `kind`. */
 type BoardNode = TermNode | ReplNode | PageNode | RefNode | AcpNode | FrameNode | ArtifactNode | WebNode | SketchNode | ImageNode | PdfNode | OpNode | GhostNode;
@@ -444,7 +440,6 @@ interface CardBackend {
   readonly dead?: boolean;
   readonly parked?: boolean;
   exitReason?: PtyExitReason | null;
-  detachOnly?: boolean;                // remove the card but leave its tmux session running
   ws?: WebSocket | null;
   waitHub?: boolean;
   host?: Host | null;
@@ -492,7 +487,7 @@ interface DaemonInfo {
   host: string; home: string;
   edit?: boolean; editUp?: boolean; sample?: boolean; models?: unknown; notes?: string; notesExists?: boolean;
   media?: MediaProviderInfo[];         // the image providers media cards can use (F-A41)
-  state?: string; dist?: string; tmux?: string | null; artifactOrigin?: string;
+  state?: string; dist?: string; artifactOrigin?: string;
   agents?: { name: string; label: string }[];
   shells?: string[]; defaultShell?: string;
   hub?: { status: HubStatus; version?: string; build?: string; proto?: number; startedAt?: number; stale?: boolean };
@@ -559,13 +554,13 @@ type JournalEvent = { seq: number; ts: number } & (
 
 /* Browser to daemon on /pty. */
 type PtyClientMsg =
-  | { t: 'open'; id: string; cmd?: string; parent?: string | null; cwd?: string; tmux?: string; cols: number; rows: number; env?: Record<string, string>; spawn?: boolean; shell?: string; resume?: { stream: number; out: number } }
+  | { t: 'open'; id: string; cmd?: string; parent?: string | null; cwd?: string; cols: number; rows: number; env?: Record<string, string>; spawn?: boolean; shell?: string; resume?: { stream: number; out: number } }
   | { t: 'in'; d: string }
   | { t: 'resize'; cols: number; rows: number }
   | { t: 'kill'; session?: boolean };   // no session: forget the card, keep nothing
 /* Daemon to browser on /pty. */
 type PtyServerMsg =
-  | { t: 'hello'; new: boolean; resumed: boolean; stream?: number; out?: number; epoch: number; cwd?: string; replay?: string; tmux?: string; adopted?: boolean; attached?: boolean }
+  | { t: 'hello'; new: boolean; resumed: boolean; stream?: number; out?: number; epoch: number; cwd?: string; replay?: string }
   | { t: 'out'; d: string; out?: number }
   | { t: 'fg'; comm: string; cwd?: string }
   | { t: 'exit'; code: number | null; signal: string | null; reason: PtyExitReason }
@@ -718,7 +713,6 @@ interface RgEntry {
   note?: NoteRow;
   proc?: ProcInfo;
   unit?: { name: string; u: SystemdUnit; h: Host | null };
-  tmux?: { target: string; h: Host | null };
   reserved?: string;                   // an explanation shown in place of contents
   go?: () => unknown;                  // what Enter does, when not the default
   attn?: 'bad' | '';
@@ -731,15 +725,8 @@ interface BoardAddr { kind: string; host: string | null; path: string }
 /* A row of /api/ls. */
 interface LsEntry { name: string; dir: boolean; size: number; mtime: number; link: string | null; mount?: boolean | string; nlink?: number; ino?: number; dev?: number; path?: string }
 
-// ---- the host's own trees: tmux, proc, unit (v13-v14)
+// ---- the host's own trees: proc, unit
 
-/* A tmux session on a host's socket (/api/tmux). */
-interface TmuxSession {
-  name: string; command?: string; path?: string; attached?: boolean;
-  windows: { index: number; name: string; active: boolean; panes: { index: number; command: string; path: string; active: boolean }[] }[];
-}
-/* A host's tmux listing as TMUX.data caches it. */
-interface TmuxData { at: number; socket: string | null; sessions: TmuxSession[]; loading?: boolean; err?: boolean }
 /* A process from /api/proc (or the demo host). */
 interface ProcInfo { pid: number; ppid: number; comm: string; state: string; cwd: string | null; cmd: string; start: number; rss: number; unit?: string | null; node?: string }
 /* A host's processes as PROC.data caches them, indexed by pid and by parent. */
