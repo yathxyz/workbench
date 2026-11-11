@@ -9571,11 +9571,12 @@ function noteByAddrPath(p: string): NoteRow | null {
   return rows.find(x => x.kind !== 'file' && x.title.toLowerCase() === heading.toLowerCase()) || null;
 }
 const LINKS: { g: NotesLinkGraph | null; at: number; p: Promise<NotesLinkGraph | null> | null } = { g: null, at: 0, p: null };
+// A 503 (edwind down or not configured) leaves no index graph; board pages still link among themselves.
 function linksLoad(force?: boolean): Promise<NotesLinkGraph | null> {
   if (!DAEMON) return Promise.resolve(LINKS.g);
   if (LINKS.p) return LINKS.p;   // one fetch in flight: every caller awaits the same one
   if (!force && Date.now() - LINKS.at < 30000) return Promise.resolve(LINKS.g);
-  return LINKS.p = (async () => { try { LINKS.g = await (await hFetch(null, '/api/links')).json(); } catch { LINKS.g = null; } LINKS.at = Date.now(); LINKS.p = null; if (VIEW === 'ranger') renderRanger(); return LINKS.g; })();
+  return LINKS.p = (async () => { try { const r = await hFetch(null, '/api/links'), j = await r.json(); LINKS.g = r.ok && Array.isArray(j?.links) && j.files ? j : null; } catch { LINKS.g = null; } LINKS.at = Date.now(); LINKS.p = null; if (VIEW === 'ranger') renderRanger(); return LINKS.g; })();
 }
 const WIKI_RE = /\[\[([^\[\]\n]+)\]\]/g;
 const linkTitle = (t: string) => t.replace(/^id:/, '').split('#')[0].trim();
