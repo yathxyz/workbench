@@ -39,11 +39,6 @@ pub struct Config {
     /// `/edwin/`. It comes from the same Edwin as the edwind on `editSocket`, so frames
     /// and daemon match. Absent, `/edwin/` is whatever `webRoot` holds under `edwin/`.
     pub edwin_web_root: Option<PathBuf>,
-    /// Ignored since E4 (edwind spec R9.21): Edwin frames are the only page editor,
-    /// on whenever `editSocket` is set. Still accepted, so a `web.json` written for an
-    /// older release loads.
-    #[serde(rename = "frames")]
-    pub _frames: Option<bool>,
     /// The destinations `POST /api/mv` refuses, shared with edwind (R14.8). Absent
     /// means the built-in list.
     pub refuse_paths: Option<Vec<String>>,
@@ -469,22 +464,6 @@ mod tests {
         ] {
             assert!(!https_or_loopback(no), "{no}");
         }
-    }
-
-    #[test]
-    fn frames_is_still_accepted() {
-        let f = Fixture::new();
-        let (cfg, _) = f.load().unwrap();
-        assert_eq!(cfg._frames, None);
-        let mut f = Fixture::new();
-        f.cfg["frames"] = json!(true);
-        assert_eq!(f.load().unwrap().0._frames, Some(true));
-        f.cfg["frames"] = json!(false);
-        assert_eq!(f.load().unwrap().0._frames, Some(false));
-        f.cfg["frames"] = Value::Null;
-        assert_eq!(f.load().unwrap().0._frames, None);
-        f.cfg["frames"] = json!("yes");
-        assert!(f.load().is_err());
     }
 
     #[test]
