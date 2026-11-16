@@ -2,7 +2,7 @@
    sketch, image, PDF and media cards; a folder holds items through `in`).
    Edges: spawn (tree lineage), pipe (dataflow), ref (pinned excerpt).
    Served by wb-web, cards run in wb-hub and pages are Edwin frames; opened from a file or a hosted artifact, it is the
-   demo (simulated shell, JS REPL, the board in localStorage). */
+   demo (simulated shell, the board in localStorage). */
 (() => {
 'use strict';
 const V = window.V;
@@ -729,49 +729,6 @@ class FakeShell implements CardBackend {
   }
 }
 
-function fmtVal(v: unknown): string {
-  try {
-    if (typeof v === 'function') return 'ƒ ' + (v.name || 'anonymous');
-    if (v === undefined) return 'undefined';
-    if (typeof v === 'string') return JSON.stringify(v);
-    if (typeof v === 'number' || typeof v === 'boolean' || v === null) return String(v);
-    return JSON.stringify(v) ?? String(v);
-  } catch { return String(v); }
-}
-// JavaScript REPL: each node owns a hidden iframe, so each has its own global scope.
-// History is replayed on load and on branch, which is the cheap, deterministic way to fork state.
-type JsReplNode = ReplNode & { history: string[] };
-class JsRepl implements CardBackend {
-  declare n: JsReplNode; declare t: XtermTerminal; declare frame: HTMLIFrameElement; declare win: Window & typeof globalThis; declare quiet: boolean; declare le: LineEditor;
-  constructor(n: ReplNode, term: XtermTerminal) {
-    this.n = n as JsReplNode; this.t = term; n.history = n.history || [];
-    this.frame = document.createElement('iframe'); this.frame.style.display = 'none'; this.frame.setAttribute('aria-hidden', 'true');
-    document.body.append(this.frame);
-    this.win = this.frame.contentWindow as Window & typeof globalThis; this.quiet = false;
-    try { this.win.console.log = (...a) => { if (!this.quiet) this.print(a.map(x => typeof x === 'string' ? x : fmtVal(x)).join(' ')); }; } catch {}
-    this.le = new LineEditor(term, () => '\x1b[38;5;179m' + pathOf(n.id) + ' ›\x1b[0m ', line => this.exec(line));
-    term.write('\x1b[2mJavaScript REPL in your browser. Each node has its own globals.\x1b[0m\r\n');
-    if (n.history.length) {
-      this.quiet = true; let ok = 0; for (const l of n.history) if (this.evalQuiet(l)) ok++; this.quiet = false;
-      this.le.hist = [...n.history]; this.le.hi = n.history.length;
-      term.write(`\x1b[38;5;179m↺ replayed ${ok} line(s)${n.replayFrom ? ' inherited from ' + n.replayFrom : ''}; ↑ shows them\x1b[0m\r\n`);
-    }
-    this.le.prompt();
-  }
-  evalJs(code: string): unknown { return this.win.eval(code.replace(/^\s*(let|const)\s+/, 'var ')); }
-  evalQuiet(l: string): boolean { try { this.evalJs(l); return true; } catch { return false; } }
-  exec(line: string): void {
-    if (!line.trim()) { this.le.prompt(); return; }
-    activity(this.n.id); this.n.history.push(line);
-    try { this.print('\x1b[38;5;110m' + fmtVal(this.evalJs(line)) + '\x1b[0m'); }
-    catch (e) { this.print('\x1b[31m' + (e && e.name === 'EvalError' ? 'This page blocks eval. Run the prototype locally for the REPL.' : String(e)) + '\x1b[0m'); }
-    this.le.prompt(); dirty();
-  }
-  print(s: unknown): void { this.t.write(String(s).replace(/\n/g, '\r\n') + '\r\n'); }
-  input(d: string): void { this.le.feed(d); }
-  kill(): void { this.frame.remove(); }
-}
-
 // Real PTY through wb-hub. The hub keeps the session alive across reloads and replays recent output.
 // A real shell on the server (/pty, §3.5.1). Nothing auto-runs: `spawn` is true only on the first open of a card made in
 // this page and on Enter on an ended or not-found card, and only until that open is sent; page loads and reconnects attach
@@ -790,14 +747,13 @@ function plain(s: unknown): string {
 }
 // A card's shell is a name in the hub's syntax for one (DELTA-1 §B.5); anything else on a board is never shown or sent.
 const shellName: (n: { shell?: string }) => string = n => /^[a-z0-9-]{1,32}$/.test(n.shell || '') ? n.shell! : '';
-type PtyCardNode = TermNode | (ReplNode & Pick<TermNode, 'cwd' | 'env' | 'shell' | 'cwdLive' | 'fg'>);
 class PtyBackend implements CardBackend, Wakeable {
-  declare n: PtyCardNode; declare t: XtermTerminal; declare L: LiveEntry; declare spawn: boolean; declare tries: number;
+  declare n: TermNode; declare t: XtermTerminal; declare L: LiveEntry; declare spawn: boolean; declare tries: number;
   declare resume?: { stream: number; out: number }; declare disposed?: boolean; declare timer?: number; declare waitHub: boolean;
   declare host: Host | null; declare parked: boolean; declare final: boolean; declare helloSeen: boolean; declare ws: WebSocket;
   declare dead?: boolean; declare exitReason?: PtyExitReason | null; declare epoch?: number; declare lost?: boolean; declare helloed?: boolean;
   declare respawning?: boolean; declare shellOffer?: boolean;
-  constructor(n: PtyCardNode, term: XtermTerminal, L: LiveEntry) { this.n = n; this.t = term; this.L = L; this.spawn = !!n._spawn; delete n._spawn; this.tries = 0; this.connect(); }
+  constructor(n: TermNode, term: XtermTerminal, L: LiveEntry) { this.n = n; this.t = term; this.L = L; this.spawn = !!n._spawn; delete n._spawn; this.tries = 0; this.connect(); }
   openMsg(): string {
     const n = this.n, m: Extract<PtyClientMsg, { t: 'open' }> = { t: 'open', id: n.id, cmd: n.cmd || '', parent: n.spawnFrom || '', cwd: n.cwd || '', cols: this.t.cols, rows: this.t.rows, env: { CANVAS_NODE: pathOf(n.id), ...(n.env || {}) }, spawn: this.spawn };
     if (this.spawn && shellName(n)) m.shell = n.shell;
@@ -821,10 +777,6 @@ class PtyBackend implements CardBackend, Wakeable {
         if (m.stream != null) this.resume = { stream: m.stream, out: m.out! };
         if (m.new) {
           if (this.lost || (this.helloed && !this.respawning)) this.t.write('\r\n\x1b[33m[new shell: the server had no session for this card]\x1b[0m\r\n');
-          if (this.n._replay) {   // set only by spawnChild in this page, never saved: a board cannot type into a new shell
-            const r = this.n._replay; delete this.n._replay;
-            setTimeout(() => { this.t.write('\x1b[38;5;179m↺ replaying the parent’s input\x1b[0m\r\n'); this.send(r); }, 800);
-          }
         } else if (m.resumed) this.t.write(m.replay || '');   // the ring tail after our offset: the scrollback stays
         else { this.t.reset(); this.t.write(m.replay || ''); }
         this.helloed = true; this.respawning = false; this.lost = false;
@@ -897,7 +849,6 @@ class PtyBackend implements CardBackend, Wakeable {
   }
   input(d: string): void {
     if (this.dead) { if (d === '\r') this.respawn(); return; }
-    if (this.n.kind === 'repl') { this.n.inputLog = ((this.n.inputLog || '') + d).slice(-20000); dirty(); }
     this.send(d);
   }
   // only the tab the user is looking at sizes the PTY (ROB-8): the active card, or a terminal holding the keyboard (the dock is never a card)
@@ -1517,7 +1468,7 @@ function newAgentCard() {
 function acpButton() { const b = $('#add-acp') as HTMLButtonElement | null; if (b) b.disabled = !DAEMON || !(INFO?.agents || []).length; }
 function defaultCwd(): string {
   const a = (activeId && S.nodes[activeId]) as BoardNode | null | undefined;
-  if (a && (a.kind === 'term' || a.kind === 'repl')) { const c = a.cwdLive || SESS[a.id]?.cwd; if (c) return c; }
+  if (a && a.kind === 'term') { const c = a.cwdLive || SESS[a.id]?.cwd; if (c) return c; }
   if (a?.kind === 'acp' && a.cwd) return a.cwd;
   return INFO?.home || '';
 }
@@ -1544,7 +1495,7 @@ function mountAcp(n: AcpNode, L: LiveEntry) {
   ($('.ag-mode', L.body) as HTMLSelectElement).onchange = e => b.setMode((e.target as HTMLSelectElement).value);
 }
 class Offline implements CardBackend {
-  constructor(n: TermNode | ReplNode, term: XtermTerminal) { term.write('\x1b[33mThis node is a real shell: it runs when wb-web serves this page.\x1b[0m\r\n'); }
+  constructor(n: TermNode, term: XtermTerminal) { term.write('\x1b[33mThis node is a real shell: it runs when wb-web serves this page.\x1b[0m\r\n'); }
   input() {}
 }
 
@@ -1629,7 +1580,7 @@ type SepDir = 'l' | 'r' | 'u' | 'd';
 interface FolderAspect { name: string; r?: number; lh?: number }
 const PAD = 28, GAP = 24, LABEL_H = 32, DECK = { w: 300, h: 230 };
 const FSHAPES: FrameNode['shape'][] = ['folder', 'box', 'round'], FICON: Record<FrameMode, string> = { free: '◻', pack: '▦', tile: '⊞', stack: '❐' };   // ribbon (PaperWM row) removed; old boards' ribbon folders load as tile
-const KIND_GLYPH: Record<NodeKind, string> = { term: '$', repl: '›', buffer: '¶', acp: '✦', ref: '❝', frame: '▭', artifact: '◧', web: '⌾', sketch: '✎', image: '▣', ghost: '◌', pdf: '▤', op: '✺' };
+const KIND_GLYPH: Record<NodeKind, string> = { term: '$', buffer: '¶', acp: '✦', ref: '❝', frame: '▭', artifact: '◧', web: '⌾', sketch: '✎', image: '▣', ghost: '◌', pdf: '▤', op: '✺' };
 const kidsOf = (fid: string): BoardNode[] => Object.values(S.nodes).filter(m => m.in === fid);
 const byOrder = (a: BoardNode, b: BoardNode): number => (a.order ?? 0) - (b.order ?? 0) || a.y - b.y || a.x - b.x;
 function descendants(fid: string, out: BoardNode[] = []): BoardNode[] { for (const k of kidsOf(fid)) { out.push(k); if (k.kind === 'frame') descendants(k.id, out); } return out; }
@@ -2213,7 +2164,7 @@ type MountedLive = LiveEntry & { el: HTMLElement; hdr: HTMLElement; body: HTMLEl
   const L: MountedLive = live[n.id] = { el: e, hdr, body, lod, ink };
   const btns = $('.btns', hdr)!;
   const B = (label: string, title: string, fn: (b: HTMLButtonElement) => unknown) => { const b = el('button', 'hb'); b.textContent = label; b.title = title; b.onclick = ev => { ev.stopPropagation(); fn(b); }; btns.append(b); return b; };
-  if (n.kind === 'term' || n.kind === 'repl') {
+  if (n.kind === 'term') {
     B('⑂', 'Branch: spawn a child that inherits this node’s context', () => spawnChild(n));
     B('⇢', 'Send the selected output along pipe edges', () => pipeFrom(n));
     B('❝', 'Pin the selected output as a reference card', () => refFrom(n));
@@ -2263,7 +2214,7 @@ type MountedLive = LiveEntry & { el: HTMLElement; hdr: HTMLElement; body: HTMLEl
   }
   B('✕', 'Delete (click twice)', b => confirmDel(b, () => removeNode(n.id))).classList.add('hdel');
   place(n); updateTitle(n);
-  if (n.kind === 'term' || n.kind === 'repl') mountTerm(n, L);
+  if (n.kind === 'term') mountTerm(n, L);
   else if (n.kind === 'buffer') mountBuffer(n, L);
   else if (n.kind === 'ref') mountRef(n, L);
   else if (n.kind === 'acp') mountAcp(n, L);
@@ -2295,7 +2246,6 @@ function badgeOf(n: BoardNode): string {
   if (n.kind === 'artifact') return n.head ? 'v ' + String(n.head).slice(0, 6) : '';
   if (n.kind === 'ghost') return n.alias ? 'copy' : n.journalDay && !n.noteId ? 'journal' : n.noteId ? 'note' : n.linkTitle ? 'link' : n.procPid ? 'process' : n.unitName ? (n.unitState || 'unit') : n.hardlink ? 'hardlink' : n.link ? 'symlink' : n.mount ? 'mount' : n.dir ? 'directory' : 'file';
   if (n.kind === 'term') return n.backend === 'pty' ? shellName(n) || 'shell' : 'sim shell';
-  if (n.kind === 'repl') return n.lang === 'js' ? 'js' : (n.cmd || '').split(' ')[0].replace('python3', 'py');
   if (n.kind === 'acp') return agentLabel(n.agent) + ' · ' + (live[n.id]?.backend?.stateText!() || (SESS[n.id]?.state || '…').replace(/_/g, ' '));
   if (n.kind === 'pdf') return n.pages ? `p. ${n.pos?.page || 1} / ${n.pages}` : 'pdf';
   if (n.kind === 'op') return (OP_KINDS[n.op]?.label || 'media') + (live[n.id]?.op?.busy ? ' · running' : n.out?.err ? ' · failed' : opStale(n) ? ' · stale' : '');
@@ -2326,7 +2276,7 @@ function rename(n: BoardNode, nameEl: HTMLElement) {
   nameEl.onblur = () => done(true);
 }
 
-function mountTerm(n: TermNode | ReplNode, L: LiveEntry) {
+function mountTerm(n: TermNode, L: LiveEntry) {
   const term = new V.Terminal({ fontFamily: MONO, fontSize: 13, lineHeight: 1.12, cursorBlink: true, scrollback: 5000, theme: termTheme(), allowProposedApi: true });
   const fit = new V.FitAddon(); term.loadAddon(fit);
   term.open(L.body!); L.term = term;
@@ -2339,9 +2289,8 @@ function mountTerm(n: TermNode | ReplNode, L: LiveEntry) {
   L.ro.observe(L.body!);
   term.textarea?.addEventListener('focus', () => L.backend?.resize?.(term.cols, term.rows));   // focus makes this tab the one that sizes the PTY
   L.fitNow();
-  if (n.kind === 'repl' && n.lang === 'js') L.backend = new JsRepl(n, term);
-  else if (n.backend === 'pty') L.backend = DAEMON ? new PtyBackend(n, term, L) : new Offline(n, term);
-  else L.backend = new FakeShell(n as TermNode, term);
+  if (n.backend === 'pty') L.backend = DAEMON ? new PtyBackend(n, term, L) : new Offline(n, term);
+  else L.backend = new FakeShell(n, term);
   term.onData(d => L.backend!.input(d));
 }
 
@@ -2482,7 +2431,7 @@ function newAt<K extends NodeKind>(kind: K, extra: Partial<NodeOfKind<K>> = {}):
   const c = viewCenterWorld(), w = extra.w || (kind === 'frame' ? 760 : kind === 'buffer' ? 460 : 560), h = extra.h || (kind === 'frame' ? 460 : 320);
   const jitter = () => Math.round((Math.random() - .5) * 60);
   const count = Object.values(S.nodes).filter(m => m.kind === kind).length + 1;
-  const names: Record<string, string> = { term: 'shell', repl: 'repl', buffer: 'page', frame: 'folder', agent: 'agent', acp: 'agent', artifact: 'artifact', web: 'web', sketch: 'sketch', image: 'image', pdf: 'paper', op: 'media' };
+  const names: Record<string, string> = { term: 'shell', buffer: 'page', frame: 'folder', agent: 'agent', acp: 'agent', artifact: 'artifact', web: 'web', sketch: 'sketch', image: 'image', pdf: 'paper', op: 'media' };
   const x = at ? Math.round(at.x) : Math.round(c.x - w / 2) + jitter(), y = at ? Math.round(at.y) : Math.round(c.y - h / 2) + jitter();
   return addNode({ kind, name: names[kind] + count, x, y, w, h, ...extra }) as NodeOfKind<K>;
 }
@@ -2509,17 +2458,15 @@ function removeNode(id: string) {
   if (gone?.kind === 'buffer') blockCardsChanged(gone);
   restack(); renderEdges(); updateAllTitles(); renderTree(); dirty();
 }
-type SpawnChildInit = Pick<BoardNodeBase, 'id' | 'name' | 'x' | 'y' | 'w' | 'h' | 'in' | 'spawnFrom'> & { kind: NodeKind } & Partial<Pick<TermNode, 'backend' | 'cmd' | 'cwd' | 'env' | 'spawnNote' | 'shell'> & Pick<ReplNode, 'lang' | 'history' | 'replayFrom' | '_replay'> & Pick<AcpNode, 'agent'>>; function spawnChild(n: BoardNode, name?: string): SpawnChildInit {
+type SpawnChildInit = Pick<BoardNodeBase, 'id' | 'name' | 'x' | 'y' | 'w' | 'h' | 'in' | 'spawnFrom'> & { kind: NodeKind } & Partial<Pick<TermNode, 'backend' | 'cmd' | 'cwd' | 'env' | 'spawnNote' | 'shell'> & Pick<AcpNode, 'agent'>>; function spawnChild(n: BoardNode, name?: string): SpawnChildInit {
   const kids = childrenOf(n.id, 'spawn'), k = kids.length, w = Math.min(n.w, 440), h = Math.min(n.h, 300);
-  const child: SpawnChildInit = { id: uid('n'), kind: n.kind, backend: (n as TermNode).backend, lang: (n as ReplNode).lang, cmd: (n as TermNode).cmd, name: name ? clean(name) : 'b' + (k + 1),
+  const child: SpawnChildInit = { id: uid('n'), kind: n.kind, backend: (n as TermNode).backend, cmd: (n as TermNode).cmd, name: name ? clean(name) : 'b' + (k + 1),
     x: n.x + k * (w + 40), y: n.y + n.h + 90, w, h, spawnFrom: n.id, in: n.agg && S.nodes[n.agg] ? n.agg : n.in };
   if (n.kind === 'term' && n.backend !== 'pty') {
     child.cwd = n.cwd; child.env = { ...(n.env || {}) };
     child.spawnNote = `branched from ${pathOf(n.id)}: started in ${n.cwd}, inherited ${Object.keys(child.env).length} env var(s)`;
   }
   if (n.kind === 'term' && n.backend === 'pty') { child.env = { ...(n.env || {}) }; if (shellName(n)) child.shell = n.shell; }
-  if (n.kind === 'repl' && n.lang === 'js') { child.history = [...(n.history || [])]; child.replayFrom = pathOf(n.id); }
-  if (n.kind === 'repl' && n.lang !== 'js') child._replay = n.inputLog || '';
   if (n.kind === 'acp') { child.agent = n.agent; child.cwd = n.cwd; }   // a new session in the same folder, not a fork
   S.edges.push({ id: uid('e'), from: n.id, to: child.id, type: 'spawn' });
   addNode(child as AddNodeArg);
@@ -3112,21 +3059,6 @@ $('#add-frame')!.onclick = () => {
   const n = newAt('frame', { mode: 'free', shape: 'folder' });
   setTimeout(() => rename(n, $('.fname', live[n.id].el)!), 400);
 };
-const replMenu = $('#repl-menu')!;
-$('#add-repl')!.onclick = ev => {
-  ev.stopPropagation();
-  const r = (ev.currentTarget as HTMLElement).getBoundingClientRect();
-  replMenu.style.left = r.left + 'px'; replMenu.style.top = r.bottom + 'px';
-  $$('.needs-daemon', replMenu).forEach(b => (b as HTMLButtonElement).disabled = !DAEMON);
-  replMenu.hidden = !replMenu.hidden;
-};
-$$('#repl-menu button').forEach(b => b.onclick = () => {
-  replMenu.hidden = true;
-  const r = b.dataset.repl!;
-  if (r === 'js') newAt('repl', { lang: 'js', history: [] });
-  else newAt('repl', { lang: 'cmd', backend: 'pty', cmd: r, name: r.split(' ')[0].replace('python3', 'py') + (nodeList().length + 1) });
-});
-document.addEventListener('pointerdown', e => { if (!(e.target as Element).closest('.menu-wrap')) replMenu.hidden = true; });
 $('#open-palette')!.onclick = () => { PICK = null; openPalette(''); };
 $('#open-help')!.onclick = () => { $('#help')!.hidden = false; };
 $('#help-close')!.onclick = () => { $('#help')!.hidden = true; };
@@ -3255,7 +3187,7 @@ function openPalette(prefill: string) {
 $('#palette')!.addEventListener('pointerdown', (e: PointerEvent) => { if (e.target === e.currentTarget && (e.currentTarget as HTMLElement).classList.contains('at')) closeOverlays(); });   // a menu closes on a press outside it
 function closeOverlays() {
   const ret = PICK?.ret;
-  $$('.overlay').forEach(o => o.hidden = true); replMenu.hidden = true; PICK = null;
+  $$('.overlay').forEach(o => o.hidden = true); PICK = null;
   if (ret) setTimeout(() => {   // after the press that closed it (its mousedown moves focus) and after the pick's own run
     const a = document.activeElement;
     if (!ret.isConnected || $$('.overlay').some(o => !o.hidden) || (a && a !== document.body && a !== $('#pal-in'))) return;   // a picker or prompt the pick opened keeps them
@@ -3341,15 +3273,12 @@ cmd('Ink: copy as SVG (the selected strokes, or the active sketch card)', () => 
 cmd('PDF: find in the active PDF…', () => pdfFindAsk(S.nodes[activeId!] as PdfNode), '', () => S.nodes[activeId!]?.kind === 'pdf');
 cmd('PDF: quote the selection', () => pdfQuote(S.nodes[activeId!] as PdfNode), '', () => S.nodes[activeId!]?.kind === 'pdf');
 cmd('New shell', onCanvas(() => $('#add-shell')!.click()));
-cmd('New JavaScript REPL', onCanvas(() => newAt('repl', { lang: 'js', history: [] })));
-cmd('New Python REPL', onCanvas(() => newAt('repl', { lang: 'cmd', backend: 'pty', cmd: 'python3 -q', name: 'py' + (nodeList().length + 1) })), '', () => DAEMON);
-cmd('New Node REPL', onCanvas(() => newAt('repl', { lang: 'cmd', backend: 'pty', cmd: 'node', name: 'node' + (nodeList().length + 1) })), '', () => DAEMON);
 cmd('New page…', () => askName('New page name', '', name => openPage(name)));
 cmd('New folder…', () => askName('New folder name', '', name => { if (VIEW !== 'canvas') setView('canvas'); const n = newAt('frame', { mode: 'free', shape: 'folder' }) as FrameNode; n.name = clean(name); placeFrame(n); renderTree(); dirty(); }));
 cmd('Open today’s journal', () => openToday());
 cmd('Move the active item to a folder…', () => { const n = S.nodes[activeId!]; pickFolder(`Move ${n.name} to…`, f => adopt(n, f, null)); }, '', () => !!S.nodes[activeId!]);
 cmd('Rename the active item…', () => { const n = S.nodes[activeId!]; askName('Rename ' + n.name, n.name, v => { n.name = clean(v); n.kind === 'frame' ? placeFrame(n) : updateAllTitles(); renderTree(); dirty(); }); }, '', () => !!S.nodes[activeId!]);
-cmd('Branch the active shell, REPL or agent', () => spawnChild(S.nodes[activeId!]), '', () => ['term', 'repl', 'agent', 'acp'].includes(S.nodes[activeId!]?.kind as string));
+cmd('Branch the active shell or agent', () => spawnChild(S.nodes[activeId!]), '', () => ['term', 'agent', 'acp'].includes(S.nodes[activeId!]?.kind as string));
 cmd('Compact everything', onCanvas(() => compact('all')), '@compact', () => !PICKED.size);
 cmd('Compact the selection', onCanvas(() => compact('selection')), '@compact', () => PICKED.size > 0);
 cmd('Select all items in the view', onCanvas(() => { for (const n of Object.values(S.nodes)) if (!stashed(n) && !n.in) pickToggle(n.id, true); }));
@@ -3671,7 +3600,7 @@ function findNode(p: string | null | undefined): BoardNode | null {
 }
 const str = (v: unknown) => (v == null ? '' : String(v));
 const AGENT_TOOLS: AgentTool[] = [
-  { name: 'read_node', description: 'Read a node by path. A page returns its markdown; a shell or REPL returns its last 80 lines of output; a ref returns its text.',
+  { name: 'read_node', description: 'Read a node by path. A page returns its markdown; a shell returns its last 80 lines of output; a ref returns its text.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
     run: async ({ path }: { path: string }) => {
       const n = findNode(path); if (!n) throw new Error('no node at ' + path);
@@ -3683,10 +3612,10 @@ const AGENT_TOOLS: AgentTool[] = [
       if (n.kind === 'op') return `media card: ${n.op}\nprompt: ${n.prompt || ''}\n` + (n.out?.err ? 'failed: ' + n.out.err : n.out?.text || (n.out?.images ? `${n.out.images.length} image(s), picked ${(n.out.pick || 0) + 1}` : 'not run yet')) + (opStale(n) ? '\n(stale: the inputs changed since)' : '');
       return (n as RefNode).text || '';
     } },
-  { name: 'run_in_shell', description: 'Type a command into a shell or REPL node and press Enter. Returns the new output, up to 60 lines.',
+  { name: 'run_in_shell', description: 'Type a command into a shell node and press Enter. Returns the new output, up to 60 lines.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' }, command: { type: 'string' } }, required: ['path', 'command'] },
     run: async ({ path, command }: { path: string; command: string }, ctx?: { signal?: AbortSignal }) => {
-      const n = findNode(path), L = n && live[n.id]; if (!L?.term) throw new Error('not a shell or REPL: ' + path);
+      const n = findNode(path), L = n && live[n.id]; if (!L?.term) throw new Error('not a shell: ' + path);
       const before = termLines(L, 2000);
       L.backend!.input(str(command).replace(/\n/g, '\r') + '\r'); pulse(n!.id);
       let last = '', stable = 0;
@@ -3713,13 +3642,13 @@ const AGENT_TOOLS: AgentTool[] = [
       pulse(n.id);
       return `ok, ${pathOf(n.id)} now has ${(n.text || '').split('\n').length} lines`;
     } },
-  { name: 'create_node', description: 'Create a node. kind is page, shell or repl. parent (a node path of the same kind) makes it a spawned child that inherits context; near (a node path) places it beside that node. Returns the new path.',
-    inputSchema: { type: 'object', properties: { kind: { type: 'string', enum: ['page', 'shell', 'repl'] }, name: { type: 'string' }, text: { type: 'string', description: 'initial markdown for a page' }, parent: { type: 'string' }, near: { type: 'string' } }, required: ['kind', 'name'] },
-    run: ({ kind, name, text, parent, near }: { kind: 'page' | 'shell' | 'repl'; name: string; text?: string; parent?: string; near?: string }) => {
-      const k = { page: 'buffer', shell: 'term', repl: 'repl' }[kind] as 'buffer' | 'term' | 'repl'; if (!k) throw new Error('unknown kind ' + kind);
+  { name: 'create_node', description: 'Create a node. kind is page or shell. parent (a node path of the same kind) makes it a spawned child that inherits context; near (a node path) places it beside that node. Returns the new path.',
+    inputSchema: { type: 'object', properties: { kind: { type: 'string', enum: ['page', 'shell'] }, name: { type: 'string' }, text: { type: 'string', description: 'initial markdown for a page' }, parent: { type: 'string' }, near: { type: 'string' } }, required: ['kind', 'name'] },
+    run: ({ kind, name, text, parent, near }: { kind: 'page' | 'shell'; name: string; text?: string; parent?: string; near?: string }) => {
+      const k = { page: 'buffer', shell: 'term' }[kind] as 'buffer' | 'term'; if (!k) throw new Error('unknown kind ' + kind);
       const par = parent && findNode(parent), nr = near && findNode(near);
       if (par && par.kind === k) return pathOf(spawnChild(par, name).id);
-      const extra = { term: { backend: DAEMON ? 'pty' : 'fake', shell: shellDefault(), cwd: DAEMON ? undefined : '/home/me', env: {} }, repl: { lang: 'js', history: [] }, buffer: { text: str(text) || `# ${clean(name)}\n\n- ` } }[k];
+      const extra = { term: { backend: DAEMON ? 'pty' : 'fake', shell: shellDefault(), cwd: DAEMON ? undefined : '/home/me', env: {} }, buffer: { text: str(text) || `# ${clean(name)}\n\n- ` } }[k];
       const w = k === 'buffer' ? 420 : 520, h = k === 'buffer' ? 300 : 340, base = nr || par || n0();
       const pos = base ? freeSpot(base.x + base.w + 60, base.y, w, h) : (c => freeSpot(c.x - w / 2, c.y - h / 2, w, h))(viewCenterWorld());
       const m = addNode({ kind: k, name: clean(name), ...pos, w, h, ...extra } as AddNodeArg);
@@ -3977,7 +3906,7 @@ function rgLabel(key: string): string {
 }
 const rgList = () => { const all = rgEntries(RG.dir), f = RG.filter.toLowerCase(); return f ? all.filter(e => fuzzy(f, e.name)) : all; };
 function rgCur() { const l = rgList(); const i = clamp(RG.sel[RG.dir] ?? 0, 0, Math.max(0, l.length - 1)); RG.sel[RG.dir] = i; return { list: l, i, e: l[i] }; }
-const RG_GLYPH: Record<string, string> = { frame: '▸', fsdir: '▸', file: '·', buffer: '¶', term: '$', repl: '›', agent: '✦', acp: '✦', ref: '❝', artifact: '◧', persp: '⊳', itag: '#', inote: '¶', iblock: '§', ijournal: '▸', ghost: '◌', iproc: '⚙', iunit: '⊙', iattn: '!' };
+const RG_GLYPH: Record<string, string> = { frame: '▸', fsdir: '▸', file: '·', buffer: '¶', term: '$', agent: '✦', acp: '✦', ref: '❝', artifact: '◧', persp: '⊳', itag: '#', inote: '¶', iblock: '§', ijournal: '▸', ghost: '◌', iproc: '⚙', iunit: '⊙', iattn: '!' };
 function rgRow(e: RgEntry, on: boolean, cur?: boolean): HTMLElement {
   const r = el('div', 'rg-row' + (on ? ' on' : '') + (e.dir ? ' dir' : '') + (RG.marks.has(e.key) ? ' marked' : '') + (RG.clip?.keys.includes(e.key) ? ' cut' : '') + (e.n && stashed(e.n) ? ' dim' : ''));
   r.innerHTML = '<span class="g"></span><span class="nm"></span><span class="mt"></span>';
@@ -4167,7 +4096,7 @@ function setTheme(t: BoardTheme) {
   });
 }
 matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', () => { if (!S?.theme || S.theme === 'auto') setTheme('auto'); });
-// [[ completes to any page, folder, shell, REPL or agent: notes link to anything (zettelkasten). Edwin's popup offers the
+// [[ completes to any page, folder, shell or agent: notes link to anything (zettelkasten). Edwin's popup offers the
 // notes and open pages; the board adds its own cards and folders (Ed.hooks.linkNames, markdown.ts).
 function boardLinkNames(): { name: string; ann: string }[] {
   return [...nodeList().map(n => ({ name: n.name, ann: n.kind === 'buffer' ? 'page' : badgeOf(n) })), ...frameList().map(f => ({ name: f.name, ann: 'folder' }))];
@@ -4358,7 +4287,7 @@ function graphRebuild() {
 }
 function graphColors() {
   const c = (n: string) => cssVar(n);
-  G.colors = { page: c('--link'), term: c('--accent'), repl: c('--pipe'), agent: c('--ref'), ref: c('--muted'), ghost: c('--muted'), buffer: c('--link'),
+  G.colors = { page: c('--link'), term: c('--accent'), agent: c('--ref'), ref: c('--muted'), ghost: c('--muted'), buffer: c('--link'),
     link: c('--muted'), blockref: c('--ref'), folder: c('--folder-node'), contains: c('--line-strong'), spawn: c('--accent'), pipe: c('--pipe'), sketch: c('--ink-red'), fg: c('--fg'), muted: c('--muted'), bg: c('--bg'), panel: c('--panel'), accent: c('--accent') };
 }
 function graphTick() {
@@ -4547,7 +4476,6 @@ function renderOutline() {
     let meta: string | undefined = '';
     if (n.kind === 'buffer') { const t = pageText(n), links = (t.match(/\[\[[^\]]+\]\]/g) || []).length, bl = backlinksOf(n).length, todo = (t.match(/^\s*[-*+]\s+(TODO|NEXT|WAITING|HOLD|SOMEDAY|DOING|NOW|LATER)\s/gm) || []).length; meta = [`${t.split('\n').length} lines`, links && `${links} links out`, bl && `${bl} in`, todo && `${todo} open tasks`].filter(Boolean).join(' · '); }
     else if (n.kind === 'term') meta = n.backend === 'pty' ? 'real shell' : (live[n.id]?.backend?.cwd || n.cwd || '');
-    else if (n.kind === 'repl') meta = n.lang === 'js' ? `JavaScript · ${(n.history || []).length} inputs` : n.cmd;
     else if (n.kind === 'acp') meta = agentLabel(n.agent) + ' · ' + (SESS[n.id]?.state || '…').replace(/_/g, ' ');
     else if (n.kind === 'ref') meta = 'from ' + (n.srcLabel || '?');
     const pipes = S.edges.filter(e => e.from === n.id && e.type !== 'spawn').map(e => `${e.type} → ${S.nodes[e.to]?.name}`);
@@ -5671,9 +5599,6 @@ function seed(): Board {
     spawnNote: real ? undefined : 'branched from ops, then cd ~' });
   // scratch: a round folder in pack mode; items flow into rows
   add({ id: 'fScratch', kind: 'frame', name: 'scratch', shape: 'round', mode: 'pack', x: 0, y: 1220, w: 1240, h: 700 });
-  add({ id: 'calc', kind: 'repl', lang: 'js', name: 'calc', in: 'fScratch', order: 0, x: 0, y: 1220, w: 580, h: 320, history: ['var base = 120', 'var rate = 1.07', 'base * rate'] });
-  add({ id: 'whatif', kind: 'repl', lang: 'js', name: 'what-if', in: 'fScratch', order: 1, x: 0, y: 1220, w: 580, h: 300, spawnFrom: 'calc', replayFrom: 'calc',
-    history: ['var base = 120', 'var rate = 1.07', 'base * rate', 'rate = 1.25', 'base * rate'] });
   add({ id: 'reading', kind: 'buffer', name: 'reading', in: 'fScratch', order: 2, x: 0, y: 1220, w: 420, h: 260, text: '# reading\n\n- Logseq: pages are outlines; links make the graph.\n- Excalidraw: sketch over everything, arrows bind.\n- LATER Compare with [[plans]] and the journal.\n' });
   add({ id: 'scratchpad', kind: 'buffer', name: 'scratchpad', in: 'fScratch', order: 3, x: 0, y: 1220, w: 340, h: 260, text: '# scratchpad\n\n- Drag any node in here: it joins the row where you drop it.\n- Drag it out again and it stays where you leave it.\n' });
   // homelab: a folder stacked into a deck; its items keep their places for when it is spread
@@ -5684,7 +5609,7 @@ function seed(): Board {
   add({ id: 'journal', kind: 'buffer', name: TODAY, x: 2250, y: 640, w: 380, h: 470,
     text: `# ${TODAY}\n\n- Folders are containers on the canvas. Drag anything by its header into a folder.\n- Each folder is ◻ free, ▦ packed or ❐ stacked: the buttons sit on its tab.\n- Freeze reminder: ((plans#freeze))\n- TODO Drag [[reading]] out of scratch and drop it in canvas-workbench\n- TODO Spread the homelab deck (double-click it), then stack it again\n- DONE Sketch the [[canvas]] layout\n- ` });
   B.edges.push({ id: 'e1', from: 'ops', to: 'build', type: 'spawn' }, { id: 'e2', from: 'ops', to: 'logs', type: 'spawn' },
-    { id: 'e3', from: 'calc', to: 'whatif', type: 'spawn' }, { id: 'e4', from: 'ops', to: 'log', type: 'pipe' }, { id: 'e5', from: 'labsh', to: 'hosts', type: 'pipe' });
+    { id: 'e4', from: 'ops', to: 'log', type: 'pipe' }, { id: 'e5', from: 'labsh', to: 'hosts', type: 'pipe' });
   B.shapes.push(
     { id: 'sh-idea', type: 'ellipse', color: 'red', x: 1150, y: 940, w: 250, h: 92, text: 'cache the build?', seed: 11 },
     { id: 'sh-arrow', type: 'arrow', color: 'red', x1: 0, y1: 0, x2: 0, y2: 0, seed: 12, a: { id: 'sh-idea', dx: 125, dy: 0 }, b: { id: 'build', dx: 190, dy: 302 } },
@@ -8158,7 +8083,7 @@ function deskAttnTick() {   // new cards that need a look join the attention des
 // board:/PATH state:S name:TEXT, or a bare word for name:. Like desk 9 the members are found again each time the desk
 // is entered, cards that start to match join it while it is shown, and a card that stops matching stays until the desk
 // is left. It reads the board only: tasks and notes are brain's (brain docs/API.md), and Workbench has no brain client yet.
-const QKIND: Record<string, string[]> = { page: ['buffer'], note: ['buffer'], buffer: ['buffer'], shell: ['term'], terminal: ['term'], term: ['term'], agent: ['acp', 'agent'], acp: ['acp', 'agent'], folder: ['frame'], frame: ['frame'], repl: ['repl'], ref: ['ref'], artifact: ['artifact'], web: ['web'], sketch: ['sketch'], image: ['image'] };
+const QKIND: Record<string, string[]> = { page: ['buffer'], note: ['buffer'], buffer: ['buffer'], shell: ['term'], terminal: ['term'], term: ['term'], agent: ['acp', 'agent'], acp: ['acp', 'agent'], folder: ['frame'], frame: ['frame'], ref: ['ref'], artifact: ['artifact'], web: ['web'], sketch: ['sketch'], image: ['image'] };
 const QFIELDS = ['tag', 'kind', 'host', 'board', 'state', 'name'];
 function deskQueryParse(q: string): { neg: boolean; field: string; vals: string[] }[] | string {
   const out: { neg: boolean; field: string; vals: string[] }[] = [];
@@ -8493,7 +8418,7 @@ AGENT_TOOLS.push(
     run: () => deskDescribe() },
   { name: 'go_to_desk', description: 'Show a desk in the user\'s view: 0 the Board, 1-8 a desk (an unused number makes an empty one on this device), 9 the cards that need a look.', inputSchema: { type: 'object', properties: { desk: { type: 'integer', minimum: 0, maximum: 9 } }, required: ['desk'] },
     run: ({ desk }: { desk?: unknown }) => { const k = deskArg(desk); if (k === 9 && !attnBad().size) throw new Error('nothing needs a look: desk 9 is empty'); if (k !== deskPlace()) deskGo(k, true); return 'showing desk ' + (k === 9 ? '9 attention' : deskName(deskAt(k))); } },
-  { name: 'query_desk', description: 'Make a query desk, or change one\'s query: its cards are the ones the query matches, found again each time it is shown. Words must all match; -word negates; commas give alternatives: tag:T kind:K (page, shell, agent, folder, artifact, web, sketch, image, repl, ref) host:H (local is the serving daemon) board:/PATH state:S (bad: needs a look; or a session state such as running, waiting_permission, done) name:TEXT, a bare word is name:. desk: 1-8 (default: the shown query desk, else a free number). An empty query makes it a plain desk. The desk is then shown.', inputSchema: { type: 'object', properties: { query: { type: 'string' }, desk: { type: 'integer', minimum: 1, maximum: 8 } }, required: ['query'] },
+  { name: 'query_desk', description: 'Make a query desk, or change one\'s query: its cards are the ones the query matches, found again each time it is shown. Words must all match; -word negates; commas give alternatives: tag:T kind:K (page, shell, agent, folder, artifact, web, sketch, image, ref) host:H (local is the serving daemon) board:/PATH state:S (bad: needs a look; or a session state such as running, waiting_permission, done) name:TEXT, a bare word is name:. desk: 1-8 (default: the shown query desk, else a free number). An empty query makes it a plain desk. The desk is then shown.', inputSchema: { type: 'object', properties: { query: { type: 'string' }, desk: { type: 'integer', minimum: 1, maximum: 8 } }, required: ['query'] },
     run: ({ query, desk }: { query?: unknown; desk?: unknown }) => {
       const k = desk === undefined || desk === null ? (deskAt(DESK.cur)?.query ? DESK.cur : deskFree()) : deskArg(desk);
       if (!k) throw new Error('every desk 1-8 is in use');
@@ -8722,7 +8647,7 @@ function hintsType(k: string) {
   activate(n.id);
 }
 // ---- card actions (. on the board): the selected card's buttons and commands, in the palette
-const CARD_CMDS = ['Rename the active item…', 'Move the active item to a folder…', 'Branch the active shell, REPL or agent', 'Agent: start a new session in the active card (ends the current one)', 'Agent: end the active card\'s session (the card stays, ↻ revives)'];
+const CARD_CMDS = ['Rename the active item…', 'Move the active item to a folder…', 'Branch the active shell or agent', 'Agent: start a new session in the active card (ends the current one)', 'Agent: end the active card\'s session (the card stays, ↻ revives)'];
 function buttonItems(btns: HTMLButtonElement[]): PaletteItem[] {
   const items: PaletteItem[] = [], seen = new Set<string>();
   for (const b of btns) {
@@ -9775,11 +9700,11 @@ function tagDrop(n: BoardNode, t: FrameNode | null | undefined, from: FrameNode 
 }
 // ---- shells by address: the shell_* tools and commands act on a board shell (a path) or the active one.
 /* The shell a shell_* tool acts on: its card, its host and its address. */
-interface ShellTarget { n: TermNode | ReplNode; h: Host | null; addr: string }
+interface ShellTarget { n: TermNode; h: Host | null; addr: string }
 function splitHostKey(rest: string): { host: string | null; h: Host | null; path: string } { const m = rest.match(/^@([^:]+):([\s\S]*)$/); return m ? { host: m[1], h: hostByName(m[1]), path: m[2] } : { host: null, h: null, path: rest }; }
 function shellRef(p: string | undefined): ShellTarget {
   const n = p ? findNode(p) : activeId && S.nodes[activeId];
-  if (!n || !(n.kind === 'term' || n.kind === 'repl')) throw new Error('no shell at ' + (p || '(active)'));
+  if (!n || n.kind !== 'term') throw new Error('no shell at ' + (p || '(active)'));
   return { n, h: n.hostUrl ? hostByUrl(n.hostUrl) : hostOf(n), addr: addrOf(n) };
 }
 async function shellLogs(r: ShellTarget, lines: number): Promise<string> {
@@ -9796,9 +9721,9 @@ AGENT_TOOLS.push(
   { name: 'shell_kill', description: 'End a shell\'s process. The card stays and shows the exit. path: board path, or the active shell.', inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
     run: async ({ path }: { path?: string } = {}) => { const r = shellRef(path); const L = live[r.n.id]; if (L?.backend?.end) L.backend.end(true); else if (L?.backend) throw new Error(r.n.name + ' is a simulated shell'); else throw new Error(r.addr + ' is not running'); return 'killed ' + r.addr; } }
 );
-cmd('Shell: interrupt the active shell (Ctrl-C)', () => { try { const r = shellRef(''); live[r.n.id]?.backend?.input('\x03'); } catch (e) { toast(e.message); } }, '', () => n0()?.kind === 'term' || n0()?.kind === 'repl');
-cmd('Shell: kill the active shell\'s process', () => { try { const r = shellRef(''); const L = live[r.n.id]; if (L?.backend?.end) L.backend.end(true); else toast('Simulated shell.'); } catch (e) { toast(e.message); } }, '', () => n0()?.kind === 'term' || n0()?.kind === 'repl');
-cmd('Shell: scrollback of the active shell as a reference card', async () => { const n = n0(); if (!n || !(n.kind === 'term' || n.kind === 'repl')) return toast('Pick a shell first.'); const text = await shellLogs(shellRef(''), 200); const k = childrenOf(n.id, 'ref').length; const r: RefNode = { id: uid('n'), kind: 'ref', in: n.in, name: n.name + '-log' + (k + 1), text, src: { node: n.id, line: 0, lines: text.split('\n').length }, srcLabel: pathOf(n.id) + ' › scrollback', x: n.x + n.w + 70, y: n.y + k * 50, w: 420, h: 360 }; S.edges.push({ id: uid('e'), from: n.id, to: r.id, type: 'ref' }); addNode(r); }, '', () => n0()?.kind === 'term' || n0()?.kind === 'repl');
+cmd('Shell: interrupt the active shell (Ctrl-C)', () => { try { const r = shellRef(''); live[r.n.id]?.backend?.input('\x03'); } catch (e) { toast(e.message); } }, '', () => n0()?.kind === 'term');
+cmd('Shell: kill the active shell\'s process', () => { try { const r = shellRef(''); const L = live[r.n.id]; if (L?.backend?.end) L.backend.end(true); else toast('Simulated shell.'); } catch (e) { toast(e.message); } }, '', () => n0()?.kind === 'term');
+cmd('Shell: scrollback of the active shell as a reference card', async () => { const n = n0(); if (!n || n.kind !== 'term') return toast('Pick a shell first.'); const text = await shellLogs(shellRef(''), 200); const k = childrenOf(n.id, 'ref').length; const r: RefNode = { id: uid('n'), kind: 'ref', in: n.in, name: n.name + '-log' + (k + 1), text, src: { node: n.id, line: 0, lines: text.split('\n').length }, srcLabel: pathOf(n.id) + ' › scrollback', x: n.x + n.w + 70, y: n.y + k * 50, w: 420, h: 360 }; S.edges.push({ id: uid('e'), from: n.id, to: r.id, type: 'ref' }); addNode(r); }, '', () => n0()?.kind === 'term');
 // ---- the host's own trees. proc: (from /proc), unit: (systemd), the status line and the Attention query. Board
 // terminals are the real nodes; every other process or unit is a ghost. Data comes from each host's daemon; in demo mode
 // a small seeded host stands in.

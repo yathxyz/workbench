@@ -1071,7 +1071,7 @@ mod tests {
         // From stdin it is refused once the text is read.
         let c = call(&["create_node", "--json", "-"]);
         assert!(c.input(Some(r#"{"kind":"agent"}"#)).is_err());
-        assert!(c.input(Some(r#"{"kind":"repl"}"#)).is_ok());
+        assert!(c.input(Some(r#"{"kind":"shell"}"#)).is_ok());
     }
 
     #[test]

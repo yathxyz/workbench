@@ -21,7 +21,7 @@ interface BoardSize { w: number; h: number }
 // ---- the persisted board: S (app.ts line 29)
 
 /* Every node kind on the board (the `kind` tag of BoardNode). */
-type NodeKind = 'term' | 'repl' | 'buffer' | 'ref' | 'acp' | 'frame' | 'artifact' | 'web' | 'sketch' | 'image' | 'pdf' | 'op' | 'ghost';
+type NodeKind = 'term' | 'buffer' | 'ref' | 'acp' | 'frame' | 'artifact' | 'web' | 'sketch' | 'image' | 'pdf' | 'op' | 'ghost';
 
 /* The persisted board, S: what /api/board and localStorage hold (v 5; a reset writes {"v":0}). Keys starting with _ are never saved. */
 interface Board {
@@ -103,16 +103,6 @@ interface TermNode extends BoardNodeBase {
   cmd?: string; cwd?: string; env?: Record<string, string>; shell?: string; spawnNote?: string;
   fg?: string;                         // the foreground command
   cwdLive?: string;                    // the cwd the PTY last reported
-  inputLog?: string;
-  _replay?: string;
-}
-/* A REPL card: the demo's JS REPL, or a command REPL. */
-interface ReplNode extends BoardNodeBase {
-  kind: 'repl';
-  lang: 'js' | 'cmd';
-  history?: string[]; replayFrom?: string; backend?: 'pty' | 'fake'; cmd?: string;
-  inputLog?: string; _replay?: string;
-  cwdLive?: string;
 }
 /* A page (kind 'buffer'): its file in edwind (buf), edited in Edwin frames; a page not yet migrated, or on a board without edwind, keeps its Markdown in text. */
 interface PageNode extends BoardNodeBase {
@@ -231,7 +221,7 @@ interface GhostNode extends BoardNodeBase {
   procPid?: number; cmd?: string; unitName?: string; unitState?: string;
 }
 /* Any node on the board: a union tagged on `kind`. */
-type BoardNode = TermNode | ReplNode | PageNode | RefNode | AcpNode | FrameNode | ArtifactNode | WebNode | SketchNode | ImageNode | PdfNode | OpNode | GhostNode;
+type BoardNode = TermNode | PageNode | RefNode | AcpNode | FrameNode | ArtifactNode | WebNode | SketchNode | ImageNode | PdfNode | OpNode | GhostNode;
 /* The node type for one kind, e.g. NodeOfKind<'frame'> is FrameNode. */
 type NodeOfKind<K extends NodeKind> = Extract<BoardNode, { kind: K }>;
 /* What addNode takes: a kind and any of that kind's fields (the rest get defaults). */
@@ -423,7 +413,7 @@ interface BoardTextDoc {
 /* One line of a BoardTextDoc. */
 interface BoardTextLine { from: number; to: number; text: string; number: number }
 
-// ---- backends (PtyBackend line 791, AcpBackend line 925, FakeShell line 662, JsRepl line 747, Offline line 1497)
+// ---- backends (PtyBackend line 791, AcpBackend line 925, FakeShell line 662, Offline line 1497)
 
 /* What a card's backend offers; code calls the optional members after checking for them. The classes `implements` it. */
 interface CardBackend {

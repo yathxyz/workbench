@@ -30,7 +30,7 @@
 <div id="toolbar">
   <div class="grp"><button class="tb" id="toggle-tree" title="Folder tree (Alt-B)">Folders</button><button class="tb" id="view-name" title="Switch view (Alt-1 to Alt-6)">Canvas</button></div>
   <button class="search" id="open-palette" title="Search everything and run any command"><span>Search or run a command</span><kbd class="k-pal">Ctrl K</kbd></button>
-  <div class="grp c-only"><button class="tb" id="toggle-draw" title="Drawing tools. A stylus always writes.">✎ Draw</button><button class="tb" id="toggle-new" title="Add shells, REPLs, pages, agents, folders">+ New</button><button class="tb" id="open-help" title="Help (?)">?</button></div>
+  <div class="grp c-only"><button class="tb" id="toggle-draw" title="Drawing tools. A stylus always writes.">✎ Draw</button><button class="tb" id="toggle-new" title="Add shells, agents, web windows, artifacts, sketches, folders">+ New</button><button class="tb" id="open-help" title="Help (?)">?</button></div>
   <div class="grp c-only dock" id="dock-draw" role="toolbar" aria-label="Drawing tools" hidden>
     <button class="tb ico on" data-tool="select" title="Select and move (V or 1)">↖<sub>1</sub></button>
     <button class="tb ico" data-tool="rect" title="Rectangle (R or 2)">▭<sub>2</sub></button>
@@ -53,14 +53,6 @@
     <button class="tb" id="add-web" title="New browser window: a web page in a frame">Web</button>
     <button class="tb" id="add-artifact" title="New artifact: an HTML page in a sandboxed frame, made by Claude or by any agent writing a file">Artifact</button>
     <button class="tb" id="add-sketch" title="New sketch: a card to write or draw on with the pen">Sketch</button>
-    <span class="menu-wrap">
-      <button class="tb" id="add-repl" title="New REPL">REPL</button>
-      <div class="menu" id="repl-menu" hidden>
-        <button data-repl="js">JavaScript <small>in browser</small></button>
-        <button data-repl="python3 -q" class="needs-daemon">Python <small>on the host</small></button>
-        <button data-repl="node" class="needs-daemon">Node <small>on the host</small></button>
-      </div>
-    </span>
     <button class="tb" id="add-frame" title="New folder">Folder</button>
     <button class="tb" id="open-today" title="Today's journal page">Today</button>
   </div>
@@ -82,12 +74,12 @@
   <canvas id="g-canvas"></canvas>
   <div class="g-bar grp">
     <input id="g-q" placeholder="Highlight… (Enter selects)" autocomplete="off" spellcheck="false">
-    <label><input type="checkbox" id="g-all" checked> Shells, REPLs, agents</label>
+    <label><input type="checkbox" id="g-all" checked> Shells, agents</label>
     <label><input type="checkbox" id="g-ghost" checked> Pages not written yet</label>
     <button class="tb" id="g-fit">Fit</button>
   </div>
   <div class="g-legend">
-    <span><i class="lg-page"></i>page</span><span><i class="lg-term"></i>shell</span><span><i class="lg-repl"></i>REPL</span><span><i class="lg-agent"></i>agent</span>
+    <span><i class="lg-page"></i>page</span><span><i class="lg-term"></i>shell</span><span><i class="lg-agent"></i>agent</span>
     <span><b class="ln-link"></b>[[link]]</span><span><b class="ln-spawn"></b>branch</span><span><b class="ln-pipe"></b>pipe</span><span><b class="ln-sketch"></b>drawn arrow</span>
   </div>
   <div id="g-card" class="g-card" hidden></div>
@@ -267,7 +259,7 @@
         <h3>Pages</h3>
         <dl>
           <dt>Editor</dt><dd>A page is an Edwin frame: evil keys, Esc for normal mode. Without edwind (the demo) pages are read-only.</dd>
-          <dt><code>[[</code></dt><dd>Completes to any page, folder, shell, REPL or agent. Links show in the graph and in backlinks.</dd>
+          <dt><code>[[</code></dt><dd>Completes to any page, folder, shell or agent. Links show in the graph and in backlinks.</dd>
           <dt><code>((plans#freeze))</code> · ⚓</dt><dd>Block reference · name a spot</dd>
           <dt>Ink over a page</dt><dd>Sticks to its line. Aa → text writes it in at that line.</dd>
         </dl>

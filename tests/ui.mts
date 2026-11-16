@@ -564,15 +564,16 @@ st = await p.evaluate(() => { const C = window.__canvas, S = C.S, f = S.nodes.fC
   C.setModeCascade(f, 'free'); const d = [f.mode, inner.mode];
   return { a, b, c, d }; });
 check('cascade applies a mode to the nested folders too (call, Shift-click); a plain click does not', st.a.join() === 'tile,tile' && st.b.join() === 'pack,pack' && st.c.join() === 'free,pack' && st.d.join() === 'free,free', JSON.stringify(st));
-st = await p.evaluate(() => { const C = window.__canvas, S = C.S; const frames = Object.values<BoardNode>(S.nodes).filter(n => n.kind === 'frame').map((f): [string, string | null, FrameMode] => [f.id, f.in || null, f.mode]); const snapIn = Object.fromEntries(Object.values<BoardNode>(S.nodes).map(n => [n.id, n.in || null])); const pos = Object.fromEntries(Object.values<BoardNode>(S.nodes).map(n => [n.id, [n.x, n.y, n.w, n.h]]));
+st = await p.evaluate(() => { const C = window.__canvas, S = C.S; const kid = C.spawnChild(S.nodes.labsh).id; const frames = Object.values<BoardNode>(S.nodes).filter(n => n.kind === 'frame').map((f): [string, string | null, FrameMode] => [f.id, f.in || null, f.mode]); const snapIn = Object.fromEntries(Object.values<BoardNode>(S.nodes).map(n => [n.id, n.in || null])); const pos = Object.fromEntries(Object.values<BoardNode>(S.nodes).map(n => [n.id, [n.x, n.y, n.w, n.h]]));
   C.perspSet('process');
   const derived = Object.values<BoardNode>(S.nodes).filter(n => n.kind === 'frame').map(f => ({ owner: f.owner, derived: f.derived, kids: C.kidsOf(f.id).map((k: BoardNode) => k.id).sort().join() }));
   const manualGone = frames.every(([id]) => !S.nodes[id]), dim = document.querySelectorAll('.node.persp-dim').length, chip = !!document.querySelector('#persp-chip'), persp = S.persp;
-  const refused = (() => { const build = S.nodes.build, pf = Object.values<FrameNode>(S.nodes).find(f => f.owner === 'calc')!; C.adopt(build, pf, null, true); return build.in !== pf.id; })();
+  const refused = (() => { const build = S.nodes.build, pf = Object.values<FrameNode>(S.nodes).find(f => f.owner === 'labsh')!; C.adopt(build, pf, null, true); return build.in !== pf.id; })();
   C.perspSet('manual');
   const back = frames.every(([id, inn, mode]) => S.nodes[id] && (S.nodes[id].in || null) === inn && S.nodes[id].mode === mode), inOk = Object.values<BoardNode>(S.nodes).every(n => (n.in || null) === snapIn[n.id]), posOk = Object.values<BoardNode>(S.nodes).every(n => JSON.stringify([n.x, n.y, n.w, n.h]) === JSON.stringify(pos[n.id])), noDerived = !Object.values<FrameNode>(S.nodes).some(n => n.derived) && !document.querySelector('#persp-chip') && !S.manual;
-  return { derived, manualGone, dim, chip, persp, refused, back, inOk, posOk, noDerived }; });
-check('process perspective derives a folder per spawning shell, nested as the spawn tree', st.persp === 'process' && st.manualGone && st.chip && st.dim > 0 && st.derived.some((d: { owner?: string; derived?: string; kids: string }) => d.owner === 'ops' && d.derived === 'process' && d.kids === 'build,logs,ops') && st.derived.some((d: { owner?: string; derived?: string; kids: string }) => d.owner === 'calc' && d.kids === 'calc,whatif'), JSON.stringify(st));
+  C.removeNode(kid);
+  return { derived, manualGone, dim, chip, persp, refused, back, inOk, posOk, noDerived, kid }; });
+check('process perspective derives a folder per spawning shell, nested as the spawn tree', st.persp === 'process' && st.manualGone && st.chip && st.dim > 0 && st.derived.some((d: { owner?: string; derived?: string; kids: string }) => d.owner === 'ops' && d.derived === 'process' && d.kids === 'build,logs,ops') && st.derived.some((d: { owner?: string; derived?: string; kids: string }) => d.owner === 'labsh' && d.kids === ['labsh', st.kid].sort().join()), JSON.stringify(st));
 check('a drop into a derived folder is refused; back to manual restores folders, membership and positions exactly', st.refused && st.back && st.inOk && st.posOk && st.noDerived, JSON.stringify(st));
 // ---- the filesystem perspective (demo mode, seed filesystem)
 st = await p.evaluate(async () => { const C = window.__canvas, S = C.S, sl = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -1239,7 +1240,7 @@ await section('§A.5', async () => {
       for (const sh of bs.split(/,(?![^(]*\))/)) { const n = sh.replace(/[a-z-]+\([^)]*\)|inset/g, '').trim().split(/\s+/).map(parseFloat); if ((n[2] || 0) > 0) blurred.push((e.id || e.className || e.tagName) + (ps || '') + ': ' + bs); }
     }
     return {
-      radius: ['.node', '#add-shell', '#repl-menu', '#pal-in', '.frame.shape-round'].map(s => cs(s, 'borderTopLeftRadius')), body: cs('body', 'backgroundColor'),
+      radius: ['.node', '#add-shell', '#add-web', '#pal-in', '.frame.shape-round'].map(s => cs(s, 'borderTopLeftRadius')), body: cs('body', 'backgroundColor'),
       edgeLabels: document.querySelectorAll('#edges rect').length, pills: [...document.querySelectorAll('#edges rect')].filter(r => parseFloat(r.getAttribute('rx') || 0 as unknown as string) > 0).length,
       termBg: term?.options.theme.background?.toLowerCase(),
       fontCheck: document.fonts.check('13px "JetBrainsMono Nerd Font Mono"'),
