@@ -6,8 +6,8 @@ type Vendor = typeof import('../tools/vendor-entry.js');
 
 interface Window {
   V: Vendor;
-  CLAUDE_BRIDGE_SRC?: string;
-  claude?: { use(name: string): Promise<unknown> }; // the artifact runtime: web/bridge.ts in a hosted page, claude.ai's around the board
+  WB_BRIDGE_SRC?: string;
+  wb?: { use(name: string): Promise<unknown> }; // the artifact runtime: web/bridge.ts, defined in artifact frames only, never on the board page
   __canvas: Record<string, any>; // any: the suites' debug surface; each entry is typed where app.ts defines it
   __perf?: Record<string, any>; // any: the perf suite's counters, read only by tests/perf.mts
   SpeechRecognition?: { new (): SpeechRecognitionLike };

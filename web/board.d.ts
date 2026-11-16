@@ -632,7 +632,7 @@ type ArtPageMsg =
   | { t: 'tool_result'; id: string; callId: string; result: string }
   | { t: 'tool_error'; id: string; callId: string; message: string };
 /* The window message an artifact iframe sends to open its port. */
-interface ArtHelloMsg { claude: 'hello' }
+interface ArtHelloMsg { wb: 'hello' }
 /* What PUT /api/artifact answers. */
 interface ArtPublishResult { version: number | string; meta: { versions: ArtifactVersion[] }; url: string }
 

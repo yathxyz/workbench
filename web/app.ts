@@ -1,7 +1,7 @@
 /* Workbench: the board page. One pannable world of cards (shells, pages, refs, ACP agents, folders, artifacts, web,
    sketch, image, PDF and media cards; a folder holds items through `in`).
    Edges: spawn (tree lineage), pipe (dataflow), ref (pinned excerpt).
-   Served by wb-web, cards run in wb-hub and pages are Edwin frames; opened from a file or a hosted artifact, it is the
+   Served by wb-web, cards run in wb-hub and pages are Edwin frames; opened from a file, it is the
    demo (simulated shell, the board in localStorage). */
 (() => {
 'use strict';
@@ -3570,8 +3570,8 @@ shapesSvg.addEventListener('dblclick', (ev: MouseEvent) => {
 });
 
 // ------------------------------------------------------------------ agent
-// Runs on Claude through the artifact's `sample` capability. Tools are page functions over the board.
-/* The page's `sample` capability (daemonSample, or the hosted artifact's): a model call that streams text and runs tools. */
+// Runs on the server's model through the `sample` capability. Tools are page functions over the board.
+/* The page's `sample` capability (daemonSample): a model call that streams text and runs tools. */
 interface PageSampleFn {
   (input: unknown, opts?: PageSampleOpts): Promise<SampleResult>;
   limits?(): Promise<{ maxPromptBytes?: number; images?: boolean; tools?: boolean } | null>;
@@ -3586,7 +3586,7 @@ interface PageSampleOpts {
 interface PageSampleTool extends AgentToolSpec { execute(input: AgentToolInput | undefined, ctx: { signal?: AbortSignal }): Promise<unknown> }
 let samplePromise: Promise<PageSampleFn | null> | null = null;
 function getSample(): Promise<PageSampleFn | null> {
-  if (!samplePromise) samplePromise = (DAEMON && INFO?.sample) ? Promise.resolve(daemonSample()) : window.claude?.use ? Promise.resolve(window.claude.use('sample') as Promise<PageSampleFn | null>).catch(() => null) : Promise.resolve(null);
+  if (!samplePromise) samplePromise = (DAEMON && INFO?.sample) ? Promise.resolve(daemonSample()) : Promise.resolve(null);
   return samplePromise;
 }
 function findNode(p: string | null | undefined): BoardNode | null {
@@ -3710,7 +3710,7 @@ function pulse(id: string) { const L = live[id]; if (!L) return; L.el!.classList
 
 // ------------------------------------------------------------------ pen: handwriting becomes text
 // Strokes written close together in time and space form one note. A chip beside it turns the note into text
-// (Claude reads the ink as an image). Ink on a page turns into text at its line.
+// (a model reads the ink as an image). Ink on a page turns into text at its line.
 const INK: { ids: string[]; t: number } = { ids: [], t: 0 };
 function inkBox(ids: string[]): { x0: number; y0: number; x1: number; y1: number } | null {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -3742,7 +3742,7 @@ async function inkImage(ids: string[]): Promise<Blob> {
   return new Promise<Blob>(res => cv.toBlob(res as BlobCallback, 'image/png'));
 }
 async function canSeeImages(): Promise<PageSampleFn | null> {
-  const sample = await getSample(); if (!sample) { toast(DAEMON ? SAMPLE_OFF : 'Reading handwriting needs a language model: Claude inside the hosted artifact on claude.ai, or a Workbench server that serves one.', 6000); return null; }
+  const sample = await getSample(); if (!sample) { toast(DAEMON ? SAMPLE_OFF : 'Reading handwriting needs a language model: run a Workbench server that serves one.', 6000); return null; }
   const lim = await sample.limits?.().catch(() => null);
   if (!lim?.images) { toast('The model here cannot read images, so it cannot read handwriting.', 6000); return null; }
   return sample;
@@ -3776,7 +3776,7 @@ async function inkToText() {
     INK.ids = []; placeInkChip(); dirty(); scheduleCrossRefresh();
     toast(`Handwriting → text in ${where}`);
   } catch (e) {
-    toast(e?.code === 'not_granted' ? 'Allow this page to use Claude (with images), then try again.' : `Could not read the handwriting (${e?.code || e?.message || 'error'}).`, 6000);
+    toast(`Could not read the handwriting (${e?.code || e?.message || 'error'}).`, 6000);
   } finally { chip.classList.remove('busy'); }
 }
 $('#ink-text')!.onclick = inkToText;
@@ -3787,7 +3787,7 @@ $('#ink-x')!.onclick = () => { INK.ids = []; placeInkChip(); };
 // Hold 🎙 in an agent or the assistant to talk, release to send; tap it to dictate into the box without sending.
 // 🎙 on a page (or Alt-V) dictates at the cursor. Saying "new line" or "new bullet" breaks the line.
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-const VOICE_BLOCKED = 'The microphone is not available here. On claude.ai the artifact runs in a sandboxed frame without microphone access. Use the self-hosted Workbench in Chrome, Edge or Safari, or your system dictation into any text box (macOS: press Fn twice; Windows: Win+H).';
+const VOICE_BLOCKED = 'The microphone is not available here. Use Workbench in Chrome, Edge or Safari, or your system dictation into any text box (macOS: press Fn twice; Windows: Win+H).';
 const VOICE: { rec: SpeechRecognitionLike | null; target: HTMLElement | string | null } = { rec: null, target: null };
 function spoken(t: string): string { return t.replace(/\s*\bnew bullet\b\s*/gi, '\n- ').replace(/\s*\bnew (line|paragraph)\b\s*/gi, '\n'); }
 /* What listen reports to: the text so far (final and interim), and the final text with why it stopped. */
@@ -4748,8 +4748,8 @@ AGENT_TOOLS.push({
 });
 
 // ------------------------------------------------------------------ daemon info and RPC
-// In the local build every `sample` call (assistant, agent nodes, handwriting, hosted artifacts) goes to the daemon over
-// one WebSocket; the key lives in the daemon's environment. In the hosted artifact the outer page's own `sample` answers.
+// In the local build every `sample` call (assistant, agent nodes, handwriting, artifacts) goes to the daemon over
+// one WebSocket; the key lives in the daemon's environment.
 let INFO: DaemonInfo | null = null;
 // F-A11: every /rpc tells its server how long ago this tab was last visible and focused, `active{ago}`, on each (re)open,
 // on focus and on visibilitychange to visible, so `wb` reaches the tab used last (§3.3, §3.5.3). A tab that never was
@@ -4851,16 +4851,16 @@ function daemonSample() {
 }
 // Said where a model feature is used, never at startup: a server without a model is a normal setup, not a fault.
 // Provider-neutral: the server's `sample` backend is configured on the server, with its key there, never in a page.
-const SAMPLE_OFF = 'No language model on this server: the assistant, handwriting and artifacts that ask a model stay off until wb-web serves `sample` (configured in its web.json, with the key kept on the server). Shells, agent cards and pages work without it.';
+const SAMPLE_OFF = 'No language model on this server: the assistant, handwriting and artifacts that ask a model stay off until edwind runs with a model backend (the model and its key are configured for edwind, on the server). Shells, agent cards and pages work without it.';
 
-// ------------------------------------------------------------------ artifacts: Claude artifact pages as nodes
+// ------------------------------------------------------------------ artifacts: sandboxed HTML pages as nodes
 // An artifact node is a versioned HTML page running in a sandboxed frame on its own origin (the daemon's second port;
-// an opaque srcdoc frame in demo mode). The page sees only window.claude.use(); this host answers each call, asks the
-// user once per capability, and routes `sample` to the daemon (or to the outer artifact's own sample when hosted).
+// an opaque srcdoc frame in demo mode). The page sees only window.wb.use(); this host answers each call, asks the
+// user once per capability, and routes `sample` to the daemon.
 const CAPS_ALL = ['sample', 'artifact', 'db', 'permissions', 'downloads', 'user', 'room'];
-const CAP_TEXT: Record<string, string> = { sample: 'ask Claude (uses your account or API key)', artifact: 'publish new versions of itself', db: 'keep a document store in this workspace', downloads: 'hand you files to save', user: 'know who is viewing', room: 'talk to other open copies of itself' };
+const CAP_TEXT: Record<string, string> = { sample: 'ask the language model', artifact: 'publish new versions of itself', db: 'keep a document store in this workspace', downloads: 'hand you files to save', user: 'know who is viewing', room: 'talk to other open copies of itself' };
 const DEFAULT_CAPS: Record<string, object> = { sample: { images: true }, artifact: {}, db: {} };
-let BRIDGE_SRC = window.CLAUDE_BRIDGE_SRC || null;
+let BRIDGE_SRC = window.WB_BRIDGE_SRC || null;
 async function bridgeSrc(): Promise<string> {
   if (BRIDGE_SRC) return BRIDGE_SRC;
   try { BRIDGE_SRC = await (await fetch('bridge.js')).text(); } catch { BRIDGE_SRC = ''; }
@@ -4957,7 +4957,7 @@ async function artMount(n: ArtifactNode, L: LiveEntry) {
     f.srcdoc = wrapFragment(n.html, await bridgeSrc(), artTheme());
   }
   clearTimeout(L.helloT);
-  L.helloT = setTimeout(() => { if (!L.hello && live[n.id] === L) { L.notice!.hidden = false; L.notice!.textContent = 'The page did not answer the bridge within 6 s. It still runs, but window.claude.use() resolves null for it.'; } }, 6000);
+  L.helloT = setTimeout(() => { if (!L.hello && live[n.id] === L) { L.notice!.hidden = false; L.notice!.textContent = 'The page did not answer the bridge within 6 s. It still runs, but window.wb.use() resolves null for it.'; } }, 6000);
 }
 function mountArtifact(n: ArtifactNode, L: LiveEntry) {
   n.capabilities = n.capabilities || { ...DEFAULT_CAPS }; n.grants = n.grants || {}; n.db = n.db || { docs: {} };
@@ -4971,7 +4971,7 @@ function mountArtifact(n: ArtifactNode, L: LiveEntry) {
 }
 // The host side of the bridge: one listener; the frame introduces itself with a port.
 window.addEventListener('message', ev => {
-  const d = ev.data; if (!d || d.claude !== 'hello' || !ev.ports?.[0]) return;
+  const d = ev.data; if (!d || d.wb !== 'hello' || !ev.ports?.[0]) return;
   let rec = HOSTS.get(ev.source);
   if (!rec) { for (const n of nodeList()) if (n.kind === 'artifact' && live[n.id]?.frame?.contentWindow === ev.source) { rec = { n, L: live[n.id] }; HOSTS.set(ev.source, rec); } }
   if (!rec) return;
@@ -5009,7 +5009,7 @@ async function hostCall(n: ArtifactNode, L: LiveEntry, port: MessagePort, m: Art
     if (cap === 'user') return ok(({ id: 'local', me: { id: 'local', name: 'you', isOwner: true }, isOwner: true, canEdit: true, can: true, profiles: [], search: [] } as Record<string, unknown>)[m.method]);
     if (cap === 'sample') {
       if (m.method === 'limits') { const s = await getSample(); return ok(s ? await s.limits?.() : null); }
-      if (!(await grant(n, 'sample'))) return err({ code: 'not_granted', message: 'the user did not allow this artifact to use Claude' });
+      if (!(await grant(n, 'sample'))) return err({ code: 'not_granted', message: 'the user did not allow this artifact to use the language model' });
       const sample = await getSample(); if (!sample) return err({ code: 'sampling_disabled', message: SAMPLE_OFF });
       const ctl = new AbortController(); const rec = { cancel: () => ctl.abort(), tools: new Map<string, (r: ArtToolReply) => void>() }; LIVE_CALLS.set(key, rec);
       const a = (m.args || {}) as ArtSampleArgs;
@@ -5143,20 +5143,20 @@ button{font:inherit;padding:6px 10px}
 #out{white-space:pre-wrap;margin-top:12px}
 </style>
 <h1>Hello from an artifact</h1>
-<p>This page runs in a sandboxed frame. It can only reach the outside through <code>claude.use()</code>.</p>
-<button id="ask">Ask Claude for a haiku</button> <button id="count">Count (db)</button>
+<p>This page runs in a sandboxed frame. It can only reach the outside through <code>wb.use()</code>.</p>
+<button id="ask">Ask the model for a haiku</button> <button id="count">Count (db)</button>
 <div id="out"></div>
 <script>
 const out = document.getElementById('out');
 document.getElementById('ask').onclick = async () => {
-  const sample = await claude.use('sample');
+  const sample = await wb.use('sample');
   if (!sample) { out.textContent = 'sample is not served here'; return; }
   out.textContent = '…';
   try { await sample('Write a haiku about a workbench.', { modelTier: 'quick', onText: ({ text }) => { out.textContent = text; } }); }
   catch (e) { out.textContent = 'failed: ' + e.code; }
 };
 document.getElementById('count').onclick = async () => {
-  const db = await claude.use('db'); if (!db) { out.textContent = 'db is not served here'; return; }
+  const db = await wb.use('db'); if (!db) { out.textContent = 'db is not served here'; return; }
   const ref = db.doc('data/counter'); const snap = await ref.get(); const n = (snap.data()?.n || 0) + 1;
   await ref.set({ n }); out.textContent = 'count = ' + n + ' (kept in this workspace)';
 };
@@ -5194,7 +5194,7 @@ async function artifactVersions(n: ArtifactNode) {
   openPicker(`${n.name}: versions (head ${String(n.head).slice(0, 8)})`, list.map(v => ({ l: `${v.sha === n.head ? '● ' : '○ '}${v.sha.slice(0, 8)} · ${v.at.replace('T', ' ')}`, run: async () => { if (v.sha === n.head) return; const src = await artSource(n, v.sha); await artPublish(n, { html: src }); artMount(n, live[n.id]); toast(`Rolled ${n.name} to ${v.sha.slice(0, 8)} (as a new version)`); } })));
 }
 AGENT_TOOLS.push(
-  { name: 'publish_artifact', description: 'Create or update a Claude artifact node: a self-contained HTML page (fragment: no doctype/html/head/body; first element a <title>; CSS tokens on :root with a dark variant; scripts only inline or from cdnjs/jsdelivr/unpkg; no fetch) that may call window.claude.use("sample"|"db"|"artifact"). name identifies the node; an existing artifact of that name gets a new version.',
+  { name: 'publish_artifact', description: 'Create or update an artifact node: a self-contained HTML page (fragment: no doctype/html/head/body; first element a <title>; CSS tokens on :root with a dark variant; scripts only inline or from cdnjs/jsdelivr/unpkg; no fetch) that may call window.wb.use("sample"|"db"|"artifact"). name identifies the node; an existing artifact of that name gets a new version.',
     inputSchema: { type: 'object', properties: { name: { type: 'string' }, html: { type: 'string' }, capabilities: { type: 'object', description: 'e.g. {"sample":{"images":true},"db":{}}' } }, required: ['name', 'html'] },
     run: async ({ name, html, capabilities }: { name: string; html: string; capabilities?: Record<string, object> }) => {
       const ex = nodeList().find(x => x.kind === 'artifact' && x.name.toLowerCase() === str(name).toLowerCase()) as ArtifactNode | undefined;
@@ -5297,7 +5297,7 @@ function blockCardsChanged(p: BoardNode) {
   BLOCK_T.set(p.id, setTimeout(() => { BLOCK_T.delete(p.id); refreshBlockCards(p.id); }, 400));
 }
 AGENT_TOOLS.push(
-  { name: 'tear_out_block', description: 'Put a ```html block of a page on the canvas as a live card. The card shows the block in a sandboxed frame (window.claude.use offers sample and db) and reloads whenever the block changes, so edit the block with write_page to change the card. block is the id from the info string (```html {#chart}) or the 1-based position among the page\'s html blocks; a block without an id gets one.',
+  { name: 'tear_out_block', description: 'Put a ```html block of a page on the canvas as a live card. The card shows the block in a sandboxed frame (window.wb.use offers sample and db) and reloads whenever the block changes, so edit the block with write_page to change the card. block is the id from the info string (```html {#chart}) or the 1-based position among the page\'s html blocks; a block without an id gets one.',
     inputSchema: { type: 'object', properties: { page: { type: 'string', description: 'page path' }, block: { type: 'string' } }, required: ['page'] },
     run: async ({ page, block }: { page: string; block?: string }) => {
       const p = findNode(str(page)); if (!p || p.kind !== 'buffer') throw new Error('no page at ' + page);
@@ -5473,7 +5473,7 @@ async function rvFlag(g: number) { if (!RV.cur) return; await rvAppend([{ t: new
 function rvSetMode(m: RvMode, auto?: boolean) {
   RV.mode = m; if (!auto) RV.touched = true;
   ($$('#rv-modes button') as HTMLButtonElement[]).forEach(b => b.setAttribute('aria-pressed', String(b.dataset.mode === m)));
-  $('#rv-modenote')!.textContent = { basic: 'Grade from memory.', type: 'Diff ignores accents and case.', pen: 'Write the answer; the back is overlaid after reveal. Claude can grade the ink.', voice: 'Hold 🎙 and say it; the transcript is diffed against the back.' }[m];
+  $('#rv-modenote')!.textContent = { basic: 'Grade from memory.', type: 'Diff ignores accents and case.', pen: 'Write the answer; the back is overlaid after reveal. The model can grade the ink.', voice: 'Hold 🎙 and say it; the transcript is diffed against the back.' }[m];
   $('#rv-mic')!.hidden = m !== 'voice';
 }
 // ink on the card
@@ -5512,7 +5512,7 @@ async function rvOpenSource() {
 }
 async function rvAsk() {
   const c = RV.cur; if (!c) return; const box = $('#rv-ai')!; box.hidden = false;
-  const sample = await getSample(); if (!sample) { box.textContent = DAEMON ? SAMPLE_OFF : 'The assistant needs a language model: Claude inside the hosted artifact on claude.ai, or a Workbench server that serves one.'; return; }
+  const sample = await getSample(); if (!sample) { box.textContent = DAEMON ? SAMPLE_OFF : 'The assistant needs a language model: run a Workbench server that serves one.'; return; }
   box.textContent = 'Thinking…';
   try { await sample(`You are helping someone review a flashcard. Give context, one example and, if useful, a mnemonic, in at most 80 words. Plain text.\nFront: ${rvFront(c)}\nBack: ${rvAnswer(c)}\nExtra: ${c.extra || ''}\nSource: ${c.file}`, { modelTier: 'quick', onText: ({ text }: { text: string }) => { box.textContent = text; } }); }
   catch (e) { box.textContent = `Assistant unavailable (${e?.code || 'error'}).`; }

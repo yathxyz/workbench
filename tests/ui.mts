@@ -22,9 +22,9 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
-// Types only: the globals the checks set in the page, and the artifact runtime's `claude` inside artifact frames.
+// Types only: the globals the checks set in the page, and the artifact runtime's `wb` inside artifact frames.
 declare global { interface Window { __got: number; __cm: boolean[]; __rcCam: Cam; __pastes: number; __xss?: number; __n56: Element | null; __n62menus: number; __n32?: number; __xss31?: number } }
-declare const claude: { use(name: string): Promise<any> };   // any: each capability's namespace has its own shape (web/bridge.ts)
+declare const wb: { use(name: string): Promise<any> };   // any: each capability's namespace has its own shape (web/bridge.ts)
 
 const { chromium } = await import(process.env.WB_PLAYWRIGHT || 'playwright') as typeof import('playwright-core');
 const ROOT = process.argv[2] || process.env.WB_WEB_ROOT, HARNESS = process.env.WB_HARNESS;
@@ -58,7 +58,7 @@ ${rd('vendor/xterm.css')}
 ${rd('style.css')}
 </style>
 ${body}
-<script>window.CLAUDE_BRIDGE_SRC = ${JSON.stringify(rd('bridge.js')).replaceAll('</script', '<\\/script')};</script>
+<script>window.WB_BRIDGE_SRC = ${JSON.stringify(rd('bridge.js')).replaceAll('</script', '<\\/script')};</script>
 <script>
 ${js('vendor/vendor.js')}
 </script>
@@ -97,17 +97,17 @@ const grantVisible = await p.evaluate(() => !document.querySelector<HTMLElement>
 check('grant prompt shown for sample', grantVisible);
 await p.click('#grant-allow'); await sleep(800);
 check('sample absent in demo rejects with code', (await fr!.textContent('#out'))!.includes('failed: sampling_disabled'), await fr!.textContent('#out'));
-const nsCheck = await fr!.evaluate(async () => { const s = await claude.use('sample'); const d = await claude.use('db'); const x = await claude.use('nope'); const perm = await claude.use('permissions'); return { frozen: Object.isFrozen(s) && Object.isFrozen(d), same: (await claude.use('db')) === d, nope: x, st: await perm.state('sample'), limits: await s.limits() }; });
+const nsCheck = await fr!.evaluate(async () => { const s = await wb.use('sample'); const d = await wb.use('db'); const x = await wb.use('nope'); const perm = await wb.use('permissions'); return { frozen: Object.isFrozen(s) && Object.isFrozen(d), same: (await wb.use('db')) === d, nope: x, st: await perm.state('sample'), limits: await s.limits() }; });
 check('namespaces frozen, memoised, unknown null, permissions state', nsCheck.frozen && nsCheck.same && nsCheck.nope === null && nsCheck.st === 'granted', JSON.stringify(nsCheck));
 // artifact.publish from inside the page -> new version, frame reloads
-fr!.evaluate(() => { claude.use('artifact').then(a => a.publish('<title>Hi2</title><p id=v2>second</p>')).catch(() => {}); }).catch(() => {});
+fr!.evaluate(() => { wb.use('artifact').then(a => a.publish('<title>Hi2</title><p id=v2>second</p>')).catch(() => {}); }).catch(() => {});
 await sleep(800); if (await p.evaluate(() => !document.querySelector<HTMLElement>('#grant')!.hidden)) await p.click('#grant-allow');
 await sleep(1500);
 fr = await artFrame(p);
 st = await p.evaluate(() => { const n = Object.values<BoardNode>(window.__canvas.S.nodes).find(n => n.kind === 'artifact')!; return { versions: n.versions!.length, head: n.head, html: n.html }; });
 check('artifact.publish makes a version and reloads', st.versions === 2 && st.html.includes('second') && !!(await fr!.$('#v2')), JSON.stringify(st).slice(0, 200));
 // db query / onSnapshot
-const q = await fr!.evaluate(async () => { try { const db = await claude.use('db'); const col = db.collection('items'); await col.doc('a').set({ n: 3, tag: 'x' }); await col.doc('b').set({ n: 1, tag: 'x' }); await col.doc('c').set({ n: 2, tag: 'y' });
+const q = await fr!.evaluate(async () => { try { const db = await wb.use('db'); const col = db.collection('items'); await col.doc('a').set({ n: 3, tag: 'x' }); await col.doc('b').set({ n: 1, tag: 'x' }); await col.doc('c').set({ n: 2, tag: 'y' });
   const got = await col.where('tag', '==', 'x').orderBy('n', 'desc').get(); let snaps = 0; const un = col.onSnapshot((s: { size: number }) => { snaps = s.size; }); await new Promise(r => setTimeout(r, 100)); await col.doc('d').set({ n: 9 }); await new Promise(r => setTimeout(r, 100)); un();
   return { ids: got.docs.map((d: { id: string }) => d.id), size: got.size, snaps }; } catch (e) { return { error: JSON.stringify(e), msg: String(e && e.message) }; } });
 check('db query where/orderBy and onSnapshot', q.ids?.join() === 'a,b' && q.snaps === 4, JSON.stringify(q));
@@ -3645,7 +3645,7 @@ await section('N12-N15, N33', async () => {
     await fr!.click('#count'); await sleep(600);
     check('N33: the artifact frame\'s origin is null, it has no allow-same-origin, and the bridge answers (db)', origin === 'null' && !/allow-same-origin/.test(live?.sandbox || '') && (await fr!.textContent('#out'))!.includes('count = 1'), JSON.stringify({ origin, sandbox: live?.sandbox, out: await fr!.textContent('#out') }));
     // N13: artifact.publish from inside the page makes a version on the server and the frame reloads; a stale writer gets 409.
-    fr!.evaluate(() => { claude.use('artifact').then(a => a.publish('<title>Hi2</title><p id=v2>second</p>')).catch(() => {}); }).catch(() => {});
+    fr!.evaluate(() => { wb.use('artifact').then(a => a.publish('<title>Hi2</title><p id=v2>second</p>')).catch(() => {}); }).catch(() => {});
     await until(() => P.evaluate(() => !document.querySelector<HTMLElement>('#grant')!.hidden), 3000); if (await P.evaluate(() => !document.querySelector<HTMLElement>('#grant')!.hidden)) await P.click('#grant-allow');
     const v2 = await until(async () => { const f = await frameOf(); return f && await f.$('#v2').catch(() => null) ? f : null; }, 8000);
     const s2 = await (await api('/api/artifact/' + id)).json();

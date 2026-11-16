@@ -51,7 +51,7 @@
     <button class="tb" id="add-shell" title="New shell">Shell</button>
     <button class="tb needs-daemon" id="add-acp" title="New agent card: an ACP agent working in a folder on the server">Agent</button>
     <button class="tb" id="add-web" title="New browser window: a web page in a frame">Web</button>
-    <button class="tb" id="add-artifact" title="New artifact: an HTML page in a sandboxed frame, made by Claude or by any agent writing a file">Artifact</button>
+    <button class="tb" id="add-artifact" title="New HTML card: a page in a sandboxed frame, written by you or by any agent">Artifact</button>
     <button class="tb" id="add-sketch" title="New sketch: a card to write or draw on with the pen">Sketch</button>
     <button class="tb" id="add-frame" title="New folder">Folder</button>
     <button class="tb" id="open-today" title="Today's journal page">Today</button>
@@ -267,8 +267,8 @@
       <section>
         <h3>Artifacts and review</h3>
         <dl>
-          <dt>Artifact node</dt><dd>A Claude artifact page in a sandboxed frame. It reaches the world only through <code>claude.use()</code>; you allow each capability once. ✎ edits the source as a page, "Artifact: publish from this page" ships it.</dd>
-          <dt>Node kinds</dt><dd>Shell (real PTY: run claude code, oh-my-pi or anything), Web (a page in a frame; ↗ opens it outside when the site refuses frames), Artifact (sandboxed HTML page: published by Claude, or backed by a file any agent writes, reloaded on change), Sketch (write or draw with the pen; Aa turns the ink into a page), Page, Folder.</dd>
+          <dt>Artifact node</dt><dd>An HTML page in a sandboxed frame. It reaches the world only through <code>wb.use()</code>; you allow each capability once. ✎ edits the source as a page, "Artifact: publish from this page" ships it.</dd>
+          <dt>Node kinds</dt><dd>Shell (real PTY: run claude code, oh-my-pi or anything), Web (a page in a frame; ↗ opens it outside when the site refuses frames), Artifact (sandboxed HTML page: published from a page or by an agent, or backed by a file any agent writes, reloaded on change), Sketch (write or draw with the pen; Aa turns the ink into a page), Page, Folder.</dd>
           <dt>Review (Alt-7)</dt><dd>Space reveals, 1 to 4 grades, u undoes, s suspends, b buries, o opens the source, ? asks. Answer by thinking, typing, pen or voice.</dd>
         </dl>
       </section>

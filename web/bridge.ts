@@ -1,7 +1,7 @@
-/* claude.js: the page side of the Workbench artifact bridge.
+/* bridge.js: the page side of the Workbench artifact bridge.
  *
- * Injected first into every artifact page the Workbench hosts. Defines the one entry point the runtime
- * contract (0.2.75) promises, `window.claude.use(name)`, and talks to the host page over a MessageChannel.
+ * Injected first into every artifact page the Workbench hosts. Defines the one entry point a page has,
+ * `window.wb.use(name)`, and talks to the host page over a MessageChannel.
  * Nothing here knows about the daemon: the host decides which capabilities are served and answers each call.
  *
  * Wire protocol (page -> host over the port):
@@ -72,7 +72,7 @@
   }
   type BridgeRoomHandler = (payload: unknown, from: unknown) => void;
   interface BridgeRoomEvent { type: string; payload: unknown; from: unknown }
-  if (window.claude && typeof window.claude.use === 'function') return;
+  if (window.wb && typeof window.wb.use === 'function') return;
   const CONTRACT = '0.2.75';
   let port: MessagePort | null = null, hello: BridgeHello | null = null, keys: BridgeKeys | null = null, seq = 0, pinching = false;
   const pending = new Map<string, BridgePending>();   // id -> {resolve, reject, onEvent}
@@ -128,7 +128,7 @@
   // ---------------------------------------------------------------- handshake: ask the host for a port
   const ch = new MessageChannel();
   port = ch.port1; port.onmessage = onMessage;
-  const say = () => { try { window.parent.postMessage({ claude: 'hello', contract: CONTRACT }, '*', [ch.port2]); } catch {} };
+  const say = () => { try { window.parent.postMessage({ wb: 'hello', contract: CONTRACT }, '*', [ch.port2]); } catch {} };
   if (window.parent !== window) say();
 
   // ---------------------------------------------------------------- namespaces
@@ -250,7 +250,7 @@
     })();
     memo.set(name, p); return p;
   }
-  window.claude = freeze({ use });
+  window.wb = freeze({ use });
   // The board's leader key goes back to the board (hello.keys.leader, Edwin notation): keys typed in this frame never
   // reach the host page, so without this the keyboard could not leave an artifact (Workbench DESIGN §6.4, K3).
   const leaderOf = (e: KeyboardEvent) => e.key === 'F1' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey ? '<f1>'
@@ -272,5 +272,4 @@
   window.addEventListener('touchmove', touch('move'), { capture: true, passive: false });
   window.addEventListener('touchend', touch('end'), { capture: true, passive: true });
   window.addEventListener('touchcancel', touch('end'), { capture: true, passive: true });
-  window.addEventListener('message', ev => { if (ev.data && ev.data.claude === 'ping') say(); });
 })();
