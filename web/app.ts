@@ -3106,7 +3106,7 @@ function pickShell(then: (shell?: string) => unknown) {
   const d = shellDefault(), order = sh.includes(d!) ? [d!, ...sh.filter(x => x !== d)] : sh;
   openPicker('Shell', order.map(x => ({ k: 'shell', l: x, s: x === INFO!.defaultShell ? 'default' : '', run: () => { store.set(SHELL_KEY, x); then(x); } })));
 }
-$('#add-buffer')!.onclick = () => { const n = newAt('buffer', { text: '# untitled\n\n- ' }); pageSetText(n, `# ${n.name}\n\n- `); };
+function newPage() { const n = newAt('buffer', { text: '# untitled\n\n- ' }); pageSetText(n, `# ${n.name}\n\n- `); }
 $('#add-frame')!.onclick = () => {
   if (VIEW !== 'canvas') setView('canvas');
   const n = newAt('frame', { mode: 'free', shape: 'folder' });
@@ -8833,7 +8833,7 @@ window.addEventListener('contextmenu', ev => {
       PLACE.at = w; fn(); if (!$$('.overlay').some(o => !o.hidden)) PLACE.at = null;   // kept only while a picker or prompt is still asking
     } });
     title = 'Canvas';
-    items.push(mk('New page', () => $('#add-buffer')!.click()), mk('New shell', () => $('#add-shell')!.click()), mk('New folder', () => $('#add-frame')!.click()),
+    items.push(mk('New page', () => newPage()), mk('New shell', () => $('#add-shell')!.click()), mk('New folder', () => $('#add-frame')!.click()),
       mk('New sketch', () => newSketch()), mk('New browser window…', () => $('#add-web')!.click()), { k: 'command', l: 'Fit everything', run: () => fitAll() });
   }
   if (!items.length) return;   // nothing here to offer (a side pane, another view): the browser's menu
