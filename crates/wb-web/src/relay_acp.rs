@@ -21,6 +21,7 @@ use wb_proto::hub::{
 use wb_proto::journal::EventBody;
 use wb_proto::limits::{CARD_OPEN_DEADLINE, MAX_LINE, WS_MAX_ACP};
 use wb_proto::line;
+use wb_proto::policy::Policy;
 
 use crate::AppState;
 use crate::http::{self, End, Keepalive, Tick, close, send_json, ws_close, ws_too_big};
@@ -53,6 +54,8 @@ enum Browser {
         cwd: Option<String>,
         #[serde(default)]
         config: Vec<ConfigOption>,
+        #[serde(default, deserialize_with = "wb_proto::policy::deserialize_optional")]
+        policy: Option<Policy>,
     },
     #[serde(rename = "prompt")]
     Prompt { blocks: Vec<Value> },
@@ -95,10 +98,15 @@ fn decode(text: &str) -> Result<(Option<Value>, Browser), Option<Value>> {
         return Err(None);
     };
     let rid = m.remove("rid").filter(|r| !r.is_null());
-    match serde_json::from_value(Value::Object(m)) {
-        Ok(msg) => Ok((rid, msg)),
-        Err(_) => Err(rid),
+    let msg = serde_json::from_value(Value::Object(m)).map_err(|_| rid.clone())?;
+    if let Browser::Open {
+        policy: Some(policy),
+        ..
+    } = &msg
+    {
+        policy.validate().map_err(|_| rid.clone())?;
     }
+    Ok((rid, msg))
 }
 
 /// Spawn fields only when both `agent` and `cwd` are non-empty (SEC-2): a page load or
@@ -107,6 +115,7 @@ fn spawn(
     agent: Option<String>,
     cwd: Option<String>,
     config: Vec<ConfigOption>,
+    policy: Option<Policy>,
 ) -> Option<SpawnAcp> {
     match (agent, cwd) {
         (Some(agent), Some(cwd)) if !agent.is_empty() && !cwd.is_empty() => Some(SpawnAcp {
@@ -114,6 +123,7 @@ fn spawn(
             cwd,
             host: None,
             config,
+            policy,
         }),
         _ => None,
     }
@@ -249,8 +259,9 @@ impl Relay {
                     agent,
                     cwd,
                     config,
+                    policy,
                 } => {
-                    let spawn = spawn(agent, cwd, config);
+                    let spawn = spawn(agent, cwd, config, policy);
                     self.open(ws, &id, since, epoch, spawn, browser_rid).await
                 }
                 _ => {
@@ -489,18 +500,19 @@ mod tests {
         ];
         for (agent, cwd, want) in table {
             assert_eq!(
-                spawn(s(agent), s(cwd), Vec::new()).is_some(),
+                spawn(s(agent), s(cwd), Vec::new(), None).is_some(),
                 want,
                 "{agent:?} {cwd:?}"
             );
         }
         assert_eq!(
-            spawn(s(Some("claude")), s(Some("/home/alice")), Vec::new()),
+            spawn(s(Some("claude")), s(Some("/home/alice")), Vec::new(), None),
             Some(SpawnAcp {
                 agent: "claude".into(),
                 cwd: "/home/alice".into(),
                 host: None,
                 config: Vec::new(),
+                policy: None,
             })
         );
     }
@@ -519,6 +531,7 @@ mod tests {
                     agent: None,
                     cwd: None,
                     config: Vec::new(),
+                    policy: None,
                 }
             ))
         );
@@ -579,6 +592,7 @@ mod tests {
                 title: None,
                 mode_id: None,
                 config_options: None,
+                policy: None,
             }),
         }
     }
