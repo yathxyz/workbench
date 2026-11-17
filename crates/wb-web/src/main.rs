@@ -16,6 +16,8 @@ mod hub;
 mod info;
 mod media;
 mod notes;
+#[allow(dead_code)]
+mod observed;
 mod relay_acp;
 mod relay_edit;
 mod relay_pty;
