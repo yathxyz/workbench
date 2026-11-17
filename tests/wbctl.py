@@ -449,6 +449,26 @@ class AcpCard:
         return self.send("permission", req=perm["seq"], epoch=self.epoch() if epoch is None else epoch,
                          outcome={"outcome": "selected", "optionId": option["optionId"]})
 
+    def set_config(self, config_id, value, epoch=None):
+        """Set one option, waiting for the journaled full result and matching materialised info.
+
+        The agent may return a different value, so success never compares with the requested one.
+        """
+        mark = self.cursor()
+        self.send("set_config_option", configId=config_id, value=value,
+                  epoch=self.epoch() if epoch is None else epoch)
+
+        def applied():
+            events = self.since(mark, ("config",))
+            info = self.result["info"] or {}
+            if not events:
+                return False
+            options = events[-1].get("configOptions")
+            return (options is not None and (info.get("acp") or {}).get("configOptions") == options
+                    and (info.get("session") or {}).get("configOptions") == options)
+
+        return self.wait(applied)
+
     def close(self):
         if self.ws is not None:
             self.ws.close()
