@@ -404,7 +404,11 @@ impl Fake {
             return self.error(id, -32000, "Authentication required");
         }
         self.session = format!("fake-session-{}", std::process::id());
-        let result = json!({"sessionId": self.session, "modes": self.modes()});
+        let result = json!({
+            "sessionId": self.session,
+            "modes": self.modes(),
+            "configOptions": Self::config_options(),
+        });
         self.reply(id, result);
     }
 
@@ -432,7 +436,7 @@ impl Fake {
                 {"name": "test", "description": "Run the tests", "input": {"hint": "a test filter"}},
             ],
         }));
-        let result = json!({"modes": self.modes()});
+        let result = json!({"modes": self.modes(), "configOptions": Self::config_options()});
         self.reply(id, result);
     }
 
@@ -441,7 +445,7 @@ impl Fake {
             return self.error(id, -32002, "Session not found");
         }
         self.adopt(params);
-        let result = json!({"modes": self.modes()});
+        let result = json!({"modes": self.modes(), "configOptions": Self::config_options()});
         self.reply(id, result);
     }
 
@@ -800,6 +804,22 @@ impl Fake {
             .map(|(id, name, description)| json!({"id": id, "name": name, "description": description}))
             .collect();
         json!({"currentModeId": self.mode, "availableModes": available})
+    }
+
+    /// Real session metadata for the agents-view checks, carried by the journal.
+    fn config_options() -> Value {
+        json!([
+            {
+                "id": "model", "name": "Model", "category": "model", "type": "select",
+                "currentValue": "stub-model",
+                "options": [{"value": "stub-model", "name": "Stub model"}]
+            },
+            {
+                "id": "thinking", "name": "Thinking", "category": "thinking", "type": "select",
+                "currentValue": "high",
+                "options": [{"value": "high", "name": "High"}]
+            }
+        ])
     }
 
     fn permission_params(&self, tool: Value) -> Value {

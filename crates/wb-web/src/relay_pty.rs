@@ -11,13 +11,14 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 use axum::routing::get;
 use serde_json::{Map, Value, json};
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, sleep_until, timeout_at};
 use wb_proto::hub::{ErrorCode, HubMessage, HubRequest, PtyOpenReply, Resume, SpawnPty};
 use wb_proto::limits::{CARD_OPEN_DEADLINE, PTY_INPUT_FRAME, WS_MAX_PTY};
 
 use crate::AppState;
 use crate::http::{self, End, Keepalive, Tick, close, send_json, ws_close, ws_too_big};
 use crate::hub::{HUB_LOST, HubConn, REPLY_TIMEOUT, connect_relay};
+use crate::observed::Registry;
 use crate::util::{sanitize_sid, split_utf8};
 
 const ROUTE: &str = "/pty";
@@ -51,16 +52,25 @@ async fn run(app: AppState, mut ws: WebSocket) {
     };
     let mut open_by = Some(Instant::now() + CARD_OPEN_DEADLINE);
     let mut keepalive = Keepalive::new();
+    let mut read_error = false;
     let end = loop {
-        let reply_by = relay.pending.as_ref().map(|p| p.2);
+        let reply_by = relay
+            .pending
+            .iter()
+            .chain(relay.superseded.values().filter(|p| p.kill.is_some()))
+            .map(|p| p.deadline)
+            .min();
         let step = tokio::select! {
             msg = ws.recv() => match msg {
                 None | Some(Ok(Message::Close(_))) => Err(End::Gone),
-                Some(Err(_)) => return ws_too_big(ws, ROUTE).await,
+                Some(Err(_)) => {
+                    read_error = true;
+                    Err(End::Gone)
+                }
                 Some(Ok(msg)) => {
                     keepalive.seen();
                     match msg {
-                        Message::Text(text) => relay.browser(&mut ws, text.as_str(), &mut open_by).await,
+                        Message::Text(text) => relay.browser(&app, &mut ws, text.as_str(), &mut open_by).await,
                         _ => Ok(()),
                     }
                 }
@@ -85,7 +95,21 @@ async fn run(app: AppState, mut ws: WebSocket) {
             break end;
         }
     };
-    end.close(ws, ROUTE).await;
+    // Dropping HubConn only detaches: retain it until an explicitly cancelled open
+    // has answered, even when the browser has already closed.
+    let (_, cleanup) = tokio::join!(
+        async {
+            if read_error {
+                ws_too_big(ws, ROUTE).await;
+            } else {
+                end.close(ws, ROUTE).await;
+            }
+        },
+        relay.finish_kills(),
+    );
+    if cleanup.is_err() {
+        tracing::warn!("hub lost while cleaning up a pending pty kill");
+    }
 }
 
 struct Relay {
@@ -96,11 +120,19 @@ struct Relay {
     next_rid: u64,
     /// The attached sid; only its events reach the browser.
     cur: Option<String>,
-    /// The latest open waiting for its reply: rid, sid, deadline.
-    pending: Option<(u64, String, Instant)>,
-    /// Opens replaced by a later open before their reply; each is detached once its
-    /// `ok` arrives, unless a later open is for the same sid.
-    superseded: HashMap<u64, String>,
+    /// The latest open waiting for its reply.
+    pending: Option<PendingOpen>,
+    /// Opens replaced by a later open before their reply; each is detached (or
+    /// killed if requested) once its `ok` arrives, unless a later open is for the same sid.
+    superseded: HashMap<u64, PendingOpen>,
+}
+
+struct PendingOpen {
+    rid: u64,
+    sid: String,
+    deadline: Instant,
+    /// `Some(forget)` remembers a kill received before this open answered.
+    kill: Option<bool>,
 }
 
 impl Relay {
@@ -115,6 +147,7 @@ impl Relay {
 
     async fn browser(
         &mut self,
+        app: &AppState,
         ws: &mut WebSocket,
         text: &str,
         open_by: &mut Option<Instant>,
@@ -126,7 +159,7 @@ impl Relay {
         match m.get("t").and_then(Value::as_str) {
             Some("open") => {
                 *open_by = None;
-                self.open(ws, &m).await
+                self.open(app, ws, &m).await
             }
             Some("in") => {
                 let (Some(sid), Some(d)) = (self.cur.clone(), m.get("d").and_then(Value::as_str))
@@ -151,19 +184,28 @@ impl Relay {
                 self.send(&HubRequest::PtyResize { sid, cols, rows }).await
             }
             Some("kill") => {
+                // `session` absent (undefined in the browser) means forget.
+                let forget = !m.contains_key("session");
+                if let Some(open) = &mut self.pending {
+                    open.kill = Some(open.kill.unwrap_or(false) || forget);
+                    return Ok(());
+                }
                 let Some(sid) = self.cur.clone() else {
                     return Ok(());
                 };
                 let rid = self.rid();
-                // `session` absent (undefined in the browser) means forget.
-                let forget = !m.contains_key("session");
                 self.send(&HubRequest::PtyKill { rid, sid, forget }).await
             }
             _ => Ok(()),
         }
     }
 
-    async fn open(&mut self, ws: &mut WebSocket, m: &Map<String, Value>) -> Result<(), End> {
+    async fn open(
+        &mut self,
+        app: &AppState,
+        ws: &mut WebSocket,
+        m: &Map<String, Value>,
+    ) -> Result<(), End> {
         let sid = sanitize_sid(text(m, "id"));
         if sid.is_empty() {
             send_json(ws, &json!({"t": "error", "error": "bad id"}))
@@ -171,12 +213,25 @@ impl Relay {
                 .map_err(|_| End::Gone)?;
             return Err(End::Close(close::POLICY, "bad id"));
         }
+        let spawn = if spawn_requested(m) {
+            match self.spawn(app, m) {
+                Ok(spawn) => Some(spawn),
+                Err(error) => {
+                    send_json(ws, &json!({"t": "error", "error": error}))
+                        .await
+                        .map_err(|_| End::Gone)?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
         if let Some(old) = self.cur.take() {
             let rid = self.rid();
             self.send(&HubRequest::PtyDetach { rid, sid: old }).await?;
         }
-        if let Some((rid, old, _)) = self.pending.take() {
-            self.superseded.insert(rid, old);
+        if let Some(old) = self.pending.take() {
+            self.superseded.insert(old.rid, old);
         }
         let rid = self.rid();
         tracing::info!(sid, "pty open");
@@ -185,22 +240,48 @@ impl Relay {
             sid: sid.clone(),
             cols: dim(m, "cols").unwrap_or(80),
             rows: dim(m, "rows").unwrap_or(24),
-            spawn: spawn_requested(m).then(|| self.spawn(m)),
+            spawn,
             resume: m
                 .get("resume")
                 .and_then(|r| serde_json::from_value::<Resume>(r.clone()).ok()),
         };
         self.send(&req).await?;
-        self.pending = Some((rid, sid, Instant::now() + REPLY_TIMEOUT));
+        self.pending = Some(PendingOpen {
+            rid,
+            sid,
+            deadline: Instant::now() + REPLY_TIMEOUT,
+            kill: None,
+        });
         Ok(())
     }
 
     /// The hub runs one of its configured shells, never a path from here, and puts
     /// that shell's path in `argv[0]`; the web sends the name there (DELTA-1 §B.2).
-    fn spawn(&self, m: &Map<String, Value>) -> SpawnPty {
-        let shell = Some(text(m, "shell")).filter(|s| !s.is_empty());
+    fn spawn(&self, app: &AppState, m: &Map<String, Value>) -> Result<SpawnPty, &'static str> {
+        let attach = m.get("attach");
+        let shell = if attach.is_some() {
+            None
+        } else {
+            Some(text(m, "shell")).filter(|s| !s.is_empty())
+        };
         let name = shell.unwrap_or(&self.default_shell).to_owned();
-        let cmd = text(m, "cmd");
+        let command = if let Some(attach) = attach {
+            if m.contains_key("cmd") {
+                return Err("attach and cmd are mutually exclusive");
+            }
+            let id = attach
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or("bad attach id")?;
+            Some(attach_command(
+                app.cfg.attach_command.as_deref(),
+                app.observed.as_ref().map(|o| &o.registry),
+                id,
+            )?)
+        } else {
+            None
+        };
+        let cmd = command.as_deref().unwrap_or_else(|| text(m, "cmd"));
         let argv = if cmd.is_empty() {
             vec![name]
         } else {
@@ -218,13 +299,13 @@ impl Relay {
             .flatten()
             .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
             .collect();
-        SpawnPty {
+        Ok(SpawnPty {
             argv,
             shell: shell.map(str::to_owned),
             cwd,
             cwd_from,
             env: (!env.is_empty()).then_some(env),
-        }
+        })
     }
 
     fn is_cur(&self, sid: &str) -> bool {
@@ -234,18 +315,8 @@ impl Relay {
     async fn hub_msg(&mut self, ws: &mut WebSocket, msg: HubMessage) -> Result<(), End> {
         let out = match msg {
             HubMessage::Ok { rid, result } => {
-                if let Some((_, sid, _)) = self.pending.take_if(|p| p.0 == rid) {
-                    let reply: PtyOpenReply = serde_json::from_value(Value::Object(result))
-                        .map_err(|_| End::Close(close::HUB_LOST, "bad hub reply"))?;
+                if let Some((sid, reply)) = self.open_ok(rid, result).await? {
                     return self.opened(ws, sid, reply).await;
-                }
-                if let Some(sid) = self.superseded.remove(&rid) {
-                    // A later open of the same sid keeps it attached; detaching would undo it.
-                    let reopened = self.pending.as_ref().is_some_and(|p| p.1 == sid);
-                    if !reopened && !self.is_cur(&sid) {
-                        let rid = self.rid();
-                        self.send(&HubRequest::PtyDetach { rid, sid }).await?;
-                    }
                 }
                 return Ok(());
             }
@@ -256,7 +327,7 @@ impl Relay {
                 ..
             } => {
                 self.superseded.remove(&rid);
-                if self.pending.take_if(|p| p.0 == rid).is_none() {
+                if self.pending.take_if(|p| p.rid == rid).is_none() {
                     tracing::debug!(?code, message, "hub refused a request");
                     return Ok(());
                 }
@@ -311,12 +382,96 @@ impl Relay {
         send_json(ws, &out).await.map_err(|_| End::Gone)
     }
 
+    /// Resolve the open before writing its hello: a failed browser write must not
+    /// lose the kill that was requested while the hub was opening.
+    async fn open_ok(
+        &mut self,
+        rid: u64,
+        result: Map<String, Value>,
+    ) -> Result<Option<(String, PtyOpenReply)>, End> {
+        if let Some(open) = self.pending.take_if(|p| p.rid == rid) {
+            let reply: PtyOpenReply = serde_json::from_value(Value::Object(result))
+                .map_err(|_| End::Close(close::HUB_LOST, "bad hub reply"))?;
+            if let Some(forget) = open.kill {
+                let rid = self.rid();
+                self.send(&HubRequest::PtyKill {
+                    rid,
+                    sid: open.sid.clone(),
+                    forget,
+                })
+                .await?;
+            }
+            return Ok(Some((open.sid, reply)));
+        }
+        if let Some(open) = self.superseded.remove(&rid) {
+            // A later open of the same sid keeps it attached; old cleanup must not
+            // detach or kill the session that the newer open is using.
+            let reopened = self.pending.as_ref().is_some_and(|p| p.sid == open.sid);
+            if !reopened && !self.is_cur(&open.sid) {
+                let rid = self.rid();
+                let req = match open.kill {
+                    Some(forget) => HubRequest::PtyKill {
+                        rid,
+                        sid: open.sid,
+                        forget,
+                    },
+                    None => HubRequest::PtyDetach { rid, sid: open.sid },
+                };
+                self.send(&req).await?;
+            }
+        }
+        Ok(None)
+    }
+
+    /// No browser remains to receive replies, but its pending kills still own
+    /// their opens. Refusals and the original open deadlines end that ownership.
+    async fn finish_kills(&mut self) -> Result<(), End> {
+        loop {
+            let now = Instant::now();
+            self.pending
+                .take_if(|p| p.kill.is_some() && p.deadline <= now);
+            self.superseded
+                .retain(|_, p| p.kill.is_none() || p.deadline > now);
+            let deadline = self
+                .pending
+                .iter()
+                .chain(self.superseded.values())
+                .filter(|p| p.kill.is_some())
+                .map(|p| p.deadline)
+                .min();
+            let Some(deadline) = deadline else {
+                return Ok(());
+            };
+            match timeout_at(deadline, self.hub.recv()).await {
+                Ok(Some(HubMessage::Ok { rid, result })) => {
+                    if let Some((sid, _)) = self.open_ok(rid, result).await? {
+                        self.cur = Some(sid);
+                    }
+                }
+                Ok(Some(HubMessage::Err {
+                    rid: Some(rid),
+                    code,
+                    message,
+                    ..
+                })) => {
+                    self.pending.take_if(|p| p.rid == rid);
+                    self.superseded.remove(&rid);
+                    tracing::debug!(?code, message, "hub refused a request during pty cleanup");
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => return Err(HUB_LOST),
+                Err(_) => tracing::warn!("hub did not answer an open with a pending pty kill"),
+            }
+        }
+    }
+
     async fn opened(
         &mut self,
         ws: &mut WebSocket,
         sid: String,
         reply: PtyOpenReply,
     ) -> Result<(), End> {
+        self.cur = Some(sid);
         let mut hello = json!({
             "t": "hello",
             "new": reply.new,
@@ -334,9 +489,33 @@ impl Relay {
             let exit = json!({"t": "exit", "code": exit.code, "signal": exit.signal, "reason": exit.reason});
             send_json(ws, &exit).await.map_err(|_| End::Gone)?;
         }
-        self.cur = Some(sid);
         Ok(())
     }
+}
+
+/// The path and address are safe bare shell words; neither is browser-supplied.
+fn attach_command(
+    command: Option<&str>,
+    registry: Option<&Registry>,
+    id: &str,
+) -> Result<String, &'static str> {
+    let command = command.ok_or("terminal attachment is not configured")?;
+    if !crate::config::valid_attach_command(command) {
+        return Err("invalid attachCommand");
+    }
+    let session = registry
+        .and_then(|registry| registry.get(id))
+        .ok_or("unknown observed session")?;
+    if session.ended_at.is_some() {
+        return Err("observed session has ended");
+    }
+    let attach = session
+        .attach
+        .ok_or("observed session has no terminal attachment")?;
+    let address = attach
+        .address(&session.host)
+        .ok_or("invalid terminal attachment address")?;
+    Ok(format!("{command} {address}"))
 }
 
 /// Only `spawn: true` may start a process; absent means attach only (SEC-2).
@@ -360,6 +539,60 @@ mod tests {
     fn obj(v: Value) -> Map<String, Value> {
         let Value::Object(m) = v else { panic!() };
         m
+    }
+
+    #[test]
+    fn attach_command_rechecks_config_and_stored_addresses() {
+        assert_eq!(
+            attach_command(None, None, "o_x"),
+            Err("terminal attachment is not configured")
+        );
+        assert_eq!(
+            attach_command(Some("/bin/a;id"), None, "o_x"),
+            Err("invalid attachCommand")
+        );
+        assert_eq!(
+            attach_command(Some("/bin/a"), None, "o_x"),
+            Err("unknown observed session")
+        );
+        for (host, attachment) in [
+            ("bad_host", json!({"kind": "claude", "id": "deadbeef"})),
+            ("devbox", json!({"kind": "claude", "id": "deadbeef;id"})),
+            (
+                "devbox",
+                json!({"kind": "tmux", "socket": "/tmp/a;id", "pane": 0}),
+            ),
+            (
+                "devbox",
+                json!({"kind": "tmux", "socket": "/tmp/s", "pane": 1000000}),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let proc_root = dir.path().join("proc");
+            let registry = Registry::load(dir.path(), "local", &proc_root, 1);
+            registry
+                .ingest(
+                    host,
+                    json!({
+                        "harness": "pi", "payload": {"session_id": "s", "kind": "start"},
+                        "attach": {"kind": "claude", "id": "deadbeef"}
+                    }),
+                    1,
+                )
+                .unwrap();
+            let id = registry.list()[0].id.clone();
+            registry.save().unwrap();
+            let path = dir.path().join("observed.json");
+            let mut stored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            stored["sessions"][0]["attach"] = attachment;
+            std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+            let registry = Registry::load(dir.path(), "local", &proc_root, 2);
+            assert_eq!(
+                attach_command(Some("/bin/a"), Some(&registry), &id),
+                Err("invalid terminal attachment address"),
+                "{host}"
+            );
+        }
     }
 
     #[test]

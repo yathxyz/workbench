@@ -792,6 +792,147 @@ fn envelope_fields_are_untrusted() {
 }
 
 #[test]
+fn attach_is_validated_and_sticky() {
+    let good = [
+        json!({"kind": "claude", "id": "0123abcd"}),
+        json!({"kind": "tmux", "socket": "/tmp/tmux-1000/default", "pane": 0}),
+        json!({"kind": "tmux", "socket": "/A-9._/z", "pane": 1}),
+        json!({"kind": "tmux", "socket": format!("/{}", "a".repeat(200)), "pane": 999999}),
+    ];
+    let bad = [
+        Value::Null,
+        json!(true),
+        json!("claude"),
+        json!({}),
+        json!({"kind": "claude", "id": "0123ABCd"}),
+        json!({"kind": "claude", "id": "0123abc"}),
+        json!({"kind": "claude", "id": "0123abcde"}),
+        json!({"kind": "claude", "id": "0123abcd", "extra": 1}),
+        json!({"kind": "claude", "id": "0123abc\n"}),
+        json!({"kind": "other", "id": "0123abcd"}),
+        json!({"kind": "tmux", "socket": "/", "pane": 0}),
+        json!({"kind": "tmux", "socket": "tmp/s", "pane": 0}),
+        json!({"kind": "tmux", "socket": "/tmp/a:b", "pane": 0}),
+        json!({"kind": "tmux", "socket": "/tmp/../s", "pane": 0}),
+        json!({"kind": "tmux", "socket": "/tmp/.../s", "pane": 0}),
+        json!({"kind": "tmux", "socket": "/tmp/a..b", "pane": 0}),
+        json!({"kind": "tmux", "socket": "/tmp/a b", "pane": 0}),
+        json!({"kind": "tmux", "socket": "/tmp/a\n", "pane": 0}),
+        json!({"kind": "tmux", "socket": "/tmp/é", "pane": 0}),
+        json!({"kind": "tmux", "socket": "/tmp/$(id)", "pane": 0}),
+        json!({"kind": "tmux", "socket": format!("/{}", "a".repeat(201)), "pane": 0}),
+        json!({"kind": "tmux", "socket": "/tmp/s", "pane": -1}),
+        json!({"kind": "tmux", "socket": "/tmp/s", "pane": 1000000}),
+        json!({"kind": "tmux", "socket": "/tmp/s", "pane": 1.5}),
+        json!({"kind": "tmux", "socket": "/tmp/s", "pane": 1.0}),
+        json!({"kind": "tmux", "socket": "/tmp/s", "pane": "1"}),
+        json!({"kind": "tmux", "socket": "/tmp/s", "pane": null}),
+        json!({"kind": "tmux", "socket": "/tmp/s", "pane": true}),
+        json!({"kind": "tmux", "socket": "/tmp/s", "pane": 0, "extra": 1}),
+        json!({"kind": "tmux", "socket": "/tmp/s"}),
+    ];
+    for attach in &bad {
+        let f = fx();
+        let mut ev = claude("s1", T0, "SessionStart", json!({}));
+        ev["attach"] = attach.clone();
+        f.reg.ingest(HOST, ev, NOW).unwrap();
+        assert_eq!(top(&f.reg).attach, None, "{attach}");
+        assert_eq!(
+            serde_json::to_value(top(&f.reg)).unwrap()["attach"],
+            Value::Null
+        );
+    }
+    for attach in good {
+        let f = fx();
+        let mut ev = claude("s1", T0, "SessionStart", json!({}));
+        ev["attach"] = attach.clone();
+        f.reg.ingest(HOST, ev, NOW).unwrap();
+        assert_eq!(serde_json::to_value(top(&f.reg)).unwrap()["attach"], attach);
+        f.reg
+            .ingest(HOST, claude("s1", T0 + 1, "Stop", json!({})), NOW)
+            .unwrap();
+        assert_eq!(serde_json::to_value(top(&f.reg)).unwrap()["attach"], attach);
+        for malformed in &bad {
+            let mut ev = claude("s1", T0 + 2, "Stop", json!({}));
+            ev["attach"] = malformed.clone();
+            f.reg.ingest(HOST, ev, NOW).unwrap();
+            assert_eq!(serde_json::to_value(top(&f.reg)).unwrap()["attach"], attach);
+        }
+        let mut ev = claude("s1", T0 + 3, "Stop", json!({}));
+        ev["attach"] = json!({"kind": "claude", "id": "deadbeef"});
+        f.reg.ingest(HOST, ev, NOW).unwrap();
+        assert_eq!(
+            top(&f.reg).attach,
+            Some(Attach::Claude {
+                id: "deadbeef".into()
+            })
+        );
+    }
+}
+
+#[test]
+fn every_attach_address_matches_the_shell_word_invariant() {
+    let pattern = regex::Regex::new(r"^[A-Za-z0-9.-]+:[a-z]+:[A-Za-z0-9._/:-]+$").unwrap();
+    let attachments = [
+        Attach::Claude {
+            id: "deadbeef".into(),
+        },
+        Attach::Tmux {
+            socket: "/tmp/tmux-1000/default".into(),
+            pane: 0,
+        },
+        Attach::Tmux {
+            socket: format!("/{}", "a".repeat(200)),
+            pane: 999_999,
+        },
+    ];
+    for attach in &attachments {
+        for host in ["devbox", "A-1.mesh.example", &"a".repeat(64)] {
+            let address = attach.address(host).unwrap();
+            assert!(pattern.is_match(&address), "{address}");
+            assert!(!address.contains(".."), "{address}");
+        }
+        for host in [
+            "",
+            "dev_box",
+            "host:evil",
+            "host;id",
+            "a b",
+            "é",
+            "..",
+            "...",
+            "host..example",
+            &"a".repeat(65),
+        ] {
+            assert_eq!(attach.address(host), None, "{host}");
+        }
+    }
+    for attach in [
+        Attach::Claude {
+            id: "deadbeef;id".into(),
+        },
+        Attach::Tmux {
+            socket: "/tmp/a;id".into(),
+            pane: 0,
+        },
+        Attach::Tmux {
+            socket: "/tmp/../s".into(),
+            pane: 0,
+        },
+        Attach::Tmux {
+            socket: "/tmp/.../s".into(),
+            pane: 0,
+        },
+        Attach::Tmux {
+            socket: "/tmp/s".into(),
+            pane: 1_000_000,
+        },
+    ] {
+        assert_eq!(attach.address(HOST), None);
+    }
+}
+
+#[test]
 fn an_event_is_never_dated_after_the_servers_clock() {
     let f = fx();
     let ahead = claude("ahead", u64::MAX, "SessionStart", json!({}));
@@ -915,6 +1056,31 @@ fn save_and_load_round_trip() {
     f.process(PID, START + 1);
     again.sweep(T0 + 12);
     assert_eq!(top(&again).end_reason, Some(EndReason::ProcessGone));
+}
+
+#[test]
+fn attach_survives_storage_and_old_records_default_to_null() {
+    let f = fx();
+    f.process(PID, START);
+    let mut ev = claude("s1", T0, "SessionStart", json!({}));
+    ev["attach"] = json!({"kind": "tmux", "socket": "/tmp/tmux-1000/default", "pane": 7});
+    f.reg.ingest(HOST, ev, NOW).unwrap();
+    f.reg.save().unwrap();
+    assert_eq!(top(&f.reload(T0 + 1)).attach, top(&f.reg).attach);
+    let path = f.dir.path().join(FILE);
+    let mut file: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    file["sessions"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("attach");
+    fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+    let loaded = f.reload(T0 + 1);
+    assert_eq!(loaded.list().len(), 1);
+    assert_eq!(top(&loaded).attach, None);
+    assert_eq!(
+        serde_json::to_value(top(&loaded)).unwrap()["attach"],
+        Value::Null
+    );
 }
 
 #[test]

@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use common::{
-    DEFAULT_SHELL, FakeHub, Hello, OpenReply, Web, Ws, next_json, read_to_close, send_json, spawned,
+    DEFAULT_SHELL, FakeHub, Hello, OpenReply, Req, Web, Ws, next_json, read_to_close, send_json,
+    spawned,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -79,6 +80,498 @@ fn rid_of(r: &HubRequest) -> u64 {
         | HubRequest::PtyKill { rid, .. } => *rid,
         other => panic!("no rid in {other:?}"),
     }
+}
+
+/// A pong proves all preceding browser frames were handled while the scripted
+/// open was still pending; receiving a hello first would invalidate the test.
+async fn browser_barrier(ws: &mut Ws) {
+    let ping = b"pending open".to_vec();
+    ws.send(Message::Ping(ping.clone().into())).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("no browser barrier")
+            .expect("browser closed")
+            .unwrap(),
+        Message::Pong(ping.into())
+    );
+}
+
+async fn pending_kill(browser_gone: bool, session: bool) {
+    let (hub, web) = up().await;
+    let release = hub.hold_next_open();
+    let mut ws = web.ws("/pty").await;
+    send_json(
+        &mut ws,
+        json!({"t": "open", "id": "pending", "spawn": true}),
+    )
+    .await;
+    let (conn, request) = hub.wait_for(is_open).await;
+    let kill = if session {
+        json!({"t": "kill", "session": true})
+    } else {
+        json!({"t": "kill"})
+    };
+    send_json(&mut ws, kill).await;
+    browser_barrier(&mut ws).await;
+    if browser_gone {
+        ws.close(None).await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("browser did not close");
+        assert!(
+            matches!(closed, None | Some(Ok(Message::Close(_))) | Some(Err(_))),
+            "open replied before the browser disconnected: {closed:?}"
+        );
+    }
+    release.send(Ok(spawned())).unwrap();
+    if !browser_gone {
+        assert_eq!(next_json(&mut ws).await["t"], "hello");
+    }
+    let (kill_conn, kill) = hub
+        .wait_for(|r| matches!(r, HubRequest::PtyKill { .. }))
+        .await;
+    assert_eq!(kill_conn, conn);
+    assert_eq!(
+        kill,
+        HubRequest::PtyKill {
+            rid: rid_of(&request) + 1,
+            sid: "pending".into(),
+            forget: !session,
+        }
+    );
+    assert_eq!(
+        on_conn(&hub, conn)
+            .iter()
+            .filter(|r| matches!(r, HubRequest::PtyKill { .. }))
+            .count(),
+        1
+    );
+    if browser_gone {
+        hub.wait_closed(conn).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_before_open_reply_kills_and_forgets_after_open() {
+    pending_kill(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_before_open_reply_survives_browser_disconnect() {
+    pending_kill(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_kill_before_open_reply_preserves_the_session_record() {
+    pending_kill(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_kill_follows_its_superseded_open_not_the_new_sid() {
+    let (hub, web) = up().await;
+    let release = hub.hold_next_open();
+    let mut ws = web.ws("/pty").await;
+    send_json(&mut ws, open("old")).await;
+    let (conn, _) = hub.wait_for(is_open).await;
+    send_json(&mut ws, json!({"t": "kill"})).await;
+    send_json(&mut ws, open("new")).await;
+    browser_barrier(&mut ws).await;
+    release.send(Ok(spawned())).unwrap();
+    assert_eq!(next_json(&mut ws).await["t"], "hello");
+    let (kill_conn, kill) = hub
+        .wait_for(|r| matches!(r, HubRequest::PtyKill { .. }))
+        .await;
+    assert_eq!(kill_conn, conn);
+    assert!(matches!(
+        kill,
+        HubRequest::PtyKill { sid, forget: true, .. } if sid == "old"
+    ));
+    send_json(&mut ws, json!({"t": "in", "d": "still new"})).await;
+    let (_, input) = hub.wait_for(is_input).await;
+    assert!(matches!(input, HubRequest::PtyInput { sid, .. } if sid == "new"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reopen_of_the_same_sid_supersedes_its_pending_kill() {
+    let (hub, web) = up().await;
+    let release = hub.hold_next_open();
+    let mut ws = web.ws("/pty").await;
+    send_json(&mut ws, open("same")).await;
+    let (conn, _) = hub.wait_for(is_open).await;
+    send_json(&mut ws, json!({"t": "kill"})).await;
+    send_json(&mut ws, open("same")).await;
+    browser_barrier(&mut ws).await;
+    release.send(Ok(spawned())).unwrap();
+    assert_eq!(next_json(&mut ws).await["t"], "hello");
+    send_json(&mut ws, json!({"t": "in", "d": "still same"})).await;
+    hub.wait_for(is_input).await;
+    let requests = on_conn(&hub, conn);
+    assert!(
+        !requests
+            .iter()
+            .any(|r| matches!(r, HubRequest::PtyKill { .. } | HubRequest::PtyDetach { .. })),
+        "old cleanup affected the reopened sid: {requests:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_pending_open_never_turns_its_kill_into_a_session_kill() {
+    let (hub, web) = up().await;
+    let release = hub.hold_next_open();
+    let mut ws = web.ws("/pty").await;
+    send_json(&mut ws, open("refused")).await;
+    let (conn, _) = hub.wait_for(is_open).await;
+    send_json(&mut ws, json!({"t": "kill"})).await;
+    browser_barrier(&mut ws).await;
+    release
+        .send(Err((ErrorCode::NotFound, "no session refused")))
+        .unwrap();
+    let (code, texts) = read_to_close(&mut ws).await;
+    assert_eq!(code, 1000);
+    assert_eq!(
+        texts,
+        [json!({"t": "error", "error": "no session refused", "code": "not_found"})]
+    );
+    hub.wait_closed(conn).await;
+    assert!(
+        !on_conn(&hub, conn)
+            .iter()
+            .any(|r| matches!(r, HubRequest::PtyKill { .. }))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_pending_kill_finishes_after_the_browser_disconnects() {
+    let (hub, web) = up().await;
+    let release = hub.hold_next_open();
+    let mut ws = web.ws("/pty").await;
+    send_json(&mut ws, open("refused")).await;
+    let (conn, _) = hub.wait_for(is_open).await;
+    send_json(&mut ws, json!({"t": "kill"})).await;
+    browser_barrier(&mut ws).await;
+    ws.close(None).await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("browser did not close");
+    assert!(matches!(
+        closed,
+        None | Some(Ok(Message::Close(_))) | Some(Err(_))
+    ));
+    release
+        .send(Err((ErrorCode::NotFound, "no session refused")))
+        .unwrap();
+    hub.wait_closed(conn).await;
+    assert!(
+        !on_conn(&hub, conn)
+            .iter()
+            .any(|r| matches!(r, HubRequest::PtyKill { .. }))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_kill_survives_a_browser_read_error() {
+    let (hub, web) = up().await;
+    let release = hub.hold_next_open();
+    let mut ws = web.ws("/pty").await;
+    send_json(&mut ws, open("too-big")).await;
+    let (conn, _) = hub.wait_for(is_open).await;
+    send_json(&mut ws, json!({"t": "kill"})).await;
+    browser_barrier(&mut ws).await;
+    let (mut tx, mut rx) = ws.split();
+    let writer = tokio::spawn(async move {
+        let _ = tx
+            .send(Message::Text("x".repeat(WS_MAX_PTY + 1).into()))
+            .await;
+    });
+    let (code, _) = read_to_close(&mut rx).await;
+    assert_eq!(code, 1009);
+    writer.abort();
+    release.send(Ok(spawned())).unwrap();
+    let (kill_conn, kill) = hub
+        .wait_for(|r| matches!(r, HubRequest::PtyKill { .. }))
+        .await;
+    assert_eq!(kill_conn, conn);
+    assert!(matches!(
+        kill,
+        HubRequest::PtyKill { sid, forget: true, .. } if sid == "too-big"
+    ));
+    hub.wait_closed(conn).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ordinary_browser_disconnect_does_not_kill_its_session() {
+    let (hub, web) = up().await;
+    let release = hub.hold_next_open();
+    let mut ws = web.ws("/pty").await;
+    send_json(&mut ws, open("kept")).await;
+    let (conn, _) = hub.wait_for(is_open).await;
+    browser_barrier(&mut ws).await;
+    ws.close(None).await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("browser did not close");
+    assert!(matches!(
+        closed,
+        None | Some(Ok(Message::Close(_))) | Some(Err(_))
+    ));
+    release.send(Ok(spawned())).unwrap();
+    hub.wait_closed(conn).await;
+    assert!(
+        !on_conn(&hub, conn)
+            .iter()
+            .any(|r| matches!(r, HubRequest::PtyKill { .. }))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_attach_uses_registry_and_default_shell() {
+    const TOKEN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const COMMAND: &str = "/run/current-system/sw/bin/attach-agent";
+    let tokens = tempfile::tempdir().unwrap();
+    let token = tokens.path().join("token");
+    std::fs::write(&token, TOKEN).unwrap();
+    let hub = FakeHub::start();
+    let web = Web::start_with(&hub.path, |cfg| {
+        cfg["attachCommand"] = json!(COMMAND);
+        cfg["api"] = json!({
+            "listen": "127.0.0.2:0",
+            "clients": {"owner": {
+                "tokenFile": token, "scopes": ["read", "events"], "host": "devbox"
+            }}
+        });
+    });
+    web.wait_hub("up").await;
+    let addr = web.api_addr().await;
+    let request = |method: &str, path: &str| {
+        Req::to(addr, method, path).set("Authorization", &format!("Bearer {TOKEN}"))
+    };
+    for (sid, attach, kind) in [
+        (
+            "claude",
+            json!({"kind": "claude", "id": "deadbeef"}),
+            "start",
+        ),
+        (
+            "tmux",
+            json!({"kind": "tmux", "socket": "/tmp/tmux-1000/default", "pane": 17}),
+            "start",
+        ),
+        ("none", Value::Null, "start"),
+        ("ended", json!({"kind": "claude", "id": "deadbeef"}), "end"),
+    ] {
+        let response = request("POST", "/v1/events")
+            .set("Content-Type", "application/json")
+            .body(
+                json!({
+                    "harness": "pi", "attach": attach,
+                    "payload": {"session_id": sid, "kind": kind}
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(response.status, 204);
+    }
+    let observed = request("GET", "/v1/observed").send().await.json();
+    let mut rpc = web.ws("/rpc").await;
+    for kind in ["hub", "board", "sessions"] {
+        assert_eq!(next_json(&mut rpc).await["t"], kind);
+    }
+    let snapshot = next_json(&mut rpc).await;
+    assert_eq!(snapshot["t"], "observed");
+    assert_eq!(snapshot["sessions"], observed["sessions"]);
+    for session in observed["sessions"].as_array().unwrap() {
+        let response = request(
+            "GET",
+            &format!("/v1/observed/{}", session["id"].as_str().unwrap()),
+        )
+        .send()
+        .await;
+        assert_eq!(response.json(), *session);
+        assert_eq!(
+            session["attach"],
+            match session["sessionId"].as_str().unwrap() {
+                "claude" | "ended" => json!({"kind": "claude", "id": "deadbeef"}),
+                "tmux" => {
+                    json!({"kind": "tmux", "socket": "/tmp/tmux-1000/default", "pane": 17})
+                }
+                "none" => Value::Null,
+                sid => panic!("unexpected session {sid}"),
+            }
+        );
+    }
+    let id = |sid: &str| {
+        observed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["sessionId"] == sid)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let info = web.req("GET", "/api/info").send().await.json();
+    assert_eq!(info["attach"], true);
+    assert!(info.get("attachCommand").is_none());
+    assert!(!info.to_string().contains(COMMAND));
+    let mut ws = web.ws("/pty").await;
+    for (sid, address) in [
+        ("claude", "devbox:claude:deadbeef"),
+        ("tmux", "devbox:tmux:17:/tmp/tmux-1000/default"),
+    ] {
+        send_json(
+            &mut ws,
+            json!({
+                "t": "open", "id": sid, "spawn": true, "attach": id(sid),
+                "shell": "not-the-default"
+            }),
+        )
+        .await;
+        assert_eq!(next_json(&mut ws).await["t"], "hello");
+        assert_eq!(
+            spawns(&hub).last().unwrap().as_ref().unwrap(),
+            &SpawnPty {
+                argv: vec![
+                    DEFAULT_SHELL.into(),
+                    "-c".into(),
+                    format!("{COMMAND} {address}")
+                ],
+                shell: None,
+                cwd: None,
+                cwd_from: None,
+                env: None,
+            }
+        );
+    }
+    // Null and malformed updates are sticky in both the API and the browser feed.
+    for attach in [
+        Value::Null,
+        json!({"kind": "claude", "id": "BAD"}),
+        json!({"kind": "claude", "id": "0123abcd"}),
+    ] {
+        let response = request("POST", "/v1/events")
+            .set("Content-Type", "application/json")
+            .body(
+                json!({
+                    "harness": "pi", "attach": attach,
+                    "payload": {"session_id": "claude", "kind": "note"}
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(response.status, 204);
+        let expected = if attach["id"] == "0123abcd" {
+            attach
+        } else {
+            json!({"kind": "claude", "id": "deadbeef"})
+        };
+        let current = request("GET", &format!("/v1/observed/{}", id("claude")))
+            .send()
+            .await
+            .json();
+        assert_eq!(current["attach"], expected);
+        loop {
+            let update = next_json(&mut rpc).await;
+            assert_eq!(update["t"], "observed_put");
+            if update["session"]["id"] == id("claude")
+                && update["session"]["counts"] == current["counts"]
+            {
+                assert_eq!(update["session"]["attach"], expected);
+                break;
+            }
+        }
+    }
+    let before = hub.requests().len();
+    for (attach, cmd, message) in [
+        (json!("o_missing"), None, "unknown observed session"),
+        (
+            json!(id("none")),
+            None,
+            "observed session has no terminal attachment",
+        ),
+        (json!(id("ended")), None, "observed session has ended"),
+        (
+            json!(id("claude")),
+            Some(json!("echo unsafe")),
+            "attach and cmd are mutually exclusive",
+        ),
+        (
+            json!(id("claude")),
+            Some(json!("")),
+            "attach and cmd are mutually exclusive",
+        ),
+        (
+            json!(id("claude")),
+            Some(Value::Null),
+            "attach and cmd are mutually exclusive",
+        ),
+        (
+            json!({"kind": "claude", "id": "deadbeef"}),
+            None,
+            "bad attach id",
+        ),
+        (json!(""), None, "bad attach id"),
+        (Value::Null, None, "bad attach id"),
+    ] {
+        let mut frame = json!({
+            "t": "open", "id": "refused", "spawn": true, "attach": attach
+        });
+        if let Some(cmd) = cmd {
+            frame["cmd"] = cmd;
+        }
+        send_json(&mut ws, frame).await;
+        assert_eq!(
+            next_json(&mut ws).await,
+            json!({"t": "error", "error": message})
+        );
+    }
+    assert_eq!(
+        hub.requests().len(),
+        before,
+        "refusals do not detach or spawn"
+    );
+    // Reconnects ignore attach entirely and never spawn, even malformed or conflicting.
+    for spawn in [None, Some(json!(false)), Some(json!("true"))] {
+        let mut frame = json!({
+            "t": "open", "id": "reconnect", "attach": {"unsafe": true}, "cmd": "ignored"
+        });
+        if let Some(spawn) = spawn {
+            frame["spawn"] = spawn;
+        }
+        send_json(&mut ws, frame).await;
+        assert_eq!(next_json(&mut ws).await["t"], "hello");
+        assert_eq!(spawns(&hub).last(), Some(&None));
+    }
+    ws.close(None).await.unwrap();
+    rpc.close(None).await.unwrap();
+    assert!(
+        !hub.requests()
+            .iter()
+            .any(|(_, r)| matches!(r, HubRequest::PtyKill { .. }))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_attach_refuses_when_not_configured() {
+    let (hub, web) = up().await;
+    let mut ws = web.ws("/pty").await;
+    send_json(
+        &mut ws,
+        json!({
+            "t": "open", "id": "noattach", "spawn": true, "attach": "o_missing"
+        }),
+    )
+    .await;
+    assert_eq!(
+        next_json(&mut ws).await,
+        json!({
+            "t": "error", "error": "terminal attachment is not configured"
+        })
+    );
+    assert!(spawns(&hub).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

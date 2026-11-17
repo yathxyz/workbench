@@ -363,6 +363,7 @@ async fn the_api_surface_of_m0() {
         ("sample", json!(false)),
         ("notesExists", json!(false)),
         ("tmux", json!(false)),
+        ("attach", json!(false)),
         ("artifactOrigin", Value::Null),
         ("agents", json!([])),
     ] {

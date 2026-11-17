@@ -71,6 +71,7 @@ async fn info(State(app): State<AppState>) -> Json<Value> {
         "home": std::env::var("HOME").ok(),
         "edit": app.cfg.edit_socket.is_some(),
         "mesh": app.observed.is_some(),
+        "attach": app.cfg.attach_command.is_some(),
         "editUp": app.edit.as_ref().is_some_and(EditHandle::is_up),
         "sample": sample::enabled(&app).await,
         "models": edit.as_ref().map_or(json!({}), |s| match &s["models"] {
