@@ -251,6 +251,8 @@ in
         agentEnvName = [ "services.workbench.environment and agents" ];
         fixedName = [ "services.workbench.environment must not set" ];
         editWebRoot = [ "services.workbench.edit.webRoot is required" ];
+        hostName = [ "services.workbench.hosts: names" ];
+        hostArgv = [ "services.workbench.hosts.<name>" ];
       };
       got = lib.mapAttrs (_: failing) {
         valid = { };
@@ -266,6 +268,11 @@ in
         };
         fixedName.services.workbench.environment.SHELL = "/bin/sh";
         editWebRoot.services.workbench.edit.socket = "/run/edwind/edit.sock";
+        hostName.services.workbench.hosts."-laptop".argv = [ "/run/current-system/sw/bin/ssh" ];
+        hostArgv.services.workbench.hosts.laptop = {
+          argv = [ "ssh" ];
+          agents.claude.label = "Claude";
+        };
       };
       matches = lib.mapAttrs (
         case: prefixes:

@@ -96,9 +96,11 @@ fn decode(text: &str) -> Result<(Option<Value>, Browser), Option<Value>> {
 /// a reconnect sends neither and must never start an agent.
 fn spawn(agent: Option<String>, cwd: Option<String>) -> Option<SpawnAcp> {
     match (agent, cwd) {
-        (Some(agent), Some(cwd)) if !agent.is_empty() && !cwd.is_empty() => {
-            Some(SpawnAcp { agent, cwd })
-        }
+        (Some(agent), Some(cwd)) if !agent.is_empty() && !cwd.is_empty() => Some(SpawnAcp {
+            agent,
+            cwd,
+            host: None,
+        }),
         _ => None,
     }
 }
@@ -461,7 +463,8 @@ mod tests {
             spawn(s(Some("claude")), s(Some("/home/alice"))),
             Some(SpawnAcp {
                 agent: "claude".into(),
-                cwd: "/home/alice".into()
+                cwd: "/home/alice".into(),
+                host: None
             })
         );
     }

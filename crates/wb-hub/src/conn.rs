@@ -14,7 +14,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 use wb_proto::hub::{
-    Agent, ErrorCode, HubMessage, HubRequest, Kind, PROTO, Resume, SessionsReply, SpawnAcp,
+    Agent, ErrorCode, Host, HubMessage, HubRequest, Kind, PROTO, Resume, SessionsReply, SpawnAcp,
     SpawnPty,
 };
 use wb_proto::limits::{CAPTURE_MAX, HELLO_TIMEOUT, MAX_LINE, PTY_INPUT_FRAME, REQS_IN_FLIGHT};
@@ -177,6 +177,22 @@ fn hello(ctx: &Ctx) -> HubMessage {
             .collect(),
         shells: ctx.cfg.available_shells(),
         default_shell: ctx.cfg.default_shell.clone(),
+        hosts: ctx
+            .cfg
+            .hosts
+            .iter()
+            .map(|(name, h)| Host {
+                name: name.clone(),
+                agents: h
+                    .agents
+                    .iter()
+                    .map(|(name, a)| Agent {
+                        name: name.clone(),
+                        label: a.label.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 

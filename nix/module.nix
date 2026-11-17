@@ -57,8 +57,9 @@ let
     "TERM"
     "COLORTERM"
   ];
-  # wb-hub's rules for shell and agent names and for variable names.
+  # wb-hub's rules for shell, agent and host names and for variable names.
   isName = n: builtins.match "[a-z0-9-]{1,32}" n != null;
+  isHostName = n: builtins.match "[A-Za-z0-9][A-Za-z0-9._-]*" n != null;
   isEnvName = n: builtins.match "[A-Za-z_][A-Za-z0-9_]{0,63}" n != null;
 
   # Set on the hub unit by value and copied into every child (child.passEnv).
@@ -71,25 +72,34 @@ let
 
   allShellPaths = lib.concatMap (s: s.paths) (lib.attrValues cfg.shells);
 
-  hubJson = json.generate "workbench-hub.json" {
-    socket = "/run/workbench-hub/hub.sock";
-    stateDir = "${home}/.local/state/workbench/hub";
-    host = cfg.host;
-    # Attribute set order, so alphabetical.
-    shells = lib.mapAttrsToList (name: s: {
-      inherit name;
-      inherit (s) paths args;
-    }) cfg.shells;
-    inherit (cfg) defaultShell;
-    child = {
-      passEnv = lib.attrNames hubEnv;
-      setEnv = childSetEnv;
-    };
-    agents = lib.mapAttrs (name: a: {
-      inherit (a) label env;
-      argv = [ (agentArgv0 name a) ] ++ a.args;
-    }) cfg.agents;
-  };
+  hubJson = json.generate "workbench-hub.json" (
+    {
+      socket = "/run/workbench-hub/hub.sock";
+      stateDir = "${home}/.local/state/workbench/hub";
+      host = cfg.host;
+      # Attribute set order, so alphabetical.
+      shells = lib.mapAttrsToList (name: s: {
+        inherit name;
+        inherit (s) paths args;
+      }) cfg.shells;
+      inherit (cfg) defaultShell;
+      child = {
+        passEnv = lib.attrNames hubEnv;
+        setEnv = childSetEnv;
+      };
+      agents = lib.mapAttrs (name: a: {
+        inherit (a) label env;
+        argv = [ (agentArgv0 name a) ] ++ a.args;
+      }) cfg.agents;
+    }
+    # Only when set, so that a hub without hosts keeps its config, and its sessions.
+    // lib.optionalAttrs (cfg.hosts != { }) {
+      hosts = lib.mapAttrs (_: h: {
+        inherit (h) argv;
+        agents = lib.mapAttrs (_: a: { inherit (a) label; }) h.agents;
+      }) cfg.hosts;
+    }
+  );
 
   webJson = json.generate "workbench-web.json" (
     {
@@ -366,6 +376,48 @@ in
       );
     };
 
+    hosts = mkOption {
+      default = { };
+      description = ''
+        Other hosts of the mesh whose agents cards can start, by name (a host name must
+        differ from host). For an agent A of host H, session S and directory C, the hub
+        runs argv followed by A, the lowercase hex of C and S, in its home directory, with
+        the child environment but none of agents.<name>.env. argv is typically ssh to the
+        host's launcher, which maps A to a command, changes to C, sets WB_SESSION=S and
+        runs it with its own standard input and output. Changing this restarts the hub.
+      '';
+      example = lib.literalExpression ''
+        {
+          laptop = {
+            argv = [ "/run/current-system/sw/bin/ssh" "-T" "-oBatchMode=yes" "alice@198.51.100.7" "workbench-agent" ];
+            agents.claude.label = "Claude";
+          };
+        }
+      '';
+      type = types.attrsOf (
+        types.submodule {
+          options = {
+            argv = mkOption {
+              type = types.nonEmptyListOf types.str;
+              description = "The command that reaches the host's launcher; argv[0] is an absolute stable path.";
+            };
+            agents = mkOption {
+              default = { };
+              description = "The agents the host's launcher knows, by name.";
+              type = types.attrsOf (
+                types.submodule {
+                  options.label = mkOption {
+                    type = types.str;
+                    description = "Name shown in the UI.";
+                  };
+                }
+              );
+            };
+          };
+        }
+      );
+    };
+
     logLevel = mkOption {
       type = types.str;
       default = "info";
@@ -459,6 +511,16 @@ in
       {
         assertion = lib.all isName (lib.attrNames cfg.agents);
         message = "services.workbench.agents: names must match ^[a-z0-9-]{1,32}$.";
+      }
+      {
+        assertion = lib.all (n: isHostName n && n != cfg.host) (lib.attrNames cfg.hosts);
+        message = "services.workbench.hosts: names must match ^[A-Za-z0-9][A-Za-z0-9._-]*$ and differ from host.";
+      }
+      {
+        assertion = lib.all (
+          h: lib.hasPrefix "/" (lib.head h.argv) && lib.all isName (lib.attrNames h.agents)
+        ) (lib.attrValues cfg.hosts);
+        message = "services.workbench.hosts.<name>: argv[0] must be absolute and agent names must match ^[a-z0-9-]{1,32}$.";
       }
       {
         assertion = lib.all isName (lib.attrNames cfg.shells);

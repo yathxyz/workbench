@@ -4,6 +4,8 @@
 
 mod common;
 
+use std::fs;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -1917,4 +1919,220 @@ fn hub_builds_the_agent_environment_from_scratch() {
     for canary in common::CANARIES {
         assert!(!names.contains(&canary), "{canary} reached the agent");
     }
+}
+
+// ---- agents on another host (DESIGN §3.8.5) ----
+
+/// The launcher of host `laptop`: it notes its directory, its argument count and its
+/// arguments in `launches`, leaves a `sleep` in its process group (noted in
+/// `sleepers`), knows only the agent `stub`, changes to the decoded cwd, sets
+/// `WB_SESSION` and becomes `wb-fake-acp` in keyword mode, recording to `remote.rec`.
+const LAUNCHER: &str = r#"here=${0%/*}
+printf '%s %s %s\n' "$PWD" "$#" "$*" >> "$here/launches"
+sleep 600 </dev/null >/dev/null 2>&1 &
+echo $! >> "$here/sleepers"
+[ "$1" = stub ] || { echo "no agent $1" >&2; exit 1; }
+hex=$2 path=
+while [ -n "$hex" ]; do path+="\\x${hex:0:2}"; hex=${hex:2}; done
+printf -v cwd "$path"
+cd "$cwd" || exit 1
+export WB_SESSION=$3
+exec "$FAKE" --record "$here/remote.rec"
+"#;
+
+/// A hub with the `basic` scenario as a local agent and host `laptop`, whose launcher
+/// is [`LAUNCHER`] run by bash.
+fn hub_with_laptop() -> Hub {
+    Hub::with_scenarios_and(&["basic"], |config| {
+        let state = PathBuf::from(config["stateDir"].as_str().unwrap());
+        let dir = state.parent().unwrap();
+        let script = dir.join("launch.sh");
+        let fake = env!("CARGO_BIN_EXE_wb-fake-acp");
+        fs::write(&script, format!("FAKE={fake}\n{LAUNCHER}")).unwrap();
+        let bash = config["shells"][0]["paths"][0].clone();
+        config["hosts"] = json!({"laptop": {
+            "argv": [bash, script],
+            "agents": {"stub": {"label": "Remote stub"}}
+        }});
+    })
+}
+
+fn hex(s: &str) -> String {
+    s.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Each launch: the launcher's directory, its argument count and its arguments.
+fn launches(hub: &Hub) -> Vec<(String, String, Vec<String>)> {
+    fs::read_to_string(hub.dir.join("launches"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            let mut words = l.split(' ');
+            let pwd = words.next().unwrap().to_owned();
+            let count = words.next().unwrap().to_owned();
+            (pwd, count, words.map(str::to_owned).collect())
+        })
+        .collect()
+}
+
+fn remote_spawn(c: &mut Client, sid: &str, agent: &str, cwd: &str, host: &str) -> Value {
+    c.request(json!({"t": "acp.open", "sid": sid, "since": 0,
+                     "spawn": {"agent": agent, "cwd": cwd, "host": host}}))
+}
+
+fn last_sleeper(hub: &Hub) -> u32 {
+    let text = fs::read_to_string(hub.dir.join("sleepers")).unwrap();
+    text.lines().last().unwrap().parse().unwrap()
+}
+
+#[test]
+fn hub_starts_an_agent_on_another_host_through_its_launcher() {
+    let mut hub = hub_with_laptop();
+    let mut c = hub.connect();
+    assert_eq!(c.hello["host"], "example");
+    assert_eq!(
+        c.hello["hosts"],
+        json!([{"name": "laptop", "agents": [{"name": "stub", "label": "Remote stub"}]}])
+    );
+    let cwd = hub.dir.join("work dir").join("ü;$(x)");
+    fs::create_dir_all(&cwd).unwrap();
+    let cwd = cwd.to_str().unwrap().to_owned();
+
+    let open = remote_spawn(&mut c, "r1", "stub", &cwd, "laptop");
+    assert_eq!(open["t"], "ok", "{open}");
+    assert_eq!(open["new"], true);
+    assert_eq!(open["summary"]["host"], "laptop");
+    assert_eq!(open["summary"]["cwd"], cwd);
+    let evs = c.events_until("r1", "session");
+    let pid = agent_pid(&evs);
+
+    // Run in the hub's home with exactly the agent, the hex cwd and the sid.
+    let want = vec!["stub".to_owned(), hex(&cwd), "r1".to_owned()];
+    assert_eq!(launches(&hub), [(hub.home(), "3".to_owned(), want.clone())]);
+    let plain = |a: &String| {
+        a.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    assert!(want.iter().all(plain));
+    // The agent runs in the decoded cwd, with the launcher's WB_SESSION.
+    let agent_cwd = fs::read_link(format!("/proc/{pid}/cwd")).unwrap();
+    assert_eq!(agent_cwd.to_str().unwrap(), cwd);
+    let record = hub.record("remote");
+    let env = record.iter().find(|e| e["note"] == "env").unwrap();
+    assert_eq!(env["WB_SESSION"], "r1");
+    assert_eq!(env["SHELL"], hub.shell);
+    let names: Vec<&str> = env["names"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"WB_SET"), "{names:?}");
+    // `agents.<name>.env` is for local agents.
+    assert!(!names.contains(&"RUST_LOG"), "{names:?}");
+    for canary in common::CANARIES {
+        assert!(!names.contains(&canary), "{canary} reached the launcher");
+    }
+    let new = hub.received_calls("remote", "session/new");
+    assert_eq!(new[0]["params"]["cwd"], cwd);
+    let meta: Value = serde_json::from_slice(&fs::read(hub.acp_file("r1.json")).unwrap()).unwrap();
+    assert_eq!(meta["host"], "laptop");
+    assert_eq!(c.summary("r1")["host"], "laptop");
+    assert_eq!(c.acp_prompt("r1", "hello there")["t"], "ok");
+    c.event("r1", "turn_end");
+    drop(c);
+
+    // The session remembers its host: a revive after a restart goes the same way.
+    hub.terminate();
+    hub.restart();
+    let mut c = hub.connect();
+    let s = c.summary("r1");
+    assert_eq!(s["host"], "laptop");
+    assert_eq!(s["alive"], false);
+    assert_eq!(c.acp_open("r1", 0)["t"], "ok");
+    c.replay("r1");
+    let evs = revive(&mut c, "r1");
+    assert_eq!(evs[0]["via"], "revive");
+    let pid = agent_pid(&evs);
+    let all = launches(&hub);
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert_eq!(all[1], (hub.home(), "3".to_owned(), want));
+    let resume = hub.received_calls("remote", "session/resume");
+    assert_eq!(resume.len(), 1);
+    assert_eq!(resume[0]["params"]["cwd"], cwd);
+
+    // A kill ends the launcher's process group, the sleep it left included.
+    let sleeper = last_sleeper(&hub);
+    assert!(running(sleeper));
+    c.ok(json!({"t": "acp.kill", "sid": "r1", "forget": false}));
+    c.summary_until("r1", "the agent exits", |s| s["alive"] == false);
+    eventually(PATIENCE, "the group is gone", || {
+        group_members(pid).is_empty()
+    });
+    assert!(!running(sleeper));
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+fn hub_refuses_remote_spawns_it_cannot_make_and_keeps_no_session() {
+    let hub = hub_with_laptop();
+    let mut c = hub.connect();
+    let home = hub.home();
+    let missing = hub.dir.join("not here").to_str().unwrap().to_owned();
+    let long = format!("/{}", "a".repeat(4096));
+    let refusals = [
+        ("stub", home.as_str(), "mars", "bad_request", "no host mars"),
+        (
+            "basic",
+            &home,
+            "laptop",
+            "unknown_agent",
+            "no agent basic on laptop",
+        ),
+        ("stub", "relative", "laptop", "bad_request", "cwd"),
+        ("stub", "/a\0b", "laptop", "bad_request", "cwd"),
+        ("stub", &long, "laptop", "bad_request", "cwd"),
+        // The hub's own host is local: its rules apply.
+        (
+            "stub",
+            &missing,
+            "example",
+            "bad_request",
+            "existing directory",
+        ),
+        ("stub", &missing, "", "bad_request", "no host "),
+    ];
+    for (agent, cwd, host, code, message) in refusals {
+        let err = remote_spawn(&mut c, "r1", agent, cwd, host);
+        assert_eq!(err["code"], code, "{host} {agent}: {err}");
+        let text = err["message"].as_str().unwrap();
+        assert!(text.contains(message), "{host} {agent}: {err}");
+        assert_eq!(c.ok(json!({"t": "list"}))["sessions"], json!([]));
+        assert!(!hub.acp_file("r1.json").exists());
+    }
+    assert!(launches(&hub).is_empty());
+    // A local spawn refuses the missing cwd too.
+    let err = c.request(json!({"t": "acp.open", "sid": "r1", "since": 0,
+                               "spawn": {"agent": "stub", "cwd": missing}}));
+    assert_eq!(err["code"], "bad_request", "{err}");
+
+    // On another host the cwd is not looked up here.
+    let open = remote_spawn(&mut c, "r1", "stub", &missing, "laptop");
+    assert_eq!(open["t"], "ok", "{open}");
+    assert_eq!(open["summary"]["host"], "laptop");
+    c.event("r1", "exit");
+    let all = launches(&hub);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].2[1], hex(&missing));
+
+    // `host` naming the hub's own host is a local spawn and is recorded as one.
+    let open = remote_spawn(&mut c, "a1", "stub", &home, "example");
+    assert_eq!(open["t"], "ok", "{open}");
+    assert_eq!(open["summary"]["host"], "example");
+    c.events_until("a1", "session");
+    let meta: Value = serde_json::from_slice(&fs::read(hub.acp_file("a1.json")).unwrap()).unwrap();
+    assert!(meta.get("host").is_none(), "{meta}");
+    assert_eq!(launches(&hub).len(), 1);
+    assert_eq!(hub.received_calls("stub", "session/new").len(), 1);
 }

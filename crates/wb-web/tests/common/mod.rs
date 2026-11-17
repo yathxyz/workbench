@@ -531,7 +531,7 @@ pub fn spawned() -> PtyOpenReply {
 }
 
 enum Inject {
-    Line(HubMessage),
+    Line(Box<HubMessage>),
     Close,
 }
 
@@ -653,7 +653,7 @@ impl FakeHub {
 
     pub fn send(&self, conn: usize, msg: HubMessage) {
         self.conns.lock().unwrap()[conn]
-            .send(Inject::Line(msg))
+            .send(Inject::Line(Box::new(msg)))
             .unwrap();
     }
 
@@ -714,6 +714,7 @@ async fn serve(
         agents: hello.agents,
         shells: hello.shells,
         default_shell: hello.default_shell,
+        hosts: Vec::new(),
     };
     if tx.write_all(&line::encode(&hello)).await.is_err() {
         return;
@@ -765,7 +766,7 @@ async fn serve(
                 }
             }
             msg = inject.recv() => match msg {
-                Some(Inject::Line(msg)) => msg,
+                Some(Inject::Line(msg)) => *msg,
                 Some(Inject::Close) | None => return,
             },
         };

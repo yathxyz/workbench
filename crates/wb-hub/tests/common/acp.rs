@@ -26,11 +26,17 @@ pub fn stub(config: &mut Value, name: &str, args: &[&str]) {
 impl Hub {
     /// A hub with one agent per scenario, named after it, plus `stub` in keyword mode.
     pub fn with_scenarios(names: &[&str]) -> Hub {
+        Hub::with_scenarios_and(names, |_| {})
+    }
+
+    /// [`with_scenarios`](Self::with_scenarios), with `hub.json` then changed by `edit`.
+    pub fn with_scenarios_and(names: &[&str], edit: impl FnOnce(&mut Value)) -> Hub {
         Hub::start_with(|config| {
             stub(config, "stub", &[]);
             for name in names {
                 stub(config, name, &["--scenario", name]);
             }
+            edit(config);
         })
     }
 

@@ -38,6 +38,9 @@ pub struct Config {
     pub child: ChildConfig,
     #[serde(default)]
     pub agents: BTreeMap<String, AgentConfig>,
+    /// Other hosts of the mesh whose agents the hub can start (DESIGN §3.8.5).
+    #[serde(default)]
+    pub hosts: BTreeMap<String, HostConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +81,21 @@ pub struct AgentConfig {
     pub argv: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+}
+
+/// Another host: the command that reaches its launcher, and the agents it knows.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostConfig {
+    /// Run with the agent, the hex of the cwd and the sid appended.
+    pub argv: Vec<String>,
+    pub agents: BTreeMap<String, HostAgentConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostAgentConfig {
+    pub label: String,
 }
 
 fn default_socket() -> PathBuf {
@@ -158,6 +176,23 @@ impl Config {
                 bail!("agents.{name}.argv[0] must be an absolute path");
             }
         }
+        for (name, host) in &self.hosts {
+            if !valid_host_name(name) {
+                bail!("host name {name:?} must match ^[A-Za-z0-9][A-Za-z0-9._-]*$");
+            }
+            if *name == self.host {
+                bail!("hosts.{name} is this hub's own host");
+            }
+            if !host.argv.first().is_some_and(|a| absolute(a)) {
+                bail!("hosts.{name}.argv[0] must be an absolute path");
+            }
+            if host.argv.iter().any(|a| a.contains('\0')) {
+                bail!("hosts.{name}.argv must not contain NUL");
+            }
+            if let Some(agent) = host.agents.keys().find(|a| !valid_name(a)) {
+                bail!("hosts.{name}.agents: name {agent:?} must match ^[a-z0-9-]{{1,32}}$");
+            }
+        }
         Ok(())
     }
 }
@@ -172,6 +207,16 @@ fn valid_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Host names: `^[A-Za-z0-9][A-Za-z0-9._-]*$`.
+fn valid_host_name(name: &str) -> bool {
+    name.bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphanumeric())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 #[cfg(test)]
@@ -245,6 +290,73 @@ mod tests {
         assert_eq!(cfg.socket, Path::new("/run/workbench-hub/hub.sock"));
         assert!(cfg.child.pass_env.is_empty() && cfg.child.set_env.is_empty());
         assert!(cfg.agents.is_empty());
+        assert!(cfg.hosts.is_empty());
+    }
+
+    /// The example of DESIGN §3.8.5 under `hosts`.
+    fn with_host(edit: impl FnOnce(&mut serde_json::Value)) -> anyhow::Result<Config> {
+        with(|v| {
+            v["hosts"] = serde_json::json!({"laptop": {
+                "argv": ["/run/current-system/sw/bin/ssh", "-T", "-oBatchMode=yes",
+                         "alice@198.51.100.7", "workbench-agent"],
+                "agents": {"claude": {"label": "Claude"}, "pi": {"label": "pi"}}
+            }});
+            edit(v);
+        })
+    }
+
+    #[test]
+    fn the_hosts_example_parses() {
+        let cfg = with_host(|_| {}).unwrap();
+        let laptop = &cfg.hosts["laptop"];
+        assert_eq!(laptop.argv[0], "/run/current-system/sw/bin/ssh");
+        assert_eq!(laptop.argv.len(), 5);
+        assert_eq!(laptop.agents["pi"].label, "pi");
+        assert_eq!(laptop.agents.len(), 2);
+    }
+
+    #[test]
+    fn hosts_refuse_unknown_fields() {
+        assert!(with_host(|v| v["hosts"]["laptop"]["env"] = serde_json::json!({})).is_err());
+        assert!(with_host(|v| v["hosts"]["laptop"]["agents"]["pi"]["argv"] = "/x".into()).is_err());
+        assert!(
+            with_host(|v| v["hosts"]["laptop"]["agents"]["pi"] = v["agents"]["claude"].clone())
+                .is_err()
+        );
+        assert!(with_host(|v| v["hosts"]["laptop"]["agents"] = serde_json::Value::Null).is_err());
+    }
+
+    #[test]
+    fn host_validation_rejects_bad_values() {
+        let rename = |name: &str| {
+            with_host(|v| {
+                let host = v["hosts"]["laptop"].take();
+                v["hosts"] = serde_json::json!({ name: host });
+            })
+        };
+        for ok in ["laptop", "Laptop-2", "a", "9", "box.lan", "a_b"] {
+            assert!(rename(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "", ".laptop", "-x", "_x", "lap top", "lap/top", "läp", "a\0b",
+        ] {
+            assert!(rename(bad).is_err(), "{bad:?}");
+        }
+        let own = rename("example");
+        assert!(own.is_err_and(|e| e.to_string().contains("own host")));
+        let argv = |argv: serde_json::Value| with_host(|v| v["hosts"]["laptop"]["argv"] = argv);
+        assert!(argv(serde_json::json!([])).is_err());
+        assert!(argv(serde_json::json!(["ssh", "laptop"])).is_err());
+        assert!(argv(serde_json::json!(["/bin/ssh\0", "laptop"])).is_err());
+        assert!(argv(serde_json::json!(["/bin/ssh", "lap\0top"])).is_err());
+        assert!(argv(serde_json::json!(["/bin/ssh"])).is_ok());
+        let agent = |name: &str| {
+            with_host(|v| v["hosts"]["laptop"]["agents"][name] = serde_json::json!({"label": "x"}))
+        };
+        for bad in ["Pi", "p_i", "", &"a".repeat(33)] {
+            assert!(agent(bad).is_err(), "{bad:?}");
+        }
+        assert!(agent(&"a".repeat(32)).is_ok());
     }
 
     #[test]

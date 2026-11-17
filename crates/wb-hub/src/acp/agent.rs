@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -20,7 +21,7 @@ use tokio::task::JoinHandle;
 use wb_proto::limits::{MAX_LINE, PROMPT_MAX};
 
 use super::lines::{Read, read_line_capped};
-use crate::config::{AgentConfig, ChildConfig};
+use crate::config::{ChildConfig, HostConfig};
 use crate::env::Identity;
 use crate::pty::spawn::spawn_agent;
 use crate::{Ctx, lock};
@@ -61,12 +62,14 @@ impl Drop for Agent {
     }
 }
 
-/// Starts the agent of `sid` in `cwd` with the environment of DESIGN §3.7.3; its stderr
-/// goes to `log`. An error is the `setup_error{spawn_failed}` message.
+/// Starts `argv` as the agent of `sid` in `cwd` with the environment of DESIGN §3.7.3,
+/// `env` being the agent's own; its stderr goes to `log`. An error is the
+/// `setup_error{spawn_failed}` message.
 pub fn start(
     ctx: &Ctx,
     sid: &str,
-    agent: &AgentConfig,
+    argv: &[String],
+    env: &BTreeMap<String, String>,
     cwd: &str,
     log: PathBuf,
 ) -> Result<Agent, String> {
@@ -76,10 +79,10 @@ pub fn start(
         .shell("bash")
         .and_then(|s| s.resolve())
         .ok_or("shell bash not available for the agent's SHELL")?;
-    let env = agent_env(&ctx.cfg.child, &agent.env, bash, &ctx.ident, sid, |n| {
+    let env = agent_env(&ctx.cfg.child, env, bash, &ctx.ident, sid, |n| {
         std::env::var_os(n)
     });
-    let (program, args) = agent.argv.split_first().ok_or("empty argv")?;
+    let (program, args) = argv.split_first().ok_or("empty argv")?;
     let mut child = spawn_agent(Path::new(program), args, &env, cwd, ctx.child_umask)
         .map_err(|e| format!("spawn failed: {e}"))?;
     let pid = child.id().ok_or("the agent was reaped at once")?;
@@ -105,6 +108,24 @@ pub fn start(
         log,
         tasks,
     })
+}
+
+/// The command that starts agent `agent` of another host for session `sid` in `cwd`:
+/// the host's `argv`, then the agent, the lowercase hex of `cwd` and the sid
+/// (DESIGN §3.8.5).
+pub fn remote_argv(host: &HostConfig, agent: &str, cwd: &str, sid: &str) -> Vec<String> {
+    let mut argv = host.argv.clone();
+    argv.extend([agent.to_owned(), hex(cwd.as_bytes()), sid.to_owned()]);
+    argv
+}
+
+/// Lowercase hex, two digits per byte.
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// The environment of an agent: `passEnv`, then `setEnv`, then the agent's own `env`,
@@ -364,6 +385,36 @@ mod tests {
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .collect();
         assert_eq!(env, want);
+    }
+
+    #[test]
+    fn hex_is_lowercase_two_digits_per_byte() {
+        assert_eq!(hex(b""), "");
+        assert_eq!(hex(b"/a b\n\x00\xff"), "2f6120620a00ff");
+        assert_eq!(hex("/ä".as_bytes()), "2fc3a4");
+    }
+
+    #[test]
+    fn remote_argv_appends_three_plain_words() {
+        let host = HostConfig {
+            argv: vec!["/bin/ssh".into(), "-T".into(), "laptop".into()],
+            agents: BTreeMap::new(),
+        };
+        let cwd = "/home/alice/my proj/$(rm -rf ~);'x'\nü";
+        let argv = remote_argv(&host, "claude-2", cwd, "n_k3m-9");
+        assert_eq!(argv[..3], ["/bin/ssh", "-T", "laptop"]);
+        assert_eq!(argv[3], "claude-2");
+        assert_eq!(argv[5], "n_k3m-9");
+        assert_eq!(argv.len(), 6);
+        let decoded: Vec<u8> = (0..argv[4].len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&argv[4][i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(decoded, cwd.as_bytes());
+        for arg in &argv[3..] {
+            let plain = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+            assert!(!arg.is_empty() && arg.bytes().all(plain), "{arg:?}");
+        }
     }
 
     #[test]

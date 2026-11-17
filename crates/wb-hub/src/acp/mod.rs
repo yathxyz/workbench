@@ -50,6 +50,9 @@ use crate::registry::Route;
 use crate::store::write_atomic;
 use crate::{Ctx, lock, now_ms};
 
+/// Longest `cwd` of a spawn on another host, in bytes.
+const REMOTE_CWD_MAX: usize = 4096;
+
 /// How long `session/set_mode` may take.
 const SET_MODE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Teardown stages of a kill (DESIGN §3.4.5): `session/close`, closed stdin, SIGTERM.
@@ -227,6 +230,9 @@ struct Meta {
     sid: String,
     agent: String,
     cwd: String,
+    /// The other host the agent runs on; absent for a local agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
     created_at: u64,
     agent_session_id: Option<String>,
     /// The last `initialize` result, verbatim.
@@ -804,18 +810,26 @@ impl Acp {
             let msg = format!("no session {}", self.sid);
             return self.abandon(o.reply, ErrorCode::NotFound, msg);
         };
-        if !self.ctx.cfg.agents.contains_key(&spawn.agent) {
-            let msg = format!("no agent {}", spawn.agent);
-            return self.abandon(o.reply, ErrorCode::UnknownAgent, msg);
-        }
-        if !spawn.cwd.starts_with('/') || !Path::new(&spawn.cwd).is_dir() {
-            let msg = "cwd must be an absolute path of an existing directory".to_owned();
-            return self.abandon(o.reply, ErrorCode::BadRequest, msg);
+        let host = spawn.host.filter(|h| *h != self.ctx.cfg.host);
+        if let Some(host) = &host {
+            if let Err((code, msg)) = self.check_remote(host, &spawn.agent, &spawn.cwd) {
+                return self.abandon(o.reply, code, msg);
+            }
+        } else {
+            if !self.ctx.cfg.agents.contains_key(&spawn.agent) {
+                let msg = format!("no agent {}", spawn.agent);
+                return self.abandon(o.reply, ErrorCode::UnknownAgent, msg);
+            }
+            if !spawn.cwd.starts_with('/') || !Path::new(&spawn.cwd).is_dir() {
+                let msg = "cwd must be an absolute path of an existing directory".to_owned();
+                return self.abandon(o.reply, ErrorCode::BadRequest, msg);
+            }
         }
         self.meta = Meta {
             sid: self.sid.clone(),
             agent: spawn.agent,
             cwd: spawn.cwd,
+            host,
             created_at: self.created_at,
             ..Meta::default()
         };
@@ -846,6 +860,24 @@ impl Acp {
         self.open(o, true);
     }
 
+    /// Checks a spawn on another host (DESIGN §3.8.5); the cwd is not looked up here.
+    fn check_remote(&self, host: &str, agent: &str, cwd: &str) -> Result<(), (ErrorCode, String)> {
+        let Some(cfg) = self.ctx.cfg.hosts.get(host) else {
+            return Err((ErrorCode::BadRequest, format!("no host {host}")));
+        };
+        if !cfg.agents.contains_key(agent) {
+            return Err((
+                ErrorCode::UnknownAgent,
+                format!("no agent {agent} on {host}"),
+            ));
+        }
+        if !cwd.starts_with('/') || cwd.contains('\0') || cwd.len() > REMOTE_CWD_MAX {
+            let msg = format!("cwd must be an absolute path of at most {REMOTE_CWD_MAX} bytes");
+            return Err((ErrorCode::BadRequest, msg));
+        }
+        Ok(())
+    }
+
     /// Answers the open that would have created this session and removes it again.
     fn abandon(&mut self, reply: Reply, code: ErrorCode, message: String) {
         reply.err(code, message);
@@ -857,18 +889,24 @@ impl Acp {
     /// Starts the agent and sends `initialize`. A failure is journaled as
     /// `setup_error{spawn_failed}` with no `spawn` (DESIGN §3.4.4) and returned.
     fn spawn(&mut self, via: SpawnVia) -> Result<(), String> {
-        let started = match self.ctx.cfg.agents.get(&self.meta.agent) {
-            Some(cfg) => agent::start(
-                &self.ctx,
-                &self.sid,
-                cfg,
-                &self.meta.cwd,
-                self.path("stderr.log"),
-            ),
-            None => Err(format!(
-                "agent {} is not in the hub's table",
-                self.meta.agent
-            )),
+        let (sid, meta, log) = (&self.sid, &self.meta, self.path("stderr.log"));
+        let started = match &meta.host {
+            None => match self.ctx.cfg.agents.get(&meta.agent) {
+                Some(cfg) => agent::start(&self.ctx, sid, &cfg.argv, &cfg.env, &meta.cwd, log),
+                None => Err(format!("agent {} is not in the hub's table", meta.agent)),
+            },
+            Some(host) => match self.ctx.cfg.hosts.get(host) {
+                Some(cfg) if cfg.agents.contains_key(&meta.agent) => {
+                    let argv = agent::remote_argv(cfg, &meta.agent, &meta.cwd, sid);
+                    let home = &self.ctx.ident.home;
+                    agent::start(&self.ctx, sid, &argv, &BTreeMap::new(), home, log)
+                }
+                Some(_) => Err(format!(
+                    "agent {} is not in the table of {host}",
+                    meta.agent
+                )),
+                None => Err(format!("host {host} is not in the hub's table")),
+            },
         };
         let agent = match started {
             Ok(agent) => agent,
@@ -1074,7 +1112,12 @@ impl Acp {
         let summary = Summary {
             sid: self.sid.clone(),
             kind: Kind::Acp,
-            host: self.ctx.cfg.host.clone(),
+            host: self
+                .meta
+                .host
+                .as_ref()
+                .unwrap_or(&self.ctx.cfg.host)
+                .clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
             alive: self.proc.is_some(),
@@ -2420,6 +2463,7 @@ mod tests {
             sid: "n_1".into(),
             agent: "stub".into(),
             cwd: "/home/alice".into(),
+            host: None,
             created_at: 7,
             agent_session_id: Some("s-1".into()),
             init: Some(json!({"protocolVersion": 1})),
@@ -2432,5 +2476,13 @@ mod tests {
                    "agentSessionId": "s-1", "init": {"protocolVersion": 1}, "seenSeq": 3})
         );
         assert_eq!(serde_json::from_value::<Meta>(v).unwrap(), meta);
+
+        let remote = Meta {
+            host: Some("laptop".into()),
+            ..meta
+        };
+        let v = serde_json::to_value(&remote).unwrap();
+        assert_eq!(v["host"], "laptop");
+        assert_eq!(serde_json::from_value::<Meta>(v).unwrap(), remote);
     }
 }

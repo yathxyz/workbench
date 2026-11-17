@@ -165,6 +165,10 @@ pub enum HubMessage {
         /// The shell a [`SpawnPty`] without `shell` gets. Empty from an older hub.
         #[serde(default)]
         default_shell: String,
+        /// The other hosts the hub can start agents on, by name. Empty from an older
+        /// hub.
+        #[serde(default)]
+        hosts: Vec<Host>,
     },
     /// Success reply to the request with this `rid`; `result` holds the reply fields.
     #[serde(rename = "ok")]
@@ -297,6 +301,13 @@ pub struct Agent {
     pub label: String,
 }
 
+/// Another host of the mesh and the agents its launcher knows, as listed in the hello.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Host {
+    pub name: String,
+    pub agents: Vec<Agent>,
+}
+
 /// How to start a PTY child.
 ///
 /// The program is always one of the hub's configured shells, never a path the client
@@ -331,10 +342,14 @@ pub struct SpawnPty {
 /// How to start an ACP agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnAcp {
-    /// A name from the hub's agent table.
+    /// A name from the agent table of the hub, or of `host` when that is another host.
     pub agent: String,
-    /// Absolute path of an existing directory.
+    /// Absolute path of an existing directory. On another host, an absolute path
+    /// without NUL of at most 4096 bytes, not looked up on the hub's host.
     pub cwd: String,
+    /// A name from the hello's `hosts`. Absent, or the hub's own `host`, means local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 /// Where a viewer's terminal stopped: honoured if `stream` matches and the ring still

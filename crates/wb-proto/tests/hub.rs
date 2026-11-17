@@ -91,7 +91,8 @@ fn server_hello() {
         "t": "hello", "proto": 1, "server": "wb-hub", "version": "0.1.0",
         "build": "0123abcd", "host": "example", "pid": 1234, "startedAt": 1791460000000u64,
         "agents": [{"name": "claude", "label": "Claude"}, {"name": "codex", "label": "Codex"}],
-        "shells": ["bash", "nu", "zsh"], "defaultShell": "bash"
+        "shells": ["bash", "nu", "zsh"], "defaultShell": "bash",
+        "hosts": [{"name": "laptop", "agents": [{"name": "pi", "label": "pi"}]}]
     }));
     let HubMessage::Hello {
         proto,
@@ -100,6 +101,7 @@ fn server_hello() {
         agents,
         shells,
         default_shell,
+        hosts,
         ..
     } = msg
     else {
@@ -111,6 +113,16 @@ fn server_hello() {
     assert_eq!(agents[1].label, "Codex");
     assert_eq!(shells, ["bash", "nu", "zsh"]);
     assert_eq!(default_shell, "bash");
+    assert_eq!(
+        hosts,
+        [Host {
+            name: "laptop".into(),
+            agents: vec![Agent {
+                name: "pi".into(),
+                label: "pi".into()
+            }]
+        }]
+    );
 }
 
 #[test]
@@ -118,13 +130,13 @@ fn server_hello_without_build() {
     let msg: HubMessage = round_trip(json!({
         "t": "hello", "proto": 1, "server": "wb-hub", "version": "0.1.0",
         "host": "example", "pid": 1234, "startedAt": 1791460000000u64, "agents": [],
-        "shells": [], "defaultShell": "bash"
+        "shells": [], "defaultShell": "bash", "hosts": []
     }));
     assert!(matches!(msg, HubMessage::Hello { build: None, .. }));
 }
 
 #[test]
-fn server_hello_from_an_older_hub_without_shells() {
+fn server_hello_from_an_older_hub_without_shells_or_hosts() {
     let msg: HubMessage = serde_json::from_str(
         r#"{"t":"hello","proto":1,"server":"wb-hub","version":"0.1.0","host":"example",
             "pid":1234,"startedAt":1791460000000,"agents":[]}"#,
@@ -133,6 +145,7 @@ fn server_hello_from_an_older_hub_without_shells() {
     let HubMessage::Hello {
         shells,
         default_shell,
+        hosts,
         ..
     } = &msg
     else {
@@ -140,10 +153,12 @@ fn server_hello_from_an_older_hub_without_shells() {
     };
     assert!(shells.is_empty());
     assert_eq!(default_shell, "");
-    // A newer hub always sends both fields.
+    assert!(hosts.is_empty());
+    // A newer hub always sends these fields.
     let back: Value = serde_json::from_slice(&line::encode(&msg)).unwrap();
     assert_eq!(back["shells"], json!([]));
     assert_eq!(back["defaultShell"], "");
+    assert_eq!(back["hosts"], json!([]));
 }
 
 #[test]
@@ -733,10 +748,23 @@ fn acp_open_requests() {
             epoch: None,
             spawn: Some(SpawnAcp {
                 agent: "claude".into(),
-                cwd: "/home/alice/proj/x".into()
+                cwd: "/home/alice/proj/x".into(),
+                host: None
             })
         }
     );
+
+    let req: HubRequest = round_trip(json!({
+        "t": "acp.open", "rid": 8, "sid": "n_agent1", "since": 0,
+        "spawn": {"agent": "pi", "cwd": "/home/alice/proj/x", "host": "laptop"}
+    }));
+    let HubRequest::AcpOpen {
+        spawn: Some(spawn), ..
+    } = req
+    else {
+        panic!("{req:?}")
+    };
+    assert_eq!(spawn.host.as_deref(), Some("laptop"));
 
     let req: HubRequest = round_trip(json!({
         "t": "acp.open", "rid": 9, "sid": "n_agent1", "since": 790,

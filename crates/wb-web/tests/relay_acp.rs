@@ -191,6 +191,7 @@ async fn spawn_fields_go_only_with_agent_and_cwd() {
             let spawn = (i == opens.len() - 1).then(|| SpawnAcp {
                 agent: "claude".into(),
                 cwd: "/home/alice".into(),
+                host: None,
             });
             // The id is sanitised to the sid alphabet; since and epoch pass through.
             (format!("a{i}x"), 5 + i as u64, Some(EPOCH), spawn)
