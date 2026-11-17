@@ -1022,3 +1022,103 @@ fn programs_validate_names_and_byte_bounds_before_compilation() {
     assert!(p.validate().is_ok());
     assert!(CompiledPolicy::new(&p, "/work/project").is_ok());
 }
+
+#[test]
+fn third_review_printf_formats_ask_with_and_without_programs() {
+    for programs in [
+        None,
+        Some(json!([
+            "cargo", "git", "ls", "cat", "grep", "head", "echo", "printf", "cd"
+        ])),
+    ] {
+        let mut rule = json!({"action":"allow", "kinds":["execute"], "roots":["$cwd", "/tmp"]});
+        if let Some(programs) = programs {
+            rule["programs"] = programs;
+        }
+        let p = CompiledPolicy::new(&policy(json!([rule])), "/var/tmp/project").unwrap();
+        let mut allowed = Vec::new();
+        for format in [
+            "%'n", "%#n", "%-5n", "%.3n", "%*n", "%ln", "%(s)T", "%", "%5%", "%*3d", "%1*d",
+            "%..d", "%1.2.3d", "%Q",
+        ] {
+            let command = format!("printf \"{format}\" CDPATH; cd x && cd ../../../../tmp");
+            if p.decide(&call("execute", &["."], &command), &options())
+                .is_some()
+            {
+                allowed.push(command);
+            }
+        }
+        assert!(allowed.is_empty(), "unintended allows: {allowed:?}");
+    }
+}
+
+#[test]
+fn quoted_assignment_names_and_equals_never_hide_the_command() {
+    for programs in [None, Some(json!(["cargo", "echo"]))] {
+        let mut rule = json!({"action":"allow", "roots":["$cwd", "/tmp"]});
+        if let Some(programs) = programs {
+            rule["programs"] = programs;
+        }
+        let p = compiled(json!([rule]));
+        let mut allowed = Vec::new();
+        for command in [
+            "'X=bin/cargo' echo",
+            "\"X\"=1 echo",
+            "X'='1 echo",
+            "X''=1 echo",
+            "X\"\"=1 echo",
+            "X=1 'Y=bin/cargo' echo",
+        ] {
+            if p.decide(&call("execute", &["."], command), &options())
+                .is_some()
+            {
+                allowed.push(command);
+            }
+        }
+        assert!(allowed.is_empty(), "unintended allows: {allowed:?}");
+        for command in [
+            "X='a b' echo ok",
+            "X=\"a\" cargo test",
+            "X='a=b' echo ok",
+            "X=\"\" Y='a b' echo ok",
+        ] {
+            assert!(
+                p.decide(&call("execute", &["."], command), &options())
+                    .is_some(),
+                "{command}"
+            );
+        }
+    }
+}
+
+#[test]
+fn known_printf_format_grammar_keeps_literal_and_printing_conversions() {
+    let p = compiled(json!([{"action":"allow", "roots":["$cwd"], "programs":["printf"]}]));
+    for conversion in "diouxXeEfFgGaAcsbq".chars() {
+        for specifier in [
+            format!("%{conversion}"),
+            format!("%-+#0'12.3{conversion}"),
+            format!("% *.*{conversion}"),
+            format!("%.0{conversion}"),
+        ] {
+            let command = format!("printf \"{specifier}\" 1 2 3");
+            assert!(
+                p.decide(&call("execute", &["."], &command), &options())
+                    .is_some(),
+                "{command}"
+            );
+        }
+    }
+    for command in [
+        "printf '%%n %s' hello",
+        "printf -- '%s' hello",
+        "printf 'plain text'",
+        "printf '%.s' hello",
+    ] {
+        assert!(
+            p.decide(&call("execute", &["."], command), &options())
+                .is_some(),
+            "{command}"
+        );
+    }
+}

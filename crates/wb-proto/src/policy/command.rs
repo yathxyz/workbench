@@ -32,15 +32,20 @@ enum Separator {
     Pipe,
 }
 
+struct Word<'a> {
+    text: Cow<'a, str>,
+    assignment: bool,
+}
+
 enum Token<'a> {
-    Word(Cow<'a, str>),
+    Word(Word<'a>),
     Redirect,
     Separator(Separator),
 }
 
 #[derive(Default)]
 struct Simple<'a> {
-    args: Vec<Cow<'a, str>>,
+    args: Vec<Word<'a>>,
     redirects: Vec<Cow<'a, str>>,
 }
 
@@ -180,6 +185,7 @@ pub(super) fn evidence<'a>(
                     return None;
                 }
                 for (i, word) in simple.args.into_iter().enumerate() {
+                    let word = word.text;
                     let executable = i == index && word.contains('/');
                     let next = paths.word(&word, &dirs, (cd && i == 1) || executable)?;
                     if cd && i == 1 {
@@ -229,13 +235,13 @@ fn assignment(word: &str) -> bool {
 fn classify(simple: &Simple<'_>) -> Option<(usize, bool)> {
     let mut index = 0;
     for word in &simple.args {
-        if !word.contains('=') {
+        if !word.text.contains('=') {
             break;
         }
-        if !assignment(word) {
+        if !word.assignment {
             return None;
         }
-        let (name, _) = word.split_once('=')?;
+        let (name, _) = word.text.split_once('=')?;
         if matches!(
             name,
             "CDPATH"
@@ -257,7 +263,7 @@ fn classify(simple: &Simple<'_>) -> Option<(usize, bool)> {
         }
         index += 1;
     }
-    let name = simple.args.get(index)?.as_ref();
+    let name = simple.args.get(index)?.text.as_ref();
     if name.is_empty() || name.contains(['*', '?', '[']) {
         return None;
     }
@@ -312,15 +318,15 @@ fn classify(simple: &Simple<'_>) -> Option<(usize, bool)> {
     if name == "printf" {
         printing_format(&simple.args[index + 1..])?;
     }
-    if name == "test" && simple.args[index + 1..].iter().any(|arg| arg == "-v") {
+    if name == "test" && simple.args[index + 1..].iter().any(|arg| arg.text == "-v") {
         return None;
     }
     if name == "cd" {
         if index != 0
             || simple.args.len() != 2
-            || simple.args[1].is_empty()
-            || simple.args[1].starts_with('-')
-            || simple.args[1].contains(['*', '?', '[', ']'])
+            || simple.args[1].text.is_empty()
+            || simple.args[1].text.starts_with('-')
+            || simple.args[1].text.contains(['*', '?', '[', ']'])
         {
             return None;
         }
@@ -329,20 +335,52 @@ fn classify(simple: &Simple<'_>) -> Option<(usize, bool)> {
     Some((index, false))
 }
 
-fn printing_format(args: &[Cow<'_, str>]) -> Option<()> {
-    let first = args.first()?;
+fn printing_format(args: &[Word<'_>]) -> Option<()> {
+    let first = args.first()?.text.as_ref();
     if first.starts_with("-v") {
         return None;
     }
-    let format = if first == "--" { args.get(1)? } else { first };
-    let mut bytes = format.bytes();
+    let format = if first == "--" {
+        args.get(1)?.text.as_ref()
+    } else {
+        first
+    };
+    let mut bytes = format.bytes().peekable();
     while let Some(ch) = bytes.next() {
-        if ch == b'%' {
-            let conversion = bytes
-                .find(|ch| !matches!(ch, b'#' | b'-' | b'+' | b' ' | b'0'..=b'9' | b'.' | b'*'))?;
-            if conversion == b'n' {
-                return None;
-            }
+        if ch != b'%' || bytes.next_if_eq(&b'%').is_some() {
+            continue;
+        }
+        while bytes
+            .next_if(|ch| matches!(ch, b'-' | b'+' | b' ' | b'#' | b'0' | b'\''))
+            .is_some()
+        {}
+        if bytes.next_if_eq(&b'*').is_none() {
+            while bytes.next_if(u8::is_ascii_digit).is_some() {}
+        }
+        if bytes.next_if_eq(&b'.').is_some() && bytes.next_if_eq(&b'*').is_none() {
+            while bytes.next_if(u8::is_ascii_digit).is_some() {}
+        }
+        if !matches!(
+            bytes.next()?,
+            b'd' | b'i'
+                | b'o'
+                | b'u'
+                | b'x'
+                | b'X'
+                | b'e'
+                | b'E'
+                | b'f'
+                | b'F'
+                | b'g'
+                | b'G'
+                | b'a'
+                | b'A'
+                | b'c'
+                | b's'
+                | b'b'
+                | b'q'
+        ) {
+            return None;
         }
     }
     Some(())
@@ -359,7 +397,7 @@ fn parse(command: &str) -> Option<Vec<Pipeline<'_>>> {
         match token {
             Token::Word(word) => simple.args.push(word),
             Token::Redirect => match tokens.next()? {
-                Token::Word(word) => simple.redirects.push(word),
+                Token::Word(word) => simple.redirects.push(word.text),
                 _ => return None,
             },
             Token::Separator(separator) => {
@@ -510,7 +548,12 @@ fn tokenize(command: &str) -> Option<Vec<Token<'_>>> {
                 {
                     return None;
                 }
-                tokens.push(Token::Word(word));
+                // Validate the source prefix: quotes before '=' disqualify assignments,
+                // while quoted values after an unquoted NAME= remain ordinary values.
+                tokens.push(Token::Word(Word {
+                    text: word,
+                    assignment: assignment(&command[start..i]),
+                }));
             }
         }
     }
