@@ -308,13 +308,11 @@ fn classify(simple: &Simple<'_>) -> Option<(usize, bool)> {
     ) {
         return None;
     }
-    // Bash printf -v defines shell variables, unlike the ordinary printf form.
-    if name == "printf"
-        && simple
-            .args
-            .get(index + 1)
-            .is_some_and(|arg| arg.starts_with("-v"))
-    {
+    // Bash's printing and variable-test extensions can mutate shell resolution state.
+    if name == "printf" {
+        printing_format(&simple.args[index + 1..])?;
+    }
+    if name == "test" && simple.args[index + 1..].iter().any(|arg| arg == "-v") {
         return None;
     }
     if name == "cd" {
@@ -329,6 +327,25 @@ fn classify(simple: &Simple<'_>) -> Option<(usize, bool)> {
         return Some((index, true));
     }
     Some((index, false))
+}
+
+fn printing_format(args: &[Cow<'_, str>]) -> Option<()> {
+    let first = args.first()?;
+    if first.starts_with("-v") {
+        return None;
+    }
+    let format = if first == "--" { args.get(1)? } else { first };
+    let mut bytes = format.bytes();
+    while let Some(ch) = bytes.next() {
+        if ch == b'%' {
+            let conversion = bytes
+                .find(|ch| !matches!(ch, b'#' | b'-' | b'+' | b' ' | b'0'..=b'9' | b'.' | b'*'))?;
+            if conversion == b'n' {
+                return None;
+            }
+        }
+    }
+    Some(())
 }
 
 fn parse(command: &str) -> Option<Vec<Pipeline<'_>>> {

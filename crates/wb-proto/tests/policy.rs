@@ -834,6 +834,10 @@ fn assignment_prefixes_cannot_hide_commands_or_change_shell_resolution() {
         "read CDPATH; cd x",
         "printf -v CDPATH /tmp; cd x",
         "printf -vCDPATH /tmp; cd x",
+        "printf '%n' CDPATH; cd x",
+        "printf -- '%03n' CDPATH; cd x",
+        "test -v 'BASH_VERSINFO[CDPATH=3]'; cd x",
+        "test ! -v 'BASH_VERSINFO[CDPATH=3]'; cd x",
         "enable -n cd; cd x",
     ] {
         assert_eq!(
@@ -846,6 +850,8 @@ fn assignment_prefixes_cannot_hide_commands_or_change_shell_resolution() {
         "_X1=y A= B=c=d cargo test",
         "echo hello",
         "printf '%s' hello",
+        "printf '%%n %03d %s' 1 hello",
+        "printf -- '%s' hello",
         "true",
         "false",
         "test -f ./file",
