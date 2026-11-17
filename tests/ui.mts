@@ -3929,6 +3929,7 @@ await section('N78', async () => {
 
     await section('N78 layout', async () => {
       const viewport = D.viewportSize()!, prompt = 'Long observed prompt '.repeat(100).slice(0, 2000);
+      await D.evaluate(() => { if (document.body.classList.contains('side-open')) window.__canvas.toggleDockTerm(); });   // measure Agents, not the dock's overlay
       const created = await meshApi('/sessions', 'POST', { sid: 'n78_layout_api', agent: 'stub', cwd });
       if (created.status !== 201) throw new Error('N78 layout ACP spawn: ' + created.status);
       await report('near', 'n78-layout', { wbSession: 'n78_layout_api' }, 'prompt', prompt);
