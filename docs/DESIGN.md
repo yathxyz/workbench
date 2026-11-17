@@ -141,7 +141,7 @@ flake.nix flake.lock   (inputs: nixpkgs, edwin = github:yathxyz/edwin)
 | Module | Contents |
 |---|---|
 | `line` | `encode<T: Serialize>(&T) -> Vec<u8>` (compact JSON + `\n`), `MAX_LINE`, blocking `read_line_capped` for the CLI |
-| `hub` | `HubRequest`, `HubMessage`, `SpawnPty`, `SpawnAcp`, `Resume`, `Summary`, `PtyFacts`, `AcpFacts`, `Fault`, `Exit`, `Pending`, `Last`, `AcpSessionInfo`, `PROTO` |
+| `hub` | `HubRequest`, `HubMessage`, `SpawnPty`, `SpawnAcp`, `ConfigValue`, `ConfigOption`, `ConfigError`, `AcpOpenReply`, `Resume`, `Summary`, `PtyFacts`, `AcpFacts`, `Fault`, `Exit`, `Pending`, `Last`, `AcpSessionInfo`, `PROTO` |
 | `journal` | `JournalEvent { seq, ts, body: EventBody }`, with `EventBody` tagged by `e` |
 | `state` | `enum State`, `pub fn derive(&Summary) -> State`, and the table tests that define it |
 | `websock` | `WbRequest`, `WbMessage` |
@@ -149,7 +149,7 @@ flake.nix flake.lock   (inputs: nixpkgs, edwin = github:yathxyz/edwin)
 
 **Serde rules (all wire types).**
 - `#[serde(tag = "t")]`, an explicit `rename` per variant, and `rename_all_fields = "camelCase"`.
-- Every receiving enum ends with `#[serde(other)] Unknown`.
+- Every tagged receiving enum ends with `#[serde(other)] Unknown`. `ConfigValue` is an untagged string-or-boolean enum.
 - **Never** `deny_unknown_fields` on wire types. Config structs may use it.
 - ACP payloads are carried as `serde_json::Value` and never re-shaped.
 
@@ -222,7 +222,7 @@ The error codes are a closed set:
 | `not_found` | sid unknown, or a `*.open` without spawn fields for an unknown sid |
 | `kind_mismatch` | sid exists with the other kind |
 | `not_alive` | needs a live process |
-| `busy` | an ACP turn is outstanding |
+| `busy` | an ACP turn or the session's initial configuration batch is outstanding |
 | `already_resolved` | permission or elicitation already answered |
 | `bad_option` | `optionId`, `modeId`, `methodId` or `configId` not offered, or a config value not offered for that option |
 | `not_revivable` | revive impossible |
@@ -302,7 +302,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `pty.resize` | `sid, cols, rows` | – | `TIOCSWINSZ` plus the VT resize (§3.4.3). Clamped to cols 2..=1000 and rows 1..=500. Last writer wins. |
 | `pty.kill` | `sid, forget` | `{}` | SIGHUP to every member of the PTY's session (/proc stat field 6), SIGKILL survivors after 3 s, close the master. **`forget:false`:** ok when the kill starts. **`forget:true`:** ok only after the exit, the file deletion and the registry removal. Every attached connection, and every watcher, gets `gone`. |
 | `pty.capture` | `sid, lines?` (default 200, max 1000) | `{text}` | plain text from the VT state, each row right-trimmed and blank rows after the last text left out; works on dead sessions |
-| `acp.open` | `sid, since, epoch?, spawn?: SpawnAcp` | `{new, summary, session, head, from, reset}` | then the replay as `acp.ev`, then `acp.replayed`, then live events. Rules below. |
+| `acp.open` | `sid, since, epoch?, spawn?: SpawnAcp` | `{new, summary, session, head, from, reset, configErrors?: ConfigError[]}` | then the replay as `acp.ev`, then `acp.replayed`, then live events. With a non-empty spawn config, the initiating reply waits for the hub-owned batch or its termination. Rules below. |
 | `acp.detach` | `sid` | `{}` | |
 | `acp.prompt` | `sid, prompt: ContentBlock[]` | `{}` once written | needs `alive` (`not_alive`), `activity=="none"` (`busy`) and no fault (`faulted`). Blocks non-empty, ≤ `PROMPT_MAX`. `image`, `audio` and `resource` need the matching `promptCapabilities`. Journals `prompt`, sets `seenSeq=headSeq`. |
 | `acp.cancel` | `sid` | `{}` | sends the `session/cancel` notification when a turn is running, answers every pending request with cancelled (`by:"cancel"`), sets `seenSeq=headSeq`. With no turn and nothing pending it only sets `seenSeq`. |
@@ -315,7 +315,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `acp.authenticate` | `sid, methodId` | `{}` after the agent answers | only during a failed setup, agent-handled methods only (`type:"terminal"` → `bad_option`) |
 | `acp.kill` | `sid, forget` | `{}` | teardown stages in §3.4.5. **`forget:false`:** ok when the kill starts; the session stays revivable. **`forget:true`:** ok only after exit, deletion of `acp/<sid>.*` and registry removal. `gone` goes to attached connections and watchers. |
 
-**Check order.** When a request fails several checks, the first in this list applies:
+**Check order.** While a non-empty initial configuration batch is active (including its preceding setup), `acp.prompt`, `acp.cancel`, `acp.set_mode`, `acp.set_config_option`, `acp.revive` and `acp.authenticate` fail with `busy` before their normal actor checks. They are rejected, never queued for a future turn. Permission and elicitation answers, `acp.seen` and `acp.kill` remain usable. Otherwise, when a request fails several checks, the first in this list applies:
 - `acp.prompt`: `faulted`, `not_alive`, `bad_request` (no ACP session yet), `busy`, then the content rules.
 - `acp.set_config_option`: `faulted`, `not_alive`, `bad_request` (no ACP session yet), `stale` (epoch differs from `createdAt`), then `bad_option` (unknown id, unsupported option type or wrong/unoffered value). Registry errors `not_found` and `kind_mismatch` apply before these actor checks.
 - `acp.permission`, `acp.elicitation`: `stale`; an unknown `req` is `bad_request` (`already_resolved` when that request was announced and has been answered); then `bad_option` or the shape rules.
@@ -331,7 +331,9 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 - Cwd precedence: the cwd of a live `cwdFrom`, then `cwd`, then `$HOME`. A missing or non-directory cwd falls back to `$HOME`.
 - `env`: at most 32 entries. Keys match `^[A-Za-z_][A-Za-z0-9_]{0,63}$`, values are ≤ 4096 bytes, and keys the hub sets cannot be overridden.
 
-**`SpawnAcp`** = `{agent, cwd: absolute existing directory}`.
+**`SpawnAcp`** = `{agent, cwd: absolute existing directory, config?: ConfigOption[]}`.
+- **`ConfigValue`** is a JSON string or boolean, never a number, null, array or object. **`ConfigOption`** = `{id: string, value: ConfigValue}`. The optional `config` array is ordered: at most 16 entries, with distinct ids. The hub rejects an invalid batch with `bad_request` before spawning. Absent or empty `config` preserves the old asynchronous open behaviour; serializers omit the empty array.
+- **`ConfigError`** = `{id: string, value: ConfigValue, code: ErrorCode, error: string}`. `AcpOpenReply.configErrors` reports failed entries in input order, retaining their requested values and a required hub error code. It is omitted when empty and defaults to an empty array when absent. These errors belong only to the initiating open reply, not to the session facts or later attaches.
 
 **`pty.open` rules.** Principle: **a request without `spawn` never starts a process**.
 - **Alive:** attach, whether or not `spawn` is present. An alive session is never respawned.
@@ -346,9 +348,10 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 - A `pty.fg` event follows the `ok` for live sessions.
 
 **`acp.open` rules.**
-- **Unknown sid:** with `spawn`, create it (`new:true`, `activity:"setup"`; setup runs asynchronously). Without `spawn`: `not_found`.
-  - If the agent cannot be executed, the reply is still `ok`. The journal gets only `setup_error{spawn_failed}`, with no `spawn` line, and the session stays dead. A failed `acp.revive` spawn writes the same line and replies `err{code:"spawn_failed"}`.
-- **Existing sid:** attach, whether alive or dead. Nothing runs.
+- **Unknown sid:** with `spawn`, create it (`new:true`). Absent or empty spawn config replies immediately with `activity:"setup"` while setup runs asynchronously. Non-empty config waits for setup and the initial configuration batch (§3.4.5) to finish or terminate, then replies with the resulting Summary and `AcpSessionInfo`. Without `spawn`: `not_found`.
+  - If the agent cannot be executed, the reply is still `ok`. The journal gets `setup_error{spawn_failed}`, with no `spawn` or `exit` line, and the session stays dead; non-empty config also records unapplied-entry failures as described in §3.4.5. A failed `acp.revive` spawn writes the same setup-error line and replies `err{code:"spawn_failed"}`.
+  - Configuration failures do not undo an accepted creation or turn the open into an `err`. They are returned as `configErrors`; setup failure accounts for every unapplied entry and releases the open reply.
+- **Existing sid:** attach, whether alive or dead. Nothing runs, and spawn config is not applied to it.
 - **Reset:** `reset:true`, with a replay from seq 1, when `since > headSeq` **or** `epoch` is present and differs from `createdAt`.
 
 #### 3.2.8 Events (hub to client)
@@ -376,6 +379,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `CONN_QUEUE` | 4 MiB per connection | close the connection. An event is admitted whatever its size when the queue is empty. Replies are always admitted. |
 | `ACP_REPLAY_MAX` | 4 MiB | truncate the oldest events (`truncated:true`); also the largest merged chunk event (§3.4.4) |
 | `PROMPT_MAX` | 8 MiB | `bad_request` |
+| `ACP_CONFIG_MAX` | 16 initial configuration entries, with distinct ids | hub `bad_request`; API 400 "bad body", before spawn |
 | `VT_SCROLLBACK` | 1000 lines | |
 | `SNAPSHOT_MAX` | 4 MiB | halve the scrollback budget until it fits |
 | `ESC_HOLDBACK_MAX` | 4 KiB | flush the held tail as is |
@@ -521,7 +525,7 @@ Each line is `{"seq":N,"ts":…,"e":KIND,…}`.
 | `elicitation_complete` | `elicitationId` | `elicitation/complete` arrived (url mode) |
 | `mode` | `modeId` | `session/set_mode` succeeded |
 | `config` | `configOptions` (full list) | `session/set_config_option` succeeded; written before its hub reply |
-| `notice` | `level, text` | hub notes: the revive method, `agent stderr: <last line>` (≤ 500 characters) for an unclean exit, "agent stopped after failed setup", and the fault probe's `warn` |
+| `notice` | `level, text` | hub notes: initial configuration entry failures, the revive method, `agent stderr: <last line>` (≤ 500 characters) for an unclean exit, "agent stopped after failed setup", and the fault probe's `warn` |
 | `exit` | `code, signal, reason: "exited"\|"killed"\|"hub_restart"` | the process ended. `code` and `signal` are the agent's real exit status, including on a graceful stop; they are null only in the lines startup normalisation writes. |
 
 **Death invariant (pure fold).** When an agent dies, the hub writes, in order:
@@ -593,6 +597,12 @@ A pinned event appears at its own seq position, never ahead of a lower seq. Clie
   - A failed setup ends with `auth_required` and at least one agent-handled auth method (one without a `type`): the agent is kept and waits for `acp.authenticate`.
   - Any other failed setup journals `notice{warn, "agent stopped after failed setup"}` and kills the agent.
   - A setup response that arrives once teardown has started is ignored.
+- **Initial configuration batch (non-empty `SpawnAcp.config`):**
+  1. The hub owns the batch from creation, including the setup interval. It blocks the live actions listed in §3.2.7 for every client, not only the opener. No prompt is sent implicitly.
+  2. After a successful `session/new` is journaled as `session`, apply the ordered array one entry at a time with the ordinary `session/set_config_option` RPC and 30 s timeout. Validate each entry against the latest full offering, including changes from earlier results.
+  3. A successful result must be journaled as a full-list `config` event before proceeding. A bad id/value gives `bad_option`; an agent error or malformed result gives `agent_error`; a timeout gives `timeout`. Append the entry's `configErrors` result and journal a failure `notice` before starting the next RPC, continue with later entries while the session remains usable, and ignore replies to timed-out or otherwise completed requests.
+  4. A setup failure fails every unapplied entry (`spawn_failed` for spawn failure, `timeout` for setup timeout, otherwise `agent_error`). Death or kill fails the outstanding and remaining entries with `not_alive`; a journal failure uses `faulted`. Every entry must be either successfully journaled or accounted for in `configErrors`; termination also journals a failure `notice` for each unapplied entry while the journal remains writable.
+  5. End the gate and release the initiating `acp.open` reply on batch completion or termination, preserving the normal reply-before-replay/live-event ordering. The reply carries the final materialised options and opener-only errors; the hub does not need a web client to sequence configuration. Empty or absent config adds no gate or wait.
 - **Revive:**
   1. `spawn{via:"revive"}` and initialize.
   2. `session/resume` if `sessionCapabilities.resume` is advertised.
@@ -602,13 +612,13 @@ A pinned event appears at its own seq position, never ahead of a lower seq. Clie
 - **Agent-to-client:**
   - `session/request_permission` and `elicitation/create` are held, with no timeout, until answered by any viewer, by cancel, by the agent's `$/cancel_request` (`by:"agent"`), or by the hub at death.
   - Any other method gets −32601. Unknown notifications are logged and dropped.
-- **Session configuration:** `session/set_config_option` carries `{sessionId, configId, value}` for a select string, with no `type` member; a boolean carries `{sessionId, configId, type:"boolean", value:true|false}`. The agent's successful response carries the full `configOptions` list. The hub journals that list as `config` before answering `{}`; an agent error, timeout or journal fault is not success. This does not change `acp.set_mode`.
+- **Session configuration:** `session/set_config_option` carries `{sessionId, configId, value}` for a select string, with no `type` member; a boolean carries `{sessionId, configId, type:"boolean", value:true|false}`. The agent's successful response must carry a valid full `configOptions` list. The hub journals that list as `config` before answering `{}` or advancing an initial batch; an agent error, malformed list, timeout or journal fault is not success. Malformed results leave the previous full list unchanged and produce no successful `config` event; `[]` is a valid result that clears the offering. This does not change `acp.set_mode`.
 - **Facts:**
-  - `activity`: `setup` from `spawn`/`authenticate` to `session`/`setup_error`; `turn` from `prompt` to `turn_end`/`turn_error`; otherwise `none`.
+  - `activity`: in the journal fold, `setup` from `spawn`/`authenticate` to `session`/`setup_error`; `turn` from `prompt` to `turn_end`/`turn_error`; otherwise `none`. Published snapshots additionally report `setup` for the entire active initial configuration batch, including after its `session` line, until its gate ends.
   - `pending` = unresolved requests.
   - `last` comes from `turn_end`, `turn_error` and `setup_error`.
   - `title` from `session_info_update`; `modeId` from `session`, `current_mode_update` and `mode`.
-  - `configOptions` from `session.configOptions`, `update{sessionUpdate:"config_option_update", configOptions}` and `config.configOptions`. Each supplied list replaces the previous list whole in both the Summary and `AcpSessionInfo`, including an empty list; it is never merged by id. The fold is identical live and on replay, so options survive a hub restart. A `session` without `configOptions` clears the previous offering.
+  - `configOptions` from `session.configOptions`, `update{sessionUpdate:"config_option_update", configOptions}` and `config.configOptions`. Each valid supplied list replaces the previous list whole in both the Summary and `AcpSessionInfo`, including an empty list; it is never merged by id. Malformed lists (including malformed option members, not only a non-array top level) are rejected without replacing the previous offering. The fold is identical live and on replay, so options survive a hub restart. A `session` without `configOptions` clears the previous offering.
   - User actions set `seenSeq = headSeq`: prompt, cancel, permission, elicitation, revive, authenticate.
   - An answer (permission, elicitation, cancel, or the agent's own cancel) is journaled **before** the response goes to the agent. If that write faults, the agent receives only the cancel marker, so it never acts on an answer the journal lacks.
 - **Teardown.** One routine serves user kill, failed setup, fault, crash and shutdown.
@@ -730,7 +740,7 @@ Client to server. An optional `rid` (any non-null JSON value) is echoed verbatim
 
 | t | Fields | Becomes |
 |---|---|---|
-| `open` | `id, since, epoch?, agent?, cwd?` | `acp.open{sid, since, epoch, spawn: agent && cwd ? {agent, cwd} : absent}` |
+| `open` | `id, since, epoch?, agent?, cwd?, config?: ConfigOption[]` | `acp.open{sid, since, epoch, spawn: agent && cwd ? {agent, cwd, config} : absent}`. `config` is the same ordered string-or-boolean array as `SpawnAcp.config`, not the API's object. |
 | `prompt` | `blocks` | `acp.prompt` |
 | `cancel` | – | `acp.cancel` |
 | `permission` | `req, epoch, outcome` | `acp.permission` |
@@ -746,7 +756,7 @@ Server to client:
 
 | t | Fields |
 |---|---|
-| `hello` | `status: "new"\|"attached", info: AcpInfo, head, from, reset` |
+| `hello` | `status: "new"\|"attached", info: AcpInfo, head, from, reset, configErrors?: ConfigError[]`. Opener-only errors are top-level, omitted when empty, not part of `info`. |
 | `ev` | `ev: JournalEvent` |
 | `replayed` | `head, truncated` |
 | `info` | `info: AcpInfo`. `info.session` is **omitted when unchanged** since the last one sent on this socket. |
@@ -755,12 +765,12 @@ Server to client:
 
 `AcpInfo = Summary + {state, session?}`.
 
-The relay carries config options in `info` and journal `ev` messages and accepts `set_config_option` for a future page. F-A48 adds no page controls or other `web/` changes.
+The relay carries config options in `info` and journal `ev` messages and accepts `set_config_option` for a future page. A configured open receives its `hello` only after the hub's initial batch ends or terminates; its `info` already contains the resulting full option list. F-A49 adds no page controls or other `web/` changes.
 
 **Errors and closes:**
 - **Before `open`:** a malformed message, a message that is not `open`, or an id that sanitises to empty gets `error{code:"bad_request"}`, then close 1008. No `open` within `CARD_OPEN_DEADLINE` also closes 1008.
 - **After `open`:** a malformed message gets `error{code:"bad_request"}` and is not relayed; a second `open` gets `error` "open was already sent". In both cases the socket stays.
-- **Commands are relayed as soon as `open` is sent**, without waiting for its `ok`. If the hub has not answered the open within 10 s, the web closes 1011.
+- **Commands are relayed as soon as `open` is sent**, without waiting for its `ok`. The hub rejects blocked actions with `busy` throughout a non-empty initial batch, rather than retaining them for later. The web closes 1011 if the hub has not answered an ordinary open within 10 s; for a non-empty config array the outer reply wait is `40 s × (1 + number of options)`, covering setup and each sequential option with grace. This is a web reply deadline, not a replacement for the hub's setup idle timeout.
 - **A failed open** sends `error` with the `rid` echoed, then closes 1000.
 - **`kill` with `forget`:** on `ok` the web closes 1000, with no message before it; on `err` it sends `error` and the socket stays.
 - **`gone`** is sent as `{t:"gone", epoch}`, then close 1000.
@@ -1048,7 +1058,7 @@ Three parts follow from that, and each stands alone: the API listener (§3.8.1, 
 - Every response is JSON with `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`, except the event stream (`text/event-stream`). There are no CORS headers. A request body is at most `API_BODY_MAX`; a larger one is 413.
 - Errors are `{"error": message}`. An error the hub gave also carries the hub's `code`: `{"error": message, "code": "busy"}`.
 
-**Hub errors as statuses:** `bad_request`, `bad_option`, `unknown_agent` → 400; `not_found` → 404; `kind_mismatch`, `busy`, `not_alive`, `already_resolved`, `stale`, `not_revivable`, `faulted` → 409; `timeout` → 504; anything else → 502. The hub down or incompatible is 503; no reply within 10 s (40 s for `mode` and `config`, which wait for the agent) is 504.
+**Hub errors as statuses:** `bad_request`, `bad_option`, `unknown_agent` → 400; `not_found` → 404; `kind_mismatch`, `busy`, `not_alive`, `already_resolved`, `stale`, `not_revivable`, `faulted` → 409; `timeout` → 504; anything else → 502. The hub down or incompatible is 503; no reply within 10 s (40 s for `mode` and `config`, which wait for the agent) is 504. A create with non-empty config instead allows `40 s × (1 + number of options)` for its delayed hub open reply (§3.8.2).
 
 #### 3.8.2 `/v1` endpoints
 
@@ -1064,7 +1074,7 @@ A sid in a path that does not match `^[A-Za-z0-9_-]{1,64}$` is 400 "bad id". Req
 | `GET /v1/observed` | read | `{sessions:[ObservedSession]}` (§3.8.3), live first, then by `lastAt`, newest first. |
 | `GET /v1/observed/{id}` | read | One `ObservedSession` by its `id`; 404. |
 | `GET /v1/stream` | read | Server-sent events (§3.8.4). |
-| `POST /v1/sessions` | control | Starts an ACP agent. Body `{agent, cwd, host?, sid?, config?: {optionId: string\|boolean}}`. `sid` defaults to `api_` and 16 random hex digits. `host` absent, or the hub's own, starts it on the hub's host; another name must be one of the hub's `hosts` as its hello lists them, else 400 "no host H" (so a hub that predates §3.8.5 is never asked). 201 `{sid, session: Summary+state, configErrors:[{id, value, error, code?}]}`; configuration rules below. A sid that an agent session has is 409 "session exists", and one that a shell has is 409 with the hub's `kind_mismatch`; that session is left as it is. |
+| `POST /v1/sessions` | control | Starts an ACP agent. Body `{agent, cwd, host?, sid?, config?: {optionId: string\|boolean}}`. `sid` defaults to `api_` and 16 random hex digits. `host` absent, or the hub's own, starts it on the hub's host; another name must be one of the hub's `hosts` as its hello lists them, else 400 "no host H" (so a hub that predates §3.8.5 is never asked). 201 `{sid, session: Summary+state, configErrors:[{id, value, code, error}]}`; configuration rules below. A sid that an agent session has is 409 "session exists", and one that a shell has is 409 with the hub's `kind_mismatch`; that session is left as it is. |
 | `POST /v1/sessions/{sid}/prompt` | control | Body `{text}` or `{blocks:[ContentBlock]}`, exactly one of them; `text` becomes one text block. `acp.prompt`. 200 `{}`. |
 | `POST /v1/sessions/{sid}/cancel` | control | `acp.cancel`. 200 `{}`. |
 | `POST /v1/sessions/{sid}/permission` | control | Body `{req, epoch, outcome}`: `acp.permission`. 200 `{}`. |
@@ -1077,7 +1087,7 @@ A sid in a path that does not match `^[A-Za-z0-9_-]{1,64}$` is 400 "bad id". Req
 
 A body that is not the JSON the endpoint takes, an unknown key included, is 400 "bad body". A sid the control connection has not heard of is 404 "no session S" for `GET /v1/sessions/{sid}`, `POST /v1/sessions/{sid}/config` and `DELETE`; the other endpoints ask the hub, and answer with its error. The API starts no PTY and sends no PTY input: a shell on the mesh is what ssh is for.
 
-**Configuration on create.** With no `config`, or an empty object, create keeps its immediate post-open behaviour: it does not wait for ACP setup. With a non-empty `config`, it keeps the same attached hub connection open after `acp.open` replies and waits for `session` (setup ready), `setup_error` or `exit`. Readiness is bounded to 40 s from the open reply (`SETUP_IDLE_TIMEOUT` plus 10 s grace); a failed or timed-out setup is reported in `configErrors` for every unapplied option, not as a failed start. After readiness, options are applied sequentially in the input JSON object's member order, not sorted by id, using the incarnation from the open reply. Each gets the ordinary 30 s hub timeout and 40 s API wait. A failure appends `{id, value, error, code?}` and does not stop later options; later validation uses the latest offering returned by the agent. The response remains 201 with `configErrors:[]` when all succeeded and the latest session received as `acp.info` while waiting. Create never sends a prompt, with or without configuration.
+**Configuration on create.** `config`, when present, is a JSON object with at most **16 distinct option ids**, each value a string or boolean. A non-object, another value type, duplicate id or a seventeenth option is 400 "bad body", before any spawn. The web retains the input object's member order and passes it as the hub's ordered `SpawnAcp.config` array `[{id, value}]`; it does not wait for setup events and issue its own configuration RPCs. With no config or `{}`, create keeps its immediate post-open behaviour and does not wait for ACP setup. With non-empty config, the hub delays the initiating `acp.open` reply until setup and the ordered batch end or terminate (§3.4.5), blocking prompts and the other listed live actions from every client in the meantime. The API waits up to `40 s × (1 + number of options)` for that reply, then returns its resulting session and opener `configErrors` verbatim. This outer HTTP wait is not a total setup timeout: the hub still uses `SETUP_IDLE_TIMEOUT`, which can be extended by agent messages or paused for pending requests. Individual configuration failures and setup failure do not turn accepted creation into a failed start: the response remains 201, with every unapplied option accounted for and `configErrors:[]` when all succeeded. Later option validation uses the latest authoritative full list. Create never sends a prompt, with or without configuration.
 
 **Who answers permission requests.** `control` includes `permission` and `elicitation`: a client that holds it can approve what an agent asks. Whether an orchestrating client does so, or leaves those to the owner, is that client's configuration. The owner sees every pending request in Workbench either way.
 
@@ -1393,7 +1403,7 @@ The amendments below are binding.
 | F-A46 | **The artifact card is agent-neutral** (2026-11-16). A page in an artifact card reaches the Workbench through `window.wb.use(name)` (was `window.claude.use`; no alias), and its handshake message is `{wb:'hello'}` (the host never sent the `ping` the bridge answered, so that listener is gone). The board page itself no longer asks a `window.claude` for `sample` (a leftover of the hosted mode of F-A44): `sample` is the server's or nothing. The UI says "HTML card" and "language model", not "Claude artifact". The New dock has no Page button: a page is made by double-click on the canvas, "New page" (palette, context menu), `n` in the navigator, "+ Page" in the Editor view, Today and links. |
 | F-A47 | **The mesh in the page** (2026-11-17; Agents interaction extended by F-A48). With `api` in `web.json` (`/api/info.mesh`), the page keeps `OBS`, the observed sessions of §3.8.3 as `/rpc` carries them (§3.5.3), and draws one overview from them and from `SESS`. **Rows.** A row is an observed session, with its subagents under it, or an agent session of the hub that no harness reports. An observed session is joined with the hub session named by its `wbSession` only when that session is on the same host (a host can name any `wbSession`; it is believed for its own sessions only), and then has that session's card. A joined row is waiting when either side says so: the hub's ACP state when it is `waiting_permission`, `waiting_input` or `error`, else the observed state. A row is live until its record has ended; a record that ended (it went silent, say) while the hub still runs the agent session it is joined with stays live, in the hub's state. **Agents overview.** The main Agents view groups rows by `project`, the groups and the rows ordered by waiting for you, working, the rest, ended, and then by start time, newest first, so the list does not reorder while sessions work; a row shows title, harness, model, host, what it is doing (the pending tool and input, the running tool, or the state) and the age of its last event. Ended sessions list when Ended is ticked; a live subagent lists with its session even so. A click selects its separate detail pane, with folder, model, mode, last prompt and reply, counts and the last 12 lines of the tail, plus "Show on canvas" for a row with a card, "Add its card" for a hub session without one, and "Copy id". Rows and the selected live backend keep their DOM identity across activity and metadata updates; only changes to the list's rows, order or action targets rebuild its shape. **Status and attention.** The status line has `mesh N · M waiting` (live rows; a click opens Agents at the first waiting row). An observed session that waits is an Attention item `obs:<id>`, unless it is joined to an agent card whose own session waits, which is listed already; joined to any other card, the item is that card's (it counts as a card that needs a look, F-A15); else Enter opens Agents at the row. An Attention list that is open follows these items. The out-of-page signal (F-A12) fires for such a session, with the same exception, as for an agent card, and its notification opens Agents at the row in a page that is open. Joined to an agent card it fires under the card's sid, so the hub saying the same after the harness is one signal; joined to an agent session of the hub that has no card, the hub saying that it waits fires it under the observed id. **Graph.** With "Agents on the mesh" ticked (the default), each live row is a `session` node (`mesh:<id>`, a diamond in its state's colour). A session is tied to a `host:<name>` node (a hexagon), to a `proj:<project>` node (a hollow square; one node for a project name on every host) and to its card when the card is in the graph; a subagent is tied to its session alone, by a `spawn` edge, or stands as a session when that one has ended. A session's card in the graph shows what it is doing and the end of its tail, kept current in place, with "Show in Agents" (also double-click). A session that starts or ends moves the layout; a change of state or title only redraws. A node that goes while the pointer holds it ends the drag and is not selected; the open card is drawn again when the layout moves, and a button that still names a node that went selects nothing. Two projects with one directory name on different hosts are one node. |
 | F-A48 | **Agents is a place to work** (2026-11-17). The Agents main view is available without the mesh API: it lists the hub's agent sessions from `SESS`, adding observed sessions from `OBS` when configured, and never requires adopting a canvas card. A hub shell appears only through an observed session running in it (F-A47). Wide screens show list and detail together; below 700 px they show one pane with a Sessions back action (F-A13). Selecting a hub ACP session opens its journal, composer, permission and elicitation controls through the existing `AcpBackend`; selecting a reachable hub PTY opens its existing terminal through `PtyBackend`, without spawning. Each selection owns a transient UI/backend, not a node in the board. Only a change of row, hub sid, kind or hub session incarnation (`createdAt`) remounts that backend; changes in card presence, attach capability, configuration or liveness refresh actions and hints in place, preserving the draft and any Edwin prompt editor. Selecting another row, leaving the view or unloading disposes the viewer without killing the existing session. A validated observed `attach` plus `/api/info.attach:true` offers "Open terminal", spawning a unique per-mount `attach_<observed id>_<random>` PTY with `attach`, not browser `cmd`; two pages never share that temporary viewer. It is killed and forgotten on selection change, view leave or unload, including a kill requested before open completes, and must not kill the observed agent. Only PTYs with that prefix are excluded from Attention's orphan list; they are not Agents rows. Each remains a real PTY in `/api/sessions` until forgotten. An observed session without a reachable hub session or usable attach capability stays read-only with an explanatory reason and setup guidance. With Edwin built, the ACP composer can open a local unsaved buffer in an Edwin frame (F-A27, F-A39); `C-c C-c` sends its current text as the normal prompt, and `C-c C-k` cancels editing and restores the text to the composer unsent. Rows expose harness and model, truncated as needed but with full title attributes. Detail shows harness, model, host, cwd, mode, thinking/reasoning, start and activity times only when known; ACP model and thinking come from journaled session/config-option updates, not invented values or a hub protocol change. Up/Down and j/k select rows, Enter enters the selected live control, and Escape returns to the list without changing the selection; text fields, terminals and Edwin retain their own keys (§6.4). **Ownership.** A card made by `adoptOrphan` carries `adopted:true`, saved with its board node. Closing a marked card only removes the card; closing any unmarked card kills its session, including after a reload. Reset board applies the same rule per card and kills the docked terminal. Only confirmation of a newly created replacement session (ACP `status:"new"` or PTY `new:true`) clears the mark and saves that ownership change; a spawn request that attaches to an existing session leaves it borrowed. Agents selection never claims ownership. A separate explicit "Kill session" action requires confirmation before ending a hub session, regardless of ownership. |
-| F-A49 | **Session configuration, without a page change** (2026-11-17). The hub materialises the agent's whole `configOptions` list in `Summary.acp` and `AcpSessionInfo`, journals successful `session/set_config_option` results as `config`, and accepts epoch-checked select (including grouped choices) and boolean values (§3.2.7, §3.4.5). The `/acp` relay supports `set_config_option` for a future page, but this amendment adds no page UI. The mesh API's control scope can configure one session or pass ordered configuration when creating one, with partial failures in `configErrors` (§3.8.2); the old `set_mode` path is unchanged. |
+| F-A49 | **Session configuration, without a page change** (2026-11-17). The hub materialises valid full `configOptions` lists in `Summary.acp` and `AcpSessionInfo`, rejects malformed replacements without losing the existing offering, journals successful `session/set_config_option` results as `config`, and accepts epoch-checked select (including grouped choices) and boolean values (§3.2.7, §3.4.5). A non-empty ordered `SpawnAcp.config` batch runs in the hub after setup, before any client's prompt or other gated live action; the initiating open waits and reports per-entry `configErrors`. The `/acp` relay accepts the same ordered array and returns opener errors on `hello`; it supports `set_config_option` for a future page, but this amendment adds no page UI. The mesh API's control scope can configure one session or pass an ordered object of at most 16 string-or-boolean options on creation, translated into the hub batch (§3.8.2). No create sends a prompt. |
 
 **ui check amendments.**
 - **N8** expects "No session: press Enter" after a wiped `stateDir`, then Enter → `[new shell]` (H-1).
@@ -1567,7 +1577,7 @@ The flake builds the workspace with `buildRustPackage` (`cargoLock.lockFile`), b
 - No sleeps in tests except the `hang` scenario and the 20 ms holdback; wait on events.
 - Sockets live under `$TMPDIR`, and shells come from `$BASH`.
 - Tests never hard-code `/run/current-system`.
-- Conformance's `session_config` uses the real `/acp` relay, hub and keyword-mode fake agent: initial options in both info forms, stale-before-bad-option checks, rejected values, grouped/dependent selects, booleans, authoritative whole-list results, hub list and journal replay, with no prompt.
+- Conformance's `session_config` uses the real `/acp` relay, hub and keyword-mode fake agent: no-config initial options in both info forms, stale-before-bad-option checks, rejected values, grouped/dependent selects, booleans, authoritative whole-list results, hub list and journal replay. `configured_open` proves the initial hello is already configured, dependent options follow input order, opener errors do not fail accepted creation or prevent later entries, and no implicit prompt is journaled.
 
 ### 9.2 `wb-fake-acp` scenarios (one Rust stub for every layer, registered as agent `stub`)
 - **Hub scenarios** (`basic`, `noise`, `permission`, `permission-reconnect`, `agent-cancels`, `elicitation`, `cancel`, `crash-midturn`, `auth`, `auth-terminal`, `revive-resume`, `revive-load`, `unknown`, `version`, `hang`, `set-mode`, `kill-stubborn`, `replay-large`):

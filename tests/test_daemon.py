@@ -344,7 +344,99 @@ def session_config(t, h):
         wbctl.acp_session(ep, sid, kill=True)
 
 
-SECTIONS = [board, fs, session_config]
+def configured_open(t, h):
+    ep = wbctl.Endpoint(ORIGIN, unix=h.caddy_sock)
+
+    def values(options):
+        return {o["id"]: o["currentValue"] for o in options or []}
+
+    cases = (
+        ("ready", [
+            {"id": "model", "value": "large"},
+            {"id": "effort", "value": "max"},
+            {"id": "thinking", "value": True},
+        ], [], [
+            {"model": "large", "effort": "low", "thinking": False},
+            {"model": "large", "effort": "max", "thinking": False},
+            {"model": "large", "effort": "max", "thinking": True},
+        ]),
+        ("errors", [
+            {"id": "missing", "value": True},
+            {"id": "effort", "value": "max"},
+            {"id": "model", "value": "large"},
+            {"id": "thinking", "value": True},
+        ], [("missing", True, "bad_option"), ("effort", "max", "bad_option")], [
+            {"model": "large", "effort": "low", "thinking": False},
+            {"model": "large", "effort": "low", "thinking": True},
+        ]),
+    )
+    for name, config, expected_errors, expected_results in cases:
+        sid = "conformance_config_open_" + name
+        card = wbctl.AcpCard(ep, sid)
+        try:
+            opened = card.open(agent="stub", cwd=str(h.home.resolve()), config=config)
+            hello = card.result["hello"] or {}
+            info = hello.get("info") or {}
+            acp = info.get("acp") or {}
+            options = acp.get("configOptions")
+            events = card.result["events"]
+            applied = [e for e in events if e.get("e") == "config"]
+            session_events = [e for e in events if e.get("e") == "session"]
+            t.check(f"configured open ({name}): hello already carries the ready configured full list",
+                    opened and hello.get("status") == "new" and info.get("alive") is True
+                    and acp.get("activity") == "none" and bool(acp.get("agentSessionId"))
+                    and values(options) == expected_results[-1]
+                    and (info.get("session") or {}).get("configOptions") == options,
+                    repr(card.result))
+
+            errors = hello.get("configErrors") or []
+            actual_errors = [(e.get("id"), e.get("value"), e.get("code")) for e in errors]
+            t.check(f"configured open ({name}): ordered opener errors retain values and required codes",
+                    actual_errors == expected_errors
+                    and all(isinstance(e.get("error"), str) and e["error"] for e in errors)
+                    and bool("configErrors" in hello) == bool(expected_errors)
+                    and "configErrors" not in info and not card.result["errors"],
+                    repr(hello))
+            notices = [e for e in events if e.get("e") == "notice"]
+            t.check(f"configured open ({name}): each failure is journaled before later successful options",
+                    opened and bool(applied) and len(notices) == len(expected_errors)
+                    and all(e.get("level") == "warn" and error[0] in e.get("text", "")
+                            for e, error in zip(notices, expected_errors))
+                    and all(e["seq"] < applied[0]["seq"] for e in notices),
+                    repr(events))
+            t.check(f"configured open ({name}): dependent options run in input order and journal full results",
+                    opened and [values(e.get("configOptions")) for e in applied] == expected_results
+                    and all(len(e.get("configOptions") or []) == 3 for e in applied)
+                    and len(session_events) == 1 and bool(applied)
+                    and session_events[0]["seq"] < applied[0]["seq"],
+                    repr(events))
+            t.check(f"configured open ({name}): creation sends no implicit prompt",
+                    opened and not any(e.get("e") == "prompt" for e in events), repr(events))
+
+            summary = next((s for s in wbctl.hub_sessions(h.hub_sock) if s.get("sid") == sid), {})
+            t.check(f"configured open ({name}): hub list agrees with the initial hello",
+                    opened and summary.get("acp", {}).get("configOptions") == options,
+                    repr(summary))
+
+            replay = wbctl.AcpCard(ep, sid)
+            try:
+                attached = replay.open()
+                replay_hello = replay.result["hello"] or {}
+                t.check(f"configured open ({name}): attach replays results but not opener-only errors",
+                        attached and replay_hello.get("status") == "attached"
+                        and "configErrors" not in replay_hello
+                        and [e for e in replay.result["events"] if e.get("e") == "config"] == applied
+                        and (replay_hello.get("info") or {}).get("acp", {}).get("configOptions") == options
+                        and not any(e.get("e") == "prompt" for e in replay.result["events"]),
+                        repr(replay.result))
+            finally:
+                replay.close()
+        finally:
+            card.close()
+            wbctl.acp_session(ep, sid, kill=True)
+
+
+SECTIONS = [board, fs, session_config, configured_open]
 
 
 def main():
