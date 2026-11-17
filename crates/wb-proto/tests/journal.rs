@@ -75,7 +75,8 @@ fn session() {
             "via": "new", "sessionId": "c0ffee",
             "modes": {"currentModeId": "default",
                       "availableModes": [{"id": "default", "name": "Default", "description": null}]},
-            "configOptions": [{"id": "model", "currentValue": "opus"}]
+            "configOptions": [{"id": "model", "name": "Model", "type": "select",
+                               "currentValue": "opus", "options": [{"value": "opus", "name": "Opus"}]}]
         }),
     ));
     let EventBody::Session {

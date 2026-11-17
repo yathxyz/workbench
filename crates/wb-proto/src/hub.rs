@@ -349,6 +349,39 @@ pub struct SpawnPty {
     pub env: Option<BTreeMap<String, String>>,
 }
 
+/// A typed value for a session configuration option.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ConfigValue {
+    String(String),
+    Boolean(bool),
+}
+
+impl From<ConfigValue> for Value {
+    fn from(value: ConfigValue) -> Self {
+        match value {
+            ConfigValue::String(value) => Self::String(value),
+            ConfigValue::Boolean(value) => Self::Bool(value),
+        }
+    }
+}
+
+/// One session configuration option to apply at startup.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigOption {
+    pub id: String,
+    pub value: ConfigValue,
+}
+
+/// A startup configuration option that could not be applied.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigError {
+    pub id: String,
+    pub value: ConfigValue,
+    pub code: ErrorCode,
+    pub error: String,
+}
+
 /// How to start an ACP agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnAcp {
@@ -360,6 +393,9 @@ pub struct SpawnAcp {
     /// A name from the hello's `hosts`. Absent, or the hub's own `host`, means local.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Startup options, applied sequentially in the supplied order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config: Vec<ConfigOption>,
 }
 
 /// Where a viewer's terminal stopped: honoured if `stream` matches and the ring still
@@ -587,6 +623,7 @@ pub struct AcpSessionInfo {
 
 /// `ok` reply fields of `acp.open`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AcpOpenReply {
     /// The session was created by this request.
     pub new: bool,
@@ -598,6 +635,9 @@ pub struct AcpOpenReply {
     pub from: u64,
     /// The replay starts from seq 1 and the client must drop what it holds.
     pub reset: bool,
+    /// Failed startup options, in the order they were attempted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_errors: Vec<ConfigError>,
 }
 
 /// `ok` reply fields of `pty.capture`.

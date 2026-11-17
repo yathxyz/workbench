@@ -737,6 +737,113 @@ fn acp_session_info() {
 }
 
 #[test]
+fn config_values_are_typed() {
+    for (wire, expected) in [
+        (json!("small"), ConfigValue::String("small".into())),
+        (json!("true"), ConfigValue::String("true".into())),
+        (json!(""), ConfigValue::String(String::new())),
+        (json!(true), ConfigValue::Boolean(true)),
+        (json!(false), ConfigValue::Boolean(false)),
+    ] {
+        let value: ConfigValue = round_trip(wire.clone());
+        assert_eq!(value, expected);
+        assert_eq!(Value::from(value), wire);
+    }
+}
+
+#[test]
+fn config_values_reject_other_json_shapes() {
+    for value in [
+        json!(null),
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!([]),
+        json!(["small"]),
+        json!({}),
+        json!({"value": "small"}),
+    ] {
+        assert!(serde_json::from_value::<ConfigValue>(value.clone()).is_err());
+        let option = json!({"id": "model", "value": value});
+        assert!(serde_json::from_value::<ConfigOption>(option.clone()).is_err());
+        assert!(
+            serde_json::from_value::<HubRequest>(json!({
+                "t": "acp.open", "rid": 8, "sid": "n_agent1", "since": 0,
+                "spawn": {"agent": "claude", "cwd": "/home/alice/proj/x", "config": [option]}
+            }))
+            .is_err()
+        );
+        let error = json!({
+            "id": "model", "value": value, "code": "bad_option", "error": "Not offered"
+        });
+        assert!(serde_json::from_value::<ConfigError>(error.clone()).is_err());
+        assert!(
+            serde_json::from_value::<AcpOpenReply>(json!({
+                "new": true, "summary": summary_acp(), "session": session_info_empty(),
+                "head": 1, "from": 1, "reset": true, "configErrors": [error]
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn acp_spawn_config_defaults_and_omits_empty() {
+    let wire = json!({"agent": "claude", "cwd": "/home/alice/proj/x"});
+    let absent: SpawnAcp = round_trip(wire.clone());
+    assert!(absent.config.is_empty());
+    let empty: SpawnAcp = serde_json::from_value(json!({
+        "agent": "claude", "cwd": "/home/alice/proj/x", "config": []
+    }))
+    .unwrap();
+    assert_eq!(empty, absent);
+    assert_eq!(serde_json::to_value(empty).unwrap(), wire);
+}
+
+#[test]
+fn acp_spawn_config_preserves_order_and_duplicates() {
+    let req: HubRequest = round_trip(json!({
+        "t": "acp.open", "rid": 8, "sid": "n_agent1", "since": 0,
+        "spawn": {
+            "agent": "claude", "cwd": "/home/alice/proj/x",
+            "config": [
+                {"id": "model", "value": "small"},
+                {"id": "thinking", "value": true},
+                {"id": "model", "value": "large"},
+                {"id": "thinking", "value": false}
+            ]
+        }
+    }));
+    let HubRequest::AcpOpen {
+        spawn: Some(spawn), ..
+    } = req
+    else {
+        panic!("{req:?}")
+    };
+    assert_eq!(
+        spawn.config,
+        vec![
+            ConfigOption {
+                id: "model".into(),
+                value: ConfigValue::String("small".into()),
+            },
+            ConfigOption {
+                id: "thinking".into(),
+                value: ConfigValue::Boolean(true),
+            },
+            ConfigOption {
+                id: "model".into(),
+                value: ConfigValue::String("large".into()),
+            },
+            ConfigOption {
+                id: "thinking".into(),
+                value: ConfigValue::Boolean(false),
+            },
+        ]
+    );
+}
+
+#[test]
 fn acp_open_requests() {
     let req: HubRequest = round_trip(json!({
         "t": "acp.open", "rid": 8, "sid": "n_agent1", "since": 0,
@@ -752,7 +859,8 @@ fn acp_open_requests() {
             spawn: Some(SpawnAcp {
                 agent: "claude".into(),
                 cwd: "/home/alice/proj/x".into(),
-                host: None
+                host: None,
+                config: Vec::new(),
             })
         }
     );
@@ -805,6 +913,7 @@ fn acp_open_replies() {
         head: 815,
         from: 120,
         reset: false,
+        config_errors: Vec::new(),
     };
     let json = json!({
         "t": "ok", "rid": 9, "new": false, "summary": summary_acp(),
@@ -827,6 +936,66 @@ fn acp_open_replies() {
     }));
     assert!(fresh.new && fresh.reset);
     assert_eq!(fresh.session, AcpSessionInfo::default());
+    assert!(fresh.config_errors.is_empty());
+}
+
+#[test]
+fn acp_open_config_errors_default_and_omit_empty() {
+    let wire = json!({
+        "new": true, "summary": summary_acp(), "session": session_info_empty(),
+        "head": 1, "from": 1, "reset": true
+    });
+    let absent: AcpOpenReply = round_trip(wire.clone());
+    assert!(absent.config_errors.is_empty());
+    let mut with_empty = wire.clone();
+    with_empty["configErrors"] = json!([]);
+    let empty: AcpOpenReply = serde_json::from_value(with_empty).unwrap();
+    assert_eq!(empty, absent);
+    assert_eq!(serde_json::to_value(empty).unwrap(), wire);
+}
+
+#[test]
+fn acp_open_config_errors_preserve_order_and_duplicates() {
+    let wire = json!({
+        "new": true, "summary": summary_acp(), "session": session_info_empty(),
+        "head": 1, "from": 1, "reset": true,
+        "configErrors": [
+            {"id": "model", "value": "missing", "code": "bad_option", "error": "Not offered"},
+            {"id": "thinking", "value": true, "code": "agent_error", "error": "Rejected"},
+            {"id": "model", "value": "large", "code": "timeout", "error": "No response"}
+        ]
+    });
+    let reply: AcpOpenReply = round_trip(wire.clone());
+    assert_eq!(
+        reply.config_errors,
+        vec![
+            ConfigError {
+                id: "model".into(),
+                value: ConfigValue::String("missing".into()),
+                code: ErrorCode::BadOption,
+                error: "Not offered".into(),
+            },
+            ConfigError {
+                id: "thinking".into(),
+                value: ConfigValue::Boolean(true),
+                code: ErrorCode::AgentError,
+                error: "Rejected".into(),
+            },
+            ConfigError {
+                id: "model".into(),
+                value: ConfigValue::String("large".into()),
+                code: ErrorCode::Timeout,
+                error: "No response".into(),
+            },
+        ]
+    );
+    let mut expected = wire;
+    expected["t"] = json!("ok");
+    expected["rid"] = json!(8);
+    assert_eq!(
+        serde_json::to_value(HubMessage::ok(8, &reply)).unwrap(),
+        expected
+    );
 }
 
 #[test]

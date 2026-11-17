@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 use wb_proto::hub::{Activity, Last, LastError, Pending, PendingKind};
 use wb_proto::journal::{EventBody, JournalEvent, ResolvedBy, SetupErrorCode, TurnErrorCode};
 
+use super::config::valid_options;
+
 /// `Pending.title` is cut to this many characters.
 const TITLE_MAX: usize = 200;
 
@@ -75,7 +77,13 @@ impl Facts {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 self.modes = modes.clone();
-                self.config_options = config_options.clone();
+                match config_options {
+                    None => self.config_options = None,
+                    Some(options) if valid_options(options) => {
+                        self.config_options = Some(options.clone());
+                    }
+                    Some(_) => {}
+                }
                 self.revive_failed = false;
             }
             EventBody::SetupError { code, message, .. } => {
@@ -123,7 +131,9 @@ impl Facts {
             }
             EventBody::Mode { mode_id } => self.set_mode(mode_id),
             EventBody::Config { config_options } => {
-                self.config_options = Some(config_options.clone());
+                if valid_options(config_options) {
+                    self.config_options = Some(config_options.clone());
+                }
             }
             EventBody::Exit { .. } => {
                 self.activity = Activity::None;
@@ -208,7 +218,7 @@ impl Facts {
                 }
             }
             Some("config_option_update") => {
-                if let Some(options) = update.get("configOptions").filter(|v| v.is_array()) {
+                if let Some(options) = update.get("configOptions").filter(|v| valid_options(v)) {
                     self.config_options = Some(options.clone());
                 }
             }
@@ -370,8 +380,9 @@ mod tests {
 
     #[test]
     fn config_folds_initial_updates_results_and_absent_session_reset() {
-        let initial = json!([{"id": "model", "currentValue": "small"}]);
-        let changed = json!([{"id": "thinking", "currentValue": true}]);
+        let initial = json!([{"id": "model", "name": "Model", "type": "select", "currentValue": "small",
+                              "options": [{"value": "small", "name": "Small"}]}]);
+        let changed = json!([{"id": "thinking", "name": "Thinking", "type": "boolean", "currentValue": true}]);
         let mut f = fold(vec![
             spawn(),
             EventBody::Session {
@@ -396,6 +407,91 @@ mod tests {
         assert_eq!(f.config_options, Some(json!([])));
         f.apply(&ev(5, session("s", None)));
         assert_eq!(f.config_options, None);
+    }
+
+    #[test]
+    fn malformed_old_journal_config_lists_preserve_the_preceding_good_state() {
+        let initial = json!([{"id": "thinking", "name": "Thinking", "type": "boolean", "currentValue": true}]);
+        let mut f = fold(vec![EventBody::Config {
+            config_options: initial.clone(),
+        }]);
+        let mut seq = 1;
+        for invalid in [
+            json!(false),
+            json!("options"),
+            json!({}),
+            json!([null]),
+            json!([{"id": "model", "currentValue": "small"}]),
+            json!([{"id": "thinking", "name": "Thinking", "type": "boolean", "currentValue": "true"}]),
+            json!([{"id": "model", "name": "Model", "type": "select", "currentValue": "small",
+                    "options": [{"group": "local", "name": "Local", "options": [null]}]}]),
+            json!([initial[0].clone(), null]),
+        ] {
+            for mut body in [
+                json!({"e": "session", "via": "resume", "sessionId": "old", "configOptions": invalid}),
+                json!({"e": "config", "configOptions": invalid}),
+                json!({"e": "update", "update": {
+                    "sessionUpdate": "config_option_update", "configOptions": invalid
+                }}),
+            ] {
+                seq += 1;
+                body["seq"] = json!(seq);
+                body["ts"] = json!(1000 + seq);
+                let event: JournalEvent = serde_json::from_value(body).unwrap();
+                f.apply(&event);
+                assert_eq!(f.config_options.as_ref(), Some(&initial), "{event:?}");
+                assert_eq!(f.head_seq, seq);
+            }
+        }
+        assert_eq!(f.agent_session_id.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn invalid_config_does_not_create_state_and_explicit_invalid_some_keeps_state() {
+        let initial = json!([{"id": "thinking", "name": "Thinking", "type": "boolean", "currentValue": false}]);
+        for invalid in [json!(null), json!([null])] {
+            for body in [
+                EventBody::Session {
+                    via: SessionVia::Resume,
+                    session_id: "s".into(),
+                    modes: None,
+                    config_options: Some(invalid.clone()),
+                },
+                EventBody::Config {
+                    config_options: invalid.clone(),
+                },
+                update(json!({"sessionUpdate": "config_option_update", "configOptions": invalid})),
+            ] {
+                assert_eq!(fold(vec![body.clone()]).config_options, None);
+                let mut f = fold(vec![EventBody::Config {
+                    config_options: initial.clone(),
+                }]);
+                f.apply(&ev(2, body));
+                assert_eq!(f.config_options.as_ref(), Some(&initial));
+                assert_eq!(f.head_seq, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_config_lists_legitimately_replace_preceding_state_in_every_event() {
+        let initial = json!([{"id": "thinking", "name": "Thinking", "type": "boolean", "currentValue": true}]);
+        for mut body in [
+            json!({"e": "session", "via": "load", "sessionId": "s", "configOptions": []}),
+            json!({"e": "config", "configOptions": []}),
+            json!({"e": "update", "update": {
+                "sessionUpdate": "config_option_update", "configOptions": []
+            }}),
+        ] {
+            let mut f = fold(vec![EventBody::Config {
+                config_options: initial.clone(),
+            }]);
+            body["seq"] = json!(2);
+            body["ts"] = json!(1002);
+            f.apply(&serde_json::from_value::<JournalEvent>(body).unwrap());
+            assert_eq!(f.config_options, Some(json!([])));
+            assert_eq!(f.head_seq, 2);
+        }
     }
 
     #[test]

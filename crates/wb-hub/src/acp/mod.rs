@@ -5,13 +5,14 @@
 //! supervisor task per sid reloads the session from disk when its actor panics.
 
 mod agent;
+mod config;
 mod facts;
 mod journal;
 mod lines;
 mod replay;
 mod rpc;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::process::ExitStatusExt;
@@ -30,14 +31,16 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{Instrument, error, info, info_span, warn};
 use wb_proto::hub::{
-    AcpFacts, AcpOpenReply, AcpSessionInfo, Activity, ErrorCode, ExitReason, Fault, FaultCode,
-    HubMessage, Kind, PendingKind, SpawnAcp, Summary,
+    AcpFacts, AcpOpenReply, AcpSessionInfo, Activity, ConfigError, ConfigOption, ErrorCode,
+    ExitReason, Fault, FaultCode, HubMessage, Kind, PendingKind, SpawnAcp, Summary,
 };
 use wb_proto::journal::{
     EventBody, JournalEvent, NoticeLevel, ResolvedBy, SessionVia, SetupErrorCode, SpawnVia,
     TurnErrorCode,
 };
-use wb_proto::limits::{ACP_REPLAY_MAX, CONN_QUEUE, PROMPT_MAX, SETUP_IDLE_TIMEOUT};
+use wb_proto::limits::{
+    ACP_CONFIG_MAX, ACP_REPLAY_MAX, CONN_QUEUE, PROMPT_MAX, SETUP_IDLE_TIMEOUT,
+};
 
 use self::agent::{Agent, Out};
 use self::facts::Facts;
@@ -172,6 +175,19 @@ impl Cmd {
 /// Boxed because a forgotten actor routes its queued opens through here again.
 pub fn open(ctx: Arc<Ctx>, sid: String, open: Open) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     Box::pin(async move {
+        if let Some(spawn) = &open.spawn {
+            if spawn.config.len() > ACP_CONFIG_MAX {
+                return open
+                    .reply
+                    .err(ErrorCode::BadRequest, "config has more than 16 entries");
+            }
+            let mut ids = BTreeSet::new();
+            if spawn.config.iter().any(|option| !ids.insert(&option.id)) {
+                return open
+                    .reply
+                    .err(ErrorCode::BadRequest, "config has duplicate ids");
+            }
+        }
         // The second round covers an actor that was forgotten between the lookup and
         // the send; it removed its registry entry before it stopped receiving.
         for _ in 0..2 {
@@ -544,6 +560,9 @@ enum Purpose {
         reply: Reply,
         deadline: Instant,
     },
+    StartupConfig {
+        deadline: Instant,
+    },
     Authenticate(Reply),
     Close,
 }
@@ -565,6 +584,14 @@ struct HeldReq {
     rpc_id: Value,
     kind: PendingKind,
     option_ids: Vec<String>,
+}
+
+/// The creating open waits for this ordered batch; no live action may interleave.
+struct StartupConfig {
+    open: Open,
+    remaining: VecDeque<ConfigOption>,
+    current: Option<ConfigOption>,
+    errors: Vec<ConfigError>,
 }
 
 enum Event {
@@ -598,6 +625,7 @@ struct Acp {
     /// How the agent ended while the journal was faulted, for the probe's `exit`.
     fault_exit: Option<(Option<i32>, Option<i32>, ExitReason)>,
     proc: Option<Proc>,
+    startup_config: Option<StartupConfig>,
     /// The agent's requests waiting for an answer, by `req`.
     held: BTreeMap<u64, HeldReq>,
     /// A `session` event follows the last `spawn`.
@@ -644,6 +672,7 @@ impl Acp {
             fault: None,
             fault_exit: None,
             proc: None,
+            startup_config: None,
             held: BTreeMap::new(),
             has_session: false,
             load_filter: false,
@@ -870,8 +899,18 @@ impl Acp {
                 return self.abandon(o.reply, ErrorCode::Internal, msg);
             }
         }
-        let _ = self.spawn(SpawnVia::New);
-        self.open(o, true);
+        if spawn.config.is_empty() {
+            let _ = self.spawn(SpawnVia::New);
+            self.open(o, true);
+        } else {
+            self.startup_config = Some(StartupConfig {
+                open: o,
+                remaining: spawn.config.into(),
+                current: None,
+                errors: Vec::new(),
+            });
+            let _ = self.spawn(SpawnVia::New);
+        }
     }
 
     /// Checks a spawn on another host (DESIGN §3.8.5); the cwd is not looked up here.
@@ -1019,6 +1058,17 @@ impl Acp {
 
     /// Folds an event that is on disk, sends it to the viewers and publishes.
     fn applied(&mut self, ev: JournalEvent) {
+        let setup_error = match &ev.body {
+            EventBody::SetupError { code, message, .. } => Some((
+                match code {
+                    SetupErrorCode::Timeout => ErrorCode::Timeout,
+                    SetupErrorCode::SpawnFailed => ErrorCode::SpawnFailed,
+                    _ => ErrorCode::AgentError,
+                },
+                message.clone(),
+            )),
+            _ => None,
+        };
         match ev.body {
             EventBody::Spawn { .. } => self.has_session = false,
             EventBody::Session { .. } => self.has_session = true,
@@ -1044,6 +1094,9 @@ impl Acp {
         });
         self.fan_out(&msg);
         self.publish();
+        if let Some((code, message)) = setup_error {
+            self.fail_startup_config(code, &message);
+        }
     }
 
     /// A journal write failed (H-9): the agent's requests are cancelled, the agent is
@@ -1144,7 +1197,11 @@ impl Acp {
                 agent: self.meta.agent.clone(),
                 agent_session_id: facts.agent_session_id.clone(),
                 revivable: facts.revivable(self.meta.init.as_ref()),
-                activity: facts.activity,
+                activity: if self.startup_config.is_some() {
+                    Activity::Setup
+                } else {
+                    facts.activity
+                },
                 pending: facts.pending.clone(),
                 last: facts.last.clone(),
                 head_seq: facts.head_seq,
@@ -1245,6 +1302,10 @@ impl Acp {
     /// Attaches a connection: its `ok`, the replay and `acp.replayed` are sent by a pump
     /// task, and live events wait in its backlog until the pump is done (10-hub §7.9).
     fn open(&mut self, o: Open, new: bool) {
+        self.open_with_config_errors(o, new, Vec::new());
+    }
+
+    fn open_with_config_errors(&mut self, o: Open, new: bool, config_errors: Vec<ConfigError>) {
         let Open {
             viewer,
             since,
@@ -1280,6 +1341,7 @@ impl Acp {
             head,
             from: since + 1,
             reset,
+            config_errors,
         };
         let pump = Pump {
             sid: self.sid.clone(),
@@ -1337,6 +1399,19 @@ impl Acp {
     }
 
     fn act(&mut self, act: Act, reply: Reply) {
+        if self.startup_config.is_some()
+            && matches!(
+                &act,
+                Act::Prompt(_)
+                    | Act::Cancel
+                    | Act::SetMode(_)
+                    | Act::SetConfigOption { .. }
+                    | Act::Revive
+                    | Act::Authenticate(_)
+            )
+        {
+            return reply.err(ErrorCode::Busy, "startup configuration is being applied");
+        }
         match act {
             Act::Prompt(blocks) => self.prompt(blocks, reply),
             Act::Cancel => self.cancel(reply),
@@ -1531,6 +1606,26 @@ impl Acp {
         if epoch != self.created_at {
             return reply.err(ErrorCode::Stale, "the session was created again");
         }
+        if let Err((code, message)) = self.check_config_option(&config_id, &value) {
+            return reply.err(code, message);
+        }
+        let session = self.facts.agent_session_id.clone().unwrap_or_default();
+        let purpose = Purpose::SetConfigOption {
+            reply,
+            deadline: Instant::now() + SET_CONFIG_TIMEOUT,
+        };
+        if let Err(purpose) = self.request(purpose, |id| {
+            rpc::set_config_option(id, &session, &config_id, &value)
+        }) {
+            purpose.fail(ErrorCode::Internal, "agent not reading stdin");
+        }
+    }
+
+    fn check_config_option(
+        &self,
+        config_id: &str,
+        value: &Value,
+    ) -> Result<(), (ErrorCode, String)> {
         let offered = self
             .facts
             .config_options
@@ -1539,7 +1634,7 @@ impl Acp {
             .and_then(|options| {
                 options
                     .iter()
-                    .find(|option| option["id"].as_str() == Some(&config_id))
+                    .find(|option| option["id"].as_str() == Some(config_id))
             });
         let valid = offered.is_some_and(|option| match option["type"].as_str() {
             Some("boolean") => value.is_boolean(),
@@ -1558,20 +1653,142 @@ impl Acp {
             _ => false,
         });
         if !valid {
-            return reply.err(
+            return Err((
                 ErrorCode::BadOption,
                 format!("configuration {config_id} or its value is not offered"),
-            );
+            ));
+        }
+        Ok(())
+    }
+
+    fn advance_startup_config(&mut self) {
+        let Some(batch) = &mut self.startup_config else {
+            return;
+        };
+        let Some(option) = batch.remaining.pop_front() else {
+            let batch = self.startup_config.take().unwrap();
+            return self.open_with_config_errors(batch.open, true, batch.errors);
+        };
+        let value = match &option.value {
+            wb_proto::hub::ConfigValue::String(value) => Value::String(value.clone()),
+            wb_proto::hub::ConfigValue::Boolean(value) => Value::Bool(*value),
+        };
+        let config_id = option.id.clone();
+        batch.current = Some(option);
+        if let Err(error) = self.check_config_option(&config_id, &value) {
+            return self.startup_config_result(Err(error));
         }
         let session = self.facts.agent_session_id.clone().unwrap_or_default();
-        let purpose = Purpose::SetConfigOption {
-            reply,
+        let purpose = Purpose::StartupConfig {
             deadline: Instant::now() + SET_CONFIG_TIMEOUT,
         };
-        if let Err(purpose) = self.request(purpose, |id| {
-            rpc::set_config_option(id, &session, &config_id, &value)
+        if self
+            .request(purpose, |id| {
+                rpc::set_config_option(id, &session, &config_id, &value)
+            })
+            .is_err()
+        {
+            self.startup_config_result(Err((
+                ErrorCode::Internal,
+                "agent not reading stdin".into(),
+            )));
+        }
+    }
+
+    fn startup_config_result(&mut self, result: Result<(), (ErrorCode, String)>) {
+        let Some(option) = self
+            .startup_config
+            .as_ref()
+            .and_then(|batch| batch.current.as_ref())
+        else {
+            return;
+        };
+        let failure = result.err();
+        if let Some((code, error)) = &failure {
+            let text = format!(
+                "startup configuration {} failed ({code:?}): {error}",
+                option.id
+            );
+            if !self.record(EventBody::Notice {
+                level: NoticeLevel::Warn,
+                text,
+            }) {
+                return;
+            }
+            if let Some(journal) = &self.journal {
+                drop(journal.sync());
+            }
+        }
+        let Some(batch) = &mut self.startup_config else {
+            return;
+        };
+        let Some(option) = batch.current.take() else {
+            return;
+        };
+        if let Some((code, error)) = failure {
+            batch.errors.push(ConfigError {
+                id: option.id,
+                value: option.value,
+                code,
+                error,
+            });
+        }
+        self.advance_startup_config();
+    }
+
+    /// Releases the accepted creating open, accounting for every unapplied entry.
+    fn fail_startup_config(&mut self, code: ErrorCode, error: &str) {
+        let Some(mut batch) = self.startup_config.take() else {
+            return;
+        };
+        if let Some(p) = &mut self.proc {
+            p.outstanding
+                .retain(|_, purpose| !matches!(purpose, Purpose::StartupConfig { .. }));
+        }
+        for option in batch.current.into_iter().chain(batch.remaining) {
+            if self.record(EventBody::Notice {
+                level: NoticeLevel::Warn,
+                text: format!(
+                    "startup configuration {} failed ({code:?}): {error}",
+                    option.id
+                ),
+            }) && let Some(journal) = &self.journal
+            {
+                drop(journal.sync());
+            }
+            batch.errors.push(ConfigError {
+                id: option.id,
+                value: option.value,
+                code,
+                error: error.to_owned(),
+            });
+        }
+        self.open_with_config_errors(batch.open, true, batch.errors);
+    }
+
+    fn config_result(&mut self, outcome: Result<Value, Value>) -> Result<(), (ErrorCode, String)> {
+        if self.fault.is_some() {
+            return Err((ErrorCode::Faulted, JOURNAL_FAILED.into()));
+        }
+        if self.stage.is_some() {
+            return Err((ErrorCode::NotAlive, "the agent is being stopped".into()));
+        }
+        let result = outcome.map_err(|error| (ErrorCode::AgentError, rpc_message(&error)))?;
+        let Some(options) = result
+            .get("configOptions")
+            .filter(|options| config::valid_options(options))
+        else {
+            return Err((
+                ErrorCode::AgentError,
+                "the session/set_config_option result has invalid configOptions".into(),
+            ));
+        };
+        if self.record(EventBody::Config {
+            config_options: options.clone(),
         }) {
-            purpose.fail(ErrorCode::Internal, "agent not reading stdin");
+            Ok(())
+        } else {
+            Err((ErrorCode::Faulted, JOURNAL_FAILED.into()))
         }
     }
 
@@ -1695,6 +1912,7 @@ impl Acp {
         } else if matches!(self.stage, None | Some((Stage::Close, _))) {
             self.enter(Stage::Stdin);
         }
+        self.fail_startup_config(ErrorCode::NotAlive, "the hub is stopping");
     }
 
     /// Starts ending the agent in stages (DESIGN §3.4.5). A no-op when there is no agent
@@ -1707,6 +1925,18 @@ impl Acp {
         let close =
             self.has_session && self.advertised("/agentCapabilities/sessionCapabilities/close");
         self.enter(if close { Stage::Close } else { Stage::Stdin });
+        self.fail_startup_config(
+            if cause == Cause::Fault {
+                ErrorCode::Faulted
+            } else {
+                ErrorCode::NotAlive
+            },
+            if cause == Cause::Fault {
+                JOURNAL_FAILED
+            } else {
+                "the agent is being stopped"
+            },
+        );
     }
 
     fn enter(&mut self, stage: Stage) {
@@ -1771,9 +2001,9 @@ impl Acp {
         p.outstanding
             .values()
             .filter_map(|purpose| match purpose {
-                Purpose::SetMode { deadline, .. } | Purpose::SetConfigOption { deadline, .. } => {
-                    Some(*deadline)
-                }
+                Purpose::SetMode { deadline, .. }
+                | Purpose::SetConfigOption { deadline, .. }
+                | Purpose::StartupConfig { deadline } => Some(*deadline),
                 _ => None,
             })
             .min()
@@ -1785,11 +2015,20 @@ impl Acp {
         let late: Vec<u64> = p
             .outstanding
             .iter()
-            .filter(|(_, purpose)| matches!(purpose, Purpose::SetMode { deadline, .. } | Purpose::SetConfigOption { deadline, .. } if *deadline <= now))
+            .filter(|(_, purpose)| matches!(purpose, Purpose::SetMode { deadline, .. } | Purpose::SetConfigOption { deadline, .. } | Purpose::StartupConfig { deadline } if *deadline <= now))
             .map(|(id, _)| *id)
             .collect();
-        for id in late {
-            if let Some(purpose) = p.outstanding.remove(&id) {
+        let late: Vec<Purpose> = late
+            .into_iter()
+            .filter_map(|id| p.outstanding.remove(&id))
+            .collect();
+        for purpose in late {
+            if matches!(purpose, Purpose::StartupConfig { .. }) {
+                self.startup_config_result(Err((
+                    ErrorCode::Timeout,
+                    "the agent did not answer session/set_config_option in 30 s".into(),
+                )));
+            } else {
                 let method = match &purpose {
                     Purpose::SetConfigOption { .. } => "session/set_config_option",
                     _ => "session/set_mode",
@@ -1885,32 +2124,14 @@ impl Acp {
                 Ok(_) => reply.err(ErrorCode::Faulted, JOURNAL_FAILED),
                 Err(e) => reply.err(ErrorCode::AgentError, rpc_message(&e)),
             },
-            Purpose::SetConfigOption { reply, .. } if self.fault.is_some() => {
-                reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
-            }
-            Purpose::SetConfigOption { reply, .. } => match outcome {
-                Ok(_) if self.stage.is_some() => {
-                    reply.err(ErrorCode::NotAlive, "the agent is being stopped")
-                }
-                Ok(result) => match result
-                    .get("configOptions")
-                    .filter(|options| options.is_array())
-                {
-                    Some(options)
-                        if self.record(EventBody::Config {
-                            config_options: options.clone(),
-                        }) =>
-                    {
-                        reply.done()
-                    }
-                    Some(_) => reply.err(ErrorCode::Faulted, JOURNAL_FAILED),
-                    None => reply.err(
-                        ErrorCode::AgentError,
-                        "the session/set_config_option result has no configOptions array",
-                    ),
-                },
-                Err(e) => reply.err(ErrorCode::AgentError, rpc_message(&e)),
+            Purpose::SetConfigOption { reply, .. } => match self.config_result(outcome) {
+                Ok(()) => reply.done(),
+                Err((code, message)) => reply.err(code, message),
             },
+            Purpose::StartupConfig { .. } => {
+                let result = self.config_result(outcome);
+                self.startup_config_result(result);
+            }
             Purpose::Authenticate(reply) => match outcome {
                 Ok(_) if self.stage.is_some() => {
                     reply.err(ErrorCode::NotAlive, "the agent is being stopped");
@@ -2015,6 +2236,20 @@ impl Acp {
             }
             Err(e) => return self.revive_step(Some((via, e))),
         };
+        if result
+            .get("configOptions")
+            .is_some_and(|options| !options.is_null() && !config::valid_options(options))
+        {
+            self.record(EventBody::SetupError {
+                code: SetupErrorCode::AgentError,
+                message: format!(
+                    "the session/{} result has invalid configOptions",
+                    via_name(via)
+                ),
+                rpc: None,
+            });
+            return self.stop_failed_setup();
+        }
         // Only `session/new` names the session; resume and load keep the known one.
         let session_id = match via {
             SessionVia::New => result
@@ -2048,6 +2283,9 @@ impl Acp {
                 level: NoticeLevel::Info,
                 text: format!("revived via session/{}", via_name(via)),
             });
+        }
+        if via == SessionVia::New && self.startup_config.is_some() {
+            self.advance_startup_config();
         }
     }
 
@@ -2131,6 +2369,13 @@ impl Acp {
                 let variant = update.get("sessionUpdate").and_then(Value::as_str);
                 if self.load_filter && variant.is_some_and(|v| HISTORY.contains(&v)) {
                     return;
+                }
+                if variant == Some("config_option_update")
+                    && !update
+                        .get("configOptions")
+                        .is_some_and(config::valid_options)
+                {
+                    return self.log("dropped a config_option_update with invalid configOptions");
                 }
                 let session_id = params
                     .get("sessionId")
@@ -2253,6 +2498,7 @@ impl Acp {
         for purpose in p.outstanding.into_values() {
             purpose.fail(ErrorCode::NotAlive, "the agent exited");
         }
+        self.fail_startup_config(ErrorCode::NotAlive, "the agent exited");
         // ROB-13: a kill the user asked for is not an error to report.
         if user_kill && self.fault.is_none() {
             self.set_seen(self.facts.head_seq);

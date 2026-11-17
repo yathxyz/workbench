@@ -24,6 +24,8 @@ pub const CONN_QUEUE: usize = 4 * MIB;
 pub const ACP_REPLAY_MAX: usize = 4 * MIB;
 /// Largest prompt. Larger is `bad_request`.
 pub const PROMPT_MAX: usize = 8 * MIB;
+/// Most ordered configuration entries in an ACP spawn. Larger is `bad_request`.
+pub const ACP_CONFIG_MAX: usize = 16;
 /// Scrollback lines kept by the VT state.
 pub const VT_SCROLLBACK: usize = 1000;
 /// Largest snapshot. The scrollback budget is halved until it fits.

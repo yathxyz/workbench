@@ -77,8 +77,11 @@ enum Scenario {
     SetMode,
     Config,
     ConfigResult,
+    ConfigBatch,
     ConfigError,
     ConfigMalformed,
+    ConfigMalformedList,
+    ConfigNewMalformed,
     ConfigHang,
     ConfigExit,
     KillStubborn,
@@ -115,6 +118,9 @@ enum Scenario {
 /// - `set-mode`: `session/set_mode` sends no `current_mode_update`;
 /// - `config`: initial select/grouped/boolean options; config changes send an update;
 /// - `config-result`: config changes return the complete list without a notification;
+/// - `config-batch`: creation/config replies wait for numbered steps in `<record>.step`;
+/// - `config-malformed-list`: returns malformed lists/updates, or clears on thinking=false;
+/// - `config-new-malformed`: returns a malformed list from session creation;
 /// - `config-error`, `config-malformed`, `config-hang`, `config-exit`: refuse a config
 ///   request, return a malformed result, defer the answer until a prompt, or exit;
 /// - `kill-stubborn`: SIGTERM and the end of stdin are ignored, and a prompt never ends;
@@ -125,7 +131,7 @@ enum Scenario {
 ///   with the agent's stdout and stderr, and exits 1;
 /// - `setsid-child`: a prompt starts `sleep 1000` in a process group of its own, with
 ///   no stdio, and exits 1.
-const SCENARIOS: [(&str, Scenario); 27] = [
+const SCENARIOS: [(&str, Scenario); 30] = [
     ("basic", Scenario::Basic),
     ("noise", Scenario::Noise),
     ("permission", Scenario::Permission),
@@ -145,8 +151,11 @@ const SCENARIOS: [(&str, Scenario); 27] = [
     ("set-mode", Scenario::SetMode),
     ("config", Scenario::Config),
     ("config-result", Scenario::ConfigResult),
+    ("config-batch", Scenario::ConfigBatch),
     ("config-error", Scenario::ConfigError),
     ("config-malformed", Scenario::ConfigMalformed),
+    ("config-malformed-list", Scenario::ConfigMalformedList),
+    ("config-new-malformed", Scenario::ConfigNewMalformed),
     ("config-hang", Scenario::ConfigHang),
     ("config-exit", Scenario::ConfigExit),
     ("kill-stubborn", Scenario::KillStubborn),
@@ -282,6 +291,7 @@ async fn main() -> ExitCode {
         effort: "low".into(),
         thinking: false,
         delayed_config: None,
+        config_step: 0,
         authenticated: false,
         titled: false,
         cancelled: false,
@@ -309,6 +319,7 @@ struct Fake {
     effort: String,
     thinking: bool,
     delayed_config: Option<Value>,
+    config_step: u64,
     authenticated: bool,
     /// The keyword mode titles the session on its first prompt.
     titled: bool,
@@ -336,6 +347,24 @@ impl Fake {
             return;
         };
         let params = &msg["params"];
+        if self.scenario == Scenario::ConfigBatch
+            && matches!(method, "session/new" | "session/set_config_option")
+        {
+            self.config_step += 1;
+            if let Some(record) = &self.rec.0 {
+                let gate = record.with_extension("step");
+                loop {
+                    let released = std::fs::read_to_string(&gate)
+                        .ok()
+                        .and_then(|step| step.parse::<u64>().ok())
+                        .is_some_and(|step| step >= self.config_step);
+                    if released {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
         match method {
             "initialize" => self.initialize(id),
             "session/new" => self.new_session(id, params),
@@ -435,11 +464,14 @@ impl Fake {
             return self.error(id, -32000, "Authentication required");
         }
         self.session = format!("fake-session-{}", std::process::id());
-        let result = json!({
+        let mut result = json!({
             "sessionId": self.session,
             "modes": self.modes(),
             "configOptions": self.session_config_options(),
         });
+        if self.scenario == Scenario::ConfigNewMalformed {
+            result["configOptions"] = json!([null]);
+        }
         self.reply(id, result);
     }
 
@@ -509,8 +541,11 @@ impl Fake {
             self.scenario,
             Scenario::Config
                 | Scenario::ConfigResult
+                | Scenario::ConfigBatch
                 | Scenario::ConfigError
                 | Scenario::ConfigMalformed
+                | Scenario::ConfigMalformedList
+                | Scenario::ConfigNewMalformed
                 | Scenario::ConfigHang
                 | Scenario::ConfigExit
         )
@@ -544,6 +579,21 @@ impl Fake {
             Scenario::ConfigMalformed => return self.reply(id, json!({})),
             Scenario::ConfigExit => std::process::exit(1),
             _ => {}
+        }
+        if self.scenario == Scenario::ConfigMalformedList {
+            let options = match params["configId"].as_str() {
+                Some("model") => json!([null]),
+                Some("effort") => json!([{
+                    "id": "effort", "name": "Effort", "type": "select", "currentValue": "high",
+                    "options": [{"group": "bad", "name": "Bad", "options": [{"value": 1, "name": "One"}]}]
+                }]),
+                _ if params["value"] == false => json!([]),
+                _ => json!([{
+                    "id": "thinking", "name": "Thinking", "type": "boolean", "currentValue": "true"
+                }]),
+            };
+            self.update(json!({"sessionUpdate": "config_option_update", "configOptions": options}));
+            return self.reply(id, json!({"configOptions": options}));
         }
         if !self.has_config() {
             return self.error(id, -32602, "No configuration offered");
@@ -634,6 +684,10 @@ impl Fake {
             Scenario::ReplayLarge => self.large_turn().await,
             Scenario::CrashLeaveChild => self.leave_child(false),
             Scenario::SetsidChild => self.leave_child(true),
+            Scenario::ConfigBatch => {
+                self.say(&format!("model={} effort={}", self.model, self.effort));
+                "end_turn"
+            }
             _ => self.stream_turn(),
         };
         if self.cancelled { "cancelled" } else { stop }
