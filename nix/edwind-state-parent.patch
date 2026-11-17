@@ -1,0 +1,18 @@
+diff --git a/nix/edwind-module.nix b/nix/edwind-module.nix
+--- a/nix/edwind-module.nix
++++ b/nix/edwind-module.nix
+@@ -255,7 +255,13 @@
+     # The state and config directories exist before the unit starts (R14.10); the parents are the user's, left
+     # as they are when present.
+     systemd.tmpfiles.rules =
+-      map (d: "d ${d} - ${cfg.user} ${userCfg.group} -") (pinnedPaths ++ [ "${home}/.local/state" ])
++      # An implicit root-owned edwin parent makes tmpfiles reject the path below the user's state directory.
++      map (d: "d ${d} - ${cfg.user} ${userCfg.group} -") (
++        pinnedPaths ++ [
++          "${home}/.local/state"
++          "${home}/.local/state/edwin"
++        ]
++      )
+       ++ map (d: "d ${d} 0700 ${cfg.user} ${userCfg.group} -") (
+         refusePaths
+         ++ [

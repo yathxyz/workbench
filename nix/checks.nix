@@ -214,7 +214,22 @@ in
     };
   };
 
-  vm = pkgs.testers.runNixOSTest (import ./vm.nix { inherit self; });
+  vm =
+    let
+      # Temporary: remove this patch when the edwin input contains the parent-directory rule.
+      # It will then fail to apply, reminding us to remove it.
+      edwinSource = pkgs.applyPatches {
+        name = "edwin-state-parent";
+        src = edwin;
+        patches = [ ./edwind-state-parent.patch ];
+      };
+    in
+    pkgs.testers.runNixOSTest (
+      import ./vm.nix {
+        inherit self;
+        edwindModule = import "${edwinSource}/nix/edwind-module.nix" edwin;
+      }
+    );
 
   # The module's assertions refuse what wb-hub would refuse at its next start, so a bad name
   # fails the evaluation instead of the first hub restart after a deploy.

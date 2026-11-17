@@ -1545,12 +1545,13 @@ The flake builds the workspace with `buildRustPackage` (`cargoLock.lockFile`), b
 | Security regressions (`tests/test_security.py`, Caddy in the loop) | `security` | nix/test work packages | every merge |
 | Frontend (`tests/ui.mts`, headless Chromium, stub agent) | `ui` | frontend work packages | every merge from M1 |
 | Module assertions (one valid and four bad configurations, N-11) | `module` | nix work packages | every merge |
-| NixOS VM (`nix/vm.nix`) | `vm` (needs kvm) | nix work packages | every milestone |
+| NixOS VM (`nix/vm.nix`) | `vm` (needs kvm) | nix work packages | deploying host's release gate |
 | Adapter probe against the stub (`lib.adapterCheck`, N-9) | `adapters` | M3-N | every merge |
 | Real adapters, offline (`lib.adapterCheck`) | a downstream flake check | M3-N | every adapter or workbench bump |
 | Credentialed adapter smoke | manual on the deployment host, `#[ignore]` | operator | M3 deploy and each adapter bump |
 
 **Rules.**
+- The VM check passes on a fresh home and belongs in a deploying host's explicit list of gated checks.
 - No sleeps in tests except the `hang` scenario and the 20 ms holdback; wait on events.
 - Sockets live under `$TMPDIR`, and shells come from `$BASH`.
 - Tests never hard-code `/run/current-system`.
@@ -1587,6 +1588,7 @@ The flake builds the workspace with `buildRustPackage` (`cargoLock.lockFile`), b
 
 The test runs numbered steps. The steps this design pins down:
 - **Agent:** `stub` from `packages.fake-acp`.
+- **Fresh home:** Edwin's pinned system-service module is patched by `nix/edwind-state-parent.patch` to declare the user-owned `~/.local/state/edwin` parent. Otherwise tmpfiles creates it as root and rejects the unsafe ownership transition before creating `edwind/`; an existing user-owned parent on a deployed host masks the bug. The VM provisions its notes tree before boot because it is host data, and checks edwind at boot plus the state directories' ownership and private state mode.
 - **Memory limit:** the base configuration sets `MemoryMax = "400M"` as a plain value (a plain value beats the module's `mkDefault`), and the specialisation uses `mkForce "500M"`; `mkForce` on both is rejected by the unit option type. There is no `MemoryHigh`. The node sets `vm.panic_on_oom = 0`, because the test instrumentation's default of 2 would panic the whole VM at the cgroup OOM step.
 - **Step 3:** `wbctl pty-open s1 --spawn`; `wbctl acp-new a1 --agent stub` sends `ask-permission` and waits for the pending permission, recording its `req` and `createdAt`.
 - **Step 4 (web restart):** the shell PID is unchanged, and `wbctl pty-attach s1 --resume <stream,out>` gets `resumed:true` and a ring tail without the snapshot prefix. `acp-attach a1` shows the same `createdAt` and exactly the same pending `req`; answering it ends the turn with `PONG` and leaves nothing pending.

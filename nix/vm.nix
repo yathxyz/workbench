@@ -8,7 +8,7 @@
 # restart leaving it alone, and edit.sock refused to another uid (R16.12). Step 11 is `wb` board tools
 # (DESIGN 3.3, fix 4): web.sock's modes, and `wb read_node` from a card without a page (exit 7) and
 # with wbctl's page open on /rpc (the page's text, exit 0).
-{ self }:
+{ self, edwindModule }:
 let
   secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
   wrongSecret = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
@@ -33,7 +33,7 @@ in
       {
         imports = [
           self.nixosModules.workbench
-          self.inputs.edwin.nixosModules.edwind
+          edwindModule
         ];
         virtualisation.memorySize = 2048;
         virtualisation.cores = 2;
@@ -45,6 +45,11 @@ in
           linger = true;
         };
         users.users.bob.isNormalUser = true;
+        # The notes are host data, not daemon state; a fresh VM has no existing notes tree.
+        systemd.tmpfiles.rules = [
+          "d ${config.users.users.alice.home}/work - alice users -"
+          "d ${config.services.edwind.notesDir} 0700 alice users -"
+        ];
         # Passwordless sudo, so that NoNewPrivileges is what stops sudo in a card.
         security.sudo.wheelNeedsPassword = false;
         nix.settings.experimental-features = [ "nix-command" ];
@@ -199,6 +204,10 @@ in
           wb.wait_for_unit("workbench-hub.service")
           wb.wait_for_file(HUB_SOCK)
           wb.wait_for_unit("workbench-web.service")
+          wb.wait_for_unit("edwind.service", timeout=60)
+          state_dir = "${nodes.wb.services.edwind.stateDir}"
+          assert wb.succeed(f"stat -c %U:%G {shlex.quote(state_dir + '/..')}").strip() == "alice:users"
+          assert wb.succeed(f"stat -c '%U:%G %a' {shlex.quote(state_dir)}").strip() == "alice:users 700"
           wb.wait_for_open_port(8090, WB_IP)
           proxy.wait_for_unit("caddy.service")
           proxy.wait_for_open_port(80)
@@ -397,7 +406,7 @@ in
 
       with subtest("10: edwind: the unit, wb buf and wb eval, a restart, the web restart, edit.sock peers"):
           EDIT_SOCK = "/run/edwind/edit.sock"
-          wb.wait_for_unit("edwind.service")
+          assert wb.succeed("systemctl is-active edwind").strip() == "active"
           wb.wait_until_succeeds(f"test -S {EDIT_SOCK}", timeout=30)
           assert wb.succeed(f"stat -c %a /run/edwind {EDIT_SOCK}").split() == ["700", "600"]
           assert wb.succeed(f"stat -c %U /run/edwind {EDIT_SOCK}").split() == ["alice", "alice"]
@@ -411,7 +420,6 @@ in
               return wb.succeed("set -o pipefail; " + pipe + as_user("alice", f"env HOME={HOME} wb {cmd}"))
 
           # R16.18: a write and a read round trip; wb eval on the server image.
-          wb.succeed(f"mkdir -p {HOME}/work/roam && chown alice:users {HOME}/work {HOME}/work/roam")
           wb_cli("buf write t.md --append --create -", "hello\n")
           assert wb_cli("buf read t.md") == "hello\n"
           assert wb_cli("eval '(+ 1 2)'").strip() == "3"
