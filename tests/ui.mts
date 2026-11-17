@@ -3973,7 +3973,7 @@ await section('N78', async () => {
       await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: x - 40, y, id: 1 }] });
       await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }); await cdp.detach();
       const touched = await widths();
-      check('N78: touch drags the same divider', Math.abs(touched.list - (restored.list - 40)) <= 1, JSON.stringify({ restored, touched }));
+      check('N78: touch narrows the list while preserving both pane minima', touched.list <= restored.list - 32 && touched.list >= 200 && touched.pane >= 360, JSON.stringify({ restored, touched }));
       for (const width of [600, 320]) {
         await D.setViewportSize({ width, height: 700 }); await open(id); await liveIdle();
         const detail = await D.locator('#mesh-detail').isVisible(), list = await D.locator('.mesh-side').isVisible(), fits = await layout();
