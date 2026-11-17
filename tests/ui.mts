@@ -3780,9 +3780,9 @@ await section('N78', async () => {
     ws.onmessage = e => { const m = JSON.parse(e.data); if (m.t === 'hello') { ws.close(); resolve(); } else if (m.t === 'error') { ws.close(); reject(new Error(m.error)); } };
     ws.onerror = () => reject(new Error('external PTY open failed'));
   }), id);
-  const report = async (who: 'near' | 'far', session: string, more: Record<string, unknown> = {}, kind = 'prompt') =>
+  const report = async (who: 'near' | 'far', session: string, more: Record<string, unknown> = {}, kind = 'prompt', text = 'n78 observed prompt') =>
     (await fetch(H.api + '/v1/events', { method: 'POST', headers: { Authorization: 'Bearer ' + fs.readFileSync(H.apiTokenFiles[who], 'utf8').trim(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ harness: 'pi', payload: { session_id: session, kind, cwd, model, permission_mode: 'default', text: 'n78 observed prompt' }, ...more }) })).status;
+      body: JSON.stringify({ harness: 'pi', payload: { session_id: session, kind, cwd, model, permission_mode: 'default', text }, ...more }) })).status;
   const row = (id: string) => D.locator(`#mesh-list .mesh-row[data-id="${id}"]`);
   const info = () => D.evaluate(() => Object.fromEntries([...document.querySelectorAll('#mesh-detail .mesh-info .mesh-kv')].map(e => [e.querySelector('span')!.textContent!, e.querySelector('code')!.textContent!])));
   const nodes = () => D.evaluate(() => Object.keys(window.__canvas.S.nodes).sort().join());
@@ -3925,6 +3925,64 @@ await section('N78', async () => {
       const restored = await until(async () => !await D.locator('#mesh-detail .ag-editor').count() && await D.inputValue(composer) === 'n78 editor restores edited', 10000);
       check('N78: a local unsaved Edwin prompt sends with C-c C-c; C-c C-k restores the current text without sending',
         local && !!sent && !!restored && acpSent(D, sid, 'prompt').length === prompts && await nodes() === before, JSON.stringify({ local, sent, restored, prompts, now: acpSent(D, sid, 'prompt').length }));
+    });
+
+    await section('N78 layout', async () => {
+      const viewport = D.viewportSize()!, prompt = 'Long observed prompt '.repeat(100).slice(0, 2000);
+      const created = await meshApi('/sessions', 'POST', { sid: 'n78_layout_api', agent: 'stub', cwd });
+      if (created.status !== 201) throw new Error('N78 layout ACP spawn: ' + created.status);
+      await report('near', 'n78-layout', { wbSession: 'n78_layout_api' }, 'prompt', prompt);
+      const id = await until(() => D.evaluate((prompt: string) => Object.values<ObservedSession>(window.__canvas.OBS).find(o => o.sessionId === 'n78-layout' && o.lastPrompt === prompt)?.id, prompt), 10000);
+      if (!id) throw new Error('N78 layout session did not arrive');
+      const layout = () => D.evaluate(() => {
+        const rect = (s: string) => document.querySelector(s)!.getBoundingClientRect(), pane = rect('#mesh-detail'), live = rect('.mesh-live > .body'), input = rect('#mesh-detail .ag-in');
+        const buttons = [...document.querySelectorAll<HTMLElement>('.mesh-head button')].filter(e => !e.hidden).map(e => {
+          const r = e.getBoundingClientRect(); return { text: e.textContent, x: r.x, y: r.y, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
+        });
+        return { buttons, inside: buttons.every(r => r.width > 0 && r.height > 0 && r.x >= pane.left && r.right <= pane.right && r.y >= pane.top && r.bottom <= pane.bottom && r.x >= 0 && r.right <= innerWidth && r.y >= 0 && r.bottom <= innerHeight),
+          pane: pane.height, live: live.height, gap: pane.bottom - input.bottom, facts: !document.querySelector<HTMLElement>('.mesh-info')!.hidden };
+      });
+      const widths = () => D.evaluate(() => ({ list: document.querySelector('.mesh-side')!.getBoundingClientRect().width, pane: document.querySelector('#mesh-detail')!.getBoundingClientRect().width }));
+      const drag = async (x: number) => { const r = (await D.locator('#mesh-grip').boundingBox())!; await D.mouse.move(r.x + r.width / 2, r.y + 100); await D.mouse.down(); await D.mouse.move(x, r.y + 100, { steps: 8 }); await D.mouse.up(); };
+      for (const size of [{ width: 1280, height: 800 }, { width: 900, height: 700 }]) {
+        await D.setViewportSize(size); await open(id); await liveIdle();
+        const closed = await layout();
+        await D.getByRole('button', { name: 'Details', exact: true }).click();
+        const expanded = await layout(), promptShown = await D.locator('.mesh-info .mesh-kv').filter({ hasText: /^prompt/ }).locator('code').textContent();
+        const facts = await D.locator('.mesh-info').evaluate(e => ({ height: e.getBoundingClientRect().height, scroll: getComputedStyle(e).overflowY }));
+        check(`N78: ${size.width}×${size.height} compact header contains every action, gives the session half the pane and keeps a composer gap; disclosure reveals 2,000 characters without shifting actions`,
+          !closed.facts && closed.inside && closed.live >= closed.pane / 2 && closed.gap >= 8 && expanded.facts && expanded.inside && expanded.live >= expanded.pane / 2
+          && promptShown === prompt && facts.height <= size.height * .35 && facts.scroll === 'auto' && JSON.stringify(closed.buttons) === JSON.stringify(expanded.buttons),
+          JSON.stringify({ closed, expanded, facts, promptLength: promptShown?.length }));
+        await open(sid); await liveIdle(); await open(id); await liveIdle();
+        check('N78: disclosure stays open across selection during this page lifetime', (await layout()).facts);
+        await D.getByRole('button', { name: 'Details', exact: true }).click();
+        await drag(10); const min = await widths();
+        await drag(size.width - 10); const max = await widths();
+        check(`N78: ${size.width}px divider clamps list to 200px and pane to 360px`, Math.abs(min.list - 200) <= 1 && Math.abs(max.pane - 360) <= 1, JSON.stringify({ min, max }));
+        await D.locator('#mesh-grip').dblclick();
+        const reset = await widths(); await D.locator('#mesh-grip').focus(); await D.keyboard.press('ArrowRight'); const right = await widths(); await D.keyboard.press('ArrowLeft'); const left = await widths();
+        check('N78: divider resets to default and keyboard arrows move 16px', Math.abs(reset.list - Math.max(260, Math.round(size.width * .34))) <= 1 && right.list === reset.list + 16 && left.list === reset.list, JSON.stringify({ reset, right, left }));
+      }
+      const before = await widths(); await drag(before.list + 70); const changed = await widths();
+      await reload(); await open(id); await liveIdle(); const restored = await widths();
+      check('N78: dragging changes list width and survives reload; disclosure resets closed', changed.list > before.list + 60 && restored.list === changed.list && !(await layout()).facts, JSON.stringify({ before, changed, restored }));
+      const cdp = await D.context().newCDPSession(D), grip = (await D.locator('#mesh-grip').boundingBox())!, x = grip.x + grip.width / 2, y = grip.y + 100;
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y, id: 1 }] });
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: x - 40, y, id: 1 }] });
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }); await cdp.detach();
+      const touched = await widths();
+      check('N78: touch drags the same divider', Math.abs(touched.list - (restored.list - 40)) <= 1, JSON.stringify({ restored, touched }));
+      for (const width of [600, 320]) {
+        await D.setViewportSize({ width, height: 700 }); await open(id); await liveIdle();
+        const detail = await D.locator('#mesh-detail').isVisible(), list = await D.locator('.mesh-side').isVisible(), fits = await layout();
+        await D.getByRole('button', { name: '← Sessions', exact: true }).click();
+        check(`N78: ${width}px has no divider, one pane at a time and contained actions`, !await D.locator('#mesh-grip').isVisible() && detail && !list && fits.inside && !await D.locator('#mesh-detail').isVisible() && await D.locator('.mesh-side').isVisible(), JSON.stringify(fits));
+      }
+      await D.setViewportSize(viewport);
+      await report('near', 'n78-layout', {}, 'end');
+      await meshApi('/sessions/n78_layout_api?forget=true', 'DELETE');
+      await open(sid); await liveIdle(); await D.locator('#mesh-grip').dblclick();
     });
 
     await row(ids['n78-readonly']).click();
@@ -4184,8 +4242,9 @@ await section('N78', async () => {
     await D.evaluate((ids: (string | undefined)[]) => { const C = window.__canvas; C.setView('canvas'); for (const id of ids) if (id && C.S.nodes[id]) C.removeNode(id); }, [sid, externalPty, owned, ownedPty]);
     if (externalPty) await meshApi('/sessions/' + externalPty + '?forget=true', 'DELETE');
     await meshApi('/sessions/' + sid + '?forget=true', 'DELETE');
+    await meshApi('/sessions/n78_layout_api?forget=true', 'DELETE');
     for (const id of [owned, ownedPty]) if (id) await meshApi('/sessions/' + id + '?forget=true', 'DELETE');
-    for (const id of ['n78-readonly', 'n78-claude', 'n78-hubpty']) await report('near', id, {}, 'end');
+    for (const id of ['n78-readonly', 'n78-claude', 'n78-hubpty', 'n78-layout']) await report('near', id, {}, 'end');
     await report('far', 'n78-tmux', {}, 'end');
     await settled(D); await owner.close(); await D.close();
   }
