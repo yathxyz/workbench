@@ -385,6 +385,24 @@ impl Conn {
             HubRequest::AcpSetMode { rid, sid, mode_id } => {
                 self.act(rid, sid, Act::SetMode(mode_id)).await;
             }
+            HubRequest::AcpSetConfigOption {
+                rid,
+                sid,
+                epoch,
+                config_id,
+                value,
+            } => {
+                self.act(
+                    rid,
+                    sid,
+                    Act::SetConfigOption {
+                        epoch,
+                        config_id,
+                        value,
+                    },
+                )
+                .await;
+            }
             HubRequest::AcpSeen { rid, sid, seq } => self.act(rid, sid, Act::Seen(seq)).await,
             HubRequest::AcpRevive { rid, sid } => self.act(rid, sid, Act::Revive).await,
             HubRequest::AcpAuthenticate {

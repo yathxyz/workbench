@@ -74,6 +74,9 @@ fn request(from: Side, method: &str, p: &Value) {
         (Side::Client, "session/resume") => conforms::<acp::ResumeSessionRequest>(method, p),
         (Side::Client, "session/prompt") => conforms::<acp::PromptRequest>(method, p),
         (Side::Client, "session/set_mode") => conforms::<acp::SetSessionModeRequest>(method, p),
+        (Side::Client, "session/set_config_option") => {
+            conforms::<acp::SetSessionConfigOptionRequest>(method, p)
+        }
         (Side::Client, "authenticate") => conforms::<acp::AuthenticateRequest>(method, p),
         (Side::Agent, "session/request_permission") => {
             conforms::<acp::RequestPermissionRequest>(method, p);
@@ -107,6 +110,9 @@ fn response(from: Side, method: &str, r: &Value) {
         (Side::Agent, "session/resume") => conforms::<acp::ResumeSessionResponse>(&what, r),
         (Side::Agent, "session/prompt") => conforms::<acp::PromptResponse>(&what, r),
         (Side::Agent, "session/set_mode") => conforms::<acp::SetSessionModeResponse>(&what, r),
+        (Side::Agent, "session/set_config_option") => {
+            conforms::<acp::SetSessionConfigOptionResponse>(&what, r)
+        }
         (Side::Agent, "authenticate") => conforms::<acp::AuthenticateResponse>(&what, r),
         (Side::Client, "session/request_permission") => {
             conforms::<acp::RequestPermissionResponse>(&what, r);

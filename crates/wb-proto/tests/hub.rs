@@ -59,7 +59,7 @@ fn summary_acp() -> Value {
             "last": {"seq": 790, "ts": 1791460100000u64, "outcome": "end_turn", "error": null},
             "headSeq": 815, "seenSeq": 790,
             "title": "Fix flaky test",
-            "modeId": "default"
+            "modeId": "default", "configOptions": []
         }
     })
 }
@@ -80,7 +80,7 @@ fn summary_acp_fresh_faulted() -> Value {
                      "error": {"code": "agent_exited", "message": "agent exited"}},
             "headSeq": 5, "seenSeq": 0,
             "title": null,
-            "modeId": null
+            "modeId": null, "configOptions": null
         }
     })
 }
@@ -693,6 +693,8 @@ fn session_info_full() -> Value {
         "modes": {"currentModeId": "default",
                   "availableModes": [{"id": "default", "name": "Default"},
                                      {"id": "plan", "name": "Plan", "description": "Read only"}]},
+        "configOptions": [{"id": "model", "name": "Model", "type": "select", "currentValue": "small",
+                           "options": [{"value": "small", "name": "Small"}]}],
         "availableCommands": [{"name": "review", "description": "Review the diff", "input": null}],
         "plan": {"entries": [{"content": "Fix it", "priority": "high", "status": "in_progress"}]},
         "usage": {"used": 1200, "size": 200000, "cost": null}
@@ -702,7 +704,7 @@ fn session_info_full() -> Value {
 fn session_info_empty() -> Value {
     json!({
         "protocolVersion": null, "agentInfo": null, "agentCapabilities": null,
-        "promptCapabilities": null, "authMethods": null, "modes": null,
+        "promptCapabilities": null, "authMethods": null, "modes": null, "configOptions": null,
         "availableCommands": null, "plan": null, "usage": null
     })
 }
@@ -728,6 +730,7 @@ fn acp_session_info() {
         info,
         AcpSessionInfo {
             protocol_version: Some(1),
+            config_options: Some(json!([])),
             ..AcpSessionInfo::default()
         }
     );
@@ -901,6 +904,17 @@ fn acp_requests() {
             },
         ),
         (
+            json!({"t": "acp.set_config_option", "rid": 22, "sid": "n_agent1",
+                   "epoch": 42, "configId": "thinking", "value": true}),
+            HubRequest::AcpSetConfigOption {
+                rid: 22,
+                sid: sid(),
+                epoch: 42,
+                config_id: "thinking".into(),
+                value: json!(true),
+            },
+        ),
+        (
             json!({"t": "acp.seen", "rid": 18, "sid": "n_agent1", "seq": 815}),
             HubRequest::AcpSeen {
                 rid: 18,
@@ -954,6 +968,9 @@ fn acp_requests_need_their_fields() {
         r#"{"t":"acp.permission","rid":1,"sid":"n_1","req":2,"outcome":{"outcome":"cancelled"}}"#,
         r#"{"t":"acp.elicitation","rid":1,"sid":"n_1","epoch":3,"response":{"action":"cancel"}}"#,
         r#"{"t":"acp.set_mode","rid":1,"sid":"n_1"}"#,
+        r#"{"t":"acp.set_config_option","rid":1,"sid":"n_1","configId":"model","value":"small"}"#,
+        r#"{"t":"acp.set_config_option","rid":1,"sid":"n_1","epoch":3,"value":"small"}"#,
+        r#"{"t":"acp.set_config_option","rid":1,"sid":"n_1","epoch":3,"configId":"model"}"#,
         r#"{"t":"acp.seen","rid":1,"sid":"n_1"}"#,
         r#"{"t":"acp.kill","rid":1,"sid":"n_1"}"#,
     ] {

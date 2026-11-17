@@ -82,7 +82,8 @@ pub fn initialize(id: u64) -> Value {
         "clientCapabilities": {
             "fs": {"readTextFile": false, "writeTextFile": false},
             "terminal": false,
-            "elicitation": {"form": {}, "url": {}}
+            "elicitation": {"form": {}, "url": {}},
+            "session": {"configOptions": {"boolean": {}}}
         }
     });
     request(id, "initialize", params)
@@ -110,6 +111,14 @@ pub fn prompt(id: u64, session_id: &str, blocks: Vec<Value>) -> Value {
 pub fn set_mode(id: u64, session_id: &str, mode_id: &str) -> Value {
     let params = json!({"sessionId": session_id, "modeId": mode_id});
     request(id, "session/set_mode", params)
+}
+
+pub fn set_config_option(id: u64, session_id: &str, config_id: &str, value: &Value) -> Value {
+    let mut params = json!({"sessionId": session_id, "configId": config_id, "value": value});
+    if value.is_boolean() {
+        params["type"] = json!("boolean");
+    }
+    request(id, "session/set_config_option", params)
 }
 
 pub fn authenticate(id: u64, method_id: &str) -> Value {
@@ -157,7 +166,7 @@ mod tests {
         AuthenticateRequest, CancelNotification, CloseSessionRequest, CreateElicitationResponse,
         Error, InitializeRequest, JsonRpcMessage, LoadSessionRequest, NewSessionRequest,
         Notification, PromptRequest, Request, RequestPermissionResponse, ResumeSessionRequest,
-        SetSessionModeRequest,
+        SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     };
     use serde::Serialize;
     use serde::de::DeserializeOwned;
@@ -231,6 +240,7 @@ mod tests {
         let caps = &init["params"]["clientCapabilities"];
         assert!(caps["elicitation"]["form"].is_object());
         assert!(caps["elicitation"]["url"].is_object());
+        assert!(caps["session"]["configOptions"]["boolean"].is_object());
         assert_eq!(
             caps["fs"],
             json!({"readTextFile": false, "writeTextFile": false})
@@ -241,9 +251,32 @@ mod tests {
         round_trip::<Req<ResumeSessionRequest>>(&resume_session(2, "s-1", "/home/alice"));
         round_trip::<Req<LoadSessionRequest>>(&load_session(3, "s-1", "/home/alice"));
         round_trip::<Req<SetSessionModeRequest>>(&set_mode(4, "s-1", "plan"));
+        for value in [json!("large"), json!(true)] {
+            let request = set_config_option(8, "s-1", "model", &value);
+            assert_eq!(request["params"]["value"], value);
+            if value.is_string() {
+                assert!(request["params"].get("type").is_none());
+            } else {
+                assert_eq!(request["params"]["type"], "boolean");
+            }
+            round_trip::<Req<SetSessionConfigOptionRequest>>(&request);
+        }
         round_trip::<Req<AuthenticateRequest>>(&authenticate(5, "login"));
         round_trip::<Req<CloseSessionRequest>>(&close_session(6, "s-1"));
         round_trip::<JsonRpcMessage<Notification<CancelNotification>>>(&cancel("s-1"));
+    }
+
+    #[test]
+    fn config_results_conform() {
+        let options = json!([
+            {"id": "model", "name": "Model", "type": "select", "currentValue": "large",
+             "options": [{"group": "cloud", "name": "Cloud", "options": [{"value": "large", "name": "Large"}]}]},
+            {"id": "thinking", "name": "Thinking", "type": "boolean", "currentValue": true}
+        ]);
+        round_trip::<Resp<SetSessionConfigOptionResponse>>(&result(
+            &json!(8),
+            json!({"configOptions": options}),
+        ));
     }
 
     #[test]

@@ -354,6 +354,19 @@ fn mode() {
 }
 
 #[test]
+fn config() {
+    let options =
+        json!([{"id": "thinking", "name": "Thinking", "type": "boolean", "currentValue": true}]);
+    let event = round_trip(ev(21, "config", json!({"configOptions": options})));
+    assert_eq!(
+        event.body,
+        EventBody::Config {
+            config_options: options
+        }
+    );
+}
+
+#[test]
 fn notice() {
     for (wire, level) in [
         ("info", NoticeLevel::Info),

@@ -21,6 +21,7 @@ pub struct Facts {
     pub title: Option<String>,
     pub mode_id: Option<String>,
     pub modes: Option<Value>,
+    pub config_options: Option<Value>,
     pub available_commands: Option<Value>,
     pub plan: Option<Value>,
     pub usage: Option<Value>,
@@ -41,6 +42,7 @@ impl Default for Facts {
             title: None,
             mode_id: None,
             modes: None,
+            config_options: None,
             available_commands: None,
             plan: None,
             usage: None,
@@ -60,7 +62,10 @@ impl Facts {
                 self.running = true;
             }
             EventBody::Session {
-                session_id, modes, ..
+                session_id,
+                modes,
+                config_options,
+                ..
             } => {
                 self.activity = Activity::None;
                 self.agent_session_id = Some(session_id.clone());
@@ -70,6 +75,7 @@ impl Facts {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 self.modes = modes.clone();
+                self.config_options = config_options.clone();
                 self.revive_failed = false;
             }
             EventBody::SetupError { code, message, .. } => {
@@ -116,6 +122,9 @@ impl Facts {
                 self.pending.retain(|p| p.req != *req);
             }
             EventBody::Mode { mode_id } => self.set_mode(mode_id),
+            EventBody::Config { config_options } => {
+                self.config_options = Some(config_options.clone());
+            }
             EventBody::Exit { .. } => {
                 self.activity = Activity::None;
                 self.running = false;
@@ -196,6 +205,11 @@ impl Facts {
             Some("current_mode_update") => {
                 if let Some(id) = update.get("currentModeId").and_then(Value::as_str) {
                     self.set_mode(id);
+                }
+            }
+            Some("config_option_update") => {
+                if let Some(options) = update.get("configOptions").filter(|v| v.is_array()) {
+                    self.config_options = Some(options.clone());
                 }
             }
             Some("plan") => self.plan = Some(without_tag(update)),
@@ -352,6 +366,36 @@ mod tests {
         assert_eq!(f.mode_id.as_deref(), Some("default"));
         assert_eq!(f.modes, Some(modes));
         assert!(f.running);
+    }
+
+    #[test]
+    fn config_folds_initial_updates_results_and_absent_session_reset() {
+        let initial = json!([{"id": "model", "currentValue": "small"}]);
+        let changed = json!([{"id": "thinking", "currentValue": true}]);
+        let mut f = fold(vec![
+            spawn(),
+            EventBody::Session {
+                via: SessionVia::New,
+                session_id: "s".into(),
+                modes: None,
+                config_options: Some(initial.clone()),
+            },
+        ]);
+        assert_eq!(f.config_options, Some(initial));
+        f.apply(&ev(
+            3,
+            update(json!({"sessionUpdate": "config_option_update", "configOptions": changed})),
+        ));
+        assert_eq!(f.config_options, Some(changed));
+        f.apply(&ev(
+            4,
+            EventBody::Config {
+                config_options: json!([]),
+            },
+        ));
+        assert_eq!(f.config_options, Some(json!([])));
+        f.apply(&ev(5, session("s", None)));
+        assert_eq!(f.config_options, None);
     }
 
     #[test]

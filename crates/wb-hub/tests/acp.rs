@@ -386,6 +386,31 @@ fn keyword_set_mode_reports_the_mode_and_set_mode_scenario_does_not() {
 }
 
 #[test]
+fn fake_config_options_conform_for_initial_grouped_boolean_and_runtime_changes() {
+    let mut a = Agent::start(&[]);
+    let opened = a.open(CWD);
+    let session = opened["sessionId"].as_str().unwrap();
+    let options = &opened["configOptions"];
+    assert_eq!(options[0]["options"][1]["options"][0]["value"], "large");
+    assert_eq!(options[2]["currentValue"], false);
+    let (messages, result) = a.call(
+        "session/set_config_option",
+        json!({"sessionId": session, "configId": "model", "value": "large"}),
+    );
+    assert_eq!(
+        updates(&messages)[0]["sessionUpdate"],
+        "config_option_update"
+    );
+    assert_eq!(result["configOptions"][0]["currentValue"], "large");
+    assert_eq!(result["configOptions"][1]["options"][2]["value"], "max");
+    let (_, result) = a.call(
+        "session/set_config_option",
+        json!({"sessionId": session, "configId": "thinking", "type": "boolean", "value": true}),
+    );
+    assert_eq!(result["configOptions"][2]["currentValue"], true);
+}
+
+#[test]
 fn scenario_basic_streams_three_chunks() {
     let (mut a, session) = scenario("basic");
     let (msgs, result) = turn(&mut a, &session, "perm form url");
@@ -1473,6 +1498,237 @@ fn hub_set_mode_journals_the_mode() {
     let sent = hub.received_calls("set-mode", "session/set_mode");
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0]["params"]["modeId"], "plan");
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+fn configure(c: &mut Client, sid: &str, epoch: u64, id: &str, value: Value) -> Value {
+    c.request(json!({"t": "acp.set_config_option", "sid": sid, "epoch": epoch, "configId": id, "value": value}))
+}
+
+#[test]
+fn hub_config_result_is_authoritative_journaled_and_available_without_replay() {
+    let mut hub = Hub::with_scenarios(&["config-result"]);
+    let mut c = hub.connect();
+    let open = ready(&mut c, &hub, "a1", "config-result");
+    let epoch = epoch(&open);
+    let initial = c.summary("a1")["acp"]["configOptions"].clone();
+    assert_eq!(initial[0]["currentValue"], "small");
+    assert_eq!(initial[2]["currentValue"], false);
+    assert_eq!(
+        configure(&mut c, "a1", epoch, "model", json!("large"))["t"],
+        "ok"
+    );
+    let event = c.event("a1", "config");
+    let options = &event["configOptions"];
+    assert_eq!(options[0]["currentValue"], "large");
+    assert_eq!(options[1]["options"][2]["value"], "max");
+    assert_eq!(tail(&hub, "a1", 1), ["config"]);
+    assert!(!hub.kinds("a1").iter().any(|kind| kind == "update"));
+    assert_eq!(
+        configure(&mut c, "a1", epoch, "effort", json!("max"))["t"],
+        "ok"
+    );
+    assert_eq!(
+        c.event("a1", "config")["configOptions"][1]["currentValue"],
+        "max"
+    );
+    assert_eq!(
+        configure(&mut c, "a1", epoch, "effort", json!("high"))["t"],
+        "ok"
+    );
+    assert_eq!(
+        c.event("a1", "config")["configOptions"][1]["currentValue"],
+        "low"
+    );
+    assert_eq!(
+        configure(&mut c, "a1", epoch, "thinking", json!(true))["t"],
+        "ok"
+    );
+    let current = c.event("a1", "config")["configOptions"].clone();
+    assert_eq!(current[2]["currentValue"], true);
+    assert_eq!(c.summary("a1")["acp"]["configOptions"], current);
+    let mut attached = hub.connect();
+    let reopened = attached.ok(json!({"t": "acp.open", "sid": "a1", "since": 6, "epoch": epoch}));
+    assert_eq!(reopened["session"]["configOptions"], current);
+    assert_eq!(reopened["summary"]["acp"]["configOptions"], current);
+    let (replay, _) = attached.replay("a1");
+    assert!(replay.is_empty());
+    let calls = hub.received_calls("config-result", "session/set_config_option");
+    assert_eq!(
+        calls[0]["params"],
+        json!({"sessionId": c.summary("a1")["acp"]["agentSessionId"],
+                                       "configId": "model", "value": "large"})
+    );
+    assert_eq!(calls[3]["params"]["type"], "boolean");
+    assert_eq!(calls[3]["params"]["value"], true);
+    drop((c, attached));
+    fold_equals_live(&mut hub);
+    let mut c = hub.connect();
+    assert_eq!(c.summary("a1")["acp"]["configOptions"], current);
+}
+
+#[test]
+fn hub_config_rejects_unknown_values_and_stale_epochs_without_agent_calls() {
+    let mut hub = Hub::with_scenarios(&["config-result", "basic"]);
+    let mut c = hub.connect();
+    let open = ready(&mut c, &hub, "a1", "config-result");
+    let current_epoch = epoch(&open);
+    for (id, value) in [
+        ("missing", json!("large")),
+        ("model", json!("missing")),
+        ("model", json!(true)),
+        ("thinking", json!("true")),
+        ("thinking", json!(1)),
+        ("thinking", Value::Null),
+        ("effort", json!("max")),
+    ] {
+        assert_eq!(
+            configure(&mut c, "a1", current_epoch, id, value)["code"],
+            "bad_option"
+        );
+    }
+    assert_eq!(
+        configure(&mut c, "a1", current_epoch + 1, "missing", json!({}))["code"],
+        "stale"
+    );
+    assert!(
+        hub.received_calls("config-result", "session/set_config_option")
+            .is_empty()
+    );
+    let basic = ready(&mut c, &hub, "b1", "basic");
+    assert!(c.summary("b1")["acp"]["configOptions"].is_null());
+    assert_eq!(
+        configure(&mut c, "b1", epoch(&basic), "model", json!("large"))["code"],
+        "bad_option"
+    );
+    c.ok(json!({"t": "acp.kill", "sid": "a1", "forget": false}));
+    assert_eq!(
+        configure(&mut c, "a1", current_epoch + 1, "missing", Value::Null)["code"],
+        "not_alive"
+    );
+    c.ok(json!({"t": "acp.kill", "sid": "a1", "forget": true}));
+    let recreated = ready(&mut c, &hub, "a1", "config-result");
+    assert_ne!(epoch(&recreated), current_epoch);
+    assert_eq!(
+        configure(&mut c, "a1", current_epoch, "model", json!("large"))["code"],
+        "stale"
+    );
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+fn hub_config_requires_a_live_acp_session_before_checking_epoch_or_option() {
+    let mut hub = Hub::with_scenarios(&["auth"]);
+    let mut c = hub.connect();
+    let (open, _) = spawn_until(&mut c, &hub, "a1", "auth", "setup_error");
+    let reply = configure(&mut c, "a1", epoch(&open) + 1, "missing", Value::Null);
+    assert_eq!(reply["code"], "bad_request");
+    assert!(
+        hub.received_calls("auth", "session/set_config_option")
+            .is_empty()
+    );
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+fn hub_config_updates_during_a_pending_turn() {
+    let mut hub = Hub::start_with(|cfg| stub(cfg, "keywords", &[]));
+    let mut c = hub.connect();
+    let open = ready(&mut c, &hub, "a1", "keywords");
+    assert_eq!(c.acp_prompt("a1", "perm")["t"], "ok");
+    c.event("a1", "permission");
+    assert_eq!(
+        configure(&mut c, "a1", epoch(&open), "thinking", json!(true))["t"],
+        "ok"
+    );
+    let update = c.event("a1", "update");
+    assert_eq!(update["update"]["sessionUpdate"], "config_option_update");
+    assert_eq!(
+        c.event("a1", "config")["configOptions"][2]["currentValue"],
+        true
+    );
+    let summary = c.summary("a1");
+    assert_eq!(summary["acp"]["activity"], "turn");
+    assert_eq!(summary["acp"]["pending"].as_array().unwrap().len(), 1);
+    assert_eq!(summary["acp"]["configOptions"][2]["currentValue"], true);
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+fn hub_config_agent_errors_malformed_results_and_death_never_invent_values() {
+    let mut hub = Hub::with_scenarios(&["config-error", "config-malformed", "config-exit"]);
+    let mut c = hub.connect();
+    for (i, agent) in ["config-error", "config-malformed", "config-exit"]
+        .into_iter()
+        .enumerate()
+    {
+        let sid = format!("a{i}");
+        let open = ready(&mut c, &hub, &sid, agent);
+        let initial = c.summary(&sid)["acp"]["configOptions"].clone();
+        let reply = configure(&mut c, &sid, epoch(&open), "model", json!("large"));
+        assert_eq!(
+            reply["code"],
+            if agent == "config-exit" {
+                "not_alive"
+            } else {
+                "agent_error"
+            }
+        );
+        assert_eq!(c.summary(&sid)["acp"]["configOptions"], initial);
+        assert!(!hub.kinds(&sid).iter().any(|kind| kind == "config"));
+    }
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+fn hub_config_timeout_ignores_a_late_result_without_changing_the_offering() {
+    let mut hub = Hub::with_scenarios(&["config-hang"]);
+    let mut c = hub.connect();
+    let open = ready(&mut c, &hub, "a1", "config-hang");
+    let initial = c.summary("a1")["acp"]["configOptions"].clone();
+    c.send(
+        &json!({"t": "acp.set_config_option", "rid": 900, "sid": "a1",
+                  "epoch": epoch(&open), "configId": "model", "value": "large"}),
+    );
+    let reply = c.reply_within(900, Duration::from_secs(40));
+    assert_eq!(reply["code"], "timeout");
+    // The fake releases its held result before answering this prompt. Its late
+    // config response must not create an event or overwrite the offering.
+    assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
+    c.event("a1", "turn_end");
+    assert_eq!(c.summary("a1")["acp"]["configOptions"], initial);
+    assert!(!hub.kinds("a1").iter().any(|kind| kind == "config"));
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hub_config_journal_failure_is_not_acknowledged_or_folded() {
+    let mut hub = Hub::start_with_env(
+        |cfg| stub(cfg, "config-result", &["--scenario", "config-result"]),
+        &[("WB_HUB_TEST_FAIL_WRITE_AT", "3")],
+    );
+    let mut c = hub.connect();
+    let open = ready(&mut c, &hub, "a1", "config-result");
+    let initial = c.summary("a1")["acp"]["configOptions"].clone();
+    let reply = configure(&mut c, "a1", epoch(&open), "model", json!("large"));
+    assert_eq!(reply["code"], "faulted");
+    let summary = c.summary_until("a1", "faulted and dead", |s| {
+        s["fault"]["code"] == "journal_write" && s["alive"] == false
+    });
+    assert_eq!(summary["acp"]["configOptions"], initial);
+    assert_eq!(hub.kinds("a1"), ["spawn", "session"]);
+    assert_eq!(
+        configure(&mut c, "a1", epoch(&open) + 1, "missing", Value::Null)["code"],
+        "faulted"
+    );
+    c.ok(json!({"t": "acp.kill", "sid": "a1", "forget": false}));
     drop(c);
     fold_equals_live(&mut hub);
 }

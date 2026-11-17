@@ -326,10 +326,15 @@ impl Client {
     /// The `ok` or `err` with `rid`. Other messages read meanwhile stay queued, in order,
     /// for [`next`](Self::next).
     pub fn reply(&mut self, rid: u64) -> Value {
+        self.reply_within(rid, PATIENCE)
+    }
+
+    /// The reply to `rid`, allowing slow protocol deadlines to expire.
+    pub fn reply_within(&mut self, rid: u64, within: Duration) -> Value {
         if let Some(i) = self.pending.iter().position(|m| m["rid"] == rid) {
             return self.pending.remove(i).unwrap();
         }
-        let deadline = Instant::now() + PATIENCE;
+        let deadline = Instant::now() + within;
         loop {
             let m = self
                 .read_line(deadline)

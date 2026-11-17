@@ -55,6 +55,8 @@ const REMOTE_CWD_MAX: usize = 4096;
 
 /// How long `session/set_mode` may take.
 const SET_MODE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `session/set_config_option` may take.
+const SET_CONFIG_TIMEOUT: Duration = Duration::from_secs(30);
 /// Teardown stages of a kill (DESIGN §3.4.5): `session/close`, closed stdin, SIGTERM.
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
 const STDIN_WAIT: Duration = Duration::from_secs(3);
@@ -134,6 +136,11 @@ pub enum Act {
         response: Value,
     },
     SetMode(String),
+    SetConfigOption {
+        epoch: u64,
+        config_id: String,
+        value: Value,
+    },
     Seen(u64),
     Revive,
     Authenticate(String),
@@ -533,6 +540,10 @@ enum Purpose {
         reply: Reply,
         deadline: Instant,
     },
+    SetConfigOption {
+        reply: Reply,
+        deadline: Instant,
+    },
     Authenticate(Reply),
     Close,
 }
@@ -540,7 +551,10 @@ enum Purpose {
 impl Purpose {
     /// Answers the request that waited on this one, if any.
     fn fail(self, code: ErrorCode, message: &str) {
-        if let Purpose::SetMode { reply, .. } | Purpose::Authenticate(reply) = self {
+        if let Purpose::SetMode { reply, .. }
+        | Purpose::SetConfigOption { reply, .. }
+        | Purpose::Authenticate(reply) = self
+        {
             reply.err(code, message);
         }
     }
@@ -1016,6 +1030,7 @@ impl Acp {
                 | EventBody::SetupError { .. }
                 | EventBody::TurnEnd { .. }
                 | EventBody::TurnError { .. }
+                | EventBody::Config { .. }
                 | EventBody::Exit { .. }
         );
         if durable && let Some(journal) = &self.journal {
@@ -1136,6 +1151,7 @@ impl Acp {
                 seen_seq: self.meta.seen_seq,
                 title: facts.title.clone(),
                 mode_id: facts.mode_id.clone(),
+                config_options: facts.config_options.clone(),
             }),
         };
         let init = self.meta.init.as_ref();
@@ -1151,6 +1167,7 @@ impl Acp {
                 .cloned(),
             auth_methods: field("authMethods"),
             modes: facts.modes.clone(),
+            config_options: facts.config_options.clone(),
             available_commands: facts.available_commands.clone(),
             plan: facts.plan.clone(),
             usage: facts.usage.clone(),
@@ -1334,6 +1351,13 @@ impl Acp {
                 response,
             } => self.answer(req, epoch, PendingKind::Elicitation, response, reply),
             Act::SetMode(mode_id) => self.set_mode(mode_id, reply),
+            Act::SetConfigOption {
+                epoch,
+                config_id,
+                value,
+            } => {
+                self.set_config_option(epoch, config_id, value, reply);
+            }
             Act::Seen(seq) => {
                 self.set_seen(seq);
                 reply.done();
@@ -1496,6 +1520,57 @@ impl Acp {
         };
         let sent = self.request(purpose, msg);
         if let Err(purpose) = sent {
+            purpose.fail(ErrorCode::Internal, "agent not reading stdin");
+        }
+    }
+
+    fn set_config_option(&mut self, epoch: u64, config_id: String, value: Value, reply: Reply) {
+        if let Err((code, msg)) = self.check_live() {
+            return reply.err(code, msg);
+        }
+        if epoch != self.created_at {
+            return reply.err(ErrorCode::Stale, "the session was created again");
+        }
+        let offered = self
+            .facts
+            .config_options
+            .as_ref()
+            .and_then(Value::as_array)
+            .and_then(|options| {
+                options
+                    .iter()
+                    .find(|option| option["id"].as_str() == Some(&config_id))
+            });
+        let valid = offered.is_some_and(|option| match option["type"].as_str() {
+            Some("boolean") => value.is_boolean(),
+            Some("select") => value.as_str().is_some_and(|value| {
+                option["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|option| {
+                        option["value"].as_str() == Some(value)
+                            || option["options"].as_array().is_some_and(|group| {
+                                group
+                                    .iter()
+                                    .any(|option| option["value"].as_str() == Some(value))
+                            })
+                    })
+                })
+            }),
+            _ => false,
+        });
+        if !valid {
+            return reply.err(
+                ErrorCode::BadOption,
+                format!("configuration {config_id} or its value is not offered"),
+            );
+        }
+        let session = self.facts.agent_session_id.clone().unwrap_or_default();
+        let purpose = Purpose::SetConfigOption {
+            reply,
+            deadline: Instant::now() + SET_CONFIG_TIMEOUT,
+        };
+        if let Err(purpose) = self.request(purpose, |id| {
+            rpc::set_config_option(id, &session, &config_id, &value)
+        }) {
             purpose.fail(ErrorCode::Internal, "agent not reading stdin");
         }
     }
@@ -1696,7 +1771,9 @@ impl Acp {
         p.outstanding
             .values()
             .filter_map(|purpose| match purpose {
-                Purpose::SetMode { deadline, .. } => Some(*deadline),
+                Purpose::SetMode { deadline, .. } | Purpose::SetConfigOption { deadline, .. } => {
+                    Some(*deadline)
+                }
                 _ => None,
             })
             .min()
@@ -1708,14 +1785,18 @@ impl Acp {
         let late: Vec<u64> = p
             .outstanding
             .iter()
-            .filter(|(_, purpose)| matches!(purpose, Purpose::SetMode { deadline, .. } if *deadline <= now))
+            .filter(|(_, purpose)| matches!(purpose, Purpose::SetMode { deadline, .. } | Purpose::SetConfigOption { deadline, .. } if *deadline <= now))
             .map(|(id, _)| *id)
             .collect();
         for id in late {
             if let Some(purpose) = p.outstanding.remove(&id) {
+                let method = match &purpose {
+                    Purpose::SetConfigOption { .. } => "session/set_config_option",
+                    _ => "session/set_mode",
+                };
                 purpose.fail(
                     ErrorCode::Timeout,
-                    "the agent did not answer session/set_mode in 30 s",
+                    &format!("the agent did not answer {method} in 30 s"),
                 );
             }
         }
@@ -1802,6 +1883,32 @@ impl Acp {
             Purpose::SetMode { mode_id, reply, .. } => match outcome {
                 Ok(_) if self.record(EventBody::Mode { mode_id }) => reply.done(),
                 Ok(_) => reply.err(ErrorCode::Faulted, JOURNAL_FAILED),
+                Err(e) => reply.err(ErrorCode::AgentError, rpc_message(&e)),
+            },
+            Purpose::SetConfigOption { reply, .. } if self.fault.is_some() => {
+                reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
+            }
+            Purpose::SetConfigOption { reply, .. } => match outcome {
+                Ok(_) if self.stage.is_some() => {
+                    reply.err(ErrorCode::NotAlive, "the agent is being stopped")
+                }
+                Ok(result) => match result
+                    .get("configOptions")
+                    .filter(|options| options.is_array())
+                {
+                    Some(options)
+                        if self.record(EventBody::Config {
+                            config_options: options.clone(),
+                        }) =>
+                    {
+                        reply.done()
+                    }
+                    Some(_) => reply.err(ErrorCode::Faulted, JOURNAL_FAILED),
+                    None => reply.err(
+                        ErrorCode::AgentError,
+                        "the session/set_config_option result has no configOptions array",
+                    ),
+                },
                 Err(e) => reply.err(ErrorCode::AgentError, rpc_message(&e)),
             },
             Purpose::Authenticate(reply) => match outcome {

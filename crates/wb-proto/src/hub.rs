@@ -119,6 +119,16 @@ pub enum HubRequest {
         sid: String,
         mode_id: String,
     },
+    /// Change an offered session configuration option. Reply: `{}` after journaling
+    /// the agent's complete resulting configuration.
+    #[serde(rename = "acp.set_config_option")]
+    AcpSetConfigOption {
+        rid: u64,
+        sid: String,
+        epoch: u64,
+        config_id: String,
+        value: Value,
+    },
     /// The client has seen the events up to `seq`. Reply: `{}`.
     #[serde(rename = "acp.seen")]
     AcpSeen { rid: u64, sid: String, seq: u64 },
@@ -470,6 +480,7 @@ pub struct AcpFacts {
     pub seen_seq: u64,
     pub title: Option<String>,
     pub mode_id: Option<String>,
+    pub config_options: Option<Value>,
 }
 
 /// What is outstanding to the agent.
@@ -564,6 +575,8 @@ pub struct AcpSessionInfo {
     pub auth_methods: Option<Value>,
     /// The session's modes, with the current mode id.
     pub modes: Option<Value>,
+    /// The full current session configuration options, verbatim.
+    pub config_options: Option<Value>,
     /// The last `available_commands_update`.
     pub available_commands: Option<Value>,
     /// The last `plan` update.
