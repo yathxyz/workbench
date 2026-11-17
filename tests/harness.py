@@ -197,6 +197,10 @@ class Harness:
             (self.root / d).mkdir(mode=0o700, parents=True)
         for d in (self.boards_dir, self.notes_dir) + (() if dogfood else (self.home,)):
             d.mkdir(mode=0o700)
+        # A real PTY child: the suite reads the resolved address, then sends input through cat.
+        attach = self.root / "attach"
+        attach.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\"\nexec cat\n")
+        attach.chmod(0o700)
         fd = os.open(self.secret_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
         with os.fdopen(fd, "w") as f:
             f.write(self.secret + "\n")
@@ -233,6 +237,7 @@ class Harness:
             "notesDir": str(self.notes_dir),
             "host": host,
             "editSocket": self.edit_sock,
+            "attachCommand": str(attach),
         }
         if os.environ.get("WB_EDWIN_WEB_ROOT"):
             self.web_config["edwinWebRoot"] = str(Path(os.environ["WB_EDWIN_WEB_ROOT"]).resolve())
@@ -256,7 +261,7 @@ class Harness:
         }
         self.api_tokens = {}
         if api:
-            # the mesh API (design §3.8) on loopback: a token that files events under this host, one under "farbox"
+            # The local UI checks also create sessions outside a card; farbox only reports events.
             clients = {}
             for name, client_host in (("near", host), ("far", "farbox")):
                 path = self.root / f"api-{name}"
@@ -264,7 +269,7 @@ class Harness:
                 with os.fdopen(fd, "w") as f:
                     f.write(secrets.token_hex(32) + "\n")
                 self.api_tokens[name] = str(path)
-                clients[name] = {"tokenFile": str(path), "scopes": ["events"], "host": client_host}
+                clients[name] = {"tokenFile": str(path), "scopes": ["events", "control"] if name == "near" else ["events"], "host": client_host}
             self.web_config["api"] = {"listen": f"{API_ADDR[0]}:{API_ADDR[1]}", "clients": clients}
         self.hub_json = self.write_json("hub.json", self.hub_config)
         self.web_json = self.write_json("web.json", self.web_config)

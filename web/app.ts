@@ -407,7 +407,7 @@ function barRender() {
 }
 // Session facts from /rpc: sessions replaces, session upserts, gone deletes and leaves a tombstone (§3.5.3).
 const SESS: Record<string, SessionSummary> = {}, TOMBS = new Set<string>();
-function sessChanged(sid: string): void { if (S?.nodes[sid]) { updateTitle(S.nodes[sid]); live[sid]?.backend?.refresh?.(); } clearTimeout((sessChanged as SessTimerFn).t); (sessChanged as SessTimerFn).t = setTimeout(sessShown, 250); }
+function sessChanged(sid: string): void { if (S?.nodes[sid]) { updateTitle(S.nodes[sid]); live[sid]?.backend?.refresh?.(); } if (MESH_PANE.node?.id === sid) live.$agents?.backend?.refresh?.(); clearTimeout((sessChanged as SessTimerFn).t); (sessChanged as SessTimerFn).t = setTimeout(sessShown, 250); }
 // The Folders tree, the outline and the navigator show each agent card's state (30 §1.6): redraw them only when one
 // changed, since a running card's info arrives every 500 ms and a redraw replaces the rows under the pointer.
 type SessTimerFn = typeof sessChanged & { t?: number };
@@ -435,7 +435,7 @@ const RPC_EVENTS: RpcEventHandlers = {
   gone: m => {
     TOMBS.add(m.sid + ' ' + m.epoch);
     if (SESS[m.sid]?.createdAt === m.epoch) delete SESS[m.sid];
-    live[m.sid]?.backend?.goneElsewhere?.(m.epoch); sessChanged(m.sid);
+    live[m.sid]?.backend?.goneElsewhere?.(m.epoch); if (MESH_PANE.node?.id === m.sid) live.$agents?.backend?.goneElsewhere?.(m.epoch); sessChanged(m.sid);
   },
   board: m => boardChanged(m.etag),
   observed: m => { const was: Record<string, SessionState> = {}; for (const k in OBS) { was[k] = OBS[k].state; delete OBS[k]; } (m.sessions || []).forEach(o => obsPut(o, was[o.id])); meshChanged(); },
@@ -766,6 +766,7 @@ class PtyBackend implements CardBackend, Wakeable {
   constructor(n: TermNode, term: XtermTerminal, L: LiveEntry) { this.n = n; this.t = term; this.L = L; this.spawn = !!n._spawn; delete n._spawn; this.tries = 0; this.connect(); }
   openMsg(): string {
     const n = this.n, m: Extract<PtyClientMsg, { t: 'open' }> = { t: 'open', id: n.id, cmd: n.cmd || '', parent: n.spawnFrom || '', cwd: n.cwd || '', cols: this.t.cols, rows: this.t.rows, env: { CANVAS_NODE: pathOf(n.id), ...(n.env || {}) }, spawn: this.spawn };
+    if (this.spawn && n._attach) { delete m.cmd; m.attach = n._attach; }
     if (this.spawn && shellName(n)) m.shell = n.shell;
     if (!this.spawn && this.resume) m.resume = this.resume;
     return JSON.stringify(m);
@@ -786,12 +787,13 @@ class PtyBackend implements CardBackend, Wakeable {
         this.L?.el.classList.remove('net-wait');
         if (m.stream != null) this.resume = { stream: m.stream, out: m.out! };
         if (m.new) {
+          if (this.n.adopted) { delete this.n.adopted; dirty(); }
           if (this.lost || (this.helloed && !this.respawning)) this.t.write('\r\n\x1b[33m[new shell: the server had no session for this card]\x1b[0m\r\n');
         } else if (m.resumed) this.t.write(m.replay || '');   // the ring tail after our offset: the scrollback stays
         else { this.t.reset(); this.t.write(m.replay || ''); }
         this.helloed = true; this.respawning = false; this.lost = false;
       } else if (m.t === 'out') { this.t.write(m.d); if (m.out != null && this.resume) this.resume.out = m.out; activity(this.n.id); }
-      else if (m.t === 'fg') { if (this.n.fg !== m.comm) { this.n.fg = m.comm; retag(this.n); } if (m.cwd && this.n.cwdLive !== m.cwd) { this.n.cwdLive = m.cwd; cwdMoved(this.n as TermNode); } }
+      else if (m.t === 'fg') { if (this.n.fg !== m.comm) { this.n.fg = m.comm; if (S.nodes[this.n.id] === this.n) retag(this.n); } if (m.cwd && this.n.cwdLive !== m.cwd) { this.n.cwdLive = m.cwd; if (S.nodes[this.n.id] === this.n) cwdMoved(this.n); } }
       else if (m.t === 'exit') {
         this.dead = true; this.exitReason = m.reason || null;
         const how = m.code != null ? ` with code ${m.code}` : m.signal ? ` (signal ${m.signal})` : '';
@@ -862,7 +864,7 @@ class PtyBackend implements CardBackend, Wakeable {
     this.send(d);
   }
   // only the tab the user is looking at sizes the PTY (ROB-8): the active card, or a terminal holding the keyboard (the dock is never a card)
-  resize(cols: number, rows: number): void { if (this.ws?.readyState === 1 && document.visibilityState === 'visible' && document.hasFocus() && (activeId === this.n.id || this.L?.body?.contains(document.activeElement))) this.ws.send(JSON.stringify({ t: 'resize', cols, rows })); }
+  resize(cols: number, rows: number): void { if (this.ws?.readyState === 1 && document.visibilityState === 'visible' && document.hasFocus() && (VIEW === 'canvas' && activeId === this.n.id || this.L?.body?.contains(document.activeElement))) this.ws.send(JSON.stringify({ t: 'resize', cols, rows })); }
   // the card goes, and its session with it (a kill without `session` forgets it).
   // Without an open socket the kill waits for the server; a connecting socket is dropped before it can send its open.
   kill(): void {
@@ -898,6 +900,8 @@ interface AcpDiffContent { type?: JsonValue; path?: JsonValue; oldText?: JsonVal
 interface AcpToolLocation { path?: JsonValue; line?: JsonValue }
 /* An agent card's live entry once mountNode and mountAcp have filled it. */
 type AcpLive = LiveEntry & { el: HTMLElement; hdr: HTMLElement; body: HTMLElement; logEl: HTMLElement; ta: HTMLTextAreaElement };
+interface AcpEditor { buf: EdwinBuffer; frame: EdwinFrame; root: HTMLElement }
+const ACP_COMPOSERS = new Set<AcpBackend>(), ACP_DRAFTS = new WeakMap<EdwinBuffer, AcpBackend>();
 const PROMPT_MAX = 8388608;   // bytes of UTF-8 in one prompt's blocks (F-A17)
 const ACP_STATES = new Set<SessionState | undefined>(['idle', 'running', 'waiting_permission', 'waiting_input', 'done', 'error', 'exited', 'detached']);
 const ACP_BAD = new Set<SessionState | undefined>(['waiting_permission', 'waiting_input', 'error']);
@@ -921,11 +925,14 @@ class AcpBackend implements CardBackend {
   declare gone?: boolean; declare missing?: boolean; declare failed?: string | null; declare restarting?: boolean; declare disposed?: boolean;
   declare ended?: number | null; declare cleared?: boolean; declare authNeeded?: boolean;
   declare modeSeen?: string; declare modeWanted?: string | null; declare planKey?: string; declare stateKey?: string;
+  editor: AcpEditor | null = null;
+  editPrefix = 0;
   constructor(n: AcpNode, L: AcpLive) {
     this.n = n; this.L = L; this.spawn = !!n._spawn; delete n._spawn;   // spawn fields only for a card made in this page (SEC-2)
     this.seq = 0; this.epoch = null; this.sum = null; this.session = {}; this.tries = 0; this.rid = 0; this.rids = new Map();
     this.items = []; this.changed = new Set(); this.byMsg = new Map(); this.byTool = new Map(); this.pending = new Map(); this.waiting = new Map();
     this.panels = new Map(); this.draft = null; this.seenSent = 0;
+    ACP_COMPOSERS.add(this); this.editorAvailability();
     this.connect();
   }
   get dead() { return this.gone || this.missing || !this.sum?.alive; }
@@ -951,6 +958,7 @@ class AcpBackend implements CardBackend {
   onMessage(m: AcpServerMsg) {
     if (m.t === 'hello') {
       const info = m.info || {} as AcpInfo;
+      if (m.status === 'new' && this.n.adopted) { delete this.n.adopted; dirty(); }
       this.helloSeen = true; this.tries = 0; this.spawn = false; this.missing = false; this.gone = false; this.failed = null;
       this.L.el.classList.remove('net-wait');
       if (m.reset) this.clear();   // F-A1: transcript, pending and cursor, before the replay
@@ -1020,7 +1028,7 @@ class AcpBackend implements CardBackend {
   }
   setInfo(info: AcpInfo) {
     const { session, ...sum } = info;
-    if (session) this.session = session;
+    if (session) this.session = { ...session, configOptions: session.configOptions ?? this.session.configOptions };
     this.sum = sum; sessPut(sum); this.schedule();
   }
   refresh() {   // sessChanged: /rpc may carry a fresher summary of the same incarnation
@@ -1043,7 +1051,54 @@ class AcpBackend implements CardBackend {
     if (composer) this.draft = text;   // F-A5: the composer keeps the text until this prompt's echo
     this.schedule();
   }
-  submit() { const text = this.L.ta.value; if (!text.trim() || this.draft != null) return; try { this.prompt(text, true); } catch (e) { toast(e.message); } }
+  submit() { const text = this.L.ta.value; if (!text.trim() || this.draft != null || this.editor) return; try { this.prompt(text, true); } catch (e) { toast(e.message); } }
+  editorAvailability() {
+    const b = $('.ag-edit', this.L.body) as HTMLButtonElement | null; if (!b) return;
+    b.hidden = !frPromptAvailable();
+    b.disabled = !!this.disposed || this.L.ta.disabled || this.draft != null || !!this.editor;
+  }
+  composerKey(e: KeyboardEvent): boolean {
+    if (!frPromptAvailable() || e.isComposing) { this.editPrefix = 0; return false; }
+    if (e.key === 'Control') return false;   // releasing Ctrl between the two chords keeps the prefix
+    const ctrl = e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey, key = e.key.toLowerCase(), now = performance.now();
+    if (ctrl && key === 'c') { this.editPrefix = now; return false; }   // a lone C-c still copies
+    const open = ctrl && key === 'e' && this.editPrefix > 0 && now - this.editPrefix < 1500;
+    this.editPrefix = 0;
+    if (!open) return false;
+    e.preventDefault(); e.stopPropagation(); this.editPrompt(); return true;
+  }
+  editPrompt() {
+    if (this.editor) { this.editor.frame.focus(); return; }
+    if (!frPromptAvailable() || this.disposed || this.L.ta.disabled || this.draft != null) return;
+    const Ed = FR.Ed!, L = FR.L!, root = el('div', 'ag-editor'), head = el('div', 'ag-editor-head'), host = el('div', 'ag-editor-host');
+    const send = el('button', '', 'Send · C-c C-c'), back = el('button', '', 'Back · C-c C-k');
+    send.type = back.type = 'button'; send.onclick = () => this.finishPrompt(true); back.onclick = () => this.finishPrompt(false);
+    head.append(el('span', '', 'Prompt · local, unsaved'), send, back); root.append(head, host);
+    let buf: EdwinBuffer | null = null, frame: EdwinFrame | null = null;
+    try {
+      frPromptKeymap();
+      buf = L.call('get-buffer-create', [L.call('generate-new-buffer-name', [' *agent-prompt*'])]) as EdwinBuffer;
+      buf.mode = 'wb-agent-prompt-mode'; buf.text = this.L.ta.value; buf.pt = buf.text.length; buf.modified = false;
+      $('.ag-transcript', this.L.body)!.append(root);
+      frame = Ed.makeFrame(host, { buffer: buf, kind: 'card', fontSize: FR_FONT });
+      this.editor = { buf, frame, root }; ACP_DRAFTS.set(buf, this);
+      frame.focus(); Ed.withFrame(frame, () => L.call('evil-insert-state'));
+      this.L.ta.readOnly = true; this.editorAvailability(); this.schedule();
+    } catch (e) {
+      this.editor = null;
+      try { frame?.destroy(); } finally { if (buf) { ACP_DRAFTS.delete(buf); L.call('kill-buffer', [buf]); } root.remove(); }
+      toast('Prompt editor: ' + (e?.message || e));
+    }
+  }
+  finishPrompt(send: boolean, focus = true) {
+    const ed = this.editor; if (!ed) return;
+    this.editor = null; ACP_DRAFTS.delete(ed.buf);
+    this.L.ta.value = ed.buf.text; this.L.ta.readOnly = this.draft != null;
+    try { ed.frame.destroy(); } finally {
+      try { FR.L!.call('kill-buffer', [ed.buf]); } finally { ed.root.remove(); this.editorAvailability(); }
+    }
+    if (!this.disposed) { if (send) this.submit(); if (focus) this.L.ta.focus(); this.schedule(); }
+  }
   input(d: string) {   // duck typing: a trailing \r prompts (or throws); anything else drafts into the composer
     if (!d.endsWith('\r')) { this.L.ta.value += d; return; }
     this.prompt(d.slice(0, -1));
@@ -1087,11 +1142,11 @@ class AcpBackend implements CardBackend {
     this.dispose();
     if (!ended) new Reap('/acp', { t: 'open', id: this.n.id, since: this.seq }, { t: 'kill', forget: true }, (m: Extract<AcpServerMsg, { t: 'hello' }>) => epoch == null || m.info?.createdAt === epoch);
   }
-  stop() { this.disposed = true; clearTimeout(this.timer); WAKE.delete(this); cancelAnimationFrame(this.raf!); }
+  stop() { this.disposed = true; this.finishPrompt(false, false); ACP_COMPOSERS.delete(this); clearTimeout(this.timer); WAKE.delete(this); cancelAnimationFrame(this.raf!); }
   dispose() { this.stop(); try { this.ws?.close(); } catch {} }   // the card went in another tab: close here, the session is not ours to end
   maybeSeen() {   // seen only when the user can see the result (§3.4.6)
     const s = this.sum, a = s?.acp;
-    if (!a || activeId !== this.n.id || document.visibilityState !== 'visible' || !document.hasFocus()) return;
+    if (!a || !(VIEW === 'canvas' && activeId === this.n.id || VIEW === 'agents' && live.$agents === this.L) || document.visibilityState !== 'visible' || !document.hasFocus()) return;
     if ((s.state !== 'done' && s.state !== 'error') || a.headSeq <= a.seenSeq || this.seenSent >= a.headSeq) return;
     if (this.send({ t: 'seen', seq: a.headSeq })) this.seenSent = a.headSeq;
   }
@@ -1157,7 +1212,9 @@ class AcpBackend implements CardBackend {
         break;
       }
       case 'spawn': this.authNeeded = false; this.add({ k: 'note', text: ev.via === 'revive' ? 'agent restarted to revive the session' : 'agent started' }); break;
-      case 'session': this.authNeeded = false; this.add({ k: 'note', text: ev.via === 'load' ? 'resumed via load' : ev.via === 'resume' ? 'resumed' : 'session ready' }); break;
+      case 'session':
+        if (ev.configOptions) this.session.configOptions = ev.configOptions;
+        this.authNeeded = false; this.add({ k: 'note', text: ev.via === 'load' ? 'resumed via load' : ev.via === 'resume' ? 'resumed' : 'session ready' }); break;
       case 'authenticate': this.add({ k: 'note', text: 'authenticating…' }); break;
       case 'mode': this.modeSeen = vtext(ev.modeId); this.add({ k: 'note', text: 'mode: ' + vtext((this.session.modes?.availableModes || []).find(x => x?.id === ev.modeId)?.name || ev.modeId) }); break;
       case 'notice': this.add({ k: 'note', cls: ev.level === 'error' ? 'err' : ev.level === 'warn' ? 'warn' : '', text: vtext(ev.text) }); break;
@@ -1176,6 +1233,7 @@ class AcpBackend implements CardBackend {
     if (u.sessionUpdate === 'tool_call' || u.sessionUpdate === 'tool_call_update') this.tool(u);
     else if (u.sessionUpdate === 'plan') this.session = { ...this.session, plan: { entries: Array.isArray(u.entries) ? u.entries : [] } };
     else if (u.sessionUpdate === 'current_mode_update') this.modeSeen = vtext(u.currentModeId);
+    else if (u.sessionUpdate === 'config_option_update') this.session.configOptions = u.configOptions;
   }
   tool(u: JsonObject) {   // tool_call and tool_call_update merge into one item per toolCallId; content replaces (ACP)
     const id = vtext(u.toolCallId); let it = this.byTool.get(id);
@@ -1192,6 +1250,7 @@ class AcpBackend implements CardBackend {
     this.changed.clear();
     if (stick) log.scrollTop = log.scrollHeight;
     this.renderPlan(); this.renderPending(); this.paint();
+    if (live.$agents === L) meshRender();
   }
   renderPlan() {
     const box = $('.ag-plan', this.L.body)!, es: any[] = Array.isArray((this.session.plan as any)?.entries) ? (this.session.plan as any).entries : [], key = JSON.stringify(es);   // any: plan entries from the agent, read by duck typing
@@ -1271,11 +1330,11 @@ class AcpBackend implements CardBackend {
   paint() {
     const L = this.L, s = this.sum, a = s?.acp, ta = L.ta, go = $('.ag-row .go', L.body) as HTMLButtonElement, sel = $('.ag-mode', L.body) as HTMLSelectElement;   // .ag-row: the state panel has a .go too
     const off = this.restarting || this.gone || this.missing || !s || !s.alive || a?.activity === 'setup';
-    ta.disabled = off; ta.readOnly = this.draft != null;
+    ta.disabled = off; ta.readOnly = this.draft != null || !!this.editor; this.editorAvailability();
     ta.placeholder = this.restarting ? 'Ending the session…' : this.gone || this.missing ? 'No session: Start new session, or ⑂ for a new card'
       : !s ? 'Connecting…' : !s.alive ? (a?.revivable ? 'Detached: ↻ revive to continue' : 'Ended: Start new session, or ⑂ for a new card')
       : a?.activity === 'setup' ? 'Starting…' : 'Message ' + agentLabel(this.n.agent) + ' (Enter sends, Shift+Enter is a new line)';
-    go.disabled = off || !this.promptable();
+    go.disabled = off || !this.promptable() || !!this.editor;
     go.textContent = this.draft != null ? 'Sending…' : 'Send';
     $('.ag-row .stop', L.body)!.hidden = !(s?.alive && a?.activity === 'turn');
     const modes = (Array.isArray(this.session.modes?.availableModes) ? this.session.modes.availableModes : []).filter(m => m && m.id != null);
@@ -1288,7 +1347,8 @@ class AcpBackend implements CardBackend {
     const st = this.state(), badge = $('.badge', L.hdr)!;
     $('.dot', L.hdr)!.className = 'dot' + (st ? ' st-' + st : '');
     // Checked against the DOM: sessChanged writes the badge too, from a /rpc summary that may be older than this one.
-    if (badge.textContent !== badgeOf(this.n)) updateTitle(this.n);
+    if (live[this.n.id] === L) { if (badge.textContent !== badgeOf(this.n)) updateTitle(this.n); }
+    else badge.textContent = this.stateText();
     badge.className = 'badge' + (st ? ' st-' + st : '');
   }
 }
@@ -1489,18 +1549,19 @@ function adoptOrphan(s: SessionSummary) {
   if (S.nodes[s.sid]) return jumpNode(S.nodes[s.sid]);
   const acp = s.kind === 'acp', c = viewCenterWorld(), w = 560, h = acp ? 520 : 320;
   const base = acp ? { kind: 'acp' as const, agent: s.acp?.agent || '', cwd: s.cwd || '' } : { kind: 'term' as const, backend: 'pty' as const, env: {}, ...(s.cwd ? { cwd: s.cwd } : {}) };
-  const n = addNode({ id: s.sid, name: (acp ? 'agent' : 'shell') + (nodeList().length + 1), ...base, ...freeSpot(c.x - w / 2, c.y - h / 2, w, h), w, h, _spawn: false });
+  const n = addNode({ id: s.sid, name: (acp ? 'agent' : 'shell') + (nodeList().length + 1), ...base, ...freeSpot(c.x - w / 2, c.y - h / 2, w, h), w, h, adopted: true, _spawn: false });
   jumpNode(n);
 }
 function mountAcp(n: AcpNode, L: LiveEntry) {
   if (!DAEMON) { L.body!.append(el('div', 'ag-note', 'Agent cards run on the Workbench server.')); return; }
-  L.body!.innerHTML = '<div class="ag-plan" hidden></div><div class="ag-log" aria-live="polite"></div><div class="ag-pend"><div class="ag-state" hidden></div></div>'
+  L.body!.innerHTML = '<div class="ag-plan" hidden></div><div class="ag-transcript"><div class="ag-log" aria-live="polite"></div></div><div class="ag-pend"><div class="ag-state" hidden></div></div>'
     + '<form class="ag-in"><textarea rows="2"></textarea><div class="ag-row"><select class="ag-mode" title="Agent mode" hidden></select>'
-    + '<button type="button" class="stop" hidden>Stop</button><button type="submit" class="go">Send</button></div></form>';
+    + '<button type="button" class="ag-edit" title="Edit prompt in Edwin (C-c C-e)" hidden>Edwin</button><button type="button" class="stop" hidden>Stop</button><button type="submit" class="go">Send</button></div></form>';
   L.logEl = $('.ag-log', L.body)!; L.ta = $('textarea', L.body) as HTMLTextAreaElement;
   const b = L.backend = new AcpBackend(n, L as AcpLive);
   $('.ag-in', L.body)!.addEventListener('submit', e => { e.preventDefault(); b.submit(); });
-  L.ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); b.submit(); } });
+  L.ta.addEventListener('keydown', e => { if (b.composerKey(e)) return; if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); b.submit(); } });
+  $('.ag-edit', L.body)!.onclick = () => b.editPrompt();
   $('.ag-row .stop', L.body)!.onclick = () => b.cancel();
   ($('.ag-mode', L.body) as HTMLSelectElement).onchange = e => b.setMode((e.target as HTMLSelectElement).value);
 }
@@ -2222,6 +2283,7 @@ type MountedLive = LiveEntry & { el: HTMLElement; hdr: HTMLElement; body: HTMLEl
   } else if (n.kind === 'ghost') {
     B('↗', n.alias ? 'Jump to the real node' : n.dir ? 'Open: this directory becomes a folder' : 'Open: make it real (a page on the file when edwind edits it; a page in demo mode)', () => ghostOpen(n));
   }
+  if (n.kind === 'acp' || n.kind === 'term' && n.backend === 'pty') B('■', 'Kill session', () => confirmSessionKill(n, L)).classList.add('session-kill');
   B('✕', 'Delete (click twice)', b => confirmDel(b, () => removeNode(n.id))).classList.add('hdel');
   place(n); updateTitle(n);
   if (n.kind === 'term') mountTerm(n, L);
@@ -2291,7 +2353,7 @@ function mountTerm(n: TermNode, L: LiveEntry) {
   const fit = new V.FitAddon(); term.loadAddon(fit);
   term.open(L.body!); L.term = term;
   L.fitNow = () => {
-    if ((lastLod && n.id !== 'dock') || !L.body!.clientWidth || !L.body!.isConnected) return;
+    if ((lastLod && S.nodes[n.id] === n) || !L.body!.clientWidth || !L.body!.isConnected) return;
     try { fit.fit(); } catch {}
     L.backend?.resize?.(term.cols, term.rows);
   };
@@ -2459,7 +2521,7 @@ function removeNode(id: string) {
     for (const k of kidsOf(id)) { if (parent) k.in = parent.id; else delete k.in; }
   }
   const L = live[id];
-  if (L) { pdfClose(L); L.backend?.kill?.(); L.ro?.disconnect(); L.term?.dispose(); if (L.frame?.contentWindow) { HOSTS.delete(L.frame.contentWindow); frameTouchDrop(id); } if (FR.on) frUnmount(id); cardGhost(L.el!); L.el!.remove(); delete live[id]; }
+  if (L) { pdfClose(L); if (gone?.adopted) L.backend?.dispose?.(); else L.backend?.kill?.(); L.ro?.disconnect(); clearTimeout(L.fitT); L.term?.dispose(); if (L.frame?.contentWindow) { HOSTS.delete(L.frame.contentWindow); frameTouchDrop(id); } if (FR.on) frUnmount(id); cardGhost(L.el!); L.el!.remove(); delete live[id]; }
   delete S.nodes[id]; DESK.mem.delete(id); for (const d of [...deskList(), DESK.smart].filter(Boolean) as Desk[]) { delete d.members[id]; if (d.saved) delete d.saved.members[id]; }
   if (S.sticky) { S.sticky = S.sticky.filter(x => x !== id); if (!S.sticky.length) delete S.sticky; } if (ovlHas({ id })) { OVL.ids = OVL.ids.filter(x => x !== id); delete OVL.saved[id]; viewSave(); }
   S.edges = S.edges.filter(e => e.from !== id && e.to !== id);
@@ -2467,6 +2529,14 @@ function removeNode(id: string) {
   if (parent) relayout(parent, true);
   if (gone?.kind === 'buffer') blockCardsChanged(gone);
   restack(); renderEdges(); updateAllTitles(); renderTree(); dirty();
+}
+function confirmSessionKill(n: BoardNode, L: LiveEntry): void {
+  const backend = L.backend;
+  if (!backend?.end) return toast('No live session.');
+  openPicker('Kill session?', [
+    { k: 'session', l: 'Cancel', run: () => {} },
+    { k: 'session', l: 'Kill session', s: n.name + ' · this ends the running process', run: () => { if (L.backend === backend && (live[n.id] === L || live.$agents === L)) backend.end!(true); } },
+  ]);
 }
 type SpawnChildInit = Pick<BoardNodeBase, 'id' | 'name' | 'x' | 'y' | 'w' | 'h' | 'in' | 'spawnFrom'> & { kind: NodeKind } & Partial<Pick<TermNode, 'backend' | 'cmd' | 'cwd' | 'env' | 'spawnNote' | 'shell'> & Pick<AcpNode, 'agent'>>; function spawnChild(n: BoardNode, name?: string): SpawnChildInit {
   const kids = childrenOf(n.id, 'spawn'), k = kids.length, w = Math.min(n.w, 440), h = Math.min(n.h, 300);
@@ -3073,7 +3143,8 @@ $('#open-palette')!.onclick = () => { PICK = null; openPalette(''); };
 $('#open-help')!.onclick = () => { $('#help')!.hidden = false; };
 $('#help-close')!.onclick = () => { $('#help')!.hidden = true; };
 $('#reset-board')!.onclick = ev => confirmDel(ev.currentTarget as HTMLElement, () => {
-  for (const id in live) live[id].backend?.kill?.();
+  meshClose();
+  for (const id in live) { if (id !== 'dock' && S.nodes[id]?.adopted) live[id].backend?.dispose?.(); else live[id].backend?.kill?.(); }
   S = null!; clearTimeout(saveT);
   SAVE.leaving = true;   // a deliberate wipe: a 412 reloads too
   if (DAEMON) fetch('/api/board', { method: 'PUT', redirect: 'manual', headers: { 'Content-Type': 'application/json', 'If-Match': BOARD_ETAG! }, body: '{"v":0}' }).finally(() => location.reload());
@@ -3245,8 +3316,8 @@ function pickFolder(prompt: string, cb: (f: FrameNode | null) => unknown) {
 
 // Every action in the app is a command here. Keys show what is bound; the palette is the way to find the rest.
 {
-  const VN: Record<string, string> = { canvas: 'Canvas', ranger: 'Navigator (ranger)', graph: 'Graph', editor: 'Editor', outline: 'Outline', tasks: 'Tasks' };
-  ['canvas', 'ranger', 'graph', 'editor', 'outline', 'tasks'].forEach((v, i) => cmd(`View: ${VN[v]}`, () => setView(v), '@view.' + v));  // Review is Alt-7, registered with its view
+  const VN: Record<string, string> = { canvas: 'Canvas', ranger: 'Navigator (ranger)', graph: 'Graph', editor: 'Editor', outline: 'Outline', tasks: 'Tasks', agents: 'Agents' };
+  ['canvas', 'ranger', 'graph', 'editor', 'outline', 'tasks', 'agents'].forEach(v => cmd(`View: ${VN[v]}`, () => setView(v), '@view.' + v));  // Review is registered with its view
 }
 cmd('Toggle folder tree', () => toggleTree(), '@tree.toggle');
 cmd('Toggle the docked terminal', () => toggleDockTerm(), '@dock.toggle');
@@ -3268,7 +3339,7 @@ cmd('New agent card…', onCanvas(() => newAgentCard()), '', () => DAEMON && (IN
 {
   const acpActive = () => S.nodes[activeId!]?.kind === 'acp' ? live[activeId!]?.backend : null;
   cmd('Agent: start a new session in the active card (ends the current one)', () => acpActive()?.restart!(), '', () => !!acpActive());
-  cmd('Agent: end the active card\'s session (the card stays, ↻ revives)', () => acpActive()?.end!(), '', () => !!acpActive()?.sum?.alive);
+  cmd('Agent: end the active card\'s session (the card stays, ↻ revives)', () => { const n = S.nodes[activeId!], L = live[activeId!]; if (n && L) confirmSessionKill(n, L); }, '', () => !!acpActive()?.sum?.alive);
 }
 cmd('New browser window…', onCanvas(() => $('#add-web')!.click()));
 cmd('New sketch (write on it with the pen)', onCanvas(() => newSketch()));
@@ -4070,28 +4141,22 @@ $('#rg-parent')!.addEventListener('click', (e: MouseEvent) => { const r = (e.tar
 $('#rg-prev')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; const cur = rgCur().e; if (r && cur?.dir) rgGo(cur.key, r.dataset.key); });
 
 // ------------------------------------------------------------------ docked terminal: a shell in the side pane
-function sideTab(which?: Board['sideTab']) {
-  if (which !== 'agents' || !INFO?.mesh) which = 'term';   // the Agents tab is there with the mesh API only (F-A47)
-  S.sideTab = which; dirty();
-  $$('.side-tabs button').forEach(b => b.classList.toggle('on', b.dataset.side === which));
-  $('#side-term')!.hidden = which !== 'term'; $('#side-mesh')!.hidden = which !== 'agents';
-  if (which === 'agents') meshRender();
-  if (which === 'term') {
-    if (!S.dockTerm) { S.dockTerm = { id: 'dock', kind: 'term', name: 'dock', backend: DAEMON ? 'pty' : 'fake', cwd: DAEMON ? undefined : '/home/me', env: {}, _spawn: BOOTED } as TermNode; if (shellDefault()) S.dockTerm.shell = shellDefault(); dirty(); }
-    if (!live.dock) { live.dock = { el: $('#side-term')!, body: $('#side-term-body')!, hdr: null }; mountTerm(S.dockTerm, live.dock); }
-    setTimeout(() => { live.dock.term?.focus(); live.dock.fitNow?.(); }, 60);
-  }
+function sideTab() {
+  S.sideTab = 'term';
+  if (!S.dockTerm) { S.dockTerm = { id: 'dock', kind: 'term', name: 'dock', backend: DAEMON ? 'pty' : 'fake', cwd: DAEMON ? undefined : '/home/me', env: {}, _spawn: BOOTED } as TermNode; if (shellDefault()) S.dockTerm.shell = shellDefault(); dirty(); }
+  if (!live.dock) { live.dock = { el: $('#side-term')!, body: $('#side-term-body')!, hdr: null }; mountTerm(S.dockTerm, live.dock); }
+  setTimeout(() => { live.dock.term?.focus(); live.dock.fitNow?.(); }, 60);
 }
 function toggleDockTerm() {
   const open = document.body.classList.contains('side-open');
-  if (open && S.sideTab === 'term') toggleSide(false); else { toggleSide(true); sideTab('term'); }
+  if (open) toggleSide(false); else { toggleSide(true); sideTab(); }
 }
-$$('.side-tabs button').forEach(b => b.onclick = () => sideTab(b.dataset.side as Board['sideTab']));
 
 // ------------------------------------------------------------------ agents on the mesh: every session the hub runs or is told of (§3.8.3, F-A47)
 // Observed sessions from /rpc: observed replaces, observed_put upserts, observed_gone deletes.
 const OBS: Record<string, ObservedSession> = {};
 const MESH: { open: string | null; ended: boolean; shape: string; graph: string; topo: string; t: number } = { open: null, ended: false, shape: '', graph: '', topo: '', t: 0 };
+const MESH_PANE: { row: string | null; key: string; actions: string; node: TermNode | AcpNode | null; attach: boolean; rows: string[] } = { row: null, key: '', actions: '', node: null, attach: false, rows: [] };
 // The hub session an observed one runs in: its WB_SESSION, believed only from the host that session is on.
 function obsSess(o: ObservedSession): SessionSummary | null { const s = !o.parent && o.wbSession ? SESS[o.wbSession] : undefined; return s && s.host === o.host ? s : null; }
 function obsPut(o: ObservedSession | undefined, was = o && OBS[o.id]?.state): void {
@@ -4137,41 +4202,100 @@ function meshDoing(r: MeshRow): string {
   return r.state === 'done' ? 'finished' : r.state.replace(/_/g, ' ');
 }
 function meshRowEl(r: MeshRow, depth: number): HTMLElement {
-  const row = el('div', 'mesh-row'), main = el('div', 'mesh-main'); row.dataset.id = r.id; row.style.setProperty('--d', String(depth)); row.setAttribute('role', 'listitem');
-  main.append(el('b'), el('span', 'mesh-sub')); row.append(el('i', 'dot'), main, el('span', 'mesh-at'));
-  if (r.card) { const go = el('button', 'mini', '↗'); go.title = 'Show its card on the canvas'; go.onclick = e => { e.stopPropagation(); const n = S.nodes[r.card!.id]; if (n) jumpNode(n); }; row.append(go); }
-  row.onclick = () => { MESH.open = MESH.open === r.id ? null : r.id; meshRender(); };
+  const row = el('div', 'mesh-row'), main = el('div', 'mesh-main'), sub = el('span', 'mesh-sub'); row.dataset.id = r.id; row.style.setProperty('--d', String(depth)); row.setAttribute('role', 'listitem');
+  sub.append(el('span', 'mesh-harness'), ' · ', el('span', 'mesh-model'), el('span', 'mesh-doing'));
+  main.append(el('b'), sub); row.append(el('i', 'dot'), main, el('span', 'mesh-at'));
+  if (r.card) { const go = el('button', 'mini', '↗'); go.title = 'Show its card on the canvas'; go.onclick = e => { e.stopPropagation(); const n = S.nodes[r.card!.id]; if (n) { setView('canvas'); jumpNode(n); } }; row.append(go); }
+  row.onclick = () => meshSelect(r.id);
   return row;
 }
 // A row's texts, set in place: a row under the pointer is not replaced while its session works.
 function meshFill(row: HTMLElement, r: MeshRow, depth: number): void {
   row.className = 'mesh-row' + (r.live ? '' : ' ended') + (meshBad(r) ? ' bad' : '') + (r.id === MESH.open ? ' on' : '');
+  row.setAttribute('aria-current', r.id === MESH.open ? 'true' : 'false');
   $('.dot', row)!.className = 'dot st-' + (r.live ? r.state : 'exited');
-  const set = (sel: string, text: string) => { const e = $(sel, row)!; if (e.textContent !== text) e.textContent = text; };
+  const set = (sel: string, text: string) => { const e = $(sel, row)!; if (e.textContent !== text) e.textContent = text; return e; };
   set('b', r.title); set('.mesh-at', agoShort(r.at));
-  set('.mesh-sub', [depth && r.obs?.agentType ? r.obs.agentType : r.harness, ...(depth ? [] : ['@' + r.host]), meshDoing(r)].join(' · '));
+  const model = meshConfig(r, 'model') || r.obs?.model || '', harness = depth && r.obs?.agentType ? r.harness + '/' + r.obs.agentType : r.harness;
+  set('.mesh-harness', meshShort(harness)).title = harness; set('.mesh-model', model ? meshShort(model) + ' · ' : '').title = model;
+  set('.mesh-doing', [...(depth ? [] : ['@' + r.host]), meshDoing(r)].join(' · '));
+}
+const meshShort = (s: string): string => s.length > 32 ? s.slice(0, 15) + '…' + s.slice(-16) : s;
+function meshConfig(r: MeshRow, category: string): string {
+  const b = MESH_PANE.row === r.id ? live.$agents?.backend : r.sess && live[r.sess.sid]?.backend, opts = b?.session?.configOptions;
+  if (!Array.isArray(opts)) return '';
+  const opt = opts.find(o => o && typeof o === 'object' && !Array.isArray(o) && (o.category === category || o.id === category)) as JsonObject | undefined;
+  return opt?.currentValue == null ? '' : vtext(opt.currentValue);
 }
 function meshInfo(box: HTMLElement, r: MeshRow): void {
-  const o = r.obs, out: HTMLElement[] = [], kv = (k: string, v: string | null | undefined | false) => { if (v) { const d = el('div', 'mesh-kv'); d.append(el('span', '', k), el('code', '', v)); out.push(d); } };
-  kv('folder', o?.cwd || r.sess?.cwd); kv('model', o?.model); kv('mode', o?.permissionMode);
+  const o = r.obs, b = MESH_PANE.row === r.id ? live.$agents?.backend as AcpBackend | undefined : undefined, out: HTMLElement[] = [], kv = (k: string, v: string | null | undefined | false) => { if (v) { const d = el('div', 'mesh-kv'); d.append(el('span', '', k), el('code', '', v)); out.push(d); } };
+  kv('harness', r.harness); kv('model', meshConfig(r, 'model') || o?.model); kv('host', r.host);
+  kv('folder', o?.cwd || r.sess?.cwd); kv('mode', b instanceof AcpBackend ? b.mode() || o?.permissionMode : o?.permissionMode); kv('reasoning', meshConfig(r, 'thinking'));
   kv('waiting', meshBad(r) && meshDoing(r)); kv('prompt', o?.lastPrompt); kv('reply', o?.lastMessage);
-  kv('started', hhmm(r.since) + (o ? ' · ' + o.counts.prompts + ' prompt(s), ' + o.counts.tools + ' tool call(s)' + (o.counts.toolFailures ? ', ' + o.counts.toolFailures + ' failed' : '') : ''));
+  kv('started', new Date(r.since).toLocaleString()); kv('last active', new Date(r.at).toLocaleString());
+  if (o) kv('counts', o.counts.prompts + ' prompt(s), ' + o.counts.tools + ' tool call(s)' + (o.counts.toolFailures ? ', ' + o.counts.toolFailures + ' failed' : ''));
   if (o?.tail.length) out.push(el('pre', '', o.tail.slice(-12).map(t => hhmm(t.at) + ' ' + t.kind.replace(/_/g, ' ') + (t.text ? ' ' + t.text : '')).join('\n')));
-  if (!r.sess) out.push(el('div', 'mesh-hint', 'Watched through its harness’s hooks: it can be seen here, not steered.'));
   box.replaceChildren(...out);
 }
-function meshDetail(r: MeshRow): HTMLElement {
-  const box = el('div', 'mesh-detail'), acts = el('div', 'ex-btns'), sid = r.sess?.sid;
-  const B = (label: string, fn: () => unknown) => { const b = el('button', 'tb', label); b.onclick = fn; acts.append(b); };
-  if (r.card) B('Show on canvas', () => { const n = sid && S.nodes[sid]; if (n) jumpNode(n); });
-  else if (sid) B('Add its card', () => { if (SESS[sid]) adoptOrphan(SESS[sid]); });
-  B('Copy id', () => copyText(r.obs?.key || r.id));
-  box.append(el('div', 'mesh-info'), acts);
-  return box;
+function meshClose(): void {
+  const L = live.$agents;
+  if (L) {
+    if (MESH_PANE.attach) L.backend?.kill?.(); else L.backend?.dispose?.();
+    L.ro?.disconnect(); clearTimeout(L.fitT); L.term?.dispose(); delete live.$agents;
+    L.el.remove();
+  }
+  MESH_PANE.row = null; MESH_PANE.key = ''; MESH_PANE.actions = ''; MESH_PANE.node = null; MESH_PANE.attach = false;
 }
+function meshMount(r: MeshRow, attach = false): void {
+  const box = $('#mesh-detail')!, host = el('div', 'mesh-live ' + (r.sess?.kind === 'acp' && !attach ? 'k-acp' : 'k-term')), hdr = el('div', 'hdr'), body = el('div', 'body');
+  const sid = attach ? 'attach_' + r.id + '_' + crypto.randomUUID() : r.sess!.sid, base = { id: sid, name: r.title, x: 0, y: 0, w: 560, h: 520 };   // o_ + 16 hex digits and a UUID: 62 sid-safe ASCII characters
+  const n: TermNode | AcpNode = r.sess?.kind === 'acp' && !attach ? { ...base, kind: 'acp', agent: r.sess.acp?.agent || '', cwd: r.sess.cwd || '' }
+    : { ...base, kind: 'term', backend: 'pty', env: {}, ...(attach ? { _spawn: true, _attach: r.id } : {}) };
+  hdr.append(el('i', 'dot'), el('span', 'badge')); host.append(hdr, body); box.append(host);
+  MESH_PANE.node = n; MESH_PANE.attach = attach;
+  const L = live.$agents = { el: host, hdr, body };
+  if (n.kind === 'acp') mountAcp(n, L); else mountTerm(n, L);
+}
+const meshPaneKey = (r: MeshRow): string => [r.id, r.sess?.sid || '', r.sess?.kind || '', r.sess?.createdAt ?? ''].join(' ');
+const meshActionKey = (r: MeshRow): string => [r.card?.id || '', !!r.obs?.attach, !!INFO?.attach, r.live].join(' ');
+function meshActions(r: MeshRow): void {
+  MESH_PANE.actions = meshActionKey(r);
+  const box = $('#mesh-detail')!, acts = $('.ex-btns', box)!, sid = r.sess?.sid,
+    reachable = r.sess?.kind === 'acp' || r.sess?.kind === 'pty' && r.sess.host === INFO?.host;
+  acts.replaceChildren(); $('.mesh-hint', box)?.remove();
+  const B = (label: string, fn: () => unknown) => { const b = el('button', 'tb', label); b.onclick = fn; acts.append(b); return b; };
+  if (r.card) B('Show on canvas', () => { const n = sid && S.nodes[sid]; if (n) { setView('canvas'); jumpNode(n); } });
+  else if (sid) B('Add its card', () => { if (SESS[sid]) { setView('canvas'); adoptOrphan(SESS[sid]); } });
+  B('Copy id', () => copyText(r.obs?.key || r.id));
+  if (reachable && r.live) B('Kill session', () => { const n = MESH_PANE.node, L = live.$agents; if (n && L) confirmSessionKill(n, L); }).classList.add('mesh-kill');
+  if (reachable) return;
+  if (r.obs?.attach && INFO?.attach && r.live) {
+    const open = B('Open terminal', () => { open.disabled = true; meshMount(r, true); meshEnter(); }); open.disabled = MESH_PANE.attach;
+    box.append(el('div', 'mesh-hint', 'Closing this terminal leaves the agent running.'));
+  } else box.append(el('div', 'mesh-hint', 'Started in a terminal the hub cannot reach. Start a Claude background session, use tmux, or run in a Workbench shell or agent card to control it here.'));
+}
+function meshDetail(r: MeshRow): void {
+  meshClose(); MESH_PANE.row = r.id; MESH_PANE.key = meshPaneKey(r);
+  const box = $('#mesh-detail')!, back = el('button', 'tb mesh-back', '← Sessions');
+  back.onclick = meshBack; box.replaceChildren(back, el('h3', '', r.title), el('div', 'mesh-info'), el('div', 'ex-btns'));
+  meshActions(r); if (r.sess?.kind === 'acp' || r.sess?.kind === 'pty' && r.sess.host === INFO?.host) meshMount(r);
+}
+function meshSelect(id: string): void {
+  MESH.open = id; $('#v-agents')!.classList.add('detail-open'); meshRender();
+  $(`#mesh-list .mesh-row[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'nearest' });
+}
+function meshBack(): void { $('#v-agents')!.classList.remove('detail-open'); $('#mesh-list')!.focus(); }
+function meshMove(by: number): void {
+  const rows = MESH_PANE.rows; if (!rows.length) return;
+  const i = Math.max(0, rows.indexOf(MESH.open || '')); meshSelect(rows[clamp(i + by, 0, rows.length - 1)]); $('#mesh-list')!.focus();
+  $('#v-agents')!.classList.remove('detail-open');
+}
+function meshEnter(): void { $('#v-agents')!.classList.add('detail-open'); const L = live.$agents; if (L?.ta) L.ta.focus(); else if (L?.term) { L.fitNow?.(); L.term.focus(); } else $('#mesh-detail button:not(.mesh-back)')?.focus(); }
+addEventListener('pagehide', meshClose);
+$('#mesh-detail')!.addEventListener('keydown', e => { if (e.key === 'Escape' && (e.target as Element).matches('textarea')) { e.preventDefault(); meshBack(); } });
 function meshRender(): void {
   const box = $('#mesh-list');
-  if (!box || !INFO?.mesh || S?.sideTab !== 'agents' || !document.body.classList.contains('side-open')) return;
+  if (!box || VIEW !== 'agents') return;
   const shown = (r: MeshRow): boolean => MESH.ended || r.live || r.id === MESH.open || r.kids.some(shown);
   const rank = (r: MeshRow) => meshBad(r) || r.kids.some(meshBad) ? 0 : !r.live ? 3 : r.state === 'running' ? 1 : 2;   // waiting for you first, a list that does not reorder as sessions work
   const order = (a: MeshRow, b: MeshRow) => rank(a) - rank(b) || b.since - a.since || a.id.localeCompare(b.id);
@@ -4180,26 +4304,33 @@ function meshRender(): void {
   const lines: { r: MeshRow; d: number; head?: string }[] = [];
   const walk = (r: MeshRow, d: number, head?: string) => { lines.push({ r, d, head }); r.kids.filter(shown).sort(order).forEach(k => walk(k, d + 1)); };
   for (const [name, rows] of groups) rows.forEach((r, i) => walk(r, 0, i ? undefined : name));
+  MESH_PANE.rows = lines.map(l => l.r.id);
+  if (!MESH.open || !lines.some(l => l.r.id === MESH.open)) MESH.open = lines[0]?.r.id || null;
   const live = meshFlat(all).filter(r => r.live), bad = live.filter(meshBad).length, hosts = new Set(live.map(r => r.host)).size;
   $('#mesh-sum')!.textContent = live.length ? `${live.length} session${live.length === 1 ? '' : 's'} on ${hosts} host${hosts === 1 ? '' : 's'}` + (bad ? ` · ${bad} waiting for you` : '') : 'No agent is running.';
-  const shape = lines.map(l => [l.head ?? '', l.r.id, l.d, l.r.card?.id || '', l.r.sess?.sid || ''].join(' ')).join('\n') + '\n' + MESH.open;   // what the rows' buttons act on
+  const shape = lines.map(l => [l.head ?? '', l.r.id, l.d, l.r.card?.id || '', l.r.sess?.sid || ''].join(' ')).join('\n');   // selection and changing texts do not replace rows
   if (shape !== MESH.shape) {
     MESH.shape = shape; box.replaceChildren();
     for (const l of lines) {
       if (l.head != null) box.append(el('div', 'mesh-group', l.head));
-      box.append(meshRowEl(l.r, l.d)); if (l.r.id === MESH.open) box.append(meshDetail(l.r));
+      box.append(meshRowEl(l.r, l.d));
     }
     if (!lines.length) box.append(el('p', 'muted', 'A session shows here when a harness on any host of the mesh reports to this hub, or when an agent card starts.'));
   }
-  const rows = $$('.mesh-row', box) as HTMLElement[], info = $('.mesh-info', box);
-  lines.forEach((l, i) => { meshFill(rows[i], l.r, l.d); if (info && l.r.id === MESH.open) meshInfo(info, l.r); });
+  const selected = lines.find(l => l.r.id === MESH.open)?.r;
+  if (selected) {
+    if (meshPaneKey(selected) !== MESH_PANE.key) meshDetail(selected);
+    else if (meshActionKey(selected) !== MESH_PANE.actions) meshActions(selected);
+    const title = $('#mesh-detail h3'); if (title && title.textContent !== selected.title) title.textContent = selected.title;
+    meshInfo($('#mesh-detail .mesh-info')!, selected);
+  } else { meshClose(); $('#mesh-detail')!.replaceChildren(el('p', 'muted', 'Select a session.')); $('#v-agents')!.classList.remove('detail-open'); }
+  const rows = $$('.mesh-row', box) as HTMLElement[];
+  lines.forEach((l, i) => meshFill(rows[i], l.r, l.d));
 }
-// Open the Agents pane, at one session when it is named.
+// Open the Agents view, selecting the named session without adding a card.
 function meshOpen(id?: string | null): void {
-  if (!INFO?.mesh) return;
   if (id) MESH.open = id;
-  toggleSide(true); sideTab('agents');
-  if (id) $(`#mesh-list .mesh-row[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'nearest' });
+  setView('agents'); if (id) meshSelect(id); else meshBack();
 }
 // The graph follows the mesh: a session that starts or ends moves the layout, a change of state or title only redraws.
 function graphMesh(): void {
@@ -4213,7 +4344,7 @@ function graphMesh(): void {
 function meshText(r: MeshRow): string { const o = r.obs; return [meshDoing(r), o?.cwd || r.sess?.cwd, o?.lastPrompt && '› ' + o.lastPrompt, ...(o?.tail.slice(-5).map(t => hhmm(t.at) + ' ' + t.kind.replace(/_/g, ' ') + (t.text ? ' ' + t.text : '')) || [])].filter(Boolean).join('\n'); }
 $('#mesh-ended')!.onchange = e => { MESH.ended = (e.target as HTMLInputElement).checked; meshRender(); };
 setInterval(meshRender, 30000);   // the ages
-cmd('Agents: every session on the mesh', () => meshOpen(), '', () => !!INFO?.mesh);
+cmd('Agents: every session', () => meshOpen(), '@view.agents');
 
 // ------------------------------------------------------------------ chrome: docks, theme
 function toggleDock(which: string, open?: boolean) {
@@ -4245,8 +4376,8 @@ function boardLinkNames(): { name: string; ann: string }[] {
 // Every view reads and writes the same S (nodes, edges, shapes) and the same page buffers,
 // so switching never copies or forks data. The canvas stays mounted underneath the other views.
 let VIEW: ViewName = 'canvas';
-const VIEWS: ViewName[] = ['canvas', 'ranger', 'graph', 'editor', 'outline', 'tasks', 'review'];
-const VIEW_NAMES: Record<ViewName, string> = { canvas: 'Canvas', ranger: 'Navigator', graph: 'Graph', editor: 'Editor', outline: 'Outline', tasks: 'Tasks', review: 'Review' };
+const VIEWS: ViewName[] = ['canvas', 'ranger', 'graph', 'editor', 'outline', 'tasks', 'review', 'agents'];
+const VIEW_NAMES: Record<ViewName, string> = { canvas: 'Canvas', ranger: 'Navigator', graph: 'Graph', editor: 'Editor', outline: 'Outline', tasks: 'Tasks', review: 'Review', agents: 'Agents' };
 const pages = () => nodeList().filter(n => n.kind === 'buffer');
 const pageText = (n: PageNode): string => FR.on && n.buf ? (frBufOf(n)?.text ?? n.snap ?? '') : roText(n);
 const isJournal = (n: BoardNode): boolean => /^\d{4}-\d\d-\d\d$/.test(n.name);
@@ -4260,6 +4391,8 @@ function setView(v: string) {
   $$('[data-view]').forEach(b => { b.classList.toggle('on', b.dataset.view === v); b.setAttribute('aria-selected', (b.dataset.view === v) as unknown as string); });
   $$('.view').forEach(p => { p.hidden = p.id !== 'v-' + v; });
   if (prev === 'graph' && v !== 'graph') graphStop();
+  if (prev === 'agents' && v !== 'agents') meshClose();
+  if (v === 'agents') meshRender();
   if (v === 'graph') graphStart();
   if (v === 'editor') edEnsure();
   if (v === 'outline') renderOutline();
@@ -4269,7 +4402,7 @@ function setView(v: string) {
   $('#view-name')!.textContent = VIEW_NAMES[v as ViewName];
   if (S) placeInkChip();
   if (v !== 'canvas') { if (tool !== 'select') setTool('select'); $('#st-addr')!.textContent = VIEW_NAMES[v as ViewName]; $('#st-zoom')!.textContent = ''; }
-  else { $('#st-zoom')!.textContent = Math.round(cam().z * 100) + '%'; $('#st-addr')!.textContent = '–'; }
+  else { $('#st-zoom')!.textContent = Math.round(cam().z * 100) + '%'; $('#st-addr')!.textContent = '–'; requestAnimationFrame(() => { for (const n of nodeList()) live[n.id]?.fitNow?.(); }); }
   ringNote();
 }
 $$('[data-view]').forEach(b => b.onclick = () => setView(b.dataset.view!));
@@ -4558,7 +4691,7 @@ function graphSelect(id: string | null) {
   if (g.ref) { const ad = el('div', 'gc-addr'); const code = el('code'); code.textContent = addrOf(g.ref); const cp = el('button', 'mini', '⧉'); cp.title = 'Copy the address'; cp.onclick = () => copyText(addrOf(g.ref!)); ad.append(code, cp); card.append(ad); }
   if (g.kind === 'ghost') B('Create page', () => { const n = openPage(g.label, null, true); graphRebuild(); edOpen(n); });
   if (g.kind === 'buffer') B('Open in editor', () => edOpen(g.ref));
-  if (row) B('Show in the Agents pane', () => meshOpen(row.id));
+  if (row) B('Show in the Agents view', () => meshOpen(row.id));
   if (g.ref) B('Show on canvas', () => { setView('canvas'); jumpNode(g.ref!); });
   if (g.ref) B(g.ref.kind === 'frame' ? 'Enter as workspace' : 'Open as tab', () => { setView('canvas'); g.ref!.kind === 'frame' ? wsEnter(g.ref) : focusOpen(g.ref); });
   const hint = el('div', 'gc-hint', 'Neighbours of ' + g.label + ' are bright; the rest is dimmed. Esc, ✕ or a click on empty space shows all.');
@@ -4893,7 +5026,7 @@ AGENT_TOOLS.push({
   },
 });
 AGENT_TOOLS.push({
-  name: 'open_view', description: 'Switch the main area to a view: canvas, graph, editor, outline or tasks. With editor, page opens that page (created if missing). With canvas, target is anything move_view accepts. With graph, target selects that node.',
+  name: 'open_view', description: 'Switch the main area to a view: canvas, ranger, graph, editor, outline, tasks, review or agents. With editor, page opens that page (created if missing). With canvas, target is anything move_view accepts. With graph, target selects that node.',
   inputSchema: { type: 'object', properties: { view: { type: 'string', enum: VIEWS }, page: { type: 'string' }, target: { type: 'string' } }, required: ['view'] },
   run: ({ view, page, target }: { view: ViewName; page?: string; target?: string }) => {
     if (!VIEWS.includes(view)) throw new Error('unknown view ' + view);
@@ -5817,6 +5950,23 @@ const FR_CAP = 24, FR_FONT = 13, FR_CLOSE_MS = 5 * 60 * 1000, FR_HOLD_MS = 10000
 // relative to /edwin/. A manifest of another api is a runtime this board cannot load.
 interface FrManifest { api: number; files: string[]; scm: string[] }
 const FR_API = 1;
+// Agent drafts never open a replica or a file: only a local runtime buffer, killed with its overlay.
+const frPromptAvailable = (): boolean => FR.on && FR.ready && FR.online && !FR.failed;
+let frPromptKeys = false;
+function frPromptKeymap() {
+  if (frPromptKeys) return;
+  const Ed = FR.Ed!, L = FR.L!, map = new Ed.Keymap('wb-agent-prompt-mode-map');
+  for (const [key, send] of [['C-c C-c', true], ['C-c C-k', false]] as const) {
+    const name = send ? 'wb-agent-prompt-send' : 'wb-agent-prompt-back';
+    L.CMD(name, '', '', send ? 'Send this agent prompt.' : 'Keep this agent prompt unsent.', () => {
+      const buf = L.call('current-buffer') as EdwinBuffer, b = ACP_DRAFTS.get(buf), editor = b?.editor;
+      if (b && editor) setTimeout(() => { if (b.editor === editor) b.finishPrompt(send); });
+      return false;
+    });
+    L.call('define-key', [map, key, L.intern(name)]);
+  }
+  L.set('wb-agent-prompt-mode-map', map); frPromptKeys = true;
+}
 // This browser profile's device id (R9.16), made once; the per-tab client id lives in sessionStorage so a reload keeps it (R7.16).
 function deviceId() { let d = store.get('wb-device'); if (!d) { d = uid('d'); store.set('wb-device', d); } return d; }
 const frSession = { get(k: string): string | null { try { return sessionStorage.getItem(k); } catch { return null; } }, set(k: string, v: string) { try { sessionStorage.setItem(k, v); } catch {} }, del(k: string) { try { sessionStorage.removeItem(k); } catch {} } };
@@ -5894,6 +6044,7 @@ function frStateChanged(s: string) {
   if (FR.online) { const w = FR.waiters.splice(0); for (const r of w) r(); }
   else if (FR.tried) frDownNow();
   frOffRender();
+  for (const b of ACP_COMPOSERS) b.editorAvailability();
   document.body.classList.toggle('edit-off', FR.ready && !FR.online);
   statusRender();
 }
@@ -6566,7 +6717,7 @@ async function boot() {
   if (fresh) setTimeout(() => toast(`${keyLabel('Mod-K')} finds anything and runs any command · Alt-2 navigator · drag items into folders · ? for keys`, 7000), 600);
   setView(S.view || (fresh && innerWidth < 760 ? 'ranger' : 'canvas'));
   ($$('.needs-mesh') as HTMLElement[]).forEach(e => { e.hidden = !INFO?.mesh; });
-  sideTab(S.sideTab);
+  sideTab();
   placeInkChip();
   wireReview(); detectMode();
   if (view.persp && view.persp !== 'manual' && PERSP_NAMES[view.persp]) { perspSet(view.persp, true); if (perspCur() === 'fs') setTimeout(() => { perspEdgesRebuild(); renderLinks(); }, 300); }
@@ -7683,7 +7834,7 @@ function migrateV9() {
     const text = '# ' + n.name + ' (former agent node)\n\n' + (n.log || []).filter(m => m.text).map(m => (m.t === 'user' ? '> ' : '') + m.text).join('\n\n');
     Object.assign(n, { kind: 'buffer', text }); delete n.log; delete n.turns; delete n.tier;
   }
-  delete S.chat; if (S.sideTab === 'chat') S.sideTab = 'term';
+  delete S.chat; if (S.sideTab === 'chat' || S.sideTab === 'agents') S.sideTab = 'term';
 }
 cmd('Tag the active node… (#)', () => tagPrompt(activeId && S.nodes[activeId]), '#');
 cmd('Filter nodes by tag…', () => askName('Tag to show (empty clears)', TAG_FILTER ? '#' + TAG_FILTER : '#', v => tagFilter(v)));
@@ -8823,7 +8974,7 @@ function buttonItems(btns: HTMLButtonElement[]): PaletteItem[] {
 }
 // A card's or folder's actions: its header buttons and commands. A folder's reconnect and list buttons show only in the
 // .hdown and .d-fs states (CSS). The ✕ buttons stay out (they only arm); Delete here takes two picks, as ✕ takes two
-// clicks, because nothing brings a removed card back (its process is killed).
+// clicks, because removing a card cannot be undone; only a session started from this page's card is ended.
 function actionsFor(n: BoardNode): PaletteItem[] {
   const L = live[n.id], st = (c: string) => !!L?.el!.classList.contains(c);
   const btns = L ? ($$('button', (L.hdr || $('.flabel', L.el))!) as HTMLButtonElement[]).filter(b => !b.matches('.hdel, .fdel') && !(b.matches('.fre') && !st('hdown')) && !(b.matches('.fls') && !st('d-fs'))) : [];
@@ -8996,6 +9147,7 @@ const KC: Record<string, KeyCmdFn> = {
     else toast('Dictation goes into a page: focus one first (Alt-V), or use the Review view.');
   },
   ...Object.fromEntries(VIEWS.map(v => ['view.' + v, () => setView(v)])),
+  'agents.next': () => meshMove(1), 'agents.prev': () => meshMove(-1), 'agents.enter': () => meshEnter(), 'agents.back': () => meshBack(),
   ...Object.fromEntries([0, 1, 2, 3, 4, 5, 6, 7, 8, 9].flatMap(i => [['desk.' + i, () => deskGo(i)], ['desk.send.' + i, () => deskSend(i)],
     ['desk.follow.' + i, () => deskSend(i, { follow: true })], ['desk.also.' + i, () => deskSend(i, { keep: true })]])),
   'desk.prev': () => deskBack(), 'desk.new': () => deskNew(), 'desk.query': () => deskQueryAsk(), 'desk.rename': () => deskRename(), 'desk.pin': () => deskPin(),
@@ -9885,7 +10037,7 @@ AGENT_TOOLS.push(
     run: async ({ path }: { path?: string } = {}) => { const r = shellRef(path); const L = live[r.n.id]; if (L?.backend?.end) L.backend.end(true); else if (L?.backend) throw new Error(r.n.name + ' is a simulated shell'); else throw new Error(r.addr + ' is not running'); return 'killed ' + r.addr; } }
 );
 cmd('Shell: interrupt the active shell (Ctrl-C)', () => { try { const r = shellRef(''); live[r.n.id]?.backend?.input('\x03'); } catch (e) { toast(e.message); } }, '', () => n0()?.kind === 'term');
-cmd('Shell: kill the active shell\'s process', () => { try { const r = shellRef(''); const L = live[r.n.id]; if (L?.backend?.end) L.backend.end(true); else toast('Simulated shell.'); } catch (e) { toast(e.message); } }, '', () => n0()?.kind === 'term');
+cmd('Shell: kill the active shell\'s process', () => { try { const r = shellRef(''); const L = live[r.n.id]; if (L?.backend?.end) confirmSessionKill(r.n, L); else toast('Simulated shell.'); } catch (e) { toast(e.message); } }, '', () => n0()?.kind === 'term');
 cmd('Shell: scrollback of the active shell as a reference card', async () => { const n = n0(); if (!n || n.kind !== 'term') return toast('Pick a shell first.'); const text = await shellLogs(shellRef(''), 200); const k = childrenOf(n.id, 'ref').length; const r: RefNode = { id: uid('n'), kind: 'ref', in: n.in, name: n.name + '-log' + (k + 1), text, src: { node: n.id, line: 0, lines: text.split('\n').length }, srcLabel: pathOf(n.id) + ' › scrollback', x: n.x + n.w + 70, y: n.y + k * 50, w: 420, h: 360 }; S.edges.push({ id: uid('e'), from: n.id, to: r.id, type: 'ref' }); addNode(r); }, '', () => n0()?.kind === 'term');
 // ---- the host's own trees. proc: (from /proc), unit: (systemd), the status line and the Attention query. Board
 // terminals are the real nodes; every other process or unit is a ghost. Data comes from each host's daemon; in demo mode
@@ -10047,7 +10199,7 @@ function attnItems(): RgEntry[] {
     else if (s.state === 'done') items.push({ ...it, name: n.name + ' finished', attn: '', meta: agentLabel(n.agent) });
   }
   const det = agentsDetached().length; if (det) items.push({ key: 'attn:detached', name: det + ' agent' + (det === 1 ? '' : 's') + ' detached', kind: 'iattn', attn: '', dir: false, meta: 'Enter: revive all', go: reviveAll });   // F-A14
-  if (DAEMON && S) for (const s of Object.values(SESS)) if (s.alive && !S.nodes[s.sid] && s.sid !== 'dock' && !String(s.sid).startsWith('ed-'))   // running invisibly otherwise; the dock is never a node; ed-* are edwind's own (R9.22)
+  if (DAEMON && S) for (const s of Object.values(SESS)) if (s.alive && !S.nodes[s.sid] && s.sid !== 'dock' && !String(s.sid).startsWith('ed-') && !(s.kind === 'pty' && s.sid.startsWith('attach_')))   // dock, attach terminals and edwind's PTYs are not cards
     items.push({ key: 'orphan:' + s.sid, name: (s.kind === 'acp' ? agentLabel(s.acp?.agent) : s.pty?.fg?.comm || 'shell') + ' running without a card', kind: 'iattn', attn: 'bad', dir: false, meta: s.cwd || '', go: () => adoptOrphan(s) });
   for (const r of meshFlat().filter(obsWaits))   // F-A47: a session some harness reports; an agent card that waits is listed above. In a card, the card is the place
     items.push({ key: 'obs:' + r.id, name: meshName(r) + ' ' + meshWants(r.state), kind: 'iattn', attn: 'bad', dir: false, meta: '@' + r.host + ' · ' + meshDoing(r), ...(r.card ? { n: r.card } : { go: () => meshOpen(r.id) }) });
@@ -10108,7 +10260,7 @@ function statusRender(): void {
   add('✦ ' + c.agents + (c.waiting ? ' · ' + c.waiting + ' waiting' : ''), c.agents + ' agent card(s) and shell(s) running an agent' + (c.waiting ? ', ' + c.waiting + ' waiting for you. Click: the next waiting card (F-A15).' : '. Click: filter the canvas by #agent.'), c.waiting ? 'bad' : '', () => {
     if (c.waiting) { notifyAsk(); attnNext(n => n.kind === 'acp' && ACP_BAD.has(SESS[n.id]?.state)); } else { setView('canvas'); tagFilter('agent'); }
   });
-  if (INFO?.mesh) add('mesh ' + c.mesh + (c.meshWaiting ? ' · ' + c.meshWaiting + ' waiting' : ''), c.mesh + ' agent session(s) on the hosts of the mesh' + (c.meshWaiting ? ', ' + c.meshWaiting + ' waiting for you' : '') + '. Click: the Agents pane (F-A47).', c.meshWaiting ? 'bad' : '', () => meshOpen(meshFlat().find(meshBad)?.id));
+  if (INFO?.mesh) add('mesh ' + c.mesh + (c.meshWaiting ? ' · ' + c.meshWaiting + ' waiting' : ''), c.mesh + ' agent session(s) on the hosts of the mesh' + (c.meshWaiting ? ', ' + c.meshWaiting + ' waiting for you' : '') + '. Click: the Agents view (F-A48).', c.meshWaiting ? 'bad' : '', () => meshOpen(meshFlat().find(meshBad)?.id));
   if (c.due != null) add('▦ ' + c.due, c.due + ' flashcard(s) due. Click: review.', c.due ? 'warn' : '', () => setView('review'));
   add('☐ ' + c.tasks + (c.dueToday ? ' (' + c.dueToday + ' due)' : ''), c.tasks + ' open task(s) on the board and in the notes' + (c.dueToday ? ', ' + c.dueToday + ' scheduled or due by today' : '') + '. Click: the tasks view.', c.dueToday ? 'warn' : '', () => setView('tasks'));
   deskAttnTick(); deskQueryTick(); deskPager();

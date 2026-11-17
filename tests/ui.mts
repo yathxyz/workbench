@@ -216,6 +216,10 @@ check('create_flashcard demo', cf.startsWith('added to page cards'), cf);
 // palette has the new commands
 const cmds = await p.evaluate(() => window.__canvas.CMDS.map((c: PaletteItem) => c.l).filter((l: string) => /Artifact|Review/.test(l)));
 check('palette commands', cmds.length >= 9, cmds.join(' | '));
+// N78's view is not conditional on the optional mesh API (the demo has neither API nor hub).
+await p.evaluate(() => window.__canvas.setView('agents'));
+check('N78: Agents is available without the mesh API', await p.evaluate(() => window.__canvas.S.view === 'agents' && !document.querySelector<HTMLElement>('#v-agents')!.hidden && !window.__canvas.INFO?.mesh));
+await p.evaluate(() => window.__canvas.setView('review'));
 // phone mode
 await p.setViewportSize({ width: 420, height: 800 }); await sleep(300);
 check('phone mode', (await p.evaluate(() => document.body.dataset.mode)) === 'phone');
@@ -619,7 +623,10 @@ st = await p.evaluate(() => { const C = window.__canvas, cd = C.AGENT_TOOLS.find
   const r = { there: run('fs:@cdhost/srv'), here: run('fs:/srv') };
   C.HOSTLIST.splice(C.HOSTLIST.indexOf(H), 1); C.removeNode(sh.id); return r; });
 check('cd_shell: a shell on another host by its hostUrl (outside that host\'s folder) takes cd to that host\'s fs: address and refuses a local one', /: cd \/srv$/.test(st.there) && /another host/.test(st.here), JSON.stringify(st));
-await p.goBack(); await sleep(500);
+// The cd_shell check changed the active card; establish this check's own two history entries.
+await p.evaluate(async () => { const C = window.__canvas; C.goAddr('tag:agent'); C.goAddr('board:/canvas-workbench/machines'); await new Promise(r => setTimeout(r, 0)); });
+await p.goBack();
+await p.waitForFunction(() => location.hash === '#tag:agent' && window.__canvas.RG.dir === 'tag:agent' && document.body.dataset.view === 'ranger');
 st = await p.evaluate(() => [location.hash, window.__canvas.RG.dir, document.body.dataset.view || null]);
 check('browser back returns to the previous address', st[0] === '#tag:agent' && st[1] === 'tag:agent', JSON.stringify(st));
 st = await p.evaluate(() => { const C = window.__canvas, S = C.S; C.setView('canvas'); C.perspSet('tag'); const fr = () => Object.values<FrameNode>(S.nodes).filter(n => n.derived === 'tag').map(f => [f.tag, f.in ? S.nodes[f.in].tag : null, C.kidsOf(f.id).map((k: BoardNode & { alias?: string }) => k.name + (k.alias ? '*' : '')).sort().join()]);
@@ -3674,7 +3681,7 @@ await section('N12-N15, N33', async () => {
   } finally { await P.close(); }
 });
 // N77 (F-A47): the mesh in the page (harness --api). Sessions that harnesses report from two hosts list in the Agents
-// pane by project with the one waiting first, count in the status line and in the Attention list, and stand in the
+// view by project with the one waiting first, count in the status line and in the Attention list, and stand in the
 // graph under their host and project; one that runs in a shell card of this board is tied to that card.
 await section('N77', async () => {
   const D = await dpage();
@@ -3684,7 +3691,7 @@ await section('N77', async () => {
     const report = async (who: 'near' | 'far', payload: Record<string, unknown>, more: Record<string, unknown> = {}) =>
       (await fetch(H.api + '/v1/events', { method: 'POST', headers: { Authorization: 'Bearer ' + token(who), 'Content-Type': 'application/json' }, body: JSON.stringify({ harness: 'pi', payload, ...more }) })).status;
     const shell = await newTerm(D, 'n77');
-    const before = await D.evaluate(() => { const C = window.__canvas; return { mesh: C.INFO.mesh, tab: document.querySelector<HTMLElement>('.side-tabs [data-side=agents]')!.hidden, toggle: document.querySelector<HTMLElement>('#g-mesh')!.closest('label')!.hidden, obs: Object.keys(C.OBS).length, side: document.body.classList.contains('side-open'), view: C.S.view }; });
+    const before = await D.evaluate(() => { const C = window.__canvas; return { mesh: C.INFO.mesh, agents: !!document.querySelector('#v-agents'), toggle: document.querySelector<HTMLElement>('#g-mesh')!.closest('label')!.hidden, obs: Object.keys(C.OBS).length, view: C.S.view }; });
     const sent = [
       await report('far', { session_id: 'a1', kind: 'prompt', cwd: '/srv/alpha', text: 'fix the parser' }),
       await report('far', { session_id: 'a1', kind: 'subagent_start', agent_id: 'sub1', agent_type: 'explorer', cwd: '/srv/alpha' }),
@@ -3697,12 +3704,12 @@ await section('N77', async () => {
       const C = window.__canvas, out: Record<string, any> = {}, $$ = (s: string) => [...document.querySelectorAll<HTMLElement>(s)]; // any: each step's findings, read by the checks below
       const ids: Record<string, string> = {}; for (const o of Object.values<ObservedSession>(C.OBS)) ids[o.sessionId + (o.parent ? '/sub' : '')] = o.id;
       C.meshOpen(); await new Promise(r => setTimeout(r, 400));
-      out.pane = { open: document.body.classList.contains('side-open'), tab: C.S.sideTab, hidden: document.querySelector<HTMLElement>('#side-mesh')!.hidden, sum: document.querySelector('#mesh-sum')!.textContent };
-      out.groups = $$('#mesh-list .mesh-group').map(e => e.textContent);
-      out.rows = $$('#mesh-list .mesh-row').map(e => ({ id: e.dataset.id, cls: e.className, title: e.querySelector('b')!.textContent, sub: e.querySelector('.mesh-sub')!.textContent, d: e.style.getPropertyValue('--d'), card: !!e.querySelector('button') }));
+      out.pane = { view: C.S.view, hidden: document.querySelector<HTMLElement>('#v-agents')!.hidden, sum: document.querySelector('#mesh-sum')!.textContent };
+      out.groups = $$('#mesh-list .mesh-group').map(e => e.textContent).filter(t => t === 'beta' || t === 'alpha');
+      out.rows = $$('#mesh-list .mesh-row').filter(e => !!C.OBS[e.dataset.id!]).map(e => ({ id: e.dataset.id, cls: e.className, title: e.querySelector('b')!.textContent, sub: e.querySelector('.mesh-sub')!.textContent, d: e.style.getPropertyValue('--d'), card: !!e.querySelector('button') }));
       out.ids = ids;
-      const first = document.querySelector<HTMLElement>('#mesh-list .mesh-row')!; first.click();
-      out.detail = document.querySelector('#mesh-list .mesh-detail')?.textContent; out.sameRow = document.querySelector('#mesh-list .mesh-row.on')?.getAttribute('data-id');
+      document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${ids.a2}"]`)!.click();
+      out.detail = document.querySelector('#mesh-detail')?.textContent; out.sameRow = document.querySelector('#mesh-list .mesh-row.on')?.getAttribute('data-id');
       C.statusRender(); out.chip = $$('#st-host .stc').map(e => e.textContent).find(t => /^mesh /.test(t || '')); out.counts = C.statusCounts();
       out.attn = C.attnItems().filter((i: RgEntry) => i.key.startsWith('obs:')).map((i: RgEntry) => ({ key: i.key, name: i.name, meta: i.meta, n: i.n?.id }));
       C.setView('graph'); await new Promise(r => setTimeout(r, 300));
@@ -3714,11 +3721,11 @@ await section('N77', async () => {
       return out;
     }, shell);
     const { ids } = st, row = (id: string) => st.rows.find((r: { id: string }) => r.id === id);
-    check('N77: /api/info says the mesh is there; the Agents tab and the graph toggle show; the events were taken', before.mesh === true && !before.tab && !before.toggle && before.obs === 0 && sent.every(s => s === 204), JSON.stringify({ before, sent }));
-    check('N77: the Agents pane lists the mesh by project, the session that waits first, a subagent under its session',
-      st.pane.open && st.pane.tab === 'agents' && !st.pane.hidden && /^4 sessions on 2 hosts · 1 waiting for you$/.test(st.pane.sum) && String(st.groups) === 'beta,alpha' && st.rows.length === 4 && st.rows[0].id === ids.a2 && /\bbad\b/.test(st.rows[0].cls)
-      && /needs permission: Bash make docs/.test(st.rows[0].sub) && /@farbox/.test(st.rows[0].sub) && row(ids['a1/sub'])?.d === '1' && /^explorer/.test(row(ids['a1/sub'])?.sub) && st.rows.findIndex((r: { id: string }) => r.id === ids['a1/sub']) === st.rows.findIndex((r: { id: string }) => r.id === ids.a1) + 1, JSON.stringify(st));
-    check('N77: a click opens a row in place; a session in a shell card of this board has the way to its card', st.sameRow === ids.a2 && /write the docs/.test(st.detail || '') && /not steered/.test(st.detail || '') && row(ids.b1)?.card === true && row(ids.a1)?.card === false, JSON.stringify({ detail: st.detail, rows: st.rows }));
+    check('N77: /api/info says the mesh is there; the Agents view and the graph toggle exist; the events were taken', before.mesh === true && before.agents && !before.toggle && before.obs === 0 && sent.every(s => s === 204), JSON.stringify({ before, sent }));
+    check('N77: the Agents view lists the mesh by project, the session that waits first, a subagent under its session',
+      st.pane.view === 'agents' && !st.pane.hidden && /sessions on \d+ hosts? · 1 waiting for you$/.test(st.pane.sum) && String(st.groups) === 'beta,alpha' && st.rows.length === 4 && st.rows[0].id === ids.a2 && /\bbad\b/.test(st.rows[0].cls)
+      && /needs permission: Bash make docs/.test(st.rows[0].sub) && /@farbox/.test(st.rows[0].sub) && row(ids['a1/sub'])?.d === '1' && /pi\/explorer/.test(row(ids['a1/sub'])?.sub) && st.rows.findIndex((r: { id: string }) => r.id === ids['a1/sub']) === st.rows.findIndex((r: { id: string }) => r.id === ids.a1) + 1, JSON.stringify(st));
+    check('N77: a click opens the detail pane; a session in a shell card of this board has the way to its card', st.sameRow === ids.a2 && /write the docs/.test(st.detail || '') && /Started in a terminal the hub cannot reach/.test(st.detail || '') && row(ids.b1)?.card === true && row(ids.a1)?.card === false, JSON.stringify({ detail: st.detail, rows: st.rows }));
     check('N77: the status line counts the mesh and the Attention list names the session that waits', st.chip === 'mesh 4 · 1 waiting' && st.counts.mesh === 4 && st.counts.meshWaiting === 1 && st.attn.length === 1 && st.attn[0].key === 'obs:' + ids.a2 && st.attn[0].name === 'pi in beta needs permission' && /^@farbox/.test(st.attn[0].meta), JSON.stringify({ chip: st.chip, counts: st.counts, attn: st.attn }));
     check('N77: the graph has the hosts, the projects and the sessions: a subagent off its session, a project shared by two hosts, the shell card tied to its session',
       st.graph.hosts.length === 2 && st.graph.hosts.includes('host:farbox') && String(st.graph.projects) === 'proj:alpha,proj:beta' && st.graph.a2 === 'waiting_permission' && !/^(mesh|host|proj):/.test(st.graph.first) && st.graph.tied && st.graph.sub && st.graph.far && st.graph.shared, JSON.stringify(st.graph));
@@ -3726,12 +3733,14 @@ await section('N77', async () => {
     // the end of a session reaches the page: it leaves the list and the graph, and nothing waits any more
     await D.evaluate(() => window.__canvas.graphSelect('host:farbox'));
     await report('far', { session_id: 'a2', kind: 'end' });
-    const gone = await until(() => D.evaluate((id: string) => { const C = window.__canvas; return !C.G.N.has('mesh:' + id) && !document.querySelector(`#mesh-list .mesh-row[data-id="${id}"]:not(.on)`) && C.statusCounts().meshWaiting === 0 && C.statusCounts().mesh === 3; }, ids.a2), 8000);
-    const ended = await D.evaluate((id: string) => { document.querySelector<HTMLInputElement>('#mesh-ended')!.click(); return document.querySelector(`#mesh-list .mesh-row[data-id="${id}"]`)?.className; }, ids.a2);
-    check('N77: an ended session leaves the graph and the counts, and lists again under Ended', gone === true && /\bended\b/.test(ended || ''), JSON.stringify({ gone, ended }));
+    const gone = await until(() => D.evaluate((id: string) => { const C = window.__canvas; return !C.G.N.has('mesh:' + id) && C.statusCounts().meshWaiting === 0 && C.statusCounts().mesh === 3; }, ids.a2), 8000);
     // the host's card was open: it names the sessions that are left, and a button for the one that went opens nothing
     const stale = await D.evaluate((id: string) => { const C = window.__canvas, card = document.querySelector('#g-card')!.textContent; C.graphSelect('mesh:' + id); return { card, sel: C.G.sel, hidden: document.querySelector<HTMLElement>('#g-card')!.hidden }; }, ids.a2);
     check('N77: the open card of a host follows the sessions that end, and a node that went cannot be selected', /1 live session on this host/.test(stale.card || '') && !/write the docs/.test(stale.card || '') && stale.sel === null && stale.hidden, JSON.stringify(stale));
+    await D.evaluate((id: string) => window.__canvas.meshOpen(id), ids.a1);
+    const absent = !await D.locator(`#mesh-list .mesh-row[data-id="${ids.a2}"]`).count();
+    const ended = await D.evaluate((id: string) => { document.querySelector<HTMLInputElement>('#mesh-ended')!.click(); return document.querySelector(`#mesh-list .mesh-row[data-id="${id}"]`)?.className; }, ids.a2);
+    check('N77: an ended session leaves the graph and the counts, and lists again under Ended', gone === true && absent && /\bended\b/.test(ended || ''), JSON.stringify({ gone, absent, ended }));
     // the Attention list, open in the navigator, takes a session that starts to wait
     await D.evaluate(() => { const C = window.__canvas; C.setView('ranger'); C.rgGo('attn:'); });
     await settled(D);
@@ -3742,9 +3751,444 @@ await section('N77', async () => {
     for (let i = 0; i < 260; i++) await report('far', { session_id: 'f' + i, kind: 'prompt', cwd: '/srv/gamma', text: 'task ' + i });
     const dropped = await until(() => D.evaluate((id: string) => { const C = window.__canvas, far = Object.values<ObservedSession>(C.OBS).filter(o => o.host === 'farbox'); return !C.OBS[id] && far.length === 256 && far.some(o => o.sessionId === 'f259'); }, ids.a2), 15000);
     check('N77: a record dropped at the host\'s cap leaves the page', dropped === true, JSON.stringify(await D.evaluate((id: string) => { const C = window.__canvas; return { still: !!C.OBS[id], far: Object.values<ObservedSession>(C.OBS).filter(o => o.host === 'farbox').length }; }, ids.a2)));
-    await D.evaluate(({ shell, before }: { shell: string; before: { side: boolean; view: string } }) => { const C = window.__canvas; document.querySelector<HTMLInputElement>('#mesh-ended')!.click(); C.MESH.open = null; C.setView(before.view || 'canvas'); C.sideTab('term'); if (!before.side) C.toggleDockTerm(); C.removeNode(shell); }, { shell, before });
+    const busyId = await D.evaluate(() => Object.values<ObservedSession>(window.__canvas.OBS).find(o => o.host === 'farbox' && o.sessionId === 'f259')!.id);
+    await D.evaluate((id: string) => window.__canvas.meshOpen(id), busyId);
+    const busyRow = await D.locator(`#mesh-list .mesh-row[data-id="${busyId}"]`).elementHandle();
+    const eventCount = await D.evaluate((id: string) => window.__canvas.OBS[id].counts.events, busyId);
+    await report('far', { session_id: 'f259', kind: 'note', text: 'n77 stable activity update' });
+    const updated = await until(() => D.evaluate(({ id, n }) => window.__canvas.OBS[id].counts.events > n, { id: busyId, n: eventCount }), 8000);
+    check('N77: a hundreds-row Agents list keeps its selected row DOM through an ordinary activity update',
+      !!updated && await D.locator('#mesh-list .mesh-row').count() >= 256 && await busyRow!.evaluate(e => e.isConnected && e === document.querySelector('#mesh-list .mesh-row.on')),
+      JSON.stringify({ updated, rows: await D.locator('#mesh-list .mesh-row').count() }));
+    await D.evaluate(({ shell, before }: { shell: string; before: { view: string } }) => { const C = window.__canvas; document.querySelector<HTMLInputElement>('#mesh-ended')!.click(); C.setView(before.view || 'canvas'); C.removeNode(shell); }, { shell, before });
     await settled(D);
   } finally { await D.close(); }
+});
+// N78 (F-A48): real, externally started ACP/PTY sessions and observed attachments, never implicit board cards.
+await section('N78', async () => {
+  if (!STUB) return skip('N78', 'no `stub` agent (wb-fake-acp) in /api/info.agents');
+  const D = await dpage(), owner = await dpage(), sid = 'attach_n78_api';
+  let externalPty: string | undefined, owned: string | undefined, ownedPty: string | undefined, unloadPage: TailPage | undefined;
+  const model = 'claude-opus-4-1-20250805', cwd = fs.mkdtempSync(path.join(TMP, 'n78-project-'));
+  const meshApi = (url: string, method = 'GET', body?: Record<string, unknown>) => fetch(H.api + '/v1' + url, {
+    method, headers: { Authorization: 'Bearer ' + fs.readFileSync(H.apiTokenFiles.near, 'utf8').trim(), 'Content-Type': 'application/json' },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const startPty = (id: string) => owner.evaluate((id: string) => new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(location.origin.replace(/^http/, 'ws') + '/pty');
+    ws.onopen = () => ws.send(JSON.stringify({ t: 'open', id, spawn: true, cols: 80, rows: 24 }));
+    ws.onmessage = e => { const m = JSON.parse(e.data); if (m.t === 'hello') { ws.close(); resolve(); } else if (m.t === 'error') { ws.close(); reject(new Error(m.error)); } };
+    ws.onerror = () => reject(new Error('external PTY open failed'));
+  }), id);
+  const report = async (who: 'near' | 'far', session: string, more: Record<string, unknown> = {}, kind = 'prompt') =>
+    (await fetch(H.api + '/v1/events', { method: 'POST', headers: { Authorization: 'Bearer ' + fs.readFileSync(H.apiTokenFiles[who], 'utf8').trim(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ harness: 'pi', payload: { session_id: session, kind, cwd, model, permission_mode: 'default', text: 'n78 observed prompt' }, ...more }) })).status;
+  const row = (id: string) => D.locator(`#mesh-list .mesh-row[data-id="${id}"]`);
+  const info = () => D.evaluate(() => Object.fromEntries([...document.querySelectorAll('#mesh-detail .mesh-info .mesh-kv')].map(e => [e.querySelector('span')!.textContent!, e.querySelector('code')!.textContent!])));
+  const nodes = () => D.evaluate(() => Object.keys(window.__canvas.S.nodes).sort().join());
+  const liveText = () => termText(D, '$agents');
+  const composer = '#mesh-detail .mesh-live .ag-in textarea';
+  const liveView = () => acpView(D, '$agents');
+  const liveIdle = () => acpIdle(D, '$agents');
+  const isAlive = async (id: string) => (await sessions()).some(s => s.sid === id && s.alive);
+  const open = async (id: string) => { await D.evaluate((id: string) => window.__canvas.meshOpen(id), id); };
+  const syncBoard = async (from: TailPage, to: TailPage) => {
+    if (!await settled(from) || !await until(async () => await from.evaluate(() => window.__canvas.BOARD_ETAG) === await to.evaluate(() => window.__canvas.BOARD_ETAG), 15000))
+      throw new Error('N78 board save did not reach the other page');
+  };
+  const showCard = async (id: string, P = D) => {
+    await P.bringToFront();
+    await P.evaluate((id: string) => { const C = window.__canvas; C.setView('canvas'); C.focusOpen(C.S.nodes[id]); }, id);
+  };
+  const closeCard = async (id: string, P = D) => {
+    await showCard(id, P);
+    const close = P.locator(`.node[data-id="${id}"] .hdel`);
+    await close.click(); const armed = await close.evaluate(e => e.classList.contains('armed'));
+    const kept = await P.evaluate((id: string) => !!window.__canvas.S.nodes[id], id);
+    await close.click(); return { armed, kept, removed: !await P.locator(`.node[data-id="${id}"]`).count() };
+  };
+  const remoteCard = async (add: boolean) => {
+    await settled(owner); await syncBoard(D, owner);
+    if (add) { await owner.evaluate((sid: string) => window.__canvas.meshOpen(sid), sid); await owner.getByRole('button', { name: 'Add its card', exact: true }).click(); }
+    else await owner.evaluate((sid: string) => window.__canvas.removeNode(sid), sid);
+    await syncBoard(owner, D);
+    return until(async () => await D.evaluate(({ sid, add }) => !!window.__canvas.S.nodes[sid] === add, { sid, add })
+      && await D.getByRole('button', { name: add ? 'Show on canvas' : 'Add its card', exact: true }).count() === 1, 15000);
+  };
+  const reload = async () => { if (!await settled(D)) throw new Error('N78 board did not settle before reload'); await D.reload(); await D.waitForFunction(() => window.__canvas?.BOOTED); };
+  try {
+    const before = await nodes();
+    const created = await meshApi('/sessions', 'POST', { sid, agent: 'stub', cwd });
+    if (created.status !== 201) throw new Error('N78 API ACP spawn: ' + created.status + ' ' + await created.text());
+    const ready = await until(async () => { const s = (await sessions()).find(s => s.sid === sid); return s?.acp?.agentSessionId && s.acp.activity === 'none'; }, 15000);
+    if (!ready) throw new Error('N78 external ACP did not finish setup');
+    const original = await meshApi('/sessions/' + sid + '/prompt', 'POST', { text: 'n78 original conversation' });
+    if (!original.ok) throw new Error('N78 external prompt: ' + original.status + ' ' + await original.text());
+    externalPty = 'n78_external_pty';
+    await startPty(externalPty);
+    const sent = [await report('near', 'n78-readonly'), await report('near', 'n78-claude', { attach: { kind: 'claude', id: 'deadbeef' } }),
+      await report('far', 'n78-tmux', { attach: { kind: 'tmux', socket: '/tmp/n78-tmux/default', pane: 12 } }),
+      await report('near', 'n78-hubpty', { wbSession: externalPty })];
+    const ids = await until(() => D.evaluate((sid: string) => {
+      const ids: Record<string, string> = {};
+      for (const o of Object.values<ObservedSession>(window.__canvas.OBS)) if (o.sessionId.startsWith('n78-')) ids[o.sessionId] = o.id;
+      return Object.keys(ids).length === 4 && window.__canvas.SESS[sid] ? ids : null;
+    }, sid), 10000);
+    if (!ids) throw new Error('N78 observed sessions did not arrive');
+    await D.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await D.keyboard.press('Alt+Digit8');
+    await D.waitForSelector('#v-agents:not([hidden])');
+    await row(sid).click(); await liveIdle();
+    const initial = await D.locator('#mesh-detail .ag-log').textContent();
+    const rowEl = await row(sid).elementHandle(), controlEl = await D.locator(composer).elementHandle();
+    await D.fill(composer, 'n78 shared conversation'); await D.press(composer, 'Enter');
+    const shared = await until(async () => {
+      const v = await liveView(), text = await D.locator('#mesh-detail .ag-log').textContent();
+      return v?.promptable && v.items.includes('asst:echo: n78 shared conversation') && text?.includes('echo: n78 shared conversation') ? { items: v.items, text } : null;
+    }, 20000);
+    const stable = { row: await rowEl!.evaluate((e, sid: string) => e === document.querySelector(`#mesh-list .mesh-row[data-id="${sid}"]`), sid),
+      control: await controlEl!.evaluate(e => e === document.querySelector('#mesh-detail .mesh-live .ag-in textarea')) };
+    const listed = await D.evaluate(({ sid, ids }) => ({ view: window.__canvas.S.view, ids: [...document.querySelectorAll<HTMLElement>('#mesh-list .mesh-row')].map(e => e.dataset.id),
+      expected: [sid, ...Object.values(ids)], card: !!window.__canvas.S.nodes[sid] }), { sid, ids });
+    check('N78: Alt-8 opens Agents; an API-started ACP session replays and accepts real prompts without a card, preserving row and composer identity during activity',
+      sent.every(s => s === 204) && listed.view === 'agents' && listed.expected.every(id => listed.ids.includes(id)) && !listed.card && initial?.includes('echo: n78 original conversation') && !!shared && stable.row && stable.control && await nodes() === before,
+      JSON.stringify({ sent, listed, initial, shared, stable, nodes: await nodes(), before }));
+    const prefixOrphan = await D.evaluate((sid: string) => window.__canvas.attnItems().some((i: RgEntry) => i.key === 'orphan:' + sid), sid);
+    check('N78: an ordinary hub ACP session whose id starts attach_ remains in Agents and Attention as an orphan',
+      sid.startsWith('attach_') && listed.ids.includes(sid) && prefixOrphan, JSON.stringify({ sid, prefixOrphan, ids: listed.ids }));
+    const hubInfo = await until(async () => { const i = await info(); return i.model && i.reasoning && i.mode ? i : null; }, 10000);
+    const known = await D.evaluate(() => {
+      const b = window.__canvas.live.$agents.backend, opts = b.session.configOptions;
+      return { mode: b.mode(), model: opts?.find((o: { category?: string; currentValue?: string }) => o.category === 'model')?.currentValue, reasoning: opts?.find((o: { category?: string; currentValue?: string }) => o.category === 'thinking')?.currentValue };
+    });
+    const harnessLabel = await D.evaluate(() => window.__canvas.INFO.agents.find((a: { name: string; label: string }) => a.name === 'stub')?.label);
+    const hubRow = await row(sid).evaluate(e => ({ harness: e.querySelector('.mesh-harness')?.getAttribute('title'), model: e.querySelector('.mesh-model')?.getAttribute('title') }));
+    check('N78: ACP journal config metadata supplies the full model title, mode and reasoning; host, folder, start and activity times are shown',
+      !!harnessLabel && !!hubInfo && hubInfo.harness === harnessLabel && hubInfo.host === H.host && hubInfo.folder === cwd && hubInfo.mode === known.mode && hubInfo.model === known.model && hubInfo.reasoning === known.reasoning
+      && known.model === 'stub-model' && known.reasoning === 'high' && !!hubInfo.started && !!hubInfo['last active'] && hubRow.harness === harnessLabel && hubRow.model === known.model, JSON.stringify({ hubInfo, known, hubRow, harnessLabel }));
+
+    // All neighbour expectations come from the actual ordered rows, not the ages of unrelated sessions.
+    await D.locator('#mesh-list').focus();
+    const next = await row(sid).evaluate(e => { let n = e.nextElementSibling; while (n && !n.classList.contains('mesh-row')) n = n.nextElementSibling; return (n as HTMLElement | null)?.dataset.id; });
+    await D.keyboard.press('ArrowDown'); const down = await D.evaluate(() => window.__canvas.MESH.open);
+    await D.keyboard.press('ArrowUp'); const up = await D.evaluate(() => window.__canvas.MESH.open);
+    await D.keyboard.press('j'); const j = await D.evaluate(() => window.__canvas.MESH.open);
+    await D.keyboard.press('k'); const k = await D.evaluate(() => window.__canvas.MESH.open);
+    await liveIdle();
+    await D.keyboard.press('Enter');
+    const entered = await D.locator(composer).evaluate(e => e === document.activeElement);
+    await D.keyboard.press('Escape');
+    const escaped = await D.evaluate(() => !document.querySelector('#v-agents')!.classList.contains('detail-open'));
+    check('N78: Up/Down and j/k navigate ordered rows; Enter focuses the live composer and Escape returns to the list',
+      !!next && down === next && up === sid && j === next && k === sid && entered && escaped, JSON.stringify({ next, down, up, j, k, entered, escaped }));
+    await open(sid); await liveIdle();
+    await D.fill(composer, 'n78 unsent draft');
+    const draftControl = await D.locator(composer).elementHandle(), draftViewer = await D.locator('#mesh-detail .mesh-live').elementHandle();
+    const draftAdded = await remoteCard(true);
+    const draftKept = await draftControl!.evaluate(e => e === document.querySelector('#mesh-detail .ag-in textarea') && (e as HTMLTextAreaElement).value === 'n78 unsent draft');
+    const draftRemoved = await remoteCard(false);
+    const viewerKept = await draftViewer!.evaluate(e => e === document.querySelector('#mesh-detail .mesh-live'));
+    check('N78: another page adding and removing the card refreshes Show/Add actions without remounting the viewer or losing an unsent draft',
+      !!draftAdded && !!draftRemoved && draftKept && viewerKept && await D.inputValue(composer) === 'n78 unsent draft' && await nodes() === before,
+      JSON.stringify({ draftAdded, draftRemoved, draftKept, viewerKept }));
+
+    await section('N78 Edwin', async () => {
+      const built = await D.evaluate(() => window.__canvas.FR.on);
+      if (!built) return;
+      const edit = D.locator('#mesh-detail .ag-edit');
+      await edit.waitFor({ state: 'visible', timeout: 30000 });
+      await D.fill(composer, 'n78 editor sends'); await edit.click();
+      const editing = await until(async () => await D.locator('#mesh-detail .ag-editor-host.edwin-frame').isVisible() || (await toastOf(D)).startsWith('Prompt editor:'), 10000);
+      if (!editing || !await D.locator('#mesh-detail .ag-editor-host.edwin-frame').isVisible()) throw new Error('N78 editor open: ' + await toastOf(D));
+      const local = await D.evaluate(() => { const e = window.__canvas.live.$agents.backend.editor; return !!e && !e.buf.shared && /agent-prompt/.test(e.buf.name); });
+      await D.keyboard.type(' edited');
+      const editorFrame = await D.locator('#mesh-detail .ag-editor-host.edwin-frame').elementHandle(), editorComposer = await D.locator(composer).elementHandle();
+      const editorAdded = await remoteCard(true);
+      const editorKept = await editorFrame!.evaluate(e => e === document.querySelector('#mesh-detail .ag-editor-host.edwin-frame'));
+      const editorText = await D.evaluate(() => window.__canvas.live.$agents.backend.editor?.buf.text);
+      const editorRemoved = await remoteCard(false);
+      const editorStill = await editorFrame!.evaluate(e => e === document.querySelector('#mesh-detail .ag-editor-host.edwin-frame'));
+      const composerStill = await editorComposer!.evaluate(e => e === document.querySelector('#mesh-detail .ag-in textarea'));
+      check('N78: card addition in another page preserves the open Edwin editor, edited draft and original composer while its actions refresh',
+        !!editorAdded && !!editorRemoved && editorKept && editorStill && composerStill && editorText === 'n78 editor sends edited',
+        JSON.stringify({ editorAdded, editorRemoved, editorKept, editorStill, composerStill, editorText }));
+      await D.evaluate(() => window.__canvas.live.$agents.backend.editor.frame.focus());
+      await D.keyboard.press('Control+c'); await D.keyboard.press('Control+c');
+      const sent = await until(async () => {
+        const v = await liveView();
+        return v?.promptable && v.items.includes('asst:echo: n78 editor sends edited') && !await D.locator('#mesh-detail .ag-editor').count() ? v.items : null;
+      }, 20000);
+      await D.fill(composer, 'n78 editor restores');
+      const prompts = acpSent(D, sid, 'prompt').length;
+      await D.press(composer, 'Control+c'); await D.press(composer, 'Control+e'); await D.waitForSelector('#mesh-detail .ag-editor-host.edwin-frame');
+      await D.keyboard.type(' edited'); await D.keyboard.press('Control+c'); await D.keyboard.press('Control+k');
+      const restored = await until(async () => !await D.locator('#mesh-detail .ag-editor').count() && await D.inputValue(composer) === 'n78 editor restores edited', 10000);
+      check('N78: a local unsaved Edwin prompt sends with C-c C-c; C-c C-k restores the current text without sending',
+        local && !!sent && !!restored && acpSent(D, sid, 'prompt').length === prompts && await nodes() === before, JSON.stringify({ local, sent, restored, prompts, now: acpSent(D, sid, 'prompt').length }));
+    });
+
+    await row(ids['n78-readonly']).click();
+    const detached = await until(async () => !await D.locator(composer).count() && await isAlive(sid), 10000);
+    await open(sid); await liveIdle();
+    await D.evaluate(() => window.__canvas.setView('canvas'));
+    const leftHub = await until(async () => !await D.locator(composer).count() && await isAlive(sid), 10000);
+    check('N78: deselecting a non-owned hub ACP session and leaving Agents dispose only the viewer, never the session',
+      !!detached && !!leftHub && acpSent(D, sid, 'kill').length === 0 && await nodes() === before, JSON.stringify({ detached, leftHub, kills: acpSent(D, sid, 'kill') }));
+
+    await open(ids['n78-readonly']);
+    const ro = await D.locator('#mesh-detail').textContent(), roInfo = await info();
+    const metadata = await row(ids['n78-readonly']).evaluate(e => ({
+      harness: e.querySelector('.mesh-harness')?.textContent, harnessTitle: e.querySelector('.mesh-harness')?.getAttribute('title'),
+      model: e.querySelector('.mesh-model')?.textContent, modelTitle: e.querySelector('.mesh-model')?.getAttribute('title'),
+    }));
+    check('N78: an observed row has full harness/model titles; read-only detail explains setup, displays known metadata and omits unknown reasoning',
+      metadata.harness === 'pi' && metadata.harnessTitle === 'pi' && !!metadata.model && metadata.modelTitle === model && roInfo.harness === 'pi' && roInfo.model === model && roInfo.host === H.host && roInfo.folder === cwd && roInfo.mode === 'default' && !('reasoning' in roInfo) && !!roInfo.started && !!roInfo['last active']
+      && /Started in a terminal the hub cannot reach/.test(ro || '') && /Claude background session/.test(ro || '') && /tmux/.test(ro || '') && !await D.locator('#mesh-detail .ag-in textarea, #mesh-detail .xterm').count()
+      && !await D.getByRole('button', { name: 'Open terminal', exact: true }).count(), JSON.stringify({ metadata, roInfo, ro }));
+    await D.evaluate(() => { if (document.body.classList.contains('side-open')) window.__canvas.toggleDockTerm(); });   // the dock covers the whole phone viewport
+    await D.setViewportSize({ width: 390, height: 844 });
+    await D.locator('#mesh-detail .mesh-back').click();
+    const listPhone = await D.evaluate(() => { const v = document.querySelector('#v-agents')!, l = document.querySelector('#mesh-list')!; return !v.classList.contains('detail-open') && l.getBoundingClientRect().width <= innerWidth && l.getBoundingClientRect().width > 0; });
+    await row(ids['n78-readonly']).click();
+    const detailPhone = await D.evaluate(() => { const v = document.querySelector('#v-agents')!, d = document.querySelector('#mesh-detail')!; return v.classList.contains('detail-open') && d.getBoundingClientRect().width <= innerWidth && d.getBoundingClientRect().width > 0 && document.documentElement.scrollWidth <= innerWidth; });
+    await D.locator('#mesh-detail .mesh-back').click();
+    check('N78: below 700 px the list and selected detail fit the screen, and Sessions returns to the list', listPhone && detailPhone && await row(ids['n78-readonly']).isVisible(), JSON.stringify({ listPhone, detailPhone }));
+    await D.setViewportSize({ width: 1500, height: 950 });
+
+    await open(ids['n78-hubpty']);
+    const ptyReady = await until(() => ptyOf(D, externalPty).some(w => w.hello && !w.closed));
+    await D.locator('#mesh-detail .xterm-helper-textarea').focus();
+    await D.keyboard.type("printf 'n78-hub-pty-%s\\n' output"); await D.keyboard.press('Enter');
+    const ptyOutput = await until(async () => (await liveText()).includes('n78-hub-pty-output'), 10000);
+    await row(ids['n78-readonly']).click();
+    const ptySurvived = await isAlive(externalPty);
+    check('N78: an externally owned hub PTY is interactive without adding a card or spawning; deselecting does not kill it',
+      !!ptyReady && !!ptyOutput && ptySurvived && ptyOf(D, externalPty).every(w => w.open?.spawn === false) && await nodes() === before,
+      JSON.stringify({ ptyReady, ptyOutput, ptySurvived, opens: ptyOf(D, externalPty).map(w => w.open) }));
+    await open(ids['n78-claude']);
+    const observedTitle = await D.locator('#mesh-detail h3').elementHandle();
+    const endedReport = await report('near', 'n78-claude', {}, 'end');
+    const endedAction = await until(async () => await D.evaluate((id: string) => window.__canvas.OBS[id].endedAt !== null, ids['n78-claude'])
+      && !await D.getByRole('button', { name: 'Open terminal', exact: true }).count() && /Started in a terminal the hub cannot reach/.test(await D.locator('#mesh-detail .mesh-hint').innerText()), 10000);
+    const revivedReport = await report('near', 'n78-claude', { attach: { kind: 'claude', id: 'deadbeef' } });
+    const revivedAction = await until(async () => await D.evaluate((id: string) => window.__canvas.OBS[id].endedAt === null, ids['n78-claude'])
+      && await D.getByRole('button', { name: 'Open terminal', exact: true }).isEnabled() && /Closing this terminal leaves the agent running/.test(await D.locator('#mesh-detail .mesh-hint').innerText()), 10000);
+    const observedDetailStable = await observedTitle!.evaluate(e => e === document.querySelector('#mesh-detail h3'));
+    check('N78: ending and reviving the selected observed session removes and restores Open terminal and its hint in place without rebuilding detail',
+      endedReport === 204 && revivedReport === 204 && !!endedAction && !!revivedAction && observedDetailStable,
+      JSON.stringify({ endedReport, revivedReport, endedAction, revivedAction, observedDetailStable }));
+
+    const attach = async (id: string, address: string, input: string, P = D) => {
+      await P.evaluate((id: string) => window.__canvas.meshOpen(id), id); await P.getByRole('button', { name: 'Open terminal', exact: true }).click();
+      const sid = await P.evaluate(() => window.__canvas.live.$agents.backend.n.id);
+      const printed = await until(async () => (await termText(P, '$agents')).includes(address), 15000);
+      await P.locator('#mesh-detail .mesh-live .xterm-helper-textarea').focus();
+      await P.keyboard.type(input); await P.keyboard.press('Enter');
+      const echoed = await until(async () => (await termText(P, '$agents')).split(input).length >= 3, 10000);
+      const hidden = await P.evaluate((sid: string) => !window.__canvas.attnItems().some((i: RgEntry) => i.key === 'orphan:' + sid) && !document.querySelector(`#mesh-list .mesh-row[data-id="${sid}"]`), sid);
+      return { printed, echoed, hidden, text: await termText(P, '$agents'), sid, opens: ptyOf(P, sid).map(w => w.open) };
+    };
+    const claude = await attach(ids['n78-claude'], H.host + ':claude:deadbeef', 'n78-cat-claude');
+    check('N78: observed Claude attach prints its safe address, carries PTY input/output, has no browser cmd or canvas card and is not an orphan',
+      !!claude.printed && !!claude.echoed && claude.hidden && claude.opens.some(o => o?.spawn && o.attach === ids['n78-claude'] && !('cmd' in o)) && await nodes() === before, JSON.stringify(claude));
+    const other = await attach(ids['n78-claude'], H.host + ':claude:deadbeef', 'n78-cat-other-page', owner);
+    const both = await isAlive(claude.sid) && await isAlive(other.sid);
+    check('N78: two pages opening the same observed row get distinct live, sid-safe attach PTYs',
+      !!other.printed && !!other.echoed && other.hidden && both && claude.sid !== other.sid
+      && [claude.sid, other.sid].every(s => s.length <= 64 && /^[A-Za-z0-9_-]+$/.test(s) && s.startsWith('attach_' + ids['n78-claude'] + '_')),
+      JSON.stringify({ claude: claude.sid, other: other.sid, both }));
+    await row(ids['n78-readonly']).click();
+    const deselected = await until(async () => !(await sessions()).some(s => s.sid === claude.sid) && !await D.locator('#mesh-detail .xterm').count(), 15000);
+    const still = await D.evaluate((id: string) => { const o = window.__canvas.OBS[id]; return !!o && o.endedAt === null; }, ids['n78-claude']);
+    await owner.locator('#mesh-detail .mesh-live .xterm-helper-textarea').focus(); await owner.keyboard.type('n78-still-other-page'); await owner.keyboard.press('Enter');
+    const otherSurvived = await until(async () => await isAlive(other.sid) && (await termText(owner, '$agents')).split('n78-still-other-page').length >= 3, 10000);
+    check('N78: deselecting terminates only that page\'s attach PTY, leaving the other page\'s viewer interactive and the observed and hub sessions live',
+      !!deselected && still && !!otherSurvived && await isAlive(sid), JSON.stringify({ deselected, still, otherSurvived }));
+    await owner.evaluate(() => window.__canvas.setView('canvas'));
+    const otherLeft = await until(async () => !(await sessions()).some(s => s.sid === other.sid), 15000);
+    check('N78: leaving the second page terminates only its separate attach PTY', !!otherLeft && still, JSON.stringify({ otherLeft, sid: other.sid }));
+    await syncBoard(owner, D);   // View changes are shared-board writes; do not race the two pages' saves.
+    const tmux = await attach(ids['n78-tmux'], 'farbox:tmux:12:/tmp/n78-tmux/default', 'n78-cat-tmux');
+    await D.evaluate(() => (document.activeElement as HTMLElement | null)?.blur()); await D.keyboard.press('Alt+Digit1');
+    const left = await until(async () => !(await sessions()).some(s => s.sid === tmux.sid) && !await D.locator('#mesh-detail .xterm').count(), 15000);
+    check('N78: remote tmux attach prints the resolved address and carries input; leaving Agents terminates only its temporary PTY',
+      !!tmux.printed && !!tmux.echoed && tmux.hidden && !!left && await isAlive(sid) && await nodes() === before, JSON.stringify({ tmux, left }));
+    await syncBoard(D, owner);
+    unloadPage = await dpage(); await unloadPage.evaluate((id: string) => window.__canvas.meshOpen(id), ids['n78-claude']);
+    await unloadPage.getByRole('button', { name: 'Open terminal', exact: true }).click();
+    const unloadingSid = await unloadPage.evaluate(() => window.__canvas.live.$agents.backend.n.id);
+    const unloading = await until(() => isAlive(unloadingSid), 15000);
+    await syncBoard(unloadPage, D);
+    await unloadPage.close(); unloadPage = undefined;
+    const unloaded = await until(async () => !(await sessions()).some(s => s.sid === unloadingSid), 15000);
+    check('N78: page unload terminates and forgets the attach viewer, leaving its observed session live',
+      !!unloading && !!unloaded && unloadingSid !== claude.sid && unloadingSid !== other.sid && await D.evaluate((id: string) => window.__canvas.OBS[id]?.endedAt === null, ids['n78-claude']), JSON.stringify({ unloading, unloaded, unloadingSid }));
+
+    // Borrowed ownership is part of the saved board, not the backend's lifetime in this page.
+    await open(sid); await D.getByRole('button', { name: 'Add its card', exact: true }).click();
+    await acpIdle(D, sid);
+    await open(ids['n78-hubpty']); await D.getByRole('button', { name: 'Add its card', exact: true }).click();
+    await until(() => ptyOf(D, externalPty).some(w => w.hello && !w.closed));
+    await reload(); await acpIdle(D, sid);
+    await until(() => ptyOf(D, externalPty).some(w => w.hello && !w.closed));
+    const borrowed = await D.evaluate((ids: string[]) => ids.every(id => window.__canvas.S.nodes[id]?.adopted === true), [sid, externalPty]);
+    const adopted = await closeCard(sid), adoptedPty = await closeCard(externalPty);
+    check('N78: after reload, closing adopted ACP and PTY cards removes only their cards and leaves their sessions running',
+      borrowed && adopted.armed && adopted.kept && adopted.removed && adoptedPty.armed && adoptedPty.kept && adoptedPty.removed && await isAlive(sid) && await isAlive(externalPty)
+      && acpSent(D, sid, 'kill').length === 0 && await nodes() === before, JSON.stringify({ borrowed, adopted, adoptedPty, kills: acpSent(D, sid, 'kill') }));
+    await open(sid); await liveIdle();
+    await D.locator('#mesh-detail .mesh-kill').click();
+    const confirmation = await D.locator('#pal-in').getAttribute('placeholder');
+    const beforeConfirm = await isAlive(sid);
+    await D.keyboard.press('Escape');
+    const cancelled = await isAlive(sid), noKill = acpSent(D, sid, 'kill').length === 0;
+    await D.locator('#mesh-detail .mesh-kill').click();
+    await D.locator('#pal-list .pi').filter({ has: D.locator('.l', { hasText: /^Kill session$/ }) }).click();
+    const killed = await until(async () => !await isAlive(sid), 15000);
+    check('N78: explicit Kill session is separate from close, cancelled confirmation preserves it, and confirmation ends it',
+      /Kill session/.test(confirmation || '') && beforeConfirm && cancelled && noKill && !!killed && acpSent(D, sid, 'kill').some(m => m.forget === false), JSON.stringify({ confirmation, beforeConfirm, cancelled, noKill, killed, kills: acpSent(D, sid, 'kill') }));
+    await open(sid); await D.getByRole('button', { name: 'Add its card', exact: true }).click();
+    await meshApi('/sessions/' + sid + '?forget=true', 'DELETE');
+    await showCard(sid);
+    await D.locator(`.node[data-id="${sid}"] .ag-state`).getByRole('button', { name: 'Start new session', exact: true }).click();
+    const freshAgent = await acpIdle(D, sid);
+    const agentClaimed = await D.evaluate((id: string) => !window.__canvas.S.nodes[id].adopted, sid);
+    const replacedAgent = await closeCard(sid), replacedAgentEnded = await until(async () => !await isAlive(sid), 15000);
+    check('N78: starting a replacement session from an adopted agent card clears its borrowed mark and restores kill-on-close',
+      !!freshAgent && agentClaimed && replacedAgent.removed && !!replacedAgentEnded, JSON.stringify({ freshAgent: !!freshAgent, agentClaimed, replacedAgent, replacedAgentEnded }));
+    await open(ids['n78-hubpty']); await D.getByRole('button', { name: 'Add its card', exact: true }).click();
+    await until(() => ptyOf(D, externalPty).some(w => w.hello && !w.closed));
+    await showCard(externalPty);
+    const shellKill = D.locator(`.node[data-id="${externalPty}"] .session-kill`);
+    await shellKill.click();
+    const shellBeforeConfirm = await isAlive(externalPty);
+    await D.keyboard.press('Escape');
+    const shellCancelled = await isAlive(externalPty);
+    await shellKill.click();
+    await D.locator('#pal-list .pi').filter({ has: D.locator('.l', { hasText: /^Kill session$/ }) }).click();
+    const shellKilled = await until(async () => !await isAlive(externalPty!), 15000);
+    const shellCardKept = await D.evaluate((id: string) => !!window.__canvas.S.nodes[id], externalPty);
+    check('N78: an adopted shell has a separate confirmed Kill session action; cancel preserves it and killing does not delete the card',
+      shellBeforeConfirm && shellCancelled && !!shellKilled && shellCardKept, JSON.stringify({ shellBeforeConfirm, shellCancelled, shellKilled, shellCardKept }));
+    await until(() => D.evaluate((id: string) => !!window.__canvas.live[id].backend.dead, externalPty!));
+    await typeIn(D, externalPty, '\r');
+    const freshShell = await until(async () => await isAlive(externalPty!) && await D.evaluate((id: string) => !window.__canvas.S.nodes[id].adopted, externalPty!), 15000);
+    const shellClaimed = await D.evaluate((id: string) => !window.__canvas.S.nodes[id].adopted, externalPty);
+    const replacedShell = await closeCard(externalPty), replacedShellEnded = await until(async () => !await isAlive(externalPty!), 15000);
+    check('N78: starting a replacement session from an adopted shell card clears its borrowed mark and restores kill-on-close',
+      !!freshShell && shellClaimed && replacedShell.removed && !!replacedShellEnded, JSON.stringify({ freshShell, shellClaimed, replacedShell, replacedShellEnded }));
+    await D.evaluate(() => window.__canvas.setView('canvas'));
+    owned = await acpNew(D); if (!owned) throw new Error('N78 page-started canvas agent did not appear');
+    await acpIdle(D, owned);
+    ownedPty = await newTerm(D, 'n78-owned');
+    await reload(); await acpIdle(D, owned);
+    await until(() => ptyOf(D, ownedPty).some(w => w.hello && !w.closed));
+    const started = await isAlive(owned) && await isAlive(ownedPty);
+    const ownedAfterReload = await D.evaluate((ids: string[]) => ids.every(id => !window.__canvas.S.nodes[id].adopted), [owned, ownedPty]);
+    const closedOwned = await closeCard(owned), closedOwnedPty = await closeCard(ownedPty);
+    const endedOwned = await until(async () => !await isAlive(owned!) && !await isAlive(ownedPty!), 15000);
+    check('N78: after reload, closing ACP and PTY cards created by this page still ends their sessions',
+      started && ownedAfterReload && closedOwned.armed && closedOwned.kept && closedOwned.removed && closedOwnedPty.armed && closedOwnedPty.kept && closedOwnedPty.removed
+      && !!endedOwned && acpSent(D, owned, 'kill').length > 0, JSON.stringify({ started, ownedAfterReload, closedOwned, closedOwnedPty, endedOwned, kills: acpSent(D, owned, 'kill') }));
+
+    await section('N78 attached races', async () => {
+      await settled(D); await settled(owner);
+      const P = await ctx.newPage(); watchErrors(P);
+      const agent = 'n78_race_acp', shell = 'n78_race_pty', ids = [agent, shell];
+      const held = new Map<string, { open: Extract<PtyClientMsg | AcpClientMsg, { t: 'open' }>; release: () => void }>();
+      const messages: { id: string; msg: PtyClientMsg | AcpClientMsg }[] = [];
+      let agentReply: Extract<AcpServerMsg, { t: 'hello' }> | undefined, shellReply: Extract<PtyServerMsg, { t: 'hello' }> | undefined;
+      let hideIncarnation = false, latest: { ws: TailPw.WebSocketRoute; message: string | Buffer; session: SessionSummary } | undefined;
+      await P.routeWebSocket(/\/rpc$/, ws => {
+        const server = ws.connectToServer();
+        server.onMessage(message => {
+          const m = JSON.parse(message as string) as HubMsg;
+          if (hideIncarnation && m.t === 'gone' && m.sid === agent) return;
+          if (hideIncarnation && m.t === 'session' && m.session.sid === agent) { latest = { ws, message, session: m.session }; return; }
+          ws.send(message);
+        });
+      });
+      await P.routeWebSocket(/\/(pty|acp)$/, ws => {
+        const server = ws.connectToServer(); let id = '';
+        ws.onMessage(message => {
+          const m = JSON.parse(message as string) as PtyClientMsg | AcpClientMsg;
+          if (m.t === 'open') id = m.id;
+          messages.push({ id, msg: m });
+          // Pause only the explicit replacement open, before the hub decides whether it is new or attached.
+          if (m.t === 'open' && ids.includes(m.id) && ('agent' in m || 'spawn' in m && m.spawn)) held.set(m.id, { open: m, release: () => server.send(message) });
+          else server.send(message);
+        });
+        server.onMessage(message => {
+          const m = JSON.parse(message as string) as PtyServerMsg | AcpServerMsg;
+          if (m.t === 'hello' && id === agent) agentReply = m as Extract<AcpServerMsg, { t: 'hello' }>;
+          if (m.t === 'hello' && id === shell) shellReply = m as Extract<PtyServerMsg, { t: 'hello' }>;
+          ws.send(message);
+        });
+      });
+      try {
+        await P.goto(ORIGIN + '/'); await P.waitForFunction(() => window.__canvas?.BOOTED);
+        await P.evaluate(({ agent, shell, cwd }) => {
+          const C = window.__canvas; C.setView('canvas');
+          C.addNode({ id: agent, kind: 'acp', name: 'n78 borrowed agent', agent: 'stub', cwd, x: 100, y: 100, w: 560, h: 520, adopted: true, _spawn: false });
+          C.addNode({ id: shell, kind: 'term', backend: 'pty', name: 'n78 borrowed shell', env: {}, x: 700, y: 100, w: 560, h: 520, adopted: true, _spawn: false });
+        }, { agent, shell, cwd });
+        await until(async () => /No session for this card/.test((await acpView(P, agent))?.state || '') && (await termText(P, shell)).includes('No session: press Enter'), 10000);
+        await acpClick(P, agent, '.ag-state .acts button.go'); await typeIn(P, shell, '\r');
+        if (!await until(() => held.size === 2, 10000)) throw new Error('N78 replacement opens were not held');
+        const beforeHello = await P.evaluate((ids: string[]) => {
+          const C = window.__canvas, saved = JSON.parse(C.serialize()); return ids.every(id => C.S.nodes[id].adopted && saved.nodes[id].adopted);
+        }, ids);
+        const created = await meshApi('/sessions', 'POST', { sid: agent, agent: 'stub', cwd });
+        if (created.status !== 201) throw new Error('N78 raced ACP spawn: ' + created.status + ' ' + await created.text());
+        await startPty(shell);
+        for (const h of held.values()) h.release();
+        const attachedAgent = await acpIdle(P, agent), attachedShell = await until(() => P.evaluate((id: string) => window.__canvas.live[id].backend.helloSeen && !window.__canvas.live[id].backend.dead, shell), 15000);
+        await settled(P);
+        const borrowedAfterHello = await P.evaluate((ids: string[]) => ids.every(id => window.__canvas.S.nodes[id].adopted === true), ids);
+        const saved = boardFile(), savedBorrowed = ids.every(id => saved?.nodes[id]?.adopted === true);
+        const closedAgent = await closeCard(agent, P), closedShell = await closeCard(shell, P); await settled(P);
+        const kills = messages.filter(m => ids.includes(m.id) && m.msg.t === 'kill');
+        const agentOpen = held.get(agent)!.open, shellOpen = held.get(shell)!.open;
+        check('N78: requested ACP/PTY replacements stay borrowed until hello; attached responses preserve the saved mark and closing their cards leaves both sessions live',
+          beforeHello && !!attachedAgent && !!attachedShell && agentReply?.status === 'attached' && shellReply?.new === false && borrowedAfterHello && savedBorrowed
+          && 'agent' in agentOpen && 'spawn' in shellOpen && shellOpen.spawn === true
+          && closedAgent.removed && closedShell.removed && !kills.length && await isAlive(agent) && await isAlive(shell),
+          JSON.stringify({ beforeHello, status: agentReply?.status, new: shellReply?.new, borrowedAfterHello, savedBorrowed, closedAgent, closedShell, kills }));
+
+        await P.evaluate((id: string) => window.__canvas.meshOpen(id), agent); await acpIdle(P, '$agents');
+        const oldComposer = await P.locator('#mesh-detail .ag-in textarea').elementHandle(), oldEpoch = (await acpView(P, '$agents'))!.epoch;
+        hideIncarnation = true;
+        await meshApi('/sessions/' + agent + '?forget=true', 'DELETE');
+        await until(async () => !(await sessions()).some(s => s.sid === agent), 15000);
+        const recreated = await meshApi('/sessions', 'POST', { sid: agent, agent: 'stub', cwd });
+        if (recreated.status !== 201) throw new Error('N78 incarnation spawn: ' + recreated.status + ' ' + await recreated.text());
+        const incarnation = await until(() => latest?.session.alive && latest.session.createdAt !== oldEpoch ? latest : null, 15000);
+        if (!incarnation) throw new Error('N78 new incarnation was not reported');
+        // Deliver a real new summary without its preceding gone: the row/sid/kind stay the same.
+        hideIncarnation = false; incarnation.ws.send(incarnation.message);
+        const fresh = await until(async () => { const v = await acpView(P, '$agents'); return v?.promptable && v.epoch === incarnation.session.createdAt ? v : null; }, 20000);
+        const replacedComposer = await oldComposer!.evaluate(e => !e.isConnected);
+        const selected = await P.evaluate((id: string) => window.__canvas.MESH.open === id && !window.__canvas.S.nodes[id], agent);
+        check('N78: a changed hub createdAt remounts the same selected row onto its new incarnation without adding a card or killing the viewer',
+          !!fresh && fresh.epoch === incarnation.session.createdAt && fresh.epoch !== oldEpoch && replacedComposer && selected
+          && !messages.some(m => m.id === agent && m.msg.t === 'kill') && await isAlive(agent),
+          JSON.stringify({ oldEpoch, epoch: fresh?.epoch, expected: incarnation.session.createdAt, replacedComposer, selected }));
+      } finally {
+        await P.evaluate((ids: string[]) => { const C = window.__canvas; C.setView('canvas'); for (const id of ids) if (C.S.nodes[id]) C.removeNode(id); }, ids);
+        for (const id of ids) await meshApi('/sessions/' + id + '?forget=true', 'DELETE');
+        await settled(P); await P.close();
+      }
+    });
+  } finally {
+    await unloadPage?.close();
+    await D.evaluate((ids: (string | undefined)[]) => { const C = window.__canvas; C.setView('canvas'); for (const id of ids) if (id && C.S.nodes[id]) C.removeNode(id); }, [sid, externalPty, owned, ownedPty]);
+    if (externalPty) await meshApi('/sessions/' + externalPty + '?forget=true', 'DELETE');
+    await meshApi('/sessions/' + sid + '?forget=true', 'DELETE');
+    for (const id of [owned, ownedPty]) if (id) await meshApi('/sessions/' + id + '?forget=true', 'DELETE');
+    for (const id of ['n78-readonly', 'n78-claude', 'n78-hubpty']) await report('near', id, {}, 'end');
+    await report('far', 'n78-tmux', {}, 'end');
+    await settled(D); await owner.close(); await D.close();
+  }
 });
 // M5-W3: the host trees. A board shell's process is listed with its card; units answer their shape whatever the host has.
 await section('N72', async () => {

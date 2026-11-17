@@ -65,7 +65,7 @@
   const BROWSER = ['C-w', 'C-t', 'C-n', 'C-S-w', 'C-S-t', 'C-S-n', 'C-TAB', 'C-S-TAB', 'C-<prior>', 'C-<next>', 'C-q', 's-w', 's-t', 's-n', 's-q'];
 
   const range = (a: number, b: number): number[] => Array.from({ length: b - a + 1 }, (_, i) => a + i);
-  const VIEWS = ['canvas', 'ranger', 'graph', 'editor', 'outline', 'tasks', 'review'];
+  const VIEWS = ['canvas', 'ranger', 'graph', 'editor', 'outline', 'tasks', 'review', 'agents'];
 
   // ---- keymaps: [key, command, label, group]. group folds several rows into one in which-key and the help.
   const MAPS: Record<string, WBKeyRow[]> = {
@@ -75,7 +75,7 @@
       ['C-`', 'dock.toggle', 'docked terminal'], ['C-j', 'dock.toggle', 'docked terminal'], ['s-j', 'dock.toggle', 'docked terminal'],
       ['C-M-[', 'pane.wider', 'side pane wider'], ['C-M-]', 'pane.narrower', 'side pane narrower'],
       ['M-b', 'tree.toggle', 'folder tree'], ['M-v', 'dictate', 'dictate into the page'],
-      ...VIEWS.map<WBKeyRow>((v, i) => ['M-' + (i + 1), 'view.' + v, 'view: ' + v, 'Alt-1…7']),
+      ...VIEWS.map<WBKeyRow>((v, i) => ['M-' + (i + 1), 'view.' + v, 'view: ' + v, 'Alt-1…8']),
       ...range(0, 9).map<WBKeyRow>(i => ['M-' + SHIFT_DIGIT[i], 'desk.' + i, 'desk n (0 is the Board)', 'Alt-Shift-0…9']),
       ['ESC', 'esc', 'step out: tool, selection, tab, workspace, tag filter'], ['?', 'help', 'keys and gestures'],
     ],
@@ -102,6 +102,11 @@
       ['v', 'tool.select', 'tool: select', 'v r d o a s p t e'], ['r', 'tool.rect', 'tool: rectangle', 'v r d o a s p t e'], ['d', 'tool.diamond', 'tool: diamond', 'v r d o a s p t e'],
       ['o', 'tool.ellipse', 'tool: ellipse', 'v r d o a s p t e'], ['a', 'tool.arrow', 'tool: arrow', 'v r d o a s p t e'], ['s', 'tool.area', 'tool: select an area', 'v r d o a s p t e'],
       ['p', 'tool.pen', 'tool: pen', 'v r d o a s p t e'], ['t', 'tool.text', 'tool: text', 'v r d o a s p t e'], ['e', 'tool.erase', 'tool: eraser', 'v r d o a s p t e'],
+    ],
+    agents: [
+      ['j', 'agents.next', 'next session', 'j k / arrows'], ['<down>', 'agents.next', 'next session', 'j k / arrows'],
+      ['k', 'agents.prev', 'previous session', 'j k / arrows'], ['<up>', 'agents.prev', 'previous session', 'j k / arrows'],
+      ['RET', 'agents.enter', 'focus the session'], ['ESC', 'agents.back', 'back to the session list'],
     ],
     graph: [
       ['h', 'graph.left', 'select the neighbour node', 'h j k l'], ['j', 'graph.down', 'select the neighbour node', 'h j k l'],
@@ -169,7 +174,7 @@
   const ALL = () => true;
   // what a text field leaves to the board: the palette, the dock, the tree, dictation, the views, the desks
   const TEXT_LEAVES = new Set(['C-k', 's-k', 'C-S-p', 's-S-p', 'C-j', 's-j', 'C-`', 'C-M-[', 'C-M-]', 'M-b', 'M-v',
-    ...range(1, 7).map(i => 'M-' + i), ...range(0, 9).map(i => 'M-' + SHIFT_DIGIT[i])]);
+    ...range(1, 8).map(i => 'M-' + i), ...range(0, 9).map(i => 'M-' + SHIFT_DIGIT[i])]);
   const INTERIORS: Record<WBKeyInteriorName, WBKeyInterior> = {
     // a terminal needs every key (readline, Emacs, vim, tmux, agents' TUIs); Ctrl-` still closes the dock from inside it
     // (leaves: every key it gives up must do something on the board, or the card lost it for nothing)

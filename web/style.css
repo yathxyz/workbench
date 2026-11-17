@@ -296,6 +296,10 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 .backlinks .bl b { font: 500 11.5px var(--mono); color: var(--link); }
 .backlinks .bl span { color: var(--muted); }
 .backlinks .bl:hover span { color: var(--fg); }
+.ag-transcript { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.ag-editor { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; background: var(--buf-bg); border: 1px solid var(--line); }
+.ag-editor-head { flex: none; display: flex; gap: 6px; align-items: center; padding: 5px 8px; background: var(--panel); border-bottom: 1px solid var(--line); font: 11px var(--mono); }
+.ag-editor-host { flex: 1; min-height: 0; position: relative; }
 .ag-log { flex: 1; min-height: 0; overflow: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
 .ag-msg { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 92%; font-family: var(--ui); }
 .ag-user { align-self: flex-end; background: var(--accent-soft); padding: 6px 10px; border-radius: var(--radius); }
@@ -635,12 +639,10 @@ body.listening #st-buf-text { color: var(--ink-red); }
 #status { background: var(--modeline-bg); color: var(--modeline-fg); border-top: 1px solid var(--modeline-border); font: 12px var(--mono); }
 #status #st-addr { color: var(--modeline-fg); font-weight: 600; }
 #st-buf-text.live { color: var(--modeline-fg); }
-.side-tabs { display: flex; gap: 2px; }
-.side-tabs button { border: 0; background: transparent; padding: 4px 8px; border-radius: var(--radius); cursor: pointer; font: 600 13px var(--mono); color: var(--muted); }
-.side-tabs button.on { color: var(--fg); background: var(--panel-2); box-shadow: inset 0 -2px 0 var(--accent); }
 #side-term .body { background: var(--term-bg); overflow: hidden; position: relative; }
-/* The Agents tab (F-A47): the mesh's sessions by project. A row's dot has an agent card's state colours. */
-#side-mesh { flex-direction: column; font: 12.5px var(--mono); }
+/* Agents (F-A48): stable rows beside a live session, or one pane at a time on phones. */
+#v-agents { display: grid; grid-template-columns: minmax(260px, 34%) minmax(0, 1fr); font: 12.5px var(--mono); }
+.mesh-side { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); }
 .mesh-bar { flex: none; display: flex; gap: 10px; align-items: center; padding: 7px 12px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11.5px; }
 .mesh-bar #mesh-sum { flex: 1; min-width: 0; } .mesh-bar label { display: flex; gap: 4px; align-items: center; white-space: nowrap; }
 #mesh-list { flex: 1; min-height: 0; overflow: auto; padding: 4px 6px calc(env(safe-area-inset-bottom, 0px) + 10px); } #mesh-list > p { padding: 10px 8px; }
@@ -653,11 +655,23 @@ body.listening #st-buf-text { color: var(--ink-red); }
 .mesh-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .mesh-main b, .mesh-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .mesh-main b { font-weight: 600; }
 .mesh-sub, .mesh-at { color: var(--muted); font-size: 11.5px; } .mesh-row.bad .mesh-sub { color: var(--warn); } .mesh-at { flex: none; }
-.mesh-detail { margin: 2px 8px 8px 24px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-2); display: flex; flex-direction: column; gap: 6px; }
-.mesh-info { display: flex; flex-direction: column; gap: 3px; }
-.mesh-kv { display: flex; gap: 8px; } .mesh-kv span { flex: none; width: 52px; color: var(--muted); } .mesh-kv code { flex: 1; min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; max-height: 6em; overflow: auto; }
+.mesh-detail { min-width: 0; min-height: 0; padding: 12px; display: flex; flex-direction: column; gap: 8px; overflow: auto; }
+.mesh-info { display: flex; flex-direction: column; gap: 3px; flex: none; max-height: 38%; overflow: auto; }
+.mesh-kv { display: flex; gap: 8px; } .mesh-kv span { flex: none; width: 80px; color: var(--muted); } .mesh-kv code { flex: 1; min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; max-height: 6em; overflow: auto; }
 .mesh-info pre { margin: 4px 0 0; font: 11.5px/1.45 var(--mono); color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 14em; overflow: auto; }
 .mesh-hint { color: var(--muted); font-size: 11.5px; }
+.mesh-live { flex: 1; min-height: 260px; display: flex; flex-direction: column; overflow: hidden; }
+.mesh-live > .body { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; overflow: hidden; }
+.mesh-live.k-term > .body { display: block; background: var(--term-bg); }
+.mesh-live .xterm { height: 100%; padding: 8px; box-sizing: border-box; }
+.mesh-live .hdr { display: flex; gap: 8px; align-items: center; }
+.mesh-back { display: none; }
+@media (max-width: 699px) {
+  #v-agents { grid-template-columns: minmax(0, 1fr); }
+  #v-agents:not(.detail-open) .mesh-detail, #v-agents.detail-open .mesh-side { display: none; }
+  .mesh-back { display: inline-block; align-self: flex-start; }
+  .mesh-row { min-height: 44px; }
+}
 #side-term .xterm { padding: 8px 6px 6px 10px; height: 100%; box-sizing: border-box; }
 
 #v-ranger { display: flex; flex-direction: column; font: 13px var(--mono); }

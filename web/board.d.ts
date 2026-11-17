@@ -48,7 +48,7 @@ interface Board {
   treeClosed?: Record<string, boolean>;
   paneW?: number;
   side?: boolean;                      // the side pane is open
-  sideTab?: 'chat' | 'term' | 'agents';   // 'agents' is the mesh's sessions (F-A47); 'chat' is no longer a tab
+  sideTab?: 'chat' | 'term' | 'agents';   // old chat/agents tabs migrate to the docked terminal
   docks?: Record<string, boolean>;
   theme?: BoardTheme;
   view?: ViewName;
@@ -67,7 +67,7 @@ interface Board {
 /* The colour scheme setting. */
 type BoardTheme = 'light' | 'dark' | 'auto';
 /* The main views (VIEWS, line 4256). */
-type ViewName = 'canvas' | 'ranger' | 'graph' | 'editor' | 'outline' | 'tasks' | 'review';
+type ViewName = 'canvas' | 'ranger' | 'graph' | 'editor' | 'outline' | 'tasks' | 'review' | 'agents';
 /* A leader key name (LEADERS, line 7721). */
 type LeaderName = 'C-SPC' | 'C-M-SPC' | 'F1';
 /* A perspective: the manual layout or one derived from the host (PERSP). */
@@ -83,6 +83,7 @@ interface BoardNodeBase {
   order?: number;                      // position among its folder's items
   tags?: string[];
   hostUrl?: string;                    // the host it runs on ('' or absent: the serving daemon)
+  adopted?: boolean;                   // borrowed session: closing the card leaves it running
   prePack?: BoardSize;                 // its size before a pack folder resized it
   preTile?: { w: number; h: number; dx?: number; dy?: number };
   tile?: TileSlot | null;
@@ -101,6 +102,7 @@ interface TermNode extends BoardNodeBase {
   kind: 'term';
   backend: 'pty' | 'fake';
   cmd?: string; cwd?: string; env?: Record<string, string>; shell?: string; spawnNote?: string;
+  _attach?: string;                    // transient Agents pane spawn; never a board card
   fg?: string;                         // the foreground command
   cwdLive?: string;                    // the cwd the PTY last reported
 }
@@ -475,7 +477,7 @@ interface BootError { kind: 'net' | 'signed_out' | 'forbidden' | 'http' | 'not_j
 /* What /api/info says about the serving daemon (INFO, line 4956). */
 interface DaemonInfo {
   host: string; home: string;
-  edit?: boolean; mesh?: boolean; editUp?: boolean; sample?: boolean; models?: unknown; notes?: string; notesExists?: boolean;
+  edit?: boolean; mesh?: boolean; attach?: boolean; editUp?: boolean; sample?: boolean; models?: unknown; notes?: string; notesExists?: boolean;
   media?: MediaProviderInfo[];         // the image providers media cards can use (F-A41)
   state?: string; artifactOrigin?: string;
   agents?: { name: string; label: string }[];
@@ -499,6 +501,7 @@ interface ObservedSession {
   parent: string | null;               // the id of a subagent's session
   agentType: string | null;
   wbSession: string | null;            // the hub session it runs in (its WB_SESSION)
+  attach: { kind: 'claude'; id: string } | { kind: 'tmux'; socket: string; pane: number } | null;
   pid: number | null; transcriptPath: string | null;
   cwd: string | null; projectRoot: string | null; project: string;
   model: string | null; permissionMode: string | null;
@@ -511,8 +514,8 @@ interface ObservedSession {
   counts: { events: number; prompts: number; tools: number; toolFailures: number; subagents: number };
   tail: { at: number; kind: ObsKind; text: string }[];
 }
-/* One row of the Agents pane (F-A47): an observed session, joined with the hub session it runs in when that is on
-   the same host, or an agent card's session that no harness reports. */
+/* One row of the Agents view: an observed session joined to a same-host hub session,
+   or a hub agent session that no harness reports. */
 interface MeshRow {
   id: string; host: string; harness: string; project: string; title: string;
   state: SessionState; since: number; at: number; live: boolean;
@@ -544,6 +547,7 @@ interface AcpSessionInfo {
   protocolVersion?: number | null; agentInfo?: JsonValue | null; agentCapabilities?: JsonValue | null;
   promptCapabilities?: JsonValue | null; authMethods?: JsonValue[] | null;
   modes?: { currentModeId?: string; availableModes?: { id: string; name: string; description?: string }[] } | null;
+  configOptions?: JsonValue;
   availableCommands?: JsonValue[] | null; plan?: JsonValue | null; usage?: JsonValue | null;
 }
 /* A session summary with the agent's own details (the info in /acp hello and info). */
@@ -572,7 +576,7 @@ type JournalEvent = { seq: number; ts: number } & (
 
 /* Browser to daemon on /pty. */
 type PtyClientMsg =
-  | { t: 'open'; id: string; cmd?: string; parent?: string | null; cwd?: string; cols: number; rows: number; env?: Record<string, string>; spawn?: boolean; shell?: string; resume?: { stream: number; out: number } }
+  | { t: 'open'; id: string; cmd?: string; attach?: string; parent?: string | null; cwd?: string; cols: number; rows: number; env?: Record<string, string>; spawn?: boolean; shell?: string; resume?: { stream: number; out: number } }
   | { t: 'in'; d: string }
   | { t: 'resize'; cols: number; rows: number }
   | { t: 'kill'; session?: boolean };   // no session: forget the card, keep nothing
@@ -776,7 +780,7 @@ interface ClipItems { v: 1; cards: CopiedCard[]; strokes: Stroke[]; shapes: Shap
 
 /* An Edwin buffer: text, point and mark, and its sync state. */
 interface EdwinBuffer {
-  id: string; name: string; text: string;
+  id: string; name: string; text: string; mode: string;
   pt: number; mark: number | null; markActive: boolean;
   shared: boolean; sver: number; ver: number; modified: boolean;
   meta: { anchors?: PageAnchor[]; [k: string]: unknown };
