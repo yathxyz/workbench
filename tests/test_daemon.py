@@ -441,10 +441,15 @@ def session_policy(t, h):
     cwd = str(h.home.resolve())
     empty = {"rules": []}
     allow = {"rules": [{"action": "allow", "kinds": ["execute"], "roots": ["$cwd"],
+                        "programs": ["rm"],
                         "command": {"matches": ["rm -rf build"], "notMatches": ["sudo"]}}]}
-    reject = {"rules": [{"action": "reject", "kinds": ["execute"], "roots": ["$cwd"]}]}
+    reject = {"rules": [{"action": "reject", "kinds": ["execute"], "roots": ["$cwd"],
+                         "programs": ["rm"]}]}
     ask = {"rules": [{"action": "ask"}, {"action": "allow"}]}
     fallback = {"rules": [{"action": "allow", "roots": [cwd + "/elsewhere"]}]}
+    programs_fallback = {"rules": [{"action": "allow", "kinds": ["execute"], "roots": ["$cwd"],
+                                    "programs": ["git"],
+                                    "command": {"matches": ["rm -rf build"]}}]}
 
     class PolicyCard(wbctl.AcpCard):
         def __init__(self, sid):
@@ -546,7 +551,19 @@ def session_policy(t, h):
         finally:
             replay.close()
 
-    for name, policy in (("allow", allow), ("reject", reject), ("fallback", fallback), ("ask", ask)):
+    invalid_programs = [None, "rm", [1], [""], ["rm -rf"], ["rm\tbuild"], ["rm\nbuild"],
+                        ["rm\u00a0build"], ["rm\u2003build"], ["r\0m"], ["x" * 257],
+                        ["é" * 129], ["rm"] * 65]
+    for programs in invalid_programs:
+        invalid = {"rules": [{"action": "allow", "programs": programs}]}
+        refused = request("acp.open", sid="conformance_policy_invalid", since=0,
+                          spawn={"agent": "stub", "cwd": cwd, "policy": invalid})
+        t.check(f"policy: invalid programs {programs!r} is rejected before spawn",
+                refused.get("code") == "bad_request" and not summary("conformance_policy_invalid"),
+                repr(refused))
+
+    for name, policy in (("allow", allow), ("reject", reject), ("fallback", fallback),
+                         ("programs_fallback", programs_fallback), ("ask", ask)):
         sid = "conformance_policy_" + name
         card = PolicyCard(sid)
         try:
@@ -580,8 +597,9 @@ def session_policy(t, h):
                 continue
 
             mark, permission = pending_turn(card)
-            if name == "fallback":
-                t.check("policy: unmatched rules retain ordinary user resolution",
+            if name in ("fallback", "programs_fallback"):
+                reason = "unlisted program" if name == "programs_fallback" else "unmatched roots"
+                t.check(f"policy: {reason} retains ordinary user resolution",
                         answer_turn(card, mark, permission), repr(card.result))
                 replay_policy(card, policy)
                 continue

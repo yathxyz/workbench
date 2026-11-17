@@ -50,7 +50,7 @@ fn policies_reject_unknown_fields_and_actions() {
             "{wire}"
         );
     }
-    for field in ["kinds", "roots", "command"] {
+    for field in ["kinds", "roots", "programs", "command"] {
         let mut rule = json!({"action": "allow"});
         rule[field] = Value::Null;
         assert!(serde_json::from_value::<Policy>(json!({"rules":[rule]})).is_err());
@@ -76,7 +76,7 @@ fn policy_validation_bounds_and_regex_syntax() {
             .validate()
             .is_err()
     );
-    for field in ["roots", "kinds"] {
+    for field in ["roots", "kinds", "programs"] {
         let value = if field == "roots" { "/work" } else { "read" };
         let mut rule = json!({"action": "allow"});
         rule[field] = json!(vec![value; POLICY_SELECTORS_MAX]);
@@ -476,6 +476,7 @@ fn literal_shell_subset_keeps_cooperative_commands_usable() {
         "FOO=bar make",
         "cat a/b.txt > /tmp/out.txt",
         "grep -n \"a b\" src/x.rs | head -5",
+        "ls src/*.rs",
         "cat < ./src/x.rs >> /tmp/out.txt",
         "cd crates/a && cat ../../README",
         "cd crates/a && cd ../b && ls ./src",
@@ -633,19 +634,13 @@ fn command_and_path_work_bounds_ask_without_losing_boundary_cases() {
         p.decide(&call("execute", &["."], &(command + " x")), &options()),
         None
     );
-    let mut words = vec!["--file=/tmp/x"; POLICY_COMMAND_WORDS_MAX - 1];
-    let command = format!("cat {}", words.join(" "));
+    let paths = vec!["/tmp/a"; POLICY_PATHS_MAX - 1];
     assert!(
-        p.decide(&call("execute", &["."], &command), &options())
+        p.decide(&call("execute", &paths, "cat /tmp/x"), &options())
             .is_some()
     );
-    words[0] = "/tmp/x,/tmp/y";
-    words[1] = "/tmp/x,/tmp/y";
     assert_eq!(
-        p.decide(
-            &call("execute", &["."], &format!("cat {}", words.join(" "))),
-            &options()
-        ),
+        p.decide(&call("execute", &paths, "cat /tmp/x /tmp/y"), &options()),
         None
     );
     let mut paths = vec!["/tmp/a"; POLICY_PATHS_MAX];
@@ -720,4 +715,304 @@ fn regex_conditions_match_raw_command_not_joined_words() {
         p.decide(&call("execute", &["."], "cat './src/'file"), &options()),
         None
     );
+}
+
+#[test]
+fn second_review_shell_semantics_bypasses_ask() {
+    let mut allowed = Vec::new();
+    for (cwd, command) in [
+        ("/work/project", "trap 'cat /etc/passwd' EXIT"),
+        ("/work/project", "X+=y eval 'cat /etc/passwd'"),
+        ("/work/project", "cd missing && >out; cat ../secret"),
+        ("/work/project", "cd missing && >out\ncat ../secret"),
+        ("/work/project", "alias c='cd ..'\nc"),
+        (
+            "/work/project",
+            "shopt -s expand_aliases\nalias c='cd ..'\nc",
+        ),
+        ("/home/u/proj", "export CDPATH=/tmp; cd x && cd ../../proj"),
+        ("/work/project", "env sh -c 'cat /etc/passwd'"),
+        ("/work/project", "nice sh -c 'cat /etc/passwd'"),
+        ("/work/project", "timeout 1 sh -c 'cat /etc/passwd'"),
+        ("/work/project", "nohup sh -c 'cat /etc/passwd'"),
+        ("/work/project", "printf x | xargs sh -c 'cat /etc/passwd'"),
+        ("/work/project", "busybox sh -c 'cat /etc/passwd'"),
+        ("/work/project", "cat /tmp/.[.]/etc/passwd"),
+        (
+            "/work/project",
+            "shopt -u globskipdots; cat /tmp/.[.]/etc/passwd",
+        ),
+        ("/work/project", "/bin/s[h] -c 'cat /etc/passwd'"),
+    ] {
+        let p = CompiledPolicy::new(
+            &policy(json!([{"action":"allow", "roots":["$cwd", "/tmp", "/bin"]}])),
+            cwd,
+        )
+        .unwrap();
+        if p.decide(&call("execute", &["."], command), &options())
+            .is_some()
+        {
+            allowed.push(command);
+        }
+    }
+    assert!(allowed.is_empty(), "unintended allows: {allowed:?}");
+}
+
+#[test]
+fn overlapping_delimiter_fragments_exhaust_work_before_set_insertion() {
+    let p = compiled(json!([{"action":"allow", "roots":["$cwd"]}]));
+    let command = "echo ".to_owned() + &"a".repeat(63_530) + &",x".repeat(1_000);
+    assert_eq!(command.len(), POLICY_COMMAND_MAX - 1);
+    assert_eq!(
+        p.decide(&call("execute", &["."], &command), &options()),
+        None
+    );
+}
+
+#[test]
+fn delimiter_fragments_do_not_replace_the_whole_path() {
+    let p = CompiledPolicy::new(
+        &policy(json!([{"action":"allow", "roots":["$cwd", "/tmp"]}])),
+        "/home/u/proj",
+    )
+    .unwrap();
+    for delimiter in ['=', ':', ','] {
+        // Each delimiter piece is inside a root; only the whole word escapes.
+        let command = format!("cat /tmp/p{delimiter}q/../../proj/secret");
+        assert_eq!(
+            p.decide(&call("execute", &["."], &command), &options()),
+            None,
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn assignment_prefixes_cannot_hide_commands_or_change_shell_resolution() {
+    let p = compiled(json!([{"action":"allow", "roots":["/"]}]));
+    for prefix in ["X+=y", "a[0]=b", "1X=y", "=y", "a-b=c"] {
+        for suffix in ["eval 'cat /etc/passwd'", "cd x", ""] {
+            let command = format!("{prefix} {suffix}");
+            assert_eq!(
+                p.decide(&call("execute", &["."], &command), &options()),
+                None,
+                "{command}"
+            );
+        }
+    }
+    for variable in [
+        "CDPATH",
+        "PATH",
+        "IFS",
+        "ENV",
+        "BASH_ENV",
+        "HOME",
+        "PWD",
+        "OLDPWD",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "GLOBIGNORE",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+    ] {
+        let command = format!("{variable}=local cargo test");
+        assert_eq!(
+            p.decide(&call("execute", &["."], &command), &options()),
+            None,
+            "{command}"
+        );
+    }
+    for command in [
+        ">out",
+        ">out; cat file",
+        ">out\ncat file",
+        "cat file && >out; cat file",
+        "declare CDPATH=/tmp; cd x",
+        "set -f; ls src/*.rs",
+        "unset CDPATH; cd x",
+        "read CDPATH; cd x",
+        "printf -v CDPATH /tmp; cd x",
+        "printf -vCDPATH /tmp; cd x",
+        "enable -n cd; cd x",
+    ] {
+        assert_eq!(
+            p.decide(&call("execute", &["."], command), &options()),
+            None,
+            "{command}"
+        );
+    }
+    for command in [
+        "_X1=y A= B=c=d cargo test",
+        "echo hello",
+        "printf '%s' hello",
+        "true",
+        "false",
+        "test -f ./file",
+        "pwd",
+    ] {
+        assert!(
+            p.decide(&call("execute", &["."], command), &options())
+                .is_some(),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn glob_components_cannot_expand_to_parents_or_hide_the_command() {
+    let p = compiled(json!([{"action":"allow", "roots":["/"]}]));
+    for command in [
+        "c?t file",
+        "c* file",
+        "'c[a]t' file",
+        "[ -f file ]",
+        "cat .*/file",
+        "cat /tmp/[.]/etc/passwd",
+        "cat /tmp/.[.]/etc/passwd",
+        "cat /tmp/[a-z]/file",
+        "cat --file=/tmp/..?/*",
+        "cat file >/tmp/.[.]/out",
+    ] {
+        assert_eq!(
+            p.decide(&call("execute", &["."], command), &options()),
+            None,
+            "{command}"
+        );
+    }
+    for command in [
+        "ls src/*.rs",
+        "ls src/a?/*.rs",
+        "ls src/a[bc].rs",
+        "ls src/x*/../file",
+    ] {
+        assert!(
+            p.decide(&call("execute", &["."], command), &options())
+                .is_some(),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn programs_select_every_simple_command_without_interpreting_its_arguments() {
+    let p = compiled(json!([{
+        "action":"allow", "roots":["$cwd", "/tmp"],
+        "programs":["cargo", "cd", "git", "ls", "cat", "grep", "head", "make", "nix"]
+    }]));
+    for command in [
+        "cargo test -p x",
+        "cd crates/a && cargo fmt",
+        "git -C sub status",
+        "ls ./src",
+        "nix build .#checks.x86_64-linux.fmt --no-link",
+        "FOO=bar make",
+        "cat a/b.txt > /tmp/out.txt",
+        "grep -n \"a b\" src/x.rs | head -5",
+        "ls src/*.rs",
+        // Program-specific options remain the rule author's responsibility.
+        "git -C.. status",
+        "make -o/etc/x",
+        "cat @file",
+    ] {
+        assert!(
+            p.decide(&call("execute", &["."], command), &options())
+                .is_some(),
+            "{command}"
+        );
+    }
+    for command in [
+        "cargo test | tail -5",
+        "cargo test && tail log",
+        "tail log || cargo test",
+        "cargo test; tail log",
+        "CC=cc tail log",
+        "/bin/cat file",
+        "./cargo test",
+        "find . -exec cat file",
+        "python -c 'print 1'",
+    ] {
+        assert_eq!(
+            p.decide(&call("execute", &["."], command), &options()),
+            None,
+            "{command}"
+        );
+    }
+    let p = compiled(json!([{"action":"allow", "programs":[]}]));
+    assert_eq!(
+        p.decide(&call("execute", &["."], "cargo test"), &options()),
+        None
+    );
+    assert!(p.decide(&call("read", &["."], ""), &options()).is_some());
+    let p = compiled(json!([
+        {"action":"allow", "programs":["cargo"]},
+        {"action":"reject", "programs":["cat"]},
+    ]));
+    let decision = p
+        .decide(&call("execute", &["."], "cat file"), &options())
+        .unwrap();
+    assert_eq!((decision.rule, decision.action), (1, Action::Reject));
+}
+
+#[test]
+fn program_paths_are_normalized_not_matched_by_basename() {
+    let p = compiled(json!([{
+        "action":"allow", "roots":["$cwd", "/bin"], "programs":["./tools/../bin/tool", "/bin/./cat", "cd"]
+    }]));
+    for command in [
+        "./bin/tool file",
+        "/work/project/bin/tool file",
+        "/bin/../bin/cat file",
+        "cd crates && ../bin/tool file",
+        "FOO=bar ./bin/tool file",
+    ] {
+        assert!(
+            p.decide(&call("execute", &["."], command), &options())
+                .is_some(),
+            "{command}"
+        );
+    }
+    for command in [
+        "tool file",
+        "cat file",
+        "./other/tool file",
+        "cd crates; ../bin/tool file",
+        "cd crates && ./bin/tool file",
+    ] {
+        assert_eq!(
+            p.decide(&call("execute", &["."], command), &options()),
+            None,
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn programs_validate_names_and_byte_bounds_before_compilation() {
+    for programs in [
+        json!(null),
+        json!("cargo"),
+        json!([1]),
+        json!([""]),
+        json!(["cargo test"]),
+        json!(["a\tb"]),
+        json!(["a\nb"]),
+        json!(["a\u{a0}b"]),
+        json!(["a\0b"]),
+        json!(["x".repeat(POLICY_PROGRAM_MAX + 1)]),
+        json!(vec!["cargo"; POLICY_SELECTORS_MAX + 1]),
+    ] {
+        let wire = json!({"rules":[{"action":"allow", "programs":programs}]});
+        if let Ok(p) = serde_json::from_value::<Policy>(wire) {
+            assert!(p.validate().is_err(), "{programs}");
+            assert!(
+                CompiledPolicy::new(&p, "/work/project").is_err(),
+                "{programs}"
+            );
+        }
+    }
+    let p =
+        policy(json!([{"action":"allow", "programs":["x", "é".repeat(POLICY_PROGRAM_MAX / 2)]}]));
+    assert!(p.validate().is_ok());
+    assert!(CompiledPolicy::new(&p, "/work/project").is_ok());
 }

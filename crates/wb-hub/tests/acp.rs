@@ -1043,6 +1043,7 @@ fn hub_permission_first_answer_wins() {
 fn permission_policy(action: &str) -> Value {
     json!({"rules": [{
         "action": action, "kinds": ["execute"], "roots": ["$cwd", "/nix/store", "/tmp"],
+        "programs": ["rm"],
         "command": {"matches": ["^rm "], "notMatches": ["sudo"]}
     }]})
 }
@@ -1090,6 +1091,11 @@ fn hub_policy_answers_once_without_publishing_pending_and_replays() {
             Some(auto)
         );
         assert!(hub.journal(sid).contains(auto));
+        assert!(
+            hub.journal(sid)
+                .iter()
+                .any(|e| e["e"] == "policy" && e["policy"] == policy)
+        );
     }
     // A list reply is a barrier after every session publication already queued.
     watcher.send(&json!({"t":"list","rid":901}));
@@ -1103,7 +1109,52 @@ fn hub_policy_answers_once_without_publishing_pending_and_replays() {
             assert_eq!(message["session"]["acp"]["pending"], json!([]), "{message}");
         }
     }
-    drop((c, watcher));
+    drop(watcher);
+    let mut unlisted_policy = permission_policy("allow");
+    unlisted_policy["rules"][0]["programs"] = json!(["git"]);
+    let unlisted = policy_ready(&mut c, &hub, "unlisted", unlisted_policy.clone());
+    assert_eq!(c.acp_prompt("unlisted", "perm")["t"], "ok");
+    let permission = c.event("unlisted", "permission");
+    assert_eq!(
+        permission["toolCall"]["rawInput"]["command"],
+        "rm -rf build"
+    );
+    assert!(permission.get("policy").is_none());
+    assert_eq!(
+        c.summary("unlisted")["acp"]["pending"][0]["req"],
+        permission["seq"]
+    );
+    assert_eq!(
+        permit(
+            &mut c,
+            "unlisted",
+            &permission["seq"],
+            epoch(&unlisted),
+            "allow-once"
+        )["t"],
+        "ok"
+    );
+    c.event("unlisted", "turn_end");
+    let unlisted_facts: Vec<_> = hub
+        .journal("unlisted")
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e["e"].as_str(),
+                Some("policy" | "permission" | "permission_resolved")
+            )
+        })
+        .collect();
+    assert_eq!(unlisted_facts.len(), 3);
+    assert_eq!(unlisted_facts[0]["policy"], unlisted_policy);
+    assert_eq!(unlisted_facts[1], permission);
+    assert_eq!(unlisted_facts[2]["by"], "user");
+    assert!(
+        !hub.journal("unlisted")
+            .iter()
+            .any(|e| e["e"] == "permission_auto")
+    );
+    drop(c);
     fold_equals_live(&mut hub);
     let mut c = hub.connect();
     assert_eq!(
@@ -1120,6 +1171,35 @@ fn hub_policy_answers_once_without_publishing_pending_and_replays() {
         "allow-once"
     );
     c.event("allowed", "turn_end");
+    assert_eq!(c.summary("unlisted")["acp"]["policy"], unlisted_policy);
+    c.acp_open("unlisted", 0);
+    let (replay, _) = c.replay("unlisted");
+    let replayed_facts: Vec<_> = replay
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e["e"].as_str(),
+                Some("policy" | "permission" | "permission_resolved")
+            )
+        })
+        .collect();
+    assert_eq!(replayed_facts, unlisted_facts);
+    c.ok(json!({"t":"acp.revive","sid":"unlisted"}));
+    c.event("unlisted", "session");
+    assert_eq!(c.acp_prompt("unlisted", "perm")["t"], "ok");
+    let permission = c.event("unlisted", "permission");
+    assert!(permission.get("policy").is_none());
+    assert_eq!(
+        permit(
+            &mut c,
+            "unlisted",
+            &permission["seq"],
+            epoch(&unlisted),
+            "allow-once"
+        )["t"],
+        "ok"
+    );
+    c.event("unlisted", "turn_end");
 }
 
 #[test]
@@ -1195,13 +1275,27 @@ fn hub_policy_is_incarnation_scoped_and_attach_cannot_replace_it() {
 fn hub_invalid_policy_never_registers_or_spawns_and_replacement_is_atomic() {
     let hub = Hub::with_scenarios(&[]);
     let mut c = hub.connect();
-    for policy in [
+    let invalid = [
         json!({"rules":[{"action":"allow","command":{"matches":["("]}}]}),
         json!({"rules":[{"action":"allow","roots":["relative"]}]}),
         json!({"rules":[{"action":"alow"}]}),
         json!({"rules":[],"typo":true}),
         json!({"rules":vec![json!({"action":"allow"});65]}),
-    ] {
+        json!({"rules":[{"action":"allow","programs":null}]}),
+        json!({"rules":[{"action":"allow","programs":"rm"}]}),
+        json!({"rules":[{"action":"allow","programs":[1]}]}),
+        json!({"rules":[{"action":"allow","programs":[""]}]}),
+        json!({"rules":[{"action":"allow","programs":["rm -rf"]}]}),
+        json!({"rules":[{"action":"allow","programs":["rm\tbuild"]}]}),
+        json!({"rules":[{"action":"allow","programs":["rm\nbuild"]}]}),
+        json!({"rules":[{"action":"allow","programs":["rm\u{a0}build"]}]}),
+        json!({"rules":[{"action":"allow","programs":["rm\u{2003}build"]}]}),
+        json!({"rules":[{"action":"allow","programs":["r\u{0}m"]}]}),
+        json!({"rules":[{"action":"allow","programs":["x".repeat(257)]}]}),
+        json!({"rules":[{"action":"allow","programs":["é".repeat(129)]}]}),
+        json!({"rules":[{"action":"allow","programs":vec!["rm";65]}]}),
+    ];
+    for policy in &invalid {
         let reply = c.request(json!({"t":"acp.open","sid":"bad","since":0,
             "spawn":{"agent":"stub","cwd":hub.home(),"policy":policy}}));
         assert_eq!(reply["code"], "bad_request", "{reply}");
@@ -1215,11 +1309,13 @@ fn hub_invalid_policy_never_registers_or_spawns_and_replacement_is_atomic() {
     );
     let open = policy_ready(&mut c, &hub, "a1", permission_policy("reject"));
     let before = hub.journal("a1");
-    assert_eq!(
-        c.request(json!({"t":"acp.set_policy","sid":"a1","epoch":epoch(&open),
-        "policy":{"rules":[{"action":"allow","command":{"matches":["("]}}]}}))["code"],
-        "bad_request"
-    );
+    for policy in invalid {
+        assert_eq!(
+            c.request(json!({"t":"acp.set_policy","sid":"a1","epoch":epoch(&open),
+                "policy":policy}))["code"],
+            "bad_request"
+        );
+    }
     assert_eq!(
         c.summary("a1")["acp"]["policy"],
         permission_policy("reject")

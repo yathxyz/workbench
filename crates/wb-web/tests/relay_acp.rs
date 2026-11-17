@@ -895,6 +895,7 @@ async fn policy_reaches_a_spawn_but_never_turns_a_page_load_into_one() {
         "action": "allow",
         "kinds": ["read", "edit", "execute"],
         "roots": ["$cwd", "/nix/store", "/tmp"],
+        "programs": ["git", "/usr/bin/git", "./tools/git"],
         "command": {"notMatches": ["danger"]}
     }]});
     let mut ws = web.ws("/acp").await;
@@ -968,6 +969,19 @@ async fn malformed_spawn_and_attach_policies_are_rejected_before_open() {
         json!({"rules": [{"action": "allow", "roots": null}]}),
         json!({"rules": [{"action": "allow", "kinds": null}]}),
         json!({"rules": [{"action": "allow", "command": null}]}),
+        json!({"rules": [{"action": "allow", "programs": null}]}),
+        json!({"rules": [{"action": "allow", "programs": "git"}]}),
+        json!({"rules": [{"action": "allow", "programs": [1]}]}),
+        json!({"rules": [{"action": "allow", "programs": [""]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["git status"]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["git\tstatus"]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["git\nstatus"]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["git\u{a0}status"]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["git\u{2003}status"]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["a\u{0}b"]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["x".repeat(257)]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["é".repeat(129)]}]}),
+        json!({"rules": [{"action": "allow", "programs": vec!["git"; 65]}]}),
         json!({"rules": [], "extra": true}),
         json!({"rules": [{"action": "allow", "extra": true}]}),
         json!({"rules": [{"action": "deny"}]}),

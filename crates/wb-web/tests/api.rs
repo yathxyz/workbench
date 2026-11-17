@@ -1339,6 +1339,7 @@ fn session_policy() -> Value {
             "action": "reject",
             "kinds": ["execute"],
             "roots": ["$cwd"],
+            "programs": ["git", "/usr/bin/git", "./tools/git"],
             "command": {"matches": ["^git\\s"], "notMatches": ["--force"]}
         },
         {"action": "ask"}
@@ -1371,6 +1372,14 @@ async fn invalid_policies_are_bad_bodies_before_any_hub_connection() {
         json!({"rules": [{"action": "allow", "kinds": ["a\u{0}b"]}]}),
         json!({"rules": [{"action": "allow", "kinds": ["a".repeat(65)]}]}),
         json!({"rules": [{"action": "allow", "kinds": "read"}]}),
+        json!({"rules": [{"action": "allow", "programs": null}]}),
+        json!({"rules": [{"action": "allow", "programs": "git"}]}),
+        json!({"rules": [{"action": "allow", "programs": [1]}]}),
+        json!({"rules": [{"action": "allow", "programs": [""]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["a\u{0}b"]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["x".repeat(257)]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["é".repeat(129)]}]}),
+        json!({"rules": [{"action": "allow", "programs": vec!["git"; 65]}]}),
         json!({"rules": [{
             "action": "allow", "kinds": ["execute"], "command": {"unknown": []}
         }]}),
@@ -1406,6 +1415,16 @@ async fn invalid_policies_are_bad_bodies_before_any_hub_connection() {
             "command": {"matches": vec!["x"; 65], "notMatches": vec!["y"; 64]}
         }]}),
     ];
+    for program in [
+        " git",
+        "git ",
+        "git\tstatus",
+        "git\nstatus",
+        "git\u{a0}status",
+        "git\u{2003}status",
+    ] {
+        invalid.push(json!({"rules": [{"action": "allow", "programs": [program]}]}));
+    }
     invalid.push(json!({"rules": [
         {"action": "allow", "kinds": ["execute"], "command": {"matches": vec!["x"; 64]}},
         {"action": "reject", "kinds": ["execute"], "command": {"notMatches": vec!["y"; 65]}}
@@ -1460,6 +1479,12 @@ async fn spawn_policy_bodies_accept_valid_conditions_and_boundary_values() {
         session_policy(),
         json!({"rules": []}),
         json!({"rules": [{"action": "allow", "command": {"matches": ["^safe"]}}]}),
+        json!({"rules": [{"action": "allow", "programs": []}]}),
+        json!({"rules": [{"action": "allow", "programs": ["x", "é".repeat(128)]}]}),
+        json!({"rules": [{
+            "action": "allow",
+            "programs": (0..64).map(|i| format!("program{i}")).collect::<Vec<_>>()
+        }]}),
         json!({"rules": [{
             "action": "allow", "kinds": ["read", "edit", "execute"],
             "command": {"notMatches": ["danger"]}
@@ -1482,12 +1507,19 @@ async fn spawn_policy_bodies_accept_valid_conditions_and_boundary_values() {
             })
             .to_string(),
         );
-        let (_, res) = api
+        let (hub_req, res) = api
             .answered(req, |rid| {
                 HubMessage::ok(rid, &open_reply("mine", "testhost", true))
             })
             .await;
         assert_eq!(res.status, 201);
+        let HubRequest::AcpOpen {
+            spawn: Some(spawn), ..
+        } = hub_req
+        else {
+            panic!("{hub_req:?}");
+        };
+        assert_eq!(serde_json::to_value(spawn.policy).unwrap(), policy);
     }
 }
 

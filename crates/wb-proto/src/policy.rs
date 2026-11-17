@@ -4,7 +4,8 @@
 //! a symlink beneath an allowed root is not resolved, and shell expansion is not
 //! interpreted. Missing or malformed descriptions always leave the request to a user.
 
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use regex::Regex;
@@ -15,7 +16,7 @@ mod command;
 
 use crate::limits::{
     POLICY_KIND_MAX, POLICY_PATH_CHECKS_MAX, POLICY_PATTERN_MAX, POLICY_PATTERNS_MAX,
-    POLICY_RULES_MAX, POLICY_SELECTORS_MAX,
+    POLICY_PROGRAM_MAX, POLICY_RULES_MAX, POLICY_SELECTORS_MAX,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +41,12 @@ pub struct Rule {
         skip_serializing_if = "Option::is_none"
     )]
     pub roots: Option<Vec<String>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub programs: Option<Vec<String>>,
     #[serde(
         default,
         deserialize_with = "deserialize_optional",
@@ -91,6 +98,7 @@ struct CompiledRule {
     action: Action,
     kinds: Option<Vec<String>>,
     roots: Option<Vec<PathBuf>>,
+    programs: Option<BTreeSet<command::Program<'static>>>,
     matches: Vec<Regex>,
     not_matches: Vec<Regex>,
 }
@@ -125,6 +133,16 @@ impl Policy {
                     }))
             {
                 return Err(format!("policy rule {index} has invalid roots"));
+            }
+            if let Some(programs) = &rule.programs
+                && (programs.len() > POLICY_SELECTORS_MAX
+                    || programs.iter().any(|program| {
+                        !valid_text(program)
+                            || program.len() > POLICY_PROGRAM_MAX
+                            || program.chars().any(char::is_whitespace)
+                    }))
+            {
+                return Err(format!("policy rule {index} has invalid programs"));
             }
             if let Some(command) = &rule.command {
                 patterns += command.matches.len() + command.not_matches.len();
@@ -172,6 +190,25 @@ impl CompiledPolicy {
                         })
                         .collect()
                 }),
+                programs: rule.programs.as_ref().map(|programs| {
+                    programs
+                        .iter()
+                        .map(|program| {
+                            if program.contains('/') {
+                                command::Program::Path(normalize_from(
+                                    Path::new(program),
+                                    if Path::new(program).is_absolute() {
+                                        PathBuf::new()
+                                    } else {
+                                        cwd.clone()
+                                    },
+                                ))
+                            } else {
+                                command::Program::Name(Cow::Owned(program.clone()))
+                            }
+                        })
+                        .collect()
+                }),
                 matches,
                 not_matches,
             });
@@ -202,7 +239,7 @@ impl CompiledPolicy {
             None
         };
         let locations = call.get("locations")?.as_array()?;
-        let paths = command::paths(command, locations, &self.cwd)?;
+        let evidence = command::evidence(command, locations, &self.cwd)?;
         let (allow, reject) = once_options(options)?;
         let mut checks = POLICY_PATH_CHECKS_MAX;
         for (index, rule) in self.rules.iter().enumerate() {
@@ -213,9 +250,17 @@ impl CompiledPolicy {
             {
                 continue;
             }
+            if command.is_some()
+                && rule
+                    .programs
+                    .as_ref()
+                    .is_some_and(|programs| !evidence.programs.is_subset(programs))
+            {
+                continue;
+            }
             if let Some(roots) = &rule.roots {
                 let mut contained = true;
-                for path in &paths {
+                for path in &evidence.paths {
                     if !within_roots(path, roots, &mut checks)? {
                         contained = false;
                         break;

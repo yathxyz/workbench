@@ -7,11 +7,22 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::limits::{
-    POLICY_COMMAND_MAX, POLICY_COMMAND_WORDS_MAX, POLICY_CWDS_MAX, POLICY_PATH_BYTES_MAX,
-    POLICY_PATHS_MAX,
+    POLICY_COMMAND_MAX, POLICY_COMMAND_WORDS_MAX, POLICY_CWDS_MAX, POLICY_FRAGMENT_BYTES_MAX,
+    POLICY_FRAGMENTS_MAX, POLICY_PATH_BYTES_MAX, POLICY_PATHS_MAX,
 };
 
 use super::{nonempty_string, normalize_from};
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Program<'a> {
+    Name(Cow<'a, str>),
+    Path(PathBuf),
+}
+
+pub(super) struct Evidence<'a> {
+    pub paths: BTreeSet<PathBuf>,
+    pub programs: BTreeSet<Program<'a>>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Separator {
@@ -42,6 +53,8 @@ struct Paths {
     unique: BTreeSet<PathBuf>,
     candidates: usize,
     bytes: usize,
+    fragments: usize,
+    fragment_bytes: usize,
 }
 
 impl Paths {
@@ -64,43 +77,53 @@ impl Paths {
         ))
     }
 
+    fn fragment<'a>(&mut self, fragments: &mut BTreeSet<&'a str>, text: &'a str) -> Option<()> {
+        // Charge even duplicates before string ordering can compare overlapping slices.
+        self.fragments = self.fragments.checked_add(1)?;
+        self.fragment_bytes = self.fragment_bytes.checked_add(text.len())?;
+        if self.fragments > POLICY_FRAGMENTS_MAX || self.fragment_bytes > POLICY_FRAGMENT_BYTES_MAX
+        {
+            return None;
+        }
+        fragments.insert(text);
+        Some(())
+    }
+
     fn word(
         &mut self,
         word: &str,
         dirs: &BTreeSet<PathBuf>,
-        cd: bool,
+        capture: bool,
     ) -> Option<BTreeSet<PathBuf>> {
         let mut fragments = BTreeSet::new();
         if word.contains(['=', ':', ',']) {
             for fragment in word.split(['=', ':', ',']) {
-                fragments.insert(fragment);
-                if fragments.len() > POLICY_PATHS_MAX {
-                    return None;
-                }
+                self.fragment(&mut fragments, fragment)?;
             }
             for (index, ch) in word.char_indices() {
                 if matches!(ch, '=' | ':' | ',') {
-                    fragments.insert(&word[..index]);
-                    fragments.insert(&word[index + 1..]);
-                    if fragments.len() > POLICY_PATHS_MAX {
-                        return None;
-                    }
+                    self.fragment(&mut fragments, &word[..index])?;
+                    self.fragment(&mut fragments, &word[index + 1..])?;
                 }
             }
             fragments.remove(word);
         }
         let mut changed = BTreeSet::new();
         for fragment in std::iter::once(word).chain(fragments) {
-            if fragment.starts_with('~') {
+            if fragment.starts_with('~')
+                || fragment.split('/').any(|component| {
+                    component.contains(['*', '?', '[']) && component.starts_with(['.', '['])
+                })
+            {
                 return None;
             }
-            let is_cd = cd && fragment == word;
-            if !is_cd && !fragment.contains('/') && !matches!(fragment, "." | "..") {
+            let whole = capture && fragment == word;
+            if !whole && !fragment.contains('/') && !matches!(fragment, "." | "..") {
                 continue;
             }
             for dir in dirs {
                 let path = self.resolve(fragment, dir)?;
-                if is_cd {
+                if whole {
                     changed.insert(path.clone());
                 }
                 self.unique.insert(path);
@@ -110,11 +133,11 @@ impl Paths {
     }
 }
 
-pub(super) fn paths(
-    command: Option<&str>,
+pub(super) fn evidence<'a>(
+    command: Option<&'a str>,
     locations: &[Value],
     cwd: &Path,
-) -> Option<BTreeSet<PathBuf>> {
+) -> Option<Evidence<'a>> {
     if locations.is_empty() || locations.len() > POLICY_PATHS_MAX {
         return None;
     }
@@ -122,12 +145,15 @@ pub(super) fn paths(
         unique: BTreeSet::new(),
         candidates: 0,
         bytes: 0,
+        fragments: 0,
+        fragment_bytes: 0,
     };
     for location in locations {
         let text = nonempty_string(location.get("path")?)?;
         let path = paths.resolve(text, cwd)?;
         paths.unique.insert(path);
     }
+    let mut programs = BTreeSet::new();
     if let Some(command) = command {
         let pipelines = parse(command)?;
         // Bare operands are only safe to ignore while every possible cwd is inside.
@@ -146,16 +172,22 @@ pub(super) fn paths(
                 Separator::Pipe => unreachable!(),
             };
             let mut changed = None;
-            for simple in &pipeline.commands {
-                let cd = command_cd(simple)?;
+            let count = pipeline.commands.len();
+            for simple in pipeline.commands {
+                let (index, cd) = classify(&simple)?;
                 // A pipeline's builtins run in shell-dependent subshell contexts.
-                if cd && pipeline.commands.len() != 1 {
+                if cd && count != 1 {
                     return None;
                 }
-                for (index, word) in simple.args.iter().enumerate() {
-                    let next = paths.word(word, &dirs, cd && index == 1)?;
-                    if cd && index == 1 {
+                for (i, word) in simple.args.into_iter().enumerate() {
+                    let executable = i == index && word.contains('/');
+                    let next = paths.word(&word, &dirs, (cd && i == 1) || executable)?;
+                    if cd && i == 1 {
                         changed = Some(next);
+                    } else if executable {
+                        programs.extend(next.into_iter().map(Program::Path));
+                    } else if i == index {
+                        programs.insert(Program::Name(word));
                     }
                 }
                 for word in &simple.redirects {
@@ -177,7 +209,10 @@ pub(super) fn paths(
             previous = pipeline.next;
         }
     }
-    Some(paths.unique)
+    Some(Evidence {
+        paths: paths.unique,
+        programs,
+    })
 }
 
 fn assignment(word: &str) -> bool {
@@ -191,45 +226,95 @@ fn assignment(word: &str) -> bool {
         && bytes.all(|ch| ch.is_ascii_alphanumeric() || ch == b'_')
 }
 
-fn command_cd(simple: &Simple<'_>) -> Option<bool> {
-    let index = simple.args.iter().position(|word| !assignment(word))?;
-    let name = simple.args[index].as_ref();
+fn classify(simple: &Simple<'_>) -> Option<(usize, bool)> {
+    let mut index = 0;
+    for word in &simple.args {
+        if !word.contains('=') {
+            break;
+        }
+        if !assignment(word) {
+            return None;
+        }
+        let (name, _) = word.split_once('=')?;
+        if matches!(
+            name,
+            "CDPATH"
+                | "PATH"
+                | "IFS"
+                | "ENV"
+                | "BASH_ENV"
+                | "HOME"
+                | "PWD"
+                | "OLDPWD"
+                | "SHELLOPTS"
+                | "BASHOPTS"
+                | "GLOBIGNORE"
+                | "LD_PRELOAD"
+                | "LD_LIBRARY_PATH"
+                | "LD_AUDIT"
+        ) {
+            return None;
+        }
+        index += 1;
+    }
+    let name = simple.args.get(index)?.as_ref();
+    if name.is_empty() || name.contains(['*', '?', '[']) {
+        return None;
+    }
+    // Complete bash/POSIX builtin and keyword classification; cd is modeled below.
+    match name {
+        "echo" | "printf" | "true" | "false" | "test" | "[" | "pwd" | "cd" => {}
+        "." | ":" | "alias" | "bg" | "bind" | "break" | "builtin" | "caller" | "command"
+        | "compgen" | "complete" | "compopt" | "continue" | "declare" | "dirs" | "disown"
+        | "enable" | "eval" | "exec" | "exit" | "export" | "fc" | "fg" | "getopts" | "hash"
+        | "help" | "history" | "jobs" | "kill" | "let" | "local" | "logout" | "mapfile"
+        | "popd" | "pushd" | "read" | "readarray" | "readonly" | "return" | "set" | "shift"
+        | "shopt" | "source" | "suspend" | "times" | "trap" | "type" | "typeset" | "ulimit"
+        | "umask" | "unalias" | "unset" | "wait" | "if" | "then" | "else" | "elif" | "fi"
+        | "case" | "esac" | "for" | "select" | "while" | "until" | "do" | "done" | "in"
+        | "function" | "time" | "{" | "}" | "!" | "[[" | "]]" | "coproc" => return None,
+        _ => {}
+    }
+    // Convenience only: program dispatch and argument conventions need rule author trust.
     if matches!(
-        name,
-        "eval"
-            | "exec"
-            | "source"
-            | "."
-            | "pushd"
-            | "popd"
-            | "command"
-            | "builtin"
-            | "if"
-            | "then"
-            | "else"
-            | "elif"
-            | "fi"
-            | "while"
-            | "until"
-            | "do"
-            | "done"
-            | "for"
-            | "in"
-            | "case"
-            | "esac"
-            | "function"
-            | "select"
+        Path::new(name).file_name()?.to_str()?,
+        "sh" | "bash"
+            | "dash"
+            | "zsh"
+            | "ksh"
+            | "fish"
+            | "env"
+            | "nice"
+            | "nohup"
+            | "timeout"
             | "time"
-            | "coproc"
-            | "!"
+            | "xargs"
+            | "busybox"
+            | "sudo"
+            | "doas"
+            | "su"
+            | "watch"
+            | "stdbuf"
+            | "setsid"
+            | "chroot"
+            | "unshare"
+            | "nsenter"
+            | "flock"
+            | "strace"
+            | "ltrace"
+            | "parallel"
+            | "ssh"
+            | "script"
     ) {
         return None;
     }
-    // Nested shell programs are not part of the modeled command grammar.
-    if matches!(
-        Path::new(name).file_name()?.to_str()?,
-        "sh" | "bash" | "dash" | "zsh" | "ksh" | "fish"
-    ) {
+    // Bash printf -v defines shell variables, unlike the ordinary printf form.
+    if name == "printf"
+        && simple
+            .args
+            .get(index + 1)
+            .is_some_and(|arg| arg.starts_with("-v"))
+    {
         return None;
     }
     if name == "cd" {
@@ -241,9 +326,9 @@ fn command_cd(simple: &Simple<'_>) -> Option<bool> {
         {
             return None;
         }
-        return Some(true);
+        return Some((index, true));
     }
-    (!name.is_empty()).then_some(false)
+    Some((index, false))
 }
 
 fn parse(command: &str) -> Option<Vec<Pipeline<'_>>> {
@@ -262,6 +347,9 @@ fn parse(command: &str) -> Option<Vec<Pipeline<'_>>> {
             },
             Token::Separator(separator) => {
                 if simple.args.is_empty() {
+                    if !simple.redirects.is_empty() {
+                        return None;
+                    }
                     // Blank lines and newlines after &&/||/| are shell continuations.
                     if separator == Separator::Always {
                         continue;
