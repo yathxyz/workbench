@@ -40,6 +40,15 @@ pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Captures waiting for the control task.
 const CALLS: usize = 64;
 
+/// Configured opens wait for setup and each agent config deadline, with reply margin.
+pub fn acp_open_timeout(config_count: usize) -> Duration {
+    if config_count == 0 {
+        REPLY_TIMEOUT
+    } else {
+        Duration::from_secs(40) * (config_count as u32 + 1)
+    }
+}
+
 /// What the web knows about the hub, from the control connection.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HubStatus {

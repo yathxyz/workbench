@@ -184,6 +184,7 @@ fn open_reply(sid: &str, host: &str, new: bool) -> AcpOpenReply {
         head: 3,
         from: 1,
         reset: false,
+        config_errors: Vec::new(),
     }
 }
 
@@ -482,6 +483,7 @@ async fn a_post_starts_an_agent() {
             agent: "claude".into(),
             cwd: "/home/alice/src".into(),
             host: None,
+            config: Vec::new(),
         })
     );
     assert_eq!(res.status, 201);
@@ -795,151 +797,82 @@ async fn actions_are_the_hubs_requests() {
 }
 
 #[tokio::test]
-async fn start_config_waits_for_ready_and_continues_after_an_option_fails() {
+async fn start_config_refuses_duplicate_ids_and_more_than_sixteen_members() {
     let api = Api::start().await;
     let before = api.hub.requests().len();
-    // Deliberately not lexical order: the first option changes the next one's choices.
-    let sent = tokio::spawn(api.req("POST", "/v1/sessions", OWNER).body(
-        r#"{"agent":"claude","cwd":"/x","sid":"mine","config":{"model":"other","missing":"x","effort":"high","enabled":true}}"#
-    ).send());
-    let (conn, open) = api.asked_after(before).await;
-    let mut reply = open_reply("mine", "testhost", true);
-    let facts = reply.summary.acp.as_mut().unwrap();
-    facts.activity = Activity::Setup;
-    facts.agent_session_id = None;
-    api.hub.send(conn, HubMessage::ok(rid_of(&open), &reply));
-    let before = api.hub.requests().len();
-    assert!(
-        timeout(
-            std::time::Duration::from_millis(100),
-            api.asked_after(before)
-        )
-        .await
-        .is_err()
-    );
-    assert!(!sent.is_finished());
-
-    let mut current = summary("mine", "testhost");
-    current.acp.as_mut().unwrap().config_options = Some(json!([
-        {"id":"model","type":"select","currentValue":"default","options":[{"value":"other","name":"Other"}]}
-    ]));
-    let mut cursor = before;
-    api.hub.send(
-        conn,
-        HubMessage::AcpInfo {
-            sid: "mine".into(),
-            summary: Box::new(current.clone()),
-            session: Box::default(),
-        },
-    );
-    for (index, (id, value)) in [
-        ("model", json!("other")),
-        ("missing", json!("x")),
-        ("effort", json!("high")),
-        ("enabled", json!(true)),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let (_, req) = api.asked_after(cursor).await;
-        cursor = api.hub.requests().len();
-        assert_eq!(
-            req,
-            HubRequest::AcpSetConfigOption {
-                rid: index as u64 + 2,
-                sid: "mine".into(),
-                epoch: EPOCH,
-                config_id: id.into(),
-                value: value.clone(),
-            }
-        );
-        if id == "missing" {
-            api.hub.send(
-                conn,
-                refusal(ErrorCode::BadOption, "option is not offered")(rid_of(&req)),
-            );
-        } else {
-            current.acp.as_mut().unwrap().config_options = Some(json!([
-                {"id":id,"currentValue":value}
-            ]));
-            api.hub.send(
-                conn,
-                HubMessage::AcpInfo {
-                    sid: "mine".into(),
-                    summary: Box::new(current.clone()),
-                    session: Box::default(),
-                },
-            );
-            api.hub.send(conn, ok(rid_of(&req)));
-        }
+    let too_many = (0..17)
+        .map(|i| format!(r#""option{i}":"value""#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let bad_configs = [
+        format!("{{{too_many}}}"),
+        r#"{"model":"small","model":"large"}"#.into(),
+        r#"{"model":"small","effort":"low","model":"large"}"#.into(),
+        "null".into(),
+        "[]".into(),
+    ];
+    for config in bad_configs {
+        let res = api
+            .req("POST", "/v1/sessions", OWNER)
+            .body(format!(
+                r#"{{"agent":"claude","cwd":"/x","sid":"mine","config":{config}}}"#
+            ))
+            .send()
+            .await;
+        assert_eq!((res.status, res.json()), (400, json!({"error":"bad body"})));
     }
-    let res = sent.await.unwrap();
+    assert!(
+        api.hub
+            .requests()
+            .into_iter()
+            .skip(before)
+            .all(|(_, request)| matches!(request, HubRequest::Hello { .. })),
+        "an invalid config reached the hub"
+    );
+
+    let sixteen = (0..16)
+        .map(|i| format!(r#""option{i}":true"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let req = api.req("POST", "/v1/sessions", OWNER).body(format!(
+        r#"{{"agent":"claude","cwd":"/x","sid":"mine","config":{{{sixteen}}}}}"#
+    ));
+    let (_, res) = api
+        .answered(req, |rid| {
+            HubMessage::ok(rid, &open_reply("mine", "testhost", true))
+        })
+        .await;
     assert_eq!(res.status, 201);
-    assert_eq!(
-        res.json()["configErrors"],
-        json!([
-            {"id":"missing","value":"x","error":"option is not offered","code":"bad_option"}
-        ])
-    );
-    assert_eq!(
-        res.json()["session"]["acp"]["configOptions"],
-        json!([
-            {"id":"enabled","currentValue":true}
-        ])
-    );
 }
 
 #[tokio::test]
-async fn failed_setup_reports_each_start_config_without_failing_the_start() {
+async fn config_values_must_be_strings_or_booleans_before_reaching_the_hub() {
     let api = Api::start().await;
     let before = api.hub.requests().len();
-    let sent = tokio::spawn(api.req("POST", "/v1/sessions", OWNER).body(
-        r#"{"agent":"claude","cwd":"/x","sid":"mine","config":{"model":"other","effort":"high"}}"#
-    ).send());
-    let (conn, open) = api.asked_after(before).await;
-    let mut reply = open_reply("mine", "testhost", true);
-    reply.summary.acp.as_mut().unwrap().activity = Activity::Setup;
-    api.hub.send(conn, HubMessage::ok(rid_of(&open), &reply));
-    api.hub.send(
-        conn,
-        HubMessage::AcpEv {
-            sid: "mine".into(),
-            ev: Box::new(JournalEvent {
-                seq: 4,
-                ts: EPOCH,
-                body: EventBody::SetupError {
-                    code: wb_proto::journal::SetupErrorCode::AgentError,
-                    message: "login required".into(),
-                    rpc: None,
-                },
-            }),
-        },
-    );
-    let mut current = summary("mine", "testhost");
-    current.alive = false;
-    api.hub.send(
-        conn,
-        HubMessage::AcpInfo {
-            sid: "mine".into(),
-            summary: Box::new(current),
-            session: Box::default(),
-        },
-    );
-    let res = sent.await.unwrap();
-    assert_eq!(res.status, 201);
-    assert_eq!(res.json()["session"]["alive"], false);
-    assert_eq!(
-        res.json()["configErrors"],
-        json!([
-            {"id":"model","value":"other","error":"login required","code":"agent_error"},
-            {"id":"effort","value":"high","error":"login required","code":"agent_error"}
-        ])
-    );
+    for value in ["123", "1.5", "null", "[]", r#"{"nested":"value"}"#] {
+        for (path, body) in [
+            (
+                "/v1/sessions",
+                format!(
+                    r#"{{"agent":"claude","cwd":"/x","sid":"mine","config":{{"model":{value}}}}}"#
+                ),
+            ),
+            (
+                "/v1/sessions/a1/config",
+                format!(r#"{{"id":"model","value":{value}}}"#),
+            ),
+        ] {
+            let res = api.req("POST", path, OWNER).body(body).send().await;
+            assert_eq!((res.status, res.json()), (400, json!({"error":"bad body"})));
+        }
+    }
     assert!(
-        !api.hub
+        api.hub
             .requests()
-            .iter()
-            .any(|(_, r)| matches!(r, HubRequest::AcpSetConfigOption { .. }))
+            .into_iter()
+            .skip(before)
+            .all(|(_, request)| matches!(request, HubRequest::Hello { .. })),
+        "an invalid value reached the hub"
     );
 }
 

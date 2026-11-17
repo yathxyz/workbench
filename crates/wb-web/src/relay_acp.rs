@@ -15,7 +15,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Instant, sleep_until};
 use wb_proto::hub::{
-    AcpOpenReply, AcpSessionInfo, ErrorCode, HubMessage, HubRequest, SpawnAcp, Summary,
+    AcpOpenReply, AcpSessionInfo, ConfigOption, ErrorCode, HubMessage, HubRequest, SpawnAcp,
+    Summary,
 };
 use wb_proto::journal::EventBody;
 use wb_proto::limits::{CARD_OPEN_DEADLINE, MAX_LINE, WS_MAX_ACP};
@@ -23,7 +24,7 @@ use wb_proto::line;
 
 use crate::AppState;
 use crate::http::{self, End, Keepalive, Tick, close, send_json, ws_close, ws_too_big};
-use crate::hub::{HUB_LOST, HubConn, REPLY_TIMEOUT, connect_relay, with_state};
+use crate::hub::{HUB_LOST, HubConn, acp_open_timeout, connect_relay, with_state};
 use crate::util::sanitize_sid;
 
 const ROUTE: &str = "/acp";
@@ -50,6 +51,8 @@ enum Browser {
         epoch: Option<u64>,
         agent: Option<String>,
         cwd: Option<String>,
+        #[serde(default)]
+        config: Vec<ConfigOption>,
     },
     #[serde(rename = "prompt")]
     Prompt { blocks: Vec<Value> },
@@ -100,12 +103,17 @@ fn decode(text: &str) -> Result<(Option<Value>, Browser), Option<Value>> {
 
 /// Spawn fields only when both `agent` and `cwd` are non-empty (SEC-2): a page load or
 /// a reconnect sends neither and must never start an agent.
-fn spawn(agent: Option<String>, cwd: Option<String>) -> Option<SpawnAcp> {
+fn spawn(
+    agent: Option<String>,
+    cwd: Option<String>,
+    config: Vec<ConfigOption>,
+) -> Option<SpawnAcp> {
     match (agent, cwd) {
         (Some(agent), Some(cwd)) if !agent.is_empty() && !cwd.is_empty() => Some(SpawnAcp {
             agent,
             cwd,
             host: None,
+            config,
         }),
         _ => None,
     }
@@ -240,8 +248,9 @@ impl Relay {
                     epoch,
                     agent,
                     cwd,
+                    config,
                 } => {
-                    let spawn = spawn(agent, cwd);
+                    let spawn = spawn(agent, cwd, config);
                     self.open(ws, &id, since, epoch, spawn, browser_rid).await
                 }
                 _ => {
@@ -341,6 +350,7 @@ impl Relay {
             return Err(End::Close(close::POLICY, "bad id"));
         }
         let rid = self.rid();
+        let wait = acp_open_timeout(spawn.as_ref().map_or(0, |spawn| spawn.config.len()));
         tracing::info!(sid, spawn = spawn.is_some(), "acp open");
         let req = HubRequest::AcpOpen {
             rid,
@@ -351,7 +361,7 @@ impl Relay {
         };
         self.send(&req).await?;
         self.replies.insert(rid, (Pending::Open, browser_rid));
-        self.deadline = Some(Instant::now() + REPLY_TIMEOUT);
+        self.deadline = Some(Instant::now() + wait);
         self.sid = Some(sid);
         Ok(())
     }
@@ -446,14 +456,18 @@ impl Relay {
     }
 
     fn hello(&mut self, reply: AcpOpenReply) -> Value {
-        json!({
+        let mut hello = json!({
             "t": "hello",
             "status": if reply.new { "new" } else { "attached" },
             "info": info(&reply.summary, reply.session, &mut self.session),
             "head": reply.head,
             "from": reply.from,
             "reset": reply.reset,
-        })
+        });
+        if !reply.config_errors.is_empty() {
+            hello["configErrors"] = json!(reply.config_errors);
+        }
+        hello
     }
 }
 
@@ -474,14 +488,19 @@ mod tests {
             (Some("claude"), Some("/home/alice"), true),
         ];
         for (agent, cwd, want) in table {
-            assert_eq!(spawn(s(agent), s(cwd)).is_some(), want, "{agent:?} {cwd:?}");
+            assert_eq!(
+                spawn(s(agent), s(cwd), Vec::new()).is_some(),
+                want,
+                "{agent:?} {cwd:?}"
+            );
         }
         assert_eq!(
-            spawn(s(Some("claude")), s(Some("/home/alice"))),
+            spawn(s(Some("claude")), s(Some("/home/alice")), Vec::new()),
             Some(SpawnAcp {
                 agent: "claude".into(),
                 cwd: "/home/alice".into(),
-                host: None
+                host: None,
+                config: Vec::new(),
             })
         );
     }
@@ -498,7 +517,8 @@ mod tests {
                     since: 7,
                     epoch: None,
                     agent: None,
-                    cwd: None
+                    cwd: None,
+                    config: Vec::new(),
                 }
             ))
         );

@@ -72,6 +72,7 @@ fn reply(sid: &str) -> AcpOpenReply {
         head: 3,
         from: 1,
         reset: false,
+        config_errors: Vec::new(),
     }
 }
 
@@ -194,6 +195,7 @@ async fn spawn_fields_go_only_with_agent_and_cwd() {
                 agent: "claude".into(),
                 cwd: "/home/alice".into(),
                 host: None,
+                config: Vec::new(),
             });
             // The id is sanitised to the sid alphabet; since and epoch pass through.
             (format!("a{i}x"), 5 + i as u64, Some(EPOCH), spawn)
