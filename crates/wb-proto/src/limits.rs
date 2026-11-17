@@ -26,6 +26,16 @@ pub const ACP_REPLAY_MAX: usize = 4 * MIB;
 pub const PROMPT_MAX: usize = 8 * MIB;
 /// Most ordered configuration entries in an ACP spawn. Larger is `bad_request`.
 pub const ACP_CONFIG_MAX: usize = 16;
+/// Most ordered rules in a session permission policy; excess is `bad_request`.
+pub const POLICY_RULES_MAX: usize = 64;
+/// Most command regular expressions across one policy; excess is `bad_request`.
+pub const POLICY_PATTERNS_MAX: usize = 128;
+/// Most UTF-8 bytes in one command regular expression.
+pub const POLICY_PATTERN_MAX: usize = 4096;
+/// Most roots or tool kinds in one permission rule.
+pub const POLICY_SELECTORS_MAX: usize = 64;
+/// Most UTF-8 bytes in one tool kind.
+pub const POLICY_KIND_MAX: usize = 64;
 /// Scrollback lines kept by the VT state.
 pub const VT_SCROLLBACK: usize = 1000;
 /// Largest snapshot. The scrollback budget is halved until it fits.
