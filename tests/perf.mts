@@ -249,8 +249,8 @@ try {
     await p.keyboard.type('perfpage', { delay: 40 }); await sleep(200);
     await p.keyboard.press('Escape');
   });
-  await scenario('switch views Alt-1 … Alt-7', async () => {
-    for (let i = 1; i <= 7; i++) { await p.keyboard.press(`Alt+Digit${i}`); await sleep(250); }
+  await scenario('switch views Alt-1 … Alt-8', async () => {
+    for (let i = 1; i <= 8; i++) { await p.keyboard.press(`Alt+Digit${i}`); await sleep(250); }
     await p.keyboard.press('Alt+Digit1'); await sleep(300);
   });
 

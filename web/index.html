@@ -28,7 +28,7 @@
 </div>
 
 <div id="toolbar">
-  <div class="grp"><button class="tb" id="toggle-tree" title="Folder tree (Alt-B)">Folders</button><button class="tb" id="view-name" title="Switch view (Alt-1 to Alt-6)">Canvas</button></div>
+  <div class="grp"><button class="tb" id="toggle-tree" title="Folder tree (Alt-B)">Folders</button><button class="tb" id="view-name" title="Switch view (Alt-1 to Alt-8)">Canvas</button></div>
   <button class="search" id="open-palette" title="Search everything and run any command"><span>Search or run a command</span><kbd class="k-pal">Ctrl K</kbd></button>
   <div class="grp c-only"><button class="tb" id="toggle-draw" title="Drawing tools. A stylus always writes.">✎ Draw</button><button class="tb" id="toggle-new" title="Add shells, agents, web windows, artifacts, sketches, folders">+ New</button><button class="tb" id="open-help" title="Help (?)">?</button></div>
   <div class="grp c-only dock" id="dock-draw" role="toolbar" aria-label="Drawing tools" hidden>
@@ -160,17 +160,21 @@
   </div>
 </section>
 
+<section id="v-agents" class="view" hidden aria-label="Agents">
+  <nav class="mesh-side" aria-label="Agent sessions">
+    <div class="mesh-bar"><span id="mesh-sum"></span><label title="Also list the sessions that have ended"><input type="checkbox" id="mesh-ended"> Ended</label></div>
+    <div id="mesh-list" role="list" tabindex="0" aria-label="Sessions"></div>
+  </nav>
+  <div id="mesh-detail" class="mesh-detail" tabindex="-1"><p class="muted">Select a session.</p></div>
+</section>
+
 <aside id="side" aria-label="Docked terminal">
   <div id="side-grip" role="separator" aria-orientation="vertical" title="Drag to resize · double-click to reset"></div>
   <div class="side-hd">
-    <span class="side-tabs" role="tablist"><button class="on" data-side="term" role="tab" title="Docked terminal (Ctrl-`)">Terminal</button><button class="needs-mesh" data-side="agents" role="tab" title="Every agent session on the hosts of the mesh, the ones waiting for you first" hidden>Agents</button></span><span id="side-ctx"></span>
+    <span>Terminal</span><span id="side-ctx"></span>
     <button class="hb" id="side-close" title="Hide">✕</button>
   </div>
   <div class="k-term side-wrap" id="side-term"><div class="body" id="side-term-body"></div></div>
-  <div class="side-wrap" id="side-mesh" hidden>
-    <div class="mesh-bar"><span id="mesh-sum"></span><label title="Also list the sessions that have ended"><input type="checkbox" id="mesh-ended"> Ended</label></div>
-    <div id="mesh-list" role="list"></div>
-  </div>
 </aside>
 
 <div id="pick-chip" hidden><span id="pick-n"></span><button class="mini" data-act="delete" title="Remove the selection: ink, shapes and cards (Delete). Ctrl-Z brings ink and shapes back.">Delete</button><button class="mini" data-act="sketch" title="Turn the selected handwriting into a sketch card: it gets an address, tags, arrows and Aa → text">Sketch card</button><button class="mini" data-act="read" title="Read the selected handwriting into text">Aa → text</button><button class="mini" data-act="png" title="Copy the selected ink as PNG (transparent), for Krita or another program">PNG</button><button class="mini" data-act="svg" title="Copy the selected ink as SVG paths, for Krita, Inkscape or another program">SVG</button><button class="mini" data-act="compact" title="Pack the selected items into tight rows (c)">Compact</button><button class="mini" data-act="clear" title="Clear the selection (Esc)">✕</button></div>
@@ -227,7 +231,7 @@
           <dt><kbd data-modkey="Mod-K">Ctrl-K</kbd></dt><dd>Fuzzy search over pages, shells, agents, folders, anchors, saved views and every command. Type letters in order: <code>cwb</code> finds canvas-workbench.</dd>
           <dt><kbd>:</kbd> · <kbd data-modkey="Mod-Shift-P">Ctrl-Shift-P</kbd> · <code>&gt;</code></dt><dd>Commands only</dd>
           <dt>Ctrl-N / Ctrl-P, Ctrl-J / Ctrl-K</dt><dd>Move in the palette</dd>
-          <dt>Alt-1 … Alt-7</dt><dd>Canvas, Navigator, Graph, Editor, Outline, Tasks, Review</dd>
+          <dt>Alt-1 … Alt-8</dt><dd>Canvas, Navigator, Graph, Editor, Outline, Tasks, Review, Agents. In Agents: j/k or arrows select a session, Enter focuses it, Escape from the composer returns to the list.</dd>
           <dt>Alt-B · Ctrl-` (or Ctrl-J)</dt><dd>Folder tree · docked terminal. Inside a shell, every key goes to the program except Ctrl-`; inside a page, these keys, Ctrl-K and the views stay with the board.</dd>
           <dt>h j k l · H J K L · f · . · m</dt><dd>On the board: select the neighbour card · swap with it · hints (a label on every card and on the selected card's buttons; type one to pick it) · the selected card's actions · arrange it (h j k l move, H J K L resize, Enter done, Esc puts it back)</dd>
           <dt>Arrows · - = · z · ! · Alt-← Alt-→</dt><dd>Pan · zoom out, in · the selected card at 100 % · fit everything · previous and next view</dd>
