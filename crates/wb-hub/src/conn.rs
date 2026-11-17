@@ -403,6 +403,14 @@ impl Conn {
                 )
                 .await;
             }
+            HubRequest::AcpSetPolicy {
+                rid,
+                sid,
+                epoch,
+                policy,
+            } => {
+                self.act(rid, sid, Act::SetPolicy { epoch, policy }).await;
+            }
             HubRequest::AcpSeen { rid, sid, seq } => self.act(rid, sid, Act::Seen(seq)).await,
             HubRequest::AcpRevive { rid, sid } => self.act(rid, sid, Act::Revive).await,
             HubRequest::AcpAuthenticate {

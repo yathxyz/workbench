@@ -756,7 +756,9 @@ impl Fake {
 
     async fn permission_turn(&mut self) -> &'static str {
         let call = self.turn_id("call");
-        let tool = json!({"toolCallId": call, "title": "Run `rm -rf build`", "kind": "execute", "status": "pending"});
+        let tool = json!({"toolCallId": call, "title": "Run `rm -rf build`", "kind": "execute",
+                          "status": "pending", "locations": [{"path": "build"}],
+                          "rawInput": {"command": "rm -rf build"}});
         let mut announce = tool.clone();
         announce["sessionUpdate"] = "tool_call".into();
         announce["rawInput"] = json!({"command": "rm -rf build"});

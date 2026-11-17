@@ -1040,6 +1040,242 @@ fn hub_permission_first_answer_wins() {
     fold_equals_live(&mut hub);
 }
 
+fn permission_policy(action: &str) -> Value {
+    json!({"rules": [{
+        "action": action, "kinds": ["execute"], "roots": ["$cwd", "/nix/store", "/tmp"],
+        "command": {"matches": ["^rm "], "notMatches": ["sudo"]}
+    }]})
+}
+
+fn policy_ready(c: &mut Client, hub: &Hub, sid: &str, policy: Value) -> Value {
+    let open = c.ok(json!({"t":"acp.open", "sid":sid, "since":0,
+        "spawn":{"agent":"stub", "cwd":hub.home(), "policy":policy}}));
+    c.event(sid, "session");
+    open
+}
+
+#[test]
+fn hub_policy_answers_once_without_publishing_pending_and_replays() {
+    let mut hub = Hub::with_scenarios(&[]);
+    let mut c = hub.connect();
+    let mut watcher = hub.connect();
+    watcher.ok(json!({"t":"watch"}));
+    for (sid, action, option, status) in [
+        ("allowed", "allow", "allow-once", "completed"),
+        ("rejected", "reject", "reject-once", "failed"),
+    ] {
+        let policy = permission_policy(action);
+        let open = policy_ready(&mut c, &hub, sid, policy.clone());
+        assert_eq!(c.summary(sid)["acp"]["policy"], policy);
+        assert_eq!(c.acp_prompt(sid, "perm")["t"], "ok");
+        let evs = c.events_until(sid, "turn_end");
+        let auto = evs.iter().find(|e| e["e"] == "permission_auto").unwrap();
+        assert_eq!(auto["policy"], json!({"rule":0,"action":action}));
+        assert_eq!(
+            auto["outcome"],
+            json!({"outcome":"selected","optionId":option})
+        );
+        assert!(evs.iter().any(|e| e["update"]["status"] == status));
+        assert!(!evs.iter().any(|e| e["e"] == "permission"));
+        assert_eq!(c.summary(sid)["acp"]["pending"], json!([]));
+        assert_eq!(
+            permit(&mut c, sid, &auto["seq"], epoch(&open), option)["code"],
+            "already_resolved"
+        );
+        let mut attached = hub.connect();
+        attached.acp_open(sid, 0);
+        let (replay, _) = attached.replay(sid);
+        assert_eq!(
+            replay.iter().find(|e| e["e"] == "permission_auto"),
+            Some(auto)
+        );
+        assert!(hub.journal(sid).contains(auto));
+    }
+    // A list reply is a barrier after every session publication already queued.
+    watcher.send(&json!({"t":"list","rid":901}));
+    loop {
+        let message = watcher.next().expect("watcher stays connected");
+        if message["rid"] == 901 {
+            assert_eq!(message["t"], "ok");
+            break;
+        }
+        if message["t"] == "session" {
+            assert_eq!(message["session"]["acp"]["pending"], json!([]), "{message}");
+        }
+    }
+    drop((c, watcher));
+    fold_equals_live(&mut hub);
+    let mut c = hub.connect();
+    assert_eq!(
+        c.summary("allowed")["acp"]["policy"],
+        permission_policy("allow")
+    );
+    c.acp_open("allowed", 0);
+    c.replay("allowed");
+    c.ok(json!({"t":"acp.revive","sid":"allowed"}));
+    c.event("allowed", "session");
+    assert_eq!(c.acp_prompt("allowed", "perm")["t"], "ok");
+    assert_eq!(
+        c.event("allowed", "permission_auto")["outcome"]["optionId"],
+        "allow-once"
+    );
+    c.event("allowed", "turn_end");
+}
+
+#[test]
+fn hub_policy_replace_remove_leave_pending_and_never_answer_elicitations() {
+    let mut hub = Hub::with_scenarios(&[]);
+    let mut c = hub.connect();
+    let open = policy_ready(&mut c, &hub, "a1", permission_policy("ask"));
+    let epoch = epoch(&open);
+    assert_eq!(c.acp_prompt("a1", "perm")["t"], "ok");
+    let req = c.event("a1", "permission")["seq"].clone();
+    for policy in [permission_policy("allow"), json!({"rules":[]})] {
+        c.ok(json!({"t":"acp.set_policy","sid":"a1","epoch":epoch,"policy":policy}));
+        assert_eq!(c.summary("a1")["acp"]["pending"][0]["req"], req);
+    }
+    assert!(c.summary("a1")["acp"]["policy"].is_null());
+    assert_eq!(permit(&mut c, "a1", &req, epoch, "reject-once")["t"], "ok");
+    c.event("a1", "turn_end");
+    assert_eq!(c.acp_prompt("a1", "perm")["t"], "ok");
+    let req = c.event("a1", "permission")["seq"].clone();
+    assert_eq!(permit(&mut c, "a1", &req, epoch, "allow-once")["t"], "ok");
+    c.event("a1", "turn_end");
+    c.ok(json!({"t":"acp.set_policy","sid":"a1","epoch":epoch,
+        "policy":{"rules":[{"action":"allow"}]}}));
+    assert_eq!(c.acp_prompt("a1", "form")["t"], "ok");
+    let elicitation = c.event("a1", "elicitation");
+    assert_eq!(c.summary("a1")["acp"]["pending"][0]["kind"], "elicitation");
+    c.ok(json!({"t":"acp.elicitation","sid":"a1","epoch":epoch,
+        "req":elicitation["seq"],"response":{"action":"decline"}}));
+    c.event("a1", "turn_end");
+    assert_eq!(
+        hub.journal("a1")
+            .iter()
+            .filter(|e| e["e"] == "policy")
+            .count(),
+        4
+    );
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[test]
+fn hub_policy_is_incarnation_scoped_and_attach_cannot_replace_it() {
+    let hub = Hub::with_scenarios(&[]);
+    let mut c = hub.connect();
+    let open = policy_ready(&mut c, &hub, "a1", permission_policy("reject"));
+    let old = epoch(&open);
+    let attach = c.ok(json!({"t":"acp.open","sid":"a1","since":0,
+        "spawn":{"agent":"stub","cwd":hub.home(),"policy":permission_policy("allow")}}));
+    assert_eq!(
+        attach["summary"]["acp"]["policy"],
+        permission_policy("reject")
+    );
+    c.replay("a1");
+    c.ok(json!({"t":"acp.kill","sid":"a1","forget":true}));
+    let new = ready(&mut c, &hub, "a1", "stub");
+    assert_ne!(epoch(&new), old);
+    assert_eq!(
+        c.request(json!({"t":"acp.set_policy","sid":"a1","epoch":old,
+        "policy":permission_policy("allow")}))["code"],
+        "stale"
+    );
+    assert!(c.summary("a1")["acp"]["policy"].is_null());
+    assert_eq!(c.acp_prompt("a1", "perm")["t"], "ok");
+    let req = c.event("a1", "permission")["seq"].clone();
+    assert_eq!(
+        permit(&mut c, "a1", &req, epoch(&new), "reject-once")["t"],
+        "ok"
+    );
+    c.event("a1", "turn_end");
+}
+
+#[test]
+fn hub_invalid_policy_never_registers_or_spawns_and_replacement_is_atomic() {
+    let hub = Hub::with_scenarios(&[]);
+    let mut c = hub.connect();
+    for policy in [
+        json!({"rules":[{"action":"allow","command":{"matches":["("]}}]}),
+        json!({"rules":[{"action":"allow","roots":["relative"]}]}),
+        json!({"rules":[{"action":"alow"}]}),
+        json!({"rules":[],"typo":true}),
+        json!({"rules":vec![json!({"action":"allow"});65]}),
+    ] {
+        let reply = c.request(json!({"t":"acp.open","sid":"bad","since":0,
+            "spawn":{"agent":"stub","cwd":hub.home(),"policy":policy}}));
+        assert_eq!(reply["code"], "bad_request", "{reply}");
+        assert!(!hub.acp_file("bad.json").exists());
+    }
+    assert!(
+        c.ok(json!({"t":"list"}))["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let open = policy_ready(&mut c, &hub, "a1", permission_policy("reject"));
+    let before = hub.journal("a1");
+    assert_eq!(
+        c.request(json!({"t":"acp.set_policy","sid":"a1","epoch":epoch(&open),
+        "policy":{"rules":[{"action":"allow","command":{"matches":["("]}}]}}))["code"],
+        "bad_request"
+    );
+    assert_eq!(
+        c.summary("a1")["acp"]["policy"],
+        permission_policy("reject")
+    );
+    assert_eq!(hub.journal("a1"), before);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hub_policy_journal_fault_sends_cancellation_not_an_unrecorded_allow() {
+    let hub = Hub::start_with_env(
+        |cfg| stub(cfg, "stub", &[]),
+        &[("WB_HUB_TEST_FAIL_WRITE_AT", "7")],
+    );
+    let mut c = hub.connect();
+    policy_ready(&mut c, &hub, "a1", permission_policy("allow"));
+    assert_eq!(c.acp_prompt("a1", "perm")["t"], "ok");
+    c.summary_until("a1", "policy answer faults the journal", |s| {
+        s["fault"]["code"] == "journal_write" && s["alive"] == false
+    });
+    assert!(!hub.kinds("a1").iter().any(|e| e == "permission_auto"));
+    let outcomes: Vec<Value> = answers(&hub, "stub")
+        .iter()
+        .map(|answer| answer["result"]["outcome"].clone())
+        .collect();
+    assert_eq!(outcomes, [json!({"outcome":"cancelled"})]);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hub_policy_spawn_write_failure_accounts_for_every_startup_option() {
+    let hub = Hub::start_with_env(
+        |cfg| stub(cfg, "stub", &[]),
+        &[("WB_HUB_TEST_FAIL_WRITE_AT", "1")],
+    );
+    let mut c = hub.connect();
+    let open = c.ok(json!({"t":"acp.open","sid":"a1","since":0,
+        "spawn":{"agent":"stub","cwd":hub.home(),"policy":permission_policy("allow"),
+            "config":[{"id":"model","value":"large"},{"id":"thinking","value":true}]}}));
+    assert_eq!(open["summary"]["alive"], false);
+    assert_eq!(open["summary"]["fault"]["code"], "journal_write");
+    let errors = open["configErrors"].as_array().unwrap();
+    assert_eq!(
+        errors
+            .iter()
+            .map(|e| (&e["id"], &e["value"], &e["code"]))
+            .collect::<Vec<_>>(),
+        [
+            (&json!("model"), &json!("large"), &json!("faulted")),
+            (&json!("thinking"), &json!(true), &json!("faulted"))
+        ]
+    );
+    assert!(hub.record("stub").is_empty());
+    assert!(hub.journal("a1").is_empty());
+}
+
 #[test]
 fn hub_permission_reconnect_replays_in_seq_order() {
     let mut hub = Hub::with_scenarios(&["permission-reconnect"]);

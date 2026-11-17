@@ -4,6 +4,7 @@
 use serde_json::{Value, json};
 use wb_proto::hub::{Activity, Last, LastError, Pending, PendingKind};
 use wb_proto::journal::{EventBody, JournalEvent, ResolvedBy, SetupErrorCode, TurnErrorCode};
+use wb_proto::policy::Policy;
 
 use super::config::valid_options;
 
@@ -24,6 +25,7 @@ pub struct Facts {
     pub mode_id: Option<String>,
     pub modes: Option<Value>,
     pub config_options: Option<Value>,
+    pub policy: Option<Policy>,
     pub available_commands: Option<Value>,
     pub plan: Option<Value>,
     pub usage: Option<Value>,
@@ -45,6 +47,7 @@ impl Default for Facts {
             mode_id: None,
             modes: None,
             config_options: None,
+            policy: None,
             available_commands: None,
             plan: None,
             usage: None,
@@ -135,11 +138,15 @@ impl Facts {
                     self.config_options = Some(config_options.clone());
                 }
             }
+            EventBody::Policy { policy } => {
+                self.policy = (!policy.rules.is_empty()).then(|| policy.clone());
+            }
             EventBody::Exit { .. } => {
                 self.activity = Activity::None;
                 self.running = false;
             }
             EventBody::ElicitationComplete { .. }
+            | EventBody::PermissionAuto { .. }
             | EventBody::Notice { .. }
             | EventBody::Unknown => {}
         }
@@ -853,7 +860,7 @@ mod tests {
                 EventBody::PermissionResolved {
                     req: 4,
                     outcome: json!({"outcome": "cancelled"}),
-                    by: ResolvedBy::Hub
+                    by: ResolvedBy::Hub,
                 },
                 EventBody::ElicitationResolved {
                     req: 5,
