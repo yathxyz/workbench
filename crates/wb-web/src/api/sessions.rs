@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, MapAccess, Visitor};
 use serde_json::{Value, json};
 use tokio::time::timeout;
 use wb_proto::hub::{AcpOpenReply, ErrorCode, HubMessage, HubRequest, Kind, SpawnAcp, Summary};
@@ -26,8 +26,8 @@ use crate::util::valid_sid;
 
 /// The rid of the one request a connection carries.
 const RID: u64 = 1;
-/// How long `mode` waits: the hub waits for the agent first.
-const MODE_TIMEOUT: Duration = Duration::from_secs(40);
+/// Mode and config changes wait for the hub's 30 s agent deadline.
+const CONFIG_TIMEOUT: Duration = Duration::from_secs(40);
 /// Lines a capture returns when the request does not say.
 const CAPTURE_DEFAULT: usize = 200;
 
@@ -43,6 +43,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/sessions/{sid}/permission", post(permission))
         .route("/sessions/{sid}/elicitation", post(elicitation))
         .route("/sessions/{sid}/mode", post(mode))
+        .route("/sessions/{sid}/config", post(config))
         .route("/sessions/{sid}/revive", post(revive))
 }
 
@@ -278,6 +279,32 @@ struct Create {
     cwd: String,
     host: Option<String>,
     sid: Option<String>,
+    config: Option<StartConfig>,
+}
+
+/// JSON member order matters: changing a model may change the remaining options.
+struct StartConfig(Vec<(String, Value)>);
+
+impl<'de> Deserialize<'de> for StartConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Ordered;
+        impl<'de> Visitor<'de> for Ordered {
+            type Value = StartConfig;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an object of config option ids to values")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<StartConfig, M::Error> {
+                let mut options = Vec::new();
+                while let Some(option) = map.next_entry()? {
+                    options.push(option);
+                }
+                Ok(StartConfig(options))
+            }
+        }
+        deserializer.deserialize_map(Ordered)
+    }
 }
 
 /// `api_` and 16 random hex digits.
@@ -331,18 +358,162 @@ async fn create(
                 host: spawn_host(&info, body.host)?,
             }),
         };
-        conn.request(&req, RID).await.map_err(call_error)
+        let reply = conn.request(&req, RID).await.map_err(call_error)?;
+        Ok::<_, ApiError>((conn, reply))
     };
-    let reply = timeout(REPLY_TIMEOUT, open)
+    let (mut conn, reply) = timeout(REPLY_TIMEOUT, open)
         .await
         .unwrap_or_else(|_| Err(silent()))?;
-    let reply: AcpOpenReply =
+    let mut reply: AcpOpenReply =
         serde_json::from_value(Value::Object(reply)).map_err(|_| bad_reply())?;
     if !reply.new {
         return Err(ApiError::new(StatusCode::CONFLICT, "session exists"));
     }
-    let created = json!({"sid": sid, "session": with_state(&reply.summary)});
+    let mut errors = Vec::new();
+    if let Some(StartConfig(options)) = body.config
+        && !options.is_empty()
+    {
+        let ready = timeout(CONFIG_TIMEOUT, config_ready(&mut conn, &mut reply.summary))
+            .await
+            .unwrap_or(Err(CallError::Timeout));
+        for (index, (id, value)) in options.into_iter().enumerate() {
+            let rid = index as u64 + 2;
+            let result = match &ready {
+                Ok(()) => {
+                    let req = HubRequest::AcpSetConfigOption {
+                        rid,
+                        sid: sid.clone(),
+                        epoch: reply.summary.created_at,
+                        config_id: id.clone(),
+                        value: value.clone(),
+                    };
+                    timeout(
+                        CONFIG_TIMEOUT,
+                        configure(&mut conn, req, rid, &mut reply.summary),
+                    )
+                    .await
+                    .unwrap_or(Err(CallError::Timeout))
+                }
+                Err(e) => Err(match e {
+                    CallError::Unavailable => CallError::Unavailable,
+                    CallError::Timeout => CallError::Timeout,
+                    CallError::Refused(code, message) => CallError::Refused(*code, message.clone()),
+                }),
+            };
+            if let Err(e) = result {
+                let (code, error) = match e {
+                    CallError::Unavailable => (None, "hub unavailable".to_owned()),
+                    CallError::Timeout => (
+                        Some(ErrorCode::Timeout),
+                        "the hub did not answer".to_owned(),
+                    ),
+                    CallError::Refused(code, message) => (Some(code), message),
+                };
+                let mut failure = json!({"id": id, "value": value, "error": error});
+                if let Some(code) = code {
+                    failure["code"] = json!(code);
+                }
+                errors.push(failure);
+            }
+        }
+    }
+    let created = json!({
+        "sid": sid,
+        "session": with_state(&reply.summary),
+        "configErrors": errors,
+    });
     Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// Waits for this incarnation's setup, not an old session id left by a revive.
+async fn config_ready(conn: &mut HubConn, summary: &mut Summary) -> Result<(), CallError> {
+    let mut failure = None;
+    while summary.acp.as_ref().is_none_or(|a| {
+        a.agent_session_id.is_none() || a.activity == wb_proto::hub::Activity::Setup
+    }) {
+        match conn.recv().await {
+            Some(HubMessage::AcpEv { sid, ev }) if sid == summary.sid => match ev.body {
+                EventBody::SetupError { code, message, .. } => {
+                    let code = if code == wb_proto::journal::SetupErrorCode::Timeout {
+                        ErrorCode::Timeout
+                    } else {
+                        ErrorCode::AgentError
+                    };
+                    failure = Some(CallError::Refused(code, message));
+                }
+                EventBody::Exit { .. } => {
+                    failure = Some(CallError::Refused(
+                        ErrorCode::NotAlive,
+                        "the agent exited during setup".into(),
+                    ));
+                }
+                _ => {}
+            },
+            Some(HubMessage::AcpInfo {
+                summary: current, ..
+            }) if current.sid == summary.sid && current.created_at == summary.created_at => {
+                *summary = *current;
+                if let Some(fault) = &summary.fault {
+                    return Err(CallError::Refused(
+                        ErrorCode::Faulted,
+                        fault.message.clone(),
+                    ));
+                }
+                if let Some(error) = failure.take() {
+                    return Err(error);
+                }
+            }
+            Some(HubMessage::Gone { sid, epoch })
+                if sid == summary.sid && epoch == summary.created_at =>
+            {
+                return Err(CallError::Refused(
+                    ErrorCode::Stale,
+                    "the session was forgotten".into(),
+                ));
+            }
+            Some(_) => {}
+            None => return Err(CallError::Unavailable),
+        }
+    }
+    Ok(())
+}
+
+/// Keeps the snapshot updates that precede the config reply on this connection.
+async fn configure(
+    conn: &mut HubConn,
+    req: HubRequest,
+    rid: u64,
+    summary: &mut Summary,
+) -> Result<(), CallError> {
+    conn.send(&req).await.map_err(|_| CallError::Unavailable)?;
+    loop {
+        match conn.recv().await {
+            Some(HubMessage::Ok { rid: r, .. }) if r == rid => return Ok(()),
+            Some(HubMessage::Err {
+                rid: Some(r),
+                code,
+                message,
+                ..
+            }) if r == rid => {
+                return Err(CallError::Refused(code, message));
+            }
+            Some(HubMessage::AcpInfo {
+                summary: current, ..
+            }) if current.sid == summary.sid && current.created_at == summary.created_at => {
+                *summary = *current;
+            }
+            Some(HubMessage::Gone { sid, epoch })
+                if sid == summary.sid && epoch == summary.created_at =>
+            {
+                return Err(CallError::Refused(
+                    ErrorCode::Stale,
+                    "the session was forgotten".into(),
+                ));
+            }
+            Some(_) => {}
+            None => return Err(CallError::Unavailable),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -463,7 +634,33 @@ async fn mode(
         sid,
         mode_id: body.mode_id,
     };
-    act(&api.app, req, MODE_TIMEOUT).await
+    act(&api.app, req, CONFIG_TIMEOUT).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    id: String,
+    value: Value,
+}
+
+async fn config(
+    _: Control,
+    State(api): State<ApiState>,
+    Param(id): Param<String>,
+    Body(body): Body,
+) -> Result<Json<Value>, ApiError> {
+    let sid = sid_of(id)?;
+    let body: Config = parse(&body)?;
+    let epoch = summary(&api.app, &sid)?.created_at;
+    let req = HubRequest::AcpSetConfigOption {
+        rid: RID,
+        sid,
+        epoch,
+        config_id: body.id,
+        value: body.value,
+    };
+    act(&api.app, req, CONFIG_TIMEOUT).await
 }
 
 async fn revive(

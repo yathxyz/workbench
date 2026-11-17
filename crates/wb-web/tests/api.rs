@@ -139,6 +139,7 @@ fn rid_of(r: &HubRequest) -> u64 {
         | HubRequest::AcpPermission { rid, .. }
         | HubRequest::AcpElicitation { rid, .. }
         | HubRequest::AcpSetMode { rid, .. }
+        | HubRequest::AcpSetConfigOption { rid, .. }
         | HubRequest::AcpRevive { rid, .. }
         | HubRequest::AcpKill { rid, .. }
         | HubRequest::PtyKill { rid, .. } => *rid,
@@ -170,6 +171,7 @@ fn summary(sid: &str, host: &str) -> Summary {
             seen_seq: 0,
             title: None,
             mode_id: Some("default".into()),
+            config_options: None,
         }),
     }
 }
@@ -249,6 +251,13 @@ async fn scopes_paths_and_methods_are_checked_after_the_token() {
         (
             "POST",
             "/v1/sessions/a/prompt",
+            READER,
+            403,
+            json!("forbidden"),
+        ),
+        (
+            "POST",
+            "/v1/sessions/a/config",
             READER,
             403,
             json!("forbidden"),
@@ -542,6 +551,10 @@ async fn a_post_starts_an_agent() {
             "bad body",
         ),
         (json!([]), "bad body"),
+        (
+            json!({"agent": "claude", "cwd": "/x", "config": []}),
+            "bad body",
+        ),
     ];
     for (body, error) in bad {
         let res = post(body.clone()).send().await;
@@ -748,6 +761,11 @@ async fn actions_are_the_hubs_requests() {
         ),
         ("/v1/sessions/a1/elicitation", json!({"req": 8, "epoch": 1})),
         ("/v1/sessions/a1/mode", json!({"mode_id": "plan"})),
+        ("/v1/sessions/a1/config", json!({"value": "other"})),
+        (
+            "/v1/sessions/a1/config",
+            json!({"id": "model", "value": "other", "extra": 1}),
+        ),
         ("/v1/sessions/a%2Fb/cancel", json!({})),
     ];
     for (path, body) in bad {
@@ -774,6 +792,186 @@ async fn actions_are_the_hubs_requests() {
             .all(|(_, r)| matches!(r, HubRequest::Hello { .. })),
         "a refused request reached the hub"
     );
+}
+
+#[tokio::test]
+async fn start_config_waits_for_ready_and_continues_after_an_option_fails() {
+    let api = Api::start().await;
+    let before = api.hub.requests().len();
+    // Deliberately not lexical order: the first option changes the next one's choices.
+    let sent = tokio::spawn(api.req("POST", "/v1/sessions", OWNER).body(
+        r#"{"agent":"claude","cwd":"/x","sid":"mine","config":{"model":"other","missing":"x","effort":"high","enabled":true}}"#
+    ).send());
+    let (conn, open) = api.asked_after(before).await;
+    let mut reply = open_reply("mine", "testhost", true);
+    let facts = reply.summary.acp.as_mut().unwrap();
+    facts.activity = Activity::Setup;
+    facts.agent_session_id = None;
+    api.hub.send(conn, HubMessage::ok(rid_of(&open), &reply));
+    let before = api.hub.requests().len();
+    assert!(
+        timeout(
+            std::time::Duration::from_millis(100),
+            api.asked_after(before)
+        )
+        .await
+        .is_err()
+    );
+    assert!(!sent.is_finished());
+
+    let mut current = summary("mine", "testhost");
+    current.acp.as_mut().unwrap().config_options = Some(json!([
+        {"id":"model","type":"select","currentValue":"default","options":[{"value":"other","name":"Other"}]}
+    ]));
+    let mut cursor = before;
+    api.hub.send(
+        conn,
+        HubMessage::AcpInfo {
+            sid: "mine".into(),
+            summary: Box::new(current.clone()),
+            session: Box::default(),
+        },
+    );
+    for (index, (id, value)) in [
+        ("model", json!("other")),
+        ("missing", json!("x")),
+        ("effort", json!("high")),
+        ("enabled", json!(true)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_, req) = api.asked_after(cursor).await;
+        cursor = api.hub.requests().len();
+        assert_eq!(
+            req,
+            HubRequest::AcpSetConfigOption {
+                rid: index as u64 + 2,
+                sid: "mine".into(),
+                epoch: EPOCH,
+                config_id: id.into(),
+                value: value.clone(),
+            }
+        );
+        if id == "missing" {
+            api.hub.send(
+                conn,
+                refusal(ErrorCode::BadOption, "option is not offered")(rid_of(&req)),
+            );
+        } else {
+            current.acp.as_mut().unwrap().config_options = Some(json!([
+                {"id":id,"currentValue":value}
+            ]));
+            api.hub.send(
+                conn,
+                HubMessage::AcpInfo {
+                    sid: "mine".into(),
+                    summary: Box::new(current.clone()),
+                    session: Box::default(),
+                },
+            );
+            api.hub.send(conn, ok(rid_of(&req)));
+        }
+    }
+    let res = sent.await.unwrap();
+    assert_eq!(res.status, 201);
+    assert_eq!(
+        res.json()["configErrors"],
+        json!([
+            {"id":"missing","value":"x","error":"option is not offered","code":"bad_option"}
+        ])
+    );
+    assert_eq!(
+        res.json()["session"]["acp"]["configOptions"],
+        json!([
+            {"id":"enabled","currentValue":true}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn failed_setup_reports_each_start_config_without_failing_the_start() {
+    let api = Api::start().await;
+    let before = api.hub.requests().len();
+    let sent = tokio::spawn(api.req("POST", "/v1/sessions", OWNER).body(
+        r#"{"agent":"claude","cwd":"/x","sid":"mine","config":{"model":"other","effort":"high"}}"#
+    ).send());
+    let (conn, open) = api.asked_after(before).await;
+    let mut reply = open_reply("mine", "testhost", true);
+    reply.summary.acp.as_mut().unwrap().activity = Activity::Setup;
+    api.hub.send(conn, HubMessage::ok(rid_of(&open), &reply));
+    api.hub.send(
+        conn,
+        HubMessage::AcpEv {
+            sid: "mine".into(),
+            ev: Box::new(JournalEvent {
+                seq: 4,
+                ts: EPOCH,
+                body: EventBody::SetupError {
+                    code: wb_proto::journal::SetupErrorCode::AgentError,
+                    message: "login required".into(),
+                    rpc: None,
+                },
+            }),
+        },
+    );
+    let mut current = summary("mine", "testhost");
+    current.alive = false;
+    api.hub.send(
+        conn,
+        HubMessage::AcpInfo {
+            sid: "mine".into(),
+            summary: Box::new(current),
+            session: Box::default(),
+        },
+    );
+    let res = sent.await.unwrap();
+    assert_eq!(res.status, 201);
+    assert_eq!(res.json()["session"]["alive"], false);
+    assert_eq!(
+        res.json()["configErrors"],
+        json!([
+            {"id":"model","value":"other","error":"login required","code":"agent_error"},
+            {"id":"effort","value":"high","error":"login required","code":"agent_error"}
+        ])
+    );
+    assert!(
+        !api.hub
+            .requests()
+            .iter()
+            .any(|(_, r)| matches!(r, HubRequest::AcpSetConfigOption { .. }))
+    );
+}
+
+#[tokio::test]
+async fn live_config_preserves_agent_errors_and_exposes_current_options() {
+    let hub = FakeHub::start();
+    let mut current = summary("a1", "testhost");
+    current.acp.as_mut().unwrap().config_options = Some(json!([
+        {"id":"model","currentValue":"default"}
+    ]));
+    hub.set_sessions(vec![current]);
+    let api = Api::without_hub(hub).await;
+    api.web.wait_hub("up").await;
+    assert_eq!(
+        api.get("/v1/sessions/a1").await.json()["acp"]["configOptions"],
+        json!([
+            {"id":"model","currentValue":"default"}
+        ])
+    );
+    for (code, status) in [
+        (ErrorCode::BadOption, 400),
+        (ErrorCode::AgentError, 502),
+        (ErrorCode::Stale, 409),
+        (ErrorCode::Timeout, 504),
+    ] {
+        let req = api
+            .req("POST", "/v1/sessions/a1/config", OWNER)
+            .body(json!({"id":"model","value":"other"}).to_string());
+        let (_, res) = api.answered(req, refusal(code, "refused")).await;
+        assert_eq!(res.status, status);
+        assert_eq!(res.json(), json!({"error":"refused","code":code}));
+    }
 }
 
 #[tokio::test]

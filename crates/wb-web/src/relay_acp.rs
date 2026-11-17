@@ -69,6 +69,12 @@ enum Browser {
     },
     #[serde(rename = "set_mode")]
     SetMode { mode_id: String },
+    #[serde(rename = "set_config_option")]
+    SetConfigOption {
+        epoch: u64,
+        config_id: String,
+        value: Value,
+    },
     #[serde(rename = "seen")]
     Seen { seq: u64 },
     #[serde(rename = "revive")]
@@ -281,6 +287,17 @@ impl Relay {
                 response,
             },
             Browser::SetMode { mode_id } => HubRequest::AcpSetMode { rid, sid, mode_id },
+            Browser::SetConfigOption {
+                epoch,
+                config_id,
+                value,
+            } => HubRequest::AcpSetConfigOption {
+                rid,
+                sid,
+                epoch,
+                config_id,
+                value,
+            },
             Browser::Seen { seq } => HubRequest::AcpSeen { rid, sid, seq },
             Browser::Revive => HubRequest::AcpRevive { rid, sid },
             Browser::Authenticate { method_id } => HubRequest::AcpAuthenticate {
@@ -541,6 +558,7 @@ mod tests {
                 seen_seq: 0,
                 title: None,
                 mode_id: None,
+                config_options: None,
             }),
         }
     }
