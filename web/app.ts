@@ -414,12 +414,19 @@ type SessTimerFn = typeof sessChanged & { t?: number };
 type SessShownFn = typeof sessShown & { last?: string };
 function sessShown(): void {
   statusRender(); meshRender(); graphMesh();
-  const shown = S ? nodeList().filter(n => n.kind === 'acp').map(n => n.id + ' ' + badgeOf(n) + ' ' + SESS[n.id]?.state).join('\n') : '';
+  const shown = S ? nodeList().filter(n => n.kind === 'acp').map(n => n.id + ' ' + badgeOf(n) + ' ' + SESS[n.id]?.state).join('\n')
+    + '\n' + meshFlat().filter(obsWaits).map(r => r.id + ' ' + r.state + ' ' + r.title).join('\n') : '';   // the Attention list names these too (F-A47)
   if (shown === (sessShown as SessShownFn).last) return;
   (sessShown as SessShownFn).last = shown; renderTree();
   if (VIEW === 'outline') renderOutline(); else if (VIEW === 'ranger') renderRanger();
 }
-function sessPut(x: SessionSummary | undefined, was = x && SESS[x.sid]?.state): void { if (x?.sid && !TOMBS.has(x.sid + ' ' + x.createdAt)) { SESS[x.sid] = x; sessChanged(x.sid); attnSignal(x.sid, was, x.state); } }
+function sessPut(x: SessionSummary | undefined, was = x && SESS[x.sid]?.state): void {
+  if (!x?.sid || TOMBS.has(x.sid + ' ' + x.createdAt)) return;
+  SESS[x.sid] = x; sessChanged(x.sid); attnSignal(x.sid, was, x.state);
+  // Without a card that signal has no name: the harness's own record of the session has one (F-A47).
+  const o = x.kind === 'acp' && ACP_BAD.has(x.state) && !S?.nodes[x.sid] ? Object.values(OBS).find(o => obsSess(o) === x) : undefined;
+  if (o) attnSignal(o.id, was, x.state, meshName(o));
+}
 type RpcEventHandlers = { [K in HubMsg['t']]?: (m: Extract<HubMsg, { t: K }>) => void };
 const RPC_EVENTS: RpcEventHandlers = {
   hub: m => hubStatus(m),
@@ -4090,8 +4097,11 @@ function obsSess(o: ObservedSession): SessionSummary | null { const s = !o.paren
 function obsPut(o: ObservedSession | undefined, was = o && OBS[o.id]?.state): void {
   if (!o?.id) return;
   OBS[o.id] = o; meshChanged();
-  if (!obsCarded(obsSess(o))) attnSignal(o.id, was, o.state, meshName(o));
+  const sess = obsSess(o), card = sess?.kind === 'acp' && S?.nodes[sess.sid]?.kind === 'acp' ? sess.sid : null;
+  if (!obsCarded(sess)) attnSignal(card || o.id, was, o.state, card ? undefined : meshName(o));   // under its card's sid, so the hub saying the same next is not a second signal
 }
+// A session some harness reports that waits for you and that no waiting agent card already stands for.
+function obsWaits(r: MeshRow): boolean { return !!r.obs && meshBad(r) && !obsCarded(r.sess); }
 // An agent card whose own session waits already says so: in the Attention list and in the out-of-page signal.
 function obsCarded(sess: SessionSummary | null): boolean { return !!sess && sess.kind === 'acp' && ACP_BAD.has(sess.state) && S?.nodes[sess.sid]?.kind === 'acp'; }
 // Shown at most every 250 ms, however fast the changes come.
@@ -4196,7 +4206,7 @@ function graphMesh(): void {
   if (VIEW !== 'graph' || !INFO?.mesh || !($('#g-mesh') as HTMLInputElement).checked) return;
   const rows = meshFlat().filter(r => r.live), topo = rows.map(r => [r.id, r.host, r.project, r.card?.id || ''].join(' ')).join('\n'), sig = topo + '\n' + rows.map(r => r.state + ' ' + r.title).join('\n');
   const sel = rows.find(r => 'mesh:' + r.id === G.sel), pre = sel && $('#g-card pre');
-  if (sig !== MESH.graph) { const moved = topo !== MESH.topo; MESH.graph = sig; MESH.topo = topo; graphRebuild(moved); if (G.sel?.startsWith('mesh:')) graphSelect(G.sel); }
+  if (sig !== MESH.graph) { const moved = topo !== MESH.topo; MESH.graph = sig; MESH.topo = topo; graphRebuild(moved); if (G.sel && (moved || G.sel.startsWith('mesh:'))) graphSelect(G.sel); }   // the open card names its neighbours
   else if (sel && pre && pre.textContent !== meshText(sel)) pre.textContent = meshText(sel);   // its text in place: the card's buttons stay under the pointer
 }
 // A session in a few lines, for its card in the graph.
@@ -4530,9 +4540,10 @@ function gHit(sx: number, sy: number) {
   return best;
 }
 function graphSelect(id: string | null) {
-  G.sel = id; const card = $('#g-card')!;
-  if (!id) { card.hidden = true; graphKick(); return; }
-  const g = G.N.get(id)!; card.hidden = false; card.replaceChildren();
+  const card = $('#g-card')!, g = id ? G.N.get(id) : undefined;   // a card's button can outlive the node it names (F-A47)
+  G.sel = g ? id : null;
+  if (!g || !id) { card.hidden = true; graphKick(); return; }
+  card.hidden = false; card.replaceChildren();
   const row = g.kind === 'session' ? meshFlat().find(r => 'mesh:' + r.id === id) : undefined, onMesh = g.kind === 'host' || g.kind === 'project' || g.kind === 'session';
   const head = el('div', 'gc-head'); head.innerHTML = '<b></b><span class="badge"></span><button class="mini gc-x" title="Show everything again (Esc, or click empty space)">✕</button>';
   $('.gc-x', head)!.onclick = () => graphSelect(null);
@@ -10038,7 +10049,7 @@ function attnItems(): RgEntry[] {
   const det = agentsDetached().length; if (det) items.push({ key: 'attn:detached', name: det + ' agent' + (det === 1 ? '' : 's') + ' detached', kind: 'iattn', attn: '', dir: false, meta: 'Enter: revive all', go: reviveAll });   // F-A14
   if (DAEMON && S) for (const s of Object.values(SESS)) if (s.alive && !S.nodes[s.sid] && s.sid !== 'dock' && !String(s.sid).startsWith('ed-'))   // running invisibly otherwise; the dock is never a node; ed-* are edwind's own (R9.22)
     items.push({ key: 'orphan:' + s.sid, name: (s.kind === 'acp' ? agentLabel(s.acp?.agent) : s.pty?.fg?.comm || 'shell') + ' running without a card', kind: 'iattn', attn: 'bad', dir: false, meta: s.cwd || '', go: () => adoptOrphan(s) });
-  for (const r of meshFlat()) if (r.obs && meshBad(r) && !obsCarded(r.sess))   // F-A47: a session some harness reports; an agent card that waits is listed above. In a card, the card is the place
+  for (const r of meshFlat().filter(obsWaits))   // F-A47: a session some harness reports; an agent card that waits is listed above. In a card, the card is the place
     items.push({ key: 'obs:' + r.id, name: meshName(r) + ' ' + meshWants(r.state), kind: 'iattn', attn: 'bad', dir: false, meta: '@' + r.host + ' · ' + meshDoing(r), ...(r.card ? { n: r.card } : { go: () => meshOpen(r.id) }) });
   const due = RV.loaded ? rvQueue().dueNow.length : 0; if (due) items.push({ key: 'attn:review', name: due + ' card' + (due === 1 ? '' : 's') + ' due', kind: 'iattn', dir: false, meta: 'review', go: () => setView('review') });
   for (const t of allTasks()) { if (COL[t.kw] === 'DONE') continue; const due = taskDue(t); if (due && due <= TODAY) items.push({ key: 'attn:' + taskKey(t), name: (due < TODAY ? 'overdue ' : 'due today ') + plainTask(t.text).slice(0, 60), kind: 'iattn', attn: due < TODAY ? 'bad' : '', dir: false, meta: taskAddr(t), go: () => taskOpen(t) }); else if (COL[t.kw] === 'NEXT' && !t.session) items.push({ key: 'attn:' + taskKey(t), name: 'NEXT ' + plainTask(t.text).slice(0, 60), kind: 'iattn', dir: false, meta: taskAddr(t), go: () => taskOpen(t) }); }

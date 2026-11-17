@@ -3724,10 +3724,20 @@ await section('N77', async () => {
       st.graph.hosts.length === 2 && st.graph.hosts.includes('host:farbox') && String(st.graph.projects) === 'proj:alpha,proj:beta' && st.graph.a2 === 'waiting_permission' && !/^(mesh|host|proj):/.test(st.graph.first) && st.graph.tied && st.graph.sub && st.graph.far && st.graph.shared, JSON.stringify(st.graph));
     check('N77: a session and a host open their card in the graph; the toggle takes the mesh out', /needs permission: Bash make docs/.test(st.card) && /pi in beta @farbox/.test(st.card) && /2 live sessions on this host/.test(st.hostCard) && st.off === 0, JSON.stringify({ card: st.card, hostCard: st.hostCard, off: st.off }));
     // the end of a session reaches the page: it leaves the list and the graph, and nothing waits any more
+    await D.evaluate(() => window.__canvas.graphSelect('host:farbox'));
     await report('far', { session_id: 'a2', kind: 'end' });
     const gone = await until(() => D.evaluate((id: string) => { const C = window.__canvas; return !C.G.N.has('mesh:' + id) && !document.querySelector(`#mesh-list .mesh-row[data-id="${id}"]:not(.on)`) && C.statusCounts().meshWaiting === 0 && C.statusCounts().mesh === 3; }, ids.a2), 8000);
     const ended = await D.evaluate((id: string) => { document.querySelector<HTMLInputElement>('#mesh-ended')!.click(); return document.querySelector(`#mesh-list .mesh-row[data-id="${id}"]`)?.className; }, ids.a2);
     check('N77: an ended session leaves the graph and the counts, and lists again under Ended', gone === true && /\bended\b/.test(ended || ''), JSON.stringify({ gone, ended }));
+    // the host's card was open: it names the sessions that are left, and a button for the one that went opens nothing
+    const stale = await D.evaluate((id: string) => { const C = window.__canvas, card = document.querySelector('#g-card')!.textContent; C.graphSelect('mesh:' + id); return { card, sel: C.G.sel, hidden: document.querySelector<HTMLElement>('#g-card')!.hidden }; }, ids.a2);
+    check('N77: the open card of a host follows the sessions that end, and a node that went cannot be selected', /1 live session on this host/.test(stale.card || '') && !/write the docs/.test(stale.card || '') && stale.sel === null && stale.hidden, JSON.stringify(stale));
+    // the Attention list, open in the navigator, takes a session that starts to wait
+    await D.evaluate(() => { const C = window.__canvas; C.setView('ranger'); C.rgGo('attn:'); });
+    await settled(D);
+    await report('far', { session_id: 'a1', kind: 'permission', cwd: '/srv/alpha', text: 'run the tests', tool: { name: 'Bash', input: { command: 'make test' } } });
+    const listed = await D.waitForSelector(`#rg-cur .rg-row[data-key="obs:${ids.a1}"]`, { timeout: 8000 }).then(() => true, () => false);
+    check('N77: an Attention list that is open takes a session that starts to wait', listed, JSON.stringify(await D.evaluate(() => [...document.querySelectorAll<HTMLElement>('#rg-cur .rg-row')].map(r => r.dataset.key))));
     // the host's cap drops the ended record, and observed_gone takes it out of the page
     for (let i = 0; i < 260; i++) await report('far', { session_id: 'f' + i, kind: 'prompt', cwd: '/srv/gamma', text: 'task ' + i });
     const dropped = await until(() => D.evaluate((id: string) => { const C = window.__canvas, far = Object.values<ObservedSession>(C.OBS).filter(o => o.host === 'farbox'); return !C.OBS[id] && far.length === 256 && far.some(o => o.sessionId === 'f259'); }, ids.a2), 15000);
