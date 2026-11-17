@@ -2,13 +2,15 @@
 //!
 //! Unknown keys are refused: a misspelt auth key must stop startup, never be ignored.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::Deserialize;
 
+use crate::api::{Client, Gate, Scope};
 use crate::auth::Floor;
 
 /// Longest unix socket path, `sun_path` included its terminating NUL.
@@ -45,6 +47,30 @@ pub struct Config {
     /// Image providers for the canvas's media cards (F-A41). Absent means none: the
     /// cards that make images say so, and describe and expand still use `sample`.
     pub media: Option<MediaConfig>,
+    /// The mesh API (design §3.8.1). Absent means no listener and no registry of
+    /// observed sessions.
+    pub api: Option<ApiConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiConfig {
+    /// An address on the mesh interface, never a wildcard.
+    pub listen: SocketAddr,
+    /// By name, as refusals are logged.
+    pub clients: BTreeMap<String, ApiClient>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ApiClient {
+    /// 64 lowercase hex characters, read at startup.
+    pub token_file: PathBuf,
+    pub scopes: BTreeSet<Scope>,
+    /// The host this client's events are filed under; required with `events`.
+    pub host: Option<String>,
+    /// The only peer address the token is accepted from.
+    pub address: Option<IpAddr>,
 }
 
 #[derive(Deserialize)]
@@ -86,8 +112,9 @@ fn default_hub_socket() -> PathBuf {
     "/run/workbench-hub/hub.sock".into()
 }
 
-/// Reads and validates the config at `path` and builds the auth floor from it.
-pub fn load(path: &Path) -> Result<(Config, Floor)> {
+/// Reads and validates the config at `path` and builds the auth floor from it, and the
+/// API's gate when `api` is configured.
+pub fn load(path: &Path) -> Result<(Config, Floor, Option<Gate>)> {
     let text = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
     let cfg: Config =
         serde_json::from_slice(&text).with_context(|| format!("config {}", path.display()))?;
@@ -95,11 +122,35 @@ pub fn load(path: &Path) -> Result<(Config, Floor)> {
     let (expected_origin, expected_host) = parse_origin(&cfg.public_origin)?;
     let floor = Floor {
         trusted_proxy: cfg.trusted_proxy.to_canonical(),
-        secret: read_secret(&cfg.proxy_secret_file)?,
+        secret: read_secret(&cfg.proxy_secret_file, "proxy secret")?,
         expected_host,
         expected_origin,
     };
-    Ok((cfg, floor))
+    let gate = cfg.api.as_ref().map(gate).transpose()?;
+    Ok((cfg, floor, gate))
+}
+
+/// Reads every client's token. Two clients with one token are refused: a request
+/// would match both.
+fn gate(api: &ApiConfig) -> Result<Gate> {
+    let mut clients = Vec::new();
+    for (name, c) in &api.clients {
+        let token = read_secret(&c.token_file, &format!("api client {name}: token"))?;
+        ensure!(
+            clients
+                .iter()
+                .all(|other: &Arc<Client>| other.token != token),
+            "api client {name}: its token is also another client's"
+        );
+        clients.push(Arc::new(Client {
+            name: name.clone(),
+            token,
+            scopes: c.scopes.clone(),
+            host: c.host.clone(),
+            address: c.address.map(|a| a.to_canonical()),
+        }));
+    }
+    Ok(Gate { clients })
 }
 
 impl Config {
@@ -168,6 +219,42 @@ impl Config {
                 ensure!(
                     key.is_absolute(),
                     "media provider {name}: keyFile must be an absolute path"
+                );
+            }
+        }
+        if let Some(api) = &self.api {
+            ensure!(
+                !api.listen.ip().is_unspecified(),
+                "api.listen must not be a wildcard address"
+            );
+            ensure!(
+                api.listen != self.listen,
+                "api.listen must differ from listen"
+            );
+            ensure!(!api.clients.is_empty(), "api.clients must name a client");
+            for (name, c) in &api.clients {
+                ensure!(
+                    (1..=32).contains(&name.len())
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                    "api client names must match ^[a-z0-9-]{{1,32}}$"
+                );
+                ensure!(
+                    c.token_file.is_absolute(),
+                    "api client {name}: tokenFile must be an absolute path"
+                );
+                ensure!(
+                    !c.scopes.is_empty(),
+                    "api client {name}: scopes must name a scope"
+                );
+                ensure!(
+                    c.host.is_some() || !c.scopes.contains(&Scope::Events),
+                    "api client {name}: the events scope needs a host"
+                );
+                ensure!(
+                    c.host.as_deref().is_none_or(valid_host),
+                    "api client {name}: host must match [A-Za-z0-9][A-Za-z0-9._-]*"
                 );
             }
         }
@@ -268,18 +355,18 @@ fn parse_origin(origin: &str) -> Result<(String, String)> {
     Ok((format!("{scheme}://{authority}"), authority))
 }
 
-/// The secret is 64 lowercase hex characters; trailing whitespace is ignored. Errors
-/// never include the file's content.
-fn read_secret(path: &Path) -> Result<Box<[u8]>> {
+/// A secret is 64 lowercase hex characters; trailing whitespace is ignored. `what` names
+/// it in errors, which never include the file's content.
+fn read_secret(path: &Path, what: &str) -> Result<Box<[u8]>> {
     let raw = std::fs::read(path)
-        .with_context(|| format!("cannot read proxy secret file {}", path.display()))?;
+        .with_context(|| format!("cannot read {what} file {}", path.display()))?;
     let secret = raw.trim_ascii_end();
     ensure!(
         secret.len() == 64
             && secret
                 .iter()
                 .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
-        "proxy secret file {} malformed",
+        "{what} file {} malformed",
         path.display()
     );
     Ok(secret.into())
@@ -317,7 +404,7 @@ mod tests {
             Fixture { dir, cfg }
         }
 
-        fn load(&self) -> Result<(Config, Floor)> {
+        fn load(&self) -> Result<(Config, Floor, Option<Gate>)> {
             let path = self.dir.path().join("web.json");
             std::fs::write(&path, self.cfg.to_string()).unwrap();
             load(&path)
@@ -331,7 +418,7 @@ mod tests {
 
     #[test]
     fn a_complete_config_loads() {
-        let (cfg, floor) = Fixture::new().load().unwrap();
+        let (cfg, floor, _) = Fixture::new().load().unwrap();
         assert_eq!(cfg.hub_socket, Path::new("/run/workbench-hub/hub.sock"));
         assert!(cfg.edit_socket.is_none());
         assert!(cfg.refuse_paths.is_none());
@@ -344,7 +431,7 @@ mod tests {
     fn an_ipv4_mapped_trusted_proxy_is_canonicalised() {
         let mut f = Fixture::new();
         f.cfg["trustedProxy"] = json!("::ffff:192.0.2.1");
-        let (_, floor) = f.load().unwrap();
+        let (_, floor, _) = f.load().unwrap();
         assert_eq!(floor.trusted_proxy, "192.0.2.1".parse::<IpAddr>().unwrap());
     }
 
@@ -395,7 +482,7 @@ mod tests {
         let mut f = Fixture::new();
         f.cfg["editSocket"] = json!("/run/edwind/edit.sock");
         f.cfg["refusePaths"] = json!(["/home/alice/.ssh", "~/.config/systemd"]);
-        let (cfg, _) = f.load().unwrap();
+        let (cfg, _, _) = f.load().unwrap();
         assert_eq!(
             cfg.edit_socket.as_deref(),
             Some(Path::new("/run/edwind/edit.sock"))
@@ -412,7 +499,7 @@ mod tests {
         let mut f = Fixture::new();
         f.cfg["editSocket"] = Value::Null;
         f.cfg["refusePaths"] = Value::Null;
-        let (cfg, _) = f.load().unwrap();
+        let (cfg, _, _) = f.load().unwrap();
         assert!(cfg.edit_socket.is_none());
         assert!(cfg.refuse_paths.is_none());
     }
@@ -424,7 +511,7 @@ mod tests {
             "openai": {"api": "openai", "baseUrl": "https://api.openai.com/v1", "keyFile": "/run/k", "models": ["gpt-image-1"]},
             "local": {"api": "huggingface", "baseUrl": "http://127.0.0.1:7860", "models": ["flux"]},
         }});
-        let (cfg, _) = f.load().unwrap();
+        let (cfg, _, _) = f.load().unwrap();
         let p = &cfg.media.as_ref().unwrap().providers;
         assert_eq!(p.keys().collect::<Vec<_>>(), ["local", "openai"]);
         assert_eq!(p["openai"].api, MediaApi::Openai);
@@ -569,5 +656,130 @@ mod tests {
         let mut f = Fixture::new();
         f.cfg["hubSocket"] = json!(format!("/{}", "s".repeat(120)));
         assert!(f.load().is_err());
+    }
+    /// A fixture with an `api` of one client, whose token file holds `TOKEN`.
+    fn with_api() -> Fixture {
+        let mut f = Fixture::new();
+        let token = f.dir.path().join("token");
+        std::fs::write(&token, format!("{TOKEN}\n")).unwrap();
+        f.cfg["api"] = json!({
+            "listen": "198.51.100.2:8091",
+            "clients": {
+                "devbox-agents": {
+                    "tokenFile": token,
+                    "scopes": ["events"],
+                    "host": "devbox",
+                    "address": "::ffff:198.51.100.2",
+                },
+            },
+        });
+        f
+    }
+
+    const TOKEN: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
+    #[test]
+    fn an_api_loads_its_clients() {
+        let (cfg, _, gate) = Fixture::new().load().unwrap();
+        assert!(cfg.api.is_none() && gate.is_none());
+
+        let (cfg, _, gate) = with_api().load().unwrap();
+        assert_eq!(
+            cfg.api.unwrap().listen,
+            "198.51.100.2:8091".parse().unwrap()
+        );
+        let clients = gate.unwrap().clients;
+        assert_eq!(clients.len(), 1);
+        let client = &clients[0];
+        assert_eq!(client.name, "devbox-agents");
+        assert_eq!(&*client.token, TOKEN.as_bytes());
+        assert_eq!(client.scopes, [Scope::Events].into());
+        assert_eq!(client.host.as_deref(), Some("devbox"));
+        // An IPv4-mapped address is its IPv4 address, as a peer's is.
+        assert_eq!(client.address, Some("198.51.100.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_bad_api_fails() {
+        // (what, the edit)
+        type Edit = fn(&mut Value);
+        let bad: [(&str, Edit); 14] = [
+            ("a wildcard listen", |api| {
+                api["listen"] = json!("0.0.0.0:8091")
+            }),
+            ("an IPv6 wildcard listen", |api| {
+                api["listen"] = json!("[::]:8091")
+            }),
+            ("the browser's listen", |api| {
+                api["listen"] = json!("127.0.0.1:8090")
+            }),
+            ("no clients", |api| api["clients"] = json!({})),
+            ("an unknown key", |api| api["cors"] = json!("*")),
+            ("an unknown client key", |api| {
+                api["clients"]["devbox-agents"]["token"] = json!("x");
+            }),
+            ("a relative token file", |api| {
+                api["clients"]["devbox-agents"]["tokenFile"] = json!("token");
+            }),
+            ("a missing token file", |api| {
+                api["clients"]["devbox-agents"]["tokenFile"] = json!("/nonexistent/token");
+            }),
+            ("no scopes", |api| {
+                api["clients"]["devbox-agents"]["scopes"] = json!([])
+            }),
+            ("an unknown scope", |api| {
+                api["clients"]["devbox-agents"]["scopes"] = json!(["events", "admin"]);
+            }),
+            ("events without a host", |api| {
+                api["clients"]["devbox-agents"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("host");
+            }),
+            ("a bad host", |api| {
+                api["clients"]["devbox-agents"]["host"] = json!("a/b")
+            }),
+            ("a bad address", |api| {
+                api["clients"]["devbox-agents"]["address"] = json!("devbox");
+            }),
+            ("a bad client name", |api| {
+                let client = api["clients"]["devbox-agents"].clone();
+                api["clients"] = json!({"Devbox": client});
+            }),
+        ];
+        for (what, edit) in bad {
+            let mut f = with_api();
+            edit(&mut f.cfg["api"]);
+            assert!(f.load().is_err(), "{what}");
+        }
+        for name in ["", "a_b", &"a".repeat(33)] {
+            let mut f = with_api();
+            let client = f.cfg["api"]["clients"]["devbox-agents"].clone();
+            f.cfg["api"]["clients"] = json!({name: client});
+            assert!(f.load().is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn api_tokens_are_checked_and_never_echoed() {
+        // Two clients with one token.
+        let mut f = with_api();
+        let mut second = f.cfg["api"]["clients"]["devbox-agents"].clone();
+        second["scopes"] = json!(["read"]);
+        f.cfg["api"]["clients"]["owner"] = second;
+        let err = format!("{:#}", f.load().err().unwrap());
+        assert!(err.contains("also another client's"), "{err}");
+        assert!(!err.contains(TOKEN), "{err}");
+
+        // A malformed token file.
+        let f = with_api();
+        let bad = "FFEEDDCCBBAA99887766554433221100FFEEDDCCBBAA99887766554433221100";
+        std::fs::write(f.dir.path().join("token"), bad).unwrap();
+        let err = format!("{:#}", f.load().err().unwrap());
+        assert!(
+            err.contains("api client devbox-agents: token file"),
+            "{err}"
+        );
+        assert!(err.contains("malformed") && !err.contains(bad), "{err}");
     }
 }

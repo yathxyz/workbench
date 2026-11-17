@@ -9,6 +9,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Longest sid, in bytes.
 const SID_MAX: usize = 64;
 
+/// The wall clock in ms since the epoch.
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// `^[A-Za-z0-9_-]{1,64}$`, the hub's rule for a sid.
+pub fn valid_sid(sid: &str) -> bool {
+    (1..=64).contains(&sid.len())
+        && sid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// Keeps only the `[A-Za-z0-9_-]` characters of `s`, cut to 64 bytes. An empty result
 /// means the id is unusable.
 pub fn sanitize_sid(s: &str) -> String {

@@ -91,7 +91,7 @@ async fn info(State(app): State<AppState>) -> Json<Value> {
 }
 
 /// 503 unless the hub is up.
-fn hub_up(app: &AppState) -> Result<(), ApiError> {
+pub fn hub_up(app: &AppState) -> Result<(), ApiError> {
     match *app.hub.status.borrow() {
         HubStatus::Up(_) => Ok(()),
         HubStatus::Down => Err(ApiError::new(

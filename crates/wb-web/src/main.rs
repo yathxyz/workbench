@@ -3,6 +3,7 @@
 //! runs the `wb` CLI's board tools in the leader page.
 #![forbid(unsafe_code)]
 
+mod api;
 mod artifacts;
 mod auth;
 mod blobs;
@@ -16,7 +17,6 @@ mod hub;
 mod info;
 mod media;
 mod notes;
-#[allow(dead_code)]
 mod observed;
 mod relay_acp;
 mod relay_edit;
@@ -157,11 +157,20 @@ async fn main() -> ExitCode {
 
 /// Nothing listens until every startup step has passed.
 async fn run(config: &Path) -> Result<()> {
-    let (cfg, floor) = config::load(config)?;
+    let (cfg, floor, gate) = config::load(config)?;
     let assets = Assets::load(&cfg.web_root, cfg.edwin_web_root.as_deref())?;
     let listener = TcpListener::bind(cfg.listen)
         .await
         .with_context(|| format!("cannot listen on {}", cfg.listen))?;
+    let api_listener = match &cfg.api {
+        Some(api) => {
+            let listener = TcpListener::bind(api.listen)
+                .await
+                .with_context(|| format!("cannot listen on {} for the api", api.listen))?;
+            Some(listener)
+        }
+        None => None,
+    };
     let web_sock = websock::bind(&cfg.socket)?;
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
@@ -193,6 +202,11 @@ async fn run(config: &Path) -> Result<()> {
         let _ = stop.send(true);
     });
     tracing::info!("listening on {}", listener.local_addr()?);
+    // `gate` and `api_listener` are both present or both absent: each is `cfg.api`.
+    let api = match gate.zip(api_listener) {
+        Some((gate, listener)) => Some(api::start(app.clone(), gate, listener)?),
+        None => None,
+    };
     let wb = tokio::spawn(websock::serve(app.clone(), web_sock));
     let service = routes::app(app.clone()).into_make_service_with_connect_info::<SocketAddr>();
     let graceful = app.clone();
@@ -202,6 +216,9 @@ async fn run(config: &Path) -> Result<()> {
     let served = async {
         server.into_future().await?;
         let _ = sockets.wait_for(|n| *n == 0).await;
+        if let Some(api) = api {
+            let _ = api.await;
+        }
         Ok::<_, std::io::Error>(())
     };
     let outcome = tokio::select! {

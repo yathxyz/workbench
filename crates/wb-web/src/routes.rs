@@ -50,6 +50,6 @@ async fn api_no_store(res: Response) -> Response {
     no_store(res)
 }
 
-async fn method_not_allowed() -> ApiError {
+pub async fn method_not_allowed() -> ApiError {
     ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
 }

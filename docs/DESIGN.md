@@ -903,6 +903,7 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
 - `edwinWebRoot` (optional; Nix writes `services.workbench.edit.webRoot`) is edwin-web, loaded like `webRoot` and served under `/edwin/`: the console page, the frame runtime and its Scheme. It is the edwin-web of the Edwin whose edwind is on `editSocket`, so frames and daemon come from one build; `workbench-web` carries no Edwin of its own.
 - There is no `frames` key (gone with F-A39, edwind spec R9.21), and an old `web.json` that has one is refused as an unknown key: `/api/info` reports `edit: true` whenever `editSocket` is set, and `/edit` relays whenever it is set.
 - `media` (optional; Nix writes `services.workbench.media.providers`, the key files as `LoadCredential`) names the image providers of media cards (F-A41). Each provider has `api` (`openai`: the OpenAI image API, `/images/generations` and `/images/edits`, which xAI, LocalAI and other compatible servers speak; `huggingface`: Inference API, `POST /models/<model>`), `baseUrl` (https, or http to a loopback address), optional absolute `keyFile` and a non-empty `models` list; names match `[A-Za-z0-9_-]+`. Keys never leave the server; `/api/info` lists names, protocols and models only.
+- `api` (optional; Nix writes `services.workbench.api`, the token files as `LoadCredential`) is the mesh API's listener and clients: §3.8.1. A wb-web that predates it refuses the key as unknown, so a host gets the new binary before the new config.
 - `refusePaths` is the destination list `POST /api/mv` refuses, written by Nix from the list edwind refuses too (edwind spec R14.8); absent means the built-in three.
 - There is no `sample` key: the model backend and its key file are edwind's (`services.edwind.models`, edwind spec R15.6). A config that still carries `sample` fails to load, as any unknown key does.
 - Subprocesses the web runs (`systemctl show`) get `env_clear()` plus `PATH`, `HOME` and `LANG`.
@@ -959,6 +960,7 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
   - an agent name does not match `^[a-z0-9-]{1,32}$`, or an agent's `argv[0]` is not absolute.
 
   The hub also refuses to start without `HOME`, `USER` and `LOGNAME` in its environment.
+- **`hosts`** (optional; Nix writes `services.workbench.hosts`) names the other hosts the hub starts agents on: §3.8.5. Absent, `hub.json` is byte for byte what it was, so adding the option restarts no hub.
 - **Test configs:** take the shell path from `$BASH`, because the sandbox has no `/run/current-system`. The harness also configures `sh` as a second shell (§7, N-6).
 
 #### 3.7.3 Child environment (built from scratch)
@@ -994,7 +996,9 @@ Nothing else is inherited: no `NOTIFY_SOCKET`, `INVOCATION_ID`, `JOURNAL_STREAM`
 - The hub's capability is offered as an HTTP API on the mesh, so that other interfaces (an orchestrating agent, an editor, a script) can be built on it. Which client may do what is a matter of its token.
 - The hub can start agents on the other hosts of the mesh.
 
-Three parts follow from that, and each stands alone: the API listener (§3.8.1, §3.8.2), the registry of observed sessions that the reports feed (§3.8.3, §3.8.4), and remote hosts in the hub (§3.8.5). The canvas does not show observed sessions yet; the API does.
+Three parts follow from that, and each stands alone: the API listener (§3.8.1, §3.8.2), the registry of observed sessions that the reports feed (§3.8.3, §3.8.4), and remote hosts in the hub (§3.8.5).
+
+**Not yet, in the canvas.** It does not show observed sessions; the API does. It also knows nothing of remote hosts: it starts agents on the hub's host only, and a card adopted for a session on another host shows and steers that session, but "Start new session" and a branch from it send `agent` and `cwd` without a host, so they start a local agent, or fail when that agent or directory is not on the hub's host. Until the canvas carries the host, sessions on other hosts are started, and started again, through the API.
 
 #### 3.8.1 The API listener (wb-web)
 
@@ -1039,8 +1043,8 @@ A sid in a path that does not match `^[A-Za-z0-9_-]{1,64}$` is 400 "bad id". Req
 | `GET /v1/info` | read | `{host, version, hub:{status, version, build, proto, startedAt, stale}, agents:[{name,label}], hosts:[{name, agents:[{name,label}]}]}`. `hub` as in `/api/info`; `agents` and `hosts` are `[]` while the hub is not up. |
 | `GET /v1/sessions` | read | `{host, sessions:[Summary+state]}`, the hub's sessions as in `/api/sessions`; 503 when the hub is down or incompatible. |
 | `GET /v1/sessions/{sid}` | read | One `Summary+state`; 404 for a sid the hub does not know. |
-| `GET /v1/sessions/{sid}/events?since=N` | read | An ACP session's journal after seq `N` (default 0): `{sid, epoch, head, from, reset, truncated, events:[JournalEvent]}`. It is `acp.open` without `spawn`, read up to `acp.replayed`, then the connection is closed; nothing runs. `since` that is not an integer is 400 "bad query". |
-| `GET /v1/sessions/{sid}/capture?lines=N` | read | A PTY session's text, `{sid, text}`, with the rules of `GET /api/pty/{id}/capture`. |
+| `GET /v1/sessions/{sid}/events?since=N` | read | An ACP session's journal after seq `N` (default 0): `{sid, epoch, head, from, reset, truncated, events:[JournalEvent]}`. It is `acp.open` without `spawn`, read up to `acp.replayed`, then the connection is closed; nothing runs. An event of a kind this version does not know is left out, as `/acp` leaves it out. `since` that is not an integer is 400 "bad query". |
+| `GET /v1/sessions/{sid}/capture?lines=N` | read | A PTY session's text, `{sid, text}`: the last `N` lines (default 200, clamped to 1..=`CAPTURE_MAX`). A sid that is not a PTY is the hub's error under the status map of §3.8.1. |
 | `GET /v1/observed` | read | `{sessions:[ObservedSession]}` (§3.8.3), live first, then by `lastAt`, newest first. |
 | `GET /v1/observed/{id}` | read | One `ObservedSession` by its `id`; 404. |
 | `GET /v1/stream` | read | Server-sent events (§3.8.4). |
@@ -1054,7 +1058,7 @@ A sid in a path that does not match `^[A-Za-z0-9_-]{1,64}$` is 400 "bad id". Req
 | `DELETE /v1/sessions/{sid}?forget=true\|false` | control | `acp.kill` or `pty.kill` by the session's kind, `forget` defaulting to `false`. 200 `{}`; 404 for a sid the hub does not know. |
 | `POST /v1/events` | events | One session event (§3.8.3). 204. |
 
-A body that is not the JSON the endpoint takes is 400. The API starts no PTY and sends no PTY input: a shell on the mesh is what ssh is for.
+A body that is not the JSON the endpoint takes, an unknown key included, is 400 "bad body". A sid the control connection has not heard of is 404 "no session S" for `GET /v1/sessions/{sid}` and `DELETE`; the other endpoints ask the hub, and answer with its error. The API starts no PTY and sends no PTY input: a shell on the mesh is what ssh is for.
 
 **Who answers permission requests.** `control` includes `permission` and `elicitation`: a client that holds it can approve what an agent asks. Whether an orchestrating client does so, or leaves those to the owner, is that client's configuration. The owner sees every pending request in Workbench either way.
 
@@ -1082,7 +1086,7 @@ An observed session is what the harnesses report about one agent session: a reco
 - `payload` is an object with a `session_id` matching `^[A-Za-z0-9._:-]{1,128}$`:
   - for `claude` and `codex`, the JSON their hook wrote to its stdin, unchanged;
   - for any other harness, a **neutral event**: `{session_id, kind, cwd?, transcript_path?, model?, permission_mode?, agent_id?, agent_type?, text?, tool?: {name, input?}, reason?}`, with `kind` an `ObsKind`. `text` is the prompt of a `prompt`, the last assistant message of a `turn_end`, and the message of a `permission`, `question` or `note`. That is the whole contract a new harness has to meet: an extension that posts neutral events.
-- **Refused with 400**, the registry unchanged: a body that is not such an object, a bad `harness` or `session_id`, an unknown `kind` in a neutral event.
+- **Refused with 400**, the registry unchanged: a body that is not such an object, a bad `harness`, `session_id` or `agent_id`, an unknown `kind` in a neutral event.
 - The host is the client's `host` (§3.8.1).
 
 ```ts
@@ -1121,9 +1125,9 @@ Texts are excerpts: cut to `OBS_TEXT_MAX` (a tail line to 240 bytes) at a charac
 | `tool_start` | `PreToolUse` | `PreToolUse` | `tool`; in a turn |
 | `tool_end` / `tool_fail` | `PostToolUse` / `PostToolUseFailure` | `PostToolUse` | `tool` cleared; counts |
 | `permission` | `PermissionRequest`; `Notification` of type `permission_prompt` when nothing is pending | `PermissionRequest` | `pending` |
-| `permission_done` | – | – | `pending` cleared |
-| `question` | `Notification` of type `elicitation_dialog` | – | `pending{question}` |
-| `turn_end` | `Stop` | `Stop` | the turn is over; `lastMessage` |
+| `permission_done` | `PermissionDenied` | – | `pending` cleared |
+| `question` | `Notification` of type `elicitation_dialog` or `elicitation_url_dialog` | – | `pending{question}` |
+| `turn_end` | `Stop`; `StopFailure` (the tail line names the error) | `Stop` | the turn is over; `lastMessage` |
 | `subagent_start` / `subagent_end` | `SubagentStart` / `SubagentStop` | `SubagentStart` / `SubagentStop` | the subagent's record |
 | `note` | `PreCompact`, other `Notification`s, any other name | `PreCompact`, `PostCompact`, any other name | the tail only |
 | `end` | `SessionEnd` | – | ended `session_end` |
@@ -1159,14 +1163,14 @@ Server-sent events, each `event: <name>` with one line of JSON as `data`:
 
 | Event | Data | When |
 |---|---|---|
-| `hub` | `{status}` | first, and on every change |
-| `session` | `Summary+state` | one per session after the first `hub`, then on every change |
+| `hub` | `{status}` | first, and on every change. A client drops the hub sessions it holds when one arrives |
+| `session` | `Summary+state` | one per session after every `hub` whose status is `up`, then on every change |
 | `gone` | `{sid, epoch}` | the hub forgot a session |
 | `observed` | `ObservedSession` | one per record after the sessions, then on every change, at most one per record per `OBS_PUSH_EVERY` |
 | `observed_gone` | `{id, key}` | a record was dropped |
 | `ready` | `{}` | once, after the snapshot |
 
-A comment line goes out every 15 s. A client that falls so far behind that events were lost is disconnected and takes a new snapshot when it reconnects. The stream ends when wb-web shuts down.
+A comment line goes out every 15 s. A client that falls so far behind that events were lost is disconnected and takes a new snapshot when it reconnects. A change that lands between the subscription and the snapshot may be sent twice; both carry the same state. The stream ends when wb-web shuts down.
 
 #### 3.8.5 Remote hosts (hub)
 
@@ -1257,7 +1261,7 @@ A comment line goes out every 15 s. A client that falls so far behind that event
 
 ## 5. Web front (`crates/wb-web`, `crates/wb-cli`)
 
-**Module tree.** `main`, `config`, `auth`, `static_files`, `http`, `util`, `routes`, `hub`, `info`, `relay_pty`, `relay_acp`, `rpc`, `board`, `fsapi`, `host`, `artifacts`, `sample`, and `notes/`.
+**Module tree.** `main`, `config`, `auth`, `static_files`, `http`, `util`, `routes`, `hub`, `info`, `relay_pty`, `relay_acp`, `rpc`, `board`, `fsapi`, `host`, `artifacts`, `sample`, `notes/`, and for the mesh (§3.8) `api/` (the gate, `sessions`, `observed`, `stream`) and `observed/` (the registry).
 - `routes.rs` is the one place that merges each module's `pub fn routes() -> Router<AppState>`;
 - `info.rs` holds `/api/info`, `/api/sessions`, `/api/status` and capture;
 - there is no tmux module.

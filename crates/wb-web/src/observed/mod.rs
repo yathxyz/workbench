@@ -163,6 +163,7 @@ fn de_state<'de, D: Deserializer<'de>>(d: D) -> Result<State, D::Error> {
 }
 
 /// What changed since the last `drain`.
+#[derive(Clone)]
 pub enum Change {
     Upsert(Box<ObservedSession>),
     Gone { id: String, key: String },

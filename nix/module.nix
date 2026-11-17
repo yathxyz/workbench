@@ -137,7 +137,23 @@ let
         }
       ) cfg.media.providers;
     }
+    # The mesh API (design §3.8.1): web.json names only each token's credential path.
+    // lib.optionalAttrs (cfg.api.clients != { }) {
+      api = {
+        listen = "${cfg.api.listenAddress}:${toString cfg.api.port}";
+        clients = lib.mapAttrs (
+          name: c:
+          {
+            tokenFile = "/run/credentials/workbench-web.service/api-${name}";
+            inherit (c) scopes;
+          }
+          // lib.optionalAttrs (c.host != null) { inherit (c) host; }
+          // lib.optionalAttrs (c.address != null) { inherit (c) address; }
+        ) cfg.api.clients;
+      };
+    }
   );
+  apiCredentials = lib.mapAttrsToList (name: c: "api-${name}:${c.tokenFile}") cfg.api.clients;
   mediaCredentials = lib.mapAttrsToList (name: p: "media-${name}:${p.apiKeyFile}") (
     lib.filterAttrs (_: p: p.apiKeyFile != null) cfg.media.providers
   );
@@ -424,6 +440,69 @@ in
       description = "RUST_LOG for both units. Never passed to children.";
     };
 
+    # The mesh API (design §3.8): a second listener of wb-web, for the hosts that report their agent
+    # sessions and for the clients that read and steer the hub. It exists when a client is defined.
+    api = {
+      listenAddress = mkOption {
+        type = types.str;
+        default = cfg.listenAddress;
+        defaultText = lib.literalExpression "config.services.workbench.listenAddress";
+        example = "192.0.2.2";
+        description = "IPv4 literal the API listens on: the host's address on the mesh interface. Never a wildcard. The API is plain HTTP and relies on the mesh for encryption.";
+      };
+      port = mkOption {
+        type = types.port;
+        default = 8091;
+        description = "TCP port the API listens on.";
+      };
+      openFirewall = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Accept the API port on firewall.interface, from any address. A request still needs a client's token.";
+      };
+      clients = mkOption {
+        default = { };
+        description = "The API's clients, by name. A token file is loaded with LoadCredential as api-NAME. No client means no API.";
+        example = lib.literalExpression ''
+          {
+            devbox-agents = { tokenFile = "/run/secrets/workbench-api-devbox"; scopes = [ "events" ]; host = "devbox"; address = "192.0.2.2"; };
+            owner = { tokenFile = "/run/secrets/workbench-api-owner"; scopes = [ "read" "control" ]; };
+          }
+        '';
+        type = types.attrsOf (
+          types.submodule {
+            options = {
+              tokenFile = mkOption {
+                type = types.str;
+                description = "Root-readable file holding the client's token: 64 lowercase hex characters.";
+              };
+              scopes = mkOption {
+                type = types.nonEmptyListOf (
+                  types.enum [
+                    "events"
+                    "read"
+                    "control"
+                  ]
+                );
+                description = "events: send session events. read: every GET. control: start, prompt, answer and end sessions, permission requests included.";
+              };
+              host = mkOption {
+                type = types.nullOr types.str;
+                default = null;
+                description = "The host name this client's events are filed under. Required with the events scope.";
+              };
+              address = mkOption {
+                type = types.nullOr types.str;
+                default = null;
+                example = "192.0.2.7";
+                description = "The only peer address the token is accepted from; null accepts it from any.";
+              };
+            };
+          }
+        );
+      };
+    };
+
     # Image providers for the canvas's media cards (F-A41): wb-web calls them, so their keys stay on the server.
     media.providers = mkOption {
       default = { };
@@ -549,6 +628,30 @@ in
       {
         assertion = lib.all (p: isLoopbackHttp p.baseUrl) (lib.attrValues cfg.media.providers);
         message = "services.workbench.media.providers.*.baseUrl must be https, or http to loopback.";
+      }
+      {
+        assertion = lib.all isName (lib.attrNames cfg.api.clients);
+        message = "services.workbench.api.clients: names must match ^[a-z0-9-]{1,32}$.";
+      }
+      {
+        assertion =
+          cfg.api.clients == { } || (isIPv4 cfg.api.listenAddress && cfg.api.listenAddress != "0.0.0.0");
+        message = "services.workbench.api.listenAddress must be a non-wildcard IPv4 literal.";
+      }
+      {
+        assertion =
+          cfg.api.clients == { } || cfg.api.listenAddress != cfg.listenAddress || cfg.api.port != cfg.port;
+        message = "services.workbench.api must not listen where the browser's listener does.";
+      }
+      {
+        assertion = lib.all (c: c.host != null || !lib.elem "events" c.scopes) (
+          lib.attrValues cfg.api.clients
+        );
+        message = "services.workbench.api.clients.*: the events scope needs a host.";
+      }
+      {
+        assertion = !cfg.api.openFirewall || (cfg.firewall.enable && cfg.firewall.interface != null);
+        message = "services.workbench.api.openFirewall needs firewall.enable and firewall.interface.";
       }
       {
         assertion = lib.all isName (lib.attrNames cfg.media.providers);
@@ -705,7 +808,7 @@ in
         UMask = "0077";
         RuntimeDirectory = "workbench-web";
         RuntimeDirectoryMode = "0700";
-        LoadCredential = [ "proxy-secret:${cfg.proxySecretFile}" ] ++ mediaCredentials;
+        LoadCredential = [ "proxy-secret:${cfg.proxySecretFile}" ] ++ mediaCredentials ++ apiCredentials;
         Restart = "always";
         RestartSec = 2;
         OOMScoreAdjust = 100;
@@ -743,8 +846,13 @@ in
       };
     };
 
-    networking.firewall.extraCommands = mkIf cfg.firewall.enable ''
-      iptables -A nixos-fw -i ${lib.escapeShellArg cfg.firewall.interface} -s ${lib.escapeShellArg cfg.trustedProxy} -d ${lib.escapeShellArg cfg.listenAddress} -p tcp --dport ${toString cfg.port} -j nixos-fw-accept
-    '';
+    networking.firewall.extraCommands = mkIf cfg.firewall.enable (
+      ''
+        iptables -A nixos-fw -i ${lib.escapeShellArg cfg.firewall.interface} -s ${lib.escapeShellArg cfg.trustedProxy} -d ${lib.escapeShellArg cfg.listenAddress} -p tcp --dport ${toString cfg.port} -j nixos-fw-accept
+      ''
+      + lib.optionalString (cfg.api.openFirewall && cfg.api.clients != { }) ''
+        iptables -A nixos-fw -i ${lib.escapeShellArg cfg.firewall.interface} -d ${lib.escapeShellArg cfg.api.listenAddress} -p tcp --dport ${toString cfg.api.port} -j nixos-fw-accept
+      ''
+    );
   };
 }

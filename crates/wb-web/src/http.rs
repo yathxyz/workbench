@@ -16,14 +16,17 @@ use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::time::{Instant, Interval, MissedTickBehavior, Sleep, interval_at, sleep, timeout};
+use wb_proto::hub::ErrorCode;
 use wb_proto::limits::{WS_DEAD, WS_PING};
 
 use crate::AppState;
 
-/// `{"error": message}` with `Cache-Control: no-store`.
+/// `{"error": message}` with `Cache-Control: no-store`; an error the hub gave also
+/// carries its `code` (design §3.8.1).
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    code: Option<ErrorCode>,
 }
 
 impl ApiError {
@@ -31,13 +34,24 @@ impl ApiError {
         ApiError {
             status,
             message: message.into(),
+            code: None,
         }
+    }
+
+    /// Adds the hub's error code as `code`.
+    pub fn code(mut self, code: ErrorCode) -> Self {
+        self.code = Some(code);
+        self
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        no_store((self.status, Json(json!({ "error": self.message }))).into_response())
+        let mut body = json!({ "error": self.message });
+        if let Some(code) = self.code {
+            body["code"] = json!(code);
+        }
+        no_store((self.status, Json(body)).into_response())
     }
 }
 

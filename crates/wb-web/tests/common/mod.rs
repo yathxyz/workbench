@@ -23,8 +23,8 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{WebSocketStream, client_async};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use wb_proto::hub::{
-    Agent, CaptureReply, ErrorCode, Exit, ExitReason, Fg, HubMessage, HubRequest, Kind, PROTO,
-    PtyFacts, PtyOpenReply, SessionsReply, Summary,
+    Agent, CaptureReply, ErrorCode, Exit, ExitReason, Fg, Host, HubMessage, HubRequest, Kind,
+    PROTO, PtyFacts, PtyOpenReply, SessionsReply, Summary,
 };
 use wb_proto::limits::MAX_LINE;
 use wb_proto::line;
@@ -246,6 +246,14 @@ impl Web {
         }
     }
 
+    /// The address of the API listener (design §3.8.1), once it is logged.
+    pub async fn api_addr(&self) -> SocketAddr {
+        let log = self.wait_log("api listening on ", 1).await;
+        let line = log.lines().find(|l| l.contains("api listening on "));
+        let addr = line.unwrap().split("api listening on ").nth(1).unwrap();
+        addr.trim().parse().unwrap()
+    }
+
     /// Opens a WebSocket with the headers Caddy and a browser would send.
     pub async fn ws(&self, path: &str) -> Ws {
         self.ws_with(path, &[]).await.unwrap()
@@ -304,6 +312,18 @@ pub struct Req {
 }
 
 impl Req {
+    /// A request to `addr` with a `Host` header and nothing else.
+    pub fn to(addr: SocketAddr, method: &str, path: &str) -> Req {
+        Req {
+            addr,
+            method: method.to_owned(),
+            path: path.to_owned(),
+            headers: vec![("Host".to_owned(), addr.to_string())],
+            body: Vec::new(),
+            source: None,
+        }
+    }
+
     /// Replaces every header named `name`.
     pub fn set(self, name: &str, value: &str) -> Req {
         self.without(name).add(name, value)
@@ -488,6 +508,7 @@ pub struct Hello {
     pub agents: Vec<Agent>,
     pub shells: Vec<String>,
     pub default_shell: String,
+    pub hosts: Vec<Host>,
 }
 
 impl Default for Hello {
@@ -499,6 +520,7 @@ impl Default for Hello {
             agents: Vec::new(),
             shells: vec![DEFAULT_SHELL.into(), "zsh".into()],
             default_shell: DEFAULT_SHELL.into(),
+            hosts: Vec::new(),
         }
     }
 }
@@ -714,7 +736,7 @@ async fn serve(
         agents: hello.agents,
         shells: hello.shells,
         default_shell: hello.default_shell,
-        hosts: Vec::new(),
+        hosts: hello.hosts,
     };
     if tx.write_all(&line::encode(&hello)).await.is_err() {
         return;

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{sleep, timeout};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use wb_proto::hub::{
-    Agent, CaptureReply, ErrorCode, HubMessage, HubRequest, PROTO, SessionsReply, Summary,
+    Agent, CaptureReply, ErrorCode, Host, HubMessage, HubRequest, PROTO, SessionsReply, Summary,
 };
 use wb_proto::limits::{HELLO_TIMEOUT, MAX_LINE};
 use wb_proto::line;
@@ -68,7 +68,11 @@ pub struct HubInfo {
     pub build: Option<String>,
     pub proto: u32,
     pub started_at: u64,
+    /// The hub's own host.
+    pub host: String,
     pub agents: Vec<Agent>,
+    /// The other hosts the hub starts agents on (§3.8.5); empty from an older hub.
+    pub hosts: Vec<Host>,
     /// The shells a spawn may name; DELTA-1 §B.
     pub shells: Vec<String>,
     /// Empty from a hub that predates shell choice.
@@ -140,10 +144,12 @@ impl HubConn {
             proto,
             version,
             build,
+            host,
             started_at,
             agents,
             shells,
             default_shell,
+            hosts,
             ..
         }) = hello
         else {
@@ -165,7 +171,9 @@ impl HubConn {
             build,
             proto,
             started_at,
+            host,
             agents,
+            hosts,
             shells,
             default_shell,
         };
@@ -179,6 +187,30 @@ impl HubConn {
     /// Sends a line already encoded with [`line::encode`].
     pub async fn send_line(&mut self, line: &[u8]) -> std::io::Result<()> {
         self.tx.write_all(line).await
+    }
+
+    /// Sends `req`, whose rid is `rid`, and waits for its reply: the `ok` fields, or
+    /// why there are none. Other messages that arrive first are dropped; the caller
+    /// bounds the wait.
+    pub async fn request(
+        &mut self,
+        req: &HubRequest,
+        rid: u64,
+    ) -> Result<Map<String, Value>, CallError> {
+        self.send(req).await.map_err(|_| CallError::Unavailable)?;
+        loop {
+            match self.recv().await {
+                Some(HubMessage::Ok { rid: r, result }) if r == rid => return Ok(result),
+                Some(HubMessage::Err {
+                    rid: Some(r),
+                    code,
+                    message,
+                    ..
+                }) if r == rid => return Err(CallError::Refused(code, message)),
+                Some(_) => {}
+                None => return Err(CallError::Unavailable),
+            }
+        }
     }
 
     /// The next message, or `None` once the connection has ended. Lines that do not

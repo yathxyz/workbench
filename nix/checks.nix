@@ -253,6 +253,9 @@ in
         editWebRoot = [ "services.workbench.edit.webRoot is required" ];
         hostName = [ "services.workbench.hosts: names" ];
         hostArgv = [ "services.workbench.hosts.<name>" ];
+        api = [ ];
+        apiEventsHost = [ "services.workbench.api.clients.*: the events scope" ];
+        apiListen = [ "services.workbench.api must not listen" ];
       };
       got = lib.mapAttrs (_: failing) {
         valid = { };
@@ -272,6 +275,33 @@ in
         hostArgv.services.workbench.hosts.laptop = {
           argv = [ "ssh" ];
           agents.claude.label = "Claude";
+        };
+        api.services.workbench.api = {
+          openFirewall = true;
+          clients.owner = {
+            tokenFile = "/run/secrets/workbench-api-owner";
+            scopes = [
+              "read"
+              "control"
+            ];
+          };
+          clients.laptop-agents = {
+            tokenFile = "/run/secrets/workbench-api-laptop";
+            scopes = [ "events" ];
+            host = "laptop";
+            address = "192.0.2.7";
+          };
+        };
+        apiEventsHost.services.workbench.api.clients.laptop-agents = {
+          tokenFile = "/run/secrets/workbench-api-laptop";
+          scopes = [ "events" ];
+        };
+        apiListen.services.workbench = {
+          port = 8091;
+          api.clients.owner = {
+            tokenFile = "/run/secrets/workbench-api-owner";
+            scopes = [ "read" ];
+          };
         };
       };
       matches = lib.mapAttrs (

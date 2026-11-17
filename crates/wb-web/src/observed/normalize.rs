@@ -200,7 +200,7 @@ fn native(p: &Map<String, Value>, ev: &mut Event) {
                     ev.prompt_notice = true;
                     ev.tail = ev.text.clone().unwrap_or_default();
                 }
-                Some("elicitationdialog") => {
+                Some("elicitationdialog" | "elicitationurldialog") => {
                     ev.kind = ObsKind::Question;
                     ev.tail = ev.text.clone().unwrap_or_default();
                 }
@@ -209,10 +209,21 @@ fn native(p: &Map<String, Value>, ev: &mut Event) {
                 }
             }
         }
+        "permissiondenied" => {
+            ev.kind = ObsKind::PermissionDone;
+            let name = tool().map(|t| t.name);
+            ev.tail = join(name.as_deref(), text(p, "reason").as_deref());
+        }
         "stop" => {
             ev.kind = ObsKind::TurnEnd;
             ev.text = text(p, "last_assistant_message");
             ev.tail = ev.text.clone().unwrap_or_default();
+        }
+        // The turn ended in an API error: over all the same, and the tail says why.
+        "stopfailure" => {
+            ev.kind = ObsKind::TurnEnd;
+            ev.text = text(p, "last_assistant_message");
+            ev.tail = join(name, text(p, "error").as_deref());
         }
         "subagentstart" => {
             ev.kind = ObsKind::SubagentStart;
@@ -462,6 +473,63 @@ mod tests {
                         None,
                         "Notification: Claude is waiting for your input",
                     ),
+                ),
+                // `elicitation_url_dialog` is sent where `elicitation_dialog` is, for an
+                // elicitation that opens a URL.
+                (
+                    "Notification elicitation_url_dialog",
+                    base(
+                        json!({"hook_event_name": "Notification", "message": "Claude Code needs your input", "notification_type": "elicitation_url_dialog"}),
+                    ),
+                    (
+                        Question,
+                        false,
+                        Some("Claude Code needs your input"),
+                        None,
+                        None,
+                        "Claude Code needs your input",
+                    ),
+                ),
+                // `agent_needs_input` and `worker_permission_prompt` speak of another
+                // session, which reports for itself: notes here.
+                (
+                    "Notification agent_needs_input",
+                    base(
+                        json!({"hook_event_name": "Notification", "message": "reviewer needs your input", "notification_type": "agent_needs_input"}),
+                    ),
+                    (
+                        Note,
+                        false,
+                        Some("reviewer needs your input"),
+                        None,
+                        None,
+                        "Notification: reviewer needs your input",
+                    ),
+                ),
+                // Schema `PermissionDenied`: `tool_name`, `tool_input`, `tool_use_id`,
+                // `reason`.
+                (
+                    "PermissionDenied",
+                    base(
+                        json!({"hook_event_name": "PermissionDenied", "tool_name": "Bash", "tool_input": {"command": "rm -rf build"}, "tool_use_id": "toolu_01", "reason": "outside the working directory"}),
+                    ),
+                    (
+                        PermissionDone,
+                        false,
+                        None,
+                        None,
+                        None,
+                        "Bash: outside the working directory",
+                    ),
+                ),
+                // Schema `StopFailure`: `error`, optional `error_details` and
+                // `last_assistant_message`.
+                (
+                    "StopFailure",
+                    base(
+                        json!({"hook_event_name": "StopFailure", "error": "rate_limit", "error_details": "429"}),
+                    ),
+                    (TurnEnd, false, None, None, None, "StopFailure: rate_limit"),
                 ),
                 // Schema `Stop`: `stop_hook_active`, `last_assistant_message` optional.
                 (
