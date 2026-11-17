@@ -15,7 +15,7 @@ use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UnixListener, UnixStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderName;
@@ -529,12 +529,16 @@ impl Default for Hello {
 /// scripted.
 pub type CaptureResult = Result<&'static str, (ErrorCode, &'static str)>;
 
+pub type OpenResult = Result<PtyOpenReply, (ErrorCode, &'static str)>;
+
 /// What the fake hub answers to the next `pty.open`.
 pub enum OpenReply {
     Ok(PtyOpenReply),
     Err(ErrorCode, &'static str),
     /// The reply, after a pause in which the connection reads nothing.
     Late(Duration, PtyOpenReply),
+    /// Waits for the test to release the reply, without a timing window.
+    Held(oneshot::Receiver<OpenResult>),
 }
 
 /// The reply to an open when nothing else was scripted: a fresh spawn.
@@ -573,6 +577,7 @@ pub struct FakeHub {
     pub path: PathBuf,
     _dir: tempfile::TempDir,
     requests: watch::Receiver<Vec<(usize, HubRequest)>>,
+    closed: watch::Receiver<Vec<usize>>,
     conns: Arc<Mutex<Vec<mpsc::UnboundedSender<Inject>>>>,
     script: Arc<Script>,
     accept: tokio::task::JoinHandle<()>,
@@ -606,6 +611,7 @@ impl FakeHub {
     fn listen(dir: tempfile::TempDir, path: PathBuf, hello: Hello) -> FakeHub {
         let listener = UnixListener::bind(&path).unwrap();
         let (record, requests) = watch::channel(Vec::new());
+        let (closed_tx, closed) = watch::channel(Vec::new());
         let record = Arc::new(record);
         let conns = Arc::new(Mutex::new(Vec::new()));
         let script = Arc::new(Script::default());
@@ -631,7 +637,11 @@ impl FakeHub {
                         rx,
                         script.clone(),
                     );
-                    tokio::spawn(conn);
+                    let closed_tx = closed_tx.clone();
+                    tokio::spawn(async move {
+                        conn.await;
+                        closed_tx.send_modify(|all| all.push(id));
+                    });
                 }
             }
         });
@@ -639,6 +649,7 @@ impl FakeHub {
             path,
             _dir: dir,
             requests,
+            closed,
             conns,
             script,
             accept,
@@ -673,6 +684,15 @@ impl FakeHub {
         self.wait_count(1, pred).await.remove(0)
     }
 
+    /// Waits until the fake hub has observed this connection's teardown.
+    pub async fn wait_closed(&self, conn: usize) {
+        let mut closed = self.closed.clone();
+        timeout(WAIT, closed.wait_for(|all| all.contains(&conn)))
+            .await
+            .expect("hub connection did not close")
+            .unwrap();
+    }
+
     pub fn send(&self, conn: usize, msg: HubMessage) {
         self.conns.lock().unwrap()[conn]
             .send(Inject::Line(Box::new(msg)))
@@ -687,6 +707,13 @@ impl FakeHub {
     /// Scripts the reply to the next `pty.open`.
     pub fn reply_next_open(&self, reply: OpenReply) {
         self.script.opens.lock().unwrap().push_back(reply);
+    }
+
+    /// Holds the next open until its returned sender supplies the reply.
+    pub fn hold_next_open(&self) -> oneshot::Sender<OpenResult> {
+        let (release, reply) = oneshot::channel();
+        self.reply_next_open(OpenReply::Held(reply));
+        release
     }
 
     /// Scripts the reply to the next `pty.capture`.
@@ -778,6 +805,15 @@ async fn serve(
                                 tokio::time::sleep(pause).await;
                                 HubMessage::ok(rid, &reply)
                             }
+                            Some(OpenReply::Held(reply)) => match reply.await.unwrap() {
+                                Ok(reply) => HubMessage::ok(rid, &reply),
+                                Err((code, message)) => HubMessage::Err {
+                                    rid: Some(rid),
+                                    sid: None,
+                                    code,
+                                    message: message.into(),
+                                },
+                            },
                             None => HubMessage::ok(rid, &spawned()),
                         }
                     }

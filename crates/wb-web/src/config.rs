@@ -50,6 +50,8 @@ pub struct Config {
     /// The mesh API (design §3.8.1). Absent means no listener and no registry of
     /// observed sessions.
     pub api: Option<ApiConfig>,
+    /// Opens an observed agent's existing terminal through the hub's default shell.
+    pub attach_command: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +114,15 @@ fn default_hub_socket() -> PathBuf {
     "/run/workbench-hub/hub.sock".into()
 }
 
+/// Safe as a bare executable path in the hub shell's `-c` command.
+pub fn valid_attach_command(command: &str) -> bool {
+    command.len() > 1
+        && command.starts_with('/')
+        && command
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'+' | b'-'))
+}
+
 /// Reads and validates the config at `path` and builds the auth floor from it, and the
 /// API's gate when `api` is configured.
 pub fn load(path: &Path) -> Result<(Config, Floor, Option<Gate>)> {
@@ -172,6 +183,12 @@ impl Config {
         }
         if let Some(root) = &self.edwin_web_root {
             ensure!(root.is_absolute(), "edwinWebRoot must be an absolute path");
+        }
+        if let Some(command) = &self.attach_command {
+            ensure!(
+                valid_attach_command(command),
+                "attachCommand must match ^/[A-Za-z0-9._/+-]+$"
+            );
         }
         let sockets = [
             ("socket", Some(&self.socket)),
@@ -422,9 +439,42 @@ mod tests {
         assert_eq!(cfg.hub_socket, Path::new("/run/workbench-hub/hub.sock"));
         assert!(cfg.edit_socket.is_none());
         assert!(cfg.refuse_paths.is_none());
+        assert!(cfg.attach_command.is_none());
         assert_eq!(floor.expected_origin, "https://wb.example.org");
         assert_eq!(floor.expected_host, "wb.example.org");
         assert_eq!(&*floor.secret, SECRET.as_bytes());
+    }
+
+    #[test]
+    fn attach_command_is_an_optional_safe_absolute_path() {
+        for command in [
+            Value::Null,
+            json!("/run/current-system/sw/bin/attach-agent"),
+            json!("/nix/store/abc-attach+agent_1.0/bin/attach"),
+        ] {
+            let mut f = Fixture::new();
+            f.cfg["attachCommand"] = command.clone();
+            let (cfg, _, _) = f.load().unwrap();
+            assert_eq!(cfg.attach_command.as_deref(), command.as_str());
+        }
+        for command in [
+            json!("attach-agent"),
+            json!("/"),
+            json!(""),
+            json!("/a b"),
+            json!("/a;id"),
+            json!("/a\nid"),
+            json!("/a'"),
+            json!("/a$HOME"),
+            json!("/a:cmd"),
+            json!("/é"),
+            json!(["/a"]),
+            json!(true),
+        ] {
+            let mut f = Fixture::new();
+            f.cfg["attachCommand"] = command.clone();
+            assert!(f.load().is_err(), "{command}");
+        }
     }
 
     #[test]

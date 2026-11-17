@@ -108,6 +108,7 @@ let
         publicOrigin
         trustedProxy
         host
+        attachCommand
         boardsDir
         notesDir
         ;
@@ -331,6 +332,17 @@ in
       type = types.str;
       default = "bash";
       description = "The shell, a name in shells, that a card gets when it names none.";
+    };
+
+    attachCommand = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      example = "/run/current-system/sw/bin/attach-agent";
+      description = ''
+        Command that opens an observed agent's existing terminal. The absolute path must match
+        ^/[A-Za-z0-9._/+-]+$. It gets one argument, host:claude:id or host:tmux:pane:socket,
+        and carries the terminal over stdio. Closing it must leave the agent running.
+      '';
     };
 
     boardsDir = mkOption {

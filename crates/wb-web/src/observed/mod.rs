@@ -116,6 +116,53 @@ pub struct TailLine {
     pub text: String,
 }
 
+/// How the owner can open the agent's existing terminal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum Attach {
+    Claude { id: String },
+    Tmux { socket: String, pane: u32 },
+}
+
+impl Attach {
+    pub fn valid(&self) -> bool {
+        match self {
+            Self::Claude { id } => {
+                id.len() == 8
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            }
+            Self::Tmux { socket, pane } => {
+                (2..=201).contains(&socket.len())
+                    && socket.starts_with('/')
+                    && !socket.contains("..")
+                    && socket.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-')
+                    })
+                    && *pane <= 999_999
+            }
+        }
+    }
+
+    /// Revalidate at the command boundary, including records loaded from disk.
+    pub fn address(&self, host: &str) -> Option<String> {
+        if !(1..=64).contains(&host.len())
+            || host.contains("..")
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+            || !self.valid()
+        {
+            return None;
+        }
+        Some(match self {
+            Self::Claude { id } => format!("{host}:claude:{id}"),
+            Self::Tmux { socket, pane } => format!("{host}:tmux:{pane}:{socket}"),
+        })
+    }
+}
+
 /// One observed session, as the API shows it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -128,6 +175,8 @@ pub struct ObservedSession {
     pub parent: Option<String>,
     pub agent_type: Option<String>,
     pub wb_session: Option<String>,
+    #[serde(default)]
+    pub attach: Option<Attach>,
     pub pid: Option<u32>,
     pub transcript_path: Option<String>,
     pub cwd: Option<String>,
@@ -289,6 +338,7 @@ fn id_of(key: &str) -> String {
 struct Envelope {
     at: u64,
     wb_session: Option<String>,
+    attach: Option<Attach>,
     pid: Option<u32>,
     pid_start: Option<u64>,
     project_root: Option<String>,
@@ -307,6 +357,10 @@ impl Envelope {
             wb_session: str_of("wbSession")
                 .filter(|s| crate::util::sanitize_sid(s) == *s && !s.is_empty())
                 .map(str::to_owned),
+            attach: body
+                .get("attach")
+                .and_then(|v| Attach::deserialize(v).ok())
+                .filter(Attach::valid),
             pid: body
                 .get("pid")
                 .and_then(Value::as_u64)
@@ -429,6 +483,7 @@ impl Inner {
                 parent: parent_key.as_deref().map(id_of),
                 agent_type: None,
                 wb_session: None,
+                attach: None,
                 pid: None,
                 transcript_path: None,
                 cwd: None,
@@ -473,6 +528,9 @@ impl Inner {
         take(&mut s.agent_type, ev.agent_type);
         take(&mut s.wb_session, env.wb_session);
         take(&mut s.project_root, env.project_root);
+        if env.attach.is_some() {
+            s.attach = env.attach;
+        }
         if env.pid.is_some() {
             s.pid = env.pid;
             e.facts.pid_start = env.pid_start;
