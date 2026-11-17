@@ -4155,7 +4155,7 @@ function toggleDockTerm() {
 // ------------------------------------------------------------------ agents on the mesh: every session the hub runs or is told of (§3.8.3, F-A47)
 // Observed sessions from /rpc: observed replaces, observed_put upserts, observed_gone deletes.
 const OBS: Record<string, ObservedSession> = {};
-const MESH: { open: string | null; ended: boolean; shape: string; graph: string; topo: string; t: number } = { open: null, ended: false, shape: '', graph: '', topo: '', t: 0 };
+const MESH: { open: string | null; ended: boolean; facts: boolean; shape: string; graph: string; topo: string; t: number } = { open: null, ended: false, facts: false, shape: '', graph: '', topo: '', t: 0 };
 const MESH_PANE: { row: string | null; key: string; actions: string; node: TermNode | AcpNode | null; attach: boolean; rows: string[] } = { row: null, key: '', actions: '', node: null, attach: false, rows: [] };
 // The hub session an observed one runs in: its WB_SESSION, believed only from the host that session is on.
 function obsSess(o: ObservedSession): SessionSummary | null { const s = !o.parent && o.wbSession ? SESS[o.wbSession] : undefined; return s && s.host === o.host ? s : null; }
@@ -4237,6 +4237,26 @@ function meshInfo(box: HTMLElement, r: MeshRow): void {
   if (o?.tail.length) out.push(el('pre', '', o.tail.slice(-12).map(t => hhmm(t.at) + ' ' + t.kind.replace(/_/g, ' ') + (t.text ? ' ' + t.text : '')).join('\n')));
   box.replaceChildren(...out);
 }
+function meshHeader(r: MeshRow): void {
+  const box = $('#mesh-detail')!, title = $('h3', box)!, meta = $('.mesh-meta', box)!, b = live.$agents?.backend;
+  if (title.textContent !== r.title) title.textContent = r.title; title.title = r.title;
+  const values = [r.harness, meshConfig(r, 'model') || r.obs?.model, r.host, r.obs?.cwd || r.sess?.cwd,
+    b instanceof AcpBackend ? b.mode() || r.obs?.permissionMode : r.obs?.permissionMode, r.live ? r.state : 'ended'];
+  const parts = values.flatMap((v, i) => {
+    if (!v) return []; const s = el('span', i === 3 ? 'mesh-folder' : ''); s.title = v;
+    if (i === 3) { const path = el('bdi', '', v); path.dir = 'ltr'; s.append(path); } else s.textContent = v;
+    return [s];
+  });
+  meta.replaceChildren(...parts.flatMap((s, i) => i ? [' · ', s] : [s]));
+}
+function meshFactsMode(): void {
+  const box = $('#mesh-detail')!, mounted = !!live.$agents;
+  box.classList.toggle('mounted', mounted);
+  const toggle = $('.mesh-disclose', box)!;
+  toggle.hidden = !mounted; toggle.setAttribute('aria-expanded', String(MESH.facts));
+  $('.mesh-info', box)!.hidden = mounted && !MESH.facts;
+  live.$agents?.fitNow?.();
+}
 function meshClose(): void {
   const L = live.$agents;
   if (L) {
@@ -4245,6 +4265,7 @@ function meshClose(): void {
     L.el.remove();
   }
   MESH_PANE.row = null; MESH_PANE.key = ''; MESH_PANE.actions = ''; MESH_PANE.node = null; MESH_PANE.attach = false;
+  $('#mesh-detail')!.classList.remove('mounted');
 }
 function meshMount(r: MeshRow, attach = false): void {
   const box = $('#mesh-detail')!, host = el('div', 'mesh-live ' + (r.sess?.kind === 'acp' && !attach ? 'k-acp' : 'k-term')), hdr = el('div', 'hdr'), body = el('div', 'body');
@@ -4255,6 +4276,7 @@ function meshMount(r: MeshRow, attach = false): void {
   MESH_PANE.node = n; MESH_PANE.attach = attach;
   const L = live.$agents = { el: host, hdr, body };
   if (n.kind === 'acp') mountAcp(n, L); else mountTerm(n, L);
+  meshFactsMode();
 }
 const meshPaneKey = (r: MeshRow): string => [r.id, r.sess?.sid || '', r.sess?.kind || '', r.sess?.createdAt ?? ''].join(' ');
 const meshActionKey = (r: MeshRow): string => [r.card?.id || '', !!r.obs?.attach, !!INFO?.attach, r.live].join(' ');
@@ -4271,14 +4293,17 @@ function meshActions(r: MeshRow): void {
   if (reachable) return;
   if (r.obs?.attach && INFO?.attach && r.live) {
     const open = B('Open terminal', () => { open.disabled = true; meshMount(r, true); meshEnter(); }); open.disabled = MESH_PANE.attach;
-    box.append(el('div', 'mesh-hint', 'Closing this terminal leaves the agent running.'));
-  } else box.append(el('div', 'mesh-hint', 'Started in a terminal the hub cannot reach. Start a Claude background session, use tmux, or run in a Workbench shell or agent card to control it here.'));
+    $('.mesh-head', box)!.append(el('div', 'mesh-hint', 'Closing this terminal leaves the agent running.'));
+  } else $('.mesh-head', box)!.append(el('div', 'mesh-hint', 'Started in a terminal the hub cannot reach. Start a Claude background session, use tmux, or run in a Workbench shell or agent card to control it here.'));
 }
 function meshDetail(r: MeshRow): void {
   meshClose(); MESH_PANE.row = r.id; MESH_PANE.key = meshPaneKey(r);
-  const box = $('#mesh-detail')!, back = el('button', 'tb mesh-back', '← Sessions');
-  back.onclick = meshBack; box.replaceChildren(back, el('h3', '', r.title), el('div', 'mesh-info'), el('div', 'ex-btns'));
+  const box = $('#mesh-detail')!, head = el('div', 'mesh-head'), back = el('button', 'tb mesh-back', '← Sessions'), toggle = el('button', 'tb mesh-disclose', 'Details'), info = el('div', 'mesh-info');
+  info.id = 'mesh-info'; toggle.setAttribute('aria-controls', info.id);
+  toggle.onclick = () => { MESH.facts = !MESH.facts; meshFactsMode(); };
+  back.onclick = meshBack; head.append(el('h3', '', r.title), el('div', 'ex-btns'), toggle, el('div', 'mesh-meta'), info); box.replaceChildren(back, head);
   meshActions(r); if (r.sess?.kind === 'acp' || r.sess?.kind === 'pty' && r.sess.host === INFO?.host) meshMount(r);
+  else meshFactsMode();
 }
 function meshSelect(id: string): void {
   MESH.open = id; $('#v-agents')!.classList.add('detail-open'); meshRender();
@@ -4296,6 +4321,7 @@ $('#mesh-detail')!.addEventListener('keydown', e => { if (e.key === 'Escape' && 
 function meshRender(): void {
   const box = $('#mesh-list');
   if (!box || VIEW !== 'agents') return;
+  setMeshW(S.meshW);
   const shown = (r: MeshRow): boolean => MESH.ended || r.live || r.id === MESH.open || r.kids.some(shown);
   const rank = (r: MeshRow) => meshBad(r) || r.kids.some(meshBad) ? 0 : !r.live ? 3 : r.state === 'running' ? 1 : 2;   // waiting for you first, a list that does not reorder as sessions work
   const order = (a: MeshRow, b: MeshRow) => rank(a) - rank(b) || b.since - a.since || a.id.localeCompare(b.id);
@@ -4321,7 +4347,7 @@ function meshRender(): void {
   if (selected) {
     if (meshPaneKey(selected) !== MESH_PANE.key) meshDetail(selected);
     else if (meshActionKey(selected) !== MESH_PANE.actions) meshActions(selected);
-    const title = $('#mesh-detail h3'); if (title && title.textContent !== selected.title) title.textContent = selected.title;
+    meshHeader(selected);
     meshInfo($('#mesh-detail .mesh-info')!, selected);
   } else { meshClose(); $('#mesh-detail')!.replaceChildren(el('p', 'muted', 'Select a session.')); $('#v-agents')!.classList.remove('detail-open'); }
   const rows = $$('.mesh-row', box) as HTMLElement[];
@@ -4995,9 +5021,27 @@ function setPaneW(w: number, save?: boolean) {
   if (save && S) { S.paneW = w; dirty(); }
   if (VIEW === 'graph') { clearTimeout((setPaneW as PaneWidthFn).t); (setPaneW as PaneWidthFn).t = setTimeout(graphDraw, 60); }
 }
+function setMeshW(w?: number, save = false): void {
+  const box = $('#v-agents')!, width = box.getBoundingClientRect().width; if (innerWidth < 700 || !width) return;
+  const max = Math.max(200, Math.floor(width - 366));
+  w = Math.round(clamp(Number.isFinite(w) ? w! : Math.max(260, width * .34), 200, max));
+  box.style.setProperty('--mesh-w', w + 'px');
+  const grip = $('#mesh-grip')!;
+  grip.setAttribute('aria-valuemin', '200'); grip.setAttribute('aria-valuemax', String(max)); grip.setAttribute('aria-valuenow', String(w));
+  if (save) { S.meshW = w; dirty(); }
+  live.$agents?.fitNow?.();
+}
 function wirePaneGrip() {
   wireGrip($('#side-grip')!, ev => innerWidth - ev.clientX, setPaneW, PANE_W);
   wireGrip($('#tree-grip')!, ev => ev.clientX - $('#tree-pane')!.getBoundingClientRect().left, setTreeW, TREE_W);
+  const grip = $('#mesh-grip')!;
+  wireGrip(grip, ev => ev.clientX - $('#v-agents')!.getBoundingClientRect().left, setMeshW, NaN);
+  grip.addEventListener('keydown', e => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault(); e.stopPropagation();
+    setMeshW($('.mesh-side')!.getBoundingClientRect().width + (e.key === 'ArrowLeft' ? -16 : 16), true);
+  });
+  new ResizeObserver(() => setMeshW(S.meshW)).observe($('#v-agents')!);
   $('#pick-chip [data-act=compact]')!.onclick = () => compact('selection');
   $('#pick-chip [data-act=clear]')!.onclick = () => pickClear();
   const wu = $('#ws-up'); if (wu) wu.onclick = () => wsLeave();
