@@ -1015,7 +1015,7 @@ Three parts follow from that, and each stands alone: the API listener (§3.8.1, 
 }
 ```
 
-- **The listener** is a second TCP listener of wb-web, apart from the browser's: the auth floor of §3.6 does not apply to it, and it serves nothing but `/v1`. It speaks plain HTTP/1.1 and is meant for an address on the mesh interface, whose transport encrypts and authenticates the peer's address.
+- **The listener** is a second TCP listener of wb-web, apart from the browser's: the auth floor of §3.6 does not apply to it, and it serves nothing but `/v1`. It speaks plain HTTP/1.1 and is meant for an address on the mesh interface, whose transport encrypts and authenticates the peer's address. It holds at most `API_CONNS_MAX` connections, an event stream being one; a further connection waits to be accepted. So a peer that leaves connections idle can hold up the API, and not the browser's listener or the hub connections.
 - **A client** has a name, a token, a set of scopes, and optionally a `host` and an `address`.
   - `scopes` is a non-empty subset of `events` (send session events), `read` (every `GET`) and `control` (start, prompt, answer and end sessions).
   - `host` is the host name this client's events are filed under. It is required with the `events` scope and comes from nowhere else: a host named inside a request is ignored.
@@ -1028,7 +1028,7 @@ Three parts follow from that, and each stands alone: the API listener (§3.8.1, 
 
   A request that fails either gets 401 `{"error":"unauthorized"}` with `WWW-Authenticate: Bearer`; the two are not told apart. `X-Forwarded-For` is never read.
   3. The route's scope must be among the client's, else 403 `{"error":"forbidden"}`. An unknown path is 404 and a wrong method 405, both only after steps 1 and 2.
-- A refusal is logged with the peer's address, the method and the path without its query; no header value is logged.
+- A refusal is logged with the peer's address, the method and the path without its query; no header value is logged. After `REFUSALS_LOGGED` in one minute, one line says that the rest of that minute's are not logged.
 - Every response is JSON with `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`, except the event stream (`text/event-stream`). There are no CORS headers. A request body is at most `API_BODY_MAX`; a larger one is 413.
 - Errors are `{"error": message}`. An error the hub gave also carries the hub's `code`: `{"error": message, "code": "busy"}`.
 
@@ -1048,7 +1048,7 @@ A sid in a path that does not match `^[A-Za-z0-9_-]{1,64}$` is 400 "bad id". Req
 | `GET /v1/observed` | read | `{sessions:[ObservedSession]}` (§3.8.3), live first, then by `lastAt`, newest first. |
 | `GET /v1/observed/{id}` | read | One `ObservedSession` by its `id`; 404. |
 | `GET /v1/stream` | read | Server-sent events (§3.8.4). |
-| `POST /v1/sessions` | control | Starts an ACP agent. Body `{agent, cwd, host?, sid?}`. `sid` defaults to `api_` and 16 random hex digits. `host` absent, or the hub's own, starts it on the hub's host; another name must be one of the hub's `hosts` as its hello lists them, else 400 "no host H" (so a hub that predates §3.8.5 is never asked). 201 `{sid, session: Summary+state}`. A sid that exists is 409 "session exists", and that session is left as it is. |
+| `POST /v1/sessions` | control | Starts an ACP agent. Body `{agent, cwd, host?, sid?}`. `sid` defaults to `api_` and 16 random hex digits. `host` absent, or the hub's own, starts it on the hub's host; another name must be one of the hub's `hosts` as its hello lists them, else 400 "no host H" (so a hub that predates §3.8.5 is never asked). 201 `{sid, session: Summary+state}`. A sid that an agent session has is 409 "session exists", and one that a shell has is 409 with the hub's `kind_mismatch`; that session is left as it is. |
 | `POST /v1/sessions/{sid}/prompt` | control | Body `{text}` or `{blocks:[ContentBlock]}`, exactly one of them; `text` becomes one text block. `acp.prompt`. 200 `{}`. |
 | `POST /v1/sessions/{sid}/cancel` | control | `acp.cancel`. 200 `{}`. |
 | `POST /v1/sessions/{sid}/permission` | control | Body `{req, epoch, outcome}`: `acp.permission`. 200 `{}`. |
@@ -1080,7 +1080,7 @@ An observed session is what the harnesses report about one agent session: a reco
 ```
 
 - `harness` matches `^[a-z0-9-]{1,32}$`. Every other field but `payload` is optional and may be `null`; unknown fields are ignored.
-- `at` is the sender's wall clock in ms; absent, the server's.
+- `at` is the sender's wall clock in ms; absent, or later than the server's, it is the server's.
 - `wbSession` is the sender's `$WB_SESSION`, kept only when it is a sid (`^[A-Za-z0-9_-]{1,64}$`): the agent runs under the hub as that session.
 - `pid` and `pidStart` name the harness process: its pid and field 22 of its `/proc/<pid>/stat`. `projectRoot` is the nearest directory at or above the session's cwd that holds `.git`.
 - `payload` is an object with a `session_id` matching `^[A-Za-z0-9._:-]{1,128}$`:
@@ -1094,7 +1094,7 @@ type ObsKind = 'start'|'prompt'|'tool_start'|'tool_end'|'tool_fail'|'permission'
              |'question'|'turn_end'|'subagent_start'|'subagent_end'|'note'|'end';
 interface ObservedSession {
   id: string;            // "o_" + the first 16 hex digits of sha256(key)
-  key: string;           // `${host}/${harness}/${sessionId}`, or `…/${sessionId}:${agentId}` for a subagent
+  key: string;           // `${host}/${harness}/${sessionId}`, or `…/${sessionId}/${agentId}` for a subagent
   host: string; harness: string; sessionId: string;
   parent: string|null;   // the id of a subagent's session
   agentType: string|null;
@@ -1132,7 +1132,7 @@ Texts are excerpts: cut to `OBS_TEXT_MAX` (a tail line to 240 bytes) at a charac
 | `note` | `PreCompact`, other `Notification`s, any other name | `PreCompact`, `PostCompact`, any other name | the tail only |
 | `end` | `SessionEnd` | – | ended `session_end` |
 
-The names in the codex column are those of the codex release the fixtures were taken from; the fixtures are normative, and each one names the source it was taken from. Every event also sets `lastAt`, adds to `counts.events` and to the tail, and takes `cwd`, `transcriptPath`, `model`, `permissionMode`, `wbSession`, `pid` and `projectRoot` when it carries them. `pending` is cleared by any later event of the same record except `note` and `permission`. An event with an `agent_id` goes to the subagent's record, keyed `sessionId:agentId` with `parent` set, and also sets the parent's `lastAt`.
+The names in the codex column are those of the codex release the fixtures were taken from; the fixtures are normative, and each one names the source it was taken from. Every event also sets `lastAt`, adds to `counts.events` and to the tail, and takes `cwd`, `transcriptPath`, `model`, `permissionMode`, `wbSession`, `pid` and `projectRoot` when it carries them. `pending` is cleared by any later event of the same record except `note` and `permission`. An event with an `agent_id` goes to the subagent's record, keyed `sessionId/agentId` with `parent` set, and also sets the parent's `lastAt`.
 
 **State**, first match wins; the table tests are normative. `error` and `detached` are never produced.
 
@@ -1151,11 +1151,11 @@ The names in the codex column are those of the codex release the fixtures were t
 - a `start` from the same host, harness, pid and start time as another live top-level record ends that one `replaced`;
 - a parent's end ends its subagents `parent_ended`;
 - any event other than `end` makes an ended record live again;
-- an ended record is dropped `OBS_ENDED_KEEP` after `endedAt`. At `OBS_SESSIONS_MAX` records the oldest ended one goes first, else the live one with the oldest `lastAt`.
+- an ended record is dropped `OBS_ENDED_KEEP` after `endedAt`. A host has at most `OBS_SESSIONS_MAX` records: at that many, its oldest ended one goes first, else its live one with the oldest `lastAt`. A host never makes room among another's records, so one that sends a flood of sessions loses only its own.
 
-**Persistence.** `<stateDir>/observed.json` (0600, atomic), `{"v":1,"sessions":[…]}`, written at most every `OBS_SAVE_EVERY` while something changed, and once more at shutdown. So prompt excerpts are on disk. A file that does not parse, or has another `v`, is renamed `observed.json.bad-<ms>` with a warning, and the registry starts empty. A sweep runs right after loading.
+**Persistence.** `<stateDir>/observed.json` (0600, atomic), `{"v":1,"sessions":[…]}`, written at most every `OBS_SAVE_EVERY` while something changed, when a shutdown begins, and once more after the last request has ended; that last save is missed when connections outlive the shutdown grace. So prompt excerpts are on disk. A file that does not parse, or has another `v`, is renamed `observed.json.bad-<ms>` with a warning, and the registry starts empty. A sweep runs right after loading.
 
-**Limits** (wb-web, `observed`): `API_BODY_MAX` 1 MiB, `OBS_SESSIONS_MAX` 256, `OBS_TEXT_MAX` 2 KiB, `OBS_TAIL` 20, `OBS_SWEEP` 10 s, `OBS_SAVE_EVERY` 5 s, `OBS_SILENT_END` 12 h, `OBS_ENDED_KEEP` 6 h, `OBS_PUSH_EVERY` 500 ms.
+**Limits** (wb-web, `api` and `observed`): `API_CONNS_MAX` 256, `REFUSALS_LOGGED` 60, `API_BODY_MAX` 1 MiB, `OBS_SESSIONS_MAX` 256 a host, `OBS_TEXT_MAX` 2 KiB, `OBS_TAIL` 20, `OBS_SWEEP` 10 s, `OBS_SAVE_EVERY` 5 s, `OBS_SILENT_END` 12 h, `OBS_ENDED_KEEP` 6 h, `OBS_PUSH_EVERY` 500 ms.
 
 #### 3.8.4 `GET /v1/stream`
 
@@ -1167,7 +1167,7 @@ Server-sent events, each `event: <name>` with one line of JSON as `data`:
 | `session` | `Summary+state` | one per session after every `hub` whose status is `up`, then on every change |
 | `gone` | `{sid, epoch}` | the hub forgot a session |
 | `observed` | `ObservedSession` | one per record after the sessions, then on every change, at most one per record per `OBS_PUSH_EVERY` |
-| `observed_gone` | `{id, key}` | a record was dropped |
+| `observed_gone` | `{id, key}` | a record was dropped that a stream or a listing had shown |
 | `ready` | `{}` | once, after the snapshot |
 
 A comment line goes out every 15 s. A client that falls so far behind that events were lost is disconnected and takes a new snapshot when it reconnects. A change that lands between the subscription and the snapshot may be sent twice; both carry the same state. The stream ends when wb-web shuts down.

@@ -270,7 +270,12 @@ impl Envelope {
     fn read(body: &Map<String, Value>, now_ms: u64) -> Envelope {
         let str_of = |k: &str| body.get(k).and_then(Value::as_str);
         Envelope {
-            at: body.get("at").and_then(Value::as_u64).unwrap_or(now_ms),
+            // Never later than this clock: a sender cannot date its records ahead of
+            // the others'.
+            at: body
+                .get("at")
+                .and_then(Value::as_u64)
+                .map_or(now_ms, |at| at.min(now_ms)),
             wb_session: str_of("wbSession")
                 .filter(|s| crate::util::sanitize_sid(s) == *s && !s.is_empty())
                 .map(str::to_owned),
@@ -300,12 +305,19 @@ struct Inner {
     changed: BTreeSet<String>,
     /// Keys dropped since the last drain, with their ids.
     gone: BTreeMap<String, String>,
+    /// Keys a drain or a listing has given out: only these are reported when dropped,
+    /// so records that come and go between two drains cost a stream nothing.
+    told: BTreeSet<String>,
     unsaved: bool,
 }
 
 impl Inner {
     fn touch(&mut self, key: &str) {
-        self.gone.remove(key);
+        // A record that comes back before its drop was reported is still one a stream
+        // may hold.
+        if self.gone.remove(key).is_some() {
+            self.told.insert(key.to_owned());
+        }
         self.changed.insert(key.to_owned());
         self.unsaved = true;
     }
@@ -313,29 +325,34 @@ impl Inner {
     fn drop_record(&mut self, key: &str) {
         if let Some(e) = self.records.remove(key) {
             self.changed.remove(key);
-            self.gone.insert(key.to_owned(), e.s.id);
+            if self.told.remove(key) {
+                self.gone.insert(key.to_owned(), e.s.id);
+            }
             self.unsaved = true;
         }
     }
 
-    /// The record to drop first: the oldest ended one, else the live one quiet longest.
-    fn victim(&self) -> Option<String> {
-        let ended = self
-            .records
-            .iter()
+    /// The record of `host` to drop first: its oldest ended one, else its live one
+    /// quiet longest.
+    fn victim(&self, host: &str) -> Option<String> {
+        let of_host = || self.records.iter().filter(|(_, e)| e.s.host == host);
+        let ended = of_host()
             .filter_map(|(k, e)| e.s.ended_at.map(|t| (t, k)))
             .min();
         ended
-            .or_else(|| self.records.iter().map(|(k, e)| (e.s.last_at, k)).min())
+            .or_else(|| of_host().map(|(k, e)| (e.s.last_at, k)).min())
             .map(|(_, k)| k.clone())
     }
 
-    /// Drops records until there are at most `max`.
-    fn shrink_to(&mut self, max: usize) {
-        while self.records.len() > max
-            && let Some(k) = self.victim()
+    /// Drops records of `host` until it has at most `max`. A host makes room among
+    /// its own records only, so one that sends a flood loses nothing but its own.
+    fn shrink(&mut self, host: &str, max: usize) {
+        let mut held = self.records.values().filter(|e| e.s.host == host).count();
+        while held > max
+            && let Some(k) = self.victim(host)
         {
             self.drop_record(&k);
+            held -= 1;
         }
     }
 
@@ -368,12 +385,13 @@ impl Inner {
     fn apply(&mut self, host: &str, harness: &str, env: Envelope, mut ev: Event) {
         let top_key = format!("{host}/{harness}/{}", ev.session_id);
         let (key, parent_key) = match &ev.agent_id {
-            Some(a) => (format!("{top_key}:{a}"), Some(top_key)),
+            // Neither id holds a `/`, so no two records share a key.
+            Some(a) => (format!("{top_key}/{a}"), Some(top_key)),
             None => (top_key, None),
         };
         let at = env.at;
         if !self.records.contains_key(&key) {
-            self.shrink_to(OBS_SESSIONS_MAX - 1);
+            self.shrink(host, OBS_SESSIONS_MAX - 1);
             let s = ObservedSession {
                 id: id_of(&key),
                 key: key.clone(),
@@ -657,7 +675,10 @@ impl Registry {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => tracing::warn!("observed: cannot read {}: {e}", path.display()),
         }
-        inner.shrink_to(OBS_SESSIONS_MAX);
+        let hosts: BTreeSet<String> = inner.records.values().map(|e| e.s.host.clone()).collect();
+        for host in hosts {
+            inner.shrink(&host, OBS_SESSIONS_MAX);
+        }
         inner.changed.clear();
         inner.gone.clear();
         let reg = Registry(Arc::new(Shared {
@@ -696,8 +717,11 @@ impl Registry {
 
     /// Live records first, then by `lastAt`, newest first.
     pub fn list(&self) -> Vec<ObservedSession> {
-        let mut all: Vec<ObservedSession> =
-            self.lock().records.values().map(|e| e.s.clone()).collect();
+        let mut inner = self.lock();
+        let keys: Vec<String> = inner.records.keys().cloned().collect();
+        inner.told.extend(keys);
+        let mut all: Vec<ObservedSession> = inner.records.values().map(|e| e.s.clone()).collect();
+        drop(inner);
         all.sort_by(|a, b| {
             (a.ended_at.is_some(), b.last_at, &a.id).cmp(&(b.ended_at.is_some(), a.last_at, &b.id))
         });
@@ -726,12 +750,12 @@ impl Registry {
             .into_iter()
             .map(|(key, id)| Change::Gone { id, key })
             .collect();
-        out.extend(
-            changed
-                .iter()
-                .filter_map(|k| inner.records.get(k))
-                .map(|e| Change::Upsert(Box::new(e.s.clone()))),
-        );
+        for key in changed {
+            if let Some(e) = inner.records.get(&key) {
+                out.push(Change::Upsert(Box::new(e.s.clone())));
+                inner.told.insert(key);
+            }
+        }
         out
     }
 

@@ -4,15 +4,16 @@
 //! The gate wraps every route and fallback, so a request without a valid token gets
 //! 401 before it can learn whether a path exists.
 
+mod listener;
 mod observed;
 mod sessions;
 mod stream;
 
 use std::collections::BTreeSet;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -34,6 +35,7 @@ use crate::http::{ApiError, not_found};
 use crate::observed::{Change, OBS_PUSH_EVERY, OBS_SAVE_EVERY, OBS_SWEEP, Registry};
 use crate::routes::method_not_allowed;
 use crate::util::now_ms;
+use listener::{Capped, Peer};
 
 /// The largest request body, an event included.
 pub const API_BODY_MAX: usize = 1 << 20;
@@ -120,7 +122,8 @@ pub fn start(app: AppState, gate: Gate, listener: TcpListener) -> Result<JoinHan
         changes: broadcast::channel(CHANGES_CAPACITY).0,
     });
     tracing::info!("api listening on {}", listener.local_addr()?);
-    let service = router(api.clone()).into_make_service_with_connect_info::<SocketAddr>();
+    let service = router(api.clone()).into_make_service_with_connect_info::<Peer>();
+    let listener = Capped::new(listener);
     Ok(tokio::spawn(async move {
         let ticker = tokio::spawn(tick(api.clone()));
         let stopping = api.clone();
@@ -193,7 +196,7 @@ fn router(state: ApiState) -> Router {
 /// The gate middleware: 401 unless the request carries a client's token.
 async fn gate(
     State(api): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
     mut req: Request,
     next: Next,
 ) -> Response {
@@ -224,11 +227,35 @@ async fn gate(
     res
 }
 
+/// Refusals logged in one minute; the rest of that minute's are only counted, so a
+/// peer without a token cannot fill the log.
+const REFUSALS_LOGGED: u32 = 60;
+
+/// The minute of the last refusal, and how many that minute has had.
+static REFUSALS: Mutex<(u64, u32)> = Mutex::new((0, 0));
+
+/// Counts a refusal in `minute`; returns how many that minute has had.
+fn count_refusal(seen: &mut (u64, u32), minute: u64) -> u32 {
+    if seen.0 != minute {
+        *seen = (minute, 0);
+    }
+    seen.1 = seen.1.saturating_add(1);
+    seen.1
+}
+
 /// Logs a refusal: the path without its query, and no header value. `client` is the
 /// name of the client whose token the request carried, when it carried one.
 fn refused(peer: IpAddr, method: &Method, path: &str, client: Option<&str>) {
-    let client = client.unwrap_or("-");
-    tracing::warn!(%peer, %method, path, client, "api request refused");
+    let n = {
+        let mut seen = REFUSALS.lock().unwrap_or_else(PoisonError::into_inner);
+        count_refusal(&mut seen, now_ms() / 60_000)
+    };
+    if n <= REFUSALS_LOGGED {
+        let client = client.unwrap_or("-");
+        tracing::warn!(%peer, %method, path, client, "api request refused");
+    } else if n == REFUSALS_LOGGED + 1 {
+        tracing::warn!("more api requests refused; not logged for the rest of this minute");
+    }
 }
 
 /// The client the gate let in, if its token has `scope`; else 403.
@@ -237,8 +264,8 @@ fn need(parts: &Parts, scope: Scope) -> Result<Arc<Client>, ApiError> {
     match client {
         Some(client) if client.scopes.contains(&scope) => Ok(client.clone()),
         _ => {
-            let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>();
-            if let Some(ConnectInfo(peer)) = peer {
+            let peer = parts.extensions.get::<ConnectInfo<Peer>>();
+            if let Some(ConnectInfo(Peer(peer))) = peer {
                 let name = client.map(|c| c.name.as_str());
                 refused(peer.ip(), &parts.method, parts.uri.path(), name);
             }
@@ -357,5 +384,17 @@ mod tests {
         );
         assert!(!from("192.0.2.8"));
         assert!(!from("198.51.100.9"));
+    }
+
+    #[test]
+    fn refusals_are_counted_by_the_minute() {
+        let mut seen = (0, 0);
+        let counts: Vec<u32> = [7, 7, 7, 8, 8, 7]
+            .into_iter()
+            .map(|minute| count_refusal(&mut seen, minute))
+            .collect();
+        assert_eq!(counts, [1, 2, 3, 1, 2, 1]);
+        seen = (9, u32::MAX);
+        assert_eq!(count_refusal(&mut seen, 9), u32::MAX);
     }
 }

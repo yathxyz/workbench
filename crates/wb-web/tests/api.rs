@@ -366,6 +366,38 @@ async fn info_and_sessions_are_the_hubs() {
     );
 }
 
+/// `API_CONNS_MAX`: the connections the API holds at a time.
+const CONNS_MAX: usize = 256;
+
+#[tokio::test]
+async fn idle_connections_fill_the_api_and_nothing_else() {
+    let api = Api::start().await;
+    let mut idle = Vec::new();
+    for _ in 0..CONNS_MAX {
+        idle.push(TcpStream::connect(api.addr).await.unwrap());
+    }
+    // The first of them does answer, so all of them are held.
+    let first = &mut idle[0];
+    let head = format!("GET /v1/info HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {OWNER}\r\n\r\n");
+    first.write_all(head.as_bytes()).await.unwrap();
+    let mut buf = [0; 12];
+    timeout(WAIT, first.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf, b"HTTP/1.1 200");
+
+    // One more waits, and meanwhile the browser's listener answers.
+    let mut waiting = tokio::spawn(api.req("GET", "/v1/info", OWNER).send());
+    let early = timeout(std::time::Duration::from_millis(300), &mut waiting).await;
+    assert!(early.is_err(), "a connection over the cap was served");
+    assert_eq!(api.web.req("GET", "/api/info").send().await.status, 200);
+
+    // It is served once another connection ends.
+    idle.pop();
+    assert_eq!(timeout(WAIT, waiting).await.unwrap().unwrap().status, 200);
+}
+
 #[tokio::test]
 async fn without_a_hub_the_hubs_endpoints_are_503() {
     let hub = FakeHub::start();

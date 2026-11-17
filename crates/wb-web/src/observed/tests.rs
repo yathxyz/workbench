@@ -7,6 +7,8 @@ use super::*;
 
 const HOST: &str = "devbox";
 const T0: u64 = 1_763_300_000_000;
+/// The clock of the server as the events arrive; they are dated from `T0` to it.
+const NOW: u64 = T0 + 60_000;
 const PID: u64 = 4242;
 const START: u64 = 98_765_432;
 
@@ -79,7 +81,7 @@ fn top(reg: &Registry) -> ObservedSession {
 fn feed(reg: &Registry, events: &[(&str, Value)]) {
     for (i, (hook, extra)) in events.iter().enumerate() {
         let ev = claude("s1", T0 + i as u64, hook, extra.clone());
-        reg.ingest(HOST, ev, T0).unwrap();
+        reg.ingest(HOST, ev, NOW).unwrap();
     }
 }
 
@@ -309,12 +311,12 @@ fn pending_is_cleared_by_later_events_but_notes_and_permissions() {
 
     // A neutral permission_done clears it.
     let pi = |kind: &str| json!({"harness": "pi", "payload": {"session_id": "p", "kind": kind, "text": "ok?"}});
-    f.reg.ingest(HOST, pi("permission"), T0).unwrap();
+    f.reg.ingest(HOST, pi("permission"), NOW).unwrap();
     assert_eq!(
         by_key(&f.reg, "devbox/pi/p").state,
         State::WaitingPermission
     );
-    f.reg.ingest(HOST, pi("permission_done"), T0).unwrap();
+    f.reg.ingest(HOST, pi("permission_done"), NOW).unwrap();
     assert_eq!(by_key(&f.reg, "devbox/pi/p").pending, None);
 }
 
@@ -336,7 +338,7 @@ fn subagent_events_go_to_the_subagent_record() {
         ],
     );
     let parent = top(&f.reg);
-    let sub = by_key(&f.reg, "devbox/claude/s1:a1");
+    let sub = by_key(&f.reg, "devbox/claude/s1/a1");
     assert_eq!(sub.parent.as_deref(), Some(parent.id.as_str()));
     assert_eq!(sub.session_id, "s1");
     assert_eq!(sub.title, "general-purpose");
@@ -355,7 +357,7 @@ fn subagent_events_go_to_the_subagent_record() {
             json!({"agent_id": "a1", "agent_type": "general-purpose", "last_assistant_message": "3 hits"}),
         )],
     );
-    let sub = by_key(&f.reg, "devbox/claude/s1:a1");
+    let sub = by_key(&f.reg, "devbox/claude/s1/a1");
     assert_eq!(sub.end_reason, Some(EndReason::SessionEnd));
     assert_eq!(sub.last_message.as_deref(), Some("3 hits"));
     assert!(top(&f.reg).ended_at.is_none());
@@ -371,8 +373,8 @@ fn subagent_events_go_to_the_subagent_record() {
             ("SessionEnd", json!({"reason": "other"})),
         ],
     );
-    let a1 = by_key(&f.reg, "devbox/claude/s1:a1");
-    let a2 = by_key(&f.reg, "devbox/claude/s1:a2");
+    let a1 = by_key(&f.reg, "devbox/claude/s1/a1");
+    let a2 = by_key(&f.reg, "devbox/claude/s1/a2");
     assert_eq!(a1.end_reason, Some(EndReason::SessionEnd));
     assert_eq!(a2.end_reason, Some(EndReason::ParentEnded));
     assert_eq!(a2.ended_at, top(&f.reg).ended_at);
@@ -386,7 +388,7 @@ fn a_start_from_the_same_process_replaces_the_session() {
         let mut ev = claude(sid, T0, "SessionStart", json!({"source": "clear"}));
         ev["pid"] = json!(pid);
         ev["pidStart"] = json!(pid_start);
-        f.reg.ingest(host, ev, T0).unwrap();
+        f.reg.ingest(host, ev, NOW).unwrap();
     };
     start("s1", PID, START, HOST);
     feed(
@@ -402,7 +404,7 @@ fn a_start_from_the_same_process_replaces_the_session() {
     let s1 = top(&f.reg);
     assert_eq!(s1.end_reason, Some(EndReason::Replaced));
     assert_eq!(
-        by_key(&f.reg, "devbox/claude/s1:a1").end_reason,
+        by_key(&f.reg, "devbox/claude/s1/a1").end_reason,
         Some(EndReason::ParentEnded)
     );
     for key in [
@@ -420,7 +422,7 @@ fn sweep_checks_processes_of_its_own_host_only() {
     let at = |sid: &str, pid: u64, host: &str| {
         let mut ev = claude(sid, T0, "SessionStart", json!({}));
         ev["pid"] = json!(pid);
-        f.reg.ingest(host, ev, T0).unwrap();
+        f.reg.ingest(host, ev, NOW).unwrap();
     };
     f.process(100, START);
     f.process(101, START + 5);
@@ -430,7 +432,7 @@ fn sweep_checks_processes_of_its_own_host_only() {
     at("elsewhere", 102, "laptop");
     let mut no_pid = claude("no-pid", T0, "SessionStart", json!({}));
     no_pid.as_object_mut().unwrap().remove("pid");
-    f.reg.ingest(HOST, no_pid, T0).unwrap();
+    f.reg.ingest(HOST, no_pid, NOW).unwrap();
     f.reg.sweep(T0 + 1);
     let reason = |key: &str| by_key(&f.reg, key).end_reason;
     assert_eq!(reason("devbox/claude/alive"), None);
@@ -485,7 +487,7 @@ fn silence_ends_and_the_ended_are_dropped_after_a_while() {
     let keep = OBS_ENDED_KEEP.as_millis() as u64;
     let mut ev = claude("s1", T0, "SessionStart", json!({}));
     ev.as_object_mut().unwrap().remove("pid");
-    f.reg.ingest(HOST, ev, T0).unwrap();
+    f.reg.ingest(HOST, ev, NOW).unwrap();
     f.reg.drain();
     f.reg.sweep(T0 + silent - 1);
     assert_eq!(top(&f.reg).ended_at, None);
@@ -504,7 +506,7 @@ fn silence_ends_and_the_ended_are_dropped_after_a_while() {
     for at in [0, u64::MAX] {
         let mut ev = claude("skew", at, "SessionStart", json!({}));
         ev.as_object_mut().unwrap().remove("pid");
-        f.reg.ingest(HOST, ev, T0).unwrap();
+        f.reg.ingest(HOST, ev, NOW).unwrap();
         f.reg.sweep(T0);
         f.reg.sweep(u64::MAX);
     }
@@ -516,11 +518,11 @@ fn eviction_takes_the_oldest_ended_then_the_quietest_live() {
     for i in 0..OBS_SESSIONS_MAX as u64 {
         let mut ev = claude(&format!("s{i}"), T0 + 10 + i, "SessionStart", json!({}));
         ev.as_object_mut().unwrap().remove("pid");
-        f.reg.ingest(HOST, ev, T0).unwrap();
+        f.reg.ingest(HOST, ev, NOW).unwrap();
     }
     for (sid, at) in [("s20", T0 + 900), ("s10", T0 + 901)] {
         f.reg
-            .ingest(HOST, claude(sid, at, "SessionEnd", json!({})), T0)
+            .ingest(HOST, claude(sid, at, "SessionEnd", json!({})), NOW)
             .unwrap();
     }
     f.reg.drain();
@@ -528,7 +530,7 @@ fn eviction_takes_the_oldest_ended_then_the_quietest_live() {
     for i in 0..3 {
         let mut ev = claude(&format!("new{i}"), T0 + 1000, "SessionStart", json!({}));
         ev.as_object_mut().unwrap().remove("pid");
-        f.reg.ingest(HOST, ev, T0).unwrap();
+        f.reg.ingest(HOST, ev, NOW).unwrap();
         assert_eq!(f.reg.list().len(), OBS_SESSIONS_MAX);
         for c in f.reg.drain() {
             if let Change::Gone { key, .. } = c {
@@ -543,11 +545,136 @@ fn eviction_takes_the_oldest_ended_then_the_quietest_live() {
 }
 
 #[test]
+fn a_host_that_floods_pushes_out_its_own_records() {
+    let f = fx();
+    let start = |host: &str, sid: &str, at: u64| {
+        let ev =
+            json!({"harness": "pi", "at": at, "payload": {"session_id": sid, "kind": "start"}});
+        f.reg.ingest(host, ev, NOW).unwrap();
+    };
+    // The quietest records of all are the other hosts'.
+    for i in 0..10 {
+        start("quiet", &format!("q{i}"), T0 + i);
+    }
+    start("alone", "a", T0);
+    for i in 0..2000 {
+        start("loud", &format!("l{i}"), T0 + 100 + i);
+    }
+    let all = f.reg.list();
+    let of = |host: &str| all.iter().filter(|s| s.host == host).count();
+    assert_eq!(
+        (of("quiet"), of("alone"), of("loud")),
+        (10, 1, OBS_SESSIONS_MAX)
+    );
+    assert!(all.iter().any(|s| s.session_id == "l1999"));
+}
+
+#[test]
+fn a_record_nobody_was_told_of_goes_without_a_word() {
+    let f = fx();
+    let start = |sid: &str, at: u64| {
+        let ev =
+            json!({"harness": "pi", "at": at, "payload": {"session_id": sid, "kind": "start"}});
+        f.reg.ingest(HOST, ev, NOW).unwrap();
+    };
+    start("told", T0);
+    assert_eq!(f.reg.drain().len(), 1);
+    for i in 0..2000 {
+        start(&format!("flood-{i}"), T0 + 1 + i);
+    }
+    let changes = f.reg.drain();
+    let gone: Vec<&str> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::Gone { key, .. } => Some(key.as_str()),
+            Change::Upsert(_) => None,
+        })
+        .collect();
+    assert_eq!(gone, ["devbox/pi/told"]);
+    assert_eq!(changes.len(), 1 + OBS_SESSIONS_MAX);
+    // A listing tells of every record it holds.
+    f.reg.list();
+    start("one-more", T0 + 5000);
+    assert_eq!(f.reg.drain().len(), 2);
+}
+
+#[test]
+fn a_record_dropped_twice_between_drains_is_still_reported_gone() {
+    let f = fx();
+    let start = |sid: &str, at: u64| {
+        let ev =
+            json!({"harness": "pi", "at": at, "payload": {"session_id": sid, "kind": "start"}});
+        f.reg.ingest(HOST, ev, NOW).unwrap();
+    };
+    start("x", T0);
+    for i in 1..OBS_SESSIONS_MAX as u64 {
+        start(&format!("s{i}"), T0 + i);
+    }
+    f.reg.drain();
+    // Dropped for `y`, back as the quietest record again, and dropped for `z`.
+    start("y", T0 + 1000);
+    start("x", T0);
+    start("z", T0 + 1001);
+    let gone: Vec<String> = f
+        .reg
+        .drain()
+        .into_iter()
+        .filter_map(|c| match c {
+            Change::Gone { key, .. } => Some(key),
+            Change::Upsert(_) => None,
+        })
+        .collect();
+    assert_eq!(gone, ["devbox/pi/s1", "devbox/pi/x"]);
+}
+
+#[test]
+fn a_session_and_a_subagent_never_share_a_record() {
+    let f = fx();
+    let ev = |payload: Value| json!({"harness": "pi", "at": T0, "payload": payload});
+    f.reg
+        .ingest(HOST, ev(json!({"session_id": "s:a", "kind": "start"})), NOW)
+        .unwrap();
+    f.reg
+        .ingest(
+            HOST,
+            ev(json!({"session_id": "s", "agent_id": "a", "kind": "end"})),
+            NOW,
+        )
+        .unwrap();
+    f.reg
+        .ingest(
+            HOST,
+            ev(json!({"session_id": "s", "agent_id": "a:b", "kind": "start"})),
+            NOW,
+        )
+        .unwrap();
+    f.reg
+        .ingest(
+            HOST,
+            ev(json!({"session_id": "s:a", "agent_id": "b", "kind": "start"})),
+            NOW,
+        )
+        .unwrap();
+    let mut keys: Vec<String> = f.reg.list().into_iter().map(|s| s.key).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "devbox/pi/s/a",
+            "devbox/pi/s/a:b",
+            "devbox/pi/s:a",
+            "devbox/pi/s:a/b"
+        ]
+    );
+    assert_eq!(by_key(&f.reg, "devbox/pi/s:a").ended_at, None);
+}
+
+#[test]
 fn a_flood_of_sessions_stays_at_the_cap() {
     let f = fx();
     for i in 0..2000u64 {
         let ev = json!({"harness": "pi", "at": T0 + i, "payload": {"session_id": format!("flood-{i}"), "kind": "prompt", "text": "x"}});
-        f.reg.ingest(HOST, ev, T0).unwrap();
+        f.reg.ingest(HOST, ev, NOW).unwrap();
     }
     let all = f.reg.list();
     assert_eq!(all.len(), OBS_SESSIONS_MAX);
@@ -581,7 +708,7 @@ fn drain_reports_each_record_once_in_its_latest_state() {
         ups,
         [
             ("devbox/claude/s1".to_owned(), 2),
-            ("devbox/claude/s1:a1".to_owned(), 1)
+            ("devbox/claude/s1/a1".to_owned(), 1)
         ]
     );
     assert!(f.reg.drain().is_empty());
@@ -593,10 +720,10 @@ fn list_puts_live_first_then_newest() {
     for (sid, at) in [("a", T0 + 1), ("b", T0 + 3), ("c", T0 + 2)] {
         let mut ev = claude(sid, at, "SessionStart", json!({}));
         ev.as_object_mut().unwrap().remove("pid");
-        f.reg.ingest(HOST, ev, T0).unwrap();
+        f.reg.ingest(HOST, ev, NOW).unwrap();
     }
     f.reg
-        .ingest(HOST, claude("b", T0 + 4, "SessionEnd", json!({})), T0)
+        .ingest(HOST, claude("b", T0 + 4, "SessionEnd", json!({})), NOW)
         .unwrap();
     let order: Vec<String> = f.reg.list().into_iter().map(|s| s.session_id).collect();
     assert_eq!(order, ["c", "a", "b"]);
@@ -617,7 +744,7 @@ fn neutral_events_from_an_unknown_harness() {
         json!({"harness": "pi", "at": T0, "wbSession": "n_k3m9x2", "payload": payload})
     };
     f.reg
-        .ingest(HOST, ev("start", json!({"model": "m1"})), T0)
+        .ingest(HOST, ev("start", json!({"model": "m1"})), NOW)
         .unwrap();
     f.reg
         .ingest(
@@ -637,10 +764,10 @@ fn neutral_events_from_an_unknown_harness() {
     assert_eq!(s.title, "pi · y");
     assert_eq!(s.state, State::Running);
     f.reg
-        .ingest(HOST, ev("turn_end", json!({"text": "bye"})), T0)
+        .ingest(HOST, ev("turn_end", json!({"text": "bye"})), NOW)
         .unwrap();
     f.reg
-        .ingest(HOST, ev("end", json!({"reason": "quit"})), T0)
+        .ingest(HOST, ev("end", json!({"reason": "quit"})), NOW)
         .unwrap();
     let s = by_key(&f.reg, "devbox/pi/pi.1");
     assert_eq!(s.last_message.as_deref(), Some("bye"));
@@ -662,6 +789,20 @@ fn envelope_fields_are_untrusted() {
     assert_eq!((s.wb_session, s.pid, s.project_root), (None, None, None));
     assert_eq!(s.started_at, T0 + 5);
     assert_eq!(s.project, "src");
+}
+
+#[test]
+fn an_event_is_never_dated_after_the_servers_clock() {
+    let f = fx();
+    let ahead = claude("ahead", u64::MAX, "SessionStart", json!({}));
+    f.reg.ingest(HOST, ahead, T0 + 5).unwrap();
+    let behind = claude("behind", T0 - 9, "SessionStart", json!({"agent_id": "a"}));
+    f.reg.ingest(HOST, behind, T0 + 5).unwrap();
+    let at = |sid: &str| {
+        let all = f.reg.list();
+        all.iter().find(|s| s.session_id == sid).unwrap().last_at
+    };
+    assert_eq!((at("ahead"), at("behind")), (T0 + 5, T0 - 9));
 }
 
 #[test]
@@ -696,7 +837,7 @@ fn refusals_leave_the_registry_unchanged() {
     ];
     for (ev, want) in &rows {
         assert_eq!(
-            f.reg.ingest(HOST, ev.clone(), T0),
+            f.reg.ingest(HOST, ev.clone(), NOW),
             Err((*want).into()),
             "{ev}"
         );
@@ -711,9 +852,9 @@ fn refusals_leave_the_registry_unchanged() {
     f.reg.drain();
     let before = f.reg.list();
     let refused = claude("s1", T0 + 9, "UserPromptSubmit", json!({"agent_id": "a/b"}));
-    assert!(f.reg.ingest(HOST, refused, T0).is_err());
+    assert!(f.reg.ingest(HOST, refused, NOW).is_err());
     for (ev, _) in rows {
-        assert!(f.reg.ingest(HOST, ev, T0).is_err());
+        assert!(f.reg.ingest(HOST, ev, NOW).is_err());
     }
     assert_eq!(f.reg.list(), before);
     assert!(f.reg.drain().is_empty());
@@ -739,7 +880,7 @@ fn save_and_load_round_trip() {
         ],
     );
     f.reg
-        .ingest(HOST, claude("s2", T0, "Stop", json!({})), T0)
+        .ingest(HOST, claude("s2", T0, "Stop", json!({})), NOW)
         .unwrap();
     f.reg.save().unwrap();
     let path = f.dir.path().join(FILE);
@@ -829,7 +970,7 @@ fn load_sweeps_and_caps() {
     for i in 0..OBS_SESSIONS_MAX as u64 + 5 {
         let mut ev = claude(&format!("s{i}"), T0 + i, "SessionStart", json!({}));
         ev.as_object_mut().unwrap().remove("pid");
-        f.reg.ingest(HOST, ev, T0).unwrap();
+        f.reg.ingest(HOST, ev, NOW).unwrap();
     }
     f.reg.save().unwrap();
     let path = f.dir.path().join(FILE);
