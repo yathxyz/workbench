@@ -6,16 +6,19 @@ mod normalize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use tokio::sync::broadcast;
 use wb_proto::state::State;
 
-use crate::util::atomic_write;
+use crate::util::{atomic_write, now_ms};
 use normalize::{Event, excerpt, normalize};
 
 pub const OBS_SESSIONS_MAX: usize = 256;
@@ -167,6 +170,31 @@ fn de_state<'de, D: Deserializer<'de>>(d: D) -> Result<State, D::Error> {
 pub enum Change {
     Upsert(Box<ObservedSession>),
     Gone { id: String, key: String },
+}
+
+/// Changes a slow subscriber may fall behind by before it lags.
+const CHANGES_CAPACITY: usize = 1024;
+
+/// The registry and the broadcast of its changes; present when web.json has `api`.
+#[derive(Clone)]
+pub struct Observed {
+    pub registry: Registry,
+    pub changes: broadcast::Sender<Change>,
+}
+
+impl Observed {
+    /// Loads the registry from `state_dir`, which is created if need be.
+    pub fn load(state_dir: &Path, host: &str) -> Result<Observed> {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(state_dir)
+            .with_context(|| format!("cannot create {}", state_dir.display()))?;
+        Ok(Observed {
+            registry: Registry::load(state_dir, host, Path::new("/proc"), now_ms()),
+            changes: broadcast::channel(CHANGES_CAPACITY).0,
+        })
+    }
 }
 
 /// Where a record is in its turn.

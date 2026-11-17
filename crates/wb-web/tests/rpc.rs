@@ -436,3 +436,20 @@ async fn rpc_closes_1012_on_sigterm() {
     assert_eq!(read_to_close(&mut rpc).await.0, 1012);
     assert!(web.wait_exit().await.success());
 }
+
+/// Without `api` there is no registry: no `observed` message, and `mesh` is false.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_api_rpc_has_no_observed_sessions() {
+    let hub = FakeHub::start();
+    let web = Web::start(&hub.path);
+    web.wait_hub("up").await;
+    let mut rpc = web.ws("/rpc").await;
+    // The snapshot is hub, board, sessions; `observed` would come after it.
+    for want in ["hub", "board", "sessions"] {
+        assert_eq!(next_json(&mut rpc).await["t"], want);
+    }
+    let more = tokio::time::timeout(Duration::from_millis(200), next_json(&mut rpc)).await;
+    assert!(more.is_err(), "unexpected message {more:?}");
+    let info = web.req("GET", "/api/info").send().await.json();
+    assert_eq!(info["mesh"], false);
+}

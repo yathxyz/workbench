@@ -11,8 +11,6 @@ mod stream;
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
@@ -32,7 +30,7 @@ use tokio::time::{MissedTickBehavior, interval};
 
 use crate::AppState;
 use crate::http::{ApiError, not_found};
-use crate::observed::{Change, OBS_PUSH_EVERY, OBS_SAVE_EVERY, OBS_SWEEP, Registry};
+use crate::observed::{Change, OBS_PUSH_EVERY, OBS_SAVE_EVERY, OBS_SWEEP, Observed, Registry};
 use crate::routes::method_not_allowed;
 use crate::util::now_ms;
 use listener::{Capped, Peer};
@@ -101,25 +99,19 @@ pub struct Api {
 
 pub type ApiState = Arc<Api>;
 
-/// Changes a slow event stream may fall behind by before it is disconnected.
-const CHANGES_CAPACITY: usize = 1024;
-
-/// Loads the registry and serves the API on `listener` until `app` stops. The registry
-/// is saved when the stop begins, and again once the last request has ended, which is
+/// Serves the API on `listener` until `app` stops. The registry (`app.observed`) is
+/// saved when the stop begins, and again once the last request has ended, which is
 /// where the task ends.
 pub fn start(app: AppState, gate: Gate, listener: TcpListener) -> Result<JoinHandle<()>> {
-    let state_dir = &app.cfg.state_dir;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(state_dir)
-        .with_context(|| format!("cannot create {}", state_dir.display()))?;
-    let registry = Registry::load(state_dir, &app.cfg.host, Path::new("/proc"), now_ms());
+    let Observed { registry, changes } = app
+        .observed
+        .clone()
+        .context("the api needs the observed registry")?;
     let api = Arc::new(Api {
         app,
         gate,
         registry,
-        changes: broadcast::channel(CHANGES_CAPACITY).0,
+        changes,
     });
     tracing::info!("api listening on {}", listener.local_addr()?);
     let service = router(api.clone()).into_make_service_with_connect_info::<Peer>();

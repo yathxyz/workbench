@@ -8,7 +8,7 @@ mod common;
 
 use std::net::SocketAddr;
 
-use common::{FakeHub, Hello, Req, Resp, WAIT, Web, pty_summary};
+use common::{FakeHub, Hello, Req, Resp, WAIT, Web, next_json, pty_summary};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -1132,4 +1132,41 @@ async fn events_become_observed_sessions() {
     let saved: Value = serde_json::from_slice(&saved).unwrap();
     assert_eq!(saved["v"], 1);
     assert_eq!(saved["sessions"].as_array().unwrap().len(), 2);
+}
+
+/// Reads `ws` until a message with `t == want` arrives; the others are skipped.
+async fn rpc_until(ws: &mut common::Ws, want: &str) -> Value {
+    loop {
+        let msg = next_json(ws).await;
+        if msg["t"] == want {
+            return msg;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rpc_carries_the_observed_sessions() {
+    let api = Api::start().await;
+    let mut rpc = api.web.ws("/rpc").await;
+    assert_eq!(rpc_until(&mut rpc, "observed").await["sessions"], json!([]));
+
+    let event = json!({"harness": "pi", "payload": {"session_id": "s1", "kind": "prompt", "text": "hello"}});
+    let res = api
+        .req("POST", "/v1/events", AGENTS)
+        .from(AGENTS_ADDR)
+        .body(event.to_string())
+        .send()
+        .await;
+    assert_eq!(res.status, 204);
+    let put = rpc_until(&mut rpc, "observed_put").await;
+    assert_eq!(put["session"]["key"], "devbox/pi/s1");
+    assert_eq!(put["session"]["host"], "devbox");
+
+    let mut late = api.web.ws("/rpc").await;
+    let snapshot = rpc_until(&mut late, "observed").await;
+    assert_eq!(snapshot["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["sessions"][0]["key"], "devbox/pi/s1");
+
+    let info = api.web.req("GET", "/api/info").send().await.json();
+    assert_eq!(info["mesh"], true);
 }

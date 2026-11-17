@@ -1,6 +1,8 @@
 //! `/rpc` (design §3.5.3), the feed so far: `hub{…}`, `board{etag}` and `sessions{…}` on
 //! connect, `hub{…}` and `sessions{…}` whenever the hub comes up, then `session`, `gone`,
-//! `board{etag}` and `notes{gen}` as they happen. Client messages are read for the cap
+//! `board{etag}` and `notes{gen}` as they happen. With `api` configured, connect ends
+//! with `observed{sessions}`, followed by `observed_put{session}` and
+//! `observed_gone{oid, key}` (design §3.8.3). Client messages are read for the cap
 //! and the keepalive; `sample`, `tool_result`, `tool_error`, `cancel` and `limits` go
 //! through [`crate::sample`], `active` and `cmd_result` go to [`Pages`], and the rest
 //! are ignored.
@@ -22,13 +24,14 @@ use axum::response::Response;
 use axum::routing::get;
 use serde_json::{Map, Value, json};
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use wb_proto::limits::WS_MAX_RPC;
 
 use crate::board;
 use crate::edit_client::Delivery;
 use crate::http::{self, Keepalive, Tick, close, send_json, ws_close, ws_too_big};
 use crate::hub::{HubStatus, with_state};
+use crate::observed::Change;
 use crate::sample::Tab;
 use crate::{AppState, FeedMsg};
 
@@ -79,13 +82,28 @@ async fn connect_snapshot(app: &AppState) -> Vec<Value> {
         Ok(etag) => msgs.insert(1, json!({"t": "board", "etag": etag})),
         Err(e) => tracing::warn!(error = %e, "cannot read the board's tag"),
     }
+    if let Some(observed) = &app.observed {
+        let sessions = observed.registry.list();
+        msgs.push(json!({"t": "observed", "sessions": sessions}));
+    }
     msgs
+}
+
+/// The next observed change; never ready without `api`.
+async fn next_change(
+    changes: &mut Option<broadcast::Receiver<Change>>,
+) -> Result<Change, RecvError> {
+    match changes {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn run(app: AppState, mut ws: WebSocket) {
     // Subscribe before the snapshot, so no change falls between the two. A change in
     // both arrives twice, and applying it again is harmless.
     let mut feed = app.feed.subscribe();
+    let mut changes = app.observed.as_ref().map(|o| o.changes.subscribe());
     // Registered before the snapshot: a client that has read its first message can
     // already be chosen. Dropped on every return below, which fails its open calls.
     let (to_tab, mut deliveries) = mpsc::unbounded_channel();
@@ -151,6 +169,17 @@ async fn run(app: AppState, mut ws: WebSocket) {
                 // Missed messages: resend what can be resent.
                 Err(RecvError::Lagged(_)) => connect_snapshot(&app).await,
                 Err(RecvError::Closed) => return,
+            },
+            change = next_change(&mut changes) => match change {
+                Ok(Change::Upsert(session)) => vec![json!({"t": "observed_put", "session": session})],
+                // `oid`, not `id`: on this socket `id` names a call's reply.
+                Ok(Change::Gone { id, key }) => vec![json!({"t": "observed_gone", "oid": id, "key": key})],
+                Err(RecvError::Lagged(_)) => connect_snapshot(&app).await,
+                // No sender is left; stop polling rather than spin.
+                Err(RecvError::Closed) => {
+                    changes = None;
+                    continue;
+                }
             },
             tick = keepalive.tick() => match tick {
                 Tick::Ping => {

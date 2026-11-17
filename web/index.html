@@ -76,10 +76,12 @@
     <input id="g-q" placeholder="Highlight… (Enter selects)" autocomplete="off" spellcheck="false">
     <label><input type="checkbox" id="g-all" checked> Shells, agents</label>
     <label><input type="checkbox" id="g-ghost" checked> Pages not written yet</label>
+    <label class="needs-mesh" hidden><input type="checkbox" id="g-mesh" checked> Agents on the mesh</label>
     <button class="tb" id="g-fit">Fit</button>
   </div>
   <div class="g-legend">
     <span><i class="lg-page"></i>page</span><span><i class="lg-term"></i>shell</span><span><i class="lg-agent"></i>agent</span>
+    <span class="needs-mesh" hidden><i class="lg-host"></i>host</span><span class="needs-mesh" hidden><i class="lg-proj"></i>project</span><span class="needs-mesh" hidden><i class="lg-sess st-running"></i>working</span><span class="needs-mesh" hidden><i class="lg-sess st-waiting_input"></i>waiting for you</span><span class="needs-mesh" hidden><i class="lg-sess st-done"></i>finished</span><span class="needs-mesh" hidden><i class="lg-sess"></i>idle</span>
     <span><b class="ln-link"></b>[[link]]</span><span><b class="ln-spawn"></b>branch</span><span><b class="ln-pipe"></b>pipe</span><span><b class="ln-sketch"></b>drawn arrow</span>
   </div>
   <div id="g-card" class="g-card" hidden></div>
@@ -161,10 +163,14 @@
 <aside id="side" aria-label="Docked terminal">
   <div id="side-grip" role="separator" aria-orientation="vertical" title="Drag to resize · double-click to reset"></div>
   <div class="side-hd">
-    <span class="side-tabs" role="tablist"><button class="on" data-side="term" role="tab" title="Docked terminal (Ctrl-`)">Terminal</button></span><span id="side-ctx"></span>
+    <span class="side-tabs" role="tablist"><button class="on" data-side="term" role="tab" title="Docked terminal (Ctrl-`)">Terminal</button><button class="needs-mesh" data-side="agents" role="tab" title="Every agent session on the hosts of the mesh, the ones waiting for you first" hidden>Agents</button></span><span id="side-ctx"></span>
     <button class="hb" id="side-close" title="Hide">✕</button>
   </div>
   <div class="k-term side-wrap" id="side-term"><div class="body" id="side-term-body"></div></div>
+  <div class="side-wrap" id="side-mesh" hidden>
+    <div class="mesh-bar"><span id="mesh-sum"></span><label title="Also list the sessions that have ended"><input type="checkbox" id="mesh-ended"> Ended</label></div>
+    <div id="mesh-list" role="list"></div>
+  </div>
 </aside>
 
 <div id="pick-chip" hidden><span id="pick-n"></span><button class="mini" data-act="delete" title="Remove the selection: ink, shapes and cards (Delete). Ctrl-Z brings ink and shapes back.">Delete</button><button class="mini" data-act="sketch" title="Turn the selected handwriting into a sketch card: it gets an address, tags, arrows and Aa → text">Sketch card</button><button class="mini" data-act="read" title="Read the selected handwriting into text">Aa → text</button><button class="mini" data-act="png" title="Copy the selected ink as PNG (transparent), for Krita or another program">PNG</button><button class="mini" data-act="svg" title="Copy the selected ink as SVG paths, for Krita, Inkscape or another program">SVG</button><button class="mini" data-act="compact" title="Pack the selected items into tight rows (c)">Compact</button><button class="mini" data-act="clear" title="Clear the selection (Esc)">✕</button></div>

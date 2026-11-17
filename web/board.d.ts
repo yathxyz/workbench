@@ -48,7 +48,7 @@ interface Board {
   treeClosed?: Record<string, boolean>;
   paneW?: number;
   side?: boolean;                      // the side pane is open
-  sideTab?: 'chat' | 'term';
+  sideTab?: 'chat' | 'term' | 'agents';   // 'agents' is the mesh's sessions (F-A47); 'chat' is no longer a tab
   docks?: Record<string, boolean>;
   theme?: BoardTheme;
   view?: ViewName;
@@ -475,7 +475,7 @@ interface BootError { kind: 'net' | 'signed_out' | 'forbidden' | 'http' | 'not_j
 /* What /api/info says about the serving daemon (INFO, line 4956). */
 interface DaemonInfo {
   host: string; home: string;
-  edit?: boolean; editUp?: boolean; sample?: boolean; models?: unknown; notes?: string; notesExists?: boolean;
+  edit?: boolean; mesh?: boolean; editUp?: boolean; sample?: boolean; models?: unknown; notes?: string; notesExists?: boolean;
   media?: MediaProviderInfo[];         // the image providers media cards can use (F-A41)
   state?: string; artifactOrigin?: string;
   agents?: { name: string; label: string }[];
@@ -490,6 +490,34 @@ interface MediaProviderInfo { name: string; api: 'openai' | 'huggingface'; model
 
 /* A session's state, from the hub's summary. */
 type SessionState = 'idle' | 'running' | 'waiting_permission' | 'waiting_input' | 'done' | 'error' | 'exited' | 'detached';
+/* What an event of an observed session was (§3.8.3). */
+type ObsKind = 'start' | 'prompt' | 'tool_start' | 'tool_end' | 'tool_fail' | 'permission' | 'permission_done'
+  | 'question' | 'turn_end' | 'subagent_start' | 'subagent_end' | 'note' | 'end';
+/* A session some host's harness reports to wb-web's API (§3.8.3), as /rpc carries it (OBS[id]). */
+interface ObservedSession {
+  id: string; key: string; host: string; harness: string; sessionId: string;
+  parent: string | null;               // the id of a subagent's session
+  agentType: string | null;
+  wbSession: string | null;            // the hub session it runs in (its WB_SESSION)
+  pid: number | null; transcriptPath: string | null;
+  cwd: string | null; projectRoot: string | null; project: string;
+  model: string | null; permissionMode: string | null;
+  title: string; state: SessionState;
+  startedAt: number; lastAt: number; endedAt: number | null;
+  endReason: null | 'session_end' | 'process_gone' | 'silent' | 'replaced' | 'parent_ended';
+  tool: { name: string; input: string | null } | null;
+  pending: { kind: 'permission' | 'question'; tool: string | null; input: string | null; message: string | null; at: number } | null;
+  lastPrompt: string | null; lastMessage: string | null;
+  counts: { events: number; prompts: number; tools: number; toolFailures: number; subagents: number };
+  tail: { at: number; kind: ObsKind; text: string }[];
+}
+/* One row of the Agents pane (F-A47): an observed session, joined with the hub session it runs in when that is on
+   the same host, or an agent card's session that no harness reports. */
+interface MeshRow {
+  id: string; host: string; harness: string; project: string; title: string;
+  state: SessionState; since: number; at: number; live: boolean;
+  obs: ObservedSession | null; sess: SessionSummary | null; card: BoardNode | null; kids: MeshRow[];
+}
 /* How a PTY ended. */
 type PtyExitReason = 'exited' | 'killed' | 'hub_restart' | 'spawn_failed';
 /* The hub's facts about one session, PTY or ACP (SESS[sid]). */
@@ -590,6 +618,9 @@ type HubMsg =
   | { t: 'session'; session: SessionSummary }
   | { t: 'gone'; sid: string; epoch: number }
   | { t: 'board'; etag: string }
+  | { t: 'observed'; sessions: ObservedSession[] }
+  | { t: 'observed_put'; session: ObservedSession }
+  | { t: 'observed_gone'; oid: string; key: string }   // oid: a top-level id is a call's reply
   | { t: 'notes'; gen: number }
   | { t: 'cmd'; id: string; tool: string; input: AgentToolInput }
   | { t: 'text'; id: string; text: string }
@@ -726,7 +757,7 @@ interface SystemdUnit { unit: string; load: string; active: string; sub: string;
 /* A host's units as UNITS.data caches them. */
 interface UnitsData { at: number; units: SystemdUnit[]; error?: string | null; loading?: boolean }
 /* The status line's counts (statusCounts). */
-interface StatusCounts { hosts: number; down: number; failed: number; agents: number; waiting: number; due: number | null; tasks: number; dueToday: number }
+interface StatusCounts { hosts: number; down: number; failed: number; agents: number; waiting: number; mesh: number; meshWaiting: number; due: number | null; tasks: number; dueToday: number }
 
 // ---- clipboard
 

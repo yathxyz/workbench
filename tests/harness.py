@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Start wb-hub, edwind, wb-web and a test Caddy on loopback with temporary configs.
 
-  python3 -I tests/harness.py --web-root DIR [--bin-dir DIR] [--dogfood] [--board FILE]
+  python3 -I tests/harness.py --web-root DIR [--bin-dir DIR] [--dogfood] [--board FILE] [--api]
 
 Prints one JSON line on stdout once everything listens:
   {web, caddy, caddySocket, hubSocket, webSocket, editSocket, caddyAdmin, stateDir, boardsDir, notesDir, host, boardFile}
+and, with --api, {api, apiTokenFiles: {near, far}}: the mesh API's address and the files of its two tokens.
 
 wb-web listens on 127.0.0.1:18090 and trusts 127.0.0.1. Caddy injects the proxy secret and
 listens only on caddySocket, a 0600 unix socket in the 0700 temporary directory, for the site
@@ -80,6 +81,7 @@ import time
 from pathlib import Path
 
 WEB_ADDR = ("127.0.0.1", 18090)
+API_ADDR = ("127.0.0.1", 18091)
 CADDY_TCP = ("127.0.0.1", 18443)
 PUBLIC_ORIGIN = "http://127.0.0.1:18443"
 CADDY_DIR = Path(__file__).resolve().parent / "caddy"
@@ -164,7 +166,7 @@ def can_connect_unix(path):
 
 
 class Harness:
-    def __init__(self, web_root, bin_dir=None, dogfood=False, tcp=False, board=None, media=None):
+    def __init__(self, web_root, bin_dir=None, dogfood=False, tcp=False, board=None, media=None, api=False):
         self.web_root = str(Path(web_root).resolve())
         self.bin_dir = bin_dir
         self.dogfood = dogfood
@@ -252,6 +254,18 @@ class Harness:
             "host": host,
             "logLevel": "info",
         }
+        self.api_tokens = {}
+        if api:
+            # the mesh API (design §3.8) on loopback: a token that files events under this host, one under "farbox"
+            clients = {}
+            for name, client_host in (("near", host), ("far", "farbox")):
+                path = self.root / f"api-{name}"
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+                with os.fdopen(fd, "w") as f:
+                    f.write(secrets.token_hex(32) + "\n")
+                self.api_tokens[name] = str(path)
+                clients[name] = {"tokenFile": str(path), "scopes": ["events"], "host": client_host}
+            self.web_config["api"] = {"listen": f"{API_ADDR[0]}:{API_ADDR[1]}", "clients": clients}
         self.hub_json = self.write_json("hub.json", self.hub_config)
         self.web_json = self.write_json("web.json", self.web_config)
         self.edit_json = self.write_json("edit.json", self.edit_config)
@@ -434,6 +448,7 @@ class Harness:
             "notesDir": str(self.notes_dir),
             "host": self.host,
             "boardFile": str(self.board_file),
+            **({"api": f"http://{API_ADDR[0]}:{API_ADDR[1]}", "apiTokenFiles": self.api_tokens} if self.api_tokens else {}),
         }
 
     def __enter__(self):
@@ -453,6 +468,7 @@ def main():
     p.add_argument("--bin-dir", help="directory holding wb-hub and wb-web (default: PATH)")
     p.add_argument("--dogfood", action="store_true", help="real HOME, no canaries, ignore stdin")
     p.add_argument("--board", help="a board JSON file to install as <boardsDir>/<host>.json before the start")
+    p.add_argument("--api", action="store_true", help="web.json api: the mesh API on 127.0.0.1:18091, its tokens in the info line")
     p.add_argument("--media", help="web.json media: an OpenAI-compatible image provider \"stub\" at this base URL")
     a = p.parse_args()
     if not a.web_root:
@@ -470,7 +486,7 @@ def main():
 
     try:
         h = Harness(a.web_root, a.bin_dir, a.dogfood, tcp=os.environ.get("WB_HARNESS_TCP") == "1",
-                    board=a.board, media=a.media)
+                    board=a.board, media=a.media, api=a.api)
     except (RuntimeError, OSError, ValueError) as e:
         print(f"harness: {e}", file=sys.stderr)
         return 1

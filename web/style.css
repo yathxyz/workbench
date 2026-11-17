@@ -430,6 +430,8 @@ body.side-open #side { transform: none; visibility: visible; transition: transfo
 .g-legend i { width: 10px; height: 10px; border-radius: var(--radius); display: inline-block; }
 .g-legend .lg-page { border-radius: 50%; background: var(--link); } .lg-term { background: var(--accent); } .lg-agent { background: var(--ref); }
 .g-legend b { width: 18px; height: 0; border-top: 2px solid; display: inline-block; }
+.g-legend .lg-host { background: var(--fg); clip-path: polygon(25% 5%, 75% 5%, 100% 50%, 75% 95%, 25% 95%, 0 50%); } .g-legend .lg-proj { background: none; box-shadow: inset 0 0 0 2px var(--folder-node); }
+.g-legend .lg-sess { background: var(--muted); border-radius: 0; clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%); } .lg-sess.st-running { background: var(--info); } .lg-sess.st-waiting_input { background: var(--warn); } .lg-sess.st-done { background: var(--ok); }
 .ln-link { border-color: var(--muted) !important; } .ln-spawn { border-color: var(--accent) !important; } .ln-pipe { border-color: var(--pipe) !important; } .ln-sketch { border-color: var(--ink-red) !important; border-top-style: dashed !important; }
 .g-card { position: absolute; top: 58px; right: 12px; width: min(340px, calc(100% - 24px)); max-height: calc(100% - 120px); overflow: auto; box-sizing: border-box;
   background: var(--panel); border: 1.5px solid var(--stroke); border-radius: var(--radius); padding: 12px; display: grid; gap: 10px; }
@@ -637,6 +639,25 @@ body.listening #st-buf-text { color: var(--ink-red); }
 .side-tabs button { border: 0; background: transparent; padding: 4px 8px; border-radius: var(--radius); cursor: pointer; font: 600 13px var(--mono); color: var(--muted); }
 .side-tabs button.on { color: var(--fg); background: var(--panel-2); box-shadow: inset 0 -2px 0 var(--accent); }
 #side-term .body { background: var(--term-bg); overflow: hidden; position: relative; }
+/* The Agents tab (F-A47): the mesh's sessions by project. A row's dot has an agent card's state colours. */
+#side-mesh { flex-direction: column; font: 12.5px var(--mono); }
+.mesh-bar { flex: none; display: flex; gap: 10px; align-items: center; padding: 7px 12px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11.5px; }
+.mesh-bar #mesh-sum { flex: 1; min-width: 0; } .mesh-bar label { display: flex; gap: 4px; align-items: center; white-space: nowrap; }
+#mesh-list { flex: 1; min-height: 0; overflow: auto; padding: 4px 6px calc(env(safe-area-inset-bottom, 0px) + 10px); } #mesh-list > p { padding: 10px 8px; }
+.mesh-group { padding: 10px 8px 3px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mesh-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px 5px calc(8px + var(--d, 0) * 16px); border-radius: var(--radius); cursor: pointer; }
+.mesh-row:hover { background: var(--panel-2); } .mesh-row.on { background: var(--accent-soft); } .mesh-row.ended { opacity: .55; }
+.mesh-row .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.mesh-row .dot.st-running { background: var(--info); } .mesh-row .dot.st-waiting_permission, .mesh-row .dot.st-waiting_input { background: var(--warn); } .mesh-row .dot.st-error { background: var(--err); } .mesh-row .dot.st-done { background: var(--ok); }
+.mesh-row .dot.st-exited, .mesh-row .dot.st-detached { background: transparent; box-shadow: inset 0 0 0 1px var(--muted); }
+.mesh-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.mesh-main b, .mesh-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .mesh-main b { font-weight: 600; }
+.mesh-sub, .mesh-at { color: var(--muted); font-size: 11.5px; } .mesh-row.bad .mesh-sub { color: var(--warn); } .mesh-at { flex: none; }
+.mesh-detail { margin: 2px 8px 8px 24px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-2); display: flex; flex-direction: column; gap: 6px; }
+.mesh-info { display: flex; flex-direction: column; gap: 3px; }
+.mesh-kv { display: flex; gap: 8px; } .mesh-kv span { flex: none; width: 52px; color: var(--muted); } .mesh-kv code { flex: 1; min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; max-height: 6em; overflow: auto; }
+.mesh-info pre { margin: 4px 0 0; font: 11.5px/1.45 var(--mono); color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 14em; overflow: auto; }
+.mesh-hint { color: var(--muted); font-size: 11.5px; }
 #side-term .xterm { padding: 8px 6px 6px 10px; height: 100%; box-sizing: border-box; }
 
 #v-ranger { display: flex; flex-direction: column; font: 13px var(--mono); }

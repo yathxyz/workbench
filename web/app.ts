@@ -413,7 +413,7 @@ function sessChanged(sid: string): void { if (S?.nodes[sid]) { updateTitle(S.nod
 type SessTimerFn = typeof sessChanged & { t?: number };
 type SessShownFn = typeof sessShown & { last?: string };
 function sessShown(): void {
-  statusRender();
+  statusRender(); meshRender(); graphMesh();
   const shown = S ? nodeList().filter(n => n.kind === 'acp').map(n => n.id + ' ' + badgeOf(n) + ' ' + SESS[n.id]?.state).join('\n') : '';
   if (shown === (sessShown as SessShownFn).last) return;
   (sessShown as SessShownFn).last = shown; renderTree();
@@ -431,6 +431,9 @@ const RPC_EVENTS: RpcEventHandlers = {
     live[m.sid]?.backend?.goneElsewhere?.(m.epoch); sessChanged(m.sid);
   },
   board: m => boardChanged(m.etag),
+  observed: m => { const was: Record<string, SessionState> = {}; for (const k in OBS) { was[k] = OBS[k].state; delete OBS[k]; } (m.sessions || []).forEach(o => obsPut(o, was[o.id])); meshChanged(); },
+  observed_put: m => obsPut(m.session),
+  observed_gone: m => { delete OBS[m.oid]; meshChanged(); },
 };
 // Hub status (30 §3.3).
 function hubStatus(m: Extract<HubMsg, { t: 'hub' }>): void {
@@ -4061,9 +4064,11 @@ $('#rg-prev')!.addEventListener('click', (e: MouseEvent) => { const r = (e.targe
 
 // ------------------------------------------------------------------ docked terminal: a shell in the side pane
 function sideTab(which?: Board['sideTab']) {
-  which = 'term'; S.sideTab = which; dirty();
+  if (which !== 'agents' || !INFO?.mesh) which = 'term';   // the Agents tab is there with the mesh API only (F-A47)
+  S.sideTab = which; dirty();
   $$('.side-tabs button').forEach(b => b.classList.toggle('on', b.dataset.side === which));
-  $('#side-term')!.hidden = false;
+  $('#side-term')!.hidden = which !== 'term'; $('#side-mesh')!.hidden = which !== 'agents';
+  if (which === 'agents') meshRender();
   if (which === 'term') {
     if (!S.dockTerm) { S.dockTerm = { id: 'dock', kind: 'term', name: 'dock', backend: DAEMON ? 'pty' : 'fake', cwd: DAEMON ? undefined : '/home/me', env: {}, _spawn: BOOTED } as TermNode; if (shellDefault()) S.dockTerm.shell = shellDefault(); dirty(); }
     if (!live.dock) { live.dock = { el: $('#side-term')!, body: $('#side-term-body')!, hdr: null }; mountTerm(S.dockTerm, live.dock); }
@@ -4075,6 +4080,130 @@ function toggleDockTerm() {
   if (open && S.sideTab === 'term') toggleSide(false); else { toggleSide(true); sideTab('term'); }
 }
 $$('.side-tabs button').forEach(b => b.onclick = () => sideTab(b.dataset.side as Board['sideTab']));
+
+// ------------------------------------------------------------------ agents on the mesh: every session the hub runs or is told of (§3.8.3, F-A47)
+// Observed sessions from /rpc: observed replaces, observed_put upserts, observed_gone deletes.
+const OBS: Record<string, ObservedSession> = {};
+const MESH: { open: string | null; ended: boolean; shape: string; graph: string; topo: string; t: number } = { open: null, ended: false, shape: '', graph: '', topo: '', t: 0 };
+// The hub session an observed one runs in: its WB_SESSION, believed only from the host that session is on.
+function obsSess(o: ObservedSession): SessionSummary | null { const s = !o.parent && o.wbSession ? SESS[o.wbSession] : undefined; return s && s.host === o.host ? s : null; }
+function obsPut(o: ObservedSession | undefined, was = o && OBS[o.id]?.state): void {
+  if (!o?.id) return;
+  OBS[o.id] = o; meshChanged();
+  if (!obsCarded(obsSess(o))) attnSignal(o.id, was, o.state, meshName(o));
+}
+// An agent card whose own session waits already says so: in the Attention list and in the out-of-page signal.
+function obsCarded(sess: SessionSummary | null): boolean { return !!sess && sess.kind === 'acp' && ACP_BAD.has(sess.state) && S?.nodes[sess.sid]?.kind === 'acp'; }
+// Shown at most every 250 ms, however fast the changes come.
+function meshChanged(): void { if (!MESH.t) MESH.t = setTimeout(() => { MESH.t = 0; sessShown(); }, 250); }
+// The overview's rows: observed sessions with their subagents under them, then the agent sessions of the hub that
+// no harness reports. Either side saying a session waits for you makes it waiting.
+function meshRows(): MeshRow[] {
+  const rows = new Map<string, MeshRow>(), joined = new Set<string>(), top: MeshRow[] = [];
+  for (const o of Object.values(OBS)) {
+    const sess = obsSess(o), acp = sess?.kind === 'acp' ? sess : null, ended = o.endedAt != null; if (sess) joined.add(sess.sid);
+    rows.set(o.id, { id: o.id, host: o.host, harness: o.harness, project: o.project, title: o.title, state: acp && (ended || ACP_BAD.has(acp.state)) ? acp.state : o.state,
+      since: o.startedAt, at: o.lastAt, live: ended ? !!acp?.alive : true, obs: o, sess, card: (sess && S?.nodes[sess.sid]) || null, kids: [] });   // a record that went silent ends; the agent the hub still runs has not
+  }
+  for (const s of Object.values(SESS)) if (s.kind === 'acp' && !joined.has(s.sid)) {
+    const card = S?.nodes[s.sid] || null, agent = agentLabel(s.acp?.agent);
+    rows.set(s.sid, { id: s.sid, host: s.host, harness: agent, project: s.cwd?.replace(/\/+$/, '').split('/').pop() || '(no cwd)', title: s.acp?.title || card?.name || agent, state: s.state,
+      since: s.createdAt, at: s.updatedAt, live: s.alive, obs: null, sess: s, card, kids: [] });
+  }
+  for (const r of rows.values()) { const up = r.obs?.parent ? rows.get(r.obs.parent) : undefined; (up ? up.kids : top).push(r); }
+  return top;
+}
+function meshFlat(rows: MeshRow[] = meshRows()): MeshRow[] { return rows.flatMap(r => [r, ...meshFlat(r.kids)]); }
+const meshBad = (r: MeshRow): boolean => r.live && ACP_BAD.has(r.state);
+const meshName = (r: { harness: string; project: string }): string => r.harness + ' in ' + r.project;
+const meshWants = (st: SessionState): string => st === 'waiting_permission' ? 'needs permission' : st === 'waiting_input' ? 'asks a question' : 'failed';
+const agoShort = (t: number): string => { const s = Math.max(0, Date.now() - t) / 1000; return s < 60 ? 'now' : s < 3600 ? Math.floor(s / 60) + 'm' : s < 86400 ? Math.floor(s / 3600) + 'h' : Math.floor(s / 86400) + 'd'; };
+// What a session is doing, in one line.
+function meshDoing(r: MeshRow): string {
+  const o = r.obs, p = o?.pending, line = (...xs: (string | null | undefined)[]) => xs.filter(Boolean).join(' ').split('\n')[0].slice(0, 120);
+  if (!r.live) return 'ended' + (o?.endReason && o.endReason !== 'session_end' ? ' (' + o.endReason.replace(/_/g, ' ') + ')' : '');
+  if (ACP_BAD.has(r.state)) { const what = line(p?.tool, p?.input || p?.message) || line(r.sess?.acp?.pending?.[0]?.title) || line(r.sess?.fault?.message); return meshWants(r.state) + (what ? ': ' + what : ''); }
+  if (r.state === 'running') return o?.tool ? line(o.tool.name, o.tool.input) : 'working';
+  return r.state === 'done' ? 'finished' : r.state.replace(/_/g, ' ');
+}
+function meshRowEl(r: MeshRow, depth: number): HTMLElement {
+  const row = el('div', 'mesh-row'), main = el('div', 'mesh-main'); row.dataset.id = r.id; row.style.setProperty('--d', String(depth)); row.setAttribute('role', 'listitem');
+  main.append(el('b'), el('span', 'mesh-sub')); row.append(el('i', 'dot'), main, el('span', 'mesh-at'));
+  if (r.card) { const go = el('button', 'mini', '↗'); go.title = 'Show its card on the canvas'; go.onclick = e => { e.stopPropagation(); const n = S.nodes[r.card!.id]; if (n) jumpNode(n); }; row.append(go); }
+  row.onclick = () => { MESH.open = MESH.open === r.id ? null : r.id; meshRender(); };
+  return row;
+}
+// A row's texts, set in place: a row under the pointer is not replaced while its session works.
+function meshFill(row: HTMLElement, r: MeshRow, depth: number): void {
+  row.className = 'mesh-row' + (r.live ? '' : ' ended') + (meshBad(r) ? ' bad' : '') + (r.id === MESH.open ? ' on' : '');
+  $('.dot', row)!.className = 'dot st-' + (r.live ? r.state : 'exited');
+  const set = (sel: string, text: string) => { const e = $(sel, row)!; if (e.textContent !== text) e.textContent = text; };
+  set('b', r.title); set('.mesh-at', agoShort(r.at));
+  set('.mesh-sub', [depth && r.obs?.agentType ? r.obs.agentType : r.harness, ...(depth ? [] : ['@' + r.host]), meshDoing(r)].join(' · '));
+}
+function meshInfo(box: HTMLElement, r: MeshRow): void {
+  const o = r.obs, out: HTMLElement[] = [], kv = (k: string, v: string | null | undefined | false) => { if (v) { const d = el('div', 'mesh-kv'); d.append(el('span', '', k), el('code', '', v)); out.push(d); } };
+  kv('folder', o?.cwd || r.sess?.cwd); kv('model', o?.model); kv('mode', o?.permissionMode);
+  kv('waiting', meshBad(r) && meshDoing(r)); kv('prompt', o?.lastPrompt); kv('reply', o?.lastMessage);
+  kv('started', hhmm(r.since) + (o ? ' · ' + o.counts.prompts + ' prompt(s), ' + o.counts.tools + ' tool call(s)' + (o.counts.toolFailures ? ', ' + o.counts.toolFailures + ' failed' : '') : ''));
+  if (o?.tail.length) out.push(el('pre', '', o.tail.slice(-12).map(t => hhmm(t.at) + ' ' + t.kind.replace(/_/g, ' ') + (t.text ? ' ' + t.text : '')).join('\n')));
+  if (!r.sess) out.push(el('div', 'mesh-hint', 'Watched through its harness’s hooks: it can be seen here, not steered.'));
+  box.replaceChildren(...out);
+}
+function meshDetail(r: MeshRow): HTMLElement {
+  const box = el('div', 'mesh-detail'), acts = el('div', 'ex-btns'), sid = r.sess?.sid;
+  const B = (label: string, fn: () => unknown) => { const b = el('button', 'tb', label); b.onclick = fn; acts.append(b); };
+  if (r.card) B('Show on canvas', () => { const n = sid && S.nodes[sid]; if (n) jumpNode(n); });
+  else if (sid) B('Add its card', () => { if (SESS[sid]) adoptOrphan(SESS[sid]); });
+  B('Copy id', () => copyText(r.obs?.key || r.id));
+  box.append(el('div', 'mesh-info'), acts);
+  return box;
+}
+function meshRender(): void {
+  const box = $('#mesh-list');
+  if (!box || !INFO?.mesh || S?.sideTab !== 'agents' || !document.body.classList.contains('side-open')) return;
+  const shown = (r: MeshRow): boolean => MESH.ended || r.live || r.id === MESH.open || r.kids.some(shown);
+  const rank = (r: MeshRow) => meshBad(r) || r.kids.some(meshBad) ? 0 : !r.live ? 3 : r.state === 'running' ? 1 : 2;   // waiting for you first, a list that does not reorder as sessions work
+  const order = (a: MeshRow, b: MeshRow) => rank(a) - rank(b) || b.since - a.since || a.id.localeCompare(b.id);
+  const all = meshRows(), groups = new Map<string, MeshRow[]>();
+  for (const r of all.filter(shown).sort(order)) { const g = groups.get(r.project); if (g) g.push(r); else groups.set(r.project, [r]); }
+  const lines: { r: MeshRow; d: number; head?: string }[] = [];
+  const walk = (r: MeshRow, d: number, head?: string) => { lines.push({ r, d, head }); r.kids.filter(shown).sort(order).forEach(k => walk(k, d + 1)); };
+  for (const [name, rows] of groups) rows.forEach((r, i) => walk(r, 0, i ? undefined : name));
+  const live = meshFlat(all).filter(r => r.live), bad = live.filter(meshBad).length, hosts = new Set(live.map(r => r.host)).size;
+  $('#mesh-sum')!.textContent = live.length ? `${live.length} session${live.length === 1 ? '' : 's'} on ${hosts} host${hosts === 1 ? '' : 's'}` + (bad ? ` · ${bad} waiting for you` : '') : 'No agent is running.';
+  const shape = lines.map(l => [l.head ?? '', l.r.id, l.d, l.r.card?.id || '', l.r.sess?.sid || ''].join(' ')).join('\n') + '\n' + MESH.open;   // what the rows' buttons act on
+  if (shape !== MESH.shape) {
+    MESH.shape = shape; box.replaceChildren();
+    for (const l of lines) {
+      if (l.head != null) box.append(el('div', 'mesh-group', l.head));
+      box.append(meshRowEl(l.r, l.d)); if (l.r.id === MESH.open) box.append(meshDetail(l.r));
+    }
+    if (!lines.length) box.append(el('p', 'muted', 'A session shows here when a harness on any host of the mesh reports to this hub, or when an agent card starts.'));
+  }
+  const rows = $$('.mesh-row', box) as HTMLElement[], info = $('.mesh-info', box);
+  lines.forEach((l, i) => { meshFill(rows[i], l.r, l.d); if (info && l.r.id === MESH.open) meshInfo(info, l.r); });
+}
+// Open the Agents pane, at one session when it is named.
+function meshOpen(id?: string | null): void {
+  if (!INFO?.mesh) return;
+  if (id) MESH.open = id;
+  toggleSide(true); sideTab('agents');
+  if (id) $(`#mesh-list .mesh-row[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'nearest' });
+}
+// The graph follows the mesh: a session that starts or ends moves the layout, a change of state or title only redraws.
+function graphMesh(): void {
+  if (VIEW !== 'graph' || !INFO?.mesh || !($('#g-mesh') as HTMLInputElement).checked) return;
+  const rows = meshFlat().filter(r => r.live), topo = rows.map(r => [r.id, r.host, r.project, r.card?.id || ''].join(' ')).join('\n'), sig = topo + '\n' + rows.map(r => r.state + ' ' + r.title).join('\n');
+  const sel = rows.find(r => 'mesh:' + r.id === G.sel), pre = sel && $('#g-card pre');
+  if (sig !== MESH.graph) { const moved = topo !== MESH.topo; MESH.graph = sig; MESH.topo = topo; graphRebuild(moved); if (G.sel?.startsWith('mesh:')) graphSelect(G.sel); }
+  else if (sel && pre && pre.textContent !== meshText(sel)) pre.textContent = meshText(sel);   // its text in place: the card's buttons stay under the pointer
+}
+// A session in a few lines, for its card in the graph.
+function meshText(r: MeshRow): string { const o = r.obs; return [meshDoing(r), o?.cwd || r.sess?.cwd, o?.lastPrompt && '› ' + o.lastPrompt, ...(o?.tail.slice(-5).map(t => hhmm(t.at) + ' ' + t.kind.replace(/_/g, ' ') + (t.text ? ' ' + t.text : '')) || [])].filter(Boolean).join('\n'); }
+$('#mesh-ended')!.onchange = e => { MESH.ended = (e.target as HTMLInputElement).checked; meshRender(); };
+setInterval(meshRender, 30000);   // the ages
+cmd('Agents: every session on the mesh', () => meshOpen(), '', () => !!INFO?.mesh);
 
 // ------------------------------------------------------------------ chrome: docks, theme
 function toggleDock(which: string, open?: boolean) {
@@ -4236,7 +4365,7 @@ function edInfo() {
 
 // ------------------------------------------------------------------ graph view: pages and nodes as a link graph (Logseq-style)
 // A graph node: a board node, a folder, or a ghost for a link to no page.
-interface GraphNodeG { id: string; label: string; kind: NodeKind | 'folder'; ref: BoardNode | null; deg: number }
+interface GraphNodeG { id: string; label: string; kind: NodeKind | 'folder' | 'host' | 'project' | 'session'; ref: BoardNode | null; deg: number; state?: SessionState }
 interface GraphEdgeG { a: string; b: string; type: string }
 interface GraphPosG { x: number; y: number; vx: number; vy: number }
 // The graph view's state: nodes, edges, simulated positions, its own camera and pointer state.
@@ -4269,25 +4398,38 @@ function graphData() {
   for (const p of pages()) for (const m of pageText(p).matchAll(/\[\[([^\[\]\n]+)\]\]/g)) { const f = !findPage(m[1].trim()) && findFolder(m[1].trim()); if (f) link(p.id, f.id, 'link'); }
   for (const e of S.edges) link(e.from, e.to, e.type);
   for (const s of S.shapes) if (s.type === 'arrow' && s.a?.id && s.b?.id) link(s.a.id, s.b.id, 'sketch');
+  // F-A47: the mesh. Each live session hangs off its host and its project, a subagent off its session, and a
+  // session that runs in a card of this board off that card.
+  const mesh = (r: MeshRow, up?: string) => {
+    if (!r.live) return r.kids.forEach(k => mesh(k));
+    const id = 'mesh:' + r.id; add(id, r.title.slice(0, 40), 'session', null)!.state = r.state;
+    if (up) link(up, id, 'spawn');
+    else { link(add('host:' + r.host, '@' + r.host, 'host', null)!.id, id, 'mesh'); link(add('proj:' + r.project, r.project, 'project', null)!.id, id, 'mesh'); if (r.card) link(r.card.id, id, 'mesh'); }
+    r.kids.forEach(k => mesh(k, id));
+  };
+  if (INFO?.mesh && ($('#g-mesh') as HTMLInputElement).checked) meshRows().forEach(r => mesh(r));
   return { N, E };
 }
-function graphRebuild() {
+function graphRebuild(move = true) {
   const { N, E } = graphData(); G.N = N; G.E = E;
   for (const g of N.values()) {
     if (G.pos.has(g.id)) continue;
     let x: number, y: number;
     if (g.ref) { x = (g.ref.x + g.ref.w / 2 - 1300) / 5; y = (g.ref.y + g.ref.h / 2 - 500) / 5; }
-    else { const e = E.find(e => e.b === g.id || e.a === g.id), o = e && G.pos.get(e.a === g.id ? e.b : e.a); x = (o?.x || 0) + (Math.random() - .5) * 80; y = (o?.y || 0) + (Math.random() - .5) * 80; }
+    else { const e = E.find(e => e.b === g.id || e.a === g.id), o = e && G.pos.get(e.a === g.id ? e.b : e.a), far = g.kind === 'host' || g.kind === 'project' ? 420 : 0; x = (o ? o.x : far) + (Math.random() - .5) * 80; y = (o?.y || 0) + (Math.random() - .5) * 80; }   // the mesh starts beside the pages, not among them
     G.pos.set(g.id, { x, y, vx: 0, vy: 0 });
   }
   for (const id of [...G.pos.keys()]) if (!N.has(id)) G.pos.delete(id);
   if (G.sel && !N.has(G.sel)) graphSelect(null);
-  G.alpha = Math.max(G.alpha, 0.5);
+  if (G.hover && !N.has(G.hover)) G.hover = null;
+  if (G.drag && !N.has(G.drag.id)) G.drag = null;   // the mesh rebuilds the graph under the pointer (F-A47)
+  if (move) G.alpha = Math.max(G.alpha, 0.5);
   graphKick();
 }
 function graphColors() {
   const c = (n: string) => cssVar(n);
   G.colors = { page: c('--link'), term: c('--accent'), agent: c('--ref'), ref: c('--muted'), ghost: c('--muted'), buffer: c('--link'),
+    host: c('--fg'), project: c('--folder-node'), mesh: c('--line-strong'), 'st-running': c('--info'), 'st-waiting_permission': c('--warn'), 'st-waiting_input': c('--warn'), 'st-error': c('--err'), 'st-done': c('--ok'),
     link: c('--muted'), blockref: c('--ref'), folder: c('--folder-node'), contains: c('--line-strong'), spawn: c('--accent'), pipe: c('--pipe'), sketch: c('--ink-red'), fg: c('--fg'), muted: c('--muted'), bg: c('--bg'), panel: c('--panel'), accent: c('--accent') };
 }
 function graphTick() {
@@ -4314,7 +4456,7 @@ function graphTick() {
   }
   G.alpha = G.drag ? Math.max(G.alpha, 0.3) : G.alpha * 0.985;
 }
-const gRadius = (g: GraphNodeG) => (g.kind === 'buffer' || g.kind === 'ghost' ? 5 : 6) + Math.sqrt(g.deg) * 2.6;
+const gRadius = (g: GraphNodeG) => (g.kind === 'buffer' || g.kind === 'ghost' || g.kind === 'session' ? 5 : 6) + Math.sqrt(g.deg) * 2.6;
 function gToWorld(sx: number, sy: number) { const r = gCanvas.getBoundingClientRect(); return { x: (sx - r.width / 2) / G.cam.z + G.cam.x, y: (sy - r.height / 2) / G.cam.z + G.cam.y }; }
 function graphDraw() {
   const dpr = devicePixelRatio || 1, r = gCanvas.getBoundingClientRect(), W = Math.round(r.width * dpr), H = Math.round(r.height * dpr);
@@ -4330,7 +4472,7 @@ function graphDraw() {
     const p = G.pos.get(e.a)!, s = G.pos.get(e.b)!, hot = focus && (e.a === focus || e.b === focus);
     ctx.globalAlpha = focus ? (hot ? 0.95 : 0.16) : (e.type === 'link' ? 0.45 : 0.7);
     ctx.strokeStyle = C[e.type] || C.muted; ctx.lineWidth = (hot ? 2 : 1.2) / Math.sqrt(z);
-    ctx.setLineDash(e.type === 'sketch' ? [5, 4] : e.type === 'blockref' ? [2, 3] : e.type === 'contains' ? [1, 3] : []);
+    ctx.setLineDash(e.type === 'sketch' ? [5, 4] : e.type === 'blockref' ? [2, 3] : e.type === 'contains' || e.type === 'mesh' ? [1, 3] : []);
     ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(s.x, s.y); ctx.stroke();
     if (e.type === 'pipe' || e.type === 'spawn') {   // direction tick at 60 %
       const mx = p.x + (s.x - p.x) * .6, my = p.y + (s.y - p.y) * .6, an = Math.atan2(s.y - p.y, s.x - p.x), k = 6;
@@ -4341,18 +4483,21 @@ function graphDraw() {
   for (const g of G.N.values()) {
     const p = G.pos.get(g.id)!, rad = gRadius(g), d = dim(g.id);
     ctx.globalAlpha = d ? 0.38 : 1;
-    ctx.fillStyle = C[g.kind] || C.muted; ctx.strokeStyle = C.bg; ctx.lineWidth = 2 / z;
+    ctx.fillStyle = (g.kind === 'session' ? C['st-' + g.state] : C[g.kind]) || C.muted; ctx.strokeStyle = C.bg; ctx.lineWidth = 2 / z;
     ctx.beginPath();
     if (g.kind === 'buffer' || g.kind === 'ghost') ctx.arc(p.x, p.y, rad, 0, Math.PI * 2);
+    else if (g.kind === 'session') { const w = rad * 1.25; ctx.moveTo(p.x, p.y - w); ctx.lineTo(p.x + w, p.y); ctx.lineTo(p.x, p.y + w); ctx.lineTo(p.x - w, p.y); ctx.closePath(); }   // a diamond, in its state's colour
+    else if (g.kind === 'host') { for (let k = 0; k < 6; k++) { const an = Math.PI / 3 * k; ctx[k ? 'lineTo' : 'moveTo'](p.x + Math.cos(an) * rad * 1.2, p.y + Math.sin(an) * rad * 1.2); } ctx.closePath(); }
     else if (g.kind === 'folder') { const w = rad * 1.5; ctx.moveTo(p.x - w, p.y - rad * .7); ctx.lineTo(p.x - w * .3, p.y - rad * .7); ctx.lineTo(p.x - w * .15, p.y - rad); ctx.lineTo(p.x + w, p.y - rad); ctx.lineTo(p.x + w, p.y + rad); ctx.lineTo(p.x - w, p.y + rad); ctx.closePath(); }
     else ctx.rect(p.x - rad, p.y - rad, rad * 2, rad * 2);
     if (g.kind === 'ghost') { ctx.fillStyle = C.bg; ctx.fill(); ctx.setLineDash([3, 2]); ctx.strokeStyle = C.muted; ctx.lineWidth = 1.2 / z; ctx.stroke(); ctx.setLineDash([]); }
+    else if (g.kind === 'project') { ctx.fillStyle = C.bg; ctx.fill(); ctx.strokeStyle = C.project; ctx.lineWidth = 2.5 / z; ctx.stroke(); }   // a hollow square: a folder on some host, not one of this board
     else { ctx.fill(); ctx.stroke(); }
     if (g.id === G.sel) { ctx.beginPath(); ctx.arc(p.x, p.y, rad + 5 / z, 0, Math.PI * 2); ctx.strokeStyle = C.accent; ctx.lineWidth = 2 / z; ctx.stroke(); }
-    const showLabel = z > 0.7 || near.has(g.id) || g.deg >= 3 || (q && !d);
+    const showLabel = z > 0.7 || near.has(g.id) || g.deg >= 3 || g.kind === 'host' || g.kind === 'project' || (q && !d);
     if (showLabel) {
       ctx.globalAlpha = d ? 0.25 : 1;
-      ctx.font = `${g.id === focus || g.kind === 'folder' ? 600 : 400} ${12 / Math.sqrt(z)}px ${MONO}`;
+      ctx.font = `${g.id === focus || g.kind === 'folder' || g.kind === 'host' || g.kind === 'project' ? 600 : 400} ${12 / Math.sqrt(z)}px ${MONO}`;
       ctx.fillStyle = g.kind === 'ghost' ? C.muted : C.fg; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
       ctx.fillText(g.label, p.x, p.y + rad + 4 / z);
     }
@@ -4388,11 +4533,13 @@ function graphSelect(id: string | null) {
   G.sel = id; const card = $('#g-card')!;
   if (!id) { card.hidden = true; graphKick(); return; }
   const g = G.N.get(id)!; card.hidden = false; card.replaceChildren();
+  const row = g.kind === 'session' ? meshFlat().find(r => 'mesh:' + r.id === id) : undefined, onMesh = g.kind === 'host' || g.kind === 'project' || g.kind === 'session';
   const head = el('div', 'gc-head'); head.innerHTML = '<b></b><span class="badge"></span><button class="mini gc-x" title="Show everything again (Esc, or click empty space)">✕</button>';
   $('.gc-x', head)!.onclick = () => graphSelect(null);
-  $('b', head)!.textContent = g.label; $('.badge', head)!.textContent = (g.kind === 'buffer' ? 'page' : g.kind === 'ghost' ? 'no page yet' : badgeOf(g.ref!)) + (g.ref ? tagsOf(g.ref).map(t => ' #' + t).join('') : '');
+  $('b', head)!.textContent = g.label; $('.badge', head)!.textContent = (g.kind === 'buffer' ? 'page' : g.kind === 'ghost' ? 'no page yet' : onMesh ? (row ? meshName(row) + ' @' + row.host : g.kind) : badgeOf(g.ref!)) + (g.ref ? tagsOf(g.ref).map(t => ' #' + t).join('') : '');
   const nb = G.E.filter(e => e.a === id || e.b === id).map(e => ({ id: e.a === id ? e.b : e.a, type: e.type }));
-  const pre = el('pre'); pre.textContent = g.ref ? (g.kind === 'buffer' ? pageText(g.ref as PageNode).split('\n').slice(0, 8).join('\n') : snapshotText(g.ref, 8)) : 'Linked from ' + nb.map(x => G.N.get(x.id)?.label).join(', ') + '.';
+  const pre = el('pre'); pre.textContent = g.ref ? (g.kind === 'buffer' ? pageText(g.ref as PageNode).split('\n').slice(0, 8).join('\n') : snapshotText(g.ref, 8)) : row ? meshText(row)
+    : onMesh ? nb.length + ' live session' + (nb.length === 1 ? '' : 's') + ' ' + (g.kind === 'host' ? 'on this host.' : 'in this project.') : 'Linked from ' + nb.map(x => G.N.get(x.id)?.label).join(', ') + '.';
   const links = el('div', 'gc-links');
   for (const x of nb.slice(0, 12)) { const b = el('button', 'chip'); b.textContent = (G.N.get(x.id)?.label || '?') + ' · ' + x.type; b.onclick = () => { graphSelect(x.id); graphCenter(x.id); }; links.append(b); }
   const acts = el('div', 'ex-btns');
@@ -4400,6 +4547,7 @@ function graphSelect(id: string | null) {
   if (g.ref) { const ad = el('div', 'gc-addr'); const code = el('code'); code.textContent = addrOf(g.ref); const cp = el('button', 'mini', '⧉'); cp.title = 'Copy the address'; cp.onclick = () => copyText(addrOf(g.ref!)); ad.append(code, cp); card.append(ad); }
   if (g.kind === 'ghost') B('Create page', () => { const n = openPage(g.label, null, true); graphRebuild(); edOpen(n); });
   if (g.kind === 'buffer') B('Open in editor', () => edOpen(g.ref));
+  if (row) B('Show in the Agents pane', () => meshOpen(row.id));
   if (g.ref) B('Show on canvas', () => { setView('canvas'); jumpNode(g.ref!); });
   if (g.ref) B(g.ref.kind === 'frame' ? 'Enter as workspace' : 'Open as tab', () => { setView('canvas'); g.ref!.kind === 'frame' ? wsEnter(g.ref) : focusOpen(g.ref); });
   const hint = el('div', 'gc-hint', 'Neighbours of ' + g.label + ' are bright; the rest is dimmed. Esc, ✕ or a click on empty space shows all.');
@@ -4420,12 +4568,13 @@ gCanvas.addEventListener('pointerdown', ev => {
   const mv = (e: PointerEvent) => {
     if (Math.hypot(e.clientX - start.x, e.clientY - start.y) > 3) moved = true;
     if (G.drag) { const w = gToWorld(e.clientX - r.left, e.clientY - r.top), p = G.pos.get(id!)!; p.x = w.x; p.y = w.y; G.alpha = Math.max(G.alpha, 0.3); }
+    else if (id && !G.N.has(id)) return;   // the node it held is gone
     else { G.cam.x = start.cam.x - (e.clientX - start.x) / G.cam.z; G.cam.y = start.cam.y - (e.clientY - start.y) / G.cam.z; }
     graphKick(); if (!G.raf) graphDraw();
   };
   const up = () => {
     gCanvas.removeEventListener('pointermove', mv); gCanvas.removeEventListener('pointerup', up); gCanvas.removeEventListener('pointercancel', up);
-    G.drag = null; if (!moved) graphSelect(id);
+    G.drag = null; if (!moved) graphSelect(id && G.N.has(id) ? id : null);
     graphKick();
   };
   gCanvas.addEventListener('pointermove', mv); gCanvas.addEventListener('pointerup', up); gCanvas.addEventListener('pointercancel', up);
@@ -4441,7 +4590,8 @@ gCanvas.addEventListener('dblclick', ev => {
   if (g.kind === 'buffer') edOpen(g.ref);
   else if (g.kind === 'ghost') { const n = openPage(g.label, null, true); graphRebuild(); edOpen(n); }
   else if (g.kind === 'folder') jumpFolder(g.ref as FrameNode);
-  else { setView('canvas'); jumpNode(g.ref!); }
+  else if (g.kind === 'session') meshOpen(g.id.slice(5));
+  else if (g.ref) { setView('canvas'); jumpNode(g.ref); }
 });
 gCanvas.addEventListener('wheel', e => {
   e.preventDefault();
@@ -4456,7 +4606,7 @@ $('#g-q')!.addEventListener('keydown', e => {
   const q = (e.target as HTMLInputElement).value.trim().toLowerCase(), g = [...G.N.values()].find(g => g.label.toLowerCase().includes(q));
   if (g) { graphSelect(g.id); graphCenter(g.id); }
 });
-$('#g-all')!.onchange = $('#g-ghost')!.onchange = () => graphRebuild();
+$('#g-all')!.onchange = $('#g-ghost')!.onchange = $('#g-mesh')!.onchange = () => graphRebuild();
 $('#g-fit')!.onclick = () => { graphFit(); graphDraw(); };
 matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', () => { graphColors(); if (VIEW === 'graph') graphDraw(); });
 
@@ -4673,6 +4823,7 @@ function toggleSide(open?: boolean | null) {
   open = open ?? !document.body.classList.contains('side-open');
   document.body.classList.toggle('side-open', open);
   if (S) { S.side = open; dirty(); }
+  if (open) meshRender();
   if (VIEW === 'graph') setTimeout(graphDraw, 220);
 }
 const PANE_W = 400, TREE_W = 240;
@@ -6403,7 +6554,8 @@ async function boot() {
   if (fresh) requestAnimationFrame(() => setTimeout(() => { seedInk(); dirty(); }, 60));
   if (fresh) setTimeout(() => toast(`${keyLabel('Mod-K')} finds anything and runs any command · Alt-2 navigator · drag items into folders · ? for keys`, 7000), 600);
   setView(S.view || (fresh && innerWidth < 760 ? 'ranger' : 'canvas'));
-  sideTab();
+  ($$('.needs-mesh') as HTMLElement[]).forEach(e => { e.hidden = !INFO?.mesh; });
+  sideTab(S.sideTab);
   placeInkChip();
   wireReview(); detectMode();
   if (view.persp && view.persp !== 'manual' && PERSP_NAMES[view.persp]) { perspSet(view.persp, true); if (perspCur() === 'fs') setTimeout(() => { perspEdgesRebuild(); renderLinks(); }, 300); }
@@ -9886,6 +10038,8 @@ function attnItems(): RgEntry[] {
   const det = agentsDetached().length; if (det) items.push({ key: 'attn:detached', name: det + ' agent' + (det === 1 ? '' : 's') + ' detached', kind: 'iattn', attn: '', dir: false, meta: 'Enter: revive all', go: reviveAll });   // F-A14
   if (DAEMON && S) for (const s of Object.values(SESS)) if (s.alive && !S.nodes[s.sid] && s.sid !== 'dock' && !String(s.sid).startsWith('ed-'))   // running invisibly otherwise; the dock is never a node; ed-* are edwind's own (R9.22)
     items.push({ key: 'orphan:' + s.sid, name: (s.kind === 'acp' ? agentLabel(s.acp?.agent) : s.pty?.fg?.comm || 'shell') + ' running without a card', kind: 'iattn', attn: 'bad', dir: false, meta: s.cwd || '', go: () => adoptOrphan(s) });
+  for (const r of meshFlat()) if (r.obs && meshBad(r) && !obsCarded(r.sess))   // F-A47: a session some harness reports; an agent card that waits is listed above. In a card, the card is the place
+    items.push({ key: 'obs:' + r.id, name: meshName(r) + ' ' + meshWants(r.state), kind: 'iattn', attn: 'bad', dir: false, meta: '@' + r.host + ' · ' + meshDoing(r), ...(r.card ? { n: r.card } : { go: () => meshOpen(r.id) }) });
   const due = RV.loaded ? rvQueue().dueNow.length : 0; if (due) items.push({ key: 'attn:review', name: due + ' card' + (due === 1 ? '' : 's') + ' due', kind: 'iattn', dir: false, meta: 'review', go: () => setView('review') });
   for (const t of allTasks()) { if (COL[t.kw] === 'DONE') continue; const due = taskDue(t); if (due && due <= TODAY) items.push({ key: 'attn:' + taskKey(t), name: (due < TODAY ? 'overdue ' : 'due today ') + plainTask(t.text).slice(0, 60), kind: 'iattn', attn: due < TODAY ? 'bad' : '', dir: false, meta: taskAddr(t), go: () => taskOpen(t) }); else if (COL[t.kw] === 'NEXT' && !t.session) items.push({ key: 'attn:' + taskKey(t), name: 'NEXT ' + plainTask(t.text).slice(0, 60), kind: 'iattn', dir: false, meta: taskAddr(t), go: () => taskOpen(t) }); }
   return items;
@@ -9902,14 +10056,12 @@ function reviveAll(): void {
 // ("(N) "), in the app badge where there is one, and in a notification tagged with its sid, whose click focuses this
 // page (or opens one) at the card full screen. Seen again when the page is visible. Desktop only for v1.
 const ATTN_SIG = { unseen: new Set<string>(), base: document.title };
-function attnSignal(sid: string, was: SessionState | undefined, now: SessionState): void {
-  if (was === undefined || ACP_BAD.has(was) || !ACP_BAD.has(now) || !document.hidden || MODE.v === 'phone' || ATTN_SIG.unseen.has(sid)) return;   // once per card until the page is seen
-  const n = S?.nodes[sid]; if (!n || n.kind !== 'acp') return;
+function attnSignal(sid: string, was: SessionState | undefined, now: SessionState, name = S?.nodes[sid]?.kind === 'acp' ? S.nodes[sid].name : ''): void {
+  if (!name || was === undefined || ACP_BAD.has(was) || !ACP_BAD.has(now) || !document.hidden || MODE.v === 'phone' || ATTN_SIG.unseen.has(sid)) return;   // once per card until the page is seen
   ATTN_SIG.unseen.add(sid); attnTitle();
   try { (navigator as Navigator & { setAppBadge?: (n: number) => Promise<void> }).setAppBadge?.(ATTN_SIG.unseen.size)?.catch(() => {}); } catch {}
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted' || !navigator.serviceWorker) return;
-  const what = now === 'waiting_permission' ? 'needs permission' : now === 'waiting_input' ? 'asks a question' : 'failed';
-  navigator.serviceWorker.ready.then(r => r.showNotification(`${n.name} ${what}`, { tag: sid, body: 'Workbench · ' + (INFO?.host || location.host), data: { sid } })).catch(() => {});
+  navigator.serviceWorker.ready.then(r => r.showNotification(`${name} ${meshWants(now)}`, { tag: sid, body: 'Workbench · ' + (INFO?.host || location.host), data: { sid } })).catch(() => {});
 }
 function attnTitle(): void { const k = ATTN_SIG.unseen.size; document.title = (k ? `(${k}) ` : '') + ATTN_SIG.base; }
 function attnSeen(): void {
@@ -9918,7 +10070,7 @@ function attnSeen(): void {
   try { (navigator as Navigator & { clearAppBadge?: () => Promise<void> }).clearAppBadge?.()?.catch(() => {}); } catch {}
 }
 // A notification's click (sw.ts posts {t:'focus', sid}, or opens /?focus=SID): the card full screen.
-function attnFocus(sid: string | null): void { attnSeen(); const n = sid && S?.nodes[sid]; if (n) focusOpen(n); }
+function attnFocus(sid: string | null): void { attnSeen(); const n = sid && S?.nodes[sid]; if (n) focusOpen(n); else if (sid && OBS[sid]) meshOpen(sid); }
 navigator.serviceWorker?.addEventListener('message', e => { if (e.data?.t === 'focus') attnFocus(String(e.data.sid)); });
 // Asked from a user gesture only (a new agent card, the chips, the palette); never on desktop-less phones.
 function notifyAsk(): void { try { if (DAEMON && MODE.v !== 'phone' && typeof Notification !== 'undefined' && Notification.permission === 'default') Notification.requestPermission().catch(() => {}); } catch {} }
@@ -9933,7 +10085,8 @@ function statusCounts(): StatusCounts {
   const waiting = acps.filter(n => ACP_BAD.has(st(n))).length;
   const due = RV.loaded ? rvQueue().dueNow.length : null;
   const open = allTasks().filter(t => COL[t.kw] !== 'DONE'), tasks = open.length, dueToday = open.filter(t => taskDue(t) && taskDue(t)! <= TODAY).length;
-  return { hosts: hosts.length, down, failed, agents, waiting, due, tasks, dueToday };
+  const mesh = INFO?.mesh ? meshFlat().filter(r => r.live) : [];
+  return { hosts: hosts.length, down, failed, agents, waiting, mesh: mesh.length, meshWaiting: mesh.filter(meshBad).length, due, tasks, dueToday };
 }
 function statusRender(): void {
   const box = $('#st-host'); if (!box) return;
@@ -9944,6 +10097,7 @@ function statusRender(): void {
   add('✦ ' + c.agents + (c.waiting ? ' · ' + c.waiting + ' waiting' : ''), c.agents + ' agent card(s) and shell(s) running an agent' + (c.waiting ? ', ' + c.waiting + ' waiting for you. Click: the next waiting card (F-A15).' : '. Click: filter the canvas by #agent.'), c.waiting ? 'bad' : '', () => {
     if (c.waiting) { notifyAsk(); attnNext(n => n.kind === 'acp' && ACP_BAD.has(SESS[n.id]?.state)); } else { setView('canvas'); tagFilter('agent'); }
   });
+  if (INFO?.mesh) add('mesh ' + c.mesh + (c.meshWaiting ? ' · ' + c.meshWaiting + ' waiting' : ''), c.mesh + ' agent session(s) on the hosts of the mesh' + (c.meshWaiting ? ', ' + c.meshWaiting + ' waiting for you' : '') + '. Click: the Agents pane (F-A47).', c.meshWaiting ? 'bad' : '', () => meshOpen(meshFlat().find(meshBad)?.id));
   if (c.due != null) add('▦ ' + c.due, c.due + ' flashcard(s) due. Click: review.', c.due ? 'warn' : '', () => setView('review'));
   add('☐ ' + c.tasks + (c.dueToday ? ' (' + c.dueToday + ' due)' : ''), c.tasks + ' open task(s) on the board and in the notes' + (c.dueToday ? ', ' + c.dueToday + ' scheduled or due by today' : '') + '. Click: the tasks view.', c.dueToday ? 'warn' : '', () => setView('tasks'));
   deskAttnTick(); deskQueryTick(); deskPager();
@@ -9978,7 +10132,7 @@ AGENT_TOOLS.push(
   { name: 'host_status', description: 'Health of a host: load, memory, disk, uptime, shells, unit counts (failed names). host: a name from hosts.json (empty = the serving daemon).', inputSchema: { type: 'object', properties: { host: { type: 'string' } } },
     run: async ({ host }: { host?: string } = {}) => { const h = host ? hostByName(host) : null; if (host && !h) throw new Error('unknown host @' + host); if (!DAEMON) { const u = demoUnits(); return `demo host · load 0.4 · units ${u.filter(x => x.active === 'active').length}/${u.length} active, ${u.filter(x => x.active === 'failed').length} failed (${u.filter(x => x.active === 'failed').map(x => x.unit).join(', ')})`; } const j: HostStatusReply = await (await hFetch(h, '/api/status')).json(); const gb = (b: number) => (b / 2 ** 30).toFixed(1) + ' G'; return [`@${j.host}`, j.load ? 'load ' + j.load.map(x => x.toFixed(2)).join(' ') : '', j.mem ? 'mem ' + gb(j.mem.available) + ' free of ' + gb(j.mem.total) : '', j.disk ? 'disk / ' + gb(j.disk.free) + ' free of ' + gb(j.disk.total) : '', j.uptime != null ? 'up ' + Math.floor(j.uptime / 3600) + ' h' : '', `shells ${j.sessions?.alive ?? '?'}`, j.units?.error ? 'units: ' + j.units.error : `units ${j.units.active}/${j.units.total} active, ${j.units.failed} failed` + (j.units.failedNames?.length ? ' (' + j.units.failedNames.join(', ') + ')' : '')].filter(Boolean).join(' · '); } }
 );
-window.__canvas = { s2w, clipRecall, pasteData, pasteItems, pasteText, imagesOnCanvas, copyItems, imgUrl, typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, attnItems, statusCounts, statusRender, procRelList, unitRelList, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, rgPreview, RG, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, hostRetry, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, FOCUS, LEADER, setLeader, isLeader, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newWeb, newSketch, newArtifactFromFile, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, unsaved, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, frFileOpen, fsMv, noteOpen, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
+window.__canvas = { OBS, MESH, meshRows, meshFlat, meshOpen, s2w, clipRecall, pasteData, pasteItems, pasteText, imagesOnCanvas, copyItems, imgUrl, typeInto, cardInput, setTool, SEL, PICKED, pickInRect, pickClear, pickToggle, removeSelection, removeUndo, sketchFromSelection, renderInk, inkBox, addShape, applyCam, wsFill, ASPECTS, aspectSize, tileAspect, tileAspectCycle, screenAspect, camArea, fitChrome, fitChromeAll, zoomAt, WS, wsEnter, wsLeave, findNode, graphSelect, jumpFolder, RESIZING, nodeResized, frameResized, tileFolder, packFolder, PHI, findPage, openPage, LINKS, linksLoad, linkEntities, linkTargets, backlinkCount, backlinksOfTitle, noteTree, noteKids, journalDays, journalOpen, journalStep, journalCurrentDay, linkPerspFrom, TASKS, tasksLoad, allTasks, findTask, dispatchTask, taskSetKw, taskText, collectTasks, renderTasks, TK, PROC, UNITS, procData, procLoad, unitsData, unitsLoad, unitShow, attnItems, statusCounts, statusRender, procRelList, unitRelList, shellRef, shellLogs, hostByName, termLines, rgParent, addrOf, parseAddr, keyToAddr, addrToKey, goAddr, resolveAddr, rgEntries, rgGo, rgPreview, RG, notesLoad, get NOTES() { return NOTES; }, hashSync, fsIdent, fsExpand, ghostOpen, fsFrameFor, fsDrop, perspEdgesRebuild, HOSTCONN, get HOSTLIST() { return HOSTLIST; }, hostOf, hostRes, hostRetry, rgFsList, fsSplit, PERSP, perspSet, perspCur, perspRebuild, setModeCascade, folderMode, fitAll, separateAll, separate, SEP, footprint, moveTree, placeAny, foldToggle, foldCycle, packFold, unfold, FOCUS, LEADER, setLeader, isLeader, wsGo, wsTop, focusOpen, focusClose, focusHide, optimise, neighbour, leaderOpen, leaderKey, renderTree, addNode, spawnChild, tagsOf, setTags, retag, tagFilter, get TAG_FILTER() { return TAG_FILTER; }, newWeb, newSketch, newArtifactFromFile, sketchClear, RV, renderReview, rvGrade, rvReveal, FSRS, newArtifact, artPublish, htmlBlocks, tearOutBlock, boardAdopt, HOSTS, get INFO() { return INFO; }, get DAEMON() { return DAEMON; }, MODE, rgKey, renderRanger, fuzzy, CMDS, palSearch, setTheme, sideTab, toggleDockTerm, INK, inkTrack, commitStroke, get S() { return S; }, live, setView, G, ED, adopt, setMode, containerAt, kidsOf, stashed, findFolder, AGENT_TOOLS, jumpNode, removeNode, SAVE, NET, SESS, BARS, WAKE, get BOARD_ETAG() { return BOARD_ETAG; }, get BOOTED() { return BOOTED; }, unsaved, pageText: pageTextById, pageState, pageAnchors, pagePoint, pageEdit, pageSetText, FR, frFocus, frSchedule, frUpdate, frAdopt, frWhenBuf, frOpenToday, frFileOpen, fsMv, noteOpen, dirty, boardChanged, changeCount, netKick, termTheme, pickShell, shellDefault, webUrlOk, AcpBackend, newAgentCard, lineDiff, elicitForm };  // for tests and debugging
 Object.assign(window.__canvas, { reviveAll, agentsDetached, ATTN_SIG, attnFocus, attnSeen, MODE, artHead, artMount, dbLoad, keyContext, keyInterior, leaveCard, hintsOpen, hintsClose, HINTS, ARR, arrangeOpen, cardActions, KC, focusMove, graphMove });
 Object.defineProperty(window.__canvas, 'activeId', { get: () => activeId });   // Object.assign would copy a getter's value once
 Object.defineProperty(window.__canvas, 'spaceHeld', { get: () => space });

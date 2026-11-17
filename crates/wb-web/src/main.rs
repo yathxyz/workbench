@@ -45,6 +45,7 @@ use crate::auth::Floor;
 use crate::config::Config;
 use crate::edit_client::EditHandle;
 use crate::hub::{HubHandle, HubStatus};
+use crate::observed::Observed;
 use crate::rpc::Pages;
 use crate::static_files::Assets;
 
@@ -76,6 +77,8 @@ pub struct App {
     /// The edwind connection; `None` when `editSocket` is not configured (R15.5).
     pub edit: Option<EditHandle>,
     pub feed: broadcast::Sender<FeedMsg>,
+    /// The observed sessions (design §3.8.3); `None` without `api`.
+    pub observed: Option<Observed>,
     /// Serialises board writes.
     pub board_lock: Mutex<()>,
     /// The `/rpc` clients, for `wb` commands (W-4).
@@ -180,6 +183,11 @@ async fn run(config: &Path) -> Result<()> {
         .edit_socket
         .clone()
         .map(|path| edit_client::spawn(path, &cfg.host, feed.clone()));
+    let observed = cfg
+        .api
+        .is_some()
+        .then(|| Observed::load(&cfg.state_dir, &cfg.host))
+        .transpose()?;
     let (stop, shutdown) = watch::channel(false);
     let app = Arc::new(App {
         cfg,
@@ -188,6 +196,7 @@ async fn run(config: &Path) -> Result<()> {
         hub,
         edit,
         feed,
+        observed,
         board_lock: Mutex::new(()),
         pages: Pages::default(),
         shutdown,
