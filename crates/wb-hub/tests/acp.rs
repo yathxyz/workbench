@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use common::acp::{fold_equals_live, group_members, stub};
+#[cfg(debug_assertions)]
+use common::acp::stub;
+use common::acp::{fold_equals_live, group_members};
 use common::fake::{Agent, text_of, updates};
 use common::{Client, Hub, PATIENCE, eventually, running, wait_gone};
 
@@ -2066,9 +2068,9 @@ fn hub_config_requires_a_live_acp_session_before_checking_epoch_or_option() {
 
 #[test]
 fn hub_config_updates_during_a_pending_turn() {
-    let mut hub = Hub::start_with(|cfg| stub(cfg, "keywords", &[]));
+    let mut hub = Hub::with_scenarios(&["config"]);
     let mut c = hub.connect();
-    let open = ready(&mut c, &hub, "a1", "keywords");
+    let open = ready(&mut c, &hub, "a1", "config");
     assert_eq!(c.acp_prompt("a1", "perm")["t"], "ok");
     c.event("a1", "permission");
     assert_eq!(

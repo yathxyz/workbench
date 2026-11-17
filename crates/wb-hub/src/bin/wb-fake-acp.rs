@@ -677,7 +677,9 @@ impl Fake {
         }
         let text = prompt_text(&params["prompt"]);
         let stop = match self.scenario {
-            Scenario::Keywords | Scenario::Elicitation => self.keyword_turn(&text).await,
+            Scenario::Keywords | Scenario::Elicitation | Scenario::Config => {
+                self.keyword_turn(&text).await
+            }
             Scenario::Permission | Scenario::Cancel => self.permission_turn().await,
             Scenario::PermissionReconnect => self.reconnect_turn().await,
             Scenario::AgentCancels => self.agent_cancels_turn().await,
