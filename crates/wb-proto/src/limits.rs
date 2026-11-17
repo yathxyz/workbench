@@ -36,6 +36,18 @@ pub const POLICY_PATTERN_MAX: usize = 4096;
 pub const POLICY_SELECTORS_MAX: usize = 64;
 /// Most UTF-8 bytes in one tool kind.
 pub const POLICY_KIND_MAX: usize = 64;
+/// Largest command eligible for automatic policy evaluation; excess asks.
+pub const POLICY_COMMAND_MAX: usize = 64 * KIB;
+/// Most shell words, including redirection targets; excess asks.
+pub const POLICY_COMMAND_WORDS_MAX: usize = 1024;
+/// Most path candidate resolutions, including reported locations; excess asks.
+pub const POLICY_PATHS_MAX: usize = 2048;
+/// Aggregate candidate bytes plus relative-path cwd bytes to normalize; excess asks.
+pub const POLICY_PATH_BYTES_MAX: usize = 256 * KIB;
+/// Most path/root comparisons across all rules for one request; excess asks.
+pub const POLICY_PATH_CHECKS_MAX: usize = 64 * KIB;
+/// Most possible shell working directories after conditional or failed cd; excess asks.
+pub const POLICY_CWDS_MAX: usize = 32;
 /// Scrollback lines kept by the VT state.
 pub const VT_SCROLLBACK: usize = 1000;
 /// Largest snapshot. The scrollback budget is halved until it fits.

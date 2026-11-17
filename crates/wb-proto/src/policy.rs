@@ -11,9 +11,11 @@ use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+mod command;
+
 use crate::limits::{
-    POLICY_KIND_MAX, POLICY_PATTERN_MAX, POLICY_PATTERNS_MAX, POLICY_RULES_MAX,
-    POLICY_SELECTORS_MAX,
+    POLICY_KIND_MAX, POLICY_PATH_CHECKS_MAX, POLICY_PATTERN_MAX, POLICY_PATTERNS_MAX,
+    POLICY_RULES_MAX, POLICY_SELECTORS_MAX,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,31 +192,19 @@ impl CompiledPolicy {
         let command = if kind == "execute" {
             Some(nonempty_string(call.get("rawInput")?.get("command")?)?)
         } else {
+            if call
+                .get("rawInput")
+                .and_then(Value::as_object)
+                .is_some_and(|input| input.contains_key("command"))
+            {
+                return None;
+            }
             None
         };
-        let command_paths = match command {
-            Some(text) => literal_absolute_paths(text)?,
-            None => Vec::new(),
-        };
         let locations = call.get("locations")?.as_array()?;
-        if locations.is_empty() {
-            return None;
-        }
-        // Normalize once per location rather than once per candidate rule.
-        let paths: Option<Vec<PathBuf>> = locations
-            .iter()
-            .map(|location| {
-                let path = nonempty_string(location.get("path")?)?;
-                let path = Path::new(path);
-                Some(if path.is_absolute() {
-                    normalize(path)
-                } else {
-                    normalize_from(path, self.cwd.clone())
-                })
-            })
-            .collect();
-        let paths = paths?;
+        let paths = command::paths(command, locations, &self.cwd)?;
         let (allow, reject) = once_options(options)?;
+        let mut checks = POLICY_PATH_CHECKS_MAX;
         for (index, rule) in self.rules.iter().enumerate() {
             if rule
                 .kinds
@@ -223,11 +213,17 @@ impl CompiledPolicy {
             {
                 continue;
             }
-            if let Some(roots) = &rule.roots
-                && (!paths.iter().all(|path| within_roots(path, roots))
-                    || !command_paths.iter().all(|path| within_roots(path, roots)))
-            {
-                continue;
+            if let Some(roots) = &rule.roots {
+                let mut contained = true;
+                for path in &paths {
+                    if !within_roots(path, roots, &mut checks)? {
+                        contained = false;
+                        break;
+                    }
+                }
+                if !contained {
+                    continue;
+                }
             }
             if let Some(command) = command
                 && (!rule.matches.iter().all(|pattern| pattern.is_match(command))
@@ -294,92 +290,14 @@ fn normalize_from(path: &Path, mut normalized: PathBuf) -> PathBuf {
     normalized
 }
 
-fn within_roots(path: &Path, roots: &[PathBuf]) -> bool {
-    roots.iter().any(|root| path.starts_with(root))
-}
-
-/// Inspect literal absolute paths at shell token/quote/operator boundaries. This
-/// intentionally does not evaluate shell substitutions, expansions or symlinks.
-fn literal_absolute_paths(command: &str) -> Option<Vec<PathBuf>> {
-    let mut boundary = true;
-    let mut quote = None;
-    let mut quote_start = 0;
-    let mut paths = Vec::new();
-    for (start, character) in command.char_indices() {
-        // Escaping and command substitution can obscure a literal path's extent.
-        // This convenience matcher leaves ambiguous text to a human.
-        if matches!(character, '\\' | '`') {
-            return None;
+fn within_roots(path: &Path, roots: &[PathBuf], checks: &mut usize) -> Option<bool> {
+    for root in roots {
+        *checks = checks.checked_sub(1)?;
+        if path.starts_with(root) {
+            return Some(true);
         }
-        if character == '/' && boundary {
-            let rest = &command[start..];
-            let end = if let Some(delimiter) = quote
-                && quote_start + 1 == start
-            {
-                let end = rest.find(delimiter)?;
-                // A quoted path concatenated with another token is ambiguous.
-                if command[start + end + 1..]
-                    .chars()
-                    .next()
-                    .is_some_and(|next| !token_boundary(next))
-                {
-                    return None;
-                }
-                end
-            } else {
-                let end = rest.find(token_boundary).unwrap_or(rest.len());
-                if let Some(delimiter) = rest[end..]
-                    .chars()
-                    .next()
-                    .filter(|ch| matches!(ch, '\'' | '"'))
-                    && (quote != Some(delimiter)
-                        || command[start + end + 1..]
-                            .chars()
-                            .next()
-                            .is_some_and(|next| !token_boundary(next)))
-                {
-                    return None;
-                }
-                end
-            };
-            paths.push(normalize(Path::new(&rest[..end])));
-            // Keep scanning even inside this path: punctuation-delimited paths
-            // such as PATH=/tmp:/etc and quoted JSON must not hide a second one.
-        }
-        if matches!(character, '\'' | '"') {
-            if quote == Some(character) {
-                quote = None;
-            } else if quote.is_none() {
-                quote = Some(character);
-                quote_start = start;
-            }
-        }
-        boundary = token_boundary(character);
     }
-    quote.is_none().then_some(paths)
-}
-
-fn token_boundary(character: char) -> bool {
-    character.is_whitespace()
-        || matches!(
-            character,
-            ';' | '|'
-                | '&'
-                | '<'
-                | '>'
-                | '('
-                | ')'
-                | '='
-                | ':'
-                | ','
-                | '['
-                | ']'
-                | '{'
-                | '}'
-                | '\''
-                | '"'
-                | '`'
-        )
+    Some(false)
 }
 
 fn once_options(options: &[Value]) -> Option<(Option<&str>, Option<&str>)> {

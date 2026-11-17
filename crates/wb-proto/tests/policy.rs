@@ -15,11 +15,14 @@ fn options() -> Vec<Value> {
 }
 
 fn call(kind: &str, paths: &[&str], command: &str) -> Value {
-    json!({
+    let mut call = json!({
         "toolCallId": "call-1", "title": "A tool request", "kind": kind,
         "locations": paths.iter().map(|path| json!({"path": path})).collect::<Vec<_>>(),
-        "rawInput": {"command": command}
-    })
+    });
+    if kind == "execute" {
+        call["rawInput"] = json!({"command": command});
+    }
+    call
 }
 
 fn compiled(rules: Value) -> CompiledPolicy {
@@ -261,7 +264,7 @@ fn command_patterns_are_conjunctive_and_execute_only() {
 }
 
 #[test]
-fn command_absolute_paths_are_checked_at_text_boundaries() {
+fn command_words_and_redirections_are_checked_as_complete_paths() {
     let p = compiled(json!([{"action":"allow", "roots":["$cwd", "/tmp"]}]));
     for command in [
         "cat /work/project/file",
@@ -271,7 +274,8 @@ fn command_absolute_paths_are_checked_at_text_boundaries() {
         "cat --file=/tmp/file",
         "echo /tmp/./a",
         "cat '/work/project/a b'",
-        "sh -c 'cat /tmp/a /work/project/b'",
+        "cat '/work/'project/file",
+        "cat /work/project/file''",
     ] {
         assert!(
             p.decide(&call("execute", &["."], command), &options())
@@ -290,7 +294,7 @@ fn command_absolute_paths_are_checked_at_text_boundaries() {
         "cat /tmp/a&&cat /etc/passwd",
         "cat --file=/etc/passwd",
         "PATH=/tmp:/etc cmd",
-        "echo [/etc/passwd]",
+        "echo /etc/passwd[ab]",
         "echo {/etc/passwd,/tmp/a}",
         "echo /tmp/a,/etc/passwd",
         r#"echo {"path":"/etc/passwd"}"#,
@@ -406,8 +410,6 @@ fn ambiguous_command_text_asks_even_without_root_conditions() {
     for command in [
         "echo 'unfinished",
         "echo \"unfinished",
-        "cat /tmp/a'other'",
-        "cat '/tmp/a'other",
         "echo `cat /tmp/a`",
         "cat /tmp/a\\ b",
     ] {
@@ -431,4 +433,291 @@ fn unmatched_rules_can_fall_through_but_matched_rules_cannot() {
     assert_eq!(decision.rule, 1);
     assert_eq!(decision.action, Action::Reject);
     assert_eq!(p.decide(&call("unknown", &["."], ""), &options()), None);
+}
+
+#[test]
+fn review_commands_with_outside_or_unresolved_paths_ask() {
+    let p = CompiledPolicy::new(
+        &policy(json!([{"action":"allow", "roots":["$cwd", "/nix/store", "/tmp"]}])),
+        "/home/u/proj",
+    )
+    .unwrap();
+    let commands = [
+        r#"cat '/tmp/'"../etc/passwd""#,
+        "mkdir -p /tmp/p=q; cat /tmp/p=q/../../etc/passwd",
+        "mkdir -p /tmp/p:q; cat /tmp/p:q/../../etc/passwd",
+        "mkdir -p /tmp/p,q; cat /tmp/p,q/../../etc/passwd",
+        "cat ../../../etc/passwd",
+        "printf changed > ../../../etc/policy-review-marker",
+        "cd ..; cat private.txt",
+        r#"cat "$PWD/../../../etc/passwd""#,
+        "cat ~root/.profile",
+        r#"cat "$(printf '%s' ../../../etc/passwd)""#,
+    ];
+    let allowed: Vec<_> = commands
+        .into_iter()
+        .filter(|command| {
+            p.decide(&call("execute", &["."], command), &options())
+                .is_some()
+        })
+        .collect();
+    assert!(allowed.is_empty(), "unintended allows: {allowed:?}");
+}
+
+#[test]
+fn literal_shell_subset_keeps_cooperative_commands_usable() {
+    let p = compiled(json!([{"action":"allow", "roots":["$cwd", "/nix/store", "/tmp"]}]));
+    for command in [
+        "cargo test -p x",
+        "cd crates/a && cargo fmt",
+        "git -C sub status",
+        "ls ./src",
+        "nix build .#checks.x86_64-linux.fmt --no-link",
+        "FOO=bar make",
+        "cat a/b.txt > /tmp/out.txt",
+        "grep -n \"a b\" src/x.rs | head -5",
+        "cat < ./src/x.rs >> /tmp/out.txt",
+        "cd crates/a && cat ../../README",
+        "cd crates/a && cd ../b && ls ./src",
+        "false || ls ./src; true\ncat ./README",
+        "cat './src/'\"../README\"",
+        "ls ./src/*.rs",
+        r#"cat 'src/a\b'"#,
+    ] {
+        assert!(
+            p.decide(&call("execute", &["."], command), &options())
+                .is_some(),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn cwd_changes_account_for_failures_short_circuiting_and_pipeline_scope() {
+    let p = compiled(json!([{"action":"allow", "roots":["$cwd", "/tmp"]}]));
+    for command in [
+        "cd crates/a; cat ../../README",
+        "cd crates/a || cat ../../README",
+        "cd crates/a && cd sub; cat ../../../README",
+        "cd crates/a || cd crates/b; cat ../../README",
+        "cd /etc && cat passwd",
+        "cd /tmp; cat ../etc/passwd",
+        "cd crates/a | cat ./src",
+        "echo ignored | cd crates/a",
+        "cd",
+        "cd -",
+        "cd -- crates/a",
+        "cd -P crates/a",
+        "cd crates/*",
+        "CDPATH=/tmp cd crates/a",
+        "pushd crates/a",
+        "popd",
+        "command cd ..",
+        "builtin cd ..",
+    ] {
+        assert_eq!(
+            p.decide(&call("execute", &["."], command), &options()),
+            None,
+            "{command}"
+        );
+    }
+    // A rule cannot ignore bare operands while the shell's initial cwd is outside.
+    let p = compiled(json!([{"action":"allow", "roots":["/tmp"]}]));
+    assert_eq!(
+        p.decide(&call("execute", &["/tmp/a"], "cat README"), &options()),
+        None
+    );
+}
+
+#[test]
+fn unsupported_shell_constructs_ask_in_generated_contexts() {
+    let p = compiled(json!([{"action":"allow", "roots":["/"]}]));
+    // Cartesian generation needs no property-test dependency or external shell.
+    for construct in [
+        "$PWD", "${PWD}", "$(pwd)", "$((1+1))", "`pwd`", "{a,b}", "(pwd)", "é", "\t", "\r",
+        "\u{7f}",
+    ] {
+        for (prefix, suffix) in [
+            ("echo ", ""),
+            ("echo '", "'"),
+            ("echo \"", "\""),
+            ("", " cat ./a"),
+            ("cat x", "y"),
+        ] {
+            let command = format!("{prefix}{construct}{suffix}");
+            assert_eq!(
+                p.decide(&call("execute", &["."], &command), &options()),
+                None,
+                "{command:?}"
+            );
+        }
+    }
+    for command in [
+        r"cat a\ b",
+        r#"cat "a\b""#,
+        "cat ~root/.profile",
+        "cat '~root/.profile'",
+        "FOO=~root make",
+        "cat <<EOF\ntext\nEOF",
+        "cat <<<word",
+        "cat <(pwd)",
+        "cat >(pwd)",
+        "eval 'cat ./a'",
+        "exec cat ./a",
+        "source ./script",
+        ". ./script",
+        "(cat ./a)",
+        "{ cat ./a; }",
+        "if true; then cat ./a; fi",
+        "for x in a; do cat ./a; done",
+        "sh -c 'cat ./a'",
+        "/bin/bash ./script",
+        "cat ./a &",
+        "cat ./a # ignored",
+        "cat ./a 2>/tmp/out",
+        "cat ./a >&2",
+        "cat ./a <>/tmp/out",
+        "cat 'unfinished",
+        "cat \"unfinished",
+        "cat 'a\nb'",
+        "cat &&",
+        "cat |",
+        "cat >",
+        "cat ; ; ls",
+    ] {
+        assert_eq!(
+            p.decide(&call("execute", &["."], command), &options()),
+            None,
+            "{command:?}"
+        );
+    }
+}
+
+#[test]
+fn command_evidence_uses_raw_input_and_never_title_or_a_non_execute_kind() {
+    let p = compiled(json!([{"action":"allow", "roots":["$cwd"]}]));
+    let mut execute = call("execute", &["."], "cat ./README");
+    execute["title"] = json!("cat /etc/passwd");
+    assert!(p.decide(&execute, &options()).is_some());
+    execute["rawInput"]["command"] = json!("cat ../../../etc/passwd");
+    execute["title"] = json!("cat ./README");
+    assert_eq!(p.decide(&execute, &options()), None);
+    for kind in ["read", "edit", "fetch", "future-kind"] {
+        for command in [json!("cat ./README"), json!(""), json!(null), json!(42)] {
+            let mut tool = call(kind, &["README"], "");
+            tool["rawInput"] = json!({"command": command});
+            assert_eq!(p.decide(&tool, &options()), None, "{tool}");
+        }
+        assert!(p.decide(&call(kind, &["README"], ""), &options()).is_some());
+    }
+}
+
+#[test]
+fn command_and_path_work_bounds_ask_without_losing_boundary_cases() {
+    let p = compiled(json!([{"action":"allow", "roots":["$cwd", "/tmp"]}]));
+    let command = format!("echo {}", "a".repeat(POLICY_COMMAND_MAX - 5));
+    assert!(
+        p.decide(&call("execute", &["."], &command), &options())
+            .is_some()
+    );
+    assert_eq!(
+        p.decide(&call("execute", &["."], &(command + "a")), &options()),
+        None
+    );
+    let command = vec!["x"; POLICY_COMMAND_WORDS_MAX].join(" ");
+    assert!(
+        p.decide(&call("execute", &["."], &command), &options())
+            .is_some()
+    );
+    assert_eq!(
+        p.decide(&call("execute", &["."], &(command + " x")), &options()),
+        None
+    );
+    let mut words = vec!["--file=/tmp/x"; POLICY_COMMAND_WORDS_MAX - 1];
+    let command = format!("cat {}", words.join(" "));
+    assert!(
+        p.decide(&call("execute", &["."], &command), &options())
+            .is_some()
+    );
+    words[0] = "/tmp/x,/tmp/y";
+    words[1] = "/tmp/x,/tmp/y";
+    assert_eq!(
+        p.decide(
+            &call("execute", &["."], &format!("cat {}", words.join(" "))),
+            &options()
+        ),
+        None
+    );
+    let mut paths = vec!["/tmp/a"; POLICY_PATHS_MAX];
+    assert!(p.decide(&call("read", &paths, ""), &options()).is_some());
+    paths.push("/tmp/a");
+    assert_eq!(p.decide(&call("read", &paths, ""), &options()), None);
+    let huge = format!("/tmp/{}", "x".repeat(POLICY_PATH_BYTES_MAX));
+    assert_eq!(p.decide(&call("read", &[&huge], ""), &options()), None);
+    assert!(
+        p.decide(
+            &call("execute", &["."], "cd a; cd b; cd c; cd d; cd e"),
+            &options()
+        )
+        .is_some()
+    );
+    assert_eq!(
+        p.decide(
+            &call("execute", &["."], "cd a; cd b; cd c; cd d; cd e; cd f"),
+            &options()
+        ),
+        None
+    );
+}
+
+#[test]
+fn aggregate_root_comparisons_are_bounded_and_duplicate_paths_are_checked_once() {
+    let mut roots: Vec<String> = (0..62).map(|i| format!("/unused/{i}")).collect();
+    roots.extend(["$cwd".into(), "/tmp".into()]);
+    let mut rules = vec![json!({"action":"allow", "roots":roots}); POLICY_RULES_MAX - 1];
+    rules.push(json!({"action":"allow"}));
+    let p = compiled(json!(rules));
+    let repeated = format!("cat {} /zzz", vec!["/tmp/x"; 1000].join(" "));
+    assert!(
+        p.decide(&call("execute", &["."], &repeated), &options())
+            .is_some()
+    );
+    let varied = format!(
+        "cat {} /zzz",
+        (0..1000)
+            .map(|i| format!("/tmp/x{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    assert_eq!(
+        p.decide(&call("execute", &["."], &varied), &options()),
+        None
+    );
+    let reported = format!("cat {}/etc/passwd", "/tmp/x ".repeat(2_000_000));
+    assert_eq!(
+        p.decide(&call("execute", &["."], &reported), &options()),
+        None
+    );
+}
+
+#[test]
+fn regex_conditions_match_raw_command_not_joined_words() {
+    let p = compiled(json!([{
+        "action":"allow", "roots":["$cwd"], "command":{"matches":["^cat '"]}
+    }]));
+    assert!(
+        p.decide(&call("execute", &["."], "cat './src/'file"), &options())
+            .is_some()
+    );
+    assert_eq!(
+        p.decide(&call("execute", &["."], "cat ./src/file"), &options()),
+        None
+    );
+    let p = compiled(json!([{
+        "action":"allow", "roots":["$cwd"], "command":{"notMatches":["'"]}
+    }]));
+    assert_eq!(
+        p.decide(&call("execute", &["."], "cat './src/'file"), &options()),
+        None
+    );
 }
