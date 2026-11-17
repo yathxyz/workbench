@@ -30,8 +30,9 @@ Agents: `stub` runs wb-fake-acp (the scripted test agent, the package's `fake` o
 --bin-dir, else PATH, without --scenario, so it acts on prompt keywords. `stuck` runs it with
 --scenario kill-stubborn (it ignores stdin EOF and SIGTERM, and its prompts never end), for the
 ui check N39. `reconnect` runs it with --scenario permission-reconnect (a prompt streams 116
-chunks, asks a permission and streams 80 more), for the ui check N27. Test mode refuses to start
-without it; --dogfood registers no agent.
+chunks, asks a permission and streams 80 more), for the ui check N27. `config` runs it with
+--scenario config for mutable configuration checks. Test mode refuses to start without the
+fake agent; --dogfood registers no agent.
 
 Test mode (the default) gives the hub a temporary HOME and environment canaries, and exits
 when stdin closes. Control lines on stdin, one per line, each acknowledged with one JSON line on
@@ -179,6 +180,7 @@ class Harness:
                 "stub": {"label": "Stub", "argv": [fake], "env": {}},
                 "stuck": {"label": "Stuck", "argv": [fake, "--scenario", "kill-stubborn"], "env": {}},
                 "reconnect": {"label": "Reconnect", "argv": [fake, "--scenario", "permission-reconnect"], "env": {}},
+                "config": {"label": "Config", "argv": [fake, "--scenario", "config"], "env": {}},
             }
         self.root = Path(tempfile.mkdtemp(prefix="wb-"))
         self.secret = secrets.token_hex(32)

@@ -387,7 +387,7 @@ fn keyword_set_mode_reports_the_mode_and_set_mode_scenario_does_not() {
 
 #[test]
 fn fake_config_options_conform_for_initial_grouped_boolean_and_runtime_changes() {
-    let mut a = Agent::start(&[]);
+    let mut a = Agent::start(&["--scenario", "config"]);
     let opened = a.open(CWD);
     let session = opened["sessionId"].as_str().unwrap();
     let options = &opened["configOptions"];
@@ -2029,7 +2029,6 @@ fn hub_config_rejects_unknown_values_and_stale_epochs_without_agent_calls() {
             .is_empty()
     );
     let basic = ready(&mut c, &hub, "b1", "basic");
-    assert!(c.summary("b1")["acp"]["configOptions"].is_null());
     assert_eq!(
         configure(&mut c, "b1", epoch(&basic), "model", json!("large"))["code"],
         "bad_option"

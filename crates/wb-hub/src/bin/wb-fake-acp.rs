@@ -372,7 +372,10 @@ impl Fake {
             "session/resume" => self.resume(id, params),
             "session/prompt" => {
                 if let Some(config_id) = self.delayed_config.take() {
-                    self.reply(config_id, json!({"configOptions": self.session_config_options()}));
+                    self.reply(
+                        config_id,
+                        json!({"configOptions": self.session_config_options()}),
+                    );
                 }
                 let stop = self.prompt(params).await;
                 self.reply(id, json!({"stopReason": stop}));

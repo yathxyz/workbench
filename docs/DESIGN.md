@@ -1577,7 +1577,7 @@ The flake builds the workspace with `buildRustPackage` (`cargoLock.lockFile`), b
 - No sleeps in tests except the `hang` scenario and the 20 ms holdback; wait on events.
 - Sockets live under `$TMPDIR`, and shells come from `$BASH`.
 - Tests never hard-code `/run/current-system`.
-- Conformance's `session_config` uses the real `/acp` relay, hub and keyword-mode fake agent: no-config initial options in both info forms, stale-before-bad-option checks, rejected values, grouped/dependent selects, booleans, authoritative whole-list results, hub list and journal replay. `configured_open` proves the initial hello is already configured, dependent options follow input order, opener errors do not fail accepted creation or prevent later entries, and no implicit prompt is journaled.
+- Conformance's `session_config` uses the real `/acp` relay, hub and explicit `config` fake-agent scenario: no-config initial options in both info forms, stale-before-bad-option checks, rejected values, grouped/dependent selects, booleans, authoritative whole-list results, hub list and journal replay. `configured_open` proves the initial hello is already configured, dependent options follow input order, opener errors do not fail accepted creation or prevent later entries, and no implicit prompt is journaled.
 
 ### 9.2 `wb-fake-acp` scenarios (one Rust stub for every layer, registered as agent `stub`)
 - **Hub scenarios** (`basic`, `noise`, `permission`, `permission-reconnect`, `agent-cancels`, `elicitation`, `cancel`, `crash-midturn`, `auth`, `auth-terminal`, `revive-resume`, `revive-load`, `unknown`, `version`, `hang`, `set-mode`, `kill-stubborn`, `replay-large`):
@@ -1588,9 +1588,10 @@ The flake builds the workspace with `buildRustPackage` (`cargoLock.lockFile`), b
   - `setsid-child`: the fake starts `sleep 1000` in a process group of its own, with no stdio, and exits. That process survives, because the hub kills by process group. The test reaps it.
   - `revive-fail`: both resume and load fail. The result is `setup_error{revive_failed}` and `revivable:false`.
   - Configuration scenarios: `config` sends a `config_option_update` and the full result; `config-result` sends the result alone; `config-error`, `config-malformed`, `config-hang` and `config-exit` exercise agent error, malformed result, timeout and exit handling.
+  - These configuration scenarios offer grouped `model` choices `small`/`large`, `effort` choices `low`/`high` (`max` additionally with `large`), and boolean `thinking`. Model changes reset effort to `low`; requesting effort `high` returns `low`, so callers must use the authoritative result.
 - **Prompt keywords for ui and VM**, checked in this order: `ask-permission` (permission, then `PONG`), `perm`, `form`, `url`, `tool`, `slow`, `stream`; anything else echoes. Two modes, `loadSession`, `sessionCapabilities.resume`. The first prompt also titles the session (its first line, up to 60 characters), and `session/set_mode` is followed by a `current_mode_update` (the `set-mode` scenario omits it, so the hub's journalling of the mode from the RPC result alone is tested).
-  - Standard configuration, also offered in keyword mode: grouped `model` choices `small`/`large`, `effort` choices `low`/`high` (`max` additionally with `large`), and boolean `thinking`. Model changes reset effort to `low`; requesting effort `high` returns `low`, so callers must use the authoritative result.
-- **Harness agents:** `stub` (keyword mode), `stuck` (`--scenario kill-stubborn`, which ignores SIGTERM and EOF and whose prompts never end) and `reconnect` (`--scenario permission-reconnect`). `stuck` has its own name so that the picker's fuzzy filter still picks `stub`.
+  - Default session metadata stays `model: "stub-model"` and select `thinking: "high"` with category `thinking`, as consumed by N78.
+- **Harness agents:** `stub` (keyword mode), `stuck` (`--scenario kill-stubborn`, which ignores SIGTERM and EOF and whose prompts never end), `reconnect` (`--scenario permission-reconnect`) and `config` (`--scenario config`). `stuck` has its own name so that the picker's fuzzy filter still picks `stub`.
 - **Mode selection:** `--scenario` comes from argv for cargo tests. Without it, the fake dispatches on prompt keywords. `--record` stays optional.
 
 ### 9.3 Security regression list (`tests/test_security.py` unless noted)

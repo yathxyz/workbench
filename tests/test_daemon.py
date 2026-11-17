@@ -295,7 +295,7 @@ def session_config(t, h):
         return arrived and error.get("code") == code and not card.since(mark, ("config",))
 
     try:
-        opened = card.open(agent="stub", cwd=str(h.home.resolve()))
+        opened = card.open(agent="config", cwd=str(h.home.resolve()))
         ready = opened and card.wait(
             lambda: card.since(0, wbctl.SETUP_END) and options() is not None)
         if not t.check("config: /acp offers the agent's initial full options in Summary and session info",
@@ -374,7 +374,7 @@ def configured_open(t, h):
         sid = "conformance_config_open_" + name
         card = wbctl.AcpCard(ep, sid)
         try:
-            opened = card.open(agent="stub", cwd=str(h.home.resolve()), config=config)
+            opened = card.open(agent="config", cwd=str(h.home.resolve()), config=config)
             hello = card.result["hello"] or {}
             info = hello.get("info") or {}
             acp = info.get("acp") or {}
