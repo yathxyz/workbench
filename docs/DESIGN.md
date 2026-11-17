@@ -44,7 +44,7 @@ Edwin (edwind, its frame runtime and "the edwind spec") lives in its own reposit
 - nix packaging, a NixOS module and a VM test.
 
 **Non-goals (v1):**
-- multi-host and federation (the protocol stays host-aware);
+- multi-host and federation (the protocol stays host-aware). **Reversed in stages from 2026-11-17 (§3.8):** there is still one hub, on one host, and it now serves a mesh of hosts: every host reports its agent sessions to it, clients on the mesh steer it over an HTTP API, and it starts agents on the other hosts;
 - tmux adoption;
 - `/mcp`;
 - hub hot-upgrade through the systemd fd store;
@@ -985,6 +985,211 @@ Nothing else is inherited: no `NOTIFY_SOCKET`, `INVOCATION_ID`, `JOURNAL_STREAM`
 - **Messages:** `wb: cannot reach wb-web at <path> (<errno>)` and `wb: no Workbench page is open`.
 - **Commands:** there are no commands for `hosts`, `host`, `unit start|stop|restart`, `tmux` or `adopt`, and `create_node` does not accept `kind=agent`.
 - **Desks** (§10.8 D3): `wb desk ls`, `wb desk go N` and `wb desk send N [PATH]... [--keep] [--follow]` are the tools `list_desks`, `go_to_desk` and `send_to_desk`, sent as one `cmd` like `wb TOOL`; N is one digit 0-9. `wb desk query [N] WORD...` is `query_desk` (F-A38): the words, joined with spaces, are the query, and a lone digit 1-8 first is the desk.
+
+### 3.8 The mesh: API, observed sessions, remote hosts
+
+**Decisions (the owner, 2026-11-16 and 2026-11-17).**
+- Workbench is the place to see and steer every coding-agent session on a private mesh of hosts. There is one hub, on one host.
+- Every agent on every host is configured to report to that hub while it works, however it was started.
+- The hub's capability is offered as an HTTP API on the mesh, so that other interfaces (an orchestrating agent, an editor, a script) can be built on it. Which client may do what is a matter of its token.
+- The hub can start agents on the other hosts of the mesh.
+
+Three parts follow from that, and each stands alone: the API listener (§3.8.1, §3.8.2), the registry of observed sessions that the reports feed (§3.8.3, §3.8.4), and remote hosts in the hub (§3.8.5). The canvas does not show observed sessions yet; the API does.
+
+#### 3.8.1 The API listener (wb-web)
+
+`web.json` takes an optional `api` object. Without it nothing of §3.8.1 to §3.8.4 exists: no listener, no registry.
+
+```json
+"api": {
+  "listen": "198.51.100.2:8091",
+  "clients": {
+    "devbox-agents": {"tokenFile": "/run/credentials/workbench-web.service/api-devbox-agents", "scopes": ["events"], "host": "devbox", "address": "198.51.100.2"},
+    "laptop-agents": {"tokenFile": "/run/credentials/workbench-web.service/api-laptop-agents", "scopes": ["events"], "host": "laptop", "address": "198.51.100.7"},
+    "owner":         {"tokenFile": "/run/credentials/workbench-web.service/api-owner", "scopes": ["read", "control"]}
+  }
+}
+```
+
+- **The listener** is a second TCP listener of wb-web, apart from the browser's: the auth floor of §3.6 does not apply to it, and it serves nothing but `/v1`. It speaks plain HTTP/1.1 and is meant for an address on the mesh interface, whose transport encrypts and authenticates the peer's address.
+- **A client** has a name, a token, a set of scopes, and optionally a `host` and an `address`.
+  - `scopes` is a non-empty subset of `events` (send session events), `read` (every `GET`) and `control` (start, prompt, answer and end sessions).
+  - `host` is the host name this client's events are filed under. It is required with the `events` scope and comes from nowhere else: a host named inside a request is ignored.
+  - `address`, when present, is the only peer address the token is accepted from.
+  - The token file holds 64 lowercase hex characters; trailing whitespace is ignored. It is read at startup.
+- **Validation** refuses to start the web when `api.listen` is a wildcard address or equals `listen`; a client name does not match `^[a-z0-9-]{1,32}$`; `clients` is empty; a `tokenFile` is not absolute, unreadable or malformed; two clients hold the same token; `scopes` is empty or names an unknown scope; `events` is listed without `host`; or `host` does not match the rule of the top-level `host`. Errors never include a token.
+- **Every request** is checked in this order, before the path is looked at:
+  1. Exactly one `Authorization` header, of the form `Bearer <token>`. The token is compared with every client's in constant time, without stopping at a match.
+  2. When the matched client has an `address`, the peer's address (an IPv4-mapped one as IPv4) must equal it.
+
+  A request that fails either gets 401 `{"error":"unauthorized"}` with `WWW-Authenticate: Bearer`; the two are not told apart. `X-Forwarded-For` is never read.
+  3. The route's scope must be among the client's, else 403 `{"error":"forbidden"}`. An unknown path is 404 and a wrong method 405, both only after steps 1 and 2.
+- A refusal is logged with the peer's address, the method and the path without its query; no header value is logged.
+- Every response is JSON with `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`, except the event stream (`text/event-stream`). There are no CORS headers. A request body is at most `API_BODY_MAX`; a larger one is 413.
+- Errors are `{"error": message}`. An error the hub gave also carries the hub's `code`: `{"error": message, "code": "busy"}`.
+
+**Hub errors as statuses:** `bad_request`, `bad_option`, `unknown_agent` → 400; `not_found` → 404; `kind_mismatch`, `busy`, `not_alive`, `already_resolved`, `stale`, `not_revivable`, `faulted` → 409; `timeout` → 504; anything else → 502. The hub down or incompatible is 503; no reply within 10 s (40 s for `mode`, which waits for the agent) is 504.
+
+#### 3.8.2 `/v1` endpoints
+
+A sid in a path that does not match `^[A-Za-z0-9_-]{1,64}$` is 400 "bad id". Requests that reach the hub use a hub connection of their own for the one request, except those the control connection already answers.
+
+| Endpoint | Scope | Contract |
+|---|---|---|
+| `GET /v1/info` | read | `{host, version, hub:{status, version, build, proto, startedAt, stale}, agents:[{name,label}], hosts:[{name, agents:[{name,label}]}]}`. `hub` as in `/api/info`; `agents` and `hosts` are `[]` while the hub is not up. |
+| `GET /v1/sessions` | read | `{host, sessions:[Summary+state]}`, the hub's sessions as in `/api/sessions`; 503 when the hub is down or incompatible. |
+| `GET /v1/sessions/{sid}` | read | One `Summary+state`; 404 for a sid the hub does not know. |
+| `GET /v1/sessions/{sid}/events?since=N` | read | An ACP session's journal after seq `N` (default 0): `{sid, epoch, head, from, reset, truncated, events:[JournalEvent]}`. It is `acp.open` without `spawn`, read up to `acp.replayed`, then the connection is closed; nothing runs. `since` that is not an integer is 400 "bad query". |
+| `GET /v1/sessions/{sid}/capture?lines=N` | read | A PTY session's text, `{sid, text}`, with the rules of `GET /api/pty/{id}/capture`. |
+| `GET /v1/observed` | read | `{sessions:[ObservedSession]}` (§3.8.3), live first, then by `lastAt`, newest first. |
+| `GET /v1/observed/{id}` | read | One `ObservedSession` by its `id`; 404. |
+| `GET /v1/stream` | read | Server-sent events (§3.8.4). |
+| `POST /v1/sessions` | control | Starts an ACP agent. Body `{agent, cwd, host?, sid?}`. `sid` defaults to `api_` and 16 random hex digits. `host` absent, or the hub's own, starts it on the hub's host; another name must be one of the hub's `hosts` as its hello lists them, else 400 "no host H" (so a hub that predates §3.8.5 is never asked). 201 `{sid, session: Summary+state}`. A sid that exists is 409 "session exists", and that session is left as it is. |
+| `POST /v1/sessions/{sid}/prompt` | control | Body `{text}` or `{blocks:[ContentBlock]}`, exactly one of them; `text` becomes one text block. `acp.prompt`. 200 `{}`. |
+| `POST /v1/sessions/{sid}/cancel` | control | `acp.cancel`. 200 `{}`. |
+| `POST /v1/sessions/{sid}/permission` | control | Body `{req, epoch, outcome}`: `acp.permission`. 200 `{}`. |
+| `POST /v1/sessions/{sid}/elicitation` | control | Body `{req, epoch, response}`: `acp.elicitation`. 200 `{}`. |
+| `POST /v1/sessions/{sid}/mode` | control | Body `{modeId}`: `acp.set_mode`. 200 `{}`. |
+| `POST /v1/sessions/{sid}/revive` | control | `acp.revive`. 200 `{}`. |
+| `DELETE /v1/sessions/{sid}?forget=true\|false` | control | `acp.kill` or `pty.kill` by the session's kind, `forget` defaulting to `false`. 200 `{}`; 404 for a sid the hub does not know. |
+| `POST /v1/events` | events | One session event (§3.8.3). 204. |
+
+A body that is not the JSON the endpoint takes is 400. The API starts no PTY and sends no PTY input: a shell on the mesh is what ssh is for.
+
+**Who answers permission requests.** `control` includes `permission` and `elicitation`: a client that holds it can approve what an agent asks. Whether an orchestrating client does so, or leaves those to the owner, is that client's configuration. The owner sees every pending request in Workbench either way.
+
+#### 3.8.3 Observed sessions
+
+An observed session is what the harnesses report about one agent session: a record in wb-web's memory, built from the events the hosts send, for sessions the hub does not own as much as for those it does.
+
+**The event** (`POST /v1/events`):
+
+```json
+{
+  "harness": "claude",
+  "at": 1763300000123,
+  "wbSession": "n_k3m9x2",
+  "pid": 4242, "pidStart": 98765432,
+  "projectRoot": "/home/alice/proj/x",
+  "payload": { }
+}
+```
+
+- `harness` matches `^[a-z0-9-]{1,32}$`. Every other field but `payload` is optional and may be `null`; unknown fields are ignored.
+- `at` is the sender's wall clock in ms; absent, the server's.
+- `wbSession` is the sender's `$WB_SESSION`, kept only when it is a sid (`^[A-Za-z0-9_-]{1,64}$`): the agent runs under the hub as that session.
+- `pid` and `pidStart` name the harness process: its pid and field 22 of its `/proc/<pid>/stat`. `projectRoot` is the nearest directory at or above the session's cwd that holds `.git`.
+- `payload` is an object with a `session_id` matching `^[A-Za-z0-9._:-]{1,128}$`:
+  - for `claude` and `codex`, the JSON their hook wrote to its stdin, unchanged;
+  - for any other harness, a **neutral event**: `{session_id, kind, cwd?, transcript_path?, model?, permission_mode?, agent_id?, agent_type?, text?, tool?: {name, input?}, reason?}`, with `kind` an `ObsKind`. `text` is the prompt of a `prompt`, the last assistant message of a `turn_end`, and the message of a `permission`, `question` or `note`. That is the whole contract a new harness has to meet: an extension that posts neutral events.
+- **Refused with 400**, the registry unchanged: a body that is not such an object, a bad `harness` or `session_id`, an unknown `kind` in a neutral event.
+- The host is the client's `host` (§3.8.1).
+
+```ts
+type ObsKind = 'start'|'prompt'|'tool_start'|'tool_end'|'tool_fail'|'permission'|'permission_done'
+             |'question'|'turn_end'|'subagent_start'|'subagent_end'|'note'|'end';
+interface ObservedSession {
+  id: string;            // "o_" + the first 16 hex digits of sha256(key)
+  key: string;           // `${host}/${harness}/${sessionId}`, or `…/${sessionId}:${agentId}` for a subagent
+  host: string; harness: string; sessionId: string;
+  parent: string|null;   // the id of a subagent's session
+  agentType: string|null;
+  wbSession: string|null; pid: number|null; transcriptPath: string|null;
+  cwd: string|null; projectRoot: string|null;
+  project: string;       // basename(projectRoot ?? cwd), else "(no cwd)"
+  model: string|null; permissionMode: string|null;
+  title: string;         // the first line of the first prompt (≤ 120 bytes), else agentType, else `${harness} · ${project}`
+  state: State;          // the vocabulary of §3.4.6
+  startedAt: number; lastAt: number; endedAt: number|null;
+  endReason: null|'session_end'|'process_gone'|'silent'|'replaced'|'parent_ended';
+  tool: {name: string; input: string|null}|null;
+  pending: {kind: 'permission'|'question'; tool: string|null; input: string|null; message: string|null; at: number}|null;
+  lastPrompt: string|null; lastMessage: string|null;
+  counts: {events: number; prompts: number; tools: number; toolFailures: number; subagents: number};
+  tail: {at: number; kind: ObsKind; text: string}[];   // newest last, at most OBS_TAIL
+}
+```
+
+Texts are excerpts: cut to `OBS_TEXT_MAX` (a tail line to 240 bytes) at a character boundary, with `…`. A tool's `input` is the first present of `command`, `file_path`, `path`, `pattern`, `url`, `description` of the tool input, else its compact JSON.
+
+**The fold.** Each event becomes one `ObsKind` and changes the record so:
+
+| Kind | claude `hook_event_name` | codex `hook_event_name` | Change |
+|---|---|---|---|
+| `start` | `SessionStart` | `SessionStart` | `model`; the record is live again |
+| `prompt` | `UserPromptSubmit` | `UserPromptSubmit` | in a turn; `lastPrompt`; `title` if none |
+| `tool_start` | `PreToolUse` | `PreToolUse` | `tool`; in a turn |
+| `tool_end` / `tool_fail` | `PostToolUse` / `PostToolUseFailure` | `PostToolUse` | `tool` cleared; counts |
+| `permission` | `PermissionRequest`; `Notification` of type `permission_prompt` when nothing is pending | `PermissionRequest` | `pending` |
+| `permission_done` | – | – | `pending` cleared |
+| `question` | `Notification` of type `elicitation_dialog` | – | `pending{question}` |
+| `turn_end` | `Stop` | `Stop` | the turn is over; `lastMessage` |
+| `subagent_start` / `subagent_end` | `SubagentStart` / `SubagentStop` | `SubagentStart` / `SubagentStop` | the subagent's record |
+| `note` | `PreCompact`, other `Notification`s, any other name | `PreCompact`, `PostCompact`, any other name | the tail only |
+| `end` | `SessionEnd` | – | ended `session_end` |
+
+The names in the codex column are those of the codex release the fixtures were taken from; the fixtures are normative, and each one names the source it was taken from. Every event also sets `lastAt`, adds to `counts.events` and to the tail, and takes `cwd`, `transcriptPath`, `model`, `permissionMode`, `wbSession`, `pid` and `projectRoot` when it carries them. `pending` is cleared by any later event of the same record except `note` and `permission`. An event with an `agent_id` goes to the subagent's record, keyed `sessionId:agentId` with `parent` set, and also sets the parent's `lastAt`.
+
+**State**, first match wins; the table tests are normative. `error` and `detached` are never produced.
+
+```
+1. ended                      -> exited
+2. pending.kind = permission  -> waiting_permission
+3. pending.kind = question    -> waiting_input
+4. in a turn                  -> running
+5. the turn ended             -> done     (until the next prompt)
+6. otherwise                  -> idle
+```
+
+**Ending.** A sweep runs every `OBS_SWEEP`:
+- on the registry's own host, a record with a `pid` whose `/proc/<pid>/stat` is gone or has another start time ends `process_gone`;
+- a record silent for `OBS_SILENT_END` ends `silent`;
+- a `start` from the same host, harness, pid and start time as another live top-level record ends that one `replaced`;
+- a parent's end ends its subagents `parent_ended`;
+- any event other than `end` makes an ended record live again;
+- an ended record is dropped `OBS_ENDED_KEEP` after `endedAt`. At `OBS_SESSIONS_MAX` records the oldest ended one goes first, else the live one with the oldest `lastAt`.
+
+**Persistence.** `<stateDir>/observed.json` (0600, atomic), `{"v":1,"sessions":[…]}`, written at most every `OBS_SAVE_EVERY` while something changed, and once more at shutdown. So prompt excerpts are on disk. A file that does not parse, or has another `v`, is renamed `observed.json.bad-<ms>` with a warning, and the registry starts empty. A sweep runs right after loading.
+
+**Limits** (wb-web, `observed`): `API_BODY_MAX` 1 MiB, `OBS_SESSIONS_MAX` 256, `OBS_TEXT_MAX` 2 KiB, `OBS_TAIL` 20, `OBS_SWEEP` 10 s, `OBS_SAVE_EVERY` 5 s, `OBS_SILENT_END` 12 h, `OBS_ENDED_KEEP` 6 h, `OBS_PUSH_EVERY` 500 ms.
+
+#### 3.8.4 `GET /v1/stream`
+
+Server-sent events, each `event: <name>` with one line of JSON as `data`:
+
+| Event | Data | When |
+|---|---|---|
+| `hub` | `{status}` | first, and on every change |
+| `session` | `Summary+state` | one per session after the first `hub`, then on every change |
+| `gone` | `{sid, epoch}` | the hub forgot a session |
+| `observed` | `ObservedSession` | one per record after the sessions, then on every change, at most one per record per `OBS_PUSH_EVERY` |
+| `observed_gone` | `{id, key}` | a record was dropped |
+| `ready` | `{}` | once, after the snapshot |
+
+A comment line goes out every 15 s. A client that falls so far behind that events were lost is disconnected and takes a new snapshot when it reconnects. The stream ends when wb-web shuts down.
+
+#### 3.8.5 Remote hosts (hub)
+
+`hub.json` takes an optional `hosts` object:
+
+```json
+"hosts": {
+  "laptop": {
+    "argv": ["/run/current-system/sw/bin/ssh", "-T", "-oBatchMode=yes", "alice@198.51.100.7", "workbench-agent"],
+    "agents": {"claude": {"label": "Claude"}, "pi": {"label": "pi"}}
+  }
+}
+```
+
+- **A host** is a name, the command that reaches its launcher, and the agents the launcher knows. The hub knows nothing of ssh: `argv` is any command whose standard input and output are an agent's.
+- **Starting agent `A` of host `H`** for session `S` in directory `C`: the hub runs `hosts.H.argv` followed by three more arguments, `A`, the lowercase hex of `C`'s bytes, and `S`. All three match `^[A-Za-z0-9_-]+$`, so no shell between the hub and the launcher can read them as anything else. The process runs in the hub's `$HOME`, with the environment of §3.7.3 steps 1 to 3 (`agents.<name>.env` is for local agents).
+- **The launcher** is the remote host's own: it maps `A` to a command, changes to `C`, sets `WB_SESSION=S` and runs it, and exits non-zero with one line on stderr when it cannot. It is not in this repository's binaries; a host is free in how it provides one.
+- **`SpawnAcp`** gains `host?`. Absent, or the hub's own `host`, means local, as before. Otherwise: an unknown host is `bad_request` "no host H"; an agent not in that host's table is `unknown_agent`; `cwd` must be an absolute path without NUL of at most 4096 bytes, and is not looked up on the hub's host.
+- **The session** remembers its host (`acp/<sid>.json`, absent meaning local), so a revive goes the same way, and its `Summary.host` is that host's name.
+- **`hello`** gains `hosts: [{name, agents:[{name,label}]}]`, empty from a hub without `hosts`.
+- **Ending** is as for a local agent: the signals go to the local process group of the command. The launcher's side ends when its standard input closes.
+- **Validation** refuses to start the hub when a host name does not match `[A-Za-z0-9][A-Za-z0-9._-]*` or equals `host`; `argv` is empty, `argv[0]` is not absolute or an argument holds NUL; or an agent name does not match `^[a-z0-9-]{1,32}$`.
+- ACP gives the hub no file or terminal duties (`clientCapabilities` has none, §3.4.5), so an agent on another host reads, writes and runs there.
 
 ---
 
