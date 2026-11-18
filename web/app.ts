@@ -4272,7 +4272,7 @@ function meshRowEl(r: MeshRow): HTMLElement {
   };
   go.title = 'Show its card on the canvas';
   go.onclick = e => { e.stopPropagation(); const n = row.dataset.card && S.nodes[row.dataset.card]; if (n) { setView('canvas'); jumpNode(n); } };
-  row.onclick = () => { meshSelect(r.id, true); if (live.$agentsAttach) meshFocus(); };
+  row.onclick = () => meshSelect(r.id, true);
   return row;
 }
 // A row's texts, set in place: a row under the pointer is not replaced while its session works.
@@ -4456,6 +4456,11 @@ function meshSelect(id: string, commit = false): void {
   }
   MESH.open = id; $('#v-agents')!.classList.add('detail-open'); meshRender(commit);
   $(`#mesh-list .mesh-row[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'nearest' });
+  if (commit) {
+    const list = $('#mesh-list')!;
+    if (list.getClientRects().length) list.focus({ preventScroll: true });
+    else if (live.$agentsAttach) meshFocus();   // the single-pane layout hides the list
+  }
 }
 function meshBack(): void {
   $('#v-agents')!.classList.remove('detail-open');
