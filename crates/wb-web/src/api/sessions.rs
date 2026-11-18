@@ -366,6 +366,12 @@ async fn create(
     let wait = acp_open_timeout(config.len());
     let open = async {
         let (mut conn, info) = connect(&api.app).await?;
+        if !config.is_empty() && !info.acp_config {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "hub does not support session configuration",
+            ));
+        }
         let req = HubRequest::AcpOpen {
             rid: RID,
             sid: sid.clone(),
@@ -636,6 +642,7 @@ mod tests {
             started_at: 0,
             host: "hubhost".into(),
             agents: Vec::new(),
+            acp_config: true,
             hosts: hosts
                 .iter()
                 .map(|name| Host {

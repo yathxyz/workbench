@@ -26,6 +26,10 @@ pub const ACP_REPLAY_MAX: usize = 4 * MIB;
 pub const PROMPT_MAX: usize = 8 * MIB;
 /// Most ordered configuration entries in an ACP spawn. Larger is `bad_request`.
 pub const ACP_CONFIG_MAX: usize = 16;
+/// Most options in an agent's full configuration offering. Larger is malformed.
+pub const ACP_CONFIG_OPTIONS_MAX: usize = 64;
+/// Largest serialized agent configuration offering. Larger is malformed.
+pub const ACP_CONFIG_OPTIONS_BYTES: usize = 64 * KIB;
 /// Scrollback lines kept by the VT state.
 pub const VT_SCROLLBACK: usize = 1000;
 /// Largest snapshot. The scrollback budget is halved until it fits.

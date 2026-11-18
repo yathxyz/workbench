@@ -82,6 +82,7 @@ enum Scenario {
     ConfigMalformed,
     ConfigMalformedList,
     ConfigNewMalformed,
+    ConfigReviveMalformed,
     ConfigHang,
     ConfigExit,
     KillStubborn,
@@ -120,7 +121,8 @@ enum Scenario {
 /// - `config-result`: config changes return the complete list without a notification;
 /// - `config-batch`: creation/config replies wait for numbered steps in `<record>.step`;
 /// - `config-malformed-list`: returns malformed lists/updates, or clears on thinking=false;
-/// - `config-new-malformed`: returns a malformed list from session creation;
+/// - `config-new-malformed`: malformed lists from new and resume;
+/// - `config-revive-malformed`: resume fails, then load returns malformed options;
 /// - `config-error`, `config-malformed`, `config-hang`, `config-exit`: refuse a config
 ///   request, return a malformed result, defer the answer until a prompt, or exit;
 /// - `kill-stubborn`: SIGTERM and the end of stdin are ignored, and a prompt never ends;
@@ -131,7 +133,7 @@ enum Scenario {
 ///   with the agent's stdout and stderr, and exits 1;
 /// - `setsid-child`: a prompt starts `sleep 1000` in a process group of its own, with
 ///   no stdio, and exits 1.
-const SCENARIOS: [(&str, Scenario); 30] = [
+const SCENARIOS: [(&str, Scenario); 31] = [
     ("basic", Scenario::Basic),
     ("noise", Scenario::Noise),
     ("permission", Scenario::Permission),
@@ -156,6 +158,7 @@ const SCENARIOS: [(&str, Scenario); 30] = [
     ("config-malformed", Scenario::ConfigMalformed),
     ("config-malformed-list", Scenario::ConfigMalformedList),
     ("config-new-malformed", Scenario::ConfigNewMalformed),
+    ("config-revive-malformed", Scenario::ConfigReviveMalformed),
     ("config-hang", Scenario::ConfigHang),
     ("config-exit", Scenario::ConfigExit),
     ("kill-stubborn", Scenario::KillStubborn),
@@ -502,16 +505,27 @@ impl Fake {
                 {"name": "test", "description": "Run the tests", "input": {"hint": "a test filter"}},
             ],
         }));
-        let result = json!({"modes": self.modes(), "configOptions": self.session_config_options()});
+        let mut result =
+            json!({"modes": self.modes(), "configOptions": self.session_config_options()});
+        if self.scenario == Scenario::ConfigReviveMalformed {
+            result["configOptions"] = json!([null]);
+        }
         self.reply(id, result);
     }
 
     fn resume(&mut self, id: Value, params: &Value) {
-        if self.scenario == Scenario::ReviveFail {
+        if matches!(
+            self.scenario,
+            Scenario::ReviveFail | Scenario::ConfigReviveMalformed
+        ) {
             return self.error(id, -32002, "Session not found");
         }
         self.adopt(params);
-        let result = json!({"modes": self.modes(), "configOptions": self.session_config_options()});
+        let mut result =
+            json!({"modes": self.modes(), "configOptions": self.session_config_options()});
+        if self.scenario == Scenario::ConfigNewMalformed {
+            result["configOptions"] = json!([null]);
+        }
         self.reply(id, result);
     }
 

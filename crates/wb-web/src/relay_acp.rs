@@ -138,7 +138,7 @@ fn error(message: &str, code: ErrorCode, rid: Option<Value>) -> Value {
 }
 
 async fn run(app: AppState, mut ws: WebSocket) {
-    let (hub, _) = match connect_relay(&app).await {
+    let (hub, info) = match connect_relay(&app).await {
         Ok(conn) => conn,
         Err(reason) => return ws_close(ws, ROUTE, close::HUB_UNAVAILABLE, reason).await,
     };
@@ -146,6 +146,7 @@ async fn run(app: AppState, mut ws: WebSocket) {
     tokio::pin!(stop);
     let mut relay = Relay {
         hub,
+        acp_config: info.acp_config,
         app: app.clone(),
         next_rid: 0,
         sid: None,
@@ -204,6 +205,7 @@ enum Pending {
 struct Relay {
     app: AppState,
     hub: HubConn,
+    acp_config: bool,
     next_rid: u64,
     /// The session named by `open`, from the moment the open is sent; only its events
     /// reach the browser.
@@ -250,6 +252,12 @@ impl Relay {
                     cwd,
                     config,
                 } => {
+                    if !self.acp_config && !config.is_empty() {
+                        let message = "hub does not support session configuration";
+                        let e = error(message, ErrorCode::BadRequest, browser_rid);
+                        send_json(ws, &e).await.map_err(|_| End::Gone)?;
+                        return Err(End::Close(close::POLICY, message));
+                    }
                     let spawn = spawn(agent, cwd, config);
                     self.open(ws, &id, since, epoch, spawn, browser_rid).await
                 }

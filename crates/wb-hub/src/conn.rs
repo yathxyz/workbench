@@ -177,6 +177,7 @@ fn hello(ctx: &Ctx) -> HubMessage {
             .collect(),
         shells: ctx.cfg.available_shells(),
         default_shell: ctx.cfg.default_shell.clone(),
+        acp_config: true,
         hosts: ctx
             .cfg
             .hosts

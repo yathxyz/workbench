@@ -509,6 +509,7 @@ pub struct Hello {
     pub shells: Vec<String>,
     pub default_shell: String,
     pub hosts: Vec<Host>,
+    pub acp_config: Option<bool>,
 }
 
 impl Default for Hello {
@@ -521,6 +522,7 @@ impl Default for Hello {
             shells: vec![DEFAULT_SHELL.into(), "zsh".into()],
             default_shell: DEFAULT_SHELL.into(),
             hosts: Vec::new(),
+            acp_config: Some(true),
         }
     }
 }
@@ -752,6 +754,7 @@ async fn serve(
 ) {
     let (rx, mut tx) = stream.into_split();
     let mut lines = FramedRead::new(rx, LinesCodec::new_with_max_length(MAX_LINE));
+    let acp_config = hello.acp_config;
     let hello = HubMessage::Hello {
         proto: hello.proto,
         server: "wb-hub".into(),
@@ -764,7 +767,12 @@ async fn serve(
         shells: hello.shells,
         default_shell: hello.default_shell,
         hosts: hello.hosts,
+        acp_config: acp_config.unwrap_or(false),
     };
+    let mut hello = serde_json::to_value(hello).unwrap();
+    if acp_config.is_none() {
+        hello.as_object_mut().unwrap().remove("acpConfig");
+    }
     if tx.write_all(&line::encode(&hello)).await.is_err() {
         return;
     }

@@ -179,6 +179,10 @@ pub enum HubMessage {
         /// hub.
         #[serde(default)]
         hosts: Vec<Host>,
+        /// Whether ordered startup configuration and live config requests are supported.
+        /// False from an older hub.
+        #[serde(default)]
+        acp_config: bool,
     },
     /// Success reply to the request with this `rid`; `result` holds the reply fields.
     #[serde(rename = "ok")]

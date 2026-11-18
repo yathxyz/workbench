@@ -1113,6 +1113,7 @@ impl Acp {
                 to_agent(held.kind, cancelled(held.kind)),
             ));
         }
+        self.fail_startup_config(ErrorCode::Faulted, JOURNAL_FAILED);
         self.stop_agent(Cause::Fault);
         self.probe_at = Some(Instant::now() + PROBE_EVERY);
         self.publish();
@@ -2236,20 +2237,6 @@ impl Acp {
             }
             Err(e) => return self.revive_step(Some((via, e))),
         };
-        if result
-            .get("configOptions")
-            .is_some_and(|options| !options.is_null() && !config::valid_options(options))
-        {
-            self.record(EventBody::SetupError {
-                code: SetupErrorCode::AgentError,
-                message: format!(
-                    "the session/{} result has invalid configOptions",
-                    via_name(via)
-                ),
-                rpc: None,
-            });
-            return self.stop_failed_setup();
-        }
         // Only `session/new` names the session; resume and load keep the known one.
         let session_id = match via {
             SessionVia::New => result
@@ -2271,7 +2258,10 @@ impl Acp {
             via,
             session_id: session_id.clone(),
             modes: field("modes"),
-            config_options: field("configOptions"),
+            config_options: result
+                .get("configOptions")
+                .filter(|options| config::valid_options(options))
+                .cloned(),
         });
         if !recorded {
             return;

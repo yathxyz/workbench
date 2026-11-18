@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use wb_proto::hub::{Activity, Last, LastError, Pending, PendingKind};
 use wb_proto::journal::{EventBody, JournalEvent, ResolvedBy, SetupErrorCode, TurnErrorCode};
 
-use super::config::valid_options;
+use super::config::{valid_options, within_limits};
 
 /// `Pending.title` is cut to this many characters.
 const TITLE_MAX: usize = 200;
@@ -79,10 +79,7 @@ impl Facts {
                 self.modes = modes.clone();
                 match config_options {
                     None => self.config_options = None,
-                    Some(options) if valid_options(options) => {
-                        self.config_options = Some(options.clone());
-                    }
-                    Some(_) => {}
+                    Some(options) => self.set_config_options(options),
                 }
                 self.revive_failed = false;
             }
@@ -130,11 +127,7 @@ impl Facts {
                 self.pending.retain(|p| p.req != *req);
             }
             EventBody::Mode { mode_id } => self.set_mode(mode_id),
-            EventBody::Config { config_options } => {
-                if valid_options(config_options) {
-                    self.config_options = Some(config_options.clone());
-                }
-            }
+            EventBody::Config { config_options } => self.set_config_options(config_options),
             EventBody::Exit { .. } => {
                 self.activity = Activity::None;
                 self.running = false;
@@ -205,6 +198,15 @@ impl Facts {
         lines
     }
 
+    fn set_config_options(&mut self, options: &Value) {
+        if valid_options(options) {
+            self.config_options = Some(options.clone());
+        } else if !within_limits(options) {
+            // Old journals can contain offerings too large to publish safely.
+            self.config_options = None;
+        }
+    }
+
     fn apply_update(&mut self, update: &Value) {
         match update.get("sessionUpdate").and_then(Value::as_str) {
             Some("session_info_update") => match update.get("title") {
@@ -218,8 +220,8 @@ impl Facts {
                 }
             }
             Some("config_option_update") => {
-                if let Some(options) = update.get("configOptions").filter(|v| valid_options(v)) {
-                    self.config_options = Some(options.clone());
+                if let Some(options) = update.get("configOptions") {
+                    self.set_config_options(options);
                 }
             }
             Some("plan") => self.plan = Some(without_tag(update)),
@@ -491,6 +493,47 @@ mod tests {
             f.apply(&serde_json::from_value::<JournalEvent>(body).unwrap());
             assert_eq!(f.config_options, Some(json!([])));
             assert_eq!(f.head_seq, 2);
+        }
+    }
+
+    #[test]
+    fn oversized_journal_offerings_clear_previous_options_in_every_event_kind() {
+        use wb_proto::limits::{ACP_CONFIG_OPTIONS_BYTES, ACP_CONFIG_OPTIONS_MAX};
+
+        let option = json!({"id": "thinking", "name": "Thinking", "type": "boolean",
+                            "currentValue": false});
+        let initial = json!([option]);
+        let mut large = option.clone();
+        large["description"] = json!("x".repeat(ACP_CONFIG_OPTIONS_BYTES));
+        for options in [
+            json!([large]),
+            json!(vec![option.clone(); ACP_CONFIG_OPTIONS_MAX + 1]),
+        ] {
+            for body in [
+                EventBody::Session {
+                    via: SessionVia::Resume,
+                    session_id: "s".into(),
+                    modes: None,
+                    config_options: Some(options.clone()),
+                },
+                EventBody::Config {
+                    config_options: options.clone(),
+                },
+                update(json!({"sessionUpdate": "config_option_update", "configOptions": options})),
+            ] {
+                let mut f = fold(vec![EventBody::Config {
+                    config_options: initial.clone(),
+                }]);
+                f.apply(&ev(2, body));
+                assert_eq!(f.config_options, None);
+                f.apply(&ev(
+                    3,
+                    EventBody::Config {
+                        config_options: initial.clone(),
+                    },
+                ));
+                assert_eq!(f.config_options.as_ref(), Some(&initial));
+            }
         }
     }
 
