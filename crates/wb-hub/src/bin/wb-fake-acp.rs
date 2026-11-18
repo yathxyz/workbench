@@ -16,6 +16,8 @@
 //! - `ask-permission`: a permission request; once an option is selected, `PONG`;
 //! - `perm`: a `tool_call`, then a permission request with `allow_once`, `allow_always`
 //!   and `reject_once`; the tool call completes or fails with the answer;
+//! - `omp-permission`: execute permission with empty locations and omp's rawInput;
+//! - `omp-after-cancel`: that permission, sent only after receiving session/cancel;
 //! - `form`: a form elicitation with a string enum (required), an integer (1..=10), a
 //!   boolean and a multi-select; the reply quotes the content it received;
 //! - `url`: a url elicitation for an https URL (`javascript:alert(1)` when the prompt
@@ -706,7 +708,16 @@ impl Fake {
         }
         let words = words(text);
         let has = |k: &str| words.iter().any(|w| w == k);
-        if has("ask-permission") {
+        if has("omp-after-cancel") {
+            self.say("Waiting for cancel.");
+            while !self.cancelled {
+                let msg = self.recv().await;
+                self.background(msg);
+            }
+            self.omp_permission_turn(false).await
+        } else if has("omp-permission") {
+            self.omp_permission_turn(has("cwd")).await
+        } else if has("ask-permission") {
             self.ask_permission_turn().await
         } else if has("perm") {
             self.permission_turn().await
@@ -775,6 +786,19 @@ impl Fake {
         );
         self.say(text);
         stop
+    }
+
+    async fn omp_permission_turn(&mut self, cwd: bool) -> &'static str {
+        let mut input = json!({"command":"cargo test", "timeout":300, "pty":false, "async":false});
+        if cwd {
+            input["cwd"] = json!("src");
+        }
+        let tool = json!({"toolCallId":self.turn_id("call"), "title":"Run cargo test",
+            "kind":"execute", "locations":[], "rawInput":input});
+        let params = self.permission_params(tool);
+        let answer = self.ask("session/request_permission", params).await;
+        self.say(&format!("Permission: {}", answer["result"]["outcome"]));
+        "end_turn"
     }
 
     async fn ask_permission_turn(&mut self) -> &'static str {

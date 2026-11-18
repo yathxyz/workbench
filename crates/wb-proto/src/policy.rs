@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -16,8 +16,18 @@ mod command;
 
 use crate::limits::{
     POLICY_KIND_MAX, POLICY_PATH_CHECKS_MAX, POLICY_PATTERN_MAX, POLICY_PATTERNS_MAX,
-    POLICY_PROGRAM_MAX, POLICY_RULES_MAX, POLICY_SELECTORS_MAX,
+    POLICY_PROGRAM_MAX, POLICY_REGEX_SIZE_MAX, POLICY_ROOT_MAX, POLICY_RULES_MAX,
+    POLICY_SELECTORS_MAX,
 };
+
+/// Additional execute input members whose values do not change command interpretation.
+const INERT_EXECUTE_INPUT_MEMBERS: &[&str] = &[
+    "timeout",
+    "async",
+    "pty",
+    "description",
+    "run_in_background",
+];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -91,12 +101,14 @@ pub struct Decision {
 pub struct CompiledPolicy {
     rules: Vec<CompiledRule>,
     cwd: PathBuf,
+    render: bool,
 }
 
 #[derive(Debug)]
 struct CompiledRule {
     action: Action,
     kinds: Option<Vec<String>>,
+    command: bool,
     roots: Option<Vec<PathBuf>>,
     programs: Option<BTreeSet<command::Program<'static>>>,
     matches: Vec<Regex>,
@@ -129,7 +141,9 @@ impl Policy {
             if let Some(roots) = &rule.roots
                 && (roots.len() > POLICY_SELECTORS_MAX
                     || roots.iter().any(|root| {
-                        !valid_text(root) || (root != "$cwd" && !Path::new(root).is_absolute())
+                        !valid_text(root)
+                            || root.len() > POLICY_ROOT_MAX
+                            || (root != "$cwd" && !Path::new(root).is_absolute())
                     }))
             {
                 return Err(format!("policy rule {index} has invalid roots"));
@@ -178,6 +192,7 @@ impl CompiledPolicy {
             rules.push(CompiledRule {
                 action: rule.action,
                 kinds: rule.kinds.clone(),
+                command: rule.command.is_some() || rule.programs.is_some(),
                 roots: rule.roots.as_ref().map(|roots| {
                     roots
                         .iter()
@@ -213,7 +228,10 @@ impl CompiledPolicy {
                 not_matches,
             });
         }
-        Ok(Self { rules, cwd })
+        let render = rules
+            .iter()
+            .any(|rule| !rule.matches.is_empty() || !rule.not_matches.is_empty());
+        Ok(Self { rules, cwd, render })
     }
 
     /// First matching rule wins. `None` means ask, including a matching `ask` rule
@@ -226,8 +244,20 @@ impl CompiledPolicy {
         if kind.len() > POLICY_KIND_MAX {
             return None;
         }
-        let command = if kind == "execute" {
-            Some(nonempty_string(call.get("rawInput")?.get("command")?)?)
+        let (command, cwd) = if kind == "execute" {
+            let input = call.get("rawInput")?.as_object()?;
+            if input.keys().any(|key| {
+                key != "command"
+                    && key != "cwd"
+                    && !INERT_EXECUTE_INPUT_MEMBERS.contains(&key.as_str())
+            }) {
+                return None;
+            }
+            let cwd = match input.get("cwd") {
+                Some(value) => Some(nonempty_string(value)?),
+                None => None,
+            };
+            (Some(nonempty_string(input.get("command")?)?), cwd)
         } else {
             if call
                 .get("rawInput")
@@ -236,17 +266,18 @@ impl CompiledPolicy {
             {
                 return None;
             }
-            None
+            (None, None)
         };
         let locations = call.get("locations")?.as_array()?;
-        let evidence = command::evidence(command, locations, &self.cwd)?;
+        let evidence = command::evidence(command, locations, &self.cwd, cwd, self.render)?;
         let (allow, reject) = once_options(options)?;
         let mut checks = POLICY_PATH_CHECKS_MAX;
         for (index, rule) in self.rules.iter().enumerate() {
-            if rule
-                .kinds
-                .as_ref()
-                .is_some_and(|kinds| !kinds.iter().any(|k| k == kind))
+            if (command.is_none() && rule.command)
+                || rule
+                    .kinds
+                    .as_ref()
+                    .is_some_and(|kinds| !kinds.iter().any(|k| k == kind))
             {
                 continue;
             }
@@ -270,14 +301,26 @@ impl CompiledPolicy {
                     continue;
                 }
             }
-            if let Some(command) = command
-                && (!rule.matches.iter().all(|pattern| pattern.is_match(command))
-                    || rule
-                        .not_matches
-                        .iter()
-                        .any(|pattern| pattern.is_match(command)))
+            if let Some(raw) = command
+                && self.render
             {
-                continue;
+                let canonical = evidence.canonical.as_deref()?;
+                let allow = rule.action == Action::Allow;
+                if !rule.matches.iter().all(|pattern| {
+                    if allow {
+                        pattern.is_match(raw) && pattern.is_match(canonical)
+                    } else {
+                        pattern.is_match(raw) || pattern.is_match(canonical)
+                    }
+                }) || rule.not_matches.iter().any(|pattern| {
+                    if allow {
+                        pattern.is_match(raw) || pattern.is_match(canonical)
+                    } else {
+                        pattern.is_match(raw) && pattern.is_match(canonical)
+                    }
+                }) {
+                    continue;
+                }
             }
             let option = match rule.action {
                 Action::Allow => allow?,
@@ -302,7 +345,9 @@ fn compile_patterns(command: Option<&CommandPatterns>) -> Result<(Vec<Regex>, Ve
         patterns
             .iter()
             .map(|pattern| {
-                Regex::new(pattern)
+                RegexBuilder::new(pattern)
+                    .size_limit(POLICY_REGEX_SIZE_MAX)
+                    .build()
                     .map_err(|error| format!("invalid policy command pattern: {error}"))
             })
             .collect::<Result<Vec<_>, _>>()

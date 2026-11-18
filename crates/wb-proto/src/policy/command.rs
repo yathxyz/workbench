@@ -22,6 +22,7 @@ pub(super) enum Program<'a> {
 pub(super) struct Evidence<'a> {
     pub paths: BTreeSet<PathBuf>,
     pub programs: BTreeSet<Program<'a>>,
+    pub canonical: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,8 +40,8 @@ struct Word<'a> {
 
 enum Token<'a> {
     Word(Word<'a>),
-    Redirect,
-    Separator(Separator),
+    Redirect(&'static str),
+    Separator(Separator, &'static str),
 }
 
 #[derive(Default)]
@@ -141,9 +142,11 @@ impl Paths {
 pub(super) fn evidence<'a>(
     command: Option<&'a str>,
     locations: &[Value],
-    cwd: &Path,
+    session_cwd: &Path,
+    command_cwd: Option<&str>,
+    render: bool,
 ) -> Option<Evidence<'a>> {
-    if locations.is_empty() || locations.len() > POLICY_PATHS_MAX {
+    if (command.is_none() && locations.is_empty()) || locations.len() > POLICY_PATHS_MAX {
         return None;
     }
     let mut paths = Paths {
@@ -153,17 +156,23 @@ pub(super) fn evidence<'a>(
         fragments: 0,
         fragment_bytes: 0,
     };
+    let cwd = match command_cwd {
+        Some(cwd) => Cow::Owned(paths.resolve(cwd, session_cwd)?),
+        None => Cow::Borrowed(session_cwd),
+    };
     for location in locations {
         let text = nonempty_string(location.get("path")?)?;
-        let path = paths.resolve(text, cwd)?;
+        let path = paths.resolve(text, &cwd)?;
         paths.unique.insert(path);
     }
     let mut programs = BTreeSet::new();
+    let mut canonical = None;
     if let Some(command) = command {
-        let pipelines = parse(command)?;
+        let (pipelines, rendered) = parse(command, render)?;
+        canonical = rendered;
         // Bare operands are only safe to ignore while every possible cwd is inside.
-        paths.unique.insert(cwd.to_owned());
-        let mut yes = BTreeSet::from([cwd.to_owned()]);
+        paths.unique.insert(cwd.as_ref().to_owned());
+        let mut yes = BTreeSet::from([cwd.as_ref().to_owned()]);
         let mut no = BTreeSet::new();
         let mut previous = Separator::Always;
         for pipeline in pipelines {
@@ -218,6 +227,7 @@ pub(super) fn evidence<'a>(
     Some(Evidence {
         paths: paths.unique,
         programs,
+        canonical,
     })
 }
 
@@ -270,14 +280,14 @@ fn classify(simple: &Simple<'_>) -> Option<(usize, bool)> {
     // Complete bash/POSIX builtin and keyword classification; cd is modeled below.
     match name {
         "echo" | "printf" | "true" | "false" | "test" | "[" | "pwd" | "cd" => {}
-        "." | ":" | "alias" | "bg" | "bind" | "break" | "builtin" | "caller" | "command"
-        | "compgen" | "complete" | "compopt" | "continue" | "declare" | "dirs" | "disown"
-        | "enable" | "eval" | "exec" | "exit" | "export" | "fc" | "fg" | "getopts" | "hash"
-        | "help" | "history" | "jobs" | "kill" | "let" | "local" | "logout" | "mapfile"
-        | "popd" | "pushd" | "read" | "readarray" | "readonly" | "return" | "set" | "shift"
-        | "shopt" | "source" | "suspend" | "times" | "trap" | "type" | "typeset" | "ulimit"
-        | "umask" | "unalias" | "unset" | "wait" | "if" | "then" | "else" | "elif" | "fi"
-        | "case" | "esac" | "for" | "select" | "while" | "until" | "do" | "done" | "in"
+        "." | ":" | "alias" | "bg" | "bind" | "break" | "builtin" | "caller" | "chdir"
+        | "command" | "compgen" | "complete" | "compopt" | "continue" | "declare" | "dirs"
+        | "disown" | "enable" | "eval" | "exec" | "exit" | "export" | "fc" | "fg" | "getopts"
+        | "hash" | "help" | "history" | "jobs" | "kill" | "let" | "local" | "logout"
+        | "mapfile" | "popd" | "pushd" | "read" | "readarray" | "readonly" | "return" | "set"
+        | "shift" | "shopt" | "source" | "suspend" | "times" | "trap" | "type" | "typeset"
+        | "ulimit" | "umask" | "unalias" | "unset" | "wait" | "if" | "then" | "else" | "elif"
+        | "fi" | "case" | "esac" | "for" | "select" | "while" | "until" | "do" | "done" | "in"
         | "function" | "time" | "{" | "}" | "!" | "[[" | "]]" | "coproc" => return None,
         _ => {}
     }
@@ -386,8 +396,21 @@ fn printing_format(args: &[Word<'_>]) -> Option<()> {
     Some(())
 }
 
-fn parse(command: &str) -> Option<Vec<Pipeline<'_>>> {
+fn parse(command: &str, render: bool) -> Option<(Vec<Pipeline<'_>>, Option<String>)> {
     let tokens = tokenize(command)?;
+    let canonical = render.then(|| {
+        let mut rendered = String::with_capacity(command.len() + tokens.len());
+        for (index, token) in tokens.iter().enumerate() {
+            if index != 0 {
+                rendered.push(' ');
+            }
+            rendered.push_str(match token {
+                Token::Word(word) => &word.text,
+                Token::Redirect(operator) | Token::Separator(_, operator) => operator,
+            });
+        }
+        rendered
+    });
     let mut tokens = tokens.into_iter();
     let mut pipelines = Vec::new();
     let mut commands = Vec::new();
@@ -396,11 +419,11 @@ fn parse(command: &str) -> Option<Vec<Pipeline<'_>>> {
     while let Some(token) = tokens.next() {
         match token {
             Token::Word(word) => simple.args.push(word),
-            Token::Redirect => match tokens.next()? {
+            Token::Redirect(_) => match tokens.next()? {
                 Token::Word(word) => simple.redirects.push(word.text),
                 _ => return None,
             },
-            Token::Separator(separator) => {
+            Token::Separator(separator, _) => {
                 if simple.args.is_empty() {
                     if !simple.redirects.is_empty() {
                         return None;
@@ -433,7 +456,7 @@ fn parse(command: &str) -> Option<Vec<Pipeline<'_>>> {
             next: Separator::Always,
         });
     }
-    (!pipelines.is_empty()).then_some(pipelines)
+    (!pipelines.is_empty()).then_some((pipelines, canonical))
 }
 
 fn tokenize(command: &str) -> Option<Vec<Token<'_>>> {
@@ -458,11 +481,14 @@ fn tokenize(command: &str) -> Option<Vec<Token<'_>>> {
             b'\n' | b';' => {
                 // Empty semicolon commands are not modeled; blank lines are.
                 if bytes[i] == b';'
-                    && (tokens.is_empty() || matches!(tokens.last(), Some(Token::Separator(_))))
+                    && (tokens.is_empty() || matches!(tokens.last(), Some(Token::Separator(..))))
                 {
                     return None;
                 }
-                tokens.push(Token::Separator(Separator::Always));
+                tokens.push(Token::Separator(
+                    Separator::Always,
+                    if bytes[i] == b';' { ";" } else { "\n" },
+                ));
                 i += 1;
             }
             b'&' | b'|' => {
@@ -480,9 +506,18 @@ fn tokenize(command: &str) -> Option<Vec<Token<'_>>> {
                 } else {
                     return None;
                 };
-                tokens.push(Token::Separator(separator));
+                tokens.push(Token::Separator(
+                    separator,
+                    match separator {
+                        Separator::And => "&&",
+                        Separator::Or => "||",
+                        Separator::Pipe => "|",
+                        Separator::Always => unreachable!(),
+                    },
+                ));
             }
             b'<' | b'>' => {
+                let start = i;
                 let ch = bytes[i];
                 i += 1;
                 if bytes.get(i) == Some(&ch) {
@@ -497,7 +532,12 @@ fn tokenize(command: &str) -> Option<Vec<Token<'_>>> {
                 {
                     return None;
                 }
-                tokens.push(Token::Redirect);
+                tokens.push(Token::Redirect(match &command[start..i] {
+                    "<" => "<",
+                    ">" => ">",
+                    ">>" => ">>",
+                    _ => unreachable!(),
+                }));
             }
             b'#' => return None,
             _ => {

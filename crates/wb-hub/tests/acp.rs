@@ -1056,6 +1056,79 @@ fn policy_ready(c: &mut Client, hub: &Hub, sid: &str, policy: Value) -> Value {
 }
 
 #[test]
+fn hub_policy_answers_omp_empty_locations_with_and_without_cwd() {
+    let hub = Hub::with_scenarios(&[]);
+    let mut c = hub.connect();
+    let policy = json!({"rules":[{"action":"allow", "roots":["$cwd"], "programs":["cargo"]}]});
+    policy_ready(&mut c, &hub, "omp", policy);
+    for (prompt, cwd) in [
+        ("omp-permission", None),
+        ("omp-permission cwd", Some("src")),
+    ] {
+        assert_eq!(c.acp_prompt("omp", prompt)["t"], "ok");
+        let events = c.events_until("omp", "turn_end");
+        let auto = events.iter().find(|e| e["e"] == "permission_auto").unwrap();
+        assert_eq!(auto["toolCall"]["locations"], json!([]));
+        let input = &auto["toolCall"]["rawInput"];
+        assert_eq!(input["command"], "cargo test");
+        assert_eq!(input["timeout"], 300);
+        assert_eq!(input["pty"], false);
+        assert_eq!(input["async"], false);
+        assert_eq!(input.get("cwd").and_then(Value::as_str), cwd);
+        assert_eq!(auto["outcome"]["optionId"], "allow-once");
+        assert!(!events.iter().any(|e| e["e"] == "permission"));
+        assert!(hub.journal("omp").contains(auto));
+        assert_eq!(c.summary("omp")["acp"]["pending"], json!([]));
+    }
+}
+
+#[test]
+fn hub_policy_leaves_post_cancel_requests_pending_only_for_that_turn() {
+    let hub = Hub::with_scenarios(&[]);
+    let mut c = hub.connect();
+    let policy = json!({"rules":[{"action":"allow", "roots":["$cwd"], "programs":["cargo"]}]});
+    let opened = policy_ready(&mut c, &hub, "cancelled", policy);
+    assert_eq!(c.acp_prompt("cancelled", "omp-after-cancel")["t"], "ok");
+    c.ok(json!({"t":"acp.cancel", "sid":"cancelled"}));
+    let pending = c.event("cancelled", "permission");
+    assert_eq!(pending["toolCall"]["rawInput"]["command"], "cargo test");
+    assert_eq!(
+        c.summary("cancelled")["acp"]["pending"][0]["req"],
+        pending["seq"]
+    );
+    assert!(
+        !hub.journal("cancelled")
+            .iter()
+            .any(|e| e["e"] == "permission_auto")
+    );
+    assert_eq!(
+        permit(
+            &mut c,
+            "cancelled",
+            &pending["seq"],
+            epoch(&opened),
+            "reject-once"
+        )["t"],
+        "ok"
+    );
+    let events = c.events_until("cancelled", "turn_end");
+    let resolved = events
+        .iter()
+        .find(|e| e["e"] == "permission_resolved")
+        .unwrap();
+    assert_eq!(resolved["by"], "user");
+    assert_eq!(resolved["outcome"]["optionId"], "reject-once");
+    assert_eq!(events.last().unwrap()["stopReason"], "cancelled");
+
+    assert_eq!(c.acp_prompt("cancelled", "omp-permission")["t"], "ok");
+    let events = c.events_until("cancelled", "turn_end");
+    let auto = events.iter().find(|e| e["e"] == "permission_auto").unwrap();
+    assert_eq!(auto["outcome"]["optionId"], "allow-once");
+    assert!(!events.iter().any(|e| e["e"] == "permission"));
+    assert_eq!(c.summary("cancelled")["acp"]["pending"], json!([]));
+}
+
+#[test]
 fn hub_policy_answers_once_without_publishing_pending_and_replays() {
     let mut hub = Hub::with_scenarios(&[]);
     let mut c = hub.connect();

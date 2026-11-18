@@ -248,19 +248,6 @@ fn command_patterns_are_conjunctive_and_execute_only() {
             "{command}"
         );
     }
-    let mut read = call("read", &["src/main.rs"], "sudo");
-    read.as_object_mut().unwrap().remove("rawInput");
-    assert!(p.decide(&read, &options()).is_some());
-    // No kinds restriction is required to use execute-only conditions.
-    let p = compiled(json!([{"action":"allow", "command":{"matches":["^safe$"]}}]));
-    assert!(
-        p.decide(&call("read", &["file"], "unsafe"), &options())
-            .is_some()
-    );
-    assert_eq!(
-        p.decide(&call("execute", &["file"], "unsafe"), &options()),
-        None
-    );
 }
 
 #[test]
@@ -356,7 +343,6 @@ fn malformed_tool_descriptions_always_ask() {
         ("toolCallId", json!("")),
         ("title", json!(null)),
         ("kind", json!(42)),
-        ("locations", json!([])),
         ("locations", json!([{}])),
         ("locations", json!([{"path":""}])),
         ("locations", json!([{"path":null}])),
@@ -696,28 +682,6 @@ fn aggregate_root_comparisons_are_bounded_and_duplicate_paths_are_checked_once()
 }
 
 #[test]
-fn regex_conditions_match_raw_command_not_joined_words() {
-    let p = compiled(json!([{
-        "action":"allow", "roots":["$cwd"], "command":{"matches":["^cat '"]}
-    }]));
-    assert!(
-        p.decide(&call("execute", &["."], "cat './src/'file"), &options())
-            .is_some()
-    );
-    assert_eq!(
-        p.decide(&call("execute", &["."], "cat ./src/file"), &options()),
-        None
-    );
-    let p = compiled(json!([{
-        "action":"allow", "roots":["$cwd"], "command":{"notMatches":["'"]}
-    }]));
-    assert_eq!(
-        p.decide(&call("execute", &["."], "cat './src/'file"), &options()),
-        None
-    );
-}
-
-#[test]
 fn second_review_shell_semantics_bypasses_ask() {
     let mut allowed = Vec::new();
     for (cwd, command) in [
@@ -949,7 +913,7 @@ fn programs_select_every_simple_command_without_interpreting_its_arguments() {
         p.decide(&call("execute", &["."], "cargo test"), &options()),
         None
     );
-    assert!(p.decide(&call("read", &["."], ""), &options()).is_some());
+    assert_eq!(p.decide(&call("read", &["."], ""), &options()), None);
     let p = compiled(json!([
         {"action":"allow", "programs":["cargo"]},
         {"action":"reject", "programs":["cat"]},
@@ -1121,4 +1085,261 @@ fn known_printf_format_grammar_keeps_literal_and_printing_conversions() {
             "{command}"
         );
     }
+}
+
+fn omp_call(input: Value) -> Value {
+    let mut tool = call("execute", &[], "");
+    tool["rawInput"] = input;
+    tool
+}
+
+#[test]
+fn omp_execute_evidence_allows_empty_locations_and_tracks_its_starting_directory() {
+    let p = compiled(json!([{"action":"allow", "roots":["$cwd", "/tmp"],
+        "programs":["cargo", "cat", "cd"]}]));
+    for input in [
+        json!({"command":"cargo test", "timeout":300, "pty":false, "async":false}),
+        json!({"command":"cargo test", "cwd":"crates/a", "timeout":300, "pty":false, "async":false}),
+        json!({"command":"cat ../README", "cwd":"./src/../crates"}),
+        json!({"command":"cd .. && cat README", "cwd":"/work/project/src"}),
+        json!({"command":"cat ./file", "cwd":"/tmp"}),
+        json!({"command":"cat ./file", "cwd":"../project"}),
+        json!({"command":"cargo test", "description":"run tests", "run_in_background":true}),
+    ] {
+        assert_eq!(
+            p.decide(&omp_call(input.clone()), &options())
+                .unwrap()
+                .action,
+            Action::Allow,
+            "{input}"
+        );
+    }
+    for input in [
+        json!({"command":"cat id_rsa", "cwd":"/home/u/.ssh"}),
+        json!({"command":"cat id_rsa", "cwd":"/home/u/.ssh", "pty":true, "async":true}),
+        json!({"command":"cat /work/project/README", "cwd":"/home/u/.ssh"}),
+        json!({"command":"cat ../../secret", "cwd":"src"}),
+        json!({"command":"cd ..; cat README", "cwd":"."}),
+    ] {
+        assert_eq!(
+            p.decide(&omp_call(input.clone()), &options()),
+            None,
+            "{input}"
+        );
+    }
+    // Relative execute locations use the overridden starting directory too.
+    let mut tool = omp_call(json!({"command":"cat README", "cwd":"src"}));
+    tool["locations"] = json!([{"path":"../../secret"}]);
+    assert_eq!(p.decide(&tool, &options()), None);
+    for kind in ["read", "edit", "fetch"] {
+        assert_eq!(p.decide(&call(kind, &[], ""), &options()), None);
+    }
+}
+
+#[test]
+fn execute_raw_input_refuses_unknown_members_and_invalid_cwd() {
+    let p = compiled(json!([{"action":"allow"}]));
+    for cwd in [
+        json!(""),
+        json!(null),
+        json!(false),
+        json!(123),
+        json!([]),
+        json!({}),
+        json!("a\0b"),
+    ] {
+        assert_eq!(
+            p.decide(
+                &omp_call(json!({"command":"cargo test", "cwd":cwd})),
+                &options()
+            ),
+            None
+        );
+    }
+    for name in ["env", "shell", "cmd", "CWD", "unknown"] {
+        let mut input = json!({"command":"cargo test"});
+        input[name] = json!(null);
+        assert_eq!(p.decide(&omp_call(input), &options()), None, "{name}");
+    }
+    // These members are inert by name; their values are not command evidence.
+    for name in [
+        "timeout",
+        "async",
+        "pty",
+        "description",
+        "run_in_background",
+    ] {
+        let mut input = json!({"command":"cargo test"});
+        input[name] = json!(null);
+        assert_eq!(
+            p.decide(&omp_call(input), &options()).unwrap().action,
+            Action::Allow,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn quoted_words_cannot_sidestep_exclusions_or_reject_rules() {
+    let p = compiled(json!([{"action":"allow","kinds":["read","edit","execute"],
+        "roots":["$cwd","/nix/store","/tmp"],
+        "programs":["cargo","nix","git","ls","cat","grep","rg","sed","head","tail","wc","node"],
+        "command":{"notMatches":["sudo","git\\s+(push|tag|remote|config|reset|clean|checkout|switch|branch|rebase|merge|stash|worktree)","gh ","systemctl","ssh","scp","curl","wget","nc","kill","pkill","secrets","sops","~/","\\$HOME"]}}]));
+    for command in [
+        "git push origin master",
+        "git 'push' origin master",
+        "git pu''sh origin master",
+        "'git' push --force origin master",
+        "git \"reset\" --hard",
+        "git \"\"config core.pager x",
+        "cat se''crets.txt",
+    ] {
+        assert_eq!(
+            p.decide(&omp_call(json!({"command":command})), &options()),
+            None,
+            "{command}"
+        );
+    }
+    let p = compiled(json!([
+        {"action":"reject","kinds":["execute"],"command":{"matches":["rm\\s+-rf"]}},
+        {"action":"allow","kinds":["execute"],"roots":["$cwd"]}]));
+    for command in ["rm -rf sub", "rm '-rf' sub", "r''m -rf sub"] {
+        assert_eq!(
+            p.decide(&omp_call(json!({"command":command})), &options())
+                .unwrap()
+                .action,
+            Action::Reject,
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn regex_disagreement_always_resolves_away_from_allow() {
+    // Pattern, allow matches, reject/ask matches, allow notMatches, reject/ask notMatches.
+    for (pattern, am, rm, an, rn) in [
+        ("'", false, true, false, true),
+        ("^git push$", false, true, false, true),
+        ("git", true, true, false, false),
+        ("cargo", false, false, true, true),
+    ] {
+        for action in ["allow", "reject", "ask"] {
+            for field in ["matches", "notMatches"] {
+                let mut rule = json!({"action":action, "command":{}});
+                rule["command"][field] = json!([pattern]);
+                let p = compiled(json!([rule, {"action":"allow"}]));
+                let first = match (action, field) {
+                    ("allow", "matches") => am,
+                    ("allow", _) => an,
+                    (_, "matches") => rm,
+                    _ => rn,
+                };
+                let decision = p.decide(&omp_call(json!({"command":"git pu''sh"})), &options());
+                if first && action == "ask" {
+                    assert_eq!(decision, None, "{action} {field} {pattern}");
+                } else {
+                    let decision = decision.unwrap();
+                    assert_eq!(
+                        decision.rule,
+                        if first { 0 } else { 1 },
+                        "{action} {field} {pattern}"
+                    );
+                    assert_eq!(
+                        decision.action,
+                        if first && action == "reject" {
+                            Action::Reject
+                        } else {
+                            Action::Allow
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn canonical_regex_input_keeps_operators_and_redirections_in_order() {
+    let command = "'cat' a> '/tmp/out';\"grep\" x<./src|h''ead -5 && true||false\npwd";
+    let canonical = "cat a > /tmp/out ; grep x < ./src | head -5 && true || false \n pwd";
+    let p = compiled(json!([
+        {"action":"reject", "command":{"matches":[format!("^{}$", regex::escape(canonical))]}},
+        {"action":"allow"}]));
+    assert_eq!(
+        p.decide(&omp_call(json!({"command":command})), &options())
+            .unwrap()
+            .action,
+        Action::Reject
+    );
+    let p = compiled(json!([
+        {"action":"reject", "command":{"matches":["^cat a >> /tmp/out$"]}},
+        {"action":"allow"}]));
+    assert_eq!(
+        p.decide(&omp_call(json!({"command":"cat a>>/tmp/out"})), &options())
+            .unwrap()
+            .action,
+        Action::Reject
+    );
+}
+
+#[test]
+fn command_conditions_never_match_requests_without_command_evidence() {
+    let edit = call("edit", &["/home/u/.ssh/authorized_keys"], "");
+    for condition in [
+        json!({"command":{"matches":["^cargo test$"]}}),
+        json!({"programs":["cargo"]}),
+        json!({"command":{}}),
+        json!({"programs":[]}),
+    ] {
+        let mut rule = condition;
+        rule["action"] = json!("allow");
+        let p = compiled(json!([rule]));
+        assert_eq!(p.decide(&edit, &options()), None);
+    }
+    let p = compiled(json!([
+        {"action":"reject","command":{"matches":["rm -rf"]}},
+        {"action":"allow","kinds":["read"],"roots":["$cwd"]}]));
+    let decision = p
+        .decide(&call("read", &["README.md"], ""), &options())
+        .unwrap();
+    assert_eq!((decision.rule, decision.action), (1, Action::Allow));
+}
+
+#[test]
+fn chdir_is_never_a_modeled_command() {
+    let p = compiled(json!([{"action":"allow", "roots":["$cwd"]}]));
+    for command in [
+        "cd\ncat .ssh/id_rsa",
+        "chdir\ncat .ssh/id_rsa",
+        "chdir && true > .profile",
+        "chdir src && cat README",
+        "X=1 chdir src",
+    ] {
+        assert_eq!(
+            p.decide(&omp_call(json!({"command":command})), &options()),
+            None,
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn root_bytes_and_expanded_regex_size_are_bounded_before_installation() {
+    for root in [
+        format!("/{}", "r".repeat(1_000_000)),
+        format!("/{}", "r".repeat(POLICY_ROOT_MAX)),
+    ] {
+        let invalid = policy(json!([{"action":"allow", "roots":[root]}]));
+        assert!(invalid.validate().is_err());
+        assert!(CompiledPolicy::new(&invalid, "/work/project").is_err());
+    }
+    let boundary = policy(json!([{"action":"allow",
+        "roots":[format!("/{}", "r".repeat(POLICY_ROOT_MAX - 1))]}]));
+    assert!(boundary.validate().is_ok());
+    assert!(CompiledPolicy::new(&boundary, "/work/project").is_ok());
+    let patterns: Vec<String> = (0..128).map(|i| format!("\\w{{120}}x{i}")).collect();
+    let invalid = policy(json!([{"action":"allow", "kinds":["execute"],
+        "command":{"notMatches":patterns}}]));
+    assert!(invalid.validate().is_err());
+    assert!(CompiledPolicy::new(&invalid, "/work/project").is_err());
 }

@@ -645,6 +645,8 @@ struct Acp {
     proc: Option<Proc>,
     startup_config: Option<StartupConfig>,
     policy: Option<CompiledPolicy>,
+    /// A cancelled turn may still deliver requests before its prompt response.
+    turn_cancelled: bool,
     /// The agent's requests waiting for an answer, by `req`.
     held: BTreeMap<u64, HeldReq>,
     /// A `session` event follows the last `spawn`.
@@ -693,6 +695,7 @@ impl Acp {
             proc: None,
             startup_config: None,
             policy: None,
+            turn_cancelled: false,
             held: BTreeMap::new(),
             has_session: false,
             load_filter: false,
@@ -1531,6 +1534,7 @@ impl Acp {
         }) {
             return reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
         }
+        self.turn_cancelled = false;
         self.set_seen(self.facts.head_seq);
         match self.request(Purpose::Prompt, |id| rpc::prompt(id, &session, blocks)) {
             Ok(()) => reply.done(),
@@ -1539,6 +1543,9 @@ impl Acp {
     }
 
     fn cancel(&mut self, reply: Reply) {
+        if self.facts.activity == Activity::Turn {
+            self.turn_cancelled = true;
+        }
         if self.facts.activity == Activity::Turn
             && let Some(session) = &self.facts.agent_session_id
         {
@@ -2396,6 +2403,7 @@ impl Acp {
                     .unwrap_or_default();
                 let decision = params
                     .get("sessionId")
+                    .filter(|_| !self.turn_cancelled || self.facts.activity != Activity::Turn)
                     .and_then(Value::as_str)
                     .is_some_and(|session| Some(session) == self.facts.agent_session_id.as_deref())
                     .then(|| self.policy.as_ref()?.decide(&tool_call, &options))

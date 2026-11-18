@@ -32,6 +32,10 @@ pub const POLICY_RULES_MAX: usize = 64;
 pub const POLICY_PATTERNS_MAX: usize = 128;
 /// Most UTF-8 bytes in one command regular expression.
 pub const POLICY_PATTERN_MAX: usize = 4096;
+/// Largest compiled command regular expression; excess is `bad_request`.
+pub const POLICY_REGEX_SIZE_MAX: usize = 256 * KIB;
+/// Most UTF-8 bytes in one permission root.
+pub const POLICY_ROOT_MAX: usize = 4096;
 /// Most roots, tool kinds or programs in one permission rule.
 pub const POLICY_SELECTORS_MAX: usize = 64;
 /// Most UTF-8 bytes in one tool kind.
