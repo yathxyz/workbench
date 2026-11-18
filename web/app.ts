@@ -4567,7 +4567,7 @@ function meshClose(): void {
   $('#mesh-detail')!.classList.remove('mounted');
 }
 function meshMount(r: MeshRow, attach = false): void {
-  const box = $('#mesh-detail')!, host = el('div', 'mesh-live ' + (r.sess?.kind === 'acp' && !attach ? 'k-acp' : 'k-term')), hdr = el('div', 'hdr'), body = el('div', 'body');
+  const box = $('#mesh-detail .mesh-viewers')!, host = el('div', 'mesh-live ' + (r.sess?.kind === 'acp' && !attach ? 'k-acp' : 'k-term')), hdr = el('div', 'hdr'), body = el('div', 'body');
   const sid = attach ? 'attach_' + r.id + '_' + crypto.randomUUID() : r.sess!.sid, base = { id: sid, name: r.title, x: 0, y: 0, w: 560, h: 520 };   // o_ + 16 hex digits and a UUID: 62 sid-safe ASCII characters
   const n: TermNode | AcpNode = r.sess?.kind === 'acp' && !attach ? { ...base, kind: 'acp', agent: r.sess.acp?.agent || '', cwd: r.sess.cwd || '' }
     : { ...base, kind: 'term', backend: 'pty', env: {}, ...(attach ? { _spawn: true, _attach: r.id } : {}) };
@@ -4601,6 +4601,7 @@ function meshReconcile(r: MeshRow): void {
   const transcript = live.$agents?.el;
   if (transcript && transcript.hidden !== terminal) {
     transcript.hidden = terminal;
+    transcript.inert = terminal;
     if (!terminal) live.$agents?.backend?.maybeSeen?.();
   }
   const backend = live.$agentsAttach?.backend, error = backend instanceof PtyBackend ? backend.attachError : '';
@@ -4644,7 +4645,7 @@ function meshDetail(r: MeshRow): void {
   const box = $('#mesh-detail')!, head = el('div', 'mesh-head'), back = el('button', 'tb mesh-back', '← Sessions'), toggle = el('button', 'tb mesh-disclose', 'Details'), info = el('div', 'mesh-info');
   info.id = 'mesh-info'; toggle.setAttribute('aria-controls', info.id);
   toggle.onclick = () => { MESH.facts = !MESH.facts; meshFactsMode(); meshViewer()?.fitNow?.(); };
-  back.onclick = meshBack; head.append(el('h3', '', r.title), el('div', 'ex-btns'), toggle, el('div', 'mesh-meta'), info); box.replaceChildren(back, head);
+  back.onclick = meshBack; head.append(el('h3', '', r.title), el('div', 'ex-btns'), toggle, el('div', 'mesh-meta'), info); box.replaceChildren(back, head, el('div', 'mesh-viewers'));
 }
 function meshSelect(id: string, commit = false): void {
   const all = meshRows(), flat = meshFlat(all), row = flat.find(r => r.id === id || r.sess?.sid === id);

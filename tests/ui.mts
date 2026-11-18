@@ -4319,7 +4319,7 @@ await section('N78', async () => {
       await D.locator('#mesh-list').focus(); await D.keyboard.press('t');
       const firstViewer = await attachSid();
       const attached = await until(async () => (await attachText()).includes(H.host + ':claude:cafefeed'), 15000);
-      const tucked = await dualComposer!.evaluate(e => e.isConnected && !e.getClientRects().length);
+      const tucked = await dualComposer!.evaluate(e => e.isConnected) && !await D.locator(composer).isVisible();
       const readerHidden = !await D.locator(reader).isVisible();
       await D.keyboard.press('t');
       const returnedByKey = await D.locator(composer).isVisible() && !!firstViewer && await forgot(firstViewer);
