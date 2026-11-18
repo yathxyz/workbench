@@ -3767,7 +3767,8 @@ await section('N77', async () => {
 // N78 (F-A48): real, externally started ACP/PTY sessions and observed attachments, never implicit board cards.
 await section('N78', async () => {
   if (!STUB) return skip('N78', 'no `stub` agent (wb-fake-acp) in /api/info.agents');
-  const D = await dpage(), owner = await dpage(), sid = 'attach_n78_api';
+  const { P: D, g } = await gatedPage(), owner = await dpage(), sid = 'attach_n78_api';
+  record(D);
   let externalPty: string | undefined, owned: string | undefined, ownedPty: string | undefined, unloadPage: TailPage | undefined;
   const model = 'claude-opus-4-1-20250805', cwd = fs.mkdtempSync(path.join(TMP, 'n78-project-'));
   const meshApi = (url: string, method = 'GET', body?: Record<string, unknown>) => fetch(H.api + '/v1' + url, {
@@ -3788,6 +3789,27 @@ await section('N78', async () => {
   const nodes = () => D.evaluate(() => Object.keys(window.__canvas.S.nodes).sort().join());
   const liveText = () => termText(D, '$agents');
   const composer = '#mesh-detail .mesh-live .ag-in textarea';
+  const reader = '#mesh-detail .ag-reader', log = '#mesh-detail .ag-log';
+  const readerText = () => D.evaluate(() => window.__canvas.live.$agents?.backend.transcript?.buf.text as string | undefined);
+  const journalText = async () => await readerText() ?? await D.locator(log).textContent();
+  const readerState = () => D.evaluate(async () => {
+    await new Promise<void>(r => requestAnimationFrame(() => r()));
+    const { buf, frame } = window.__canvas.live.$agents.backend.transcript as { buf: EdwinBuffer; frame: EdwinFrame };
+    return { point: frame.point(), mark: buf.mark, end: buf.rope.length, undo: buf.undo.length,
+      first: frame.root.querySelector('.ln')?.textContent, focused: frame.root.contains(document.activeElement) };
+  });
+  const readUntil = (text: string) => D.waitForFunction(text => window.__canvas.live.$agents?.backend.transcript?.buf.text.includes(text), text);
+  // Deliver real hub frames through one selected event. This lets the reader move between chunks, not race the agent.
+  const releaseThrough = async (test: (ev: AcpEvOf<'update'>) => boolean) => {
+    const hit = await until(() => {
+      for (const s of g.socks) {
+        const i = s.buf.findIndex(m => { const f = JSON.parse(String(m)); return f.t === 'ev' && f.ev.e === 'update' && test(f.ev); });
+        if (i >= 0) return { s, i };
+      }
+    });
+    if (!hit) throw new Error('N78 expected a held ACP update');
+    for (const m of hit.s.buf.splice(0, hit.i + 1)) hit.s.ws.send(m);
+  };
   const liveView = () => acpView(D, '$agents');
   const liveIdle = () => acpIdle(D, '$agents');
   const isAlive = async (id: string) => (await sessions()).some(s => s.sid === id && s.alive);
@@ -3822,7 +3844,9 @@ await section('N78', async () => {
     if (created.status !== 201) throw new Error('N78 API ACP spawn: ' + created.status + ' ' + await created.text());
     const ready = await until(async () => { const s = (await sessions()).find(s => s.sid === sid); return s?.acp?.agentSessionId && s.acp.activity === 'none'; }, 15000);
     if (!ready) throw new Error('N78 external ACP did not finish setup');
-    const original = await meshApi('/sessions/' + sid + '/prompt', 'POST', { text: 'n78 original conversation' });
+    const original = await meshApi('/sessions/' + sid + '/prompt', 'POST', {
+      text: ['n78 original conversation', ...Array.from({ length: 70 }, (_, i) => 'replay line ' + i)].join('\n'),
+    });
     if (!original.ok) throw new Error('N78 external prompt: ' + original.status + ' ' + await original.text());
     externalPty = 'n78_external_pty';
     await startPty(externalPty);
@@ -3835,15 +3859,26 @@ await section('N78', async () => {
       return Object.keys(ids).length === 4 && window.__canvas.SESS[sid] ? ids : null;
     }, sid), 10000);
     if (!ids) throw new Error('N78 observed sessions did not arrive');
+    const edwin = await D.evaluate(() => window.__canvas.FR.on);
+    if (edwin) await D.waitForFunction(() => window.__canvas.FR.ready && window.__canvas.FR.online, undefined, { timeout: 30000 });
     await D.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
     await D.keyboard.press('Alt+Digit8');
     await D.waitForSelector('#v-agents:not([hidden])');
     await row(sid).click(); await liveIdle();
-    const initial = await D.locator('#mesh-detail .ag-log').textContent();
+    const initial = await journalText();
+    if (edwin) {
+      const local = await D.evaluate((sid: string) => {
+        const b = window.__canvas.live.$agents.backend.transcript?.buf;
+        return b && !b.shared && b.file === null && b.mode === 'wb-agent-transcript-mode' && b.name.includes(sid);
+      }, sid);
+      check('N78: the local transcript frame replaces the DOM journal and displays replay',
+        local && await D.locator(reader + '.edwin-frame').count() === 1 && !await D.locator(log).count()
+        && initial?.includes('Assistant:\n  echo: n78 original conversation'), { local, initial: initial?.slice(0, 200) });
+    }
     const rowEl = await row(sid).elementHandle(), controlEl = await D.locator(composer).elementHandle();
     await D.fill(composer, 'n78 shared conversation'); await D.press(composer, 'Enter');
     const shared = await until(async () => {
-      const v = await liveView(), text = await D.locator('#mesh-detail .ag-log').textContent();
+      const v = await liveView(), text = await journalText();
       return v?.promptable && v.items.includes('asst:echo: n78 shared conversation') && text?.includes('echo: n78 shared conversation') ? { items: v.items, text } : null;
     }, 20000);
     const stable = { row: await rowEl!.evaluate((e, sid: string) => e === document.querySelector(`#mesh-list .mesh-row[data-id="${sid}"]`), sid),
@@ -3867,20 +3902,132 @@ await section('N78', async () => {
       !!harnessLabel && !!hubInfo && hubInfo.harness === harnessLabel && hubInfo.host === H.host && hubInfo.folder === cwd && hubInfo.mode === known.mode && hubInfo.model === known.model && hubInfo.reasoning === known.reasoning
       && known.model === 'stub-model' && known.reasoning === 'high' && !!hubInfo.started && !!hubInfo['last active'] && hubRow.harness === harnessLabel && hubRow.model === known.model, JSON.stringify({ hubInfo, known, hubRow, harnessLabel }));
 
+    await section('N78 transcript reader', async () => {
+      if (!edwin) return;
+      const input = D.locator(reader + ' .ed-input'), key = (k: string) => D.keyboard.press(k);
+      await D.locator(composer).focus();
+      await key('Shift+Tab');
+      const tabbed = await input.evaluate(e => e === document.activeElement);
+      const beforeTyping = await readerText();
+      await key('i'); await D.keyboard.type('do not insert'); await key('Escape'); await key('u');
+      const unchanged = beforeTyping === await readerText();
+      await key('j'); await key('Enter');
+      const stayed = await input.evaluate(e => e === document.activeElement) && await D.evaluate(() => window.__canvas.MESH.open === 'attach_n78_api');
+      await key('Control+Space'); await key('Escape');
+      const left = await D.locator('#mesh-list').evaluate(e => e === document.activeElement);
+      check('N78: Shift-Tab reaches the reader; editor keys stay inside, insert and undo cannot change text, and leader Escape returns to the list',
+        tabbed && unchanged && stayed && left, { tabbed, unchanged, stayed, left });
+
+      const say = async (text: string) => { await D.fill(composer, text); await D.press(composer, 'Enter'); };
+      g.hold = true;
+      try {
+        await say('stream');
+        await releaseThrough(ev => ev.update?.content?.text === 'Streaming ');
+        await readUntil('  Streaming ');
+        await input.focus();
+        await key('g'); await key('g'); await key('4'); await key('0'); await key('j'); await key('z'); await key('z');
+        await key('v'); await key('l');
+        const middle = await readerState();
+        await releaseThrough(ev => ev.update?.content?.text === 'three ');
+        await readUntil('  Streaming three ');
+        const kept = await readerState();
+        check('N78: a streamed chunk extends the message while point, mark, first visible line and focus stay put',
+          middle.point > 0 && middle.point < middle.end && !!middle.first && middle.mark != null && kept.point === middle.point && kept.mark === middle.mark
+          && kept.first === middle.first && kept.focused && kept.end > middle.end, { middle, kept });
+        await key('Escape');
+        await key('Shift+G');
+        const tail = await readerState();
+        await releaseThrough(ev => ev.update?.content?.text === 'chunks.');
+        await readUntil('  Streaming three chunks.');
+        const followed = await readerState();
+        const visible = await D.locator(reader + ' .ln').allTextContents();
+        check('N78: G returns to the tail and resumes following without making undo history',
+          tail.point === tail.end - 1 && followed.point === followed.end - 1 && followed.end > tail.end && followed.undo === 0
+          && visible.some(line => line.includes('Streaming three chunks.')), { tail, followed, visible });
+      } finally { g.release(); }
+      await liveIdle();
+
+      g.hold = true;
+      try {
+        await say('tool');
+        await releaseThrough(ev => ev.update?.sessionUpdate === 'tool_call' && ev.update?.title === 'Edit notes.txt');
+        const pending = 'Tool: edit [pending] Edit notes.txt';
+        await readUntil(pending);
+        const prefix = (await readerText())!.split(pending)[0];
+        await releaseThrough(ev => ev.update?.sessionUpdate === 'tool_call_update' && ev.update?.status === 'completed');
+        await readUntil('  + BETA');
+        const done = (await readerText())!;
+        check('N78: a tool update replaces its heading and diff in place, without duplicating the call',
+          done.startsWith(prefix + 'Tool: edit [completed] Edit notes.txt\n  Location: ' + cwd + '/notes.txt')
+          && done.split('Edit notes.txt').length === 2 && done.includes('\n  - beta\n  + BETA\n'), done.slice(prefix.length));
+      } finally { g.release(); }
+      await liveIdle();
+
+      await say('perm');
+      await readUntil('· Permission: waiting');
+      await D.locator('#mesh-detail .ag-perm button[data-kind="reject_once"]').click();
+      await readUntil('· rejected: Reject');
+      const idle = await liveIdle(), answered = (await readerText())!;
+      check('N78: the DOM permission panel answers while the reader is mounted; waiting becomes the journal outcome',
+        !!idle && !answered.includes('Permission: waiting') && acpSent(D, sid, 'permission').some(m => m.outcome.optionId === 'reject-once')
+        && answered.includes('Did not run'), answered.slice(-500));
+    });
+
+    await section('N78 fallback journal', async () => {
+      const P = await ctx.newPage(); watchErrors(P);
+      let allowEdwin!: () => void, edit: TailPw.WebSocketRoute | undefined, online = true;
+      const gate = new Promise<void>(r => { allowEdwin = r; });
+      try {
+        await P.route('**/edwin/manifest.json', async route => { await gate; await route.continue(); });
+        await P.routeWebSocket(/\/edit$/, ws => {
+          if (!online) { ws.close({ code: 1011 }); return; }
+          edit = ws; ws.connectToServer();
+        });
+        await P.goto(ORIGIN + '/'); await P.waitForFunction(() => window.__canvas?.BOOTED);
+        await P.waitForFunction(sid => !!window.__canvas.SESS[sid], sid);
+        await P.evaluate(sid => window.__canvas.meshOpen(sid), sid);
+        const initial = !!await acpIdle(P, '$agents') && (await P.locator(log).textContent())?.includes('echo: n78 original conversation');
+        await P.fill(composer, 'n78 DOM journal'); await P.press(composer, 'Enter');
+        const reply = await until(async () => (await P.locator(log).textContent())?.includes('echo: n78 DOM journal'));
+        check('N78: without ready Edwin the DOM journal still replays and displays a new prompt and reply', initial && reply && !await P.locator(reader).count());
+        if (!edwin) return;
+        allowEdwin();
+        await P.waitForFunction(() => window.__canvas.FR.ready && window.__canvas.FR.online);
+        const focused = await P.locator(composer).evaluate(e => e === document.activeElement);
+        await P.locator(composer).press('Escape');
+        const kept = await P.locator(log).count() === 1 && !await P.locator(reader).count();
+        await P.evaluate(({ sid, other }) => { window.__canvas.meshOpen(other); window.__canvas.meshOpen(sid); }, { sid, other: ids['n78-readonly'] });
+        const mounted = await P.locator(reader + '.edwin-frame').elementHandle();
+        check('N78: readiness does not replace the focused DOM viewer, but the next mount uses Edwin', focused && kept && !!mounted && !await P.locator(log).count());
+
+        online = false; edit!.close({ code: 1011 });
+        if (!await acpIdle(P, '$agents')) throw new Error('N78 remounted ACP viewer did not finish replay');
+        await P.waitForFunction(() => !window.__canvas.FR.online);
+        await P.fill(composer, 'n78 local reader offline'); await P.press(composer, 'Enter');
+        await P.waitForFunction(() => window.__canvas.live.$agents?.backend.transcript?.buf.text.includes('echo: n78 local reader offline'));
+        check('N78: the same local reader continues receiving ACP text after losing edwind',
+          await mounted?.evaluate(e => e === document.querySelector('#mesh-detail .ag-reader')) && !await P.locator(log).count());
+      } finally { allowEdwin(); await P.close(); }
+    });
+
     // All neighbour expectations come from the actual ordered rows, not the ages of unrelated sessions.
+    await D.bringToFront(); await open(sid);
     await D.locator('#mesh-list').focus();
-    const next = await row(sid).evaluate(e => { let n = e.nextElementSibling; while (n && !n.classList.contains('mesh-row')) n = n.nextElementSibling; return (n as HTMLElement | null)?.dataset.id; });
-    await D.keyboard.press('ArrowDown'); const down = await D.evaluate(() => window.__canvas.MESH.open);
-    await D.keyboard.press('ArrowUp'); const up = await D.evaluate(() => window.__canvas.MESH.open);
-    await D.keyboard.press('j'); const j = await D.evaluate(() => window.__canvas.MESH.open);
-    await D.keyboard.press('k'); const k = await D.evaluate(() => window.__canvas.MESH.open);
+    const { near, after } = await row(sid).evaluate(e => {
+      const rows = [...e.parentElement!.querySelectorAll<HTMLElement>('.mesh-row')], i = rows.indexOf(e as HTMLElement);
+      return { near: (rows[i + 1] ?? rows[i - 1])?.dataset.id, after: i + 1 < rows.length };
+    });
+    await D.keyboard.press(after ? 'ArrowDown' : 'ArrowUp'); const arrow = await D.evaluate(() => window.__canvas.MESH.open);
+    await D.keyboard.press(after ? 'ArrowUp' : 'ArrowDown'); const back = await D.evaluate(() => window.__canvas.MESH.open);
+    await D.keyboard.press(after ? 'j' : 'k'); const vim = await D.evaluate(() => window.__canvas.MESH.open);
+    await D.keyboard.press(after ? 'k' : 'j'); const returned = await D.evaluate(() => window.__canvas.MESH.open);
     await liveIdle();
     await D.keyboard.press('Enter');
-    const entered = await D.locator(composer).evaluate(e => e === document.activeElement);
+    const entered = await D.evaluate(composer => document.activeElement?.matches(composer), composer);
     await D.keyboard.press('Escape');
     const escaped = await D.evaluate(() => !document.querySelector('#v-agents')!.classList.contains('detail-open'));
     check('N78: Up/Down and j/k navigate ordered rows; Enter focuses the live composer and Escape returns to the list',
-      !!next && down === next && up === sid && j === next && k === sid && entered && escaped, JSON.stringify({ next, down, up, j, k, entered, escaped }));
+      !!near && arrow === near && back === sid && vim === near && returned === sid && entered && escaped, { near, arrow, back, vim, returned, entered, escaped });
     await open(sid); await liveIdle();
     await D.fill(composer, 'n78 unsent draft');
     const draftControl = await D.locator(composer).elementHandle(), draftViewer = await D.locator('#mesh-detail .mesh-live').elementHandle();
@@ -3920,15 +4067,19 @@ await section('N78', async () => {
       }, 20000);
       await D.fill(composer, 'n78 editor restores');
       const prompts = acpSent(D, sid, 'prompt').length;
-      await D.press(composer, 'Control+c'); await D.press(composer, 'Control+e'); await D.waitForSelector('#mesh-detail .ag-editor-host.edwin-frame');
+      if (edwin) await D.locator(reader + ' .ed-input').focus();
+      await D.keyboard.press('Control+c'); await D.keyboard.press('Control+e'); await D.waitForSelector('#mesh-detail .ag-editor-host.edwin-frame');
       await D.keyboard.type(' edited'); await D.keyboard.press('Control+c'); await D.keyboard.press('Control+k');
       const restored = await until(async () => !await D.locator('#mesh-detail .ag-editor').count() && await D.inputValue(composer) === 'n78 editor restores edited', 10000);
       check('N78: a local unsaved Edwin prompt sends with C-c C-c; C-c C-k restores the current text without sending',
         local && !!sent && !!restored && acpSent(D, sid, 'prompt').length === prompts && await nodes() === before, JSON.stringify({ local, sent, restored, prompts, now: acpSent(D, sid, 'prompt').length }));
     });
 
+    const transcriptName = await D.evaluate(() => window.__canvas.live.$agents.backend.transcript?.buf.name as string | undefined);
     await row(ids['n78-readonly']).click();
     const detached = await until(async () => !await D.locator(composer).count() && await isAlive(sid), 10000);
+    if (edwin) check('N78: selecting another row destroys the transcript frame and kills its local buffer', !!transcriptName
+      && !await D.locator(reader).count() && await D.evaluate(name => !window.Ed.E.buffers.some(b => b.name === name), transcriptName));
     await open(sid); await liveIdle();
     await D.evaluate(() => window.__canvas.setView('canvas'));
     const leftHub = await until(async () => !await D.locator(composer).count() && await isAlive(sid), 10000);
@@ -3945,15 +4096,33 @@ await section('N78', async () => {
       metadata.harness === 'pi' && metadata.harnessTitle === 'pi' && !!metadata.model && metadata.modelTitle === model && roInfo.harness === 'pi' && roInfo.model === model && roInfo.host === H.host && roInfo.folder === cwd && roInfo.mode === 'default' && !('reasoning' in roInfo) && !!roInfo.started && !!roInfo['last active']
       && /Started in a terminal the hub cannot reach/.test(ro || '') && /Claude background session/.test(ro || '') && /tmux/.test(ro || '') && !await D.locator('#mesh-detail .ag-in textarea, #mesh-detail .xterm').count()
       && !await D.getByRole('button', { name: 'Open terminal', exact: true }).count(), JSON.stringify({ metadata, roInfo, ro }));
-    await D.evaluate(() => { if (document.body.classList.contains('side-open')) window.__canvas.toggleDockTerm(); });   // the dock covers the whole phone viewport
-    await D.setViewportSize({ width: 390, height: 844 });
-    await D.locator('#mesh-detail .mesh-back').click();
-    const listPhone = await D.evaluate(() => { const v = document.querySelector('#v-agents')!, l = document.querySelector('#mesh-list')!; return !v.classList.contains('detail-open') && l.getBoundingClientRect().width <= innerWidth && l.getBoundingClientRect().width > 0; });
-    await row(ids['n78-readonly']).click();
-    const detailPhone = await D.evaluate(() => { const v = document.querySelector('#v-agents')!, d = document.querySelector('#mesh-detail')!; return v.classList.contains('detail-open') && d.getBoundingClientRect().width <= innerWidth && d.getBoundingClientRect().width > 0 && document.documentElement.scrollWidth <= innerWidth; });
-    await D.locator('#mesh-detail .mesh-back').click();
-    check('N78: below 700 px the list and selected detail fit the screen, and Sessions returns to the list', listPhone && detailPhone && await row(ids['n78-readonly']).isVisible(), JSON.stringify({ listPhone, detailPhone }));
-    await D.setViewportSize({ width: 1500, height: 950 });
+    await section('N78 phone', async () => {
+      // Start from the saved board, not the tab used for the cross-tab board edits above.
+      const P = await dpage();
+      try {
+        await P.setViewportSize({ width: 390, height: 844 });
+        await P.waitForFunction(sid => !!window.__canvas.SESS[sid], sid);
+        if (edwin) await P.waitForFunction(() => window.__canvas.FR.ready && window.__canvas.FR.online);
+        await P.evaluate(other => {
+          const C = window.__canvas;
+          if (document.body.classList.contains('side-open')) C.toggleDockTerm();
+          C.meshOpen(other);
+        }, ids['n78-readonly']);
+        const back = P.locator('#mesh-detail .mesh-back');
+        await back.click();
+        const listPhone = await P.evaluate(() => { const v = document.querySelector('#v-agents')!, l = document.querySelector('#mesh-list')!; return !v.classList.contains('detail-open') && l.getBoundingClientRect().width <= innerWidth && l.getBoundingClientRect().width > 0; });
+        await P.locator(`#mesh-list .mesh-row[data-id="${sid}"]`).click();
+        if (edwin) await P.locator(reader + '.edwin-frame').waitFor();
+        const detailPhone = await P.evaluate((reader: string) => {
+          const v = document.querySelector('#v-agents')!, d = document.querySelector('#mesh-detail')!, f = document.querySelector(reader), box = d.getBoundingClientRect();
+          return v.classList.contains('detail-open') && box.width <= innerWidth && box.width > 0 && d.scrollWidth <= d.clientWidth
+            && document.documentElement.scrollWidth <= innerWidth && (!f || (f as HTMLElement).offsetWidth === (f.parentElement as HTMLElement).clientWidth);
+        }, reader);
+        await back.click();
+        check('N78: below 700 px the list and selected detail fit the screen, and Sessions returns to the list',
+          listPhone && detailPhone && await P.locator(`#mesh-list .mesh-row[data-id="${ids['n78-readonly']}"]`).isVisible(), { listPhone, detailPhone });
+      } finally { await P.close(); }
+    });
 
     await open(ids['n78-hubpty']);
     const ptyReady = await until(() => ptyOf(D, externalPty).some(w => w.hello && !w.closed));

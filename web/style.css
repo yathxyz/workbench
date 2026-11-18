@@ -297,6 +297,7 @@ code, kbd { font-family: var(--mono); font-size: .92em; }
 .backlinks .bl span { color: var(--muted); }
 .backlinks .bl:hover span { color: var(--fg); }
 .ag-transcript { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.ag-reader { flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
 .ag-editor { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; background: var(--buf-bg); border: 1px solid var(--line); }
 .ag-editor-head { flex: none; display: flex; gap: 6px; align-items: center; padding: 5px 8px; background: var(--panel); border-bottom: 1px solid var(--line); font: 11px var(--mono); }
 .ag-editor-host { flex: 1; min-height: 0; position: relative; }
@@ -664,7 +665,7 @@ body.listening #st-buf-text { color: var(--ink-red); }
 .mesh-live > .body { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; overflow: hidden; }
 .mesh-live.k-term > .body { display: block; background: var(--term-bg); }
 .mesh-live .xterm { height: 100%; padding: 8px; box-sizing: border-box; }
-.mesh-live .hdr { display: flex; gap: 8px; align-items: center; }
+.mesh-live > .hdr { position: static; flex: none; display: flex; gap: 8px; align-items: center; }
 .mesh-back { display: none; }
 @media (max-width: 699px) {
   #v-agents { grid-template-columns: minmax(0, 1fr); }
