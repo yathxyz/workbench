@@ -106,7 +106,8 @@
     agents: [
       ['j', 'agents.next', 'next session', 'j k / arrows'], ['<down>', 'agents.next', 'next session', 'j k / arrows'],
       ['k', 'agents.prev', 'previous session', 'j k / arrows'], ['<up>', 'agents.prev', 'previous session', 'j k / arrows'],
-      ['RET', 'agents.enter', 'focus the session'], ['ESC', 'agents.back', 'back to the session list'],
+      ['RET', 'agents.enter', 'open or focus the session'], ['ESC', 'agents.back', 'back to the session list'],
+      ['t', 'agents.source', 'switch between Transcript and Terminal'],
     ],
     graph: [
       ['h', 'graph.left', 'select the neighbour node', 'h j k l'], ['j', 'graph.down', 'select the neighbour node', 'h j k l'],
