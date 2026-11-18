@@ -3954,7 +3954,7 @@ await section('N78', async () => {
         const facts = await D.locator('.mesh-info').evaluate(e => ({ height: e.getBoundingClientRect().height, scroll: getComputedStyle(e).overflowY }));
         check(`N78: ${size.width}×${size.height} compact header contains every action, gives the session half the pane and keeps a composer gap; disclosure reveals 2,000 characters without shifting actions`,
           !closed.facts && closed.inside && closed.live >= closed.pane / 2 && closed.gap >= 8 && expanded.facts && expanded.inside && expanded.live >= expanded.pane / 2
-          && promptShown === prompt && facts.height <= size.height * .35 && facts.scroll === 'auto' && JSON.stringify(closed.buttons) === JSON.stringify(expanded.buttons),
+          && Math.abs(expanded.live - closed.live) <= 1 && promptShown === prompt && facts.height <= size.height * .35 && facts.scroll === 'auto' && JSON.stringify(closed.buttons) === JSON.stringify(expanded.buttons),
           JSON.stringify({ closed, expanded, facts, promptLength: promptShown?.length }));
         await open(sid); await liveIdle(); await open(id); await liveIdle();
         check('N78: disclosure stays open across selection during this page lifetime', (await layout()).facts);
@@ -3981,7 +3981,21 @@ await section('N78', async () => {
         && await D.locator('.mesh-side').isVisible() && await D.locator('#mesh-detail').isVisible() && !await D.locator('.mesh-back').isVisible()
         && undocked.list >= 200 && undocked.pane >= 360 && undockedLayout.inside && undockedLayout.overflow.length === 0,
         JSON.stringify({ docked, dockDetail, dockList, dockBack, dockListFits, undocked, undockedLayout }));
-      const before = await widths(); await drag(before.list + 70); const changed = await widths();
+      const before = await widths(), savedBefore = await D.evaluate(() => window.__canvas.S.meshW), heldGrip = (await D.locator('#mesh-grip').boundingBox())!;
+      await D.mouse.move(heldGrip.x + heldGrip.width / 2, heldGrip.y + 100); await D.mouse.down(); await D.mouse.move(before.list + 70, heldGrip.y + 100, { steps: 8 });
+      const changed = await widths(), dragPrompt = 'During drag: ' + prompt.slice(13);
+      const activity = await report('near', 'n78-layout', { wbSession: 'n78_layout_api' }, 'prompt', dragPrompt);
+      const rendered = await until(async () => (await info()).prompt === dragPrompt, 10000);
+      const duringUpdate = await widths(), savedDuring = await D.evaluate(() => window.__canvas.S.meshW);
+      await D.setViewportSize({ width: 920, height: 700 });
+      await D.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      const duringResize = await widths();
+      await D.mouse.up(); const savedAfter = await D.evaluate(() => window.__canvas.S.meshW);
+      await D.setViewportSize({ width: 900, height: 700 });
+      check('N78: mesh activity and view resize preserve an in-progress divider drag; release saves the dragged width',
+        activity === 204 && rendered && changed.list > before.list + 60 && savedDuring === savedBefore && changed.list !== savedBefore
+        && Math.abs(duringUpdate.list - changed.list) <= 1 && Math.abs(duringResize.list - changed.list) <= 1 && Math.abs(savedAfter! - changed.list) <= 1,
+        JSON.stringify({ activity, rendered, before, changed, savedBefore, savedDuring, duringUpdate, duringResize, savedAfter }));
       await reload(); await open(id); await liveIdle(); const restored = await widths();
       check('N78: dragging changes list width and survives reload; disclosure resets closed', changed.list > before.list + 60 && restored.list === changed.list && !(await layout()).facts, JSON.stringify({ before, changed, restored }));
       const cdp = await D.context().newCDPSession(D), grip = (await D.locator('#mesh-grip').boundingBox())!, x = grip.x + grip.width / 2, y = grip.y + 100;

@@ -4321,7 +4321,7 @@ $('#mesh-detail')!.addEventListener('keydown', e => { if (e.key === 'Escape' && 
 function meshRender(): void {
   const box = $('#mesh-list');
   if (!box || VIEW !== 'agents') return;
-  setMeshW(S.meshW);
+  if (!document.body.classList.contains('pane-drag')) setMeshW(S.meshW);
   const shown = (r: MeshRow): boolean => MESH.ended || r.live || r.id === MESH.open || r.kids.some(shown);
   const rank = (r: MeshRow) => meshBad(r) || r.kids.some(meshBad) ? 0 : !r.live ? 3 : r.state === 'running' ? 1 : 2;   // waiting for you first, a list that does not reorder as sessions work
   const order = (a: MeshRow, b: MeshRow) => rank(a) - rank(b) || b.since - a.since || a.id.localeCompare(b.id);
@@ -5041,7 +5041,7 @@ function wirePaneGrip() {
     e.preventDefault(); e.stopPropagation();
     setMeshW($('.mesh-side')!.getBoundingClientRect().width + (e.key === 'ArrowLeft' ? -16 : 16), true);
   });
-  new ResizeObserver(() => setMeshW(S.meshW)).observe($('#v-agents')!);
+  new ResizeObserver(() => { if (!document.body.classList.contains('pane-drag')) setMeshW(S.meshW); }).observe($('#v-agents')!);
   $('#pick-chip [data-act=compact]')!.onclick = () => compact('selection');
   $('#pick-chip [data-act=clear]')!.onclick = () => pickClear();
   const wu = $('#ws-up'); if (wu) wu.onclick = () => wsLeave();
