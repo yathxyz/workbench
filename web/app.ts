@@ -4155,10 +4155,16 @@ function toggleDockTerm() {
 // ------------------------------------------------------------------ agents on the mesh: every session the hub runs or is told of (§3.8.3, F-A47)
 // Observed sessions from /rpc: observed replaces, observed_put upserts, observed_gone deletes.
 const OBS: Record<string, ObservedSession> = {};
-const MESH: { open: string | null; ended: boolean; shape: string; graph: string; topo: string; t: number } = { open: null, ended: false, shape: '', graph: '', topo: '', t: 0 };
+const MESH: { open: string | null; ended: boolean; facts: boolean; collapsed: Set<string>; graph: string; topo: string; t: number } = { open: null, ended: false, facts: false, collapsed: new Set(), graph: '', topo: '', t: 0 };
+const MESH_ROWS = new Map<string, HTMLElement>(), MESH_GROUPS = new Map<string, HTMLElement>();
 const MESH_PANE: { row: string | null; key: string; actions: string; node: TermNode | AcpNode | null; attach: boolean; rows: string[] } = { row: null, key: '', actions: '', node: null, attach: false, rows: [] };
 // The hub session an observed one runs in: its WB_SESSION, believed only from the host that session is on.
-function obsSess(o: ObservedSession): SessionSummary | null { const s = !o.parent && o.wbSession ? SESS[o.wbSession] : undefined; return s && s.host === o.host ? s : null; }
+function obsSess(o: ObservedSession): SessionSummary | null {
+  // A subagent can inherit the enclosing hub sid even when its parent was never reported.
+  if (!o.wbSession || o.parent) return null;
+  const s = SESS[o.wbSession];
+  return s && s.host === o.host ? s : null;
+}
 function obsPut(o: ObservedSession | undefined, was = o && OBS[o.id]?.state): void {
   if (!o?.id) return;
   OBS[o.id] = o; meshChanged();
@@ -4174,18 +4180,39 @@ function meshChanged(): void { if (!MESH.t) MESH.t = setTimeout(() => { MESH.t =
 // The overview's rows: observed sessions with their subagents under them, then the agent sessions of the hub that
 // no harness reports. Either side saying a session waits for you makes it waiting.
 function meshRows(): MeshRow[] {
-  const rows = new Map<string, MeshRow>(), joined = new Set<string>(), top: MeshRow[] = [];
+  const rows = new Map<string, MeshRow>(), aliases = new Map<string, MeshRow>(), joined = new Set<string>(), top: MeshRow[] = [];
   for (const o of Object.values(OBS)) {
     const sess = obsSess(o), acp = sess?.kind === 'acp' ? sess : null, ended = o.endedAt != null; if (sess) joined.add(sess.sid);
-    rows.set(o.id, { id: o.id, host: o.host, harness: o.harness, project: o.project, title: o.title, state: acp && (ended || ACP_BAD.has(acp.state)) ? acp.state : o.state,
-      since: o.startedAt, at: o.lastAt, live: ended ? !!acp?.alive : true, obs: o, sess, card: (sess && S?.nodes[sess.sid]) || null, kids: [] });   // a record that went silent ends; the agent the hub still runs has not
+    const r: MeshRow = { id: o.id, host: o.host, harness: o.harness, project: o.project, repo: o.repo || o.project,
+      repoRoot: o.repoRoot || null, worktree: o.worktree || null, branch: o.branch || null,
+      parent: o.parent || sess?.parent || null, title: o.title, state: acp && (ended || ACP_BAD.has(acp.state)) ? acp.state : o.state,
+      since: o.startedAt, at: o.lastAt, live: ended ? !!acp?.alive : true, obs: o, sess, card: (sess && S?.nodes[sess.sid]) || null, kids: [] };
+    rows.set(r.id, r); if (sess && !aliases.has(sess.sid)) aliases.set(sess.sid, r);
   }
   for (const s of Object.values(SESS)) if (s.kind === 'acp' && !joined.has(s.sid)) {
-    const card = S?.nodes[s.sid] || null, agent = agentLabel(s.acp?.agent);
-    rows.set(s.sid, { id: s.sid, host: s.host, harness: agent, project: s.cwd?.replace(/\/+$/, '').split('/').pop() || '(no cwd)', title: s.acp?.title || card?.name || agent, state: s.state,
-      since: s.createdAt, at: s.updatedAt, live: s.alive, obs: null, sess: s, card, kids: [] });
+    const card = S?.nodes[s.sid] || null, agent = agentLabel(s.acp?.agent), project = s.project || (s.projectRoot || s.cwd)?.replace(/\/+$/, '').split('/').pop() || '(no cwd)';
+    rows.set(s.sid, { id: s.sid, host: s.host, harness: agent, project, repo: s.repo || project,
+      repoRoot: s.repoRoot || null, worktree: s.worktree || null, branch: s.branch || null, parent: s.parent || null,
+      title: s.acp?.title || card?.name || agent, state: s.state, since: s.createdAt, at: s.updatedAt, live: s.alive, obs: null, sess: s, card, kids: [] });
   }
-  for (const r of rows.values()) { const up = r.obs?.parent ? rows.get(r.obs.parent) : undefined; (up ? up.kids : top).push(r); }
+  for (const r of rows.values()) aliases.set(r.id, r);
+  const parents = new Map<string, MeshRow>();
+  for (const r of rows.values()) {
+    const up = r.parent ? aliases.get(r.parent) : undefined;
+    r.parent = up?.id || r.parent;   // retain ended/unknown lineage for the detail facts
+    if (up?.live && up !== r) parents.set(r.id, up);
+  }
+  // Break cycles before building children, including cycles through a joined hub sid alias.
+  const done = new Set<string>();
+  for (const r of rows.values()) {
+    const path = new Set<string>(); let cur: MeshRow | undefined = r;
+    while (cur && !done.has(cur.id)) {
+      if (path.has(cur.id)) { parents.delete(cur.id); break; }
+      path.add(cur.id); cur = parents.get(cur.id);
+    }
+    for (const id of path) done.add(id);
+  }
+  for (const r of rows.values()) (parents.get(r.id)?.kids || top).push(r);
   return top;
 }
 function meshFlat(rows: MeshRow[] = meshRows()): MeshRow[] { return rows.flatMap(r => [r, ...meshFlat(r.kids)]); }
@@ -4201,25 +4228,57 @@ function meshDoing(r: MeshRow): string {
   if (r.state === 'running') return o?.tool ? line(o.tool.name, o.tool.input) : 'working';
   return r.state === 'done' ? 'finished' : r.state.replace(/_/g, ' ');
 }
-function meshRowEl(r: MeshRow, depth: number): HTMLElement {
-  const row = el('div', 'mesh-row'), main = el('div', 'mesh-main'), sub = el('span', 'mesh-sub'); row.dataset.id = r.id; row.style.setProperty('--d', String(depth)); row.setAttribute('role', 'listitem');
-  sub.append(el('span', 'mesh-harness'), ' · ', el('span', 'mesh-model'), el('span', 'mesh-doing'));
-  main.append(el('b'), sub); row.append(el('i', 'dot'), main, el('span', 'mesh-at'));
-  if (r.card) { const go = el('button', 'mini', '↗'); go.title = 'Show its card on the canvas'; go.onclick = e => { e.stopPropagation(); const n = S.nodes[r.card!.id]; if (n) { setView('canvas'); jumpNode(n); } }; row.append(go); }
+function meshRowEl(r: MeshRow): HTMLElement {
+  const row = el('div', 'mesh-row'), main = el('div', 'mesh-main'), sub = el('span', 'mesh-sub'), context = el('span', 'mesh-context');
+  const toggle = el('button', 'mini mesh-collapse'), go = el('button', 'mini mesh-canvas', '↗');
+  row.dataset.id = r.id; row.setAttribute('role', 'listitem');
+  context.append(el('span', 'mesh-repo'), el('span', 'mesh-worktree'), el('span', 'mesh-branch'));
+  sub.append(context, el('span', 'mesh-harness'), ' · ', el('span', 'mesh-model'), el('span', 'mesh-doing'));
+  main.append(el('b'), sub, el('span', 'mesh-collapsed')); row.append(toggle, el('i', 'dot'), main, el('span', 'mesh-at'), go);
+  toggle.onclick = e => {
+    e.stopPropagation();
+    if (MESH.collapsed.has(r.id)) MESH.collapsed.delete(r.id);
+    else {
+      MESH.collapsed.add(r.id);
+      const current = meshFlat().find(x => x.id === r.id);
+      if (current && meshFlat(current.kids).some(x => x.id === MESH.open)) MESH.open = r.id;
+    }
+    meshRender();
+  };
+  go.title = 'Show its card on the canvas';
+  go.onclick = e => { e.stopPropagation(); const n = row.dataset.card && S.nodes[row.dataset.card]; if (n) { setView('canvas'); jumpNode(n); } };
   row.onclick = () => meshSelect(r.id);
   return row;
 }
 // A row's texts, set in place: a row under the pointer is not replaced while its session works.
-function meshFill(row: HTMLElement, r: MeshRow, depth: number): void {
+function meshFill(row: HTMLElement, r: MeshRow, depth: number, groupRepo: string | undefined, visible: Set<string>): void {
   row.className = 'mesh-row' + (r.live ? '' : ' ended') + (meshBad(r) ? ' bad' : '') + (r.id === MESH.open ? ' on' : '');
+  row.style.setProperty('--d', String(depth)); row.dataset.depth = String(depth); row.dataset.card = r.card?.id || '';
   row.setAttribute('aria-current', r.id === MESH.open ? 'true' : 'false');
   $('.dot', row)!.className = 'dot st-' + (r.live ? r.state : 'exited');
   const set = (sel: string, text: string) => { const e = $(sel, row)!; if (e.textContent !== text) e.textContent = text; return e; };
-  set('b', r.title); set('.mesh-at', agoShort(r.at));
+  set('b', r.title).title = r.title; set('.mesh-at', agoShort(r.at));
   const model = meshConfig(r, 'model') || r.obs?.model || '', harness = depth && r.obs?.agentType ? r.harness + '/' + r.obs.agentType : r.harness;
   set('.mesh-harness', meshShort(harness)).title = harness; set('.mesh-model', model ? meshShort(model) + ' · ' : '').title = model;
   set('.mesh-doing', [...(depth ? [] : ['@' + r.host]), meshDoing(r)].join(' · '));
+  const worktree = r.worktree?.replace(/\/+$/, '').split('/').pop() || '', branch = r.branch && r.branch !== r.worktree ? r.branch : '';
+  set('.mesh-repo', depth && r.repo !== groupRepo ? meshShort(r.repo) + ' · ' : '').title = r.repo;
+  set('.mesh-worktree', worktree ? meshShort(worktree) + ' · ' : '').title = r.worktree || '';
+  set('.mesh-branch', branch ? meshShort(branch) + ' · ' : '').title = r.branch || '';
+  const toggle = $('.mesh-collapse', row) as HTMLButtonElement, collapsed = MESH.collapsed.has(r.id), descendants = meshFlat(r.kids).filter(k => MESH.ended || k.live || k.id === MESH.open);
+  toggle.hidden = !descendants.length; toggle.textContent = collapsed ? '▸' : '▾';
+  toggle.title = (collapsed ? 'Expand' : 'Collapse') + ' descendants'; toggle.setAttribute('aria-label', toggle.title);
+  toggle.setAttribute('aria-expanded', String(!collapsed));
+  const summary = $('.mesh-collapsed', row)!; summary.hidden = !collapsed || !descendants.length;
+  if (!summary.hidden) {
+    const worst = descendants.reduce((a, b) => meshSeverity(b) < meshSeverity(a) ? b : a);
+    summary.dataset.count = String(descendants.length); summary.dataset.hidden = String(descendants.filter(x => !visible.has(x.id)).length);
+    summary.dataset.state = worst.live ? worst.state : 'exited';
+    set('.mesh-collapsed', `${descendants.length} descendant${descendants.length === 1 ? '' : 's'} · ${meshBad(worst) ? meshWants(worst.state) : worst.live ? worst.state.replace(/_/g, ' ') : 'ended'}`);
+  }
+  ($('.mesh-canvas', row) as HTMLButtonElement).hidden = !r.card;
 }
+const meshSeverity = (r: MeshRow): number => !r.live ? 7 : r.state === 'error' ? 0 : r.state === 'waiting_permission' ? 1 : r.state === 'waiting_input' ? 2 : r.state === 'running' ? 3 : r.state === 'done' ? 5 : 4;
 const meshShort = (s: string): string => s.length > 32 ? s.slice(0, 15) + '…' + s.slice(-16) : s;
 function meshConfig(r: MeshRow, category: string): string {
   const b = MESH_PANE.row === r.id ? live.$agents?.backend : r.sess && live[r.sess.sid]?.backend, opts = b?.session?.configOptions;
@@ -4231,11 +4290,37 @@ function meshInfo(box: HTMLElement, r: MeshRow): void {
   const o = r.obs, b = MESH_PANE.row === r.id ? live.$agents?.backend as AcpBackend | undefined : undefined, out: HTMLElement[] = [], kv = (k: string, v: string | null | undefined | false) => { if (v) { const d = el('div', 'mesh-kv'); d.append(el('span', '', k), el('code', '', v)); out.push(d); } };
   kv('harness', r.harness); kv('model', meshConfig(r, 'model') || o?.model); kv('host', r.host);
   kv('folder', o?.cwd || r.sess?.cwd); kv('mode', b instanceof AcpBackend ? b.mode() || o?.permissionMode : o?.permissionMode); kv('reasoning', meshConfig(r, 'thinking'));
+  kv('repo', r.repo); kv('repo root', r.repoRoot); kv('worktree', r.worktree); kv('branch', r.branch);
+  const parent = r.parent && meshFlat().find(x => x.id === r.parent);
+  if (parent) {
+    const d = el('div', 'mesh-kv'), go = el('button', 'mesh-parent', parent.title);
+    go.title = parent.id; go.onclick = () => meshSelect(parent.id); d.append(el('span', '', 'started by'), go); out.push(d);
+  }
   kv('waiting', meshBad(r) && meshDoing(r)); kv('prompt', o?.lastPrompt); kv('reply', o?.lastMessage);
   kv('started', new Date(r.since).toLocaleString()); kv('last active', new Date(r.at).toLocaleString());
   if (o) kv('counts', o.counts.prompts + ' prompt(s), ' + o.counts.tools + ' tool call(s)' + (o.counts.toolFailures ? ', ' + o.counts.toolFailures + ' failed' : ''));
   if (o?.tail.length) out.push(el('pre', '', o.tail.slice(-12).map(t => hhmm(t.at) + ' ' + t.kind.replace(/_/g, ' ') + (t.text ? ' ' + t.text : '')).join('\n')));
   box.replaceChildren(...out);
+}
+function meshHeader(r: MeshRow): void {
+  const box = $('#mesh-detail')!, title = $('h3', box)!, meta = $('.mesh-meta', box)!, b = live.$agents?.backend;
+  if (title.textContent !== r.title) title.textContent = r.title; title.title = r.title;
+  const values = [r.harness, meshConfig(r, 'model') || r.obs?.model, r.host, r.obs?.cwd || r.sess?.cwd,
+    b instanceof AcpBackend ? b.mode() || r.obs?.permissionMode : r.obs?.permissionMode, r.live ? r.state : 'ended'];
+  const parts = values.flatMap((v, i) => {
+    if (!v) return []; const s = el('span', i === 3 ? 'mesh-folder' : ''); s.title = v;
+    if (i === 3) { const path = el('bdi', '', v); path.dir = 'ltr'; s.append(path); } else s.textContent = v;
+    return [s];
+  });
+  meta.replaceChildren(...parts.flatMap((s, i) => i ? [' · ', s] : [s]));
+}
+function meshFactsMode(): void {
+  const box = $('#mesh-detail')!, mounted = !!live.$agents;
+  box.classList.toggle('mounted', mounted);
+  const toggle = $('.mesh-disclose', box)!;
+  toggle.hidden = !mounted; toggle.setAttribute('aria-expanded', String(MESH.facts));
+  $('.mesh-info', box)!.hidden = mounted && !MESH.facts;
+  live.$agents?.fitNow?.();
 }
 function meshClose(): void {
   const L = live.$agents;
@@ -4245,6 +4330,7 @@ function meshClose(): void {
     L.el.remove();
   }
   MESH_PANE.row = null; MESH_PANE.key = ''; MESH_PANE.actions = ''; MESH_PANE.node = null; MESH_PANE.attach = false;
+  $('#mesh-detail')!.classList.remove('mounted');
 }
 function meshMount(r: MeshRow, attach = false): void {
   const box = $('#mesh-detail')!, host = el('div', 'mesh-live ' + (r.sess?.kind === 'acp' && !attach ? 'k-acp' : 'k-term')), hdr = el('div', 'hdr'), body = el('div', 'body');
@@ -4255,6 +4341,7 @@ function meshMount(r: MeshRow, attach = false): void {
   MESH_PANE.node = n; MESH_PANE.attach = attach;
   const L = live.$agents = { el: host, hdr, body };
   if (n.kind === 'acp') mountAcp(n, L); else mountTerm(n, L);
+  meshFactsMode();
 }
 const meshPaneKey = (r: MeshRow): string => [r.id, r.sess?.sid || '', r.sess?.kind || '', r.sess?.createdAt ?? ''].join(' ');
 const meshActionKey = (r: MeshRow): string => [r.card?.id || '', !!r.obs?.attach, !!INFO?.attach, r.live].join(' ');
@@ -4271,16 +4358,29 @@ function meshActions(r: MeshRow): void {
   if (reachable) return;
   if (r.obs?.attach && INFO?.attach && r.live) {
     const open = B('Open terminal', () => { open.disabled = true; meshMount(r, true); meshEnter(); }); open.disabled = MESH_PANE.attach;
-    box.append(el('div', 'mesh-hint', 'Closing this terminal leaves the agent running.'));
-  } else box.append(el('div', 'mesh-hint', 'Started in a terminal the hub cannot reach. Start a Claude background session, use tmux, or run in a Workbench shell or agent card to control it here.'));
+    $('.mesh-head', box)!.append(el('div', 'mesh-hint', 'Closing this terminal leaves the agent running.'));
+  } else $('.mesh-head', box)!.append(el('div', 'mesh-hint', 'Started in a terminal the hub cannot reach. Start a Claude background session, use tmux, or run in a Workbench shell or agent card to control it here.'));
 }
 function meshDetail(r: MeshRow): void {
   meshClose(); MESH_PANE.row = r.id; MESH_PANE.key = meshPaneKey(r);
-  const box = $('#mesh-detail')!, back = el('button', 'tb mesh-back', '← Sessions');
-  back.onclick = meshBack; box.replaceChildren(back, el('h3', '', r.title), el('div', 'mesh-info'), el('div', 'ex-btns'));
+  const box = $('#mesh-detail')!, head = el('div', 'mesh-head'), back = el('button', 'tb mesh-back', '← Sessions'), toggle = el('button', 'tb mesh-disclose', 'Details'), info = el('div', 'mesh-info');
+  info.id = 'mesh-info'; toggle.setAttribute('aria-controls', info.id);
+  toggle.onclick = () => { MESH.facts = !MESH.facts; meshFactsMode(); };
+  back.onclick = meshBack; head.append(el('h3', '', r.title), el('div', 'ex-btns'), toggle, el('div', 'mesh-meta'), info); box.replaceChildren(back, head);
   meshActions(r); if (r.sess?.kind === 'acp' || r.sess?.kind === 'pty' && r.sess.host === INFO?.host) meshMount(r);
+  else meshFactsMode();
 }
 function meshSelect(id: string): void {
+  const all = meshRows(), flat = meshFlat(all), row = flat.find(r => r.id === id || r.sess?.sid === id);
+  if (row) {
+    id = row.id;
+    const expand = (rows: MeshRow[]): boolean => rows.some(r => {
+      if (r.id === id) return true;
+      if (!expand(r.kids)) return false;
+      MESH.collapsed.delete(r.id); return true;
+    });
+    expand(all);
+  }
   MESH.open = id; $('#v-agents')!.classList.add('detail-open'); meshRender();
   $(`#mesh-list .mesh-row[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'nearest' });
 }
@@ -4296,36 +4396,51 @@ $('#mesh-detail')!.addEventListener('keydown', e => { if (e.key === 'Escape' && 
 function meshRender(): void {
   const box = $('#mesh-list');
   if (!box || VIEW !== 'agents') return;
-  const shown = (r: MeshRow): boolean => MESH.ended || r.live || r.id === MESH.open || r.kids.some(shown);
-  const rank = (r: MeshRow) => meshBad(r) || r.kids.some(meshBad) ? 0 : !r.live ? 3 : r.state === 'running' ? 1 : 2;   // waiting for you first, a list that does not reorder as sessions work
+  if (!document.body.classList.contains('pane-drag')) setMeshW(S.meshW);
+  const shown = (r: MeshRow): boolean => MESH.ended || r.live || r.id === MESH.open;
+  const all = meshRows(), flat = meshFlat(all), waiting = new Map<string, boolean>(), groups = new Map<string, MeshRow[]>();
+  const waits = (r: MeshRow): boolean => {
+    const cached = waiting.get(r.id); if (cached != null) return cached;
+    const value = meshBad(r) || r.kids.some(waits); waiting.set(r.id, value); return value;
+  };
+  const rank = (r: MeshRow) => waits(r) ? 0 : !r.live ? 3 : r.state === 'running' ? 1 : 2;
   const order = (a: MeshRow, b: MeshRow) => rank(a) - rank(b) || b.since - a.since || a.id.localeCompare(b.id);
-  const all = meshRows(), groups = new Map<string, MeshRow[]>();
-  for (const r of all.filter(shown).sort(order)) { const g = groups.get(r.project); if (g) g.push(r); else groups.set(r.project, [r]); }
-  const lines: { r: MeshRow; d: number; head?: string }[] = [];
-  const walk = (r: MeshRow, d: number, head?: string) => { lines.push({ r, d, head }); r.kids.filter(shown).sort(order).forEach(k => walk(k, d + 1)); };
+  for (const r of all.filter(shown).sort(order)) { const g = groups.get(r.repo); if (g) g.push(r); else groups.set(r.repo, [r]); }
+  const lines: { r: MeshRow; d: number; head?: string; groupRepo?: string }[] = [];
+  const walk = (r: MeshRow, d: number, head?: string, groupRepo = r.repo) => {
+    lines.push({ r, d, head, groupRepo });
+    if (!MESH.collapsed.has(r.id)) r.kids.filter(shown).sort(order).forEach(k => walk(k, d + 1, undefined, groupRepo));
+  };
   for (const [name, rows] of groups) rows.forEach((r, i) => walk(r, 0, i ? undefined : name));
   MESH_PANE.rows = lines.map(l => l.r.id);
-  if (!MESH.open || !lines.some(l => l.r.id === MESH.open)) MESH.open = lines[0]?.r.id || null;
-  const live = meshFlat(all).filter(r => r.live), bad = live.filter(meshBad).length, hosts = new Set(live.map(r => r.host)).size;
+  const visible = new Set(MESH_PANE.rows), present = new Set(flat.map(r => r.id));
+  if (!MESH.open || !visible.has(MESH.open)) MESH.open = lines[0]?.r.id || null;
+  const live = flat.filter(r => r.live), bad = live.filter(meshBad).length, hosts = new Set(live.map(r => r.host)).size;
   $('#mesh-sum')!.textContent = live.length ? `${live.length} session${live.length === 1 ? '' : 's'} on ${hosts} host${hosts === 1 ? '' : 's'}` + (bad ? ` · ${bad} waiting for you` : '') : 'No agent is running.';
-  const shape = lines.map(l => [l.head ?? '', l.r.id, l.d, l.r.card?.id || '', l.r.sess?.sid || ''].join(' ')).join('\n');   // selection and changing texts do not replace rows
-  if (shape !== MESH.shape) {
-    MESH.shape = shape; box.replaceChildren();
-    for (const l of lines) {
-      if (l.head != null) box.append(el('div', 'mesh-group', l.head));
-      box.append(meshRowEl(l.r, l.d));
+  // Reconcile by id even when shape/order/actions change: activity never replaces an existing row.
+  const elements: HTMLElement[] = [];
+  for (const l of lines) {
+    if (l.head != null) {
+      let group = MESH_GROUPS.get(l.head); if (!group) { group = el('div', 'mesh-group', l.head); group.title = l.head; MESH_GROUPS.set(l.head, group); }
+      elements.push(group);
     }
-    if (!lines.length) box.append(el('p', 'muted', 'A session shows here when a harness on any host of the mesh reports to this hub, or when an agent card starts.'));
+    let row = MESH_ROWS.get(l.r.id); if (!row) { row = meshRowEl(l.r); MESH_ROWS.set(l.r.id, row); }
+    elements.push(row);
   }
+  const retained = new Set(elements);
+  for (const child of Array.from(box.children)) if (!retained.has(child as HTMLElement)) child.remove();
+  elements.forEach((e, i) => { if (box.children[i] !== e) box.insertBefore(e, box.children[i] || null); });
+  for (const id of MESH_ROWS.keys()) if (!present.has(id)) { MESH_ROWS.delete(id); MESH.collapsed.delete(id); }
+  for (const name of MESH_GROUPS.keys()) if (!groups.has(name)) MESH_GROUPS.delete(name);
+  if (!lines.length && !box.children.length) box.append(el('p', 'muted', 'A session shows here when a harness on any host of the mesh reports to this hub, or when an agent card starts.'));
   const selected = lines.find(l => l.r.id === MESH.open)?.r;
   if (selected) {
     if (meshPaneKey(selected) !== MESH_PANE.key) meshDetail(selected);
     else if (meshActionKey(selected) !== MESH_PANE.actions) meshActions(selected);
-    const title = $('#mesh-detail h3'); if (title && title.textContent !== selected.title) title.textContent = selected.title;
+    meshHeader(selected);
     meshInfo($('#mesh-detail .mesh-info')!, selected);
   } else { meshClose(); $('#mesh-detail')!.replaceChildren(el('p', 'muted', 'Select a session.')); $('#v-agents')!.classList.remove('detail-open'); }
-  const rows = $$('.mesh-row', box) as HTMLElement[];
-  lines.forEach((l, i) => meshFill(rows[i], l.r, l.d));
+  lines.forEach(l => meshFill(MESH_ROWS.get(l.r.id)!, l.r, l.d, l.groupRepo, visible));
 }
 // Open the Agents view, selecting the named session without adding a card.
 function meshOpen(id?: string | null): void {
@@ -4335,7 +4450,7 @@ function meshOpen(id?: string | null): void {
 // The graph follows the mesh: a session that starts or ends moves the layout, a change of state or title only redraws.
 function graphMesh(): void {
   if (VIEW !== 'graph' || !INFO?.mesh || !($('#g-mesh') as HTMLInputElement).checked) return;
-  const rows = meshFlat().filter(r => r.live), topo = rows.map(r => [r.id, r.host, r.project, r.card?.id || ''].join(' ')).join('\n'), sig = topo + '\n' + rows.map(r => r.state + ' ' + r.title).join('\n');
+  const rows = meshFlat().filter(r => r.live), topo = rows.map(r => [r.id, r.host, r.repo, r.parent || '', r.card?.id || ''].join(' ')).join('\n'), sig = topo + '\n' + rows.map(r => r.state + ' ' + r.title).join('\n');
   const sel = rows.find(r => 'mesh:' + r.id === G.sel), pre = sel && $('#g-card pre');
   if (sig !== MESH.graph) { const moved = topo !== MESH.topo; MESH.graph = sig; MESH.topo = topo; graphRebuild(moved); if (G.sel && (moved || G.sel.startsWith('mesh:'))) graphSelect(G.sel); }   // the open card names its neighbours
   else if (sel && pre && pre.textContent !== meshText(sel)) pre.textContent = meshText(sel);   // its text in place: the card's buttons stay under the pointer
@@ -4547,7 +4662,7 @@ function graphData() {
     if (!r.live) return r.kids.forEach(k => mesh(k));
     const id = 'mesh:' + r.id; add(id, r.title.slice(0, 40), 'session', null)!.state = r.state;
     if (up) link(up, id, 'spawn');
-    else { link(add('host:' + r.host, '@' + r.host, 'host', null)!.id, id, 'mesh'); link(add('proj:' + r.project, r.project, 'project', null)!.id, id, 'mesh'); if (r.card) link(r.card.id, id, 'mesh'); }
+    else { link(add('host:' + r.host, '@' + r.host, 'host', null)!.id, id, 'mesh'); link(add('proj:' + r.repo, r.repo, 'project', null)!.id, id, 'mesh'); if (r.card) link(r.card.id, id, 'mesh'); }
     r.kids.forEach(k => mesh(k, id));
   };
   if (INFO?.mesh && ($('#g-mesh') as HTMLInputElement).checked) meshRows().forEach(r => mesh(r));
@@ -4995,9 +5110,27 @@ function setPaneW(w: number, save?: boolean) {
   if (save && S) { S.paneW = w; dirty(); }
   if (VIEW === 'graph') { clearTimeout((setPaneW as PaneWidthFn).t); (setPaneW as PaneWidthFn).t = setTimeout(graphDraw, 60); }
 }
+function setMeshW(w?: number, save = false): void {
+  const box = $('#v-agents')!, width = box.getBoundingClientRect().width; if (width < 700) return;
+  const max = Math.max(200, Math.floor(width - 366));
+  w = Math.round(clamp(Number.isFinite(w) ? w! : Math.max(260, width * .34), 200, max));
+  box.style.setProperty('--mesh-w', w + 'px');
+  const grip = $('#mesh-grip')!;
+  grip.setAttribute('aria-valuemin', '200'); grip.setAttribute('aria-valuemax', String(max)); grip.setAttribute('aria-valuenow', String(w));
+  if (save) { S.meshW = w; dirty(); }
+  live.$agents?.fitNow?.();
+}
 function wirePaneGrip() {
   wireGrip($('#side-grip')!, ev => innerWidth - ev.clientX, setPaneW, PANE_W);
   wireGrip($('#tree-grip')!, ev => ev.clientX - $('#tree-pane')!.getBoundingClientRect().left, setTreeW, TREE_W);
+  const grip = $('#mesh-grip')!;
+  wireGrip(grip, ev => ev.clientX - $('#v-agents')!.getBoundingClientRect().left, setMeshW, NaN);
+  grip.addEventListener('keydown', e => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault(); e.stopPropagation();
+    setMeshW($('.mesh-side')!.getBoundingClientRect().width + (e.key === 'ArrowLeft' ? -16 : 16), true);
+  });
+  new ResizeObserver(() => { if (!document.body.classList.contains('pane-drag')) setMeshW(S.meshW); }).observe($('#v-agents')!);
   $('#pick-chip [data-act=compact]')!.onclick = () => compact('selection');
   $('#pick-chip [data-act=clear]')!.onclick = () => pickClear();
   const wu = $('#ws-up'); if (wu) wu.onclick = () => wsLeave();
@@ -5023,6 +5156,18 @@ AGENT_TOOLS.push({
     if (!DAEMON) throw new Error('PDFs on the host need a Workbench server');
     if (!/\.pdf$/i.test(str(file))) throw new Error('not a .pdf file: ' + file);
     return pathOf(pdfFromPath(str(file)).id);
+  },
+}, {
+  name: 'open_file', description: 'Open a file on this host in an Edwin frame, or focus its existing frame. Use an absolute path or ~/ for the home directory. An optional line moves point to that line (from 1). Answers the file and line.',
+  inputSchema: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'integer', minimum: 1 } }, required: ['file'] },
+  run: async ({ file, line }: { file: string; line?: number }) => {
+    if (typeof file !== 'string' || !/^(\/|~(?:\/|$))/.test(file)) throw new Error('file must be an absolute path or start with ~/');
+    if (line !== undefined && (!Number.isInteger(line) || line < 1)) throw new Error('line must be a positive integer');
+    const c = viewCenterWorld();
+    const n = await frFileOpen(file, freeSpot(c.x - 210, c.y - 150, 420, 300), line, message => { throw new Error(message); });
+    if (!n || !(await frWhenWritable(n))) throw new Error(frDown() ? 'edwind is not running' : `Could not open ${file} in Edwin`);
+    const doc = pageState(n)!.doc;
+    return { file, line: line === undefined ? doc.lineAt(pagePoint(n)).number : Math.min(line, doc.lines) };
   },
 });
 AGENT_TOOLS.push({
@@ -6413,15 +6558,21 @@ async function frOpenToday() {
 // ---- notes and files open as pages (noteOpen, ghostOpen): edwind's visit-id names the id it would visit FILE under, or
 // refuses it (the refusal list, not UTF-8 text, missing) or answers read-only (outside its writable paths, over 32 MiB).
 // Then, and while edwind is down, nothing opens and a toast says why (the host has no other editor for a card).
-// LINE > 1 puts the frame's point at the start of that line.
+// A positive LINE puts the frame's point at the start of that line; zero leaves it where Edwin puts it.
 // Only the first connection attempt is waited for (3 s at most); once it was made or failed, edwind down falls back at once.
-async function frFileOpen(file: string, props: { x?: number; y?: number; w?: number; h?: number }, line: number): Promise<PageNode | null> {
-  if (!FR.tried && !FR.failed) await Promise.race([frWhenReady(), new Promise(r => setTimeout(r, 3000))]);
+async function frFileOpen(file: string, props: { x?: number; y?: number; w?: number; h?: number }, line = 0, refuse = (message: string) => toast(message, 6000)): Promise<PageNode | null> {
+  if (FR.on && !FR.tried && !FR.failed) await Promise.race([frWhenReady(), new Promise(r => setTimeout(r, 3000))]);
   const r = FR.online ? await FR.Ed!.sync.call({ cmd: 'visit-id', args: [file], ctx: {} }) : null;
   const id = r && !r.error && r.value && !r.value.readOnly ? r.value.buf : null;
-  if (!id) { toast(`${file} does not open as a page: ${!r ? 'edwind is not running' : r.error ? (r.error.message || r.error) : r.value?.readOnly ? 'edwind has it read-only' : 'edwind refused it'}.`, 6000); return null; }
+  if (!id) {
+    const error = r?.error;
+    const why = !r ? 'edwind is not running' : error
+      ? error.condition === 'no_buffer' ? 'file not found' : /: (EACCES|EPERM)$/.test(error.report) ? 'file is not readable' : error.report || error.message || 'edwind refused it'
+      : r.value?.readOnly ? `edwind has it read-only (${r.value.readOnly})` : 'edwind refused it';
+    refuse(`${file} does not open as a page: ${why}.`); return null;
+  }
   const n = nodeList().find(m => m.kind === 'buffer' && m.buf && frBufNow(m.buf) === id) as PageNode | undefined || addNode({ kind: 'buffer', name: clean(id.replace(/^.*\//, '').replace(/\.(md|org)$/, '')), w: 420, h: 300, ...props, buf: id } as AddNodeArg) as PageNode;
-  const at = line > 1 ? (f: EdwinFrame, b: EdwinBuffer) => { const d = new TextDoc(b.text); f.setPoint(d.line(Math.min(line, d.lines)).from); } : undefined;
+  const at = line > 0 ? (f: EdwinFrame, b: EdwinBuffer) => { const d = pageState(n)?.doc || new TextDoc(b.text); f.setPoint(d.line(Math.min(line, d.lines)).from); } : undefined;
   jumpNode(n, 1, () => frFocus(n, at));
   return n;
 }
@@ -9966,7 +10117,7 @@ function noteOpen(r: { path: string; line: number; board?: PageNode }) {
   if (r.board) { edOpen(r.board, r.line > 1 ? r.line : undefined); return r.board; }
   if (!DAEMON) { toast('That note is not on the board.'); return null; }
   if (!FR.on) { toast('Notes open as pages, which need edwind.'); return null; }
-  const c = viewCenterWorld(); return frFileOpen(r.path, freeSpot(c.x - 210, c.y - 150, 420, 300), r.line);   // a page when edwind edits it
+  const c = viewCenterWorld(); return frFileOpen(r.path, freeSpot(c.x - 210, c.y - 150, 420, 300), r.line > 1 ? r.line : 0);   // a page when edwind edits it
 }
 // go to an address: board nodes on the canvas, everything else in the navigator
 function goAddr(addr: string, push = true): boolean {

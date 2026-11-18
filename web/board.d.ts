@@ -47,6 +47,7 @@ interface Board {
   tree?: boolean;                      // the outline sidebar is open
   treeClosed?: Record<string, boolean>;
   paneW?: number;
+  meshW?: number;
   side?: boolean;                      // the side pane is open
   sideTab?: 'chat' | 'term' | 'agents';   // old chat/agents tabs migrate to the docked terminal
   docks?: Record<string, boolean>;
@@ -498,12 +499,13 @@ type ObsKind = 'start' | 'prompt' | 'tool_start' | 'tool_end' | 'tool_fail' | 'p
 /* A session some host's harness reports to wb-web's API (§3.8.3), as /rpc carries it (OBS[id]). */
 interface ObservedSession {
   id: string; key: string; host: string; harness: string; sessionId: string;
-  parent: string | null;               // the id of a subagent's session
+  parent: string | null;               // lineage parent: an observed id or a joined hub sid
   agentType: string | null;
   wbSession: string | null;            // the hub session it runs in (its WB_SESSION)
   attach: { kind: 'claude'; id: string } | { kind: 'tmux'; socket: string; pane: number } | null;
   pid: number | null; transcriptPath: string | null;
   cwd: string | null; projectRoot: string | null; project: string;
+  repoRoot?: string | null; repo?: string | null; worktree?: string | null; branch?: string | null;
   model: string | null; permissionMode: string | null;
   title: string; state: SessionState;
   startedAt: number; lastAt: number; endedAt: number | null;
@@ -517,7 +519,8 @@ interface ObservedSession {
 /* One row of the Agents view: an observed session joined to a same-host hub session,
    or a hub agent session that no harness reports. */
 interface MeshRow {
-  id: string; host: string; harness: string; project: string; title: string;
+  id: string; host: string; harness: string; project: string; repo: string; title: string;
+  repoRoot: string | null; worktree: string | null; branch: string | null; parent: string | null;
   state: SessionState; since: number; at: number; live: boolean;
   obs: ObservedSession | null; sess: SessionSummary | null; card: BoardNode | null; kids: MeshRow[];
 }
@@ -527,6 +530,9 @@ type PtyExitReason = 'exited' | 'killed' | 'hub_restart' | 'spawn_failed';
 interface SessionSummary {
   sid: string; kind: 'pty' | 'acp'; host: string;
   createdAt: number; updatedAt: number; alive: boolean; viewers: number; cwd: string | null;
+  parent?: string | null;
+  projectRoot?: string | null; project?: string | null;
+  repoRoot?: string | null; repo?: string | null; worktree?: string | null; branch?: string | null;
   fault: { code: string; message: string } | null;
   state: SessionState;
   pty?: {

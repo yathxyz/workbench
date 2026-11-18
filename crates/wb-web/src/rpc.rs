@@ -30,7 +30,7 @@ use wb_proto::limits::WS_MAX_RPC;
 use crate::board;
 use crate::edit_client::Delivery;
 use crate::http::{self, Keepalive, Tick, close, send_json, ws_close, ws_too_big};
-use crate::hub::{HubStatus, with_state};
+use crate::hub::HubStatus;
 use crate::observed::Change;
 use crate::sample::Tab;
 use crate::{AppState, FeedMsg};
@@ -67,7 +67,12 @@ fn snapshot(app: &AppState) -> Vec<Value> {
     let status = app.hub.status.borrow().clone();
     let mut msgs = vec![hub_msg(&status)];
     if let HubStatus::Up(_) = status {
-        let sessions: Vec<Value> = app.hub.sessions().iter().map(with_state).collect();
+        let sessions: Vec<Value> = app
+            .hub
+            .sessions()
+            .iter()
+            .map(|s| app.session_summary(s))
+            .collect();
         msgs.push(json!({"t": "sessions", "sessions": sessions}));
     }
     msgs
@@ -161,7 +166,7 @@ async fn run(app: AppState, mut ws: WebSocket) {
                 Ok(FeedMsg::Hub(HubStatus::Up(_))) => snapshot(&app),
                 Ok(FeedMsg::Hub(status)) => vec![hub_msg(&status)],
                 Ok(FeedMsg::Session(session)) => {
-                    vec![json!({"t": "session", "session": with_state(&session)})]
+                    vec![json!({"t": "session", "session": app.session_summary(&session)})]
                 }
                 Ok(FeedMsg::Gone { sid, epoch }) => vec![json!({"t": "gone", "sid": sid, "epoch": epoch})],
                 Ok(FeedMsg::Board { etag }) => vec![json!({"t": "board", "etag": etag})],

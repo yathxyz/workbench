@@ -25,7 +25,6 @@ use crate::AppState;
 use crate::http::{ApiError, ApiQuery, Body, Param};
 use crate::hub::{
     CallError, ConnectError, HubConn, HubInfo, HubStatus, REPLY_TIMEOUT, acp_open_timeout,
-    with_state,
 };
 use crate::info::hub_up;
 use crate::util::valid_sid;
@@ -166,7 +165,12 @@ async fn info(_: Read, State(api): State<ApiState>) -> Json<Value> {
 async fn list(_: Read, State(api): State<ApiState>) -> Result<Json<Value>, ApiError> {
     let app = &api.app;
     hub_up(app)?;
-    let sessions: Vec<Value> = app.hub.sessions().iter().map(with_state).collect();
+    let sessions: Vec<Value> = app
+        .hub
+        .sessions()
+        .iter()
+        .map(|s| app.session_summary(s))
+        .collect();
     Ok(Json(json!({"host": app.cfg.host, "sessions": sessions})))
 }
 
@@ -186,7 +190,7 @@ async fn one(
     Param(id): Param<String>,
 ) -> Result<Json<Value>, ApiError> {
     let sid = sid_of(id)?;
-    Ok(Json(with_state(&summary(&api.app, &sid)?)))
+    Ok(Json(api.app.session_summary(&summary(&api.app, &sid)?)))
 }
 
 #[derive(Deserialize)]
@@ -387,7 +391,7 @@ async fn create(
     }
     let created = json!({
         "sid": sid,
-        "session": with_state(&reply.summary),
+        "session": api.app.session_summary(&reply.summary),
         "configErrors": reply.config_errors,
     });
     Ok((StatusCode::CREATED, Json(created)))

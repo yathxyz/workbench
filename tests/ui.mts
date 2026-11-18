@@ -2914,11 +2914,54 @@ await section('frames', async () => {
   await A2.evaluate((id: string) => { const C = window.__canvas; for (const n of Object.values<BoardNode & { block?: ArtifactNode['block'] }>(C.S.nodes)) if (n.block?.page === id) C.removeNode(n.id); C.removeNode(id); }, blk);
   await settled(A2); await settled(B2);
 
+  // N79: a host process opens a file the same way as a click, through the leader tab.
+  const openFile = (input: AgentToolInput) => {
+    const { promise, resolve } = Promise.withResolvers<{ code: number | null; out: string; err: string }>();
+    const c = spawn('wb', ['open_file', '--socket', H.webSocket, '--json', JSON.stringify(input)]);
+    let out = '', err = '';
+    c.stdout.on('data', d => { out += d; }); c.stderr.on('data', d => { err += d; });
+    c.on('error', e => resolve({ code: -1, out, err: String(e) })); c.on('close', code => resolve({ code, out, err }));
+    return promise;
+  };
+  const name79 = 'n79-open-file.md', rel79 = '~/' + name79;
+  const home79 = (await (await api('/api/info')).json()).home as string, abs79 = path.join(home79, name79);
+  fs.writeFileSync(abs79, 'first\nsecond\nthird\nfourth');
+  fs.writeFileSync(noteFile('bin.md'), Buffer.from([0xff, 0xfe, 0x00, 0x41]));
+  fs.mkdirSync(path.join(home79, '.ssh'), { recursive: true });
+  fs.writeFileSync(path.join(home79, '.ssh', name79), 'refused');
+  await A2.bringToFront(); await A2.evaluate(() => dispatchEvent(new Event('focus'))); await sleep(300);
+  const frame79 = () => A2.evaluate((buf: string) => Object.values<BoardNode>(window.__canvas.S.nodes).flatMap(n => {
+    if (n.kind !== 'buffer' || n.buf !== buf) return [];
+    const l = window.__canvas.live[n.id], frame = l?.frame;
+    return [{ id: n.id, focused: frame?.focused, point: frame?.point(), frames: l?.el?.querySelectorAll('.edwin-frame').length }];
+  }), rel79);
+  const point79 = (pt: number) => until(async () => { const frames = await frame79(); return frames.some(f => f.focused && f.point === pt) ? frames : null; }, 10000);
+  const result79 = (r: Awaited<ReturnType<typeof openFile>>, file: string, line: number) => r.code === 0 && r.out.trim() === JSON.stringify({ file, line });
+  const open79 = await openFile({ file: abs79, line: 3 }), at3 = await point79('first\nsecond\n'.length);
+  check('N79: wb open_file over web.sock opens the file in a focused Edwin frame at line 3', result79(open79, abs79, 3) && at3?.length === 1 && at3[0].frames === 1, JSON.stringify({ open79, at3 }));
+  const reopen79 = await openFile({ file: rel79, line: 1 }), at1 = await point79(0);
+  check('N79: opening the same file via ~/ moves point to line 1 without a second frame', result79(reopen79, rel79, 1) && at1?.length === 1 && at1[0].id === at3?.[0].id && at1[0].frames === 1, JSON.stringify({ reopen79, at1 }));
+  const past79 = await openFile({ file: rel79, line: 99 }), atEnd = await point79('first\nsecond\nthird\n'.length);
+  await leave(A2);
+  const keep79 = await openFile({ file: rel79 }), kept = await point79('first\nsecond\nthird\n'.length);
+  check('N79: open_file reports the clamped line and leaves point where a click would if line is omitted', result79(past79, rel79, 4) && atEnd?.length === 1 && result79(keep79, rel79, 4) && kept?.length === 1, JSON.stringify({ past79, atEnd, keep79, kept }));
+  const refuse79 = async (input: AgentToolInput, why: RegExp) => {
+    const r = await openFile(input);
+    check(`N79: open_file refuses ${JSON.stringify(input)} with ${why.source}`, r.code === 1 && why.test(r.err), JSON.stringify(r));
+  };
+  await refuse79({ file: path.join(home79, 'n79-missing.md') }, /file not found/);
+  await refuse79({ file: noteFile('bin.md') }, /not UTF-8 text/);
+  await refuse79({ file: '~/.ssh/' + name79 }, /: refused/);
+  await refuse79({ file: name79 }, /absolute path/);
+  for (const line of [0, -1, 1.5, '2', null]) await refuse79({ file: abs79, line }, /line must be a positive integer/);
+  await leave(A2);
+  await A2.evaluate((ids: string[]) => { for (const id of ids) window.__canvas.removeNode(id); }, (await frame79()).map(f => f.id));
+  await settled(A2); await settled(B2);
+
   // (j) notes and files open as Edwin pages (noteOpen, ghostOpen); the frame starts at the note's line. A file edwind
   // will not edit (here: not UTF-8 text) opens nothing: no card, and a toast says why.
   fs.writeFileSync(noteFile('open-me.md'), '# open me\n\nsecond body line\nthird');
   fs.writeFileSync(noteFile('ghost-me.md'), '# ghost me\n');
-  fs.writeFileSync(noteFile('bin.md'), Buffer.from([0xff, 0xfe, 0x00, 0x41]));
   await A2.bringToFront();
   const opened = await A2.evaluate(async () => { const n = await window.__canvas.noteOpen({ path: 'open-me.md', line: 3 }); return n && { id: n.id, kind: n.kind, buf: n.buf || null }; });
   const openPt = opened && await until(() => A2.evaluate((id: string) => { const L = window.__canvas.live[id]; return L?.frame?.focused ? L.frame.point() : null; }, opened.id), 10000);
@@ -2978,6 +3021,8 @@ await section('frames', async () => {
   // A note opened while edwind is down says so at once (no wait for a connection that was up before) and opens nothing.
   const downOpen = await A2.evaluate(async () => { const t0 = performance.now(); const n = await window.__canvas.noteOpen({ path: 'ghost-me.md' }); return { opened: !!n, ms: performance.now() - t0, toast: document.querySelector('#toast')?.textContent || '' }; });
   check('frames: with edwind down a note opens nothing at once and the toast says edwind is not running', !downOpen.opened && downOpen.ms < 1000 && /edwind is not running/.test(downOpen.toast), JSON.stringify(downOpen));
+  await A2.evaluate(() => dispatchEvent(new Event('focus'))); await sleep(300);
+  await refuse79({ file: abs79 }, /edwind is not running/);
   check('frames: with edwind down the page card shows the notice that editing is off, the mode line says offline and typing still goes into the page (unacked)', st.stopped?.event === 'stopped' && st.offA && st.offB && st.notice?.shown && !st.notice.hidden && st.notice.text === 'Editing is off: edwind is not running' && st.noticeB?.shown && /while-down$/.test(st.text) && /•/.test(st.sync) && /⚠ offline/.test(st.sync) && st.body && !st.status?.up && st.info.edit === true && st.info.editUp === false, JSON.stringify({ ...st, text: st.text.slice(-30), info: { edit: st.info.edit, editUp: st.info.editUp } }));
 
   // (c) edwind back: both tabs reconnect, the unacked edit is acked, reaches the other tab and the file on disk
@@ -3706,7 +3751,7 @@ await section('N77', async () => {
       C.meshOpen(); await new Promise(r => setTimeout(r, 400));
       out.pane = { view: C.S.view, hidden: document.querySelector<HTMLElement>('#v-agents')!.hidden, sum: document.querySelector('#mesh-sum')!.textContent };
       out.groups = $$('#mesh-list .mesh-group').map(e => e.textContent).filter(t => t === 'beta' || t === 'alpha');
-      out.rows = $$('#mesh-list .mesh-row').filter(e => !!C.OBS[e.dataset.id!]).map(e => ({ id: e.dataset.id, cls: e.className, title: e.querySelector('b')!.textContent, sub: e.querySelector('.mesh-sub')!.textContent, d: e.style.getPropertyValue('--d'), card: !!e.querySelector('button') }));
+      out.rows = $$('#mesh-list .mesh-row').filter(e => !!C.OBS[e.dataset.id!]).map(e => ({ id: e.dataset.id, cls: e.className, title: e.querySelector('b')!.textContent, sub: e.querySelector('.mesh-sub')!.textContent, d: e.style.getPropertyValue('--d'), card: !!e.querySelector('.mesh-canvas:not([hidden])') }));
       out.ids = ids;
       document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${ids.a2}"]`)!.click();
       out.detail = document.querySelector('#mesh-detail')?.textContent; out.sameRow = document.querySelector('#mesh-list .mesh-row.on')?.getAttribute('data-id');
@@ -3780,9 +3825,9 @@ await section('N78', async () => {
     ws.onmessage = e => { const m = JSON.parse(e.data); if (m.t === 'hello') { ws.close(); resolve(); } else if (m.t === 'error') { ws.close(); reject(new Error(m.error)); } };
     ws.onerror = () => reject(new Error('external PTY open failed'));
   }), id);
-  const report = async (who: 'near' | 'far', session: string, more: Record<string, unknown> = {}, kind = 'prompt') =>
+  const report = async (who: 'near' | 'far', session: string, more: Record<string, unknown> = {}, kind = 'prompt', text = 'n78 observed prompt') =>
     (await fetch(H.api + '/v1/events', { method: 'POST', headers: { Authorization: 'Bearer ' + fs.readFileSync(H.apiTokenFiles[who], 'utf8').trim(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ harness: 'pi', payload: { session_id: session, kind, cwd, model, permission_mode: 'default', text: 'n78 observed prompt' }, ...more }) })).status;
+      body: JSON.stringify({ harness: 'pi', payload: { session_id: session, kind, cwd, model, permission_mode: 'default', text }, ...more }) })).status;
   const row = (id: string) => D.locator(`#mesh-list .mesh-row[data-id="${id}"]`);
   const info = () => D.evaluate(() => Object.fromEntries([...document.querySelectorAll('#mesh-detail .mesh-info .mesh-kv')].map(e => [e.querySelector('span')!.textContent!, e.querySelector('code')!.textContent!])));
   const nodes = () => D.evaluate(() => Object.keys(window.__canvas.S.nodes).sort().join());
@@ -3925,6 +3970,95 @@ await section('N78', async () => {
       const restored = await until(async () => !await D.locator('#mesh-detail .ag-editor').count() && await D.inputValue(composer) === 'n78 editor restores edited', 10000);
       check('N78: a local unsaved Edwin prompt sends with C-c C-c; C-c C-k restores the current text without sending',
         local && !!sent && !!restored && acpSent(D, sid, 'prompt').length === prompts && await nodes() === before, JSON.stringify({ local, sent, restored, prompts, now: acpSent(D, sid, 'prompt').length }));
+    });
+
+    await section('N78 layout', async () => {
+      const viewport = D.viewportSize()!, prompt = 'Long observed prompt '.repeat(100).slice(0, 2000);
+      await D.evaluate(() => { if (document.body.classList.contains('side-open')) window.__canvas.toggleDockTerm(); });   // measure Agents, not the dock's overlay
+      const created = await meshApi('/sessions', 'POST', { sid: 'n78_layout_api', agent: 'stub', cwd });
+      if (created.status !== 201) throw new Error('N78 layout ACP spawn: ' + created.status);
+      await report('near', 'n78-layout', { wbSession: 'n78_layout_api' }, 'prompt', prompt);
+      const id = await until(() => D.evaluate((prompt: string) => Object.values<ObservedSession>(window.__canvas.OBS).find(o => o.sessionId === 'n78-layout' && o.lastPrompt === prompt)?.id, prompt), 10000);
+      if (!id) throw new Error('N78 layout session did not arrive');
+      const layout = () => D.evaluate(() => {
+        const rect = (s: string) => document.querySelector(s)!.getBoundingClientRect(), view = rect('#v-agents'), pane = rect('#mesh-detail'), live = rect('.mesh-live > .body'), input = rect('#mesh-detail .ag-in');
+        const buttons = [...document.querySelectorAll<HTMLElement>('.mesh-head button')].filter(e => !e.hidden).map(e => {
+          const r = e.getBoundingClientRect(); return { text: e.textContent, x: r.x, y: r.y, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
+        });
+        const overflow = [...document.querySelectorAll<HTMLElement>('#v-agents *')].filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.right > view.right + 1; }).map(e => e.id || e.className);
+        return { buttons, overflow, width: view.width, inside: buttons.every(r => r.width > 0 && r.height > 0 && r.x >= pane.left && r.right <= pane.right && r.y >= pane.top && r.bottom <= pane.bottom && r.x >= view.left && r.right <= view.right && r.y >= 0 && r.bottom <= innerHeight),
+          pane: pane.height, live: live.height, gap: pane.bottom - input.bottom, facts: !document.querySelector<HTMLElement>('.mesh-info')!.hidden };
+      });
+      const widths = () => D.evaluate(() => ({ list: document.querySelector('.mesh-side')!.getBoundingClientRect().width, pane: document.querySelector('#mesh-detail')!.getBoundingClientRect().width }));
+      const drag = async (x: number) => { const r = (await D.locator('#mesh-grip').boundingBox())!; await D.mouse.move(r.x + r.width / 2, r.y + 100); await D.mouse.down(); await D.mouse.move(x, r.y + 100, { steps: 8 }); await D.mouse.up(); };
+      for (const size of [{ width: 1280, height: 800 }, { width: 900, height: 700 }]) {
+        await D.setViewportSize(size); await open(id); await liveIdle();
+        const closed = await layout();
+        await D.getByRole('button', { name: 'Details', exact: true }).click();
+        const expanded = await layout(), promptShown = await D.locator('.mesh-info .mesh-kv').filter({ hasText: /^prompt/ }).locator('code').textContent();
+        const facts = await D.locator('.mesh-info').evaluate(e => ({ height: e.getBoundingClientRect().height, scroll: getComputedStyle(e).overflowY }));
+        check(`N78: ${size.width}×${size.height} compact header contains every action, gives the session half the pane and keeps a composer gap; disclosure reveals 2,000 characters without shifting actions`,
+          !closed.facts && closed.inside && closed.live >= closed.pane / 2 && closed.gap >= 8 && expanded.facts && expanded.inside && expanded.live >= expanded.pane / 2
+          && Math.abs(expanded.live - closed.live) <= 1 && promptShown === prompt && facts.height <= size.height * .35 && facts.scroll === 'auto' && JSON.stringify(closed.buttons) === JSON.stringify(expanded.buttons),
+          JSON.stringify({ closed, expanded, facts, promptLength: promptShown?.length }));
+        await open(sid); await liveIdle(); await open(id); await liveIdle();
+        check('N78: disclosure stays open across selection during this page lifetime', (await layout()).facts);
+        await D.getByRole('button', { name: 'Details', exact: true }).click();
+        await drag(10); const min = await widths();
+        await drag(size.width - 10); const max = await widths();
+        check(`N78: ${size.width}px divider clamps list to 200px and pane to 360px`, Math.abs(min.list - 200) <= 1 && Math.abs(max.pane - 360) <= 1, JSON.stringify({ min, max }));
+        await D.locator('#mesh-grip').dblclick();
+        const reset = await widths(); await D.locator('#mesh-grip').focus(); await D.keyboard.press('ArrowRight'); const right = await widths(); await D.keyboard.press('ArrowLeft'); const left = await widths();
+        check('N78: divider resets to default and keyboard arrows move 16px', Math.abs(reset.list - Math.max(260, Math.round(size.width * .34))) <= 1 && right.list === reset.list + 16 && left.list === reset.list, JSON.stringify({ reset, right, left }));
+      }
+      await D.evaluate(() => { const C = window.__canvas; C.CMDS.find((c: PaletteItem) => c.l === 'Side pane: reset width')!.run(); C.toggleDockTerm(); });
+      await D.waitForSelector('#mesh-grip', { state: 'hidden' });
+      const docked = await layout(), dockDetail = await D.locator('#mesh-detail').isVisible(), dockList = await D.locator('.mesh-side').isVisible();
+      await D.getByRole('button', { name: '← Sessions', exact: true }).click();
+      const dockBack = !await D.locator('#mesh-detail').isVisible() && await D.locator('.mesh-side').isVisible();
+      const dockListFits = await D.locator('#v-agents').evaluate(e => [...e.querySelectorAll('*')].every(child => { const r = child.getBoundingClientRect(); return !r.width || !r.height || r.right <= e.getBoundingClientRect().right + 1; }));
+      await row(id).click(); await liveIdle();
+      await D.evaluate(() => window.__canvas.toggleDockTerm());
+      await D.waitForSelector('#mesh-grip', { state: 'visible' });
+      const undocked = await widths(), undockedLayout = await layout();
+      check('N78: 900×700 with the default 400px dock shows one contained pane with Sessions back; closing the dock restores both columns',
+        docked.width === 500 && docked.inside && docked.overflow.length === 0 && dockDetail && !dockList && dockBack && dockListFits
+        && await D.locator('.mesh-side').isVisible() && await D.locator('#mesh-detail').isVisible() && !await D.locator('.mesh-back').isVisible()
+        && undocked.list >= 200 && undocked.pane >= 360 && undockedLayout.inside && undockedLayout.overflow.length === 0,
+        JSON.stringify({ docked, dockDetail, dockList, dockBack, dockListFits, undocked, undockedLayout }));
+      const before = await widths(), savedBefore = await D.evaluate(() => window.__canvas.S.meshW), heldGrip = (await D.locator('#mesh-grip').boundingBox())!;
+      await D.mouse.move(heldGrip.x + heldGrip.width / 2, heldGrip.y + 100); await D.mouse.down(); await D.mouse.move(before.list + 70, heldGrip.y + 100, { steps: 8 });
+      const changed = await widths(), dragPrompt = 'During drag: ' + prompt.slice(13);
+      const activity = await report('near', 'n78-layout', { wbSession: 'n78_layout_api' }, 'prompt', dragPrompt);
+      const rendered = await until(async () => (await info()).prompt === dragPrompt, 10000);
+      const duringUpdate = await widths(), savedDuring = await D.evaluate(() => window.__canvas.S.meshW);
+      await D.setViewportSize({ width: 920, height: 700 });
+      await D.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      const duringResize = await widths();
+      await D.mouse.up(); const savedAfter = await D.evaluate(() => window.__canvas.S.meshW);
+      await D.setViewportSize({ width: 900, height: 700 });
+      check('N78: mesh activity and view resize preserve an in-progress divider drag; release saves the dragged width',
+        activity === 204 && rendered && changed.list > before.list + 60 && savedDuring === savedBefore && changed.list !== savedBefore
+        && Math.abs(duringUpdate.list - changed.list) <= 1 && Math.abs(duringResize.list - changed.list) <= 1 && Math.abs(savedAfter! - changed.list) <= 1,
+        JSON.stringify({ activity, rendered, before, changed, savedBefore, savedDuring, duringUpdate, duringResize, savedAfter }));
+      await reload(); await open(id); await liveIdle(); const restored = await widths();
+      check('N78: dragging changes list width and survives reload; disclosure resets closed', changed.list > before.list + 60 && restored.list === changed.list && !(await layout()).facts, JSON.stringify({ before, changed, restored }));
+      const cdp = await D.context().newCDPSession(D), grip = (await D.locator('#mesh-grip').boundingBox())!, x = grip.x + grip.width / 2, y = grip.y + 100;
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y, id: 1 }] });
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: x - 40, y, id: 1 }] });
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }); await cdp.detach();
+      const touched = await widths();
+      check('N78: touch narrows the list while preserving both pane minima', touched.list <= restored.list - 32 && touched.list >= 200 && touched.pane >= 360, JSON.stringify({ restored, touched }));
+      for (const width of [600, 320]) {
+        await D.setViewportSize({ width, height: 700 }); await open(id); await liveIdle();
+        const detail = await D.locator('#mesh-detail').isVisible(), list = await D.locator('.mesh-side').isVisible(), fits = await layout();
+        await D.getByRole('button', { name: '← Sessions', exact: true }).click();
+        check(`N78: ${width}px has no divider, one pane at a time and contained actions`, !await D.locator('#mesh-grip').isVisible() && detail && !list && fits.inside && fits.overflow.length === 0 && !await D.locator('#mesh-detail').isVisible() && await D.locator('.mesh-side').isVisible(), JSON.stringify(fits));
+      }
+      await D.setViewportSize(viewport);
+      await report('near', 'n78-layout', {}, 'end');
+      await meshApi('/sessions/n78_layout_api?forget=true', 'DELETE');
+      await open(sid); await liveIdle(); await D.locator('#mesh-grip').dblclick();
     });
 
     await row(ids['n78-readonly']).click();
@@ -4184,10 +4318,191 @@ await section('N78', async () => {
     await D.evaluate((ids: (string | undefined)[]) => { const C = window.__canvas; C.setView('canvas'); for (const id of ids) if (id && C.S.nodes[id]) C.removeNode(id); }, [sid, externalPty, owned, ownedPty]);
     if (externalPty) await meshApi('/sessions/' + externalPty + '?forget=true', 'DELETE');
     await meshApi('/sessions/' + sid + '?forget=true', 'DELETE');
+    await meshApi('/sessions/n78_layout_api?forget=true', 'DELETE');
     for (const id of [owned, ownedPty]) if (id) await meshApi('/sessions/' + id + '?forget=true', 'DELETE');
-    for (const id of ['n78-readonly', 'n78-claude', 'n78-hubpty']) await report('near', id, {}, 'end');
+    for (const id of ['n78-readonly', 'n78-claude', 'n78-hubpty', 'n78-layout']) await report('near', id, {}, 'end');
     await report('far', 'n78-tmux', {}, 'end');
     await settled(D); await owner.close(); await D.close();
+  }
+});
+// N77/N78 hierarchy: real reports and a handwritten checkout/linked worktree, isolated from N77's graph/count fixtures.
+await section('N77/N78 hierarchy', async () => {
+  const P = await ctx.newPage(); watchErrors(P);
+  const prefix = 'n77-tree-', sid = 'n78_hierarchy_api', repo = 'example/hierarchy', otherRepo = 'example/other';
+  const dir = fs.mkdtempSync(path.join(TMP, 'n77-hierarchy-')), checkout = path.join(dir, 'checkout'), git = path.join(checkout, '.git');
+  const worktrees = ['observed-one', 'observed-two', 'hub-worktree'].map(n => path.join(dir, n)), hubGit = path.join(git, 'worktrees', 'hub-worktree');
+  fs.mkdirSync(hubGit, { recursive: true });
+  for (const cwd of worktrees) fs.mkdirSync(cwd, { recursive: true });
+  fs.writeFileSync(path.join(git, 'config'), '[core]\n\tbare = false\n[remote "origin"]\n\turl = git@example.invalid:example/hierarchy.git\n');
+  fs.writeFileSync(path.join(git, 'HEAD'), 'ref: refs/heads/main\n');
+  fs.writeFileSync(path.join(worktrees[2], '.git'), 'gitdir: ' + hubGit + '\n');
+  fs.writeFileSync(path.join(hubGit, 'commondir'), '../..\n');
+  fs.writeFileSync(path.join(hubGit, 'gitdir'), path.join(worktrees[2], '.git') + '\n');
+  fs.writeFileSync(path.join(hubGit, 'HEAD'), 'ref: refs/heads/topic/hub\n');
+  const ids: Record<string, string> = {};
+  // Reports currently expose only direct subagents. Rewrite only existing parent edges on the real RPC feed to
+  // exercise its arbitrary-depth consumer contract, without adding a parent/title API or inventing session records.
+  const hierarchy = (o: ObservedSession): void => {
+    if (!o.sessionId.startsWith(prefix)) return;
+    const name = o.key.endsWith('/cross') ? 'cross' : o.sessionId.slice(prefix.length);
+    ids[name] = o.id;
+    const parent = name === 'deep' ? ids.cross : name === 'waiting' ? ids.deep : name === 'quiet' ? ids.root : name === 'missing' ? 'o_missing_hierarchy_parent' : undefined;
+    if (parent) o.parent = parent;
+  };
+  await P.routeWebSocket(/\/rpc$/, ws => {
+    const server = ws.connectToServer();
+    server.onMessage(message => {
+      const m = JSON.parse(message as string) as HubMsg;
+      if (m.t === 'observed') { m.sessions.forEach(hierarchy); ws.send(JSON.stringify(m)); }
+      else if (m.t === 'observed_put') { hierarchy(m.session); ws.send(JSON.stringify(m)); }
+      else ws.send(message);
+    });
+  });
+  const meshApi = (url: string, method = 'GET', body?: Record<string, unknown>) => fetch(H.api + '/v1' + url, {
+    method, headers: { Authorization: 'Bearer ' + fs.readFileSync(H.apiTokenFiles.near, 'utf8').trim(), 'Content-Type': 'application/json' },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const report = async (name: string, payload: Record<string, unknown> = {}, metadata: Record<string, unknown> = {}) =>
+    (await meshApi('/events', 'POST', { harness: 'pi', payload: { session_id: prefix + name, kind: 'prompt', text: 'hierarchy ' + name, ...payload }, ...metadata })).status;
+  const reported = async (name: string, payload: Record<string, unknown>, metadata: Record<string, unknown>) => {
+    const status = await report(name, payload, metadata);
+    if (status !== 204 || !await until(() => ids[name], 8000)) throw new Error('hierarchy report ' + name + ': ' + status);
+  };
+  const metadata = (i: number) => ({ repoRoot: checkout, repo, worktree: path.basename(worktrees[i]), branch: i ? 'topic/two' : 'topic/one', projectRoot: worktrees[i] });
+  const row = (name: string) => P.locator(`#mesh-list .mesh-row[data-id="${ids[name] || name}"]`);
+  const group = (name: string) => row(name).evaluate(e => { let prev = e.previousElementSibling; while (prev && !prev.classList.contains('mesh-group')) prev = prev.previousElementSibling; return prev?.textContent; });
+  try {
+    await P.goto(ORIGIN + '/'); await P.waitForFunction(() => window.__canvas?.BOOTED); await settled(P);
+    // N77's assertions are finished; end its remaining waiting fixture so the status chip has one unambiguous target.
+    await fetch(H.api + '/v1/events', { method: 'POST', headers: { Authorization: 'Bearer ' + fs.readFileSync(H.apiTokenFiles.far, 'utf8').trim(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ harness: 'pi', payload: { session_id: 'a1', kind: 'end' } }) });
+    await reported('root', { cwd: worktrees[0] }, metadata(0));
+    await reported('two', { cwd: worktrees[1] }, metadata(1));
+    const crossStatus = await report('root', { kind: 'subagent_start', agent_id: 'cross', agent_type: 'explorer', cwd: '/srv/other' },
+      { repoRoot: '/srv/other', repo: otherRepo, worktree: 'other-tree', branch: 'topic/other', projectRoot: '/srv/other' });
+    if (crossStatus !== 204 || !await until(() => ids.cross, 8000)) throw new Error('hierarchy cross-repo subagent did not arrive');
+    await reported('deep', { cwd: '/srv/deep' }, { repo: 'example/deep', branch: 'topic/deep' });
+    await reported('waiting', { cwd: '/srv/waiting' }, { repo: 'example/waiting', branch: 'topic/waiting' });
+    await reported('quiet', { cwd: worktrees[0] }, metadata(0));
+    await reported('missing', { cwd: '/srv/missing' }, { repo: 'example/missing' });
+    await reported('legacy', { cwd: '/srv/n77-legacy' }, {});
+    await report('waiting', { kind: 'permission', tool: { name: 'Bash', input: { command: 'hierarchy permission' } } });
+    await P.evaluate(() => window.__canvas.meshOpen());
+    await row('waiting').waitFor();
+    const ready = await until(() => row('waiting').evaluate(e => e.classList.contains('bad')), 8000);
+    const observed = await P.evaluate((ids: Record<string, string>) => Object.fromEntries(['root', 'two', 'cross', 'deep', 'waiting', 'quiet', 'missing', 'legacy'].map(name => {
+      const e = document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${ids[name]}"]`)!;
+      return [name, { depth: e.dataset.depth, branch: e.querySelector('.mesh-branch')?.getAttribute('title'), repo: e.querySelector('.mesh-repo')?.getAttribute('title'), worktree: e.querySelector('.mesh-worktree')?.getAttribute('title'), context: e.querySelector('.mesh-context')?.textContent || '' }];
+    })), ids);
+    const groups = await P.locator('#mesh-list .mesh-group').allTextContents();
+    check('N77: observed worktrees share one repository group with distinct branch/worktree labels; older reports fall back to project',
+      ready && groups.filter(g => g === repo).length === 1 && await group('root') === repo && await group('two') === repo
+      && observed.root.branch === 'topic/one' && observed.two.branch === 'topic/two' && observed.root.worktree === 'observed-one' && observed.two.worktree === 'observed-two'
+      && observed.root.context.includes('topic/one') && observed.two.context.includes('topic/two') && observed.root.context.includes('observed-one') && observed.two.context.includes('observed-two')
+      && await group('legacy') === 'n77-legacy' && !observed.legacy.branch && !observed.legacy.worktree, JSON.stringify({ groups, observed }));
+    check('N77: a cross-repository parent chain nests at arbitrary depth; a missing parent promotes its child to a root',
+      observed.root.depth === '0' && observed.cross.depth === '1' && observed.deep.depth === '2' && observed.waiting.depth === '3' && observed.missing.depth === '0'
+      && observed.cross.repo === otherRepo && await group('cross') === repo && !groups.includes(otherRepo), JSON.stringify(observed));
+    await row('deep').click();
+    await P.locator('#mesh-detail .mesh-parent').click();
+    check('N77: the detail parent link selects the cross-repository parent', await row('cross').evaluate(e => e.classList.contains('on')));
+    await row('root').click(); await row('root').locator('.mesh-collapse').click();
+    const collapsed = await row('root').locator('.mesh-collapsed').evaluate(e => ({ count: e.getAttribute('data-count'), state: e.getAttribute('data-state'), hidden: e.getAttribute('data-hidden'), text: e.textContent }));
+    check('N77: collapsing hides the subtree while its summary retains descendant count and worst waiting state',
+      collapsed.count === '4' && collapsed.state === 'waiting_permission' && collapsed.hidden === '4' && /4 descendants/.test(collapsed.text || '')
+      && !await row('quiet').count() && !await row('cross').count() && !await row('deep').count() && !await row('waiting').count(),
+      JSON.stringify(collapsed));
+    await P.evaluate(() => window.__canvas.statusRender());
+    await P.locator('#st-host .stc').filter({ hasText: /^mesh \d+/ }).click();
+    const firstWaiting = await row('waiting').evaluate(e => e.classList.contains('on'));
+    const expanded = await row('root').locator('.mesh-collapse').getAttribute('aria-expanded');
+    check('N77: first-waiting opens the deep descendant and expands its ancestors', firstWaiting && expanded === 'true' && await row('quiet').count() === 1, JSON.stringify({ firstWaiting, expanded }));
+    await row('root').locator('.mesh-collapse').click(); await row('root').locator('.mesh-collapse').click();
+    check('N77: expanding restores quiet descendants at their original depth', await row('quiet').getAttribute('data-depth') === '1' && !await row('root').locator('.mesh-collapsed').isVisible());
+    await row('cross').click(); await P.locator('#mesh-list').focus(); await P.keyboard.press('ArrowDown');
+    const down = await row('deep').evaluate(e => e.classList.contains('on'));
+    await P.keyboard.press('k');
+    const up = await row('cross').evaluate(e => e.classList.contains('on'));
+    const stableRow = await row('cross').elementHandle(), stableDetail = await P.locator('#mesh-detail h3').elementHandle();
+    const count = await P.evaluate((id: string) => window.__canvas.OBS[id].counts.events, ids.cross);
+    const update = await report('root', { kind: 'note', agent_id: 'cross', text: 'hierarchy stable activity' });
+    const updated = await until(() => P.evaluate(({ id, count }) => window.__canvas.OBS[id].counts.events > count, { id: ids.cross, count }), 8000);
+    check('N77: keyboard follows the expanded tree and an ordinary report preserves selected row/detail DOM and valid metadata',
+      down && up && update === 204 && !!updated && await stableRow!.evaluate(e => e.isConnected && e === document.querySelector('#mesh-list .mesh-row.on'))
+      && await stableDetail!.evaluate(e => e === document.querySelector('#mesh-detail h3'))
+      && await row('cross').locator('.mesh-repo').getAttribute('title') === otherRepo && await row('cross').locator('.mesh-branch').getAttribute('title') === 'topic/other', JSON.stringify({ down, up, update, updated }));
+
+    if (STUB) {
+      const created = await meshApi('/sessions', 'POST', { sid, agent: 'stub', cwd: worktrees[2] });
+      if (created.status !== 201) throw new Error('hierarchy hub ACP: ' + created.status + ' ' + await created.text());
+      const joined = await until(async () => await row(sid).count() && await row(sid).locator('.mesh-branch').getAttribute('title') === 'topic/hub' && (await row(sid).textContent())?.includes('topic/hub'), 15000);
+      const hubMetadata = await P.evaluate((sid: string) => { const s = window.__canvas.SESS[sid]; return { repoRoot: s?.repoRoot, repo: s?.repo, worktree: s?.worktree, branch: s?.branch, card: !!window.__canvas.S.nodes[sid] }; }, sid);
+      check('N78: a hub ACP in a handwritten linked worktree derives repository metadata and joins observed worktrees without a board card',
+        !!joined && await group(sid) === repo && hubMetadata.repoRoot === checkout && hubMetadata.repo === repo && hubMetadata.worktree === 'hub-worktree' && hubMetadata.branch === 'topic/hub' && !hubMetadata.card,
+        JSON.stringify(hubMetadata));
+      // The only report for this session is a real child event: its parent must never enter OBS.
+      await P.evaluate(({ sid, cwd }) => {
+        const C = window.__canvas; C.setView('canvas');
+        C.addNode({ id: sid, kind: 'acp', name: 'hierarchy hub card', agent: 'stub', cwd, x: 100, y: 100, w: 560, h: 520, adopted: true, _spawn: false });
+      }, { sid, cwd: worktrees[2] });
+      try {
+        await acpIdle(P, sid);
+        const hubState = await P.evaluate((sid: string) => window.__canvas.SESS[sid].state, sid);
+        const started = await report('orphan', { kind: 'subagent_start', agent_id: 'child', agent_type: 'explorer', cwd: worktrees[0] }, { ...metadata(0), wbSession: sid });
+        if (started !== 204 || !await until(() => ids.orphan, 8000)) throw new Error('hierarchy orphan subagent did not arrive: ' + started);
+        const permission = await report('orphan', { kind: 'permission', agent_id: 'child', tool: { name: 'Bash', input: { command: 'orphan permission' } } }, { wbSession: sid });
+        await P.evaluate((id: string) => window.__canvas.meshOpen(id), ids.orphan);
+        await row('orphan').waitFor();
+        const waiting = await until(() => row('orphan').evaluate(e => e.classList.contains('bad')), 8000);
+        await P.evaluate((sid: string) => window.__canvas.meshOpen(sid), sid);
+        const separate = await P.evaluate(({ id, sid, sessionId }) => {
+          const C = window.__canvas, o = C.OBS[id], s = C.SESS[sid];
+          const child = document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${id}"]`);
+          const hub = document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${sid}"]`);
+          return { parent: o.parent, parentAbsent: !!o.parent && !C.OBS[o.parent],
+            onlyChild: Object.values<ObservedSession>(C.OBS).filter(o => o.sessionId === sessionId).every(o => !!o.parent),
+            sameHost: o.host === s.host, wbSession: o.wbSession, observedState: o.state, hubState: s.state,
+            child: child && { depth: child.dataset.depth, card: child.dataset.card, dot: child.querySelector('.dot')?.className },
+            hub: hub && { card: hub.dataset.card, dot: hub.querySelector('.dot')?.className, selected: hub.classList.contains('on') },
+            selected: C.MESH.open, cardPresent: C.S.nodes[sid]?.kind === 'acp' };
+        }, { id: ids.orphan, sid, sessionId: prefix + 'orphan' });
+        check('N77/N78: an unreported parent cannot let its child inherit a same-host hub session, card, alias, or state',
+          permission === 204 && !!waiting && separate.parentAbsent && separate.onlyChild && separate.sameHost && separate.wbSession === sid
+          && separate.child?.depth === '0' && separate.child.card === '' && separate.child.dot === 'dot st-waiting_permission'
+          && separate.observedState === 'waiting_permission' && separate.hubState === hubState && separate.hub?.card === sid
+          && separate.hub.dot === 'dot st-' + hubState && separate.hub.selected && separate.selected === sid && separate.cardPresent,
+          JSON.stringify({ hubState, separate }));
+      } finally {
+        await report('orphan', { kind: 'end', agent_id: 'child' });
+        await P.evaluate((sid: string) => { const C = window.__canvas; if (C.S.nodes[sid]) C.removeNode(sid); }, sid);
+      }
+      const hubRow = await row(sid).elementHandle();
+      fs.writeFileSync(path.join(hubGit, 'HEAD'), 'ref: refs/heads/topic/switched\n');
+      const refreshed = await until(async () => await row(sid).locator('.mesh-branch').getAttribute('title') === 'topic/switched', 15000);
+      check('N78: a quiet hub session refreshes a filesystem branch change over RPC without an activity event or row remount',
+        !!refreshed && await hubRow!.evaluate(e => e.isConnected && e === document.querySelector(`#mesh-list .mesh-row[data-id="${e.getAttribute('data-id')}"]`)));
+    } else skip('N78 hierarchy hub', 'no `stub` agent (wb-fake-acp) in /api/info.agents');
+
+    await P.evaluate(() => window.__canvas.setView('graph'));
+    const graphed = await until(() => P.evaluate((repo: string) => window.__canvas.G.N.has('proj:' + repo), repo), 8000);
+    const graph = await P.evaluate(({ ids, repo, sid }: { ids: Record<string, string>; repo: string; sid: string }) => {
+      const C = window.__canvas, edge = (a: string, b: string, type: string) => C.G.E.some((e: { a: string; b: string; type: string }) => e.type === type && ((e.a === a && e.b === b) || (e.a === b && e.b === a)));
+      return { groups: [...C.G.N.keys()].filter(k => k === 'proj:' + repo), one: edge('proj:' + repo, 'mesh:' + ids.root, 'mesh'), two: edge('proj:' + repo, 'mesh:' + ids.two, 'mesh'),
+        cross: edge('mesh:' + ids.root, 'mesh:' + ids.cross, 'spawn'), deep: edge('mesh:' + ids.cross, 'mesh:' + ids.deep, 'spawn'), hub: edge('proj:' + repo, 'mesh:' + sid, 'mesh') };
+    }, { ids, repo, sid });
+    check('N77/N78: the graph shares one repository node across worktrees and preserves cross-repository spawn ancestry',
+      !!graphed && graph.groups.length === 1 && graph.one && graph.two && graph.cross && graph.deep && (!STUB || graph.hub), JSON.stringify(graph));
+    await P.evaluate((id: string) => window.__canvas.meshOpen(id), ids.two);
+    await row('two').click();
+    await report('deep', { kind: 'end' });
+    const promoted = await until(() => row('waiting').getAttribute('data-depth').then(d => d === '0'), 8000);
+    check('N77: a child of an ended, hidden parent is promoted to its own repository root', !!promoted && !await row('deep').count() && await group('waiting') === 'example/waiting');
+  } finally {
+    await P.evaluate(() => window.__canvas.setView('canvas'));
+    await meshApi('/sessions/' + sid + '?forget=true', 'DELETE');
+    for (const name of ['root', 'two', 'deep', 'waiting', 'quiet', 'missing', 'legacy']) await report(name, { kind: 'end' });
+    await settled(P); await P.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 // M5-W3: the host trees. A board shell's process is listed with its card; units answer their shape whatever the host has.

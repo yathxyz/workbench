@@ -640,9 +640,12 @@ body.listening #st-buf-text { color: var(--ink-red); }
 #status #st-addr { color: var(--modeline-fg); font-weight: 600; }
 #st-buf-text.live { color: var(--modeline-fg); }
 #side-term .body { background: var(--term-bg); overflow: hidden; position: relative; }
-/* Agents (F-A48): stable rows beside a live session, or one pane at a time on phones. */
-#v-agents { display: grid; grid-template-columns: minmax(260px, 34%) minmax(0, 1fr); font: 12.5px var(--mono); }
-.mesh-side { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); }
+/* Agents (F-A48): stable rows beside a live session, or one pane when the view is narrow. */
+#v-agents { container-type: inline-size; }
+.mesh-layout { height: 100%; display: grid; grid-template-columns: minmax(200px, min(var(--mesh-w, 34%), calc(100% - 366px))) 6px minmax(360px, 1fr); font: 12.5px var(--mono); }
+.mesh-side { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+#mesh-grip { cursor: col-resize; touch-action: none; border-inline: 2px solid var(--bg); background: var(--line); }
+#mesh-grip:hover, #mesh-grip:focus-visible, body.pane-drag #mesh-grip { background: var(--accent); }
 .mesh-bar { flex: none; display: flex; gap: 10px; align-items: center; padding: 7px 12px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11.5px; }
 .mesh-bar #mesh-sum { flex: 1; min-width: 0; } .mesh-bar label { display: flex; gap: 4px; align-items: center; white-space: nowrap; }
 #mesh-list { flex: 1; min-height: 0; overflow: auto; padding: 4px 6px calc(env(safe-area-inset-bottom, 0px) + 10px); } #mesh-list > p { padding: 10px 8px; }
@@ -655,19 +658,37 @@ body.listening #st-buf-text { color: var(--ink-red); }
 .mesh-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .mesh-main b, .mesh-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .mesh-main b { font-weight: 600; }
 .mesh-sub, .mesh-at { color: var(--muted); font-size: 11.5px; } .mesh-row.bad .mesh-sub { color: var(--warn); } .mesh-at { flex: none; }
-.mesh-detail { min-width: 0; min-height: 0; padding: 12px; display: flex; flex-direction: column; gap: 8px; overflow: auto; }
-.mesh-info { display: flex; flex-direction: column; gap: 3px; flex: none; max-height: 38%; overflow: auto; }
-.mesh-kv { display: flex; gap: 8px; } .mesh-kv span { flex: none; width: 80px; color: var(--muted); } .mesh-kv code { flex: 1; min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; max-height: 6em; overflow: auto; }
+.mesh-collapse { flex: none; width: 16px; padding: 0; color: var(--muted); line-height: 18px; }
+.mesh-collapse[hidden] { display: block; visibility: hidden; }
+.mesh-context { color: var(--ink); }
+.mesh-collapsed { color: var(--muted); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mesh-collapsed[data-state="waiting_permission"], .mesh-collapsed[data-state="waiting_input"] { color: var(--warn); }
+.mesh-collapsed[data-state="error"] { color: var(--err); }
+.mesh-parent { min-width: 0; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent); }
+.mesh-detail { position: relative; min-width: 0; min-height: 0; padding: 12px; display: flex; flex-direction: column; gap: 8px; overflow: auto; }
+.mesh-detail.mounted { overflow: hidden; padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 12px); }
+.mesh-head { position: relative; flex: none; min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; }
+.mesh-head h3 { flex: 1 1 140px; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.mesh-head .ex-btns { flex: 0 1 auto; min-width: 0; max-width: 100%; justify-content: flex-start; }
+.mesh-head .tb { max-width: 100%; }
+.mesh-head .mesh-kill { color: var(--err); border-color: var(--err); }
+.mesh-meta { order: 1; flex: 1 0 100%; min-width: 0; display: flex; gap: 0 6px; color: var(--muted); font-size: 11.5px; overflow: hidden; white-space: nowrap; }
+.mesh-meta span { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.mesh-meta .mesh-folder { direction: rtl; text-align: left; }
+.mesh-info { order: 2; flex: 1 0 100%; min-width: 0; display: flex; flex-direction: column; gap: 3px; overflow: auto; }
+.mounted .mesh-info { position: absolute; z-index: 2; top: calc(100% + 8px); left: 0; right: 0; max-height: min(30vh, 280px); padding: 10px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--panel); box-shadow: var(--shadow); }
+.mesh-kv { display: flex; gap: 8px; } .mesh-kv span { flex: none; width: 80px; color: var(--muted); } .mesh-kv code { flex: 1; min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 .mesh-info pre { margin: 4px 0 0; font: 11.5px/1.45 var(--mono); color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 14em; overflow: auto; }
-.mesh-hint { color: var(--muted); font-size: 11.5px; }
-.mesh-live { flex: 1; min-height: 260px; display: flex; flex-direction: column; overflow: hidden; }
-.mesh-live > .body { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; overflow: hidden; }
+.mesh-hint { order: 3; flex: 1 0 100%; color: var(--muted); font-size: 11.5px; }
+.mesh-live { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.mesh-live > .body { flex: 1; min-height: 0; position: relative; inset: auto; display: flex; flex-direction: column; overflow: hidden; }
 .mesh-live.k-term > .body { display: block; background: var(--term-bg); }
 .mesh-live .xterm { height: 100%; padding: 8px; box-sizing: border-box; }
-.mesh-live .hdr { display: flex; gap: 8px; align-items: center; }
+.mesh-live .hdr { position: static; flex: none; display: flex; gap: 8px; align-items: center; }
 .mesh-back { display: none; }
-@media (max-width: 699px) {
-  #v-agents { grid-template-columns: minmax(0, 1fr); }
+@container (width < 700px) {
+  .mesh-layout { grid-template-columns: minmax(0, 1fr); }
+  #mesh-grip { display: none; }
   #v-agents:not(.detail-open) .mesh-detail, #v-agents.detail-open .mesh-side { display: none; }
   .mesh-back { display: inline-block; align-self: flex-start; }
   .mesh-row { min-height: 44px; }
