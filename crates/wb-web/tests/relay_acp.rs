@@ -270,6 +270,8 @@ async fn hello_carries_state_and_session_and_info_omits_an_unchanged_session() {
                 "seenSeq": 0, "title": null, "modeId": "default",
             },
             "state": state,
+            "repoRoot": null, "repo": null, "worktree": null, "branch": null,
+            "projectRoot": null, "project": "src",
         })
     };
     let mut want = info("setup", 3, "running");

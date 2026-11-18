@@ -21,7 +21,7 @@ use wb_proto::state::derive;
 use crate::AppState;
 use crate::edit_client::EditHandle;
 use crate::http::{ApiError, ApiQuery, Param};
-use crate::hub::{CallError, HubStatus, with_state};
+use crate::hub::{CallError, HubStatus};
 use crate::util::sanitize_sid;
 use crate::{media, notes, sample};
 
@@ -109,7 +109,12 @@ pub fn hub_up(app: &AppState) -> Result<(), ApiError> {
 
 async fn sessions(State(app): State<AppState>) -> Result<Json<Value>, ApiError> {
     hub_up(&app)?;
-    let sessions: Vec<Value> = app.hub.sessions().iter().map(with_state).collect();
+    let sessions: Vec<Value> = app
+        .hub
+        .sessions()
+        .iter()
+        .map(|s| app.session_summary(s))
+        .collect();
     Ok(Json(json!({"host": app.cfg.host, "sessions": sessions})))
 }
 

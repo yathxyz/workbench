@@ -16,7 +16,7 @@ use serde_json::json;
 use tokio::sync::broadcast::{Receiver, error::RecvError};
 
 use super::{ApiState, Read};
-use crate::hub::{HubStatus, with_state};
+use crate::hub::HubStatus;
 use crate::observed::Change;
 use crate::{AppState, FeedMsg};
 
@@ -40,7 +40,7 @@ fn hub_events(app: &AppState, status: &HubStatus, out: &mut VecDeque<Event>) {
     out.push_back(event("hub", &json!({"status": status.name()})));
     if let HubStatus::Up(_) = status {
         for session in app.hub.sessions() {
-            out.push_back(event("session", &with_state(&session)));
+            out.push_back(event("session", &app.session_summary(&session)));
         }
     }
 }
@@ -73,7 +73,7 @@ impl Feed {
                 msg = self.hub.recv() => match msg {
                     Ok(FeedMsg::Hub(status)) => hub_events(&self.app, &status, &mut self.out),
                     Ok(FeedMsg::Session(session)) => {
-                        self.out.push_back(event("session", &with_state(&session)));
+                        self.out.push_back(event("session", &self.app.session_summary(&session)));
                     }
                     Ok(FeedMsg::Gone { sid, epoch }) => {
                         self.out.push_back(event("gone", &json!({"sid": sid, "epoch": epoch})));

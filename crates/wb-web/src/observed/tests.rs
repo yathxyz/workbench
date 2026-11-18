@@ -1149,3 +1149,146 @@ fn load_sweeps_and_caps() {
     fs::write(&path, file.to_string()).unwrap();
     assert_eq!(f.reload(T0).list().len(), OBS_SESSIONS_MAX);
 }
+
+#[test]
+fn git_metadata_wire_validation_and_storage_compatibility() {
+    let f = fx();
+    f.process(PID, START);
+    let keys = ["repoRoot", "repo", "worktree", "branch"];
+    let values = ["/home/alice/proj/x", "owner/x", "topic", "feature/é"];
+    let mut event = claude("s1", T0, "SessionStart", json!({}));
+    for (key, value) in keys.into_iter().zip(values) {
+        event[key] = json!(value);
+    }
+    f.reg.ingest(HOST, event, NOW).unwrap();
+    // Legacy events without metadata retain the previous complete set.
+    f.reg
+        .ingest(HOST, claude("s1", T0 + 2, "SessionStart", json!({})), NOW)
+        .unwrap();
+    let session = serde_json::to_value(top(&f.reg)).unwrap();
+    for (key, value) in keys.into_iter().zip(values) {
+        assert_eq!(session[key], value);
+    }
+    f.reg.save().unwrap();
+    let reloaded = serde_json::to_value(top(&f.reload(NOW))).unwrap();
+    for key in keys {
+        assert_eq!(reloaded[key], session[key]);
+    }
+
+    let path = f.dir.path().join(FILE);
+    let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for key in keys {
+        saved["sessions"][0].as_object_mut().unwrap().remove(key);
+    }
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let legacy = f.reload(NOW);
+    assert_eq!(legacy.list().len(), 1);
+    let old = serde_json::to_value(top(&legacy)).unwrap();
+    for key in keys {
+        assert_eq!(old[key], Value::Null);
+    }
+    assert_eq!(old["project"], "x");
+
+    // Bad persisted metadata cannot quarantine otherwise valid old records.
+    for key in keys {
+        saved["sessions"][0][key] = json!(["not a string"]);
+    }
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert_eq!(f.reload(NOW).list().len(), 1);
+}
+
+#[test]
+fn git_metadata_replaces_the_complete_set_and_retains_legacy_events() {
+    let f = fx();
+    f.process(PID, START);
+    let mut event = claude("s1", T0, "SessionStart", json!({}));
+    event["repoRoot"] = json!("/home/alice/proj/x");
+    event["repo"] = json!("owner/x");
+    event["worktree"] = json!("topic");
+    event["branch"] = json!("feature/topic");
+    f.reg.ingest(HOST, event, NOW).unwrap();
+
+    let mut event = claude("s1", T0 + 1, "SessionStart", json!({}));
+    event["worktree"] = Value::Null;
+    event["projectRoot"] = Value::Null;
+    f.reg.ingest(HOST, event, NOW).unwrap();
+    let session = top(&f.reg);
+    assert_eq!(session.repo_root, None);
+    assert_eq!(session.repo, None);
+    assert_eq!(session.worktree, None);
+    assert_eq!(session.branch, None);
+    assert_eq!(session.project_root.as_deref(), Some("/home/alice/proj/x"));
+    f.reg.save().unwrap();
+    assert_eq!(top(&f.reload(NOW)), session);
+
+    let mut event = claude("s1", T0 + 2, "SessionStart", json!({}));
+    event["repo"] = json!("owner/other");
+    event["branch"] = json!("main");
+    f.reg.ingest(HOST, event, NOW).unwrap();
+    let mut event = claude("s1", T0 + 3, "SessionStart", json!({}));
+    event.as_object_mut().unwrap().remove("projectRoot");
+    f.reg.ingest(HOST, event, NOW).unwrap();
+    let session = top(&f.reg);
+    assert_eq!(session.repo_root, None);
+    assert_eq!(session.repo.as_deref(), Some("owner/other"));
+    assert_eq!(session.worktree, None);
+    assert_eq!(session.branch.as_deref(), Some("main"));
+    assert_eq!(session.project_root.as_deref(), Some("/home/alice/proj/x"));
+    f.reg.save().unwrap();
+    assert_eq!(top(&f.reload(NOW)), session);
+}
+
+#[test]
+fn git_metadata_invalid_values_replace_the_complete_set() {
+    let f = fx();
+    f.process(PID, START);
+    let keys = ["repoRoot", "repo", "worktree", "branch"];
+    for invalid in [
+        Value::Null,
+        json!(9),
+        json!(false),
+        json!({}),
+        json!([]),
+        json!("é".repeat(OBS_TEXT_MAX / 2 + 1)),
+    ] {
+        for invalid_key in keys {
+            let mut event = claude("s1", T0, "SessionStart", json!({}));
+            for key in keys {
+                event[key] = json!("previous");
+            }
+            f.reg.ingest(HOST, event, NOW).unwrap();
+            let mut event = claude("s1", T0 + 1, "SessionStart", json!({}));
+            event[invalid_key] = invalid.clone();
+            f.reg.ingest(HOST, event, NOW).unwrap();
+            // An event without any metadata must not restore the replaced set.
+            f.reg
+                .ingest(HOST, claude("s1", T0 + 2, "SessionStart", json!({})), NOW)
+                .unwrap();
+            let session = serde_json::to_value(top(&f.reg)).unwrap();
+            for key in keys {
+                assert_eq!(session[key], Value::Null, "{invalid_key}: {invalid}");
+            }
+            f.reg.save().unwrap();
+            assert_eq!(top(&f.reload(NOW)), top(&f.reg));
+        }
+    }
+}
+
+#[test]
+fn git_metadata_accepts_exact_utf8_byte_limit() {
+    let f = fx();
+    let mut event = claude("s1", T0, "SessionStart", json!({}));
+    for key in ["repoRoot", "repo", "worktree", "branch"] {
+        event[key] = json!("é".repeat(OBS_TEXT_MAX / 2));
+    }
+    f.reg.ingest(HOST, event, NOW).unwrap();
+    let session = top(&f.reg);
+    for value in [
+        session.repo_root,
+        session.repo,
+        session.worktree,
+        session.branch,
+    ] {
+        assert_eq!(value.unwrap().len(), OBS_TEXT_MAX);
+    }
+}
