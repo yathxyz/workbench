@@ -3936,11 +3936,12 @@ await section('N78', async () => {
       const id = await until(() => D.evaluate((prompt: string) => Object.values<ObservedSession>(window.__canvas.OBS).find(o => o.sessionId === 'n78-layout' && o.lastPrompt === prompt)?.id, prompt), 10000);
       if (!id) throw new Error('N78 layout session did not arrive');
       const layout = () => D.evaluate(() => {
-        const rect = (s: string) => document.querySelector(s)!.getBoundingClientRect(), pane = rect('#mesh-detail'), live = rect('.mesh-live > .body'), input = rect('#mesh-detail .ag-in');
+        const rect = (s: string) => document.querySelector(s)!.getBoundingClientRect(), view = rect('#v-agents'), pane = rect('#mesh-detail'), live = rect('.mesh-live > .body'), input = rect('#mesh-detail .ag-in');
         const buttons = [...document.querySelectorAll<HTMLElement>('.mesh-head button')].filter(e => !e.hidden).map(e => {
           const r = e.getBoundingClientRect(); return { text: e.textContent, x: r.x, y: r.y, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
         });
-        return { buttons, inside: buttons.every(r => r.width > 0 && r.height > 0 && r.x >= pane.left && r.right <= pane.right && r.y >= pane.top && r.bottom <= pane.bottom && r.x >= 0 && r.right <= innerWidth && r.y >= 0 && r.bottom <= innerHeight),
+        const overflow = [...document.querySelectorAll<HTMLElement>('#v-agents *')].filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.right > view.right + 1; }).map(e => e.id || e.className);
+        return { buttons, overflow, width: view.width, inside: buttons.every(r => r.width > 0 && r.height > 0 && r.x >= pane.left && r.right <= pane.right && r.y >= pane.top && r.bottom <= pane.bottom && r.x >= view.left && r.right <= view.right && r.y >= 0 && r.bottom <= innerHeight),
           pane: pane.height, live: live.height, gap: pane.bottom - input.bottom, facts: !document.querySelector<HTMLElement>('.mesh-info')!.hidden };
       });
       const widths = () => D.evaluate(() => ({ list: document.querySelector('.mesh-side')!.getBoundingClientRect().width, pane: document.querySelector('#mesh-detail')!.getBoundingClientRect().width }));
@@ -3965,6 +3966,21 @@ await section('N78', async () => {
         const reset = await widths(); await D.locator('#mesh-grip').focus(); await D.keyboard.press('ArrowRight'); const right = await widths(); await D.keyboard.press('ArrowLeft'); const left = await widths();
         check('N78: divider resets to default and keyboard arrows move 16px', Math.abs(reset.list - Math.max(260, Math.round(size.width * .34))) <= 1 && right.list === reset.list + 16 && left.list === reset.list, JSON.stringify({ reset, right, left }));
       }
+      await D.evaluate(() => { const C = window.__canvas; C.CMDS.find((c: PaletteItem) => c.l === 'Side pane: reset width')!.run(); C.toggleDockTerm(); });
+      await D.waitForSelector('#mesh-grip', { state: 'hidden' });
+      const docked = await layout(), dockDetail = await D.locator('#mesh-detail').isVisible(), dockList = await D.locator('.mesh-side').isVisible();
+      await D.getByRole('button', { name: '← Sessions', exact: true }).click();
+      const dockBack = !await D.locator('#mesh-detail').isVisible() && await D.locator('.mesh-side').isVisible();
+      const dockListFits = await D.locator('#v-agents').evaluate(e => [...e.querySelectorAll('*')].every(child => { const r = child.getBoundingClientRect(); return !r.width || !r.height || r.right <= e.getBoundingClientRect().right + 1; }));
+      await row(id).click(); await liveIdle();
+      await D.evaluate(() => window.__canvas.toggleDockTerm());
+      await D.waitForSelector('#mesh-grip', { state: 'visible' });
+      const undocked = await widths(), undockedLayout = await layout();
+      check('N78: 900×700 with the default 400px dock shows one contained pane with Sessions back; closing the dock restores both columns',
+        docked.width === 500 && docked.inside && docked.overflow.length === 0 && dockDetail && !dockList && dockBack && dockListFits
+        && await D.locator('.mesh-side').isVisible() && await D.locator('#mesh-detail').isVisible() && !await D.locator('.mesh-back').isVisible()
+        && undocked.list >= 200 && undocked.pane >= 360 && undockedLayout.inside && undockedLayout.overflow.length === 0,
+        JSON.stringify({ docked, dockDetail, dockList, dockBack, dockListFits, undocked, undockedLayout }));
       const before = await widths(); await drag(before.list + 70); const changed = await widths();
       await reload(); await open(id); await liveIdle(); const restored = await widths();
       check('N78: dragging changes list width and survives reload; disclosure resets closed', changed.list > before.list + 60 && restored.list === changed.list && !(await layout()).facts, JSON.stringify({ before, changed, restored }));
@@ -3978,7 +3994,7 @@ await section('N78', async () => {
         await D.setViewportSize({ width, height: 700 }); await open(id); await liveIdle();
         const detail = await D.locator('#mesh-detail').isVisible(), list = await D.locator('.mesh-side').isVisible(), fits = await layout();
         await D.getByRole('button', { name: '← Sessions', exact: true }).click();
-        check(`N78: ${width}px has no divider, one pane at a time and contained actions`, !await D.locator('#mesh-grip').isVisible() && detail && !list && fits.inside && !await D.locator('#mesh-detail').isVisible() && await D.locator('.mesh-side').isVisible(), JSON.stringify(fits));
+        check(`N78: ${width}px has no divider, one pane at a time and contained actions`, !await D.locator('#mesh-grip').isVisible() && detail && !list && fits.inside && fits.overflow.length === 0 && !await D.locator('#mesh-detail').isVisible() && await D.locator('.mesh-side').isVisible(), JSON.stringify(fits));
       }
       await D.setViewportSize(viewport);
       await report('near', 'n78-layout', {}, 'end');

@@ -640,8 +640,9 @@ body.listening #st-buf-text { color: var(--ink-red); }
 #status #st-addr { color: var(--modeline-fg); font-weight: 600; }
 #st-buf-text.live { color: var(--modeline-fg); }
 #side-term .body { background: var(--term-bg); overflow: hidden; position: relative; }
-/* Agents (F-A48): stable rows beside a live session, or one pane at a time on phones. */
-#v-agents { display: grid; grid-template-columns: minmax(200px, min(var(--mesh-w, 34%), calc(100% - 366px))) 6px minmax(360px, 1fr); font: 12.5px var(--mono); }
+/* Agents (F-A48): stable rows beside a live session, or one pane when the view is narrow. */
+#v-agents { container-type: inline-size; }
+.mesh-layout { height: 100%; display: grid; grid-template-columns: minmax(200px, min(var(--mesh-w, 34%), calc(100% - 366px))) 6px minmax(360px, 1fr); font: 12.5px var(--mono); }
 .mesh-side { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 #mesh-grip { cursor: col-resize; touch-action: none; border-inline: 2px solid var(--bg); background: var(--line); }
 #mesh-grip:hover, #mesh-grip:focus-visible, body.pane-drag #mesh-grip { background: var(--accent); }
@@ -678,8 +679,8 @@ body.listening #st-buf-text { color: var(--ink-red); }
 .mesh-live .xterm { height: 100%; padding: 8px; box-sizing: border-box; }
 .mesh-live .hdr { position: static; flex: none; display: flex; gap: 8px; align-items: center; }
 .mesh-back { display: none; }
-@media (max-width: 699px) {
-  #v-agents { grid-template-columns: minmax(0, 1fr); }
+@container (width < 700px) {
+  .mesh-layout { grid-template-columns: minmax(0, 1fr); }
   #mesh-grip { display: none; }
   #v-agents:not(.detail-open) .mesh-detail, #v-agents.detail-open .mesh-side { display: none; }
   .mesh-back { display: inline-block; align-self: flex-start; }

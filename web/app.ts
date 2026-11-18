@@ -5022,7 +5022,7 @@ function setPaneW(w: number, save?: boolean) {
   if (VIEW === 'graph') { clearTimeout((setPaneW as PaneWidthFn).t); (setPaneW as PaneWidthFn).t = setTimeout(graphDraw, 60); }
 }
 function setMeshW(w?: number, save = false): void {
-  const box = $('#v-agents')!, width = box.getBoundingClientRect().width; if (innerWidth < 700 || !width) return;
+  const box = $('#v-agents')!, width = box.getBoundingClientRect().width; if (width < 700) return;
   const max = Math.max(200, Math.floor(width - 366));
   w = Math.round(clamp(Number.isFinite(w) ? w! : Math.max(260, width * .34), 200, max));
   box.style.setProperty('--mesh-w', w + 'px');
