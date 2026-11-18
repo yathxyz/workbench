@@ -201,9 +201,9 @@ class Harness:
             (self.root / d).mkdir(mode=0o700, parents=True)
         for d in (self.boards_dir, self.notes_dir) + (() if dogfood else (self.home,)):
             d.mkdir(mode=0o700)
-        # A real PTY child: the suite reads the resolved address, then sends input through cat.
+        # A real PTY child: print the resolved address, then echo input, except for the failure fixture.
         attach = self.root / "attach"
-        attach.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\"\nexec cat\n")
+        attach.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\"\ncase \"$1\" in *:claude:badc0ffe) exit 23;; esac\nexec cat\n")
         attach.chmod(0o700)
         fd = os.open(self.secret_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
         with os.fdopen(fd, "w") as f:
