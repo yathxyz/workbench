@@ -8,7 +8,7 @@
 # restart leaving it alone, and edit.sock refused to another uid (R16.12). Step 11 is `wb` board tools
 # (DESIGN 3.3, fix 4): web.sock's modes, and `wb read_node` from a card without a page (exit 7) and
 # with wbctl's page open on /rpc (the page's text, exit 0).
-{ self, edwindModule }:
+{ self }:
 let
   secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
   wrongSecret = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
@@ -33,7 +33,7 @@ in
       {
         imports = [
           self.nixosModules.workbench
-          edwindModule
+          self.inputs.edwin.nixosModules.edwind
         ];
         virtualisation.memorySize = 2048;
         virtualisation.cores = 2;
@@ -49,6 +49,8 @@ in
         systemd.tmpfiles.rules = [
           "d ${config.users.users.alice.home}/work - alice users -"
           "d ${config.services.edwind.notesDir} 0700 alice users -"
+          # Edwin's module should create this itself (fixed by yathxyz/edwin#9); remove once the edwin input includes the fix.
+          "d ${config.users.users.alice.home}/.local/state/edwin - alice users -"
         ];
         # Passwordless sudo, so that NoNewPrivileges is what stops sudo in a card.
         security.sudo.wheelNeedsPassword = false;
@@ -406,7 +408,7 @@ in
 
       with subtest("10: edwind: the unit, wb buf and wb eval, a restart, the web restart, edit.sock peers"):
           EDIT_SOCK = "/run/edwind/edit.sock"
-          assert wb.succeed("systemctl is-active edwind").strip() == "active"
+          wb.wait_for_unit("edwind.service")
           wb.wait_until_succeeds(f"test -S {EDIT_SOCK}", timeout=30)
           assert wb.succeed(f"stat -c %a /run/edwind {EDIT_SOCK}").split() == ["700", "600"]
           assert wb.succeed(f"stat -c %U /run/edwind {EDIT_SOCK}").split() == ["alice", "alice"]
