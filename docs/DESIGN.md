@@ -1134,7 +1134,7 @@ Texts are excerpts: cut to `OBS_TEXT_MAX` (a tail line to 240 bytes) at a charac
 
 1. When `projectRoot/.git` is a directory, that is the git directory and `projectRoot` is the repository root.
 2. Otherwise `.git` MUST be a file containing `gitdir: PATH`. Resolve a relative PATH against `projectRoot` to obtain the worktree's git directory. Its `commondir` file, when present, names the common git directory (relative to the worktree's git directory); without that file, use the worktree's git directory itself. If the common directory is named `.git`, the repository root is its parent; otherwise the common directory itself is the repository root (a bare repository). Resolve relative path components before comparing roots.
-3. `repoRoot` is that repository root. Read only the common directory's `config` for remote `origin`. For `https://host/owner/name`, `ssh://git@host/owner/name` and `git@host:owner/name`, take the last two non-empty path segments and strip the final `.git` to obtain `owner/name`. Without an origin, `repo` is the basename of the repository root. `repo` is only a display name and grouping key: nothing is fetched from it.
+3. `repoRoot` is that repository root. Read only the common directory's `config` for remote `origin`. For `https://host/owner/name`, `ssh://git@host/owner/name` and `user@host:owner/name` (any non-empty user without `/`, `@` or `:`, and a non-empty host without `/` or `:`), take the last two non-empty path segments and strip the final `.git` to obtain `owner/name`. Without an origin, `repo` is the basename of the repository root. `repo` is only a display name and grouping key: nothing is fetched from it.
 4. `worktree` is the basename of `projectRoot` if that root differs from `repoRoot`, otherwise `null`.
 5. Read `HEAD` in the **worktree's** git directory. `ref: refs/heads/X` gives branch `X`; otherwise a hexadecimal value gives its first seven characters, and anything else gives `null`.
 
@@ -1152,6 +1152,7 @@ These hand-written filesystem fixtures are normative (paths are absolute unless 
 | HTTPS origin | origin = `https://host/team/x.git` | `/r/x`, `team/x`, null, `main` |
 | SSH URL origin | origin = `ssh://git@host/team/x.git` | `/r/x`, `team/x`, null, `main` |
 | SCP-style origin | origin = `git@host:team/x.git` | `/r/x`, `team/x`, null, `main` |
+| SCP-style origin with another user | origin = `alice@example.org:team/app.git` | `/r/x`, `team/app`, null, `main` |
 | Bare repository's worktree | `/r/checkout/.git` = `gitdir: /r/bare/worktrees/checkout`; `commondir` = `../..`, `HEAD` = `ref: refs/heads/main`; `/r/bare/config` has no origin | `/r/bare`, `bare`, `checkout`, `main` |
 | Unreadable `.git` | `.git` cannot be opened (or is malformed, oversized or a special file) | null, null, null, null; existing project grouping |
 

@@ -24,10 +24,11 @@ fn plain_checkout_and_url_forms() {
     let (_tmp, root) = checkout();
     // A directory marker is the common dir itself; do not consult commondir.
     write(&root.join(".git/commondir"), [0xff]);
-    for url in [
-        "https://host/owner/name.git",
-        "ssh://git@host/owner/name.git",
-        "git@host:owner/name.git",
+    for (url, repo) in [
+        ("https://host/owner/name.git", "owner/name"),
+        ("ssh://git@host/owner/name.git", "owner/name"),
+        ("git@host:owner/name.git", "owner/name"),
+        ("alice@example.org:team/app.git", "team/app"),
     ] {
         write(
             &root.join(".git/config"),
@@ -36,9 +37,29 @@ fn plain_checkout_and_url_forms() {
         let m = derive(&root.join("src/deep")).unwrap();
         assert_eq!(m.repo_root.as_deref(), root.to_str());
         assert_eq!(m.project_root.as_deref(), root.to_str());
-        assert_eq!(m.repo.as_deref(), Some("owner/name"));
+        assert_eq!(m.repo.as_deref(), Some(repo));
         assert_eq!(m.branch.as_deref(), Some("main"));
         assert_eq!(m.worktree, None);
+    }
+}
+
+#[test]
+fn scp_origin_authorities_match_the_reporter() {
+    for url in [
+        "alice@example.org:team/app.git",
+        "build-bot+ci@example.org:team/app.git",
+        "alice@relay@example.org:team/app.git",
+    ] {
+        assert_eq!(repo_name(url), Some("team/app"), "{url}");
+    }
+    for url in [
+        "@host:team/app.git",
+        "alice@:team/app.git",
+        "/alice@host:team/app.git",
+        "alice:token@host:team/app.git",
+        "alice@some/host:team/app.git",
+    ] {
+        assert_eq!(repo_name(url), None, "{url}");
     }
 }
 

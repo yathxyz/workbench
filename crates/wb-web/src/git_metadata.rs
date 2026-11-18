@@ -298,8 +298,9 @@ fn repo_name(url: &str) -> Option<&str> {
         }
         path
     } else {
-        let (host, path) = url.strip_prefix("git@")?.split_once(':')?;
-        if host.is_empty() {
+        let (user, location) = url.split_once('@')?;
+        let (host, path) = location.split_once(':')?;
+        if user.is_empty() || user.contains(['/', ':']) || host.is_empty() || host.contains('/') {
             return None;
         }
         path
