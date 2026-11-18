@@ -5244,6 +5244,18 @@ AGENT_TOOLS.push({
     if (!/\.pdf$/i.test(str(file))) throw new Error('not a .pdf file: ' + file);
     return pathOf(pdfFromPath(str(file)).id);
   },
+}, {
+  name: 'open_file', description: 'Open a file on this host in an Edwin frame, or focus its existing frame. Use an absolute path or ~/ for the home directory. An optional line moves point to that line (from 1). Answers the file and line.',
+  inputSchema: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'integer', minimum: 1 } }, required: ['file'] },
+  run: async ({ file, line }: { file: string; line?: number }) => {
+    if (typeof file !== 'string' || !/^(\/|~(?:\/|$))/.test(file)) throw new Error('file must be an absolute path or start with ~/');
+    if (line !== undefined && (!Number.isInteger(line) || line < 1)) throw new Error('line must be a positive integer');
+    const c = viewCenterWorld();
+    const n = await frFileOpen(file, freeSpot(c.x - 210, c.y - 150, 420, 300), line, message => { throw new Error(message); });
+    if (!n || !(await frWhenWritable(n))) throw new Error(frDown() ? 'edwind is not running' : `Could not open ${file} in Edwin`);
+    const doc = pageState(n)!.doc;
+    return { file, line: line === undefined ? doc.lineAt(pagePoint(n)).number : Math.min(line, doc.lines) };
+  },
 });
 AGENT_TOOLS.push({
   name: 'open_view', description: 'Switch the main area to a view: canvas, ranger, graph, editor, outline, tasks, review or agents. With editor, page opens that page (created if missing). With canvas, target is anything move_view accepts. With graph, target selects that node.',
@@ -6633,15 +6645,21 @@ async function frOpenToday() {
 // ---- notes and files open as pages (noteOpen, ghostOpen): edwind's visit-id names the id it would visit FILE under, or
 // refuses it (the refusal list, not UTF-8 text, missing) or answers read-only (outside its writable paths, over 32 MiB).
 // Then, and while edwind is down, nothing opens and a toast says why (the host has no other editor for a card).
-// LINE > 1 puts the frame's point at the start of that line.
+// A positive LINE puts the frame's point at the start of that line; zero leaves it where Edwin puts it.
 // Only the first connection attempt is waited for (3 s at most); once it was made or failed, edwind down falls back at once.
-async function frFileOpen(file: string, props: { x?: number; y?: number; w?: number; h?: number }, line: number): Promise<PageNode | null> {
-  if (!FR.tried && !FR.failed) await Promise.race([frWhenReady(), new Promise(r => setTimeout(r, 3000))]);
+async function frFileOpen(file: string, props: { x?: number; y?: number; w?: number; h?: number }, line = 0, refuse = (message: string) => toast(message, 6000)): Promise<PageNode | null> {
+  if (FR.on && !FR.tried && !FR.failed) await Promise.race([frWhenReady(), new Promise(r => setTimeout(r, 3000))]);
   const r = FR.online ? await FR.Ed!.sync.call({ cmd: 'visit-id', args: [file], ctx: {} }) : null;
   const id = r && !r.error && r.value && !r.value.readOnly ? r.value.buf : null;
-  if (!id) { toast(`${file} does not open as a page: ${!r ? 'edwind is not running' : r.error ? (r.error.message || r.error) : r.value?.readOnly ? 'edwind has it read-only' : 'edwind refused it'}.`, 6000); return null; }
+  if (!id) {
+    const error = r?.error;
+    const why = !r ? 'edwind is not running' : error
+      ? error.condition === 'no_buffer' ? 'file not found' : /: (EACCES|EPERM)$/.test(error.report) ? 'file is not readable' : error.report || error.message || 'edwind refused it'
+      : r.value?.readOnly ? `edwind has it read-only (${r.value.readOnly})` : 'edwind refused it';
+    refuse(`${file} does not open as a page: ${why}.`); return null;
+  }
   const n = nodeList().find(m => m.kind === 'buffer' && m.buf && frBufNow(m.buf) === id) as PageNode | undefined || addNode({ kind: 'buffer', name: clean(id.replace(/^.*\//, '').replace(/\.(md|org)$/, '')), w: 420, h: 300, ...props, buf: id } as AddNodeArg) as PageNode;
-  const at = line > 1 ? (f: EdwinFrame, b: EdwinBuffer) => { const d = new TextDoc(b.text); f.setPoint(d.line(Math.min(line, d.lines)).from); } : undefined;
+  const at = line > 0 ? (f: EdwinFrame, b: EdwinBuffer) => { const d = pageState(n)?.doc || new TextDoc(b.text); f.setPoint(d.line(Math.min(line, d.lines)).from); } : undefined;
   jumpNode(n, 1, () => frFocus(n, at));
   return n;
 }
@@ -10187,7 +10205,7 @@ function noteOpen(r: { path: string; line: number; board?: PageNode }) {
   if (r.board) { edOpen(r.board, r.line > 1 ? r.line : undefined); return r.board; }
   if (!DAEMON) { toast('That note is not on the board.'); return null; }
   if (!FR.on) { toast('Notes open as pages, which need edwind.'); return null; }
-  const c = viewCenterWorld(); return frFileOpen(r.path, freeSpot(c.x - 210, c.y - 150, 420, 300), r.line);   // a page when edwind edits it
+  const c = viewCenterWorld(); return frFileOpen(r.path, freeSpot(c.x - 210, c.y - 150, 420, 300), r.line > 1 ? r.line : 0);   // a page when edwind edits it
 }
 // go to an address: board nodes on the canvas, everything else in the navigator
 function goAddr(addr: string, push = true): boolean {

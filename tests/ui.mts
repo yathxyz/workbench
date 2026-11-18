@@ -2917,11 +2917,54 @@ await section('frames', async () => {
   await A2.evaluate((id: string) => { const C = window.__canvas; for (const n of Object.values<BoardNode & { block?: ArtifactNode['block'] }>(C.S.nodes)) if (n.block?.page === id) C.removeNode(n.id); C.removeNode(id); }, blk);
   await settled(A2); await settled(B2);
 
+  // N79: a host process opens a file the same way as a click, through the leader tab.
+  const openFile = (input: AgentToolInput) => {
+    const { promise, resolve } = Promise.withResolvers<{ code: number | null; out: string; err: string }>();
+    const c = spawn('wb', ['open_file', '--socket', H.webSocket, '--json', JSON.stringify(input)]);
+    let out = '', err = '';
+    c.stdout.on('data', d => { out += d; }); c.stderr.on('data', d => { err += d; });
+    c.on('error', e => resolve({ code: -1, out, err: String(e) })); c.on('close', code => resolve({ code, out, err }));
+    return promise;
+  };
+  const name79 = 'n79-open-file.md', rel79 = '~/' + name79;
+  const home79 = (await (await api('/api/info')).json()).home as string, abs79 = path.join(home79, name79);
+  fs.writeFileSync(abs79, 'first\nsecond\nthird\nfourth');
+  fs.writeFileSync(noteFile('bin.md'), Buffer.from([0xff, 0xfe, 0x00, 0x41]));
+  fs.mkdirSync(path.join(home79, '.ssh'), { recursive: true });
+  fs.writeFileSync(path.join(home79, '.ssh', name79), 'refused');
+  await A2.bringToFront(); await A2.evaluate(() => dispatchEvent(new Event('focus'))); await sleep(300);
+  const frame79 = () => A2.evaluate((buf: string) => Object.values<BoardNode>(window.__canvas.S.nodes).flatMap(n => {
+    if (n.kind !== 'buffer' || n.buf !== buf) return [];
+    const l = window.__canvas.live[n.id], frame = l?.frame;
+    return [{ id: n.id, focused: frame?.focused, point: frame?.point(), frames: l?.el?.querySelectorAll('.edwin-frame').length }];
+  }), rel79);
+  const point79 = (pt: number) => until(async () => { const frames = await frame79(); return frames.some(f => f.focused && f.point === pt) ? frames : null; }, 10000);
+  const result79 = (r: Awaited<ReturnType<typeof openFile>>, file: string, line: number) => r.code === 0 && r.out.trim() === JSON.stringify({ file, line });
+  const open79 = await openFile({ file: abs79, line: 3 }), at3 = await point79('first\nsecond\n'.length);
+  check('N79: wb open_file over web.sock opens the file in a focused Edwin frame at line 3', result79(open79, abs79, 3) && at3?.length === 1 && at3[0].frames === 1, JSON.stringify({ open79, at3 }));
+  const reopen79 = await openFile({ file: rel79, line: 1 }), at1 = await point79(0);
+  check('N79: opening the same file via ~/ moves point to line 1 without a second frame', result79(reopen79, rel79, 1) && at1?.length === 1 && at1[0].id === at3?.[0].id && at1[0].frames === 1, JSON.stringify({ reopen79, at1 }));
+  const past79 = await openFile({ file: rel79, line: 99 }), atEnd = await point79('first\nsecond\nthird\n'.length);
+  await leave(A2);
+  const keep79 = await openFile({ file: rel79 }), kept = await point79('first\nsecond\nthird\n'.length);
+  check('N79: open_file reports the clamped line and leaves point where a click would if line is omitted', result79(past79, rel79, 4) && atEnd?.length === 1 && result79(keep79, rel79, 4) && kept?.length === 1, JSON.stringify({ past79, atEnd, keep79, kept }));
+  const refuse79 = async (input: AgentToolInput, why: RegExp) => {
+    const r = await openFile(input);
+    check(`N79: open_file refuses ${JSON.stringify(input)} with ${why.source}`, r.code === 1 && why.test(r.err), JSON.stringify(r));
+  };
+  await refuse79({ file: path.join(home79, 'n79-missing.md') }, /file not found/);
+  await refuse79({ file: noteFile('bin.md') }, /not UTF-8 text/);
+  await refuse79({ file: '~/.ssh/' + name79 }, /: refused/);
+  await refuse79({ file: name79 }, /absolute path/);
+  for (const line of [0, -1, 1.5, '2', null]) await refuse79({ file: abs79, line }, /line must be a positive integer/);
+  await leave(A2);
+  await A2.evaluate((ids: string[]) => { for (const id of ids) window.__canvas.removeNode(id); }, (await frame79()).map(f => f.id));
+  await settled(A2); await settled(B2);
+
   // (j) notes and files open as Edwin pages (noteOpen, ghostOpen); the frame starts at the note's line. A file edwind
   // will not edit (here: not UTF-8 text) opens nothing: no card, and a toast says why.
   fs.writeFileSync(noteFile('open-me.md'), '# open me\n\nsecond body line\nthird');
   fs.writeFileSync(noteFile('ghost-me.md'), '# ghost me\n');
-  fs.writeFileSync(noteFile('bin.md'), Buffer.from([0xff, 0xfe, 0x00, 0x41]));
   await A2.bringToFront();
   const opened = await A2.evaluate(async () => { const n = await window.__canvas.noteOpen({ path: 'open-me.md', line: 3 }); return n && { id: n.id, kind: n.kind, buf: n.buf || null }; });
   const openPt = opened && await until(() => A2.evaluate((id: string) => { const L = window.__canvas.live[id]; return L?.frame?.focused ? L.frame.point() : null; }, opened.id), 10000);
@@ -2981,6 +3024,8 @@ await section('frames', async () => {
   // A note opened while edwind is down says so at once (no wait for a connection that was up before) and opens nothing.
   const downOpen = await A2.evaluate(async () => { const t0 = performance.now(); const n = await window.__canvas.noteOpen({ path: 'ghost-me.md' }); return { opened: !!n, ms: performance.now() - t0, toast: document.querySelector('#toast')?.textContent || '' }; });
   check('frames: with edwind down a note opens nothing at once and the toast says edwind is not running', !downOpen.opened && downOpen.ms < 1000 && /edwind is not running/.test(downOpen.toast), JSON.stringify(downOpen));
+  await A2.evaluate(() => dispatchEvent(new Event('focus'))); await sleep(300);
+  await refuse79({ file: abs79 }, /edwind is not running/);
   check('frames: with edwind down the page card shows the notice that editing is off, the mode line says offline and typing still goes into the page (unacked)', st.stopped?.event === 'stopped' && st.offA && st.offB && st.notice?.shown && !st.notice.hidden && st.notice.text === 'Editing is off: edwind is not running' && st.noticeB?.shown && /while-down$/.test(st.text) && /•/.test(st.sync) && /⚠ offline/.test(st.sync) && st.body && !st.status?.up && st.info.edit === true && st.info.editUp === false, JSON.stringify({ ...st, text: st.text.slice(-30), info: { edit: st.info.edit, editUp: st.info.editUp } }));
 
   // (c) edwind back: both tabs reconnect, the unacked edit is acked, reaches the other tab and the file on disk
