@@ -29,6 +29,7 @@ rustPlatform.buildRustPackage {
       ../Cargo.toml
       ../Cargo.lock
       ../crates
+      ../docs/DESIGN.md
     ];
   };
   cargoLock.lockFile = ../Cargo.lock;

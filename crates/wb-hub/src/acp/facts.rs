@@ -139,9 +139,8 @@ impl Facts {
                 }
             }
             EventBody::Policy { policy } => {
-                if policy.validate().is_ok() {
-                    self.policy = (!policy.rules.is_empty()).then(|| policy.clone());
-                }
+                self.policy =
+                    (policy.validate().is_ok() && !policy.rules.is_empty()).then(|| policy.clone());
             }
             EventBody::Exit { .. } => {
                 self.activity = Activity::None;
@@ -310,8 +309,8 @@ mod tests {
     }
 
     #[test]
-    fn invalid_policy_events_preserve_the_last_good_policy_on_replay() {
-        let good: Policy = serde_json::from_value(json!({"rules":[{"action":"ask"}]})).unwrap();
+    fn invalid_policy_events_clear_policy_until_a_later_valid_event() {
+        let good: Policy = serde_json::from_value(json!({"rules":[{"action":"allow"}]})).unwrap();
         let oversized: Policy = serde_json::from_value(json!({"rules":[
             {"action":"allow", "roots":vec![format!("/{}", "r".repeat(4095));64]}
         ]}))
@@ -320,18 +319,29 @@ mod tests {
             {"action":"allow", "command":{"matches":["["]}}
         ]}))
         .unwrap();
+        let too_big: Policy = serde_json::from_value(json!({"rules":[
+            {"action":"allow", "command":{"matches":[r"\w+\s+\w+"]}}
+        ]}))
+        .unwrap();
         assert!(serde_json::to_vec(&oversized).unwrap().len() > wb_proto::limits::POLICY_MAX);
-        for invalid in [oversized, malformed] {
+        for invalid in [oversized, malformed, too_big] {
             let bad = EventBody::Policy { policy: invalid };
             assert_eq!(fold(vec![bad.clone()]).policy, None);
             let mut facts = fold(vec![EventBody::Policy {
                 policy: good.clone(),
             }]);
             facts.apply(&ev(2, bad));
-            assert_eq!(facts.policy.as_ref(), Some(&good));
+            assert_eq!(facts.policy, None);
             assert_eq!(facts.head_seq, 2);
             facts.apply(&ev(
                 3,
+                EventBody::Policy {
+                    policy: good.clone(),
+                },
+            ));
+            assert_eq!(facts.policy.as_ref(), Some(&good));
+            facts.apply(&ev(
+                4,
                 EventBody::Policy {
                     policy: Policy::default(),
                 },

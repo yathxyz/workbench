@@ -1047,16 +1047,20 @@ fn permission_policy(action: &str) -> Value {
     }]})
 }
 
+fn policy_hub() -> Hub {
+    Hub::with_scenarios_and(&[], |cfg| stub(cfg, "omp", &[]))
+}
+
 fn policy_ready(c: &mut Client, hub: &Hub, sid: &str, policy: Value) -> Value {
     let open = c.ok(json!({"t":"acp.open", "sid":sid, "since":0,
-        "spawn":{"agent":"stub", "cwd":hub.home(), "policy":policy}}));
+        "spawn":{"agent":"omp", "cwd":hub.home(), "policy":policy}}));
     c.event(sid, "session");
     open
 }
 
 #[test]
 fn hub_policy_answers_omp_empty_locations_with_and_without_cwd() {
-    let hub = Hub::with_scenarios(&[]);
+    let hub = policy_hub();
     let mut c = hub.connect();
     let policy = json!({"rules":[{"action":"allow", "roots":["$cwd"], "programs":["cargo"]}]});
     policy_ready(&mut c, &hub, "omp", policy);
@@ -1083,7 +1087,7 @@ fn hub_policy_answers_omp_empty_locations_with_and_without_cwd() {
 
 #[test]
 fn hub_policy_leaves_post_cancel_requests_pending_only_for_that_turn() {
-    let hub = Hub::with_scenarios(&[]);
+    let hub = policy_hub();
     let mut c = hub.connect();
     let policy = json!({"rules":[{"action":"allow", "roots":["$cwd"], "programs":["cargo"]}]});
     let opened = policy_ready(&mut c, &hub, "cancelled", policy);
@@ -1129,7 +1133,7 @@ fn hub_policy_leaves_post_cancel_requests_pending_only_for_that_turn() {
 
 #[test]
 fn hub_policy_leaves_permissions_outside_every_turn_pending() {
-    let hub = Hub::with_scenarios(&[]);
+    let hub = policy_hub();
     let mut c = hub.connect();
     for action in ["allow", "reject"] {
         for cancelled in [false, true] {
@@ -1176,55 +1180,56 @@ fn hub_policy_leaves_permissions_outside_every_turn_pending() {
 }
 
 #[test]
-fn hub_policy_uses_the_configured_agent_not_the_sid_for_cwd_reset() {
-    let hub = Hub::with_scenarios_and(&[], |cfg| stub(cfg, "omp", &[]));
+fn hub_policy_only_answers_execute_for_the_configured_omp_agent() {
+    let hub = policy_hub();
     let mut c = hub.connect();
     for (agent, sid) in [("omp", "not_omp"), ("stub", "omp")] {
-        let policy =
+        let mut policy =
             json!({"rules":[{"action":"allow", "roots":["$cwd"], "programs":["cd","cargo"]}]});
         let opened = c.ok(json!({"t":"acp.open", "sid":sid, "since":0,
             "spawn":{"agent":agent, "cwd":hub.home(), "policy":policy}}));
         c.event(sid, "session");
-        // Exercise compilation both at spawn and on a later replacement.
         for replace in [false, true] {
             if replace {
+                policy["rules"][0]["action"] = json!("reject");
                 c.ok(json!({"t":"acp.set_policy", "sid":sid, "epoch":epoch(&opened), "policy":policy}));
             }
-            assert_eq!(c.acp_prompt(sid, "omp-permission cd")["t"], "ok");
-            if agent == "omp" {
-                let auto = c.event(sid, "permission_auto");
-                assert_eq!(
-                    auto["toolCall"]["rawInput"]["command"],
-                    "cd src && cargo test"
-                );
-            } else {
-                let pending = c.event(sid, "permission");
-                assert_eq!(
-                    permit(&mut c, sid, &pending["seq"], epoch(&opened), "reject-once")["t"],
-                    "ok"
-                );
+            for (prompt, command) in [
+                ("omp-permission", "cargo test"),
+                ("omp-permission same-cwd", "cd . && cargo test"),
+                ("omp-permission cd", "cd src && cargo test"),
+            ] {
+                assert_eq!(c.acp_prompt(sid, prompt)["t"], "ok");
+                if agent == "omp" {
+                    let auto = c.event(sid, "permission_auto");
+                    assert_eq!(auto["toolCall"]["rawInput"]["command"], command);
+                    assert_eq!(auto["policy"]["action"], policy["rules"][0]["action"]);
+                    assert_eq!(
+                        auto["outcome"]["optionId"],
+                        if replace { "reject-once" } else { "allow-once" }
+                    );
+                } else {
+                    let pending = c.event(sid, "permission");
+                    assert_eq!(pending["toolCall"]["rawInput"]["command"], command);
+                    assert_eq!(c.summary(sid)["acp"]["pending"][0]["req"], pending["seq"]);
+                    assert_eq!(
+                        permit(&mut c, sid, &pending["seq"], epoch(&opened), "allow-once")["t"],
+                        "ok"
+                    );
+                }
+                c.event(sid, "turn_end");
+                assert_eq!(c.summary(sid)["acp"]["pending"], json!([]));
             }
-            c.event(sid, "turn_end");
-            assert_eq!(c.acp_prompt(sid, "omp-permission same-cwd")["t"], "ok");
-            assert_eq!(
-                c.event(sid, "permission_auto")["outcome"]["optionId"],
-                "allow-once"
-            );
-            c.event(sid, "turn_end");
-            assert_eq!(c.acp_prompt(sid, "omp-permission")["t"], "ok");
-            assert_eq!(
-                c.event(sid, "permission_auto")["outcome"]["optionId"],
-                "allow-once"
-            );
-            c.event(sid, "turn_end");
-            assert_eq!(c.summary(sid)["acp"]["pending"], json!([]));
+        }
+        if agent != "omp" {
+            assert!(!hub.journal(sid).iter().any(|e| e["e"] == "permission_auto"));
         }
     }
 }
 
 #[test]
 fn hub_policy_answers_once_without_publishing_pending_and_replays() {
-    let mut hub = Hub::with_scenarios(&[]);
+    let mut hub = policy_hub();
     let mut c = hub.connect();
     let mut watcher = hub.connect();
     watcher.ok(json!({"t":"watch"}));
@@ -1371,7 +1376,7 @@ fn hub_policy_answers_once_without_publishing_pending_and_replays() {
 
 #[test]
 fn hub_policy_replace_remove_leave_pending_and_never_answer_elicitations() {
-    let mut hub = Hub::with_scenarios(&[]);
+    let mut hub = policy_hub();
     let mut c = hub.connect();
     let open = policy_ready(&mut c, &hub, "a1", permission_policy("ask"));
     let epoch = epoch(&open);
@@ -1409,7 +1414,7 @@ fn hub_policy_replace_remove_leave_pending_and_never_answer_elicitations() {
 
 #[test]
 fn hub_policy_is_incarnation_scoped_and_attach_cannot_replace_it() {
-    let hub = Hub::with_scenarios(&[]);
+    let hub = policy_hub();
     let mut c = hub.connect();
     let open = policy_ready(&mut c, &hub, "a1", permission_policy("reject"));
     let old = epoch(&open);
@@ -1440,7 +1445,7 @@ fn hub_policy_is_incarnation_scoped_and_attach_cannot_replace_it() {
 
 #[test]
 fn hub_invalid_policy_never_registers_or_spawns_and_replacement_is_atomic() {
-    let hub = Hub::with_scenarios(&[]);
+    let hub = policy_hub();
     let mut c = hub.connect();
     let invalid = [
         json!({"rules":[{"action":"allow","command":{"matches":["("]}}]}),
@@ -1494,7 +1499,7 @@ fn hub_invalid_policy_never_registers_or_spawns_and_replacement_is_atomic() {
 #[test]
 fn hub_policy_journal_fault_sends_cancellation_not_an_unrecorded_allow() {
     let hub = Hub::start_with_env(
-        |cfg| stub(cfg, "stub", &[]),
+        |cfg| stub(cfg, "omp", &[]),
         &[("WB_HUB_TEST_FAIL_WRITE_AT", "7")],
     );
     let mut c = hub.connect();
@@ -1504,7 +1509,7 @@ fn hub_policy_journal_fault_sends_cancellation_not_an_unrecorded_allow() {
         s["fault"]["code"] == "journal_write" && s["alive"] == false
     });
     assert!(!hub.kinds("a1").iter().any(|e| e == "permission_auto"));
-    let outcomes: Vec<Value> = answers(&hub, "stub")
+    let outcomes: Vec<Value> = answers(&hub, "omp")
         .iter()
         .map(|answer| answer["result"]["outcome"].clone())
         .collect();

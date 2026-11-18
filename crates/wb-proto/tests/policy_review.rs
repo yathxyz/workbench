@@ -35,11 +35,29 @@ fn action(policy: &CompiledPolicy, input: Value) -> Option<Action> {
         .map(|d| d.action)
 }
 
+fn design_policies() -> impl Iterator<Item = Policy> {
+    include_str!("../../../docs/DESIGN.md")
+        .split("```json\n")
+        .skip(1)
+        .filter_map(|block| {
+            let (example, _) = block.split_once("```")?;
+            example.contains("\"rules\"").then(|| {
+                serde_json::from_str(example).expect("DESIGN policy example must deserialize")
+            })
+        })
+}
+
 fn design_example() -> CompiledPolicy {
-    compiled(json!([{"action":"allow", "kinds":["read","edit","execute"],
-        "roots":["$cwd","/nix/store","/tmp"],
-        "programs":["cargo","nix","git","ls","cat","grep","rg","sed","head","tail","wc","node"],
-        "command":{"notMatches":["sudo","git\\s+(push|tag|remote|config|reset|clean|checkout|switch|branch|rebase|merge|stash|worktree)","gh ","systemctl","ssh","scp","curl","wget","nc","kill","pkill","secrets","sops","~/","\\$HOME"]}}]))
+    let policy = design_policies().next().expect("DESIGN policy example");
+    policy.validate().unwrap();
+    CompiledPolicy::new(&policy, "/work/project", true).unwrap()
+}
+
+#[test]
+fn documented_policy_examples_validate() {
+    for policy in design_policies() {
+        policy.validate().unwrap();
+    }
 }
 
 #[test]
@@ -73,6 +91,13 @@ fn agent_path_expansion_is_not_a_plain_working_directory() {
         "HTTP://host/x",
         "a+1.2-3:sub",
         "c:\\tmp",
+        "./local://x",
+        "sub/local://",
+        "/work/project/local://notes",
+        "./file:sub",
+        "sub/a:b",
+        "1:sub",
+        "-a:sub",
         "sub\t",
         "sub\n",
         "sub\r",
@@ -87,15 +112,7 @@ fn agent_path_expansion_is_not_a_plain_working_directory() {
             "{cwd:?}"
         );
     }
-    for cwd in [
-        ".",
-        "sub",
-        "./file:sub",
-        "sub/a:b",
-        "/tmp/plain dir",
-        "1:sub",
-        "-a:sub",
-    ] {
+    for cwd in [".", "sub", "/tmp/plain dir"] {
         assert_eq!(
             action(&p, json!({"command":"cat x", "cwd":cwd})),
             Some(Action::Allow),
@@ -109,6 +126,35 @@ fn agent_path_expansion_is_not_a_plain_working_directory() {
         action(&p, json!({"command":"cat @sub"})),
         Some(Action::Allow)
     );
+}
+
+#[test]
+fn hoisted_cd_expanders_ask_after_quote_removal_with_or_without_roots() {
+    for rule in [
+        json!({"action":"allow", "kinds":["execute"], "roots":["$cwd"], "programs":["cat","cd"]}),
+        json!({"action":"allow", "roots":["$cwd"]}),
+        json!({"action":"allow"}),
+    ] {
+        let p = compiled(json!([rule]));
+        for command in [
+            "cd file:///work/project/%2e%2e/%2e%2e/etc && cat passwd",
+            "cd file:///work/project/%2e%2e/%2e%2e/etc; cat passwd",
+            "cd FiLe:///work/project/.%2E/.%2E/etc && cat passwd",
+            "cd 'file:///work/project/%2e%2e/%2e%2e/home/u/.ssh' && cat id_rsa",
+            "cd fi\"\"le:///work/project/%2e%2e/%2e%2e/etc && cat passwd",
+            "cd :./ && cat ../secret",
+            "cd ':./' && cat ../secret",
+            "cd :./sub && cat ../../secret",
+            "cd sub/plain:dir && cat x",
+            "cd 'sub/plain:dir'; cat x",
+        ] {
+            assert_eq!(action(&p, json!({"command":command})), None, "{command}");
+        }
+        assert_eq!(
+            action(&p, json!({"command":"cd sub && cat x"})),
+            Some(Action::Allow)
+        );
+    }
 }
 
 #[test]
@@ -181,6 +227,9 @@ fn redirects_cannot_hide_command_word_adjacency_from_patterns() {
         "git </tmp/i push origin master",
         "git >o reset --hard",
         "git >o pu''sh origin master",
+        "git >o >>p <q reset --hard",
+        ">o git reset --hard",
+        ">o git <q >>p reset --hard",
     ] {
         assert_eq!(
             action(&design, json!({"command":command})),
@@ -198,6 +247,7 @@ fn redirects_cannot_hide_command_word_adjacency_from_patterns() {
             "r''m -rf sub",
             "rm >x -rf sub",
             "rm <x '-rf' sub",
+            ">x rm >y -rf sub",
         ] {
             assert_eq!(
                 deny.decide(&execute(json!({"command":command}), locations), &options())
@@ -249,51 +299,65 @@ fn an_assignment_after_a_leading_redirect_asks() {
 }
 
 #[test]
-fn a_persistent_shell_cannot_auto_change_its_top_level_directory() {
-    let rules =
-        policy(json!([{"action":"allow", "roots":["$cwd"], "programs":["cd","cat","false"]}]));
-    let persistent = CompiledPolicy::new(&rules, "/work/project", false).unwrap();
-    let resetting = CompiledPolicy::new(&rules, "/work/project", true).unwrap();
-    for command in [
-        "cd sub",
-        "cd sub && cat x",
-        "cd sub && cd ..",
-        "false || cd sub",
-        "cat x && cd sub",
-    ] {
-        assert_eq!(
-            action(&persistent, json!({"command":command})),
-            None,
-            "{command}"
-        );
-        assert_eq!(
-            action(&resetting, json!({"command":command})),
-            Some(Action::Allow),
-            "{command}"
-        );
+fn only_agents_known_to_reset_cwd_receive_execute_decisions() {
+    for action_name in ["allow", "reject"] {
+        let rules = policy(json!([{"action":action_name, "roots":["$cwd"]}]));
+        let persistent = CompiledPolicy::new(&rules, "/work/project", false).unwrap();
+        let resetting = CompiledPolicy::new(&rules, "/work/project", true).unwrap();
+        let expected = if action_name == "allow" {
+            Action::Allow
+        } else {
+            Action::Reject
+        };
+        for command in [
+            "make",
+            "cat sub/x",
+            "rm -rf build",
+            "cd sub && make",
+            "cd sub; make",
+            "cd sub || make",
+            "cd sub",
+            "cd sub && cd ..",
+            "cd sub && cd /work/project",
+            "make && cd sub",
+            "make || cd sub",
+            "make; cd sub",
+            "true\ncd sub",
+            "cd sub/deep/..",
+            "cd ./sub",
+            "cd /work/project/sub",
+            "cd . && make",
+            "cd ./ && make",
+            "cd sub/.. && make",
+            "cd /work/project && make",
+            "cd //work/project && make",
+            "cd sub/../. ; make",
+        ] {
+            assert_eq!(
+                action(&persistent, json!({"command":command})),
+                None,
+                "{command}"
+            );
+            assert_eq!(
+                action(&resetting, json!({"command":command})),
+                Some(expected),
+                "{command}"
+            );
+        }
+        for command in ["cd .. && make", "cd . && make"] {
+            let input = json!({"command":command, "cwd":"/work/project/sub"});
+            assert_eq!(action(&persistent, input.clone()), None);
+            assert_eq!(action(&resetting, input), Some(expected));
+        }
+        for kind in ["read", "edit"] {
+            let call = json!({"toolCallId":"c", "title":"t", "kind":kind,
+                "locations":[{"path":"sub/x"}]});
+            assert_eq!(
+                persistent.decide(&call, &options()).unwrap().action,
+                expected
+            );
+        }
     }
-    for command in [
-        "cd . && cat x",
-        "cd sub/..; cat x",
-        "cd /work/project",
-        "cat sub/x",
-    ] {
-        assert_eq!(
-            action(&persistent, json!({"command":command})),
-            Some(Action::Allow),
-            "{command}"
-        );
-    }
-    // Subshells remain unsupported syntax; no new grammar is implied by this guard.
-    assert_eq!(action(&persistent, json!({"command":"(cd sub)"})), None);
-    let rules =
-        policy(json!([{"action":"allow", "roots":["/a/c/d","/a/x"], "programs":["cd","cat"]}]));
-    let p = CompiledPolicy::new(&rules, "/a/c", false).unwrap();
-    assert_eq!(action(&p, json!({"command":"cd d"})), None);
-    assert_eq!(action(&p, json!({"command":"cat ../x/f"})), None);
-    // The review's exact roots also exclude the starting cwd, independently of cd.
-    let p = CompiledPolicy::new(&rules, "/a/c", true).unwrap();
-    assert_eq!(action(&p, json!({"command":"cd d"})), None);
 }
 
 #[test]
@@ -304,10 +368,12 @@ fn serialized_policy_size_is_bounded_including_json_escaping() {
     ]));
     assert!(largest.validate().is_err());
     assert!(CompiledPolicy::new(&largest, "/work/project", true).is_err());
-    let mut boundary =
-        policy(json!([{"action":"allow", "roots":vec![format!("/{}", "r".repeat(4089));64]}]));
+    let mut boundary = policy(json!([
+        {"action":"allow", "roots":vec![format!("/{}", "r".repeat(4000));64]},
+        {"action":"allow", "roots":["/","/"]}
+    ]));
     let mut spare = POLICY_MAX - serde_json::to_vec(&boundary).unwrap().len();
-    for root in boundary.rules[0].roots.as_mut().unwrap() {
+    for root in boundary.rules[1].roots.as_mut().unwrap() {
         let n = spare.min(POLICY_ROOT_MAX - root.len());
         root.push_str(&"r".repeat(n));
         spare -= n;
@@ -316,7 +382,7 @@ fn serialized_policy_size_is_bounded_including_json_escaping() {
     assert_eq!(serde_json::to_vec(&boundary).unwrap().len(), POLICY_MAX);
     assert!(boundary.validate().is_ok());
     assert!(CompiledPolicy::new(&boundary, "/work/project", true).is_ok());
-    boundary.rules[0]
+    boundary.rules[1]
         .roots
         .as_mut()
         .unwrap()
@@ -336,8 +402,60 @@ fn serialized_policy_size_is_bounded_including_json_escaping() {
 }
 
 #[test]
+fn canonical_words_precede_redirects_across_operators() {
+    for (pattern, command) in [
+        (r"^git push origin > /tmp/o$", "git >/tmp/o push origin"),
+        (r"^git push > a >> b < c$", "git >a push >>b <c"),
+        (r"^a b > x ; c d < y$", ">x a b; <y c d"),
+        (r"^a > x \| b >> y && c$", "a>x|b>>y&&c"),
+        (r"^A=1 git push > o$", "A=1 >o git push"),
+        (r"^echo > x$", "echo '>' x"),
+    ] {
+        let p = compiled(json!([
+            {"action":"reject", "command":{"matches":[pattern]}},
+            {"action":"allow", "roots":["$cwd","/tmp"]}
+        ]));
+        assert_eq!(
+            action(&p, json!({"command":command})),
+            Some(Action::Reject),
+            "{command}"
+        );
+    }
+    let p = compiled(json!([
+        {"action":"reject", "command":{"matches":["git"]}},
+        {"action":"allow", "roots":["$cwd"]}
+    ]));
+    for command in [
+        "git push 2>&1",
+        "git push >&2",
+        "git push &>o",
+        "git push <&-",
+        "git push >|o",
+        "git push 2>o",
+        "git push <<EOF",
+        "git push <<<x",
+        "git push <>o",
+        "git push > >o",
+        "cat < <x",
+    ] {
+        assert_eq!(action(&p, json!({"command":command})), None, "{command}");
+    }
+}
+
+#[test]
 fn ordinary_patterns_and_the_round_one_compile_attack_respect_the_limit() {
-    for pattern in [r"\bgit\s+push\b", r"\w+", r"[[:alpha:]]+", r"\p{L}+"] {
+    for pattern in [
+        r"\bgit\s+push\b",
+        r"\w",
+        r"\w+",
+        r"[[:alpha:]]+",
+        r"\p{L}+",
+        r"(?-u)\w+\s+\w+",
+        r"(?-u)\w{120}",
+        r"(?-u:\w+\s+\w+)",
+        r"[A-Za-z0-9_]+\s+[A-Za-z0-9_]+",
+        r"a[a-z]{906}0",
+    ] {
         let p = policy(json!([{"action":"allow", "command":{"matches":[pattern]}}]));
         assert!(p.validate().is_ok(), "{pattern}");
         assert!(
@@ -357,6 +475,26 @@ fn ordinary_patterns_and_the_round_one_compile_attack_respect_the_limit() {
                 .validate()
                 .is_err()
         );
+    }
+}
+
+#[test]
+fn oversized_unicode_patterns_explain_the_ascii_alternatives() {
+    for pattern in [
+        r"\w+\s+\w+",
+        r"\w{20}",
+        r"\d{3,40}",
+        r"\S{1,64}",
+        r".{0,500}rm",
+        r"[\w.-]{1,64}",
+        r"\b\w+\b.*\b\w+\b",
+        r"(\w+\s+){3}\w+",
+    ] {
+        let p = policy(json!([{"action":"allow", "command":{"matches":[pattern]}}]));
+        let error = p.validate().unwrap_err();
+        for hint in ["Unicode", "[A-Za-z0-9_]", r"[ \t]", "(?-u:"] {
+            assert!(error.contains(hint), "{pattern}: {error}");
+        }
     }
 }
 
@@ -426,5 +564,25 @@ fn reviewer_cost_families_ask_on_64_kib_without_running_patterns() {
         let elapsed = start.elapsed();
         assert!(elapsed < Duration::from_secs(1), "{pattern}: {elapsed:?}");
         println!("family={family} largest={low} pattern={pattern:?} 64KiB decide={elapsed:?}");
+    }
+}
+
+#[test]
+fn reviewer_128_pattern_policy_respects_the_decision_budget() {
+    let p = cost_policy(&vec!["a[a-z]{906}0".to_owned(); 128]);
+    p.validate().unwrap();
+    let p = CompiledPolicy::new(&p, "/work/project", true).unwrap();
+    for size in [8 * 1024, 64 * 1024] {
+        let command = format!("echo {}", "a".repeat(size - 5));
+        let call = execute(json!({"command":command}), false);
+        let opts = options();
+        let start = Instant::now();
+        let decision = p.decide(&call, &opts);
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(1), "{size}: {elapsed:?}");
+        if size > POLICY_REGEX_COMMAND_MAX {
+            assert_eq!(decision, None);
+        }
+        println!("128 patterns, {size} bytes: {decision:?}, {elapsed:?}");
     }
 }

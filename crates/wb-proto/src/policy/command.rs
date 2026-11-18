@@ -146,7 +146,6 @@ pub(super) fn evidence<'a>(
     session_cwd: &Path,
     command_cwd: Option<&str>,
     render: bool,
-    resets_cwd: bool,
 ) -> Option<Evidence<'a>> {
     if (command.is_none() && locations.is_empty()) || locations.len() > POLICY_PATHS_MAX {
         return None;
@@ -200,9 +199,6 @@ pub(super) fn evidence<'a>(
                     let executable = i == index && word.contains('/');
                     let next = paths.word(&word, &dirs, (cd && i == 1) || executable)?;
                     if cd && i == 1 {
-                        if !resets_cwd && next != dirs {
-                            return None;
-                        }
                         changed = Some(next);
                     } else if executable {
                         programs.extend(next.into_iter().map(Program::Path));
@@ -342,6 +338,7 @@ fn classify(simple: &Simple<'_>) -> Option<(usize, bool)> {
             || simple.args[1].text.is_empty()
             || simple.args[1].text.starts_with('-')
             || simple.args[1].text.starts_with('@')
+            || simple.args[1].text.contains(':')
             || simple.args[1].text.contains(['*', '?', '[', ']'])
         {
             return None;

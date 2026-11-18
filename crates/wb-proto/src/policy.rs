@@ -247,7 +247,7 @@ impl CompiledPolicy {
 
     /// First matching rule wins. `None` means ask, including a matching `ask` rule
     /// or an unavailable once-only option; neither falls through to later rules.
-    /// `resets_cwd` at compilation identifies agents that restart cwd for each call.
+    /// Only agents known to reset cwd for each call are eligible for execute decisions.
     pub fn decide(&self, tool_call: &Value, options: &[Value]) -> Option<Decision> {
         self.decide_until(tool_call, options, Instant::now() + POLICY_DECISION_TIMEOUT)
     }
@@ -266,6 +266,9 @@ impl CompiledPolicy {
             return None;
         }
         let (command, cwd) = if kind == "execute" {
+            if !self.resets_cwd {
+                return None;
+            }
             let input = call.get("rawInput")?.as_object()?;
             if input.keys().any(|key| {
                 key != "command"
@@ -290,14 +293,7 @@ impl CompiledPolicy {
             (None, None)
         };
         let locations = call.get("locations")?.as_array()?;
-        let evidence = command::evidence(
-            command,
-            locations,
-            &self.cwd,
-            cwd,
-            self.render,
-            self.resets_cwd,
-        )?;
+        let evidence = command::evidence(command, locations, &self.cwd, cwd, self.render)?;
         let (allow, reject) = once_options(options)?;
         let mut checks = POLICY_PATH_CHECKS_MAX;
         for (index, rule) in self.rules.iter().enumerate() {
@@ -410,13 +406,8 @@ fn matches_texts(
 
 fn plain_cwd(value: &Value) -> Option<&str> {
     let cwd = nonempty_string(value)?;
-    let scheme = cwd.split_once(':').is_some_and(|(prefix, _)| {
-        let mut bytes = prefix.bytes();
-        bytes.next().is_some_and(|ch| ch.is_ascii_alphabetic())
-            && bytes.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'+' | b'.' | b'-'))
-    });
-    (!cwd.starts_with(['~', '@', ':'])
-        && !scheme
+    (!cwd.starts_with(['~', '@'])
+        && !cwd.contains(':')
         && cwd.bytes().all(|ch| (b' '..=b'~').contains(&ch)))
     .then_some(cwd)
 }
@@ -432,7 +423,13 @@ fn compile_patterns(command: Option<&CommandPatterns>) -> Result<(Vec<Regex>, Ve
                 RegexBuilder::new(pattern)
                     .size_limit(POLICY_REGEX_SIZE_MAX)
                     .build()
-                    .map_err(|error| format!("invalid policy command pattern: {error}"))
+                    .map_err(|error| match error {
+                        regex::Error::CompiledTooBig(_) => format!(
+                            "invalid policy command pattern: {error}; Unicode classes are large; \
+                             use ASCII classes ([A-Za-z0-9_], [ \\t]) or a scoped (?-u:...)"
+                        ),
+                        _ => format!("invalid policy command pattern: {error}"),
+                    })
             })
             .collect::<Result<Vec<_>, _>>()
     };

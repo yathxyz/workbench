@@ -563,12 +563,14 @@ def session_policy(t, h):
                 repr(refused))
 
     for name, policy in (("allow", allow), ("reject", reject), ("fallback", fallback),
-                         ("programs_fallback", programs_fallback), ("ask", ask)):
+                         ("programs_fallback", programs_fallback), ("ask", ask),
+                         ("unexamined_agent", allow)):
         sid = "conformance_policy_" + name
         card = PolicyCard(sid)
+        agent = "stub" if name == "unexamined_agent" else "omp"
         try:
             opened = request("acp.open", sid=sid, since=0,
-                             spawn={"agent": "stub", "cwd": cwd, "policy": policy})
+                             spawn={"agent": agent, "cwd": cwd, "policy": policy})
             attached = card.open()
             ready = attached and card.wait(lambda: card.since(0, wbctl.SETUP_END))
             t.check(f"policy ({name}): hub spawn installs and journals policy before requests",
@@ -597,8 +599,9 @@ def session_policy(t, h):
                 continue
 
             mark, permission = pending_turn(card)
-            if name in ("fallback", "programs_fallback"):
-                reason = "unlisted program" if name == "programs_fallback" else "unmatched roots"
+            if name in ("fallback", "programs_fallback", "unexamined_agent"):
+                reason = {"fallback": "unmatched roots", "programs_fallback": "unlisted program",
+                          "unexamined_agent": "unexamined agent execution"}[name]
                 t.check(f"policy: {reason} retains ordinary user resolution",
                         answer_turn(card, mark, permission), repr(card.result))
                 replay_policy(card, policy)
@@ -653,7 +656,7 @@ def session_policy(t, h):
             old_epoch = card.epoch()
             forgotten = request("acp.kill", sid=sid, forget=True)
             reborn = request("acp.open", sid=sid, since=0,
-                             spawn={"agent": "stub", "cwd": cwd, "policy": allow})
+                             spawn={"agent": "omp", "cwd": cwd, "policy": allow})
             stale = set_policy(card, reject, epoch=old_epoch)
             t.check("policy: a prior incarnation cannot replace a recreated session's policy",
                     forgotten.get("t") == "ok" and reborn.get("t") == "ok"
@@ -668,7 +671,7 @@ def session_policy(t, h):
     sid = "conformance_policy_relay"
     card = PolicyCard(sid)
     try:
-        card.send("open", id=sid, since=0, agent="stub", cwd=cwd, policy=allow)
+        card.send("open", id=sid, since=0, agent="omp", cwd=cwd, policy=allow)
         opened = card.wait(lambda: card.result["replayed"] is not None)
         ready = opened and card.wait(lambda: card.since(0, wbctl.SETUP_END))
         t.check("policy: /acp spawning open forwards policy to the hub",
