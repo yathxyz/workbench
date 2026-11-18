@@ -999,6 +999,10 @@ async fn malformed_spawn_and_attach_policies_are_rejected_before_open() {
         json!({"rules": [{
             "action": "allow", "command": {"matches": ["x".repeat(4097)]}
         }]}),
+        json!({"rules": [{"action":"allow", "roots":[format!("/{}", "r".repeat(4096))]}]}),
+        json!({"rules": [{"action":"allow", "roots":vec![format!("/{}", "r".repeat(4095));64]}]}),
+        json!({"rules": [{"action":"allow", "command":{"notMatches":["a[a-z]{3637}0"]}}]}),
+        json!({"rules": [{"action":"allow", "command":{"notMatches":["[ab]*a[ab]{3635}c"]}}]}),
         json!({"rules": [{
             "action": "allow", "command": {"matches": vec!["x"; 129]}
         }]}),

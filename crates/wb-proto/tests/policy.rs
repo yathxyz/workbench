@@ -26,13 +26,13 @@ fn call(kind: &str, paths: &[&str], command: &str) -> Value {
 }
 
 fn compiled(rules: Value) -> CompiledPolicy {
-    CompiledPolicy::new(&policy(rules), "/work/project").unwrap()
+    CompiledPolicy::new(&policy(rules), "/work/project", true).unwrap()
 }
 
 #[test]
 fn default_empty_policy_asks() {
     assert!(Policy::default().rules.is_empty());
-    let empty = CompiledPolicy::new(&Policy::default(), "/work").unwrap();
+    let empty = CompiledPolicy::new(&Policy::default(), "/work", true).unwrap();
     assert_eq!(empty.decide(&call("read", &["file"], ""), &options()), None);
 }
 
@@ -111,15 +111,8 @@ fn policy_validation_bounds_and_regex_syntax() {
     for pattern in ["[".to_owned(), "a".repeat(POLICY_PATTERN_MAX + 1)] {
         let invalid = policy(json!([{"action":"allow", "command":{"matches":[pattern]}}]));
         assert!(invalid.validate().is_err());
-        assert!(CompiledPolicy::new(&invalid, "/work").is_err());
+        assert!(CompiledPolicy::new(&invalid, "/work", true).is_err());
     }
-    assert!(
-        policy(json!([{
-            "action":"allow", "command":{"matches":["a".repeat(POLICY_PATTERN_MAX)]}
-        }]))
-        .validate()
-        .is_ok()
-    );
     let at_limit = policy(json!([
         {"action":"allow", "command":{"matches":vec!["x"; 64]}},
         {"action":"reject", "command":{"notMatches":vec!["y"; 64]}}
@@ -131,7 +124,7 @@ fn policy_validation_bounds_and_regex_syntax() {
     ]));
     assert!(over_limit.validate().is_err());
     for cwd in ["", "relative", "/work\0"] {
-        assert!(CompiledPolicy::new(&Policy::default(), cwd).is_err());
+        assert!(CompiledPolicy::new(&Policy::default(), cwd, true).is_err());
     }
 }
 
@@ -169,8 +162,12 @@ fn relative_paths_and_parent_components_are_lexical() {
         p.decide(&call("read", &["src/a", "/etc/passwd"], ""), &options()),
         None
     );
-    let root =
-        CompiledPolicy::new(&policy(json!([{"action":"allow", "roots":["/"]}])), "/work").unwrap();
+    let root = CompiledPolicy::new(
+        &policy(json!([{"action":"allow", "roots":["/"]}])),
+        "/work",
+        true,
+    )
+    .unwrap();
     assert!(
         root.decide(&call("read", &["/../../etc/passwd"], ""), &options())
             .is_some()
@@ -426,6 +423,7 @@ fn review_commands_with_outside_or_unresolved_paths_ask() {
     let p = CompiledPolicy::new(
         &policy(json!([{"action":"allow", "roots":["$cwd", "/nix/store", "/tmp"]}])),
         "/home/u/proj",
+        true,
     )
     .unwrap();
     let commands = [
@@ -711,6 +709,7 @@ fn second_review_shell_semantics_bypasses_ask() {
         let p = CompiledPolicy::new(
             &policy(json!([{"action":"allow", "roots":["$cwd", "/tmp", "/bin"]}])),
             cwd,
+            true,
         )
         .unwrap();
         if p.decide(&call("execute", &["."], command), &options())
@@ -738,6 +737,7 @@ fn delimiter_fragments_do_not_replace_the_whole_path() {
     let p = CompiledPolicy::new(
         &policy(json!([{"action":"allow", "roots":["$cwd", "/tmp"]}])),
         "/home/u/proj",
+        true,
     )
     .unwrap();
     for delimiter in ['=', ':', ','] {
@@ -976,7 +976,7 @@ fn programs_validate_names_and_byte_bounds_before_compilation() {
         if let Ok(p) = serde_json::from_value::<Policy>(wire) {
             assert!(p.validate().is_err(), "{programs}");
             assert!(
-                CompiledPolicy::new(&p, "/work/project").is_err(),
+                CompiledPolicy::new(&p, "/work/project", true).is_err(),
                 "{programs}"
             );
         }
@@ -984,7 +984,7 @@ fn programs_validate_names_and_byte_bounds_before_compilation() {
     let p =
         policy(json!([{"action":"allow", "programs":["x", "é".repeat(POLICY_PROGRAM_MAX / 2)]}]));
     assert!(p.validate().is_ok());
-    assert!(CompiledPolicy::new(&p, "/work/project").is_ok());
+    assert!(CompiledPolicy::new(&p, "/work/project", true).is_ok());
 }
 
 #[test]
@@ -999,7 +999,7 @@ fn third_review_printf_formats_ask_with_and_without_programs() {
         if let Some(programs) = programs {
             rule["programs"] = programs;
         }
-        let p = CompiledPolicy::new(&policy(json!([rule])), "/var/tmp/project").unwrap();
+        let p = CompiledPolicy::new(&policy(json!([rule])), "/var/tmp/project", true).unwrap();
         let mut allowed = Vec::new();
         for format in [
             "%'n", "%#n", "%-5n", "%.3n", "%*n", "%ln", "%(s)T", "%", "%5%", "%*3d", "%1*d",
@@ -1331,15 +1331,15 @@ fn root_bytes_and_expanded_regex_size_are_bounded_before_installation() {
     ] {
         let invalid = policy(json!([{"action":"allow", "roots":[root]}]));
         assert!(invalid.validate().is_err());
-        assert!(CompiledPolicy::new(&invalid, "/work/project").is_err());
+        assert!(CompiledPolicy::new(&invalid, "/work/project", true).is_err());
     }
     let boundary = policy(json!([{"action":"allow",
         "roots":[format!("/{}", "r".repeat(POLICY_ROOT_MAX - 1))]}]));
     assert!(boundary.validate().is_ok());
-    assert!(CompiledPolicy::new(&boundary, "/work/project").is_ok());
+    assert!(CompiledPolicy::new(&boundary, "/work/project", true).is_ok());
     let patterns: Vec<String> = (0..128).map(|i| format!("\\w{{120}}x{i}")).collect();
     let invalid = policy(json!([{"action":"allow", "kinds":["execute"],
         "command":{"notMatches":patterns}}]));
     assert!(invalid.validate().is_err());
-    assert!(CompiledPolicy::new(&invalid, "/work/project").is_err());
+    assert!(CompiledPolicy::new(&invalid, "/work/project", true).is_err());
 }

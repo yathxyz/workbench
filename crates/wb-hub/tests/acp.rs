@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-#[cfg(debug_assertions)]
 use common::acp::stub;
 use common::acp::{fold_equals_live, group_members};
 use common::fake::{Agent, text_of, updates};
@@ -1126,6 +1125,101 @@ fn hub_policy_leaves_post_cancel_requests_pending_only_for_that_turn() {
     assert_eq!(auto["outcome"]["optionId"], "allow-once");
     assert!(!events.iter().any(|e| e["e"] == "permission"));
     assert_eq!(c.summary("cancelled")["acp"]["pending"], json!([]));
+}
+
+#[test]
+fn hub_policy_leaves_permissions_outside_every_turn_pending() {
+    let hub = Hub::with_scenarios(&[]);
+    let mut c = hub.connect();
+    for action in ["allow", "reject"] {
+        for cancelled in [false, true] {
+            let sid = format!("outside_{action}_{cancelled}");
+            let policy =
+                json!({"rules":[{"action":action, "roots":["$cwd"], "programs":["cargo"]}]});
+            let opened = policy_ready(&mut c, &hub, &sid, policy);
+            let prompt = if cancelled {
+                "omp-after-cancel outside"
+            } else {
+                "omp-outside-turn"
+            };
+            assert_eq!(c.acp_prompt(&sid, prompt)["t"], "ok");
+            if cancelled {
+                c.ok(json!({"t":"acp.cancel", "sid":sid}));
+            }
+            // The agent writes its prompt response before sending this permission.
+            let events = c.events_until(&sid, "permission");
+            let ended = events.iter().find(|ev| ev["e"] == "turn_end").unwrap();
+            assert_eq!(
+                ended["stopReason"],
+                if cancelled { "cancelled" } else { "end_turn" }
+            );
+            assert!(!events.iter().any(|ev| ev["e"] == "permission_auto"));
+            let pending = events.last().unwrap();
+            let summary = c.summary(&sid);
+            assert_eq!(summary["acp"]["activity"], "none");
+            assert_eq!(summary["acp"]["pending"][0]["req"], pending["seq"]);
+            assert_eq!(
+                permit(&mut c, &sid, &pending["seq"], epoch(&opened), "reject-once")["t"],
+                "ok"
+            );
+            assert_eq!(c.event(&sid, "permission_resolved")["by"], "user");
+            assert_eq!(c.acp_prompt(&sid, "omp-permission")["t"], "ok");
+            let events = c.events_until(&sid, "turn_end");
+            let auto = events
+                .iter()
+                .find(|ev| ev["e"] == "permission_auto")
+                .unwrap();
+            assert_eq!(auto["policy"]["action"], action);
+            assert_eq!(c.summary(&sid)["acp"]["pending"], json!([]));
+        }
+    }
+}
+
+#[test]
+fn hub_policy_uses_the_configured_agent_not_the_sid_for_cwd_reset() {
+    let hub = Hub::with_scenarios_and(&[], |cfg| stub(cfg, "omp", &[]));
+    let mut c = hub.connect();
+    for (agent, sid) in [("omp", "not_omp"), ("stub", "omp")] {
+        let policy =
+            json!({"rules":[{"action":"allow", "roots":["$cwd"], "programs":["cd","cargo"]}]});
+        let opened = c.ok(json!({"t":"acp.open", "sid":sid, "since":0,
+            "spawn":{"agent":agent, "cwd":hub.home(), "policy":policy}}));
+        c.event(sid, "session");
+        // Exercise compilation both at spawn and on a later replacement.
+        for replace in [false, true] {
+            if replace {
+                c.ok(json!({"t":"acp.set_policy", "sid":sid, "epoch":epoch(&opened), "policy":policy}));
+            }
+            assert_eq!(c.acp_prompt(sid, "omp-permission cd")["t"], "ok");
+            if agent == "omp" {
+                let auto = c.event(sid, "permission_auto");
+                assert_eq!(
+                    auto["toolCall"]["rawInput"]["command"],
+                    "cd src && cargo test"
+                );
+            } else {
+                let pending = c.event(sid, "permission");
+                assert_eq!(
+                    permit(&mut c, sid, &pending["seq"], epoch(&opened), "reject-once")["t"],
+                    "ok"
+                );
+            }
+            c.event(sid, "turn_end");
+            assert_eq!(c.acp_prompt(sid, "omp-permission same-cwd")["t"], "ok");
+            assert_eq!(
+                c.event(sid, "permission_auto")["outcome"]["optionId"],
+                "allow-once"
+            );
+            c.event(sid, "turn_end");
+            assert_eq!(c.acp_prompt(sid, "omp-permission")["t"], "ok");
+            assert_eq!(
+                c.event(sid, "permission_auto")["outcome"]["optionId"],
+                "allow-once"
+            );
+            c.event(sid, "turn_end");
+            assert_eq!(c.summary(sid)["acp"]["pending"], json!([]));
+        }
+    }
 }
 
 #[test]

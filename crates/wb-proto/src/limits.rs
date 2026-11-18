@@ -26,6 +26,8 @@ pub const ACP_REPLAY_MAX: usize = 4 * MIB;
 pub const PROMPT_MAX: usize = 8 * MIB;
 /// Most ordered configuration entries in an ACP spawn. Larger is `bad_request`.
 pub const ACP_CONFIG_MAX: usize = 16;
+/// Largest serialized permission policy; excess is `bad_request`.
+pub const POLICY_MAX: usize = 256 * KIB;
 /// Most ordered rules in a session permission policy; excess is `bad_request`.
 pub const POLICY_RULES_MAX: usize = 64;
 /// Most command regular expressions across one policy; excess is `bad_request`.
@@ -33,7 +35,7 @@ pub const POLICY_PATTERNS_MAX: usize = 128;
 /// Most UTF-8 bytes in one command regular expression.
 pub const POLICY_PATTERN_MAX: usize = 4096;
 /// Largest compiled command regular expression; excess is `bad_request`.
-pub const POLICY_REGEX_SIZE_MAX: usize = 256 * KIB;
+pub const POLICY_REGEX_SIZE_MAX: usize = 64 * KIB;
 /// Most UTF-8 bytes in one permission root.
 pub const POLICY_ROOT_MAX: usize = 4096;
 /// Most roots, tool kinds or programs in one permission rule.
@@ -44,6 +46,10 @@ pub const POLICY_KIND_MAX: usize = 64;
 pub const POLICY_PROGRAM_MAX: usize = 256;
 /// Largest command eligible for automatic policy evaluation; excess asks.
 pub const POLICY_COMMAND_MAX: usize = 64 * KIB;
+/// Largest raw command evaluated by regex conditions; excess asks at that rule.
+pub const POLICY_REGEX_COMMAND_MAX: usize = 8 * KIB;
+/// Deadline checked before every regex evaluation; expiration asks at that rule.
+pub const POLICY_DECISION_TIMEOUT: Duration = Duration::from_millis(100);
 /// Most shell words, including redirection targets; excess asks.
 pub const POLICY_COMMAND_WORDS_MAX: usize = 1024;
 /// Most path candidate resolutions, including reported locations; excess asks.

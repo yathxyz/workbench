@@ -321,7 +321,7 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
     let policy = facts
         .policy
         .as_ref()
-        .map(|policy| CompiledPolicy::new(policy, &meta.cwd))
+        .map(|policy| CompiledPolicy::new(policy, &meta.cwd, meta.agent == "omp"))
         .transpose()
         .map_err(anyhow::Error::msg)?;
     let (appended, fault) = match journal.normalise(&mut facts, now_ms()) {
@@ -896,7 +896,7 @@ impl Acp {
         self.policy = match spawn
             .policy
             .as_ref()
-            .map(|policy| CompiledPolicy::new(policy, &spawn.cwd))
+            .map(|policy| CompiledPolicy::new(policy, &spawn.cwd, spawn.agent == "omp"))
             .transpose()
         {
             Ok(policy) => policy,
@@ -1630,7 +1630,8 @@ impl Acp {
         if self.fault.is_some() {
             return reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
         }
-        let compiled = match CompiledPolicy::new(&policy, &self.meta.cwd) {
+        let compiled = match CompiledPolicy::new(&policy, &self.meta.cwd, self.meta.agent == "omp")
+        {
             Ok(compiled) => compiled,
             Err(message) => return reply.err(ErrorCode::BadRequest, message),
         };
@@ -2403,7 +2404,7 @@ impl Acp {
                     .unwrap_or_default();
                 let decision = params
                     .get("sessionId")
-                    .filter(|_| !self.turn_cancelled || self.facts.activity != Activity::Turn)
+                    .filter(|_| self.facts.activity == Activity::Turn && !self.turn_cancelled)
                     .and_then(Value::as_str)
                     .is_some_and(|session| Some(session) == self.facts.agent_session_id.as_deref())
                     .then(|| self.policy.as_ref()?.decide(&tool_call, &options))

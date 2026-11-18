@@ -47,7 +47,8 @@ enum Token<'a> {
 #[derive(Default)]
 struct Simple<'a> {
     args: Vec<Word<'a>>,
-    redirects: Vec<Cow<'a, str>>,
+    redirects: Vec<(&'static str, Cow<'a, str>)>,
+    command_word: bool,
 }
 
 struct Pipeline<'a> {
@@ -145,6 +146,7 @@ pub(super) fn evidence<'a>(
     session_cwd: &Path,
     command_cwd: Option<&str>,
     render: bool,
+    resets_cwd: bool,
 ) -> Option<Evidence<'a>> {
     if (command.is_none() && locations.is_empty()) || locations.len() > POLICY_PATHS_MAX {
         return None;
@@ -198,6 +200,9 @@ pub(super) fn evidence<'a>(
                     let executable = i == index && word.contains('/');
                     let next = paths.word(&word, &dirs, (cd && i == 1) || executable)?;
                     if cd && i == 1 {
+                        if !resets_cwd && next != dirs {
+                            return None;
+                        }
                         changed = Some(next);
                     } else if executable {
                         programs.extend(next.into_iter().map(Program::Path));
@@ -205,7 +210,7 @@ pub(super) fn evidence<'a>(
                         programs.insert(Program::Name(word));
                     }
                 }
-                for word in &simple.redirects {
+                for (_, word) in &simple.redirects {
                     paths.word(word, &dirs, false)?;
                 }
             }
@@ -336,6 +341,7 @@ fn classify(simple: &Simple<'_>) -> Option<(usize, bool)> {
             || simple.args.len() != 2
             || simple.args[1].text.is_empty()
             || simple.args[1].text.starts_with('-')
+            || simple.args[1].text.starts_with('@')
             || simple.args[1].text.contains(['*', '?', '[', ']'])
         {
             return None;
@@ -396,21 +402,23 @@ fn printing_format(args: &[Word<'_>]) -> Option<()> {
     Some(())
 }
 
+fn render_simple(simple: &Simple<'_>, rendered: &mut String) {
+    for word in simple.args.iter().map(|word| word.text.as_ref()).chain(
+        simple
+            .redirects
+            .iter()
+            .flat_map(|(operator, target)| [*operator, target.as_ref()]),
+    ) {
+        if !rendered.is_empty() {
+            rendered.push(' ');
+        }
+        rendered.push_str(word);
+    }
+}
+
 fn parse(command: &str, render: bool) -> Option<(Vec<Pipeline<'_>>, Option<String>)> {
     let tokens = tokenize(command)?;
-    let canonical = render.then(|| {
-        let mut rendered = String::with_capacity(command.len() + tokens.len());
-        for (index, token) in tokens.iter().enumerate() {
-            if index != 0 {
-                rendered.push(' ');
-            }
-            rendered.push_str(match token {
-                Token::Word(word) => &word.text,
-                Token::Redirect(operator) | Token::Separator(_, operator) => operator,
-            });
-        }
-        rendered
-    });
+    let mut canonical = render.then(|| String::with_capacity(command.len() + tokens.len()));
     let mut tokens = tokens.into_iter();
     let mut pipelines = Vec::new();
     let mut commands = Vec::new();
@@ -418,12 +426,19 @@ fn parse(command: &str, render: bool) -> Option<(Vec<Pipeline<'_>>, Option<Strin
     let mut required = false;
     while let Some(token) = tokens.next() {
         match token {
-            Token::Word(word) => simple.args.push(word),
-            Token::Redirect(_) => match tokens.next()? {
-                Token::Word(word) => simple.redirects.push(word.text),
+            Token::Word(word) => {
+                // omp's embedded shell treats an assignment after a leading redirect as argv[0].
+                if !simple.command_word && !simple.redirects.is_empty() && assignment(&word.text) {
+                    return None;
+                }
+                simple.command_word |= !word.assignment;
+                simple.args.push(word);
+            }
+            Token::Redirect(operator) => match tokens.next()? {
+                Token::Word(word) => simple.redirects.push((operator, word.text)),
                 _ => return None,
             },
-            Token::Separator(separator, _) => {
+            Token::Separator(separator, operator) => {
                 if simple.args.is_empty() {
                     if !simple.redirects.is_empty() {
                         return None;
@@ -433,6 +448,11 @@ fn parse(command: &str, render: bool) -> Option<(Vec<Pipeline<'_>>, Option<Strin
                         continue;
                     }
                     return None;
+                }
+                if let Some(rendered) = &mut canonical {
+                    render_simple(&simple, rendered);
+                    rendered.push(' ');
+                    rendered.push_str(operator);
                 }
                 commands.push(std::mem::take(&mut simple));
                 required = separator != Separator::Always;
@@ -446,6 +466,9 @@ fn parse(command: &str, render: bool) -> Option<(Vec<Pipeline<'_>>, Option<Strin
         }
     }
     if !simple.args.is_empty() {
+        if let Some(rendered) = &mut canonical {
+            render_simple(&simple, rendered);
+        }
         commands.push(simple);
     } else if required || !simple.redirects.is_empty() {
         return None;

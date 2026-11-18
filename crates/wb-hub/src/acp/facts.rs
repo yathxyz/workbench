@@ -139,7 +139,9 @@ impl Facts {
                 }
             }
             EventBody::Policy { policy } => {
-                self.policy = (!policy.rules.is_empty()).then(|| policy.clone());
+                if policy.validate().is_ok() {
+                    self.policy = (!policy.rules.is_empty()).then(|| policy.clone());
+                }
             }
             EventBody::Exit { .. } => {
                 self.activity = Activity::None;
@@ -305,6 +307,37 @@ mod tests {
             f.apply(&ev(i as u64 + 1, b));
         }
         f
+    }
+
+    #[test]
+    fn invalid_policy_events_preserve_the_last_good_policy_on_replay() {
+        let good: Policy = serde_json::from_value(json!({"rules":[{"action":"ask"}]})).unwrap();
+        let oversized: Policy = serde_json::from_value(json!({"rules":[
+            {"action":"allow", "roots":vec![format!("/{}", "r".repeat(4095));64]}
+        ]}))
+        .unwrap();
+        let malformed: Policy = serde_json::from_value(json!({"rules":[
+            {"action":"allow", "command":{"matches":["["]}}
+        ]}))
+        .unwrap();
+        assert!(serde_json::to_vec(&oversized).unwrap().len() > wb_proto::limits::POLICY_MAX);
+        for invalid in [oversized, malformed] {
+            let bad = EventBody::Policy { policy: invalid };
+            assert_eq!(fold(vec![bad.clone()]).policy, None);
+            let mut facts = fold(vec![EventBody::Policy {
+                policy: good.clone(),
+            }]);
+            facts.apply(&ev(2, bad));
+            assert_eq!(facts.policy.as_ref(), Some(&good));
+            assert_eq!(facts.head_seq, 2);
+            facts.apply(&ev(
+                3,
+                EventBody::Policy {
+                    policy: Policy::default(),
+                },
+            ));
+            assert_eq!(facts.policy, None);
+        }
     }
 
     fn spawn() -> EventBody {

@@ -6,7 +6,9 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -15,9 +17,9 @@ use serde_json::Value;
 mod command;
 
 use crate::limits::{
-    POLICY_KIND_MAX, POLICY_PATH_CHECKS_MAX, POLICY_PATTERN_MAX, POLICY_PATTERNS_MAX,
-    POLICY_PROGRAM_MAX, POLICY_REGEX_SIZE_MAX, POLICY_ROOT_MAX, POLICY_RULES_MAX,
-    POLICY_SELECTORS_MAX,
+    POLICY_DECISION_TIMEOUT, POLICY_KIND_MAX, POLICY_MAX, POLICY_PATH_CHECKS_MAX,
+    POLICY_PATTERN_MAX, POLICY_PATTERNS_MAX, POLICY_PROGRAM_MAX, POLICY_REGEX_COMMAND_MAX,
+    POLICY_REGEX_SIZE_MAX, POLICY_ROOT_MAX, POLICY_RULES_MAX, POLICY_SELECTORS_MAX,
 };
 
 /// Additional execute input members whose values do not change command interpretation.
@@ -102,6 +104,7 @@ pub struct CompiledPolicy {
     rules: Vec<CompiledRule>,
     cwd: PathBuf,
     render: bool,
+    resets_cwd: bool,
 }
 
 #[derive(Debug)]
@@ -127,6 +130,9 @@ impl Policy {
     fn check_bounds(&self) -> Result<(), String> {
         if self.rules.len() > POLICY_RULES_MAX {
             return Err(format!("policy has more than {POLICY_RULES_MAX} rules"));
+        }
+        if serde_json::to_writer(PolicyBytes(POLICY_MAX), self).is_err() {
+            return Err(format!("policy exceeds {POLICY_MAX} serialized bytes"));
         }
         let mut patterns = 0;
         for (index, rule) in self.rules.iter().enumerate() {
@@ -180,7 +186,7 @@ impl Policy {
 }
 
 impl CompiledPolicy {
-    pub fn new(policy: &Policy, cwd: &str) -> Result<Self, String> {
+    pub fn new(policy: &Policy, cwd: &str, resets_cwd: bool) -> Result<Self, String> {
         policy.check_bounds()?;
         if !valid_text(cwd) || !Path::new(cwd).is_absolute() {
             return Err("policy cwd must be an absolute path without NUL".into());
@@ -231,12 +237,27 @@ impl CompiledPolicy {
         let render = rules
             .iter()
             .any(|rule| !rule.matches.is_empty() || !rule.not_matches.is_empty());
-        Ok(Self { rules, cwd, render })
+        Ok(Self {
+            rules,
+            cwd,
+            render,
+            resets_cwd,
+        })
     }
 
     /// First matching rule wins. `None` means ask, including a matching `ask` rule
     /// or an unavailable once-only option; neither falls through to later rules.
+    /// `resets_cwd` at compilation identifies agents that restart cwd for each call.
     pub fn decide(&self, tool_call: &Value, options: &[Value]) -> Option<Decision> {
+        self.decide_until(tool_call, options, Instant::now() + POLICY_DECISION_TIMEOUT)
+    }
+
+    fn decide_until(
+        &self,
+        tool_call: &Value,
+        options: &[Value],
+        deadline: Instant,
+    ) -> Option<Decision> {
         let call = tool_call.as_object()?;
         nonempty_string(call.get("toolCallId")?)?;
         nonempty_string(call.get("title")?)?;
@@ -254,7 +275,7 @@ impl CompiledPolicy {
                 return None;
             }
             let cwd = match input.get("cwd") {
-                Some(value) => Some(nonempty_string(value)?),
+                Some(value) => Some(plain_cwd(value)?),
                 None => None,
             };
             (Some(nonempty_string(input.get("command")?)?), cwd)
@@ -269,7 +290,14 @@ impl CompiledPolicy {
             (None, None)
         };
         let locations = call.get("locations")?.as_array()?;
-        let evidence = command::evidence(command, locations, &self.cwd, cwd, self.render)?;
+        let evidence = command::evidence(
+            command,
+            locations,
+            &self.cwd,
+            cwd,
+            self.render,
+            self.resets_cwd,
+        )?;
         let (allow, reject) = once_options(options)?;
         let mut checks = POLICY_PATH_CHECKS_MAX;
         for (index, rule) in self.rules.iter().enumerate() {
@@ -302,23 +330,30 @@ impl CompiledPolicy {
                 }
             }
             if let Some(raw) = command
-                && self.render
+                && (!rule.matches.is_empty() || !rule.not_matches.is_empty())
             {
+                if raw.len() > POLICY_REGEX_COMMAND_MAX {
+                    return None;
+                }
                 let canonical = evidence.canonical.as_deref()?;
                 let allow = rule.action == Action::Allow;
-                if !rule.matches.iter().all(|pattern| {
-                    if allow {
-                        pattern.is_match(raw) && pattern.is_match(canonical)
-                    } else {
-                        pattern.is_match(raw) || pattern.is_match(canonical)
+                let mut matched = true;
+                for pattern in &rule.matches {
+                    if !matches_texts(pattern, raw, canonical, allow, deadline)? {
+                        matched = false;
+                        break;
                     }
-                }) || rule.not_matches.iter().any(|pattern| {
-                    if allow {
-                        pattern.is_match(raw) || pattern.is_match(canonical)
-                    } else {
-                        pattern.is_match(raw) && pattern.is_match(canonical)
+                }
+                if !matched {
+                    continue;
+                }
+                for pattern in &rule.not_matches {
+                    if matches_texts(pattern, raw, canonical, !allow, deadline)? {
+                        matched = false;
+                        break;
                     }
-                }) {
+                }
+                if !matched {
                     continue;
                 }
             }
@@ -335,6 +370,55 @@ impl CompiledPolicy {
         }
         None
     }
+}
+
+struct PolicyBytes(usize);
+
+impl Write for PolicyBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
+            .ok_or_else(|| io::Error::other("policy exceeds serialized byte limit"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn matches_texts(
+    pattern: &Regex,
+    raw: &str,
+    canonical: &str,
+    both: bool,
+    deadline: Instant,
+) -> Option<bool> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let matched = pattern.is_match(raw);
+    if matched != both {
+        return Some(matched);
+    }
+    if Instant::now() >= deadline {
+        return None;
+    }
+    Some(pattern.is_match(canonical))
+}
+
+fn plain_cwd(value: &Value) -> Option<&str> {
+    let cwd = nonempty_string(value)?;
+    let scheme = cwd.split_once(':').is_some_and(|(prefix, _)| {
+        let mut bytes = prefix.bytes();
+        bytes.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+            && bytes.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'+' | b'.' | b'-'))
+    });
+    (!cwd.starts_with(['~', '@', ':'])
+        && !scheme
+        && cwd.bytes().all(|ch| (b' '..=b'~').contains(&ch)))
+    .then_some(cwd)
 }
 
 fn compile_patterns(command: Option<&CommandPatterns>) -> Result<(Vec<Regex>, Vec<Regex>), String> {
@@ -436,4 +520,49 @@ pub(crate) fn deserialize_optional_policy<'de, D: Deserializer<'de>>(
 
 pub(crate) fn optional_policy_is_empty(policy: &Option<Policy>) -> bool {
     policy.as_ref().is_none_or(|policy| policy.rules.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn expired_pattern_budget_asks_without_falling_through() {
+        let call = json!({"toolCallId":"c", "title":"t", "kind":"execute", "locations":[],
+            "rawInput":{"command":"echo safe"}});
+        let options = vec![
+            json!({"optionId":"yes", "name":"Allow", "kind":"allow_once"}),
+            json!({"optionId":"no", "name":"Reject", "kind":"reject_once"}),
+        ];
+        let expired = Instant::now() - POLICY_DECISION_TIMEOUT;
+        for action in ["allow", "reject", "ask"] {
+            for field in ["matches", "notMatches"] {
+                let mut rule = json!({"action":action, "command":{}});
+                rule["command"][field] = json!(["never"]);
+                let policy =
+                    serde_json::from_value(json!({"rules":[rule, {"action":"allow"}]})).unwrap();
+                let compiled = CompiledPolicy::new(&policy, "/work", true).unwrap();
+                assert_eq!(compiled.decide_until(&call, &options, expired), None);
+            }
+        }
+        for first in [
+            json!({"action":"allow"}),
+            json!({"action":"allow", "command":{}}),
+            json!({"action":"reject", "kinds":["read"], "command":{"matches":["x"]}}),
+            json!({"action":"reject", "programs":["git"], "command":{"matches":["x"]}}),
+            json!({"action":"reject", "roots":["/elsewhere"], "command":{"matches":["x"]}}),
+        ] {
+            let policy =
+                serde_json::from_value(json!({"rules":[first, {"action":"allow"}]})).unwrap();
+            let compiled = CompiledPolicy::new(&policy, "/work", true).unwrap();
+            assert_eq!(
+                compiled
+                    .decide_until(&call, &options, expired)
+                    .unwrap()
+                    .action,
+                Action::Allow
+            );
+        }
+    }
 }

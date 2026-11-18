@@ -1401,6 +1401,10 @@ async fn invalid_policies_are_bad_bodies_before_any_hub_connection() {
         json!({"rules": [{
             "action": "allow", "kinds": ["execute"], "command": {"matches": ["x".repeat(4097)]}
         }]}),
+        json!({"rules": [{"action":"allow", "roots":[format!("/{}", "r".repeat(4096))]}]}),
+        json!({"rules": [{"action":"allow", "roots":vec![format!("/{}", "r".repeat(4095));64]}]}),
+        json!({"rules": [{"action":"allow", "command":{"notMatches":["a[a-z]{3637}0"]}}]}),
+        json!({"rules": [{"action":"allow", "command":{"notMatches":["[ab]*a[ab]{3635}c"]}}]}),
         json!({"rules": vec![json!({"action": "ask"}); 65]}),
         json!({"rules": [{
             "action": "allow",
@@ -1497,7 +1501,7 @@ async fn spawn_policy_bodies_accept_valid_conditions_and_boundary_values() {
         }]}),
         json!({"rules": [{
             "action": "allow", "kinds": ["execute"],
-            "command": {"matches": ["x".repeat(4096)], "notMatches": vec!["y"; 127]}
+            "command": {"matches": vec!["x"; 64], "notMatches": vec!["y"; 64]}
         }]}),
     ];
     for policy in policies {
