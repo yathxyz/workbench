@@ -788,12 +788,14 @@ interface ClipItems { v: 1; cards: CopiedCard[]; strokes: Stroke[]; shapes: Shap
 interface EdwinBuffer {
   id: string; name: string; text: string; mode: string;
   pt: number; mark: number | null; markActive: boolean;
+  rope: { length: number; slice(from: number, to: number): string };
+  undo: unknown[]; redo: unknown[]; pendingUndo: unknown;
   shared: boolean; sver: number; ver: number; modified: boolean;
   meta: { anchors?: PageAnchor[]; [k: string]: unknown };
   inflight?: unknown; queue?: unknown[]; sync?: { gCount?: number };
 }
 /* An Edwin window inside a frame. */
-interface EdwinWindow { buffer: EdwinBuffer; view: HTMLElement }
+interface EdwinWindow { buffer: EdwinBuffer; view: HTMLElement; start: number }
 /* An Edwin frame mounted in a page card (contentWindow and src are never set: they tell it from an iframe). */
 interface EdwinFrame {
   buffer: EdwinBuffer; focused: boolean; root: HTMLElement; wroot: unknown;
@@ -822,6 +824,7 @@ interface EdwinApi {
     applied?: (b: EdwinBuffer, ops: unknown[], origin: string) => unknown;
     wireWindow?: (w: EdwinWindow) => void;
     renderOverlay?: () => void;
+    postCommand?: (cmd: unknown, b: EdwinBuffer, failed: boolean) => void;
     beforeUserInit?: () => void;   // run by Ed.boot between the shipped Scheme files and the user's init.scm
   };
   Keymap: new (name?: string | null) => EdwinKeymap;

@@ -926,6 +926,7 @@ interface AcpToolLocation { path?: JsonValue; line?: JsonValue }
 type AcpLive = LiveEntry & { el: HTMLElement; hdr: HTMLElement; body: HTMLElement; logEl: HTMLElement; ta: HTMLTextAreaElement };
 interface AcpEditor { buf: EdwinBuffer; frame: EdwinFrame; root: HTMLElement }
 const ACP_COMPOSERS = new Set<AcpBackend>(), ACP_DRAFTS = new WeakMap<EdwinBuffer, AcpBackend>();
+const ACP_READERS = new WeakMap<EdwinBuffer, AcpBackend>();
 const PROMPT_MAX = 8388608;   // bytes of UTF-8 in one prompt's blocks (F-A17)
 const ACP_STATES = new Set<SessionState | undefined>(['idle', 'running', 'waiting_permission', 'waiting_input', 'done', 'error', 'exited', 'detached']);
 const ACP_BAD = new Set<SessionState | undefined>(['waiting_permission', 'waiting_input', 'error']);
@@ -937,6 +938,92 @@ const vtext = (v: unknown): string => (v == null ? '' : typeof v === 'string' ? 
 const blockText = (b: any): string => !b || typeof b !== 'object' ? '' : b.type === 'text' ? vtext(b.text) : b.type === 'image' ? '[image]' : b.type === 'audio' ? '[audio]'   // any: an ACP content block from the agent, read by duck typing
   : b.type === 'resource_link' ? vtext(b.name || b.uri) : b.type === 'resource' ? vtext(b.resource?.uri) : '';
 const urlHost = (u: JsonValue | undefined): string => { try { return new URL(u as string).host || 'the page'; } catch { return 'the page'; } };
+
+type AcpSplice = [pos: number, remove: number, insert: string];
+interface AcpRange { index: number; from: number; length: number; chars: number }
+const ACP_PAINT_BATCH = 64;
+function acpReaderField(text: string): string {
+  return text.replace(/\r\n|[\u0000-\u0008\u000b-\u001f\u007f\u2028\u2029]/g, c =>
+    c === '\r\n' ? '\n' : c === '\x7f' ? '␡' : c === '\u2028' ? '\\u2028' : c === '\u2029' ? '\\u2029' : String.fromCharCode(0x2400 + c.charCodeAt(0)));
+}
+const acpIndent = (text: string) => acpReaderField(text).replaceAll('\n', '\n  ');
+
+// The journal owns the items. Keep just their positions and the lengths of painted chunks, not a second text model.
+class AcpTranscript {
+  readonly ranges = new Map<AcpItem, AcpRange>();
+  end = 0;   // end of journal items, before the held-request lines
+  waiting = '';
+  readonly buf: EdwinBuffer;
+  readonly frame: EdwinFrame;
+  constructor(buf: EdwinBuffer, frame: EdwinFrame) { this.buf = buf; this.frame = frame; }
+  render(items: AcpItem[], dirty: Set<AcpItem>, pending: Map<number, AcpPending>, reset: boolean) {
+    const ops: AcpSplice[] = [], buf = this.buf;
+    // Leave an empty last line for Evil's G, which skips the virtual line after the final newline.
+    if (reset || !buf.rope.length) { ops.push([0, buf.rope.length, '\n']); this.ranges.clear(); this.end = 0; this.waiting = ''; }
+    const updates: { it: AcpItem; range: AcpRange }[] = [], added: AcpItem[] = [];
+    for (const it of dirty) {
+      const range = this.ranges.get(it);
+      if (range) updates.push({ it, range }); else added.push(it);
+      dirty.delete(it);
+      if (updates.length + added.length === ACP_PAINT_BATCH) break;
+    }
+    let delta = 0, i = 0;
+    for (const { it, range } of updates.sort((a, b) => a.range.index - b.range.index)) {
+      if (delta) for (; i < range.index; i++) this.ranges.get(items[i])!.from += delta;
+      i = range.index + 1;
+      const old = range.from;
+      range.from += delta;
+      if ('mid' in it) {   // a streamed message only grows, just before its closing newline
+        // CRLF may straddle chunks. Replace the trailing CR picture when its LF arrives.
+        const back = it.text[range.chars - 1] === '\r' && it.text[range.chars] === '\n' ? 1 : 0;
+        const text = acpIndent(it.text.slice(range.chars - back));
+        if (text) ops.push([range.from + range.length - 1 - back, back, text]);
+        range.length += text.length - back; range.chars = it.text.length; delta += text.length - back;
+      } else {
+        const text = acpReaderText(it);
+        const prev = buf.rope.slice(old, old + range.length);
+        if (prev === text) continue;
+        let pre = 0, suf = 0;
+        while (pre < prev.length && pre < text.length && prev[pre] === text[pre]) pre++;
+        while (suf < prev.length - pre && suf < text.length - pre && prev[prev.length - 1 - suf] === text[text.length - 1 - suf]) suf++;
+        ops.push([range.from + pre, prev.length - pre - suf, text.slice(pre, text.length - suf)]);
+        delta += text.length - range.length; range.length = text.length;
+      }
+    }
+    if (delta) for (; i < this.ranges.size; i++) this.ranges.get(items[i])!.from += delta;
+    this.end += delta;
+    if (added.length) {
+      const from = this.end, parts: string[] = [];
+      for (const it of added) {
+        const text = acpReaderText(it);
+        this.ranges.set(it, { index: this.ranges.size, from: this.end, length: text.length, chars: 'mid' in it ? it.text.length : 0 });
+        this.end += text.length; parts.push(text);
+      }
+      ops.push([from, 0, parts.join('')]);
+    }
+    let waiting = '';
+    for (const p of pending.values()) waiting += p.kind === 'permission' ? '· Permission: waiting\n' : '· Elicitation: waiting\n';
+    if (waiting !== this.waiting) { ops.push([this.end, this.waiting.length, waiting]); this.waiting = waiting; }
+    if (!ops.length) return;
+
+    // Edwin shifts point like an after-marker and does not shift window start. Keep the reader on the old text,
+    // except at EOF. Positions inside a replaced span retain their offset as far as the replacement permits.
+    const Ed = FR.Ed!, frame = this.frame, w = Ed.leaves(frame.wroot).find(w => w.buffer === buf);
+    let pt = frame.buffer === buf ? frame.point() : buf.pt, mark = buf.mark, start = w?.start ?? 0;
+    const tail = buf.rope.length - pt, follow = tail <= 1;
+    for (const [pos, n, text] of ops) {
+      const move = (p: number, after = false) => p < pos || (p === pos && !after) ? p
+        : p >= pos + n ? p + text.length - n : pos + Math.min(p - pos, text.length);
+      pt = move(pt); if (mark != null) mark = move(mark);
+      start = move(start, !follow && !n && text.endsWith('\n'));
+    }
+    Ed.applyOps(buf, ops, 'agent');
+    buf.mark = mark;
+    if (w) w.start = start;
+    if (frame.buffer === buf) frame.setPoint(follow ? buf.rope.length - tail : pt);
+  }
+}
+
 class AcpBackend implements CardBackend {
   declare n: AcpNode; declare L: AcpLive; declare spawn: boolean;
   declare seq: number; declare epoch: number | null; declare sum: SessionSummary | null; declare session: AcpSessionInfo;
@@ -950,13 +1037,18 @@ class AcpBackend implements CardBackend {
   declare ended?: number | null; declare cleared?: boolean; declare authNeeded?: boolean;
   declare modeSeen?: string; declare modeWanted?: string | null; declare planKey?: string; declare stateKey?: string;
   editor: AcpEditor | null = null;
+  transcript: AcpTranscript | null = null;
+  transcriptTried = false;
   editPrefix = 0;
-  constructor(n: AcpNode, L: AcpLive) {
+  readonly agents: boolean;
+  constructor(n: AcpNode, L: AcpLive, agents: boolean) {
+    this.agents = agents;
     this.n = n; this.L = L; this.spawn = !!n._spawn; delete n._spawn;   // spawn fields only for a card made in this page (SEC-2)
     this.seq = 0; this.epoch = null; this.sum = null; this.session = {}; this.tries = 0; this.rid = 0; this.rids = new Map();
     this.items = []; this.changed = new Set(); this.byMsg = new Map(); this.byTool = new Map(); this.pending = new Map(); this.waiting = new Map();
     this.panels = new Map(); this.draft = null; this.seenSent = 0;
     ACP_COMPOSERS.add(this); this.editorAvailability();
+    this.mountTranscript();
     this.connect();
   }
   get dead() { return this.gone || this.missing || !this.sum?.alive; }
@@ -1081,6 +1173,47 @@ class AcpBackend implements CardBackend {
     b.hidden = !frPromptAvailable();
     b.disabled = !!this.disposed || this.L.ta.disabled || this.draft != null || !!this.editor;
   }
+  mountTranscript() {
+    if (!this.agents || this.transcriptTried || this.disposed || !frPromptAvailable()) return;
+    this.transcriptTried = true;   // decide on the first ready transition, never after the user leaves a control
+    if (this.L.el.contains(document.activeElement) || this.editor
+        || [...this.pending.values()].some(p => p.kind === 'elicitation' && p.request.mode !== 'url')) return;
+    const Ed = FR.Ed!, L = FR.L!, host = el('div', 'ag-reader');
+    let buf: EdwinBuffer | null = null, frame: EdwinFrame | null = null;
+    try {
+      frTranscriptKeymap();
+      buf = L.call('get-buffer-create', [L.call('generate-new-buffer-name', [' *agent-transcript ' + this.n.id + '*'])]) as EdwinBuffer;
+      buf.mode = 'wb-agent-transcript-mode';
+      Object.defineProperty(buf, 'readOnly', { value: true, writable: false });
+      host.setAttribute('role', 'region'); host.setAttribute('aria-label', 'Agent transcript');
+      frame = Ed.makeFrame(host, { buffer: buf, kind: 'card', fontSize: FR_FONT });
+      $('.ed-input', host)!.setAttribute('aria-label', 'Agent transcript keyboard input');
+    } catch (e) {
+      this.destroyTranscript(buf, frame ?? Ed.E.frames.find(f => f.root === host) ?? null);
+      console.warn('agent transcript: Edwin frame not loaded', e);
+      return;
+    }
+    this.transcript = new AcpTranscript(buf, frame);
+    ACP_READERS.set(buf, this);
+    this.L.logEl.replaceWith(host);
+    this.L.logEl.replaceChildren();
+    for (const it of this.items) delete it.el;
+    this.changed = new Set(this.items);
+    this.schedule();
+  }
+  destroyTranscript(buf: EdwinBuffer | null, frame: EdwinFrame | null) {
+    try { frame?.destroy(); } catch (e) { console.warn('agent transcript: could not destroy frame', e); }
+    if (buf) {
+      ACP_READERS.delete(buf);
+      try { if (FR.Ed!.E.buffers.includes(buf)) FR.L!.call('kill-buffer', [buf]); } catch (e) { console.warn('agent transcript: could not kill buffer', e); }
+    }
+  }
+  fallbackTranscript(reader: AcpTranscript) {
+    this.transcript = null;
+    this.destroyTranscript(reader.buf, reader.frame);
+    reader.frame.root.replaceWith(this.L.logEl);
+    this.changed = new Set(this.items);
+  }
   composerKey(e: KeyboardEvent): boolean {
     if (!frPromptAvailable() || e.isComposing) { this.editPrefix = 0; return false; }
     if (e.key === 'Control') return false;   // releasing Ctrl between the two chords keeps the prefix
@@ -1166,7 +1299,14 @@ class AcpBackend implements CardBackend {
     this.dispose();
     if (!ended) new Reap('/acp', { t: 'open', id: this.n.id, since: this.seq }, { t: 'kill', forget: true }, (m: Extract<AcpServerMsg, { t: 'hello' }>) => epoch == null || m.info?.createdAt === epoch);
   }
-  stop() { this.disposed = true; this.finishPrompt(false, false); ACP_COMPOSERS.delete(this); clearTimeout(this.timer); WAKE.delete(this); cancelAnimationFrame(this.raf!); }
+  stop() {
+    this.disposed = true;
+    ACP_COMPOSERS.delete(this); clearTimeout(this.timer); WAKE.delete(this); cancelAnimationFrame(this.raf!);
+    try { this.finishPrompt(false, false); } finally {
+      const reader = this.transcript;
+      if (reader) { this.transcript = null; this.destroyTranscript(reader.buf, reader.frame); reader.frame.root.remove(); }
+    }
+  }
   dispose() { this.stop(); try { this.ws?.close(); } catch {} }   // the card went in another tab: close here, the session is not ours to end
   maybeSeen() {   // seen only when the user can see the result (§3.4.6)
     const s = this.sum, a = s?.acp;
@@ -1268,11 +1408,25 @@ class AcpBackend implements CardBackend {
   schedule() { if (!this.raf && !this.disposed) this.raf = requestAnimationFrame(() => { this.raf = 0; this.render(); }); }
   render() {
     const L = this.L, log = L.logEl; if (this.disposed || !log) return;
-    const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
-    if (this.cleared) { this.cleared = false; log.replaceChildren(); }
-    for (const it of this.changed) { if (!it.el) log.append(it.el = acpItemEl(it)); acpFill(it); }
-    this.changed.clear();
-    if (stick) log.scrollTop = log.scrollHeight;
+    const reader = this.transcript;
+    if (reader) {
+      if (reader.frame.buffer !== reader.buf || !FR.Ed!.E.buffers.includes(reader.buf)) this.fallbackTranscript(reader);
+      else try {
+        reader.render(this.items, this.changed, this.pending, !!this.cleared);
+        this.cleared = false;
+        if (this.changed.size) this.schedule();
+      } catch (e) {
+        this.fallbackTranscript(reader);
+        console.warn('agent transcript: Edwin paint failed', e);
+      }
+    }
+    if (!this.transcript) {
+      const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+      if (this.cleared) { this.cleared = false; log.replaceChildren(); }
+      for (const it of this.changed) { if (!it.el) log.append(it.el = acpItemEl(it)); acpFill(it); }
+      this.changed.clear();
+      if (stick) log.scrollTop = log.scrollHeight;
+    }
     this.renderPlan(); this.renderPending(); this.paint();
     if (live.$agents === L) meshRender();
   }
@@ -1410,24 +1564,60 @@ function acpItemEl(it: AcpItem): HTMLElement {
   if (it.k === 'thought') { const d = el('details', 'ag-thought'); d.append(el('summary', '', 'thinking'), el('div', 'ag-msg')); return d; }
   return el('div', ({ user: 'ag-msg ag-user', asst: 'ag-msg ag-asst', tool: 'ag-tool', sep: 'ag-sep' } as Record<string, string>)[it.k] || 'ag-note');
 }
+function acpToolStatus(it: AcpToolItem) {
+  const status = vtext(it.status);
+  return Object.hasOwn(TOOL_GLYPH, status) ? status : 'pending';
+}
+function acpToolLocations(it: AcpToolItem) {
+  const locs = Array.isArray(it.locations) ? it.locations as (AcpToolLocation | null)[] : [];
+  return locs.length ? locs.map(l => vtext(l?.path) + (l?.line != null ? ':' + vtext(l.line) : '')).join('  ') : null;
+}
+function acpToolText(item: JsonValue) {
+  const c = item as JsonObject | null;
+  return c?.type === 'terminal' ? '[terminal output not available]' : blockText(c?.content);
+}
+
+function acpReaderText(it: AcpItem): string {
+  if (it.k === 'user') return 'Prompt: ' + acpIndent(it.text) + '\n';
+  if (it.k === 'asst' || it.k === 'thought') return (it.k === 'asst' ? 'Assistant:' : 'Thinking:') + '\n  ' + acpIndent(it.text) + '\n';
+  if (it.k === 'note') return '· ' + acpIndent(it.text) + '\n';
+  if (it.k === 'sep') return '\n';
+  if (it.k !== 'tool') return '';
+  const locs = acpToolLocations(it);
+  let text = 'Tool: ' + acpIndent(vtext(it.kind) || 'tool') + ' [' + acpToolStatus(it) + '] ' + acpIndent(vtext(it.title)) + '\n';
+  if (locs != null) text += '  Location: ' + acpIndent(locs) + '\n';
+  for (const c of Array.isArray(it.content) ? it.content : []) {
+    if ((c as AcpDiffContent | null)?.type === 'diff') {
+      const { title, lines, large } = acpDiff(c as AcpDiffContent, acpReaderField);
+      if (large == null) text += '  Diff: ' + acpIndent(title) + '\n';
+      for (const [, line] of lines) text += '  ' + acpIndent(line) + '\n';
+    } else {
+      const output = acpToolText(c);
+      if (output) text += '  Output:\n  ' + acpIndent(output) + '\n';
+    }
+  }
+  return text;
+}
 function acpFill(it: AcpItem) {
   const e = it.el!;
   if (it.k === 'user' || it.k === 'asst') e.textContent = it.text;
   else if (it.k === 'thought') e.lastChild!.textContent = it.text;
   else if (it.k === 'note') { e.textContent = it.text; e.classList.toggle('err', it.cls === 'err'); e.classList.toggle('warn', it.cls === 'warn'); }
   else if (it.k === 'tool') {
-    const st = TOOL_GLYPH[it.status as string] ? it.status as string : 'pending', h = el('div', 'th'), locs = Array.isArray(it.locations) ? it.locations as (AcpToolLocation | null)[] : [];
+    const st = acpToolStatus(it), h = el('div', 'th'), locs = acpToolLocations(it);
     h.append(el('span', 'tg ' + st, TOOL_GLYPH[st]), el('b', '', vtext(it.kind) || 'tool'), el('span', 'tt', vtext(it.title)));
     const parts: HTMLElement[] = [h];
-    if (locs.length) parts.push(el('div', 'tl', locs.map(l => vtext(l?.path) + (l?.line != null ? ':' + vtext(l.line) : '')).join('  ')));
+    if (locs != null) parts.push(el('div', 'tl', locs));
     for (const c of Array.isArray(it.content) ? it.content : []) parts.push(toolContent(c));
     e.replaceChildren(...parts); e.dataset.status = st;
   }
 }
-function toolContent(c: any): HTMLElement {   // any: a tool call's content item from the agent, read by duck typing
+function toolContent(item: JsonValue): HTMLElement {
+  const c = item as JsonObject | null;
   if (c?.type === 'diff') return lineDiff(c);
-  if (c?.type === 'terminal') return el('div', 'ag-note', '[terminal output not available]');
-  const t = blockText(c?.content), lines = t.split('\n').length, pre = el('pre', lines > 20 ? 'clip' : '', t);
+  const t = acpToolText(item);
+  if (c?.type === 'terminal') return el('div', 'ag-note', t);
+  const lines = t.split('\n').length, pre = el('pre', lines > 20 ? 'clip' : '', t);
   if (lines <= 20) return pre;
   const box = el('div'), more = el('button', 'more', 'show all ' + lines + ' lines');
   more.type = 'button'; more.onclick = () => { pre.classList.remove('clip'); more.remove(); };
@@ -1448,15 +1638,14 @@ function acpStatePanel(box: HTMLElement, sp: AcpStateSpec | null, b: AcpBackend)
 }
 // A tool call's diff content (30 §1.2): common prefix and suffix trimmed, an LCS over the middle when it is small enough,
 // 3 lines of context around each change.
-function lineDiff(d: AcpDiffContent): HTMLElement {
-  const box = el('div', 'ag-diff'), path = vtext(d.path), oldT = d.oldText == null ? null : vtext(d.oldText), newT = vtext(d.newText);
-  const a = oldT == null ? [] : oldT.split('\n'), b = newT.split('\n');
-  box.append(el('div', 'dp', path + (oldT == null ? ' (new file)' : '')));
+function acpDiff(d: AcpDiffContent, format?: (text: string) => string): { title: string; lines: [string, string][]; large?: string } {
+  const path = vtext(d.path), oldT = d.oldText == null ? null : vtext(d.oldText), newT = vtext(d.newText), title = path + (oldT == null ? ' (new file)' : '');
   if ((oldT || '').length + newT.length > 200000) {
-    box.append(el('div', 'gap', 'diff too large: ' + path + ' (' + a.length + ' → ' + b.length + ' lines)'));
-    const t = el('button', 'more', 'show new text'); t.type = 'button'; t.onclick = () => t.replaceWith(el('pre', '', newT));
-    box.append(t); return box;
+    const count = (text: string) => { let n = 1; for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) n++; return n; };
+    return { title, lines: [['gap', 'diff too large: ' + path + ' (' + (oldT == null ? 0 : count(oldT)) + ' → ' + count(newT) + ' lines)']], large: newT };
   }
+  const split = (text: string) => (format ? format(text) : text).split('\n');
+  const a = oldT == null ? [] : split(oldT), b = split(newT);
   let p = 0; while (p < a.length && p < b.length && a[p] === b[p]) p++;
   let s = 0; while (s < a.length - p && s < b.length - p && a[a.length - 1 - s] === b[b.length - 1 - s]) s++;
   const am = a.slice(p, a.length - s), bm = b.slice(p, b.length - s), ops = a.slice(0, p).map(x => ['=', x]), m = am.length, n = bm.length;
@@ -1471,13 +1660,27 @@ function lineDiff(d: AcpDiffContent): HTMLElement {
   for (const x of a.slice(a.length - s)) ops.push(['=', x]);
   const keep = ops.map(() => false);
   ops.forEach(([o], i) => { if (o !== '=') for (let k = Math.max(0, i - 3); k <= Math.min(ops.length - 1, i + 3); k++) keep[k] = true; });
-  const pre = el('pre');
+  const lines: [string, string][] = [];
   for (let i = 0; i < ops.length;) {
-    if (keep[i]) { const [o, t] = ops[i++]; pre.append(el('div', o === '+' ? 'add' : o === '-' ? 'del' : 'ctx', (o === '=' ? ' ' : o) + ' ' + t)); continue; }
+    if (keep[i]) { const [o, t] = ops[i++]; lines.push([o === '+' ? 'add' : o === '-' ? 'del' : 'ctx', (o === '=' ? ' ' : o) + ' ' + t]); continue; }
     let j = i; while (j < ops.length && !keep[j]) j++;
-    pre.append(el('div', 'gap', '… ' + (j - i) + ' unchanged line' + (j - i === 1 ? '' : 's'))); i = j;
+    lines.push(['gap', '… ' + (j - i) + ' unchanged line' + (j - i === 1 ? '' : 's')]); i = j;
   }
-  box.append(pre); return box;
+  return { title, lines };
+}
+function lineDiff(d: AcpDiffContent): HTMLElement {
+  const { title, lines, large } = acpDiff(d), box = el('div', 'ag-diff');
+  box.append(el('div', 'dp', title));
+  if (large != null) {
+    box.append(el('div', 'gap', lines[0][1]));
+    const t = el('button', 'more', 'show new text'); t.type = 'button'; t.onclick = () => t.replaceWith(el('pre', '', large));
+    box.append(t);
+  } else {
+    const pre = el('pre');
+    for (const [cls, text] of lines) pre.append(el('div', cls, text));
+    box.append(pre);
+  }
+  return box;
 }
 // An elicitation form from requestedSchema (30 §1.4): one control per property, in object order.
 /* A field of an elicitation form: its schema, its control and how to read its value; and what the form's check says. */
@@ -1576,13 +1779,13 @@ function adoptOrphan(s: SessionSummary) {
   const n = addNode({ id: s.sid, name: (acp ? 'agent' : 'shell') + (nodeList().length + 1), ...base, ...freeSpot(c.x - w / 2, c.y - h / 2, w, h), w, h, adopted: true, _spawn: false });
   jumpNode(n);
 }
-function mountAcp(n: AcpNode, L: LiveEntry) {
+function mountAcp(n: AcpNode, L: LiveEntry, agents = false) {
   if (!DAEMON) { L.body!.append(el('div', 'ag-note', 'Agent cards run on the Workbench server.')); return; }
   L.body!.innerHTML = '<div class="ag-plan" hidden></div><div class="ag-transcript"><div class="ag-log" aria-live="polite"></div></div><div class="ag-pend"><div class="ag-state" hidden></div></div>'
     + '<form class="ag-in"><textarea rows="2"></textarea><div class="ag-row"><select class="ag-mode" title="Agent mode" hidden></select>'
     + '<button type="button" class="ag-edit" title="Edit prompt in Edwin (C-c C-e)" hidden>Edwin</button><button type="button" class="stop" hidden>Stop</button><button type="submit" class="go">Send</button></div></form>';
   L.logEl = $('.ag-log', L.body)!; L.ta = $('textarea', L.body) as HTMLTextAreaElement;
-  const b = L.backend = new AcpBackend(n, L as AcpLive);
+  const b = L.backend = new AcpBackend(n, L as AcpLive, agents);
   $('.ag-in', L.body)!.addEventListener('submit', e => { e.preventDefault(); b.submit(); });
   L.ta.addEventListener('keydown', e => { if (b.composerKey(e)) return; if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); b.submit(); } });
   $('.ag-edit', L.body)!.onclick = () => b.editPrompt();
@@ -4371,7 +4574,7 @@ function meshMount(r: MeshRow, attach = false): void {
   hdr.append(el('i', 'dot'), el('span', 'badge')); host.append(hdr, body); box.append(host);
   if (!attach) MESH_PANE.node = n;
   const L = live[attach ? '$agentsAttach' : '$agents'] = { el: host, hdr, body };
-  if (n.kind === 'acp') mountAcp(n, L); else mountTerm(n, L);
+  if (n.kind === 'acp') mountAcp(n, L, true); else mountTerm(n, L);
 }
 const MESH_SETUP = 'Start a Claude background session, use tmux, or run in a Workbench shell or agent card to control it here.';
 function meshAttachReason(r: MeshRow): string {
@@ -4483,7 +4686,9 @@ function meshEnter(): void {
   $('#v-agents')!.classList.add('detail-open'); meshRender(true); meshFocus();
 }
 addEventListener('pagehide', meshClose);
-$('#mesh-detail')!.addEventListener('keydown', e => { if (e.key === 'Escape' && (e.target as Element).matches('textarea')) { e.preventDefault(); meshBack(); } });
+$('#mesh-detail')!.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && (e.target as Element).matches('.ag-in textarea')) { e.preventDefault(); meshBack(); }
+});
 function meshRender(commit = false): void {
   const box = $('#mesh-list');
   if (!box || VIEW !== 'agents') return;
@@ -6204,6 +6409,37 @@ function frPromptKeymap() {
   }
   L.set('wb-agent-prompt-mode-map', map); frPromptKeys = true;
 }
+let frTranscriptKeys = false;
+function frTranscriptKeymap() {
+  if (frTranscriptKeys) return;
+  const Ed = FR.Ed!, L = FR.L!, map = new Ed.Keymap('wb-agent-transcript-mode-map'), name = 'wb-agent-transcript-edit-prompt';
+  L.CMD(name, '', '', 'Edit an unsent prompt for this agent.', () => {
+    const b = ACP_READERS.get(L.call('current-buffer') as EdwinBuffer);
+    if (b) setTimeout(() => b.editPrompt());
+    return false;
+  });
+  L.call('define-key', [map, 'C-c C-e', L.intern(name)]);
+  L.set('wb-agent-transcript-mode-map', map);
+  for (const cmd of ['save-buffer', 'write-file']) L.call('advice-add', [L.intern(cmd), L.intern(':before'), () => {
+    if (ACP_READERS.has(L.call('current-buffer') as EdwinBuffer)) throw new Error('Agent transcripts do not visit files');
+    return false;
+  }]);
+  L.call('add-hook!', [L.intern('kill-buffer-hook'), () => {
+    ACP_READERS.get(L.call('current-buffer') as EdwinBuffer)?.schedule();
+    return false;
+  }]);
+  const post = Ed.hooks.postCommand;
+  Ed.hooks.postCommand = (cmd, b, failed) => {
+    // An async editor command can straddle a journal paint and mistake it for its own edit.
+    const reader = ACP_READERS.get(b);
+    if (reader) {
+      b.undo.length = b.redo.length = 0; b.pendingUndo = null;
+      if (reader.transcript?.frame.buffer !== b) reader.schedule();
+    }
+    post?.(cmd, b, failed);
+  };
+  frTranscriptKeys = true;
+}
 // This browser profile's device id (R9.16), made once; the per-tab client id lives in sessionStorage so a reload keeps it (R7.16).
 function deviceId() { let d = store.get('wb-device'); if (!d) { d = uid('d'); store.set('wb-device', d); } return d; }
 const frSession = { get(k: string): string | null { try { return sessionStorage.getItem(k); } catch { return null; } }, set(k: string, v: string) { try { sessionStorage.setItem(k, v); } catch {} }, del(k: string) { try { sessionStorage.removeItem(k); } catch {} } };
@@ -6281,7 +6517,7 @@ function frStateChanged(s: string) {
   if (FR.online) { const w = FR.waiters.splice(0); for (const r of w) r(); }
   else if (FR.tried) frDownNow();
   frOffRender();
-  for (const b of ACP_COMPOSERS) b.editorAvailability();
+  for (const b of ACP_COMPOSERS) { b.editorAvailability(); b.mountTranscript(); }
   document.body.classList.toggle('edit-off', FR.ready && !FR.online);
   statusRender();
 }
@@ -6455,6 +6691,7 @@ function frLeave(f: EdwinFrame | null | undefined) {
   const id = frame ? FR.byFrame.get(frame) : null;
   if (frame) frame.blur();
   if (document.activeElement && document.activeElement !== document.body) (document.activeElement as HTMLElement).blur();
+  if (VIEW === 'agents' && frame?.root.matches('.ag-reader')) { meshBack(); return; }
   if (id && live[id]) activate(id);
 }
 // ---- snapshots (Q8: the raw first 12 lines) and the node's cached head for a replica that is not open yet (R9.6)
