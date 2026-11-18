@@ -112,14 +112,10 @@ fn worktree_of_bare_repository() {
 #[test]
 fn unreadable_invalid_oversized_and_special_files_fail_closed() {
     let (_tmp, root) = checkout();
-    let cache = Cache::default();
     let nested = root.join("src/deep/.git");
     // Invalid nearest marker never falls back to the valid ancestor checkout.
     write(&nested, "not a gitdir\n");
-    assert_eq!(
-        cache.get(root.join("src/deep").to_str().unwrap()),
-        Metadata::default()
-    );
+    assert!(derive(&root.join("src/deep")).is_err());
     fs::remove_file(&nested).unwrap();
     std::os::unix::fs::symlink("/nonexistent/git-metadata-target", &nested).unwrap();
     assert!(derive(&root.join("src/deep")).is_err());
@@ -143,20 +139,45 @@ fn unreadable_invalid_oversized_and_special_files_fail_closed() {
 }
 
 #[test]
-fn cache_is_bounded_and_refreshes_idle_branch() {
+fn requests_only_read_completed_facts_and_refresh_preserves_stale_values() {
     let (_tmp, root) = checkout();
     let cache = Cache::default();
     let cwd = root.to_str().unwrap();
+    assert_eq!(cache.get(cwd), Metadata::default());
+    assert!(cache.start(cwd));
+    assert_eq!(cache.get(cwd), Metadata::default());
+    assert!(!cache.start(cwd));
+    assert!(cache.finish(cwd, derive(&root).unwrap()));
     assert_eq!(cache.get(cwd).branch.as_deref(), Some("main"));
+    assert!(!cache.start(cwd));
     write(&root.join(".git/HEAD"), "ref: refs/heads/next\n");
+    // Expired facts remain readable; requests never derive even after the TTL.
+    cache.0.lock().unwrap().get_mut(cwd).unwrap().at = Instant::now() - TTL;
     assert_eq!(cache.get(cwd).branch.as_deref(), Some("main"));
-    // Advance the cache's monotonic timestamp without slowing the fixture down.
-    cache.0.lock().unwrap().get_mut(cwd).unwrap().0 = Instant::now() - TTL;
+    assert!(cache.start(cwd));
+    assert!(!cache.start(cwd));
+    assert_eq!(cache.get(cwd).branch.as_deref(), Some("main"));
+    assert!(cache.finish(cwd, derive(&root).unwrap()));
     assert_eq!(cache.get(cwd).branch.as_deref(), Some("next"));
-    for i in 0..=CACHE_MAX {
-        let path = root.join(format!("dir{i}"));
-        fs::create_dir(&path).unwrap();
-        cache.get(path.to_str().unwrap());
+    cache.0.lock().unwrap().get_mut(cwd).unwrap().at = Instant::now() - TTL;
+    assert!(cache.start(cwd));
+    assert!(!cache.finish(cwd, derive(&root).unwrap()));
+}
+
+#[test]
+fn cache_bounds_in_flight_work_and_never_evicts_a_pending_cwd() {
+    let cache = Cache::default();
+    for i in 0..CACHE_MAX {
+        assert!(cache.start(&format!("/pending/{i}")));
     }
+    // A hanging cwd stays single-flight even after its TTL and under capacity pressure.
+    cache.0.lock().unwrap().get_mut("/pending/0").unwrap().at = Instant::now() - TTL;
+    assert!(!cache.start("/pending/0"));
+    assert!(!cache.start("/overflow"));
+    assert_eq!(cache.get("/pending/0"), Metadata::default());
+    assert!(cache.finish("/pending/1", Metadata::default()));
+    assert!(!cache.start("/pending/1")); // Failures are cached for the TTL too.
+    assert!(cache.start("/overflow")); // Only the completed entry can be evicted.
+    assert!(!cache.start("/pending/0"));
     assert_eq!(cache.0.lock().unwrap().len(), CACHE_MAX);
 }

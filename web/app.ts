@@ -4160,10 +4160,8 @@ const MESH_ROWS = new Map<string, HTMLElement>(), MESH_GROUPS = new Map<string, 
 const MESH_PANE: { row: string | null; key: string; actions: string; node: TermNode | AcpNode | null; attach: boolean; rows: string[] } = { row: null, key: '', actions: '', node: null, attach: false, rows: [] };
 // The hub session an observed one runs in: its WB_SESSION, believed only from the host that session is on.
 function obsSess(o: ObservedSession): SessionSummary | null {
-  if (!o.wbSession) return null;
-  // A reporter may repeat the enclosing hub sid for a subagent: that is not another joined session.
-  const parent = o.parent ? OBS[o.parent] || Object.values(OBS).find(p => p.wbSession === o.parent && p.host === o.host) : undefined;
-  if (o.parent === o.wbSession || parent?.host === o.host && parent.wbSession === o.wbSession) return null;
+  // A subagent can inherit the enclosing hub sid even when its parent was never reported.
+  if (!o.wbSession || o.parent) return null;
   const s = SESS[o.wbSession];
   return s && s.host === o.host ? s : null;
 }

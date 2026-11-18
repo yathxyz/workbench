@@ -25,8 +25,14 @@ pub struct Metadata {
     pub project_root: Option<String>,
 }
 
+struct Entry {
+    value: Option<Metadata>,
+    at: Instant,
+    pending: bool,
+}
+
 #[derive(Default)]
-pub struct Cache(Mutex<HashMap<String, (Instant, Metadata)>>);
+pub struct Cache(Mutex<HashMap<String, Entry>>);
 
 impl Cache {
     #[cfg(test)]
@@ -34,103 +40,89 @@ impl Cache {
         self.with(cwd, Clone::clone)
     }
 
+    /// Requests only read completed facts, including stale facts during a refresh.
     pub fn with<R>(&self, cwd: &str, f: impl FnOnce(&Metadata) -> R) -> R {
-        // Bound keys as well as values. Invalid paths never enter the cache.
+        let cache = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match cache.get(cwd).and_then(|entry| entry.value.as_ref()) {
+            Some(value) => f(value),
+            None => f(&Metadata::default()),
+        }
+    }
+
+    /// Reserve one bounded slot before starting I/O. In-flight slots cannot be evicted.
+    fn start(&self, cwd: &str) -> bool {
         if cwd.is_empty() || cwd.len() > TEXT_MAX || !Path::new(cwd).is_absolute() {
-            return f(&Metadata::default());
+            return false;
         }
         let mut cache = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((at, value)) = cache.get(cwd)
-            && at.elapsed() < TTL
-        {
-            return f(value);
+        if let Some(entry) = cache.get_mut(cwd) {
+            if entry.pending || entry.at.elapsed() < TTL {
+                return false;
+            }
+            entry.pending = true;
+            return true;
         }
-        let value = derive(Path::new(cwd)).unwrap_or_default();
-        cache.retain(|_, (at, _)| at.elapsed() < TTL);
-        if cache.len() >= CACHE_MAX
-            && let Some(oldest) = cache
+        if cache.len() >= CACHE_MAX {
+            let oldest = cache
                 .iter()
-                .min_by_key(|(_, (at, _))| *at)
-                .map(|(k, _)| k.clone())
-        {
+                .filter(|(_, entry)| !entry.pending)
+                .min_by_key(|(_, entry)| entry.at)
+                .map(|(cwd, _)| cwd.clone());
+            let Some(oldest) = oldest else {
+                return false;
+            };
             cache.remove(&oldest);
         }
-        let result = f(&value);
-        cache.insert(cwd.to_owned(), (Instant::now(), value));
-        result
+        cache.insert(
+            cwd.to_owned(),
+            Entry {
+                value: None,
+                at: Instant::now(),
+                pending: true,
+            },
+        );
+        true
     }
-}
 
-struct Watched {
-    cwd: String,
-    metadata: Option<Metadata>,
-    seen: bool,
+    /// Publish the first result too, even if derivation failed and every fact is null.
+    fn finish(&self, cwd: &str, value: Metadata) -> bool {
+        let mut cache = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = cache.get_mut(cwd).expect("in-flight cache slot is pinned");
+        let changed = entry.value.as_ref() != Some(&value);
+        entry.value = Some(value);
+        entry.at = Instant::now();
+        entry.pending = false;
+        changed
+    }
 }
 
 /// One process-wide refresh, independent of how many pages/API streams are open.
 pub async fn refresh(app: crate::AppState) {
-    let mut watched = HashMap::new();
+    let mut jobs = tokio::task::JoinSet::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             () = app.stopped() => return,
-            _ = tick.tick() => refresh_sessions(&app, &mut watched),
-        }
-    }
-}
-
-fn refresh_sessions(app: &crate::AppState, watched: &mut HashMap<String, Watched>) {
-    for entry in watched.values_mut() {
-        entry.seen = false;
-    }
-    {
-        // Only copy newly seen paths under the hub lock; disk I/O happens below.
-        let sessions = app.hub.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        for session in sessions.values().filter(|s| s.host == app.cfg.host) {
-            if let Some(entry) = watched.get_mut(&session.sid) {
-                entry.seen = true;
-                if entry.cwd != session.cwd {
-                    entry.cwd.clone_from(&session.cwd);
-                    entry.metadata = None;
-                }
-            } else {
-                watched.insert(
-                    session.sid.clone(),
-                    Watched {
-                        cwd: session.cwd.clone(),
-                        metadata: None,
-                        seen: true,
-                    },
-                );
-            }
-        }
-    }
-    watched.retain(|_, entry| entry.seen);
-    for (sid, entry) in watched {
-        let changed = app
-            .git_metadata
-            .with(&entry.cwd, |metadata| match &mut entry.metadata {
-                Some(previous) if previous != metadata => {
-                    previous.clone_from(metadata);
-                    true
-                }
-                None => {
-                    entry.metadata = Some(metadata.clone());
-                    false
-                }
-                _ => false,
-            });
-        if changed {
-            let session = {
+            _ = tick.tick() => {
                 let sessions = app.hub.sessions.lock().unwrap_or_else(|e| e.into_inner());
-                sessions
-                    .get(sid)
-                    .filter(|s| s.host == app.cfg.host && s.cwd == entry.cwd)
-                    .cloned()
-            };
-            if let Some(session) = session {
-                let _ = app.feed.send(crate::FeedMsg::Session(Box::new(session)));
+                for session in sessions.values().filter(|s| s.host == app.cfg.host) {
+                    if app.git_metadata.start(&session.cwd) {
+                        let cwd = session.cwd.clone();
+                        jobs.spawn_blocking(move || {
+                            let metadata = derive(Path::new(&cwd)).unwrap_or_default();
+                            (cwd, metadata)
+                        });
+                    }
+                }
+            }
+            Some(Ok((cwd, metadata))) = jobs.join_next(), if !jobs.is_empty() => {
+                if app.git_metadata.finish(&cwd, metadata) {
+                    let sessions = app.hub.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                    for session in sessions.values().filter(|s| s.host == app.cfg.host && s.cwd == cwd) {
+                        let _ = app.feed.send(crate::FeedMsg::Session(Box::new(session.clone())));
+                    }
+                }
             }
         }
     }

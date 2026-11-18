@@ -4395,6 +4395,42 @@ await section('N77/N78 hierarchy', async () => {
       check('N78: a hub ACP in a handwritten linked worktree derives repository metadata and joins observed worktrees without a board card',
         !!joined && await group(sid) === repo && hubMetadata.repoRoot === checkout && hubMetadata.repo === repo && hubMetadata.worktree === 'hub-worktree' && hubMetadata.branch === 'topic/hub' && !hubMetadata.card,
         JSON.stringify(hubMetadata));
+      // The only report for this session is a real child event: its parent must never enter OBS.
+      await P.evaluate(({ sid, cwd }) => {
+        const C = window.__canvas; C.setView('canvas');
+        C.addNode({ id: sid, kind: 'acp', name: 'hierarchy hub card', agent: 'stub', cwd, x: 100, y: 100, w: 560, h: 520, adopted: true, _spawn: false });
+      }, { sid, cwd: worktrees[2] });
+      try {
+        await acpIdle(P, sid);
+        const hubState = await P.evaluate((sid: string) => window.__canvas.SESS[sid].state, sid);
+        const started = await report('orphan', { kind: 'subagent_start', agent_id: 'child', agent_type: 'explorer', cwd: worktrees[0] }, { ...metadata(0), wbSession: sid });
+        if (started !== 204 || !await until(() => ids.orphan, 8000)) throw new Error('hierarchy orphan subagent did not arrive: ' + started);
+        const permission = await report('orphan', { kind: 'permission', agent_id: 'child', tool: { name: 'Bash', input: { command: 'orphan permission' } } }, { wbSession: sid });
+        await P.evaluate((id: string) => window.__canvas.meshOpen(id), ids.orphan);
+        await row('orphan').waitFor();
+        const waiting = await until(() => row('orphan').evaluate(e => e.classList.contains('bad')), 8000);
+        await P.evaluate((sid: string) => window.__canvas.meshOpen(sid), sid);
+        const separate = await P.evaluate(({ id, sid, sessionId }) => {
+          const C = window.__canvas, o = C.OBS[id], s = C.SESS[sid];
+          const child = document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${id}"]`);
+          const hub = document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${sid}"]`);
+          return { parent: o.parent, parentAbsent: !!o.parent && !C.OBS[o.parent],
+            onlyChild: Object.values<ObservedSession>(C.OBS).filter(o => o.sessionId === sessionId).every(o => !!o.parent),
+            sameHost: o.host === s.host, wbSession: o.wbSession, observedState: o.state, hubState: s.state,
+            child: child && { depth: child.dataset.depth, card: child.dataset.card, dot: child.querySelector('.dot')?.className },
+            hub: hub && { card: hub.dataset.card, dot: hub.querySelector('.dot')?.className, selected: hub.classList.contains('on') },
+            selected: C.MESH.open, cardPresent: C.S.nodes[sid]?.kind === 'acp' };
+        }, { id: ids.orphan, sid, sessionId: prefix + 'orphan' });
+        check('N77/N78: an unreported parent cannot let its child inherit a same-host hub session, card, alias, or state',
+          permission === 204 && !!waiting && separate.parentAbsent && separate.onlyChild && separate.sameHost && separate.wbSession === sid
+          && separate.child?.depth === '0' && separate.child.card === '' && separate.child.dot === 'dot st-waiting_permission'
+          && separate.observedState === 'waiting_permission' && separate.hubState === hubState && separate.hub?.card === sid
+          && separate.hub.dot === 'dot st-' + hubState && separate.hub.selected && separate.selected === sid && separate.cardPresent,
+          JSON.stringify({ hubState, separate }));
+      } finally {
+        await report('orphan', { kind: 'end', agent_id: 'child' });
+        await P.evaluate((sid: string) => { const C = window.__canvas; if (C.S.nodes[sid]) C.removeNode(sid); }, sid);
+      }
       const hubRow = await row(sid).elementHandle();
       fs.writeFileSync(path.join(hubGit, 'HEAD'), 'ref: refs/heads/topic/switched\n');
       const refreshed = await until(async () => await row(sid).locator('.mesh-branch').getAttribute('title') === 'topic/switched', 15000);

@@ -481,7 +481,7 @@ async fn local_git_metadata_refreshes_without_hub_events_and_remote_cwd_is_not_r
     let mut remote = local.clone();
     remote.sid = "remote".into();
     remote.host = "somewhere-else".into();
-    hub.set_sessions(vec![local, remote]);
+    hub.set_sessions(vec![remote]);
     let web = Web::start(&hub.path);
     web.wait_hub("up").await;
     let mut rpc = web.ws("/rpc").await;
@@ -491,17 +491,43 @@ async fn local_git_metadata_refreshes_without_hub_events_and_remote_cwd_is_not_r
             break msg;
         }
     };
-    let sessions = snapshot["sessions"].as_array().unwrap();
-    assert_eq!(sessions[0]["repoRoot"], root.to_str().unwrap());
-    assert_eq!(sessions[0]["projectRoot"], root.to_str().unwrap());
-    assert_eq!(sessions[0]["repo"], "owner/name");
-    assert_eq!(sessions[0]["branch"], "main");
-    assert_eq!(sessions[0]["worktree"], Value::Null);
     for key in ["repoRoot", "repo", "branch", "worktree", "projectRoot"] {
-        assert_eq!(sessions[1][key], Value::Null, "{key}");
+        assert_eq!(snapshot["sessions"][0][key], Value::Null, "{key}");
     }
+    // A newly reported cwd has no synchronous filesystem work on the request path.
+    // If its worker has not completed yet, the first enrichment must arrive over RPC.
+    hub.send(
+        0,
+        HubMessage::Session {
+            session: Box::new(local),
+        },
+    );
+    let enriched = tokio::time::timeout(Duration::from_secs(7), async {
+        loop {
+            let msg = next_json(&mut rpc).await;
+            if msg["t"] != "session" || msg["session"]["sid"] != "local" {
+                continue;
+            }
+            let session = &msg["session"];
+            if session["repo"].is_null() {
+                assert_eq!(session["project"], "src");
+                for key in ["repoRoot", "repo", "branch", "worktree", "projectRoot"] {
+                    assert_eq!(session[key], Value::Null, "{key}");
+                }
+            } else {
+                break session.clone();
+            }
+        }
+    })
+    .await
+    .expect("first metadata result did not reach RPC");
+    assert_eq!(enriched["repoRoot"], root.to_str().unwrap());
+    assert_eq!(enriched["projectRoot"], root.to_str().unwrap());
+    assert_eq!(enriched["repo"], "owner/name");
+    assert_eq!(enriched["branch"], "main");
+    assert_eq!(enriched["worktree"], Value::Null);
     let api = web.req("GET", "/api/sessions").send().await.json();
-    assert_eq!(api["sessions"], snapshot["sessions"]);
+    assert_eq!(api["sessions"][0], enriched);
     std::fs::write(
         root.join(".git/HEAD"),
         "ref: refs/heads/changed-while-idle\n",
