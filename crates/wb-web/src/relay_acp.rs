@@ -14,16 +14,14 @@ use axum::routing::get;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Instant, sleep_until};
-use wb_proto::hub::{
-    AcpOpenReply, AcpSessionInfo, ErrorCode, HubMessage, HubRequest, SpawnAcp, Summary,
-};
+use wb_proto::hub::{AcpOpenReply, AcpSessionInfo, ErrorCode, HubMessage, HubRequest, SpawnAcp};
 use wb_proto::journal::EventBody;
 use wb_proto::limits::{CARD_OPEN_DEADLINE, MAX_LINE, WS_MAX_ACP};
 use wb_proto::line;
 
 use crate::AppState;
 use crate::http::{self, End, Keepalive, Tick, close, send_json, ws_close, ws_too_big};
-use crate::hub::{HUB_LOST, HubConn, REPLY_TIMEOUT, connect_relay, with_state};
+use crate::hub::{HUB_LOST, HubConn, REPLY_TIMEOUT, connect_relay};
 use crate::util::sanitize_sid;
 
 const ROUTE: &str = "/acp";
@@ -107,8 +105,7 @@ fn spawn(agent: Option<String>, cwd: Option<String>) -> Option<SpawnAcp> {
 
 /// `AcpInfo` = Summary + `{state, session?}`. `session` is left out when it equals
 /// `last`, the one this socket sent last (ROB-16); otherwise it becomes `last`.
-fn info(summary: &Summary, session: AcpSessionInfo, last: &mut Option<AcpSessionInfo>) -> Value {
-    let mut info = with_state(summary);
+fn info(mut info: Value, session: AcpSessionInfo, last: &mut Option<AcpSessionInfo>) -> Value {
     if last.as_ref() != Some(&session) {
         info["session"] = json!(session);
         *last = Some(session);
@@ -134,6 +131,7 @@ async fn run(app: AppState, mut ws: WebSocket) {
     tokio::pin!(stop);
     let mut relay = Relay {
         hub,
+        app: app.clone(),
         next_rid: 0,
         sid: None,
         replies: HashMap::new(),
@@ -189,6 +187,7 @@ enum Pending {
 }
 
 struct Relay {
+    app: AppState,
     hub: HubConn,
     next_rid: u64,
     /// The session named by `open`, from the moment the open is sent; only its events
@@ -415,7 +414,7 @@ impl Relay {
                 summary,
                 session,
             } if self.is_ours(&sid) => {
-                json!({"t": "info", "info": info(&summary, *session, &mut self.session)})
+                json!({"t": "info", "info": info(self.app.session_summary(&summary), *session, &mut self.session)})
             }
             HubMessage::Gone { sid, epoch } if self.is_ours(&sid) => {
                 send_json(ws, &json!({"t": "gone", "epoch": epoch}))
@@ -432,7 +431,7 @@ impl Relay {
         json!({
             "t": "hello",
             "status": if reply.new { "new" } else { "attached" },
-            "info": info(&reply.summary, reply.session, &mut self.session),
+            "info": info(self.app.session_summary(&reply.summary), reply.session, &mut self.session),
             "head": reply.head,
             "from": reply.from,
             "reset": reply.reset,
@@ -443,7 +442,8 @@ impl Relay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wb_proto::hub::{AcpFacts, Activity, Kind};
+    use crate::hub::with_state;
+    use wb_proto::hub::{AcpFacts, Activity, Kind, Summary};
 
     #[test]
     fn spawn_needs_both_agent_and_cwd() {
@@ -552,18 +552,18 @@ mod tests {
             protocol_version: Some(1),
             ..AcpSessionInfo::default()
         };
-        let v = info(&summary(1), first.clone(), &mut last);
+        let v = info(with_state(&summary(1)), first.clone(), &mut last);
         assert_eq!(v["state"], "idle");
         assert_eq!(v["session"]["protocolVersion"], 1);
         assert_eq!(v["session"]["plan"], Value::Null);
-        let v = info(&summary(2), first.clone(), &mut last);
+        let v = info(with_state(&summary(2)), first.clone(), &mut last);
         assert_eq!(v["acp"]["headSeq"], 2);
         assert!(v.get("session").is_none(), "{v}");
         let second = AcpSessionInfo {
             plan: Some(json!({"entries": []})),
             ..first
         };
-        let v = info(&summary(3), second.clone(), &mut last);
+        let v = info(with_state(&summary(3)), second.clone(), &mut last);
         assert_eq!(v["session"]["plan"], json!({"entries": []}));
         assert_eq!(last, Some(second));
     }

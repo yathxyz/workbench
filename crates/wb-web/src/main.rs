@@ -11,6 +11,7 @@ mod board;
 mod config;
 mod edit_client;
 mod fsapi;
+mod git_metadata;
 mod host;
 mod http;
 mod hub;
@@ -79,6 +80,8 @@ pub struct App {
     pub feed: broadcast::Sender<FeedMsg>,
     /// The observed sessions (design §3.8.3); `None` without `api`.
     pub observed: Option<Observed>,
+    /// Local Git facts shared by all page/API surfaces.
+    pub git_metadata: git_metadata::Cache,
     /// Serialises board writes.
     pub board_lock: Mutex<()>,
     /// The `/rpc` clients, for `wb` commands (W-4).
@@ -92,6 +95,36 @@ pub struct App {
 pub type AppState = Arc<App>;
 
 impl App {
+    /// Web-only enrichment; a remote host's cwd must never be read locally.
+    pub fn session_summary(&self, summary: &Summary) -> Value {
+        let mut value = hub::with_state(summary);
+        let enrich = |metadata: &git_metadata::Metadata| {
+            for (key, field) in [
+                ("repoRoot", &metadata.repo_root),
+                ("repo", &metadata.repo),
+                ("worktree", &metadata.worktree),
+                ("branch", &metadata.branch),
+                ("projectRoot", &metadata.project_root),
+            ] {
+                value[key] = serde_json::to_value(field).unwrap_or_default();
+            }
+            value["project"] = metadata
+                .project_root
+                .as_deref()
+                .or(Some(summary.cwd.as_str()))
+                .and_then(|path| Path::new(path).file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("(no cwd)")
+                .into();
+            value
+        };
+        if summary.host == self.cfg.host {
+            self.git_metadata.with(&summary.cwd, enrich)
+        } else {
+            enrich(&git_metadata::Metadata::default())
+        }
+    }
+
     /// Resolves once shutdown has begun.
     pub async fn stopped(&self) {
         let mut shutdown = self.shutdown.clone();
@@ -197,11 +230,13 @@ async fn run(config: &Path) -> Result<()> {
         edit,
         feed,
         observed,
+        git_metadata: git_metadata::Cache::default(),
         board_lock: Mutex::new(()),
         pages: Pages::default(),
         shutdown,
         sockets: watch::channel(0).0,
     });
+    tokio::spawn(git_metadata::refresh(app.clone()));
     tokio::spawn(async move {
         tokio::select! {
             _ = term.recv() => {}
