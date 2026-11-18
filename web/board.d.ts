@@ -47,6 +47,7 @@ interface Board {
   tree?: boolean;                      // the outline sidebar is open
   treeClosed?: Record<string, boolean>;
   paneW?: number;
+  meshW?: number;
   side?: boolean;                      // the side pane is open
   sideTab?: 'chat' | 'term' | 'agents';   // old chat/agents tabs migrate to the docked terminal
   docks?: Record<string, boolean>;
