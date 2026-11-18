@@ -38,7 +38,10 @@ const until = async <T,>(f: () => T | PromiseLike<T>, ms = 10000, step = 100): P
 const browser = await chromium.launch();
 process.on('uncaughtException', e => { console.log('UNCAUGHT', e); process.exit(2); });   // the harness stops when our end of its stdin closes
 const errors: string[] = [];
-const watchErrors = (p: import('playwright-core').Page): void => { p.on('pageerror', e => errors.push(String(e.stack || e))); p.on('console', m => { if (m.type() === 'error') errors.push('console: ' + m.text()); }); };
+const watchErrors = (p: import('playwright-core').Page): void => {
+  p.on('pageerror', e => errors.push(String(e.stack || e)));
+  p.on('console', m => { if (m.type() === 'error') { const loc = m.location(); errors.push(`console: ${m.text()}\n    at ${loc.url || p.url()}:${loc.lineNumber + 1}:${loc.columnNumber + 1}`); } });
+};
 async function page(url: string, w = 1500, h = 950): Promise<import('playwright-core').Page> {
   const p = await browser.newPage({ viewport: { width: w, height: h } });
   watchErrors(p);
@@ -3783,10 +3786,18 @@ await section('N78', async () => {
   const report = async (who: 'near' | 'far', session: string, more: Record<string, unknown> = {}, kind = 'prompt', text = 'n78 observed prompt') =>
     (await fetch(H.api + '/v1/events', { method: 'POST', headers: { Authorization: 'Bearer ' + fs.readFileSync(H.apiTokenFiles[who], 'utf8').trim(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ harness: 'pi', payload: { session_id: session, kind, cwd, model, permission_mode: 'default', text }, ...more }) })).status;
+  const reportClaude = (session: string, more: Record<string, unknown> = {}, hook = 'UserPromptSubmit') =>
+    report('near', session, { harness: 'claude', payload: { session_id: session, hook_event_name: hook, cwd, model, prompt: 'n78 Claude prompt', tool_name: 'Edit' }, ...more });
   const row = (id: string) => D.locator(`#mesh-list .mesh-row[data-id="${id}"]`);
   const info = () => D.evaluate(() => Object.fromEntries([...document.querySelectorAll('#mesh-detail .mesh-info .mesh-kv')].map(e => [e.querySelector('span')!.textContent!, e.querySelector('code')!.textContent!])));
   const nodes = () => D.evaluate(() => Object.keys(window.__canvas.S.nodes).sort().join());
   const liveText = () => termText(D, '$agents');
+  const attachSid = (P = D) => P.evaluate((): string => window.__canvas.live.$agentsAttach?.backend.n.id || '');
+  const attachText = (P = D) => termText(P, '$agentsAttach');
+  const attachOpens = () => ptyOf(D).filter(w => w.open?.spawn && w.open.attach);
+  const forgot = (sid: string) => until(async () => !(await sessions()).some(s => s.sid === sid), 15000);
+  const attachButton = () => D.getByRole('button', { name: 'Open terminal', exact: true });
+  const switchButton = (name: 'Transcript' | 'Terminal') => D.getByRole('button', { name, exact: true });
   const composer = '#mesh-detail .mesh-live .ag-in textarea';
   const liveView = () => acpView(D, '$agents');
   const liveIdle = () => acpIdle(D, '$agents');
@@ -3828,18 +3839,38 @@ await section('N78', async () => {
     await startPty(externalPty);
     const sent = [await report('near', 'n78-readonly'), await report('near', 'n78-claude', { attach: { kind: 'claude', id: 'deadbeef' } }),
       await report('far', 'n78-tmux', { attach: { kind: 'tmux', socket: '/tmp/n78-tmux/default', pane: 12 } }),
-      await report('near', 'n78-hubpty', { wbSession: externalPty })];
+      await report('near', 'n78-hubpty', { wbSession: externalPty, attach: { kind: 'claude', id: '0123abcd' } }),
+      await reportClaude('n78-claude-tmux', { attach: { kind: 'tmux', socket: '/tmp/n78-tmux/default', pane: 7 } }, 'PermissionRequest'),
+      await report('near', 'n78-fail', { attach: { kind: 'claude', id: 'badc0ffe' } })];
     const ids = await until(() => D.evaluate((sid: string) => {
       const ids: Record<string, string> = {};
       for (const o of Object.values<ObservedSession>(window.__canvas.OBS)) if (o.sessionId.startsWith('n78-')) ids[o.sessionId] = o.id;
-      return Object.keys(ids).length === 4 && window.__canvas.SESS[sid] ? ids : null;
+      return Object.keys(ids).length === 6 && window.__canvas.SESS[sid] ? ids : null;
     }, sid), 10000);
     if (!ids) throw new Error('N78 observed sessions did not arrive');
     await D.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
     await D.keyboard.press('Alt+Digit8');
     await D.waitForSelector('#v-agents:not([hidden])');
+    await row(ids['n78-claude-tmux']).waitFor();
+    const highlights = await D.locator('#mesh-list .mesh-row').evaluateAll(es => es.map(e => (e as HTMLElement).dataset.id));
+    const first = await D.locator('#mesh-list .mesh-row.on').getAttribute('data-id');
+    const selectedIds = [first], hasTerminal = () => D.locator('#mesh-detail .xterm').isVisible();
+    let terminalOnHighlight = !!await attachSid();
+    await D.locator('#mesh-list').focus();
+    for (let i = 1; i <= highlights.indexOf(ids['n78-claude']); i++) {
+      await D.keyboard.press(i % 2 ? 'ArrowDown' : 'j');
+      selectedIds.push(await D.locator('#mesh-list .mesh-row.on').getAttribute('data-id'));
+      terminalOnHighlight ||= !!await attachSid();
+    }
+    const highlightedSummary = await D.locator('#mesh-detail .mesh-hint').innerText();
+    check('N78: automatic and keyboard highlights across eligible Claude rows show a summary, without opening any viewer',
+      first === ids['n78-claude-tmux'] && selectedIds.at(-1) === ids['n78-claude'] && !terminalOnHighlight && !attachOpens().length
+      && /press Enter/.test(highlightedSummary), JSON.stringify({ selectedIds, terminalOnHighlight, highlightedSummary }));
+    await reportClaude('n78-claude-tmux');
+    await until(() => D.evaluate((id: string) => window.__canvas.OBS[id]?.state === 'running', ids['n78-claude-tmux']), 10000);
     await row(sid).click(); await liveIdle();
     const initial = await D.locator('#mesh-detail .ag-log').textContent();
+    const noSwitch = !await D.locator('#mesh-detail .mesh-switch').count();
     const rowEl = await row(sid).elementHandle(), controlEl = await D.locator(composer).elementHandle();
     await D.fill(composer, 'n78 shared conversation'); await D.press(composer, 'Enter');
     const shared = await until(async () => {
@@ -3851,7 +3882,7 @@ await section('N78', async () => {
     const listed = await D.evaluate(({ sid, ids }) => ({ view: window.__canvas.S.view, ids: [...document.querySelectorAll<HTMLElement>('#mesh-list .mesh-row')].map(e => e.dataset.id),
       expected: [sid, ...Object.values(ids)], card: !!window.__canvas.S.nodes[sid] }), { sid, ids });
     check('N78: Alt-8 opens Agents; an API-started ACP session replays and accepts real prompts without a card, preserving row and composer identity during activity',
-      sent.every(s => s === 204) && listed.view === 'agents' && listed.expected.every(id => listed.ids.includes(id)) && !listed.card && initial?.includes('echo: n78 original conversation') && !!shared && stable.row && stable.control && await nodes() === before,
+      sent.every(s => s === 204) && listed.view === 'agents' && listed.expected.every(id => listed.ids.includes(id)) && !listed.card && noSwitch && initial?.includes('echo: n78 original conversation') && !!shared && stable.row && stable.control && await nodes() === before,
       JSON.stringify({ sent, listed, initial, shared, stable, nodes: await nodes(), before }));
     const prefixOrphan = await D.evaluate((sid: string) => window.__canvas.attnItems().some((i: RgEntry) => i.key === 'orphan:' + sid), sid);
     check('N78: an ordinary hub ACP session whose id starts attach_ remains in Agents and Attention as an orphan',
@@ -3869,18 +3900,23 @@ await section('N78', async () => {
 
     // All neighbour expectations come from the actual ordered rows, not the ages of unrelated sessions.
     await D.locator('#mesh-list').focus();
-    const next = await row(sid).evaluate(e => { let n = e.nextElementSibling; while (n && !n.classList.contains('mesh-row')) n = n.nextElementSibling; return (n as HTMLElement | null)?.dataset.id; });
-    await D.keyboard.press('ArrowDown'); const down = await D.evaluate(() => window.__canvas.MESH.open);
-    await D.keyboard.press('ArrowUp'); const up = await D.evaluate(() => window.__canvas.MESH.open);
-    await D.keyboard.press('j'); const j = await D.evaluate(() => window.__canvas.MESH.open);
-    await D.keyboard.press('k'); const k = await D.evaluate(() => window.__canvas.MESH.open);
+    const [neighbor, step, back, forwardChar, backChar] = await row(sid).evaluate(e => {
+      const rows = [...e.parentElement!.querySelectorAll<HTMLElement>('.mesh-row')], i = rows.indexOf(e as HTMLElement);
+      return rows[i + 1] ? [rows[i + 1].dataset.id!, 'ArrowDown', 'ArrowUp', 'j', 'k']
+        : [rows[i - 1].dataset.id!, 'ArrowUp', 'ArrowDown', 'k', 'j'];
+    });
+    await D.keyboard.press(step); const byArrow = await D.evaluate(() => window.__canvas.MESH.open);
+    await D.keyboard.press(back); const backByArrow = await D.evaluate(() => window.__canvas.MESH.open);
+    await D.keyboard.press(forwardChar); const byLetter = await D.evaluate(() => window.__canvas.MESH.open);
+    await D.keyboard.press(backChar); const backByLetter = await D.evaluate(() => window.__canvas.MESH.open);
     await liveIdle();
     await D.keyboard.press('Enter');
     const entered = await D.locator(composer).evaluate(e => e === document.activeElement);
     await D.keyboard.press('Escape');
     const escaped = await D.evaluate(() => !document.querySelector('#v-agents')!.classList.contains('detail-open'));
     check('N78: Up/Down and j/k navigate ordered rows; Enter focuses the live composer and Escape returns to the list',
-      !!next && down === next && up === sid && j === next && k === sid && entered && escaped, JSON.stringify({ next, down, up, j, k, entered, escaped }));
+      byArrow === neighbor && backByArrow === sid && byLetter === neighbor && backByLetter === sid && entered && escaped,
+      JSON.stringify({ neighbor, byArrow, backByArrow, byLetter, backByLetter, entered, escaped }));
     await open(sid); await liveIdle();
     await D.fill(composer, 'n78 unsent draft');
     const draftControl = await D.locator(composer).elementHandle(), draftViewer = await D.locator('#mesh-detail .mesh-live').elementHandle();
@@ -4011,6 +4047,25 @@ await section('N78', async () => {
         check(`N78: ${width}px has no divider, one pane at a time and contained actions`, !await D.locator('#mesh-grip').isVisible() && detail && !list && fits.inside && fits.overflow.length === 0 && !await D.locator('#mesh-detail').isVisible() && await D.locator('.mesh-side').isVisible(), JSON.stringify(fits));
       }
       await D.setViewportSize(viewport);
+      await report('near', 'n78-layout', { attach: { kind: 'claude', id: 'cafefeed' } });
+      await row(id).click(); await switchButton('Terminal').waitFor();
+      const defaultTranscript = await D.locator(composer).isVisible() && !await hasTerminal();
+      await D.fill(composer, 'n78 two-source draft');
+      const dualComposer = await D.locator(composer).elementHandle();
+      await D.locator('#mesh-list').focus(); await D.keyboard.press('t');
+      const firstViewer = await attachSid();
+      const attached = await until(async () => (await attachText()).includes(H.host + ':claude:cafefeed'), 15000);
+      const tucked = await dualComposer!.evaluate(e => e.isConnected && !e.getClientRects().length);
+      await D.keyboard.press('t');
+      const returnedByKey = await D.locator(composer).isVisible() && !!firstViewer && await forgot(firstViewer);
+      await switchButton('Terminal').click(); const secondViewer = await attachSid();
+      const attachedAgain = await until(() => isAlive(secondViewer), 15000);
+      await switchButton('Transcript').click();
+      const restoredDraft = await dualComposer!.evaluate(e => e === document.querySelector('#mesh-detail .ag-in textarea') && (e as HTMLTextAreaElement).value === 'n78 two-source draft');
+      check('N78: a joined ACP/observed row defaults to Transcript; t from the list and the button switch both ways without remounting the composer or losing its draft',
+        defaultTranscript && !!attached && tucked && !!returnedByKey && !!attachedAgain && secondViewer !== firstViewer
+        && !!await forgot(secondViewer) && await D.locator(composer).isVisible() && restoredDraft && await isAlive('n78_layout_api'),
+        JSON.stringify({ defaultTranscript, firstViewer, secondViewer, attached, tucked, returnedByKey, attachedAgain, restoredDraft }));
       await report('near', 'n78-layout', {}, 'end');
       await meshApi('/sessions/n78_layout_api?forget=true', 'DELETE');
       await open(sid); await liveIdle(); await D.locator('#mesh-grip').dblclick();
@@ -4042,9 +4097,19 @@ await section('N78', async () => {
     const detailPhone = await D.evaluate(() => { const v = document.querySelector('#v-agents')!, d = document.querySelector('#mesh-detail')!; return v.classList.contains('detail-open') && d.getBoundingClientRect().width <= innerWidth && d.getBoundingClientRect().width > 0 && document.documentElement.scrollWidth <= innerWidth; });
     await D.locator('#mesh-detail .mesh-back').click();
     check('N78: below 700 px the list and selected detail fit the screen, and Sessions returns to the list', listPhone && detailPhone && await row(ids['n78-readonly']).isVisible(), JSON.stringify({ listPhone, detailPhone }));
+    const phoneRow = row(ids['n78-claude-tmux']);
+    await phoneRow.scrollIntoViewIfNeeded();
+    const phoneRect = (await phoneRow.locator('.mesh-main').boundingBox())!, touch = await D.context().newCDPSession(D);
+    await touch.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: phoneRect.x + 10, y: phoneRect.y + phoneRect.height / 2 }] });
+    await touch.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }); await touch.detach();
+    await D.locator('#mesh-detail .xterm').waitFor(); const phoneSid = await attachSid();
+    const tapped = await until(() => isAlive(phoneSid), 15000);
+    await D.locator('#mesh-detail .mesh-back').click();
+    check('N78: a phone tap opens the Claude terminal and Sessions back kills and forgets the viewer',
+      !!tapped && !!await forgot(phoneSid) && await phoneRow.isVisible() && !await hasTerminal(), JSON.stringify({ phoneSid, tapped }));
     await D.setViewportSize({ width: 1500, height: 950 });
 
-    await open(ids['n78-hubpty']);
+    await row(ids['n78-hubpty']).click();
     const ptyReady = await until(() => ptyOf(D, externalPty).some(w => w.hello && !w.closed));
     await D.locator('#mesh-detail .xterm-helper-textarea').focus();
     await D.keyboard.type("printf 'n78-hub-pty-%s\\n' output"); await D.keyboard.press('Enter');
@@ -4052,35 +4117,39 @@ await section('N78', async () => {
     await row(ids['n78-readonly']).click();
     const ptySurvived = await isAlive(externalPty);
     check('N78: an externally owned hub PTY is interactive without adding a card or spawning; deselecting does not kill it',
-      !!ptyReady && !!ptyOutput && ptySurvived && ptyOf(D, externalPty).every(w => w.open?.spawn === false) && await nodes() === before,
+      !!ptyReady && !!ptyOutput && ptySurvived && ptyOf(D, externalPty).every(w => w.open?.spawn === false)
+      && !attachOpens().some(w => w.open?.attach === ids['n78-hubpty']) && await nodes() === before,
       JSON.stringify({ ptyReady, ptyOutput, ptySurvived, opens: ptyOf(D, externalPty).map(w => w.open) }));
-    await open(ids['n78-claude']);
+    await row(ids['n78-claude']).click();
+    const endingSid = await attachSid(), beforeEnd = await until(() => isAlive(endingSid), 15000);
     const observedTitle = await D.locator('#mesh-detail h3').elementHandle();
     const endedReport = await report('near', 'n78-claude', {}, 'end');
-    const endedAction = await until(async () => await D.evaluate((id: string) => window.__canvas.OBS[id].endedAt !== null, ids['n78-claude'])
-      && !await D.getByRole('button', { name: 'Open terminal', exact: true }).count() && /Started in a terminal the hub cannot reach/.test(await D.locator('#mesh-detail .mesh-hint').innerText()), 10000);
-    const revivedReport = await report('near', 'n78-claude', { attach: { kind: 'claude', id: 'deadbeef' } });
-    const revivedAction = await until(async () => await D.evaluate((id: string) => window.__canvas.OBS[id].endedAt === null, ids['n78-claude'])
-      && await D.getByRole('button', { name: 'Open terminal', exact: true }).isEnabled() && /Closing this terminal leaves the agent running/.test(await D.locator('#mesh-detail .mesh-hint').innerText()), 10000);
+    const endedAction = await until(async () => !await hasTerminal() && /observed session has ended/i.test(await D.locator('#mesh-detail .mesh-hint').innerText())
+      && await D.locator('#mesh-detail .mesh-info').isVisible(), 10000);
+    const endedViewer = await forgot(endingSid);
+    const revivedReport = await report('near', 'n78-claude');
+    const revivedSid = await until(async () => (await attachText()).includes(H.host + ':claude:deadbeef') && await attachSid(), 15000);
     const observedDetailStable = await observedTitle!.evaluate(e => e === document.querySelector('#mesh-detail h3'));
-    check('N78: ending and reviving the selected observed session removes and restores Open terminal and its hint in place without rebuilding detail',
-      endedReport === 204 && revivedReport === 204 && !!endedAction && !!revivedAction && observedDetailStable,
-      JSON.stringify({ endedReport, revivedReport, endedAction, revivedAction, observedDetailStable }));
+    check('N78: ending the selected observed session kills its viewer and explains why; reviving reopens a fresh viewer without rebuilding detail',
+      !!beforeEnd && endedReport === 204 && !!endedAction && !!endedViewer && revivedReport === 204 && !!revivedSid && revivedSid !== endingSid && observedDetailStable,
+      JSON.stringify({ beforeEnd, endedReport, endedAction, endedViewer, revivedReport, revivedSid, observedDetailStable }));
 
-    const attach = async (id: string, address: string, input: string, P = D) => {
-      await P.evaluate((id: string) => window.__canvas.meshOpen(id), id); await P.getByRole('button', { name: 'Open terminal', exact: true }).click();
-      const sid = await P.evaluate(() => window.__canvas.live.$agents.backend.n.id);
-      const printed = await until(async () => (await termText(P, '$agents')).includes(address), 15000);
+    const attach = async (address: string, input: string, P = D) => {
+      const sid = await attachSid(P);
+      const printed = await until(async () => (await attachText(P)).includes(address), 15000);
       await P.locator('#mesh-detail .mesh-live .xterm-helper-textarea').focus();
       await P.keyboard.type(input); await P.keyboard.press('Enter');
-      const echoed = await until(async () => (await termText(P, '$agents')).split(input).length >= 3, 10000);
+      const echoed = await until(async () => (await attachText(P)).split(input).length >= 3, 10000);
       const hidden = await P.evaluate((sid: string) => !window.__canvas.attnItems().some((i: RgEntry) => i.key === 'orphan:' + sid) && !document.querySelector(`#mesh-list .mesh-row[data-id="${sid}"]`), sid);
-      return { printed, echoed, hidden, text: await termText(P, '$agents'), sid, opens: ptyOf(P, sid).map(w => w.open) };
+      return { printed, echoed, hidden, text: await attachText(P), sid, opens: ptyOf(P, sid).map(w => w.open) };
     };
-    const claude = await attach(ids['n78-claude'], H.host + ':claude:deadbeef', 'n78-cat-claude');
-    check('N78: observed Claude attach prints its safe address, carries PTY input/output, has no browser cmd or canvas card and is not an orphan',
-      !!claude.printed && !!claude.echoed && claude.hidden && claude.opens.some(o => o?.spawn && o.attach === ids['n78-claude'] && !('cmd' in o)) && await nodes() === before, JSON.stringify(claude));
-    const other = await attach(ids['n78-claude'], H.host + ':claude:deadbeef', 'n78-cat-other-page', owner);
+    const claude = await attach(H.host + ':claude:deadbeef', 'n78-cat-claude');
+    check('N78: clicking a Claude-address row opens an interactive terminal without a button, browser cmd, canvas card or orphan entry',
+      !!claude.printed && !!claude.echoed && claude.hidden && !await attachButton().count()
+      && claude.opens.some(o => o?.spawn && o.attach === ids['n78-claude'] && !('cmd' in o)) && await nodes() === before, JSON.stringify(claude));
+    await owner.evaluate((id: string) => window.__canvas.meshOpen(id), ids['n78-claude']);
+    await owner.locator(`#mesh-list .mesh-row[data-id="${ids['n78-claude']}"]`).click();
+    const other = await attach(H.host + ':claude:deadbeef', 'n78-cat-other-page', owner);
     const both = await isAlive(claude.sid) && await isAlive(other.sid);
     check('N78: two pages opening the same observed row get distinct live, sid-safe attach PTYs',
       !!other.printed && !!other.echoed && other.hidden && both && claude.sid !== other.sid
@@ -4090,28 +4159,74 @@ await section('N78', async () => {
     const deselected = await until(async () => !(await sessions()).some(s => s.sid === claude.sid) && !await D.locator('#mesh-detail .xterm').count(), 15000);
     const still = await D.evaluate((id: string) => { const o = window.__canvas.OBS[id]; return !!o && o.endedAt === null; }, ids['n78-claude']);
     await owner.locator('#mesh-detail .mesh-live .xterm-helper-textarea').focus(); await owner.keyboard.type('n78-still-other-page'); await owner.keyboard.press('Enter');
-    const otherSurvived = await until(async () => await isAlive(other.sid) && (await termText(owner, '$agents')).split('n78-still-other-page').length >= 3, 10000);
+    const otherSurvived = await until(async () => await isAlive(other.sid) && (await attachText(owner)).split('n78-still-other-page').length >= 3, 10000);
     check('N78: deselecting terminates only that page\'s attach PTY, leaving the other page\'s viewer interactive and the observed and hub sessions live',
       !!deselected && still && !!otherSurvived && await isAlive(sid), JSON.stringify({ deselected, still, otherSurvived }));
     await owner.evaluate(() => window.__canvas.setView('canvas'));
     const otherLeft = await until(async () => !(await sessions()).some(s => s.sid === other.sid), 15000);
     check('N78: leaving the second page terminates only its separate attach PTY', !!otherLeft && still, JSON.stringify({ otherLeft, sid: other.sid }));
     await syncBoard(owner, D);   // View changes are shared-board writes; do not race the two pages' saves.
-    const tmux = await attach(ids['n78-tmux'], 'farbox:tmux:12:/tmp/n78-tmux/default', 'n78-cat-tmux');
+    await open(ids['n78-claude-tmux']);
+    await D.locator('#mesh-list').focus(); await D.keyboard.press('Enter');
+    const enteredClaude = await attach(H.host + ':tmux:7:/tmp/n78-tmux/default', 'n78-cat-enter');
+    check('N78: Enter on a highlighted Claude Code row with a tmux address opens its terminal without a button',
+      !!enteredClaude.printed && !!enteredClaude.echoed && !await attachButton().count(), JSON.stringify(enteredClaude));
+    await row(ids['n78-tmux']).click();
+    const manual = await attachButton().isEnabled() && !await hasTerminal() && !attachOpens().some(w => w.open?.attach === ids['n78-tmux']);
+    await attachButton().click();
+    const tmux = await attach('farbox:tmux:12:/tmp/n78-tmux/default', 'n78-cat-tmux');
     await D.evaluate(() => (document.activeElement as HTMLElement | null)?.blur()); await D.keyboard.press('Alt+Digit1');
     const left = await until(async () => !(await sessions()).some(s => s.sid === tmux.sid) && !await D.locator('#mesh-detail .xterm').count(), 15000);
-    check('N78: remote tmux attach prints the resolved address and carries input; leaving Agents terminates only its temporary PTY',
-      !!tmux.printed && !!tmux.echoed && tmux.hidden && !!left && await isAlive(sid) && await nodes() === before, JSON.stringify({ tmux, left }));
+    check('N78: non-Claude tmux needs Open terminal; leaving Agents terminates its temporary PTY and the previous viewer is forgotten',
+      manual && !!tmux.printed && !!tmux.echoed && tmux.hidden && !!left && !!await forgot(enteredClaude.sid)
+      && await isAlive(sid) && await nodes() === before, JSON.stringify({ manual, tmux, left }));
     await syncBoard(D, owner);
     unloadPage = await dpage(); await unloadPage.evaluate((id: string) => window.__canvas.meshOpen(id), ids['n78-claude']);
-    await unloadPage.getByRole('button', { name: 'Open terminal', exact: true }).click();
-    const unloadingSid = await unloadPage.evaluate(() => window.__canvas.live.$agents.backend.n.id);
+    await unloadPage.locator(`#mesh-list .mesh-row[data-id="${ids['n78-claude']}"]`).click();
+    const unloadingSid = await attachSid(unloadPage);
     const unloading = await until(() => isAlive(unloadingSid), 15000);
     await syncBoard(unloadPage, D);
     await unloadPage.close(); unloadPage = undefined;
     const unloaded = await until(async () => !(await sessions()).some(s => s.sid === unloadingSid), 15000);
     check('N78: page unload terminates and forgets the attach viewer, leaving its observed session live',
       !!unloading && !!unloaded && unloadingSid !== claude.sid && unloadingSid !== other.sid && await D.evaluate((id: string) => window.__canvas.OBS[id]?.endedAt === null, ids['n78-claude']), JSON.stringify({ unloading, unloaded, unloadingSid }));
+
+    await open(ids['n78-fail']); await row(ids['n78-fail']).click();
+    const retry = D.getByRole('button', { name: 'Retry', exact: true });
+    await retry.waitFor();
+    const failedSid = await attachSid(), failure = await D.locator('#mesh-detail .mesh-hint').innerText(), failedOpens = attachOpens().length;
+    await D.locator('#mesh-detail .xterm-helper-textarea').focus(); await D.keyboard.press('Enter');
+    const shellOffer = /press Enter/i.test(await attachText()), enterRespawned = attachOpens().length !== failedOpens;
+    await retry.click(); await retry.waitFor();
+    const retriedSid = await attachSid();
+    check('N78: a failed attach explains the exit, never offers or starts a shell on Enter, and Retry opens a fresh attach sid',
+      /exited with code 23/.test(failure) && !shellOffer && !enterRespawned && retriedSid !== failedSid && !!await forgot(failedSid)
+      && attachOpens().some(w => w.open?.id === retriedSid && w.open.attach === ids['n78-fail']), JSON.stringify({ failure, failedSid, retriedSid, shellOffer, enterRespawned }));
+    await row(ids['n78-readonly']).click();
+
+    // Delay hello only at the app's message handler. The browser and relay still use the real socket.
+    const pendingSid = await D.evaluate((id: string): string => {
+      document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${id}"]`)!.click();
+      const b = window.__canvas.live.$agentsAttach.backend;
+      const onmessage = b.ws.onmessage!;
+      b.ws.onmessage = function (this: WebSocket, e: MessageEvent<string>) {
+        if ((JSON.parse(e.data) as PtyServerMsg).t !== 'hello') onmessage.call(this, e);
+      };
+      return b.n.id;
+    }, ids['n78-claude']);
+    const received = await until(() => ptyOf(D, pendingSid).some(w => w.hello), 15000);
+    const pending = await D.evaluate(() => !window.__canvas.live.$agentsAttach.backend.helloSeen);
+    const running = await isAlive(pendingSid);
+    await row(ids['n78-readonly']).click();
+    check('N78: deselecting while the attach hello is pending kills and forgets the PTY',
+      !!received && pending && running && !!await forgot(pendingSid) && !await hasTerminal(),
+      JSON.stringify({ pendingSid, received, pending, running }));
+
+    // Also deselect in the mount task, before xterm's initial viewport sync.
+    await D.evaluate(async (ids: string[]) => {
+      for (const id of ids) document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${id}"]`)!.click();
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }, [ids['n78-claude'], ids['n78-readonly']]);
 
     // Borrowed ownership is part of the saved board, not the backend's lifetime in this page.
     await open(sid); await D.getByRole('button', { name: 'Add its card', exact: true }).click();
@@ -4275,7 +4390,8 @@ await section('N78', async () => {
     await meshApi('/sessions/' + sid + '?forget=true', 'DELETE');
     await meshApi('/sessions/n78_layout_api?forget=true', 'DELETE');
     for (const id of [owned, ownedPty]) if (id) await meshApi('/sessions/' + id + '?forget=true', 'DELETE');
-    for (const id of ['n78-readonly', 'n78-claude', 'n78-hubpty', 'n78-layout']) await report('near', id, {}, 'end');
+    for (const id of ['n78-readonly', 'n78-claude', 'n78-hubpty', 'n78-layout', 'n78-fail']) await report('near', id, {}, 'end');
+    await reportClaude('n78-claude-tmux', {}, 'SessionEnd');
     await report('far', 'n78-tmux', {}, 'end');
     await settled(D); await owner.close(); await D.close();
   }

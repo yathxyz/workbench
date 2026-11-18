@@ -364,7 +364,9 @@ async function netProbe(): Promise<void> {
   if (r.status === 403) return netSet('forbidden');
   let info: DaemonInfo | null = null; if (r.ok) try { info = await r.json(); } catch {}
   if (!info) return netSet('down');
+  const attachChanged = INFO?.attach !== info.attach || INFO?.host !== info.host;
   Object.assign(INFO!, info); hubSeen(info.hub); acpButton(); netSet('up');
+  if (attachChanged) meshRender();
 }
 function netSet(s: NetState['state']): void {
   const was = NET.state; NET.state = s; clearTimeout(NET.timer);
@@ -436,6 +438,8 @@ const RPC_EVENTS: RpcEventHandlers = {
     TOMBS.add(m.sid + ' ' + m.epoch);
     if (SESS[m.sid]?.createdAt === m.epoch) delete SESS[m.sid];
     live[m.sid]?.backend?.goneElsewhere?.(m.epoch); if (MESH_PANE.node?.id === m.sid) live.$agents?.backend?.goneElsewhere?.(m.epoch); sessChanged(m.sid);
+    const attach = live.$agentsAttach?.backend;
+    if (attach instanceof PtyBackend && attach.n.id === m.sid) attach.goneElsewhere(m.epoch);
   },
   board: m => boardChanged(m.etag),
   observed: m => { const was: Record<string, SessionState> = {}; for (const k in OBS) { was[k] = OBS[k].state; delete OBS[k]; } (m.sessions || []).forEach(o => obsPut(o, was[o.id])); meshChanged(); },
@@ -740,9 +744,8 @@ class FakeShell implements CardBackend {
 }
 
 // Real PTY through wb-hub. The hub keeps the session alive across reloads and replays recent output.
-// A real shell on the server (/pty, §3.5.1). Nothing auto-runs: `spawn` is true only on the first open of a card made in
-// this page and on Enter on an ended or not-found card, and only until that open is sent; page loads and reconnects attach
-// with `resume` (SEC-2, F-A6).
+// A real shell on the server (/pty, §3.5.1). `spawn` is true only on the first open of a card or temporary viewer
+// made in this page, or on Enter on an ended or not-found shell card. Reconnects attach with `resume` (SEC-2, F-A6).
 const IN_CHUNK = 262144;   // characters per `in` message: worst-case JSON escaping stays under the web's message cap
 const EXIT_TEXT: Partial<Record<PtyExitReason, string>> = {
   hub_restart: 'the Workbench hub restarted: press Enter to start a new shell',
@@ -763,6 +766,7 @@ class PtyBackend implements CardBackend, Wakeable {
   declare host: Host | null; declare parked: boolean; declare final: boolean; declare helloSeen: boolean; declare ws: WebSocket;
   declare dead?: boolean; declare exitReason?: PtyExitReason | null; declare epoch?: number; declare lost?: boolean; declare helloed?: boolean;
   declare respawning?: boolean; declare shellOffer?: boolean;
+  declare attachError?: string;
   constructor(n: TermNode, term: XtermTerminal, L: LiveEntry) { this.n = n; this.t = term; this.L = L; this.spawn = !!n._spawn; delete n._spawn; this.tries = 0; this.connect(); }
   openMsg(): string {
     const n = this.n, m: Extract<PtyClientMsg, { t: 'open' }> = { t: 'open', id: n.id, cmd: n.cmd || '', parent: n.spawnFrom || '', cwd: n.cwd || '', cols: this.t.cols, rows: this.t.rows, env: { CANVAS_NODE: pathOf(n.id), ...(n.env || {}) }, spawn: this.spawn };
@@ -778,8 +782,12 @@ class PtyBackend implements CardBackend, Wakeable {
     if (h) { this.n.hostUrl = h.url; rpcFor(h); } else delete this.n.hostUrl;
     this.parked = false; this.final = false; this.helloSeen = false;
     const ws = this.ws = new WebSocket(hWs(h, '/pty'));
-    ws.onopen = () => { ws.send(this.openMsg()); this.spawn = false; if (h) { this.tries = 0; hostUp(h); } };   // a reconnect never spawns
+    ws.onopen = () => {
+      if (this.disposed || ws !== this.ws || ws.readyState !== 1) return;
+      ws.send(this.openMsg()); this.spawn = false; if (h) { this.tries = 0; hostUp(h); }   // a reconnect never spawns
+    };
     ws.onmessage = ev => {
+      if (this.disposed || ws !== this.ws) return;
       let m: PtyServerMsg; try { m = JSON.parse(ev.data); } catch { return; }
       if (m.t === 'hello') {
         this.dead = false; this.exitReason = null; this.helloSeen = true; this.tries = 0; this.epoch = m.epoch;
@@ -797,11 +805,16 @@ class PtyBackend implements CardBackend, Wakeable {
       else if (m.t === 'exit') {
         this.dead = true; this.exitReason = m.reason || null;
         const how = m.code != null ? ` with code ${m.code}` : m.signal ? ` (signal ${m.signal})` : '';
+        if (this.n._attach) {
+          const reason = m.reason === 'hub_restart' ? 'the Workbench hub restarted' : m.reason === 'spawn_failed' ? 'could not start the attachment' : m.reason === 'killed' ? 'the viewer was killed' : `the process exited${how}`;
+          return this.attachFailed(reason);
+        }
         this.t.write('\r\n\x1b[2m[' + (EXIT_TEXT[m.reason] || `process exited${how}: press Enter to start a new one`) + ']\x1b[0m\r\n');
       } else if (m.t === 'gone') this.goneElsewhere(m.epoch);
       else if (m.t === 'error') {
         if (!this.helloSeen) this.final = true;   // a failed open: the server closes 1000, nothing to reconnect to (F-A4)
         this.dead = true;
+        if (this.n._attach) return this.attachFailed(m.error || 'could not open the terminal');
         if (m.code === 'not_found') {
           const env = Object.keys(this.n.env || {});   // a board's env changes what starts too (PROMPT_COMMAND, BASH_ENV)
           this.lost = true; this.t.write(`\r\n\x1b[33m[No session: press Enter to start ${plain(this.n.cmd || shellName(this.n) || 'a shell')}${env.length ? ' with env ' + plain(env.join(' ')) : ''}]\x1b[0m\r\n`);
@@ -821,7 +834,9 @@ class PtyBackend implements CardBackend, Wakeable {
       // §3.5.4: 1000/1008/1009 are final and keep the card's state; 1013 waits for the hub; the rest back off.
       if (this.final || [1000, 1008, 1009].includes(ev.code)) {
         this.final = true;
-        if (ev.code === 1008 || ev.code === 1009) this.t.write(`\r\n\x1b[31m[connection closed: ${ev.code === 1009 ? 'message too big' : 'protocol error'} (${ev.code}): press Enter to reopen]\x1b[0m\r\n`);
+        const reason = ev.code === 1009 ? 'message too big' : ev.code === 1008 ? 'protocol error' : 'connection closed';
+        if (this.n._attach) { if (!this.attachError) this.attachFailed(reason); }
+        else if (ev.code === 1008 || ev.code === 1009) this.t.write(`\r\n\x1b[31m[connection closed: ${reason} (${ev.code}): press Enter to reopen]\x1b[0m\r\n`);
         else if (!this.dead) this.t.write('\r\n\x1b[2m[connection closed: press Enter to start a new shell]\x1b[0m\r\n');
         this.dead = true; this.L?.el.classList.remove('net-wait');
         return;
@@ -832,6 +847,10 @@ class PtyBackend implements CardBackend, Wakeable {
       if (NET.state !== 'signed_out' && NET.state !== 'forbidden') this.timer = setTimeout(() => this.connect(), backoff(this.tries++));
     };
   }
+  attachFailed(reason: string): void {
+    this.final = true; this.dead = true; this.attachError = reason;
+    if (live.$agentsAttach === this.L) meshRender();
+  }
   wake(): void { if (!this.disposed && !this.final && !this.host && this.ws?.readyState > 1) { this.tries = 0; this.connect(); } }
   reconnect(): void { if (this.parked && !this.disposed) { this.tries = 0; this.connect(); } }
   // /rpc or /pty `gone`: the session was ended in another tab or by wb; never reconnect or respawn on our own (ROB-19)
@@ -839,7 +858,8 @@ class PtyBackend implements CardBackend, Wakeable {
     if (epoch != null && this.epoch != null && epoch !== this.epoch) return;
     if (this.final) return;
     this.final = true; this.dead = true; clearTimeout(this.timer); WAKE.delete(this); this.L?.el.classList.remove('net-wait');
-    this.t.write('\r\n\x1b[2m[this session was ended elsewhere: press Enter to start a new one]\x1b[0m\r\n');
+    if (this.n._attach) this.attachFailed('the viewer was ended elsewhere');
+    else this.t.write('\r\n\x1b[2m[this session was ended elsewhere: press Enter to start a new one]\x1b[0m\r\n');
     try { this.ws?.close(); } catch {}
   }
   offerDefault(): void { this.shellOffer = true; this.t.write(`\r\n\x1b[33m[the shell ${shellName(this.n)} is not available here: press Enter to start ${plain(INFO!.defaultShell)}]\x1b[0m\r\n`); }
@@ -860,7 +880,7 @@ class PtyBackend implements CardBackend, Wakeable {
     }
   }
   input(d: string): void {
-    if (this.dead) { if (d === '\r') this.respawn(); return; }
+    if (this.dead) { if (!this.n._attach && d === '\r') this.respawn(); return; }
     this.send(d);
   }
   // only the tab the user is looking at sizes the PTY (ROB-8): the active card, or a terminal holding the keyboard (the dock is never a card)
@@ -870,7 +890,11 @@ class PtyBackend implements CardBackend, Wakeable {
   kill(): void {
     this.disposed = true; clearTimeout(this.timer); WAKE.delete(this);
     if (this.ws?.readyState === 1) { this.ws.send(JSON.stringify({ t: 'kill' })); setTimeout(() => this.ws?.close(), 50); }
-    else { try { this.ws?.close(); } catch {} new Reap('/pty', { t: 'open', id: this.n.id, spawn: false }, { t: 'kill' }, undefined, this.host); }
+    else {
+      try { this.ws?.close(); } catch {}
+      // A temporary viewer cancelled before its first open was sent cannot exist on the hub.
+      if (!this.n._attach || !this.spawn) new Reap('/pty', { t: 'open', id: this.n.id, spawn: false }, { t: 'kill' }, undefined, this.host);
+    }
   }
   // the card went in another tab: close here, the session is not ours to end
   dispose(): void { this.disposed = true; clearTimeout(this.timer); WAKE.delete(this); try { this.ws?.close(); } catch {} }
@@ -1146,7 +1170,7 @@ class AcpBackend implements CardBackend {
   dispose() { this.stop(); try { this.ws?.close(); } catch {} }   // the card went in another tab: close here, the session is not ours to end
   maybeSeen() {   // seen only when the user can see the result (§3.4.6)
     const s = this.sum, a = s?.acp;
-    if (!a || !(VIEW === 'canvas' && activeId === this.n.id || VIEW === 'agents' && live.$agents === this.L) || document.visibilityState !== 'visible' || !document.hasFocus()) return;
+    if (!a || !(VIEW === 'canvas' && activeId === this.n.id || VIEW === 'agents' && live.$agents === this.L && !this.L.el.hidden) || document.visibilityState !== 'visible' || !document.hasFocus()) return;
     if ((s.state !== 'done' && s.state !== 'error') || a.headSeq <= a.seenSeq || this.seenSent >= a.headSeq) return;
     if (this.send({ t: 'seen', seq: a.headSeq })) this.seenSent = a.headSeq;
   }
@@ -4157,7 +4181,8 @@ function toggleDockTerm() {
 const OBS: Record<string, ObservedSession> = {};
 const MESH: { open: string | null; ended: boolean; facts: boolean; collapsed: Set<string>; graph: string; topo: string; t: number } = { open: null, ended: false, facts: false, collapsed: new Set(), graph: '', topo: '', t: 0 };
 const MESH_ROWS = new Map<string, HTMLElement>(), MESH_GROUPS = new Map<string, HTMLElement>();
-const MESH_PANE: { row: string | null; key: string; actions: string; node: TermNode | AcpNode | null; attach: boolean; rows: string[] } = { row: null, key: '', actions: '', node: null, attach: false, rows: [] };
+const MESH_PANE: { row: string | null; hubKey: string; actions: string; node: TermNode | AcpNode | null; attach: string; committed: boolean; terminal: boolean; rows: string[] } =
+  { row: null, hubKey: '', actions: '', node: null, attach: '', committed: false, terminal: false, rows: [] };
 // The hub session an observed one runs in: its WB_SESSION, believed only from the host that session is on.
 function obsSess(o: ObservedSession): SessionSummary | null {
   // A subagent can inherit the enclosing hub sid even when its parent was never reported.
@@ -4247,7 +4272,7 @@ function meshRowEl(r: MeshRow): HTMLElement {
   };
   go.title = 'Show its card on the canvas';
   go.onclick = e => { e.stopPropagation(); const n = row.dataset.card && S.nodes[row.dataset.card]; if (n) { setView('canvas'); jumpNode(n); } };
-  row.onclick = () => meshSelect(r.id);
+  row.onclick = () => { meshSelect(r.id, true); if (live.$agentsAttach) meshFocus(); };
   return row;
 }
 // A row's texts, set in place: a row under the pointer is not replaced while its session works.
@@ -4315,21 +4340,27 @@ function meshHeader(r: MeshRow): void {
   meta.replaceChildren(...parts.flatMap((s, i) => i ? [' · ', s] : [s]));
 }
 function meshFactsMode(): void {
-  const box = $('#mesh-detail')!, mounted = !!live.$agents;
+  const box = $('#mesh-detail')!, mounted = !!meshViewer();
   box.classList.toggle('mounted', mounted);
   const toggle = $('.mesh-disclose', box)!;
   toggle.hidden = !mounted; toggle.setAttribute('aria-expanded', String(MESH.facts));
   $('.mesh-info', box)!.hidden = mounted && !MESH.facts;
-  live.$agents?.fitNow?.();
+}
+function meshViewer(): LiveEntry | undefined {
+  return live.$agentsAttach || (live.$agents?.el?.hidden ? undefined : live.$agents);
+}
+function meshUnmount(slot: '$agents' | '$agentsAttach'): void {
+  const L = live[slot]; if (!L) return;
+  delete live[slot];
+  if (slot === '$agentsAttach') L.backend?.kill?.(); else L.backend?.dispose?.();
+  L.ro?.disconnect(); clearTimeout(L.fitT); L.el.remove();
+  // xterm 5.5 queues its first viewport sync in a timer that disposal does not cancel.
+  if (L.term) setTimeout(() => L.term!.dispose(), 0);
 }
 function meshClose(): void {
-  const L = live.$agents;
-  if (L) {
-    if (MESH_PANE.attach) L.backend?.kill?.(); else L.backend?.dispose?.();
-    L.ro?.disconnect(); clearTimeout(L.fitT); L.term?.dispose(); delete live.$agents;
-    L.el.remove();
-  }
-  MESH_PANE.row = null; MESH_PANE.key = ''; MESH_PANE.actions = ''; MESH_PANE.node = null; MESH_PANE.attach = false;
+  meshUnmount('$agentsAttach'); meshUnmount('$agents');
+  MESH_PANE.row = null; MESH_PANE.hubKey = ''; MESH_PANE.actions = ''; MESH_PANE.node = null;
+  MESH_PANE.attach = ''; MESH_PANE.committed = false; MESH_PANE.terminal = false;
   $('#mesh-detail')!.classList.remove('mounted');
 }
 function meshMount(r: MeshRow, attach = false): void {
@@ -4338,39 +4369,81 @@ function meshMount(r: MeshRow, attach = false): void {
   const n: TermNode | AcpNode = r.sess?.kind === 'acp' && !attach ? { ...base, kind: 'acp', agent: r.sess.acp?.agent || '', cwd: r.sess.cwd || '' }
     : { ...base, kind: 'term', backend: 'pty', env: {}, ...(attach ? { _spawn: true, _attach: r.id } : {}) };
   hdr.append(el('i', 'dot'), el('span', 'badge')); host.append(hdr, body); box.append(host);
-  MESH_PANE.node = n; MESH_PANE.attach = attach;
-  const L = live.$agents = { el: host, hdr, body };
+  if (!attach) MESH_PANE.node = n;
+  const L = live[attach ? '$agentsAttach' : '$agents'] = { el: host, hdr, body };
   if (n.kind === 'acp') mountAcp(n, L); else mountTerm(n, L);
+}
+const MESH_SETUP = 'Start a Claude background session, use tmux, or run in a Workbench shell or agent card to control it here.';
+function meshAttachReason(r: MeshRow): string {
+  if (r.obs?.endedAt != null) return 'The observed session has ended.';
+  if (!r.obs?.attach) return 'Started in a terminal the hub cannot reach.';
+  if (!INFO?.attach) return 'Terminal attachment is not configured.';
+  return '';
+}
+function meshReconcile(r: MeshRow): void {
+  const hub = r.sess?.kind === 'acp' || r.sess?.kind === 'pty' && r.sess.host === INFO?.host ? r.sess : null;
+  const hubKey = hub ? [hub.sid, hub.kind, hub.createdAt].join(' ') : '';
+  if (hubKey !== MESH_PANE.hubKey) {
+    meshUnmount('$agents'); MESH_PANE.node = null; MESH_PANE.hubKey = hubKey;
+    if (hub) { MESH_PANE.terminal = false; meshMount(r); }
+  }
+  const claude = r.obs?.harness === 'claude' || r.obs?.attach?.kind === 'claude';
+  const reason = meshAttachReason(r), canAttach = !reason && hub?.kind !== 'pty';
+  const terminal = hub?.kind !== 'pty' && (MESH_PANE.terminal || !hub && MESH_PANE.committed && claude);
+  const attach = terminal && canAttach ? JSON.stringify(r.obs!.attach) : '';
+  if (attach !== MESH_PANE.attach) {
+    meshUnmount('$agentsAttach'); MESH_PANE.attach = attach;
+    if (attach) meshMount(r, true);
+  }
+  const transcript = live.$agents?.el;
+  if (transcript && transcript.hidden !== terminal) {
+    transcript.hidden = terminal;
+    if (!terminal) live.$agents?.backend?.maybeSeen?.();
+  }
+  const backend = live.$agentsAttach?.backend, error = backend instanceof PtyBackend ? backend.attachError : '';
+  const switchTo = hub?.kind === 'acp' && (canAttach || terminal) ? terminal ? 'Transcript' : 'Terminal' : '';
+  const manual = canAttach && !hub && !claude && !terminal;
+  let hint = '';
+  if (error) hint = 'Terminal attachment failed: ' + error;
+  else if (attach || manual) hint = 'Closing this terminal leaves the agent running.';
+  else if (!hub || terminal) hint = reason ? reason + ' ' + MESH_SETUP : 'Click this session or press Enter to open its terminal.';
+  const key = JSON.stringify([r.card?.id, r.sess?.sid, !!hub && r.live, switchTo, manual, !!error, hint]);
+  if (key !== MESH_PANE.actions) {
+    MESH_PANE.actions = key; meshActions(r, !!hub, switchTo, manual, !!error, hint);
+  }
   meshFactsMode();
 }
-const meshPaneKey = (r: MeshRow): string => [r.id, r.sess?.sid || '', r.sess?.kind || '', r.sess?.createdAt ?? ''].join(' ');
-const meshActionKey = (r: MeshRow): string => [r.card?.id || '', !!r.obs?.attach, !!INFO?.attach, r.live].join(' ');
-function meshActions(r: MeshRow): void {
-  MESH_PANE.actions = meshActionKey(r);
-  const box = $('#mesh-detail')!, acts = $('.ex-btns', box)!, sid = r.sess?.sid,
-    reachable = r.sess?.kind === 'acp' || r.sess?.kind === 'pty' && r.sess.host === INFO?.host;
+function meshActions(r: MeshRow, reachable: boolean, switchTo: string, manual: boolean, retry: boolean, hint: string): void {
+  const box = $('#mesh-detail')!, acts = $('.ex-btns', box)!, sid = r.sess?.sid;
   acts.replaceChildren(); $('.mesh-hint', box)?.remove();
   const B = (label: string, fn: () => unknown) => { const b = el('button', 'tb', label); b.onclick = fn; acts.append(b); return b; };
   if (r.card) B('Show on canvas', () => { const n = sid && S.nodes[sid]; if (n) { setView('canvas'); jumpNode(n); } });
   else if (sid) B('Add its card', () => { if (SESS[sid]) { setView('canvas'); adoptOrphan(SESS[sid]); } });
   B('Copy id', () => copyText(r.obs?.key || r.id));
   if (reachable && r.live) B('Kill session', () => { const n = MESH_PANE.node, L = live.$agents; if (n && L) confirmSessionKill(n, L); }).classList.add('mesh-kill');
-  if (reachable) return;
-  if (r.obs?.attach && INFO?.attach && r.live) {
-    const open = B('Open terminal', () => { open.disabled = true; meshMount(r, true); meshEnter(); }); open.disabled = MESH_PANE.attach;
-    $('.mesh-head', box)!.append(el('div', 'mesh-hint', 'Closing this terminal leaves the agent running.'));
-  } else $('.mesh-head', box)!.append(el('div', 'mesh-hint', 'Started in a terminal the hub cannot reach. Start a Claude background session, use tmux, or run in a Workbench shell or agent card to control it here.'));
+  if (switchTo) {
+    const button = B(switchTo, () => {
+      const focused = document.activeElement === button;
+      meshSetTerminal(switchTo === 'Terminal');
+      if (focused) $('.mesh-switch', acts)?.focus();
+    });
+    button.classList.add('mesh-switch'); button.title = 'Switch between Transcript and Terminal (t)';
+  }
+  if (manual) B('Open terminal', () => { meshSetTerminal(true); meshFocus(); });
+  if (retry) B('Retry', () => { meshUnmount('$agentsAttach'); MESH_PANE.attach = ''; meshRender(); meshFocus(); });
+  if (hint) $('.mesh-head', box)!.append(el('div', 'mesh-hint', hint));
+}
+function meshSetTerminal(terminal: boolean): void {
+  MESH_PANE.terminal = terminal; $('#v-agents')!.classList.add('detail-open'); meshRender();
 }
 function meshDetail(r: MeshRow): void {
-  meshClose(); MESH_PANE.row = r.id; MESH_PANE.key = meshPaneKey(r);
+  meshClose(); MESH_PANE.row = r.id;
   const box = $('#mesh-detail')!, head = el('div', 'mesh-head'), back = el('button', 'tb mesh-back', '← Sessions'), toggle = el('button', 'tb mesh-disclose', 'Details'), info = el('div', 'mesh-info');
   info.id = 'mesh-info'; toggle.setAttribute('aria-controls', info.id);
-  toggle.onclick = () => { MESH.facts = !MESH.facts; meshFactsMode(); };
+  toggle.onclick = () => { MESH.facts = !MESH.facts; meshFactsMode(); meshViewer()?.fitNow?.(); };
   back.onclick = meshBack; head.append(el('h3', '', r.title), el('div', 'ex-btns'), toggle, el('div', 'mesh-meta'), info); box.replaceChildren(back, head);
-  meshActions(r); if (r.sess?.kind === 'acp' || r.sess?.kind === 'pty' && r.sess.host === INFO?.host) meshMount(r);
-  else meshFactsMode();
 }
-function meshSelect(id: string): void {
+function meshSelect(id: string, commit = false): void {
   const all = meshRows(), flat = meshFlat(all), row = flat.find(r => r.id === id || r.sess?.sid === id);
   if (row) {
     id = row.id;
@@ -4381,19 +4454,32 @@ function meshSelect(id: string): void {
     });
     expand(all);
   }
-  MESH.open = id; $('#v-agents')!.classList.add('detail-open'); meshRender();
+  MESH.open = id; $('#v-agents')!.classList.add('detail-open'); meshRender(commit);
   $(`#mesh-list .mesh-row[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'nearest' });
 }
-function meshBack(): void { $('#v-agents')!.classList.remove('detail-open'); $('#mesh-list')!.focus(); }
+function meshBack(): void {
+  $('#v-agents')!.classList.remove('detail-open');
+  if (MESH_PANE.committed || MESH_PANE.terminal) {
+    MESH_PANE.committed = false; MESH_PANE.terminal = false; meshRender();
+  }
+  $('#mesh-list')!.focus();
+}
 function meshMove(by: number): void {
   const rows = MESH_PANE.rows; if (!rows.length) return;
   const i = Math.max(0, rows.indexOf(MESH.open || '')); meshSelect(rows[clamp(i + by, 0, rows.length - 1)]); $('#mesh-list')!.focus();
   $('#v-agents')!.classList.remove('detail-open');
 }
-function meshEnter(): void { $('#v-agents')!.classList.add('detail-open'); const L = live.$agents; if (L?.ta) L.ta.focus(); else if (L?.term) { L.fitNow?.(); L.term.focus(); } else $('#mesh-detail button:not(.mesh-back)')?.focus(); }
+function meshFocus(): void {
+  const L = meshViewer();
+  if (L?.ta) L.ta.focus(); else if (L?.term) { L.fitNow?.(); L.term.focus(); }
+  else $('#mesh-detail button:not(.mesh-back)')?.focus();
+}
+function meshEnter(): void {
+  $('#v-agents')!.classList.add('detail-open'); meshRender(true); meshFocus();
+}
 addEventListener('pagehide', meshClose);
 $('#mesh-detail')!.addEventListener('keydown', e => { if (e.key === 'Escape' && (e.target as Element).matches('textarea')) { e.preventDefault(); meshBack(); } });
-function meshRender(): void {
+function meshRender(commit = false): void {
   const box = $('#mesh-list');
   if (!box || VIEW !== 'agents') return;
   if (!document.body.classList.contains('pane-drag')) setMeshW(S.meshW);
@@ -4435,8 +4521,9 @@ function meshRender(): void {
   if (!lines.length && !box.children.length) box.append(el('p', 'muted', 'A session shows here when a harness on any host of the mesh reports to this hub, or when an agent card starts.'));
   const selected = lines.find(l => l.r.id === MESH.open)?.r;
   if (selected) {
-    if (meshPaneKey(selected) !== MESH_PANE.key) meshDetail(selected);
-    else if (meshActionKey(selected) !== MESH_PANE.actions) meshActions(selected);
+    if (selected.id !== MESH_PANE.row) meshDetail(selected);
+    if (commit) MESH_PANE.committed = true;
+    meshReconcile(selected);
     meshHeader(selected);
     meshInfo($('#mesh-detail .mesh-info')!, selected);
   } else { meshClose(); $('#mesh-detail')!.replaceChildren(el('p', 'muted', 'Select a session.')); $('#v-agents')!.classList.remove('detail-open'); }
@@ -4458,7 +4545,7 @@ function graphMesh(): void {
 // A session in a few lines, for its card in the graph.
 function meshText(r: MeshRow): string { const o = r.obs; return [meshDoing(r), o?.cwd || r.sess?.cwd, o?.lastPrompt && '› ' + o.lastPrompt, ...(o?.tail.slice(-5).map(t => hhmm(t.at) + ' ' + t.kind.replace(/_/g, ' ') + (t.text ? ' ' + t.text : '')) || [])].filter(Boolean).join('\n'); }
 $('#mesh-ended')!.onchange = e => { MESH.ended = (e.target as HTMLInputElement).checked; meshRender(); };
-setInterval(meshRender, 30000);   // the ages
+setInterval(() => meshRender(), 30000);   // the ages
 cmd('Agents: every session', () => meshOpen(), '@view.agents');
 
 // ------------------------------------------------------------------ chrome: docks, theme
@@ -5118,7 +5205,7 @@ function setMeshW(w?: number, save = false): void {
   const grip = $('#mesh-grip')!;
   grip.setAttribute('aria-valuemin', '200'); grip.setAttribute('aria-valuemax', String(max)); grip.setAttribute('aria-valuenow', String(w));
   if (save) { S.meshW = w; dirty(); }
-  live.$agents?.fitNow?.();
+  meshViewer()?.fitNow?.();
 }
 function wirePaneGrip() {
   wireGrip($('#side-grip')!, ev => innerWidth - ev.clientX, setPaneW, PANE_W);
@@ -9281,6 +9368,7 @@ const KC: Record<string, KeyCmdFn> = {
   },
   ...Object.fromEntries(VIEWS.map(v => ['view.' + v, () => setView(v)])),
   'agents.next': () => meshMove(1), 'agents.prev': () => meshMove(-1), 'agents.enter': () => meshEnter(), 'agents.back': () => meshBack(),
+  'agents.source': () => $('#mesh-detail .mesh-switch')?.click(),
   ...Object.fromEntries([0, 1, 2, 3, 4, 5, 6, 7, 8, 9].flatMap(i => [['desk.' + i, () => deskGo(i)], ['desk.send.' + i, () => deskSend(i)],
     ['desk.follow.' + i, () => deskSend(i, { follow: true })], ['desk.also.' + i, () => deskSend(i, { keep: true })]])),
   'desk.prev': () => deskBack(), 'desk.new': () => deskNew(), 'desk.query': () => deskQueryAsk(), 'desk.rename': () => deskRename(), 'desk.pin': () => deskPin(),
