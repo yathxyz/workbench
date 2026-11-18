@@ -2914,11 +2914,54 @@ await section('frames', async () => {
   await A2.evaluate((id: string) => { const C = window.__canvas; for (const n of Object.values<BoardNode & { block?: ArtifactNode['block'] }>(C.S.nodes)) if (n.block?.page === id) C.removeNode(n.id); C.removeNode(id); }, blk);
   await settled(A2); await settled(B2);
 
+  // N79: a host process opens a file the same way as a click, through the leader tab.
+  const openFile = (input: AgentToolInput) => {
+    const { promise, resolve } = Promise.withResolvers<{ code: number | null; out: string; err: string }>();
+    const c = spawn('wb', ['open_file', '--socket', H.webSocket, '--json', JSON.stringify(input)]);
+    let out = '', err = '';
+    c.stdout.on('data', d => { out += d; }); c.stderr.on('data', d => { err += d; });
+    c.on('error', e => resolve({ code: -1, out, err: String(e) })); c.on('close', code => resolve({ code, out, err }));
+    return promise;
+  };
+  const name79 = 'n79-open-file.md', rel79 = '~/' + name79;
+  const home79 = (await (await api('/api/info')).json()).home as string, abs79 = path.join(home79, name79);
+  fs.writeFileSync(abs79, 'first\nsecond\nthird\nfourth');
+  fs.writeFileSync(noteFile('bin.md'), Buffer.from([0xff, 0xfe, 0x00, 0x41]));
+  fs.mkdirSync(path.join(home79, '.ssh'), { recursive: true });
+  fs.writeFileSync(path.join(home79, '.ssh', name79), 'refused');
+  await A2.bringToFront(); await A2.evaluate(() => dispatchEvent(new Event('focus'))); await sleep(300);
+  const frame79 = () => A2.evaluate((buf: string) => Object.values<BoardNode>(window.__canvas.S.nodes).flatMap(n => {
+    if (n.kind !== 'buffer' || n.buf !== buf) return [];
+    const l = window.__canvas.live[n.id], frame = l?.frame;
+    return [{ id: n.id, focused: frame?.focused, point: frame?.point(), frames: l?.el?.querySelectorAll('.edwin-frame').length }];
+  }), rel79);
+  const point79 = (pt: number) => until(async () => { const frames = await frame79(); return frames.some(f => f.focused && f.point === pt) ? frames : null; }, 10000);
+  const result79 = (r: Awaited<ReturnType<typeof openFile>>, file: string, line: number) => r.code === 0 && r.out.trim() === JSON.stringify({ file, line });
+  const open79 = await openFile({ file: abs79, line: 3 }), at3 = await point79('first\nsecond\n'.length);
+  check('N79: wb open_file over web.sock opens the file in a focused Edwin frame at line 3', result79(open79, abs79, 3) && at3?.length === 1 && at3[0].frames === 1, JSON.stringify({ open79, at3 }));
+  const reopen79 = await openFile({ file: rel79, line: 1 }), at1 = await point79(0);
+  check('N79: opening the same file via ~/ moves point to line 1 without a second frame', result79(reopen79, rel79, 1) && at1?.length === 1 && at1[0].id === at3?.[0].id && at1[0].frames === 1, JSON.stringify({ reopen79, at1 }));
+  const past79 = await openFile({ file: rel79, line: 99 }), atEnd = await point79('first\nsecond\nthird\n'.length);
+  await leave(A2);
+  const keep79 = await openFile({ file: rel79 }), kept = await point79('first\nsecond\nthird\n'.length);
+  check('N79: open_file reports the clamped line and leaves point where a click would if line is omitted', result79(past79, rel79, 4) && atEnd?.length === 1 && result79(keep79, rel79, 4) && kept?.length === 1, JSON.stringify({ past79, atEnd, keep79, kept }));
+  const refuse79 = async (input: AgentToolInput, why: RegExp) => {
+    const r = await openFile(input);
+    check(`N79: open_file refuses ${JSON.stringify(input)} with ${why.source}`, r.code === 1 && why.test(r.err), JSON.stringify(r));
+  };
+  await refuse79({ file: path.join(home79, 'n79-missing.md') }, /file not found/);
+  await refuse79({ file: noteFile('bin.md') }, /not UTF-8 text/);
+  await refuse79({ file: '~/.ssh/' + name79 }, /: refused/);
+  await refuse79({ file: name79 }, /absolute path/);
+  for (const line of [0, -1, 1.5, '2', null]) await refuse79({ file: abs79, line }, /line must be a positive integer/);
+  await leave(A2);
+  await A2.evaluate((ids: string[]) => { for (const id of ids) window.__canvas.removeNode(id); }, (await frame79()).map(f => f.id));
+  await settled(A2); await settled(B2);
+
   // (j) notes and files open as Edwin pages (noteOpen, ghostOpen); the frame starts at the note's line. A file edwind
   // will not edit (here: not UTF-8 text) opens nothing: no card, and a toast says why.
   fs.writeFileSync(noteFile('open-me.md'), '# open me\n\nsecond body line\nthird');
   fs.writeFileSync(noteFile('ghost-me.md'), '# ghost me\n');
-  fs.writeFileSync(noteFile('bin.md'), Buffer.from([0xff, 0xfe, 0x00, 0x41]));
   await A2.bringToFront();
   const opened = await A2.evaluate(async () => { const n = await window.__canvas.noteOpen({ path: 'open-me.md', line: 3 }); return n && { id: n.id, kind: n.kind, buf: n.buf || null }; });
   const openPt = opened && await until(() => A2.evaluate((id: string) => { const L = window.__canvas.live[id]; return L?.frame?.focused ? L.frame.point() : null; }, opened.id), 10000);
@@ -2978,6 +3021,8 @@ await section('frames', async () => {
   // A note opened while edwind is down says so at once (no wait for a connection that was up before) and opens nothing.
   const downOpen = await A2.evaluate(async () => { const t0 = performance.now(); const n = await window.__canvas.noteOpen({ path: 'ghost-me.md' }); return { opened: !!n, ms: performance.now() - t0, toast: document.querySelector('#toast')?.textContent || '' }; });
   check('frames: with edwind down a note opens nothing at once and the toast says edwind is not running', !downOpen.opened && downOpen.ms < 1000 && /edwind is not running/.test(downOpen.toast), JSON.stringify(downOpen));
+  await A2.evaluate(() => dispatchEvent(new Event('focus'))); await sleep(300);
+  await refuse79({ file: abs79 }, /edwind is not running/);
   check('frames: with edwind down the page card shows the notice that editing is off, the mode line says offline and typing still goes into the page (unacked)', st.stopped?.event === 'stopped' && st.offA && st.offB && st.notice?.shown && !st.notice.hidden && st.notice.text === 'Editing is off: edwind is not running' && st.noticeB?.shown && /while-down$/.test(st.text) && /•/.test(st.sync) && /⚠ offline/.test(st.sync) && st.body && !st.status?.up && st.info.edit === true && st.info.editUp === false, JSON.stringify({ ...st, text: st.text.slice(-30), info: { edit: st.info.edit, editUp: st.info.editUp } }));
 
   // (c) edwind back: both tabs reconnect, the unacked edit is acked, reaches the other tab and the file on disk
@@ -3781,9 +3826,9 @@ await section('N78', async () => {
     ws.onmessage = e => { const m = JSON.parse(e.data); if (m.t === 'hello') { ws.close(); resolve(); } else if (m.t === 'error') { ws.close(); reject(new Error(m.error)); } };
     ws.onerror = () => reject(new Error('external PTY open failed'));
   }), id);
-  const report = async (who: 'near' | 'far', session: string, more: Record<string, unknown> = {}, kind = 'prompt') =>
+  const report = async (who: 'near' | 'far', session: string, more: Record<string, unknown> = {}, kind = 'prompt', text = 'n78 observed prompt') =>
     (await fetch(H.api + '/v1/events', { method: 'POST', headers: { Authorization: 'Bearer ' + fs.readFileSync(H.apiTokenFiles[who], 'utf8').trim(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ harness: 'pi', payload: { session_id: session, kind, cwd, model, permission_mode: 'default', text: 'n78 observed prompt' }, ...more }) })).status;
+      body: JSON.stringify({ harness: 'pi', payload: { session_id: session, kind, cwd, model, permission_mode: 'default', text }, ...more }) })).status;
   const row = (id: string) => D.locator(`#mesh-list .mesh-row[data-id="${id}"]`);
   const info = () => D.evaluate(() => Object.fromEntries([...document.querySelectorAll('#mesh-detail .mesh-info .mesh-kv')].map(e => [e.querySelector('span')!.textContent!, e.querySelector('code')!.textContent!])));
   const nodes = () => D.evaluate(() => Object.keys(window.__canvas.S.nodes).sort().join());
@@ -4075,6 +4120,95 @@ await section('N78', async () => {
         local && !!sent && !!restored && acpSent(D, sid, 'prompt').length === prompts && await nodes() === before, JSON.stringify({ local, sent, restored, prompts, now: acpSent(D, sid, 'prompt').length }));
     });
 
+    await section('N78 layout', async () => {
+      const viewport = D.viewportSize()!, prompt = 'Long observed prompt '.repeat(100).slice(0, 2000);
+      await D.evaluate(() => { if (document.body.classList.contains('side-open')) window.__canvas.toggleDockTerm(); });   // measure Agents, not the dock's overlay
+      const created = await meshApi('/sessions', 'POST', { sid: 'n78_layout_api', agent: 'stub', cwd });
+      if (created.status !== 201) throw new Error('N78 layout ACP spawn: ' + created.status);
+      await report('near', 'n78-layout', { wbSession: 'n78_layout_api' }, 'prompt', prompt);
+      const id = await until(() => D.evaluate((prompt: string) => Object.values<ObservedSession>(window.__canvas.OBS).find(o => o.sessionId === 'n78-layout' && o.lastPrompt === prompt)?.id, prompt), 10000);
+      if (!id) throw new Error('N78 layout session did not arrive');
+      const layout = () => D.evaluate(() => {
+        const rect = (s: string) => document.querySelector(s)!.getBoundingClientRect(), view = rect('#v-agents'), pane = rect('#mesh-detail'), live = rect('.mesh-live > .body'), input = rect('#mesh-detail .ag-in');
+        const buttons = [...document.querySelectorAll<HTMLElement>('.mesh-head button')].filter(e => !e.hidden).map(e => {
+          const r = e.getBoundingClientRect(); return { text: e.textContent, x: r.x, y: r.y, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
+        });
+        const overflow = [...document.querySelectorAll<HTMLElement>('#v-agents *')].filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.right > view.right + 1; }).map(e => e.id || e.className);
+        return { buttons, overflow, width: view.width, inside: buttons.every(r => r.width > 0 && r.height > 0 && r.x >= pane.left && r.right <= pane.right && r.y >= pane.top && r.bottom <= pane.bottom && r.x >= view.left && r.right <= view.right && r.y >= 0 && r.bottom <= innerHeight),
+          pane: pane.height, live: live.height, gap: pane.bottom - input.bottom, facts: !document.querySelector<HTMLElement>('.mesh-info')!.hidden };
+      });
+      const widths = () => D.evaluate(() => ({ list: document.querySelector('.mesh-side')!.getBoundingClientRect().width, pane: document.querySelector('#mesh-detail')!.getBoundingClientRect().width }));
+      const drag = async (x: number) => { const r = (await D.locator('#mesh-grip').boundingBox())!; await D.mouse.move(r.x + r.width / 2, r.y + 100); await D.mouse.down(); await D.mouse.move(x, r.y + 100, { steps: 8 }); await D.mouse.up(); };
+      for (const size of [{ width: 1280, height: 800 }, { width: 900, height: 700 }]) {
+        await D.setViewportSize(size); await open(id); await liveIdle();
+        const closed = await layout();
+        await D.getByRole('button', { name: 'Details', exact: true }).click();
+        const expanded = await layout(), promptShown = await D.locator('.mesh-info .mesh-kv').filter({ hasText: /^prompt/ }).locator('code').textContent();
+        const facts = await D.locator('.mesh-info').evaluate(e => ({ height: e.getBoundingClientRect().height, scroll: getComputedStyle(e).overflowY }));
+        check(`N78: ${size.width}×${size.height} compact header contains every action, gives the session half the pane and keeps a composer gap; disclosure reveals 2,000 characters without shifting actions`,
+          !closed.facts && closed.inside && closed.live >= closed.pane / 2 && closed.gap >= 8 && expanded.facts && expanded.inside && expanded.live >= expanded.pane / 2
+          && Math.abs(expanded.live - closed.live) <= 1 && promptShown === prompt && facts.height <= size.height * .35 && facts.scroll === 'auto' && JSON.stringify(closed.buttons) === JSON.stringify(expanded.buttons),
+          JSON.stringify({ closed, expanded, facts, promptLength: promptShown?.length }));
+        await open(sid); await liveIdle(); await open(id); await liveIdle();
+        check('N78: disclosure stays open across selection during this page lifetime', (await layout()).facts);
+        await D.getByRole('button', { name: 'Details', exact: true }).click();
+        await drag(10); const min = await widths();
+        await drag(size.width - 10); const max = await widths();
+        check(`N78: ${size.width}px divider clamps list to 200px and pane to 360px`, Math.abs(min.list - 200) <= 1 && Math.abs(max.pane - 360) <= 1, JSON.stringify({ min, max }));
+        await D.locator('#mesh-grip').dblclick();
+        const reset = await widths(); await D.locator('#mesh-grip').focus(); await D.keyboard.press('ArrowRight'); const right = await widths(); await D.keyboard.press('ArrowLeft'); const left = await widths();
+        check('N78: divider resets to default and keyboard arrows move 16px', Math.abs(reset.list - Math.max(260, Math.round(size.width * .34))) <= 1 && right.list === reset.list + 16 && left.list === reset.list, JSON.stringify({ reset, right, left }));
+      }
+      await D.evaluate(() => { const C = window.__canvas; C.CMDS.find((c: PaletteItem) => c.l === 'Side pane: reset width')!.run(); C.toggleDockTerm(); });
+      await D.waitForSelector('#mesh-grip', { state: 'hidden' });
+      const docked = await layout(), dockDetail = await D.locator('#mesh-detail').isVisible(), dockList = await D.locator('.mesh-side').isVisible();
+      await D.getByRole('button', { name: '← Sessions', exact: true }).click();
+      const dockBack = !await D.locator('#mesh-detail').isVisible() && await D.locator('.mesh-side').isVisible();
+      const dockListFits = await D.locator('#v-agents').evaluate(e => [...e.querySelectorAll('*')].every(child => { const r = child.getBoundingClientRect(); return !r.width || !r.height || r.right <= e.getBoundingClientRect().right + 1; }));
+      await row(id).click(); await liveIdle();
+      await D.evaluate(() => window.__canvas.toggleDockTerm());
+      await D.waitForSelector('#mesh-grip', { state: 'visible' });
+      const undocked = await widths(), undockedLayout = await layout();
+      check('N78: 900×700 with the default 400px dock shows one contained pane with Sessions back; closing the dock restores both columns',
+        docked.width === 500 && docked.inside && docked.overflow.length === 0 && dockDetail && !dockList && dockBack && dockListFits
+        && await D.locator('.mesh-side').isVisible() && await D.locator('#mesh-detail').isVisible() && !await D.locator('.mesh-back').isVisible()
+        && undocked.list >= 200 && undocked.pane >= 360 && undockedLayout.inside && undockedLayout.overflow.length === 0,
+        JSON.stringify({ docked, dockDetail, dockList, dockBack, dockListFits, undocked, undockedLayout }));
+      const before = await widths(), savedBefore = await D.evaluate(() => window.__canvas.S.meshW), heldGrip = (await D.locator('#mesh-grip').boundingBox())!;
+      await D.mouse.move(heldGrip.x + heldGrip.width / 2, heldGrip.y + 100); await D.mouse.down(); await D.mouse.move(before.list + 70, heldGrip.y + 100, { steps: 8 });
+      const changed = await widths(), dragPrompt = 'During drag: ' + prompt.slice(13);
+      const activity = await report('near', 'n78-layout', { wbSession: 'n78_layout_api' }, 'prompt', dragPrompt);
+      const rendered = await until(async () => (await info()).prompt === dragPrompt, 10000);
+      const duringUpdate = await widths(), savedDuring = await D.evaluate(() => window.__canvas.S.meshW);
+      await D.setViewportSize({ width: 920, height: 700 });
+      await D.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      const duringResize = await widths();
+      await D.mouse.up(); const savedAfter = await D.evaluate(() => window.__canvas.S.meshW);
+      await D.setViewportSize({ width: 900, height: 700 });
+      check('N78: mesh activity and view resize preserve an in-progress divider drag; release saves the dragged width',
+        activity === 204 && rendered && changed.list > before.list + 60 && savedDuring === savedBefore && changed.list !== savedBefore
+        && Math.abs(duringUpdate.list - changed.list) <= 1 && Math.abs(duringResize.list - changed.list) <= 1 && Math.abs(savedAfter! - changed.list) <= 1,
+        JSON.stringify({ activity, rendered, before, changed, savedBefore, savedDuring, duringUpdate, duringResize, savedAfter }));
+      await reload(); await open(id); await liveIdle(); const restored = await widths();
+      check('N78: dragging changes list width and survives reload; disclosure resets closed', changed.list > before.list + 60 && restored.list === changed.list && !(await layout()).facts, JSON.stringify({ before, changed, restored }));
+      const cdp = await D.context().newCDPSession(D), grip = (await D.locator('#mesh-grip').boundingBox())!, x = grip.x + grip.width / 2, y = grip.y + 100;
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y, id: 1 }] });
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: x - 40, y, id: 1 }] });
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }); await cdp.detach();
+      const touched = await widths();
+      check('N78: touch narrows the list while preserving both pane minima', touched.list <= restored.list - 32 && touched.list >= 200 && touched.pane >= 360, JSON.stringify({ restored, touched }));
+      for (const width of [600, 320]) {
+        await D.setViewportSize({ width, height: 700 }); await open(id); await liveIdle();
+        const detail = await D.locator('#mesh-detail').isVisible(), list = await D.locator('.mesh-side').isVisible(), fits = await layout();
+        await D.getByRole('button', { name: '← Sessions', exact: true }).click();
+        check(`N78: ${width}px has no divider, one pane at a time and contained actions`, !await D.locator('#mesh-grip').isVisible() && detail && !list && fits.inside && fits.overflow.length === 0 && !await D.locator('#mesh-detail').isVisible() && await D.locator('.mesh-side').isVisible(), JSON.stringify(fits));
+      }
+      await D.setViewportSize(viewport);
+      await report('near', 'n78-layout', {}, 'end');
+      await meshApi('/sessions/n78_layout_api?forget=true', 'DELETE');
+      await open(sid); await liveIdle(); await D.locator('#mesh-grip').dblclick();
+    });
+
     const transcriptName = await D.evaluate(() => window.__canvas.live.$agents.backend.transcript?.buf.name as string | undefined);
     await row(ids['n78-readonly']).click();
     const detached = await until(async () => !await D.locator(composer).count() && await isAlive(sid), 10000);
@@ -4353,8 +4487,9 @@ await section('N78', async () => {
     await D.evaluate((ids: (string | undefined)[]) => { const C = window.__canvas; C.setView('canvas'); for (const id of ids) if (id && C.S.nodes[id]) C.removeNode(id); }, [sid, externalPty, owned, ownedPty]);
     if (externalPty) await meshApi('/sessions/' + externalPty + '?forget=true', 'DELETE');
     await meshApi('/sessions/' + sid + '?forget=true', 'DELETE');
+    await meshApi('/sessions/n78_layout_api?forget=true', 'DELETE');
     for (const id of [owned, ownedPty]) if (id) await meshApi('/sessions/' + id + '?forget=true', 'DELETE');
-    for (const id of ['n78-readonly', 'n78-claude', 'n78-hubpty']) await report('near', id, {}, 'end');
+    for (const id of ['n78-readonly', 'n78-claude', 'n78-hubpty', 'n78-layout']) await report('near', id, {}, 'end');
     await report('far', 'n78-tmux', {}, 'end');
     await settled(D); await owner.close(); await D.close();
   }
