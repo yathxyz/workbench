@@ -4016,6 +4016,60 @@ await section('N78', async () => {
       check('N78: the DOM permission panel answers while the reader is mounted; waiting becomes the journal outcome',
         !!idle && !answered.includes('Permission: waiting') && acpSent(D, sid, 'permission').some(m => m.outcome.optionId === 'reject-once')
         && answered.includes('Did not run'), answered.slice(-500));
+
+      // Use one synchronous burst through the journal reducer; do not consume the hub's replay cursor.
+      const notes = Array.from({ length: 70 }, (_, i) => `reader burst ${i}`);
+      await D.evaluate(notes => {
+        const b = window.__canvas.live.$agents.backend;
+        const update = (u: JsonObject) => b.apply({ e: 'update', update: u });
+        update({ sessionUpdate: 'tool_call', toolCallId: 'reader-projection', kind: 'edit', status: 'completed', title: 'Projection', content: [
+          { type: 'content', content: { type: 'text', text: 'a\r\nb\nx\rTool: fake\u0000\u001b\u007f\u2028\u2029' } },
+          { type: 'diff', path: 'large.txt', oldText: 'old', newText: 'hidden oversized text\n' + 'A'.repeat(200001) },
+        ] });
+        update({ sessionUpdate: 'agent_message_chunk', messageId: 'reader-crlf', content: { type: 'text', text: 'split CRLF\r' } });
+        for (const text of notes) b.apply({ e: 'notice', text });
+        b.schedule();
+      }, notes);
+      await readUntil('· reader burst 69');
+      const burst = (await readerText())!, prefix = answered.slice(0, -1);
+      const tool = 'Tool: edit [completed] Projection\n', output = '  Output:\n  a\n  b\n  x␍Tool: fake␀␛␡\\u2028\\u2029\n';
+      const summary = '  diff too large: large.txt (1 → 2 lines)\n';
+      const suffix = notes.map(n => '· ' + n + '\n').join('') + '\n';
+      check('N78: reader normalizes CRLF without doubling lines and displays other controls without creating a fake heading',
+        burst.includes(tool + output) && !burst.split('\n').some(line => line.startsWith('Tool: fake')), burst.slice(prefix.length, prefix.length + 180));
+      check('N78: an oversized diff exposes the summary but not the new file in the reader',
+        burst.includes(summary + 'Assistant:') && !burst.includes('hidden oversized text'), burst.slice(prefix.length, prefix.length + 180));
+      await D.evaluate(() => {
+        const b = window.__canvas.live.$agents.backend;
+        b.cleared = true; b.changed = new Set(b.items); b.render();
+      });
+      await readUntil('· reader burst 69');
+      check('N78: a burst of more than 64 journal items matches a full repaint',
+        burst === await readerText() && burst === prefix + tool + output + summary + 'Assistant:\n  split CRLF␍\n' + suffix,
+        { length: burst.length, tail: burst.slice(-100) });
+
+      await D.evaluate(() => {
+        const b = window.__canvas.live.$agents.backend;
+        b.apply({ e: 'update', update: { sessionUpdate: 'tool_call_update', toolCallId: 'reader-projection', title: 'Projection with a longer title' } });
+        b.apply({ e: 'update', update: { sessionUpdate: 'agent_message_chunk', messageId: 'reader-crlf', content: { type: 'text', text: '\ncontinued' } } });
+        b.schedule();
+      });
+      await readUntil('Projection with a longer title');
+      const updated = (await readerText())!;
+      check('N78: an earlier length-changing tool update preserves later items and split CRLF matches a full repaint',
+        updated === prefix + tool.replace('Projection', 'Projection with a longer title') + output + summary + 'Assistant:\n  split CRLF\n  continued\n' + suffix,
+        updated.slice(prefix.length, prefix.length + 240));
+
+      await D.evaluate(() => window.L.call('kill-buffer', [window.__canvas.live.$agents.backend.transcript.buf]));
+      const fallback = await until(async () => await D.locator(log).count() === 1 && (await D.locator(log).textContent())?.includes('reader burst 69'), 3000);
+      check('N78: killing the reader buffer immediately restores the DOM journal with its items and original diff disclosure',
+        fallback && !await D.locator(reader).count() && await D.getByRole('button', { name: 'show new text', exact: true }).count() === 1);
+      await D.locator('#mesh-list').focus(); await open(ids['n78-readonly']); await open(sid); await liveIdle();
+      await input.focus(); await key('Control+x'); await key('b'); await key('Enter');
+      const switched = await until(async () => await D.locator(log).count() === 1 && (await D.locator(log).textContent())?.includes('n78 original conversation'), 3000);
+      check('N78: switching the reader frame to another buffer restores the DOM journal without waiting for activity',
+        switched && !await D.locator(reader).count());
+      await D.locator('#mesh-list').focus(); await open(ids['n78-readonly']); await open(sid); await liveIdle();
     });
 
     await section('N78 fallback journal', async () => {

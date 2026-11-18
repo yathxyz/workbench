@@ -918,7 +918,11 @@ const urlHost = (u: JsonValue | undefined): string => { try { return new URL(u a
 type AcpSplice = [pos: number, remove: number, insert: string];
 interface AcpRange { index: number; from: number; length: number; chars: number }
 const ACP_PAINT_BATCH = 64;
-const acpIndent = (text: string) => text.replaceAll('\n', '\n  ');
+function acpReaderField(text: string): string {
+  return text.replace(/\r\n|[\u0000-\u0008\u000b-\u001f\u007f\u2028\u2029]/g, c =>
+    c === '\r\n' ? '\n' : c === '\x7f' ? '␡' : c === '\u2028' ? '\\u2028' : c === '\u2029' ? '\\u2029' : String.fromCharCode(0x2400 + c.charCodeAt(0)));
+}
+const acpIndent = (text: string) => acpReaderField(text).replaceAll('\n', '\n  ');
 
 // The journal owns the items. Keep just their positions and the lengths of painted chunks, not a second text model.
 class AcpTranscript {
@@ -946,9 +950,11 @@ class AcpTranscript {
       const old = range.from;
       range.from += delta;
       if ('mid' in it) {   // a streamed message only grows, just before its closing newline
-        const text = acpIndent(it.text.slice(range.chars));
-        if (text) ops.push([range.from + range.length - 1, 0, text]);
-        range.length += text.length; range.chars = it.text.length; delta += text.length;
+        // CRLF may straddle chunks. Replace the trailing CR picture when its LF arrives.
+        const back = it.text[range.chars - 1] === '\r' && it.text[range.chars] === '\n' ? 1 : 0;
+        const text = acpIndent(it.text.slice(range.chars - back));
+        if (text) ops.push([range.from + range.length - 1 - back, back, text]);
+        range.length += text.length - back; range.chars = it.text.length; delta += text.length - back;
       } else {
         const text = acpReaderText(it);
         const prev = buf.rope.slice(old, old + range.length);
@@ -1175,8 +1181,14 @@ class AcpBackend implements CardBackend {
     try { frame?.destroy(); } catch (e) { console.warn('agent transcript: could not destroy frame', e); }
     if (buf) {
       ACP_READERS.delete(buf);
-      try { FR.L!.call('kill-buffer', [buf]); } catch (e) { console.warn('agent transcript: could not kill buffer', e); }
+      try { if (FR.Ed!.E.buffers.includes(buf)) FR.L!.call('kill-buffer', [buf]); } catch (e) { console.warn('agent transcript: could not kill buffer', e); }
     }
+  }
+  fallbackTranscript(reader: AcpTranscript) {
+    this.transcript = null;
+    this.destroyTranscript(reader.buf, reader.frame);
+    reader.frame.root.replaceWith(this.L.logEl);
+    this.changed = new Set(this.items);
   }
   composerKey(e: KeyboardEvent): boolean {
     if (!frPromptAvailable() || e.isComposing) { this.editPrefix = 0; return false; }
@@ -1374,15 +1386,13 @@ class AcpBackend implements CardBackend {
     const L = this.L, log = L.logEl; if (this.disposed || !log) return;
     const reader = this.transcript;
     if (reader) {
-      try {
+      if (reader.frame.buffer !== reader.buf || !FR.Ed!.E.buffers.includes(reader.buf)) this.fallbackTranscript(reader);
+      else try {
         reader.render(this.items, this.changed, this.pending, !!this.cleared);
         this.cleared = false;
         if (this.changed.size) this.schedule();
       } catch (e) {
-        this.transcript = null;
-        this.destroyTranscript(reader.buf, reader.frame);
-        reader.frame.root.replaceWith(log);
-        this.changed = new Set(this.items);
+        this.fallbackTranscript(reader);
         console.warn('agent transcript: Edwin paint failed', e);
       }
     }
@@ -1554,10 +1564,9 @@ function acpReaderText(it: AcpItem): string {
   if (locs != null) text += '  Location: ' + acpIndent(locs) + '\n';
   for (const c of Array.isArray(it.content) ? it.content : []) {
     if ((c as AcpDiffContent | null)?.type === 'diff') {
-      const { title, lines, large } = acpDiff(c as AcpDiffContent);
-      text += '  Diff: ' + acpIndent(title) + '\n';
+      const { title, lines, large } = acpDiff(c as AcpDiffContent, acpReaderField);
+      if (large == null) text += '  Diff: ' + acpIndent(title) + '\n';
       for (const [, line] of lines) text += '  ' + acpIndent(line) + '\n';
-      if (large != null) text += '  ' + acpIndent(large) + '\n';
     } else {
       const output = acpToolText(c);
       if (output) text += '  Output:\n  ' + acpIndent(output) + '\n';
@@ -1605,11 +1614,14 @@ function acpStatePanel(box: HTMLElement, sp: AcpStateSpec | null, b: AcpBackend)
 }
 // A tool call's diff content (30 §1.2): common prefix and suffix trimmed, an LCS over the middle when it is small enough,
 // 3 lines of context around each change.
-function acpDiff(d: AcpDiffContent): { title: string; lines: [string, string][]; large?: string } {
-  const path = vtext(d.path), oldT = d.oldText == null ? null : vtext(d.oldText), newT = vtext(d.newText);
-  const a = oldT == null ? [] : oldT.split('\n'), b = newT.split('\n'), title = path + (oldT == null ? ' (new file)' : '');
-  if ((oldT || '').length + newT.length > 200000)
-    return { title, lines: [['gap', 'diff too large: ' + path + ' (' + a.length + ' → ' + b.length + ' lines)']], large: newT };
+function acpDiff(d: AcpDiffContent, format?: (text: string) => string): { title: string; lines: [string, string][]; large?: string } {
+  const path = vtext(d.path), oldT = d.oldText == null ? null : vtext(d.oldText), newT = vtext(d.newText), title = path + (oldT == null ? ' (new file)' : '');
+  if ((oldT || '').length + newT.length > 200000) {
+    const count = (text: string) => { let n = 1; for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) n++; return n; };
+    return { title, lines: [['gap', 'diff too large: ' + path + ' (' + (oldT == null ? 0 : count(oldT)) + ' → ' + count(newT) + ' lines)']], large: newT };
+  }
+  const split = (text: string) => (format ? format(text) : text).split('\n');
+  const a = oldT == null ? [] : split(oldT), b = split(newT);
   let p = 0; while (p < a.length && p < b.length && a[p] === b[p]) p++;
   let s = 0; while (s < a.length - p && s < b.length - p && a[a.length - 1 - s] === b[b.length - 1 - s]) s++;
   const am = a.slice(p, a.length - s), bm = b.slice(p, b.length - s), ops = a.slice(0, p).map(x => ['=', x]), m = am.length, n = bm.length;
@@ -6320,10 +6332,18 @@ function frTranscriptKeymap() {
     if (ACP_READERS.has(L.call('current-buffer') as EdwinBuffer)) throw new Error('Agent transcripts do not visit files');
     return false;
   }]);
+  L.call('add-hook!', [L.intern('kill-buffer-hook'), () => {
+    ACP_READERS.get(L.call('current-buffer') as EdwinBuffer)?.schedule();
+    return false;
+  }]);
   const post = Ed.hooks.postCommand;
   Ed.hooks.postCommand = (cmd, b, failed) => {
     // An async editor command can straddle a journal paint and mistake it for its own edit.
-    if (ACP_READERS.has(b)) { b.undo.length = b.redo.length = 0; b.pendingUndo = null; }
+    const reader = ACP_READERS.get(b);
+    if (reader) {
+      b.undo.length = b.redo.length = 0; b.pendingUndo = null;
+      if (reader.transcript?.frame.buffer !== b) reader.schedule();
+    }
     post?.(cmd, b, failed);
   };
   frTranscriptKeys = true;
