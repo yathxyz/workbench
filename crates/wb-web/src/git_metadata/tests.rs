@@ -162,6 +162,10 @@ fn requests_only_read_completed_facts_and_refresh_preserves_stale_values() {
     cache.0.lock().unwrap().get_mut(cwd).unwrap().at = Instant::now() - TTL;
     assert!(cache.start(cwd));
     assert!(!cache.finish(cwd, derive(&root).unwrap()));
+    cache.0.lock().unwrap().get_mut(cwd).unwrap().at = Instant::now() - TTL;
+    assert!(cache.start(cwd));
+    assert!(cache.finish(cwd, Metadata::default()));
+    assert_eq!(cache.get(cwd), Metadata::default());
 }
 
 #[test]
@@ -175,7 +179,7 @@ fn cache_bounds_in_flight_work_and_never_evicts_a_pending_cwd() {
     assert!(!cache.start("/pending/0"));
     assert!(!cache.start("/overflow"));
     assert_eq!(cache.get("/pending/0"), Metadata::default());
-    assert!(cache.finish("/pending/1", Metadata::default()));
+    assert!(!cache.finish("/pending/1", Metadata::default()));
     assert!(!cache.start("/pending/1")); // Failures are cached for the TTL too.
     assert!(cache.start("/overflow")); // Only the completed entry can be evicted.
     assert!(!cache.start("/pending/0"));

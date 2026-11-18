@@ -84,11 +84,11 @@ impl Cache {
         true
     }
 
-    /// Publish the first result too, even if derivation failed and every fact is null.
+    /// Publish the first facts too; an initial failure leaves the null summary unchanged.
     fn finish(&self, cwd: &str, value: Metadata) -> bool {
         let mut cache = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let entry = cache.get_mut(cwd).expect("in-flight cache slot is pinned");
-        let changed = entry.value.as_ref() != Some(&value);
+        let changed = entry.value.as_ref().unwrap_or(&Metadata::default()) != &value;
         entry.value = Some(value);
         entry.at = Instant::now();
         entry.pending = false;
