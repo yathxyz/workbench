@@ -182,6 +182,14 @@ pub struct ObservedSession {
     pub cwd: Option<String>,
     pub project_root: Option<String>,
     pub project: String,
+    #[serde(default, deserialize_with = "de_metadata")]
+    pub repo_root: Option<String>,
+    #[serde(default, deserialize_with = "de_metadata")]
+    pub repo: Option<String>,
+    #[serde(default, deserialize_with = "de_metadata")]
+    pub worktree: Option<String>,
+    #[serde(default, deserialize_with = "de_metadata")]
+    pub branch: Option<String>,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
     pub title: String,
@@ -197,6 +205,15 @@ pub struct ObservedSession {
     pub last_message: Option<String>,
     pub counts: Counts,
     pub tail: Vec<TailLine>,
+}
+
+/// Persisted metadata is untrusted too; invalid optional fields do not lose a record.
+fn de_metadata<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(value
+        .as_str()
+        .filter(|s| s.len() <= OBS_TEXT_MAX)
+        .map(str::to_owned))
 }
 
 /// `State` by its §3.4.6 name; wb-proto only serialises it.
@@ -342,6 +359,10 @@ struct Envelope {
     pid: Option<u32>,
     pid_start: Option<u64>,
     project_root: Option<String>,
+    repo_root: Option<String>,
+    repo: Option<String>,
+    worktree: Option<String>,
+    branch: Option<String>,
 }
 
 impl Envelope {
@@ -368,6 +389,19 @@ impl Envelope {
                 .map(|p| p as u32),
             pid_start: body.get("pidStart").and_then(Value::as_u64),
             project_root: str_of("projectRoot").map(|s| excerpt(s, OBS_TEXT_MAX)),
+            // Reject oversized metadata rather than turn it into a different name.
+            repo_root: str_of("repoRoot")
+                .filter(|s| s.len() <= OBS_TEXT_MAX)
+                .map(str::to_owned),
+            repo: str_of("repo")
+                .filter(|s| s.len() <= OBS_TEXT_MAX)
+                .map(str::to_owned),
+            worktree: str_of("worktree")
+                .filter(|s| s.len() <= OBS_TEXT_MAX)
+                .map(str::to_owned),
+            branch: str_of("branch")
+                .filter(|s| s.len() <= OBS_TEXT_MAX)
+                .map(str::to_owned),
         }
     }
 }
@@ -488,6 +522,10 @@ impl Inner {
                 transcript_path: None,
                 cwd: None,
                 project_root: None,
+                repo_root: None,
+                repo: None,
+                worktree: None,
+                branch: None,
                 project: String::new(),
                 model: None,
                 permission_mode: None,
@@ -528,6 +566,10 @@ impl Inner {
         take(&mut s.agent_type, ev.agent_type);
         take(&mut s.wb_session, env.wb_session);
         take(&mut s.project_root, env.project_root);
+        take(&mut s.repo_root, env.repo_root);
+        take(&mut s.repo, env.repo);
+        take(&mut s.worktree, env.worktree);
+        take(&mut s.branch, env.branch);
         if env.attach.is_some() {
             s.attach = env.attach;
         }

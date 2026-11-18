@@ -35,6 +35,15 @@ async fn sessions_until(web: &Web, pred: impl Fn(&Value) -> bool) -> Value {
 fn with_state(summary: &wb_proto::hub::Summary, state: &str) -> Value {
     let mut v = serde_json::to_value(summary).unwrap();
     v["state"] = state.into();
+    for key in ["repoRoot", "repo", "worktree", "branch", "projectRoot"] {
+        v[key] = Value::Null;
+    }
+    v["project"] = std::path::Path::new(&summary.cwd)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .into();
     v
 }
 
@@ -452,4 +461,63 @@ async fn without_api_rpc_has_no_observed_sessions() {
     assert!(more.is_err(), "unexpected message {more:?}");
     let info = web.req("GET", "/api/info").send().await.json();
     assert_eq!(info["mesh"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_git_metadata_refreshes_without_hub_events_and_remote_cwd_is_not_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("checkout");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join(".git/config"),
+        "[remote \"origin\"]\nurl = git@host:owner/name.git\n",
+    )
+    .unwrap();
+    std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let hub = FakeHub::start();
+    let mut local = pty_summary("local", 1, true, false);
+    local.cwd = root.join("src").to_str().unwrap().to_owned();
+    let mut remote = local.clone();
+    remote.sid = "remote".into();
+    remote.host = "somewhere-else".into();
+    hub.set_sessions(vec![local, remote]);
+    let web = Web::start(&hub.path);
+    web.wait_hub("up").await;
+    let mut rpc = web.ws("/rpc").await;
+    let snapshot = loop {
+        let msg = next_json(&mut rpc).await;
+        if msg["t"] == "sessions" {
+            break msg;
+        }
+    };
+    let sessions = snapshot["sessions"].as_array().unwrap();
+    assert_eq!(sessions[0]["repoRoot"], root.to_str().unwrap());
+    assert_eq!(sessions[0]["projectRoot"], root.to_str().unwrap());
+    assert_eq!(sessions[0]["repo"], "owner/name");
+    assert_eq!(sessions[0]["branch"], "main");
+    assert_eq!(sessions[0]["worktree"], Value::Null);
+    for key in ["repoRoot", "repo", "branch", "worktree", "projectRoot"] {
+        assert_eq!(sessions[1][key], Value::Null, "{key}");
+    }
+    let api = web.req("GET", "/api/sessions").send().await.json();
+    assert_eq!(api["sessions"], snapshot["sessions"]);
+    std::fs::write(
+        root.join(".git/HEAD"),
+        "ref: refs/heads/changed-while-idle\n",
+    )
+    .unwrap();
+    let changed = tokio::time::timeout(Duration::from_secs(7), async {
+        loop {
+            let msg = next_json(&mut rpc).await;
+            if msg["t"] == "session" && msg["session"]["branch"] == "changed-while-idle" {
+                break msg["session"].clone();
+            }
+        }
+    })
+    .await
+    .expect("idle branch metadata did not refresh");
+    assert_eq!(changed["sid"], "local");
+    let api = web.req("GET", "/api/sessions").send().await.json();
+    assert_eq!(api["sessions"][1]["branch"], Value::Null);
 }

@@ -1149,3 +1149,83 @@ fn load_sweeps_and_caps() {
     fs::write(&path, file.to_string()).unwrap();
     assert_eq!(f.reload(T0).list().len(), OBS_SESSIONS_MAX);
 }
+
+#[test]
+fn git_metadata_wire_validation_and_storage_compatibility() {
+    let f = fx();
+    f.process(PID, START);
+    let keys = ["repoRoot", "repo", "worktree", "branch"];
+    let values = ["/home/alice/proj/x", "owner/x", "topic", "feature/é"];
+    let mut event = claude("s1", T0, "SessionStart", json!({}));
+    for (key, value) in keys.into_iter().zip(values) {
+        event[key] = json!(value);
+    }
+    f.reg.ingest(HOST, event, NOW).unwrap();
+    for invalid in [
+        Value::Null,
+        json!(9),
+        json!(false),
+        json!({}),
+        json!([]),
+        json!("é".repeat(1025)),
+    ] {
+        let mut event = claude("s1", T0 + 1, "SessionStart", json!({}));
+        for key in keys {
+            event[key] = invalid.clone();
+        }
+        f.reg.ingest(HOST, event, NOW).unwrap();
+    }
+    // Missing values also retain the previous valid metadata.
+    f.reg
+        .ingest(HOST, claude("s1", T0 + 2, "SessionStart", json!({})), NOW)
+        .unwrap();
+    let session = serde_json::to_value(top(&f.reg)).unwrap();
+    for (key, value) in keys.into_iter().zip(values) {
+        assert_eq!(session[key], value);
+    }
+    f.reg.save().unwrap();
+    let reloaded = serde_json::to_value(top(&f.reload(NOW))).unwrap();
+    for key in keys {
+        assert_eq!(reloaded[key], session[key]);
+    }
+
+    let path = f.dir.path().join(FILE);
+    let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for key in keys {
+        saved["sessions"][0].as_object_mut().unwrap().remove(key);
+    }
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let legacy = f.reload(NOW);
+    assert_eq!(legacy.list().len(), 1);
+    let old = serde_json::to_value(top(&legacy)).unwrap();
+    for key in keys {
+        assert_eq!(old[key], Value::Null);
+    }
+    assert_eq!(old["project"], "x");
+
+    // Bad persisted metadata cannot quarantine otherwise valid old records.
+    for key in keys {
+        saved["sessions"][0][key] = json!(["not a string"]);
+    }
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert_eq!(f.reload(NOW).list().len(), 1);
+}
+
+#[test]
+fn git_metadata_accepts_exact_utf8_byte_limit() {
+    let f = fx();
+    let mut event = claude("s1", T0, "SessionStart", json!({}));
+    for key in ["repoRoot", "repo", "worktree", "branch"] {
+        event[key] = json!("é".repeat(OBS_TEXT_MAX / 2));
+    }
+    f.reg.ingest(HOST, event, NOW).unwrap();
+    let session = top(&f.reg);
+    for value in [
+        session.repo_root,
+        session.repo,
+        session.worktree,
+        session.branch,
+    ] {
+        assert_eq!(value.unwrap().len(), OBS_TEXT_MAX);
+    }
+}
