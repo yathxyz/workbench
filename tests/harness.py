@@ -31,7 +31,8 @@ Agents: `stub` runs wb-fake-acp (the scripted test agent, the package's `fake` o
 --scenario kill-stubborn (it ignores stdin EOF and SIGTERM, and its prompts never end), for the
 ui check N39. `reconnect` runs it with --scenario permission-reconnect (a prompt streams 116
 chunks, asks a permission and streams 80 more), for the ui check N27. `config` runs it with
---scenario config for mutable configuration checks. Test mode refuses to start without the
+--scenario config for mutable configuration checks. `config-revive-malformed` returns an invalid
+offering on revive, for the Agents metadata reset check. Test mode refuses to start without the
 fake agent; --dogfood registers no agent.
 
 Test mode (the default) gives the hub a temporary HOME and environment canaries, and exits
@@ -181,6 +182,7 @@ class Harness:
                 "stuck": {"label": "Stuck", "argv": [fake, "--scenario", "kill-stubborn"], "env": {}},
                 "reconnect": {"label": "Reconnect", "argv": [fake, "--scenario", "permission-reconnect"], "env": {}},
                 "config": {"label": "Config", "argv": [fake, "--scenario", "config"], "env": {}},
+                "config-revive-malformed": {"label": "Config revive", "argv": [fake, "--scenario", "config-revive-malformed"], "env": {}},
             }
         self.root = Path(tempfile.mkdtemp(prefix="wb-"))
         self.secret = secrets.token_hex(32)
