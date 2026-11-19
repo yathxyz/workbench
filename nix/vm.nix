@@ -45,6 +45,13 @@ in
           linger = true;
         };
         users.users.bob.isNormalUser = true;
+        # The notes are host data, not daemon state; a fresh VM has no existing notes tree.
+        systemd.tmpfiles.rules = [
+          "d ${config.users.users.alice.home}/work - alice users -"
+          "d ${config.services.edwind.notesDir} 0700 alice users -"
+          # Edwin's module should create this itself (fixed by yathxyz/edwin#9); remove once the edwin input includes the fix.
+          "d ${config.users.users.alice.home}/.local/state/edwin - alice users -"
+        ];
         # Passwordless sudo, so that NoNewPrivileges is what stops sudo in a card.
         security.sudo.wheelNeedsPassword = false;
         nix.settings.experimental-features = [ "nix-command" ];
@@ -199,6 +206,10 @@ in
           wb.wait_for_unit("workbench-hub.service")
           wb.wait_for_file(HUB_SOCK)
           wb.wait_for_unit("workbench-web.service")
+          wb.wait_for_unit("edwind.service", timeout=60)
+          state_dir = "${nodes.wb.services.edwind.stateDir}"
+          assert wb.succeed(f"stat -c %U:%G {shlex.quote(state_dir + '/..')}").strip() == "alice:users"
+          assert wb.succeed(f"stat -c '%U:%G %a' {shlex.quote(state_dir)}").strip() == "alice:users 700"
           wb.wait_for_open_port(8090, WB_IP)
           proxy.wait_for_unit("caddy.service")
           proxy.wait_for_open_port(80)
@@ -411,7 +422,6 @@ in
               return wb.succeed("set -o pipefail; " + pipe + as_user("alice", f"env HOME={HOME} wb {cmd}"))
 
           # R16.18: a write and a read round trip; wb eval on the server image.
-          wb.succeed(f"mkdir -p {HOME}/work/roam && chown alice:users {HOME}/work {HOME}/work/roam")
           wb_cli("buf write t.md --append --create -", "hello\n")
           assert wb_cli("buf read t.md") == "hello\n"
           assert wb_cli("eval '(+ 1 2)'").strip() == "3"

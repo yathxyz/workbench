@@ -26,6 +26,10 @@ pub const ACP_REPLAY_MAX: usize = 4 * MIB;
 pub const PROMPT_MAX: usize = 8 * MIB;
 /// Most ordered configuration entries in an ACP spawn. Larger is `bad_request`.
 pub const ACP_CONFIG_MAX: usize = 16;
+/// Most options in an agent's full configuration offering. Larger is malformed.
+pub const ACP_CONFIG_OPTIONS_MAX: usize = 64;
+/// Largest serialized agent configuration offering. Larger is malformed.
+pub const ACP_CONFIG_OPTIONS_BYTES: usize = 64 * KIB;
 /// Largest serialized permission policy; excess is `bad_request`.
 pub const POLICY_MAX: usize = 256 * KIB;
 /// Most ordered rules in a session permission policy; excess is `bad_request`.

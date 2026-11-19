@@ -364,7 +364,9 @@ async function netProbe(): Promise<void> {
   if (r.status === 403) return netSet('forbidden');
   let info: DaemonInfo | null = null; if (r.ok) try { info = await r.json(); } catch {}
   if (!info) return netSet('down');
+  const attachChanged = INFO?.attach !== info.attach || INFO?.host !== info.host;
   Object.assign(INFO!, info); hubSeen(info.hub); acpButton(); netSet('up');
+  if (attachChanged) meshRender();
 }
 function netSet(s: NetState['state']): void {
   const was = NET.state; NET.state = s; clearTimeout(NET.timer);
@@ -436,6 +438,8 @@ const RPC_EVENTS: RpcEventHandlers = {
     TOMBS.add(m.sid + ' ' + m.epoch);
     if (SESS[m.sid]?.createdAt === m.epoch) delete SESS[m.sid];
     live[m.sid]?.backend?.goneElsewhere?.(m.epoch); if (MESH_PANE.node?.id === m.sid) live.$agents?.backend?.goneElsewhere?.(m.epoch); sessChanged(m.sid);
+    const attach = live.$agentsAttach?.backend;
+    if (attach instanceof PtyBackend && attach.n.id === m.sid) attach.goneElsewhere(m.epoch);
   },
   board: m => boardChanged(m.etag),
   observed: m => { const was: Record<string, SessionState> = {}; for (const k in OBS) { was[k] = OBS[k].state; delete OBS[k]; } (m.sessions || []).forEach(o => obsPut(o, was[o.id])); meshChanged(); },
@@ -740,9 +744,8 @@ class FakeShell implements CardBackend {
 }
 
 // Real PTY through wb-hub. The hub keeps the session alive across reloads and replays recent output.
-// A real shell on the server (/pty, §3.5.1). Nothing auto-runs: `spawn` is true only on the first open of a card made in
-// this page and on Enter on an ended or not-found card, and only until that open is sent; page loads and reconnects attach
-// with `resume` (SEC-2, F-A6).
+// A real shell on the server (/pty, §3.5.1). `spawn` is true only on the first open of a card or temporary viewer
+// made in this page, or on Enter on an ended or not-found shell card. Reconnects attach with `resume` (SEC-2, F-A6).
 const IN_CHUNK = 262144;   // characters per `in` message: worst-case JSON escaping stays under the web's message cap
 const EXIT_TEXT: Partial<Record<PtyExitReason, string>> = {
   hub_restart: 'the Workbench hub restarted: press Enter to start a new shell',
@@ -763,6 +766,7 @@ class PtyBackend implements CardBackend, Wakeable {
   declare host: Host | null; declare parked: boolean; declare final: boolean; declare helloSeen: boolean; declare ws: WebSocket;
   declare dead?: boolean; declare exitReason?: PtyExitReason | null; declare epoch?: number; declare lost?: boolean; declare helloed?: boolean;
   declare respawning?: boolean; declare shellOffer?: boolean;
+  declare attachError?: string;
   constructor(n: TermNode, term: XtermTerminal, L: LiveEntry) { this.n = n; this.t = term; this.L = L; this.spawn = !!n._spawn; delete n._spawn; this.tries = 0; this.connect(); }
   openMsg(): string {
     const n = this.n, m: Extract<PtyClientMsg, { t: 'open' }> = { t: 'open', id: n.id, cmd: n.cmd || '', parent: n.spawnFrom || '', cwd: n.cwd || '', cols: this.t.cols, rows: this.t.rows, env: { CANVAS_NODE: pathOf(n.id), ...(n.env || {}) }, spawn: this.spawn };
@@ -778,8 +782,12 @@ class PtyBackend implements CardBackend, Wakeable {
     if (h) { this.n.hostUrl = h.url; rpcFor(h); } else delete this.n.hostUrl;
     this.parked = false; this.final = false; this.helloSeen = false;
     const ws = this.ws = new WebSocket(hWs(h, '/pty'));
-    ws.onopen = () => { ws.send(this.openMsg()); this.spawn = false; if (h) { this.tries = 0; hostUp(h); } };   // a reconnect never spawns
+    ws.onopen = () => {
+      if (this.disposed || ws !== this.ws || ws.readyState !== 1) return;
+      ws.send(this.openMsg()); this.spawn = false; if (h) { this.tries = 0; hostUp(h); }   // a reconnect never spawns
+    };
     ws.onmessage = ev => {
+      if (this.disposed || ws !== this.ws) return;
       let m: PtyServerMsg; try { m = JSON.parse(ev.data); } catch { return; }
       if (m.t === 'hello') {
         this.dead = false; this.exitReason = null; this.helloSeen = true; this.tries = 0; this.epoch = m.epoch;
@@ -797,11 +805,16 @@ class PtyBackend implements CardBackend, Wakeable {
       else if (m.t === 'exit') {
         this.dead = true; this.exitReason = m.reason || null;
         const how = m.code != null ? ` with code ${m.code}` : m.signal ? ` (signal ${m.signal})` : '';
+        if (this.n._attach) {
+          const reason = m.reason === 'hub_restart' ? 'the Workbench hub restarted' : m.reason === 'spawn_failed' ? 'could not start the attachment' : m.reason === 'killed' ? 'the viewer was killed' : `the process exited${how}`;
+          return this.attachFailed(reason);
+        }
         this.t.write('\r\n\x1b[2m[' + (EXIT_TEXT[m.reason] || `process exited${how}: press Enter to start a new one`) + ']\x1b[0m\r\n');
       } else if (m.t === 'gone') this.goneElsewhere(m.epoch);
       else if (m.t === 'error') {
         if (!this.helloSeen) this.final = true;   // a failed open: the server closes 1000, nothing to reconnect to (F-A4)
         this.dead = true;
+        if (this.n._attach) return this.attachFailed(m.error || 'could not open the terminal');
         if (m.code === 'not_found') {
           const env = Object.keys(this.n.env || {});   // a board's env changes what starts too (PROMPT_COMMAND, BASH_ENV)
           this.lost = true; this.t.write(`\r\n\x1b[33m[No session: press Enter to start ${plain(this.n.cmd || shellName(this.n) || 'a shell')}${env.length ? ' with env ' + plain(env.join(' ')) : ''}]\x1b[0m\r\n`);
@@ -821,7 +834,9 @@ class PtyBackend implements CardBackend, Wakeable {
       // §3.5.4: 1000/1008/1009 are final and keep the card's state; 1013 waits for the hub; the rest back off.
       if (this.final || [1000, 1008, 1009].includes(ev.code)) {
         this.final = true;
-        if (ev.code === 1008 || ev.code === 1009) this.t.write(`\r\n\x1b[31m[connection closed: ${ev.code === 1009 ? 'message too big' : 'protocol error'} (${ev.code}): press Enter to reopen]\x1b[0m\r\n`);
+        const reason = ev.code === 1009 ? 'message too big' : ev.code === 1008 ? 'protocol error' : 'connection closed';
+        if (this.n._attach) { if (!this.attachError) this.attachFailed(reason); }
+        else if (ev.code === 1008 || ev.code === 1009) this.t.write(`\r\n\x1b[31m[connection closed: ${reason} (${ev.code}): press Enter to reopen]\x1b[0m\r\n`);
         else if (!this.dead) this.t.write('\r\n\x1b[2m[connection closed: press Enter to start a new shell]\x1b[0m\r\n');
         this.dead = true; this.L?.el.classList.remove('net-wait');
         return;
@@ -832,6 +847,10 @@ class PtyBackend implements CardBackend, Wakeable {
       if (NET.state !== 'signed_out' && NET.state !== 'forbidden') this.timer = setTimeout(() => this.connect(), backoff(this.tries++));
     };
   }
+  attachFailed(reason: string): void {
+    this.final = true; this.dead = true; this.attachError = reason;
+    if (live.$agentsAttach === this.L) meshRender();
+  }
   wake(): void { if (!this.disposed && !this.final && !this.host && this.ws?.readyState > 1) { this.tries = 0; this.connect(); } }
   reconnect(): void { if (this.parked && !this.disposed) { this.tries = 0; this.connect(); } }
   // /rpc or /pty `gone`: the session was ended in another tab or by wb; never reconnect or respawn on our own (ROB-19)
@@ -839,7 +858,8 @@ class PtyBackend implements CardBackend, Wakeable {
     if (epoch != null && this.epoch != null && epoch !== this.epoch) return;
     if (this.final) return;
     this.final = true; this.dead = true; clearTimeout(this.timer); WAKE.delete(this); this.L?.el.classList.remove('net-wait');
-    this.t.write('\r\n\x1b[2m[this session was ended elsewhere: press Enter to start a new one]\x1b[0m\r\n');
+    if (this.n._attach) this.attachFailed('the viewer was ended elsewhere');
+    else this.t.write('\r\n\x1b[2m[this session was ended elsewhere: press Enter to start a new one]\x1b[0m\r\n');
     try { this.ws?.close(); } catch {}
   }
   offerDefault(): void { this.shellOffer = true; this.t.write(`\r\n\x1b[33m[the shell ${shellName(this.n)} is not available here: press Enter to start ${plain(INFO!.defaultShell)}]\x1b[0m\r\n`); }
@@ -860,7 +880,7 @@ class PtyBackend implements CardBackend, Wakeable {
     }
   }
   input(d: string): void {
-    if (this.dead) { if (d === '\r') this.respawn(); return; }
+    if (this.dead) { if (!this.n._attach && d === '\r') this.respawn(); return; }
     this.send(d);
   }
   // only the tab the user is looking at sizes the PTY (ROB-8): the active card, or a terminal holding the keyboard (the dock is never a card)
@@ -870,7 +890,11 @@ class PtyBackend implements CardBackend, Wakeable {
   kill(): void {
     this.disposed = true; clearTimeout(this.timer); WAKE.delete(this);
     if (this.ws?.readyState === 1) { this.ws.send(JSON.stringify({ t: 'kill' })); setTimeout(() => this.ws?.close(), 50); }
-    else { try { this.ws?.close(); } catch {} new Reap('/pty', { t: 'open', id: this.n.id, spawn: false }, { t: 'kill' }, undefined, this.host); }
+    else {
+      try { this.ws?.close(); } catch {}
+      // A temporary viewer cancelled before its first open was sent cannot exist on the hub.
+      if (!this.n._attach || !this.spawn) new Reap('/pty', { t: 'open', id: this.n.id, spawn: false }, { t: 'kill' }, undefined, this.host);
+    }
   }
   // the card went in another tab: close here, the session is not ours to end
   dispose(): void { this.disposed = true; clearTimeout(this.timer); WAKE.delete(this); try { this.ws?.close(); } catch {} }
@@ -902,6 +926,7 @@ interface AcpToolLocation { path?: JsonValue; line?: JsonValue }
 type AcpLive = LiveEntry & { el: HTMLElement; hdr: HTMLElement; body: HTMLElement; logEl: HTMLElement; ta: HTMLTextAreaElement };
 interface AcpEditor { buf: EdwinBuffer; frame: EdwinFrame; root: HTMLElement }
 const ACP_COMPOSERS = new Set<AcpBackend>(), ACP_DRAFTS = new WeakMap<EdwinBuffer, AcpBackend>();
+const ACP_READERS = new WeakMap<EdwinBuffer, AcpBackend>();
 const PROMPT_MAX = 8388608;   // bytes of UTF-8 in one prompt's blocks (F-A17)
 const ACP_STATES = new Set<SessionState | undefined>(['idle', 'running', 'waiting_permission', 'waiting_input', 'done', 'error', 'exited', 'detached']);
 const ACP_BAD = new Set<SessionState | undefined>(['waiting_permission', 'waiting_input', 'error']);
@@ -913,6 +938,92 @@ const vtext = (v: unknown): string => (v == null ? '' : typeof v === 'string' ? 
 const blockText = (b: any): string => !b || typeof b !== 'object' ? '' : b.type === 'text' ? vtext(b.text) : b.type === 'image' ? '[image]' : b.type === 'audio' ? '[audio]'   // any: an ACP content block from the agent, read by duck typing
   : b.type === 'resource_link' ? vtext(b.name || b.uri) : b.type === 'resource' ? vtext(b.resource?.uri) : '';
 const urlHost = (u: JsonValue | undefined): string => { try { return new URL(u as string).host || 'the page'; } catch { return 'the page'; } };
+
+type AcpSplice = [pos: number, remove: number, insert: string];
+interface AcpRange { index: number; from: number; length: number; chars: number }
+const ACP_PAINT_BATCH = 64;
+function acpReaderField(text: string): string {
+  return text.replace(/\r\n|[\u0000-\u0008\u000b-\u001f\u007f\u2028\u2029]/g, c =>
+    c === '\r\n' ? '\n' : c === '\x7f' ? '␡' : c === '\u2028' ? '\\u2028' : c === '\u2029' ? '\\u2029' : String.fromCharCode(0x2400 + c.charCodeAt(0)));
+}
+const acpIndent = (text: string) => acpReaderField(text).replaceAll('\n', '\n  ');
+
+// The journal owns the items. Keep just their positions and the lengths of painted chunks, not a second text model.
+class AcpTranscript {
+  readonly ranges = new Map<AcpItem, AcpRange>();
+  end = 0;   // end of journal items, before the held-request lines
+  waiting = '';
+  readonly buf: EdwinBuffer;
+  readonly frame: EdwinFrame;
+  constructor(buf: EdwinBuffer, frame: EdwinFrame) { this.buf = buf; this.frame = frame; }
+  render(items: AcpItem[], dirty: Set<AcpItem>, pending: Map<number, AcpPending>, reset: boolean) {
+    const ops: AcpSplice[] = [], buf = this.buf;
+    // Leave an empty last line for Evil's G, which skips the virtual line after the final newline.
+    if (reset || !buf.rope.length) { ops.push([0, buf.rope.length, '\n']); this.ranges.clear(); this.end = 0; this.waiting = ''; }
+    const updates: { it: AcpItem; range: AcpRange }[] = [], added: AcpItem[] = [];
+    for (const it of dirty) {
+      const range = this.ranges.get(it);
+      if (range) updates.push({ it, range }); else added.push(it);
+      dirty.delete(it);
+      if (updates.length + added.length === ACP_PAINT_BATCH) break;
+    }
+    let delta = 0, i = 0;
+    for (const { it, range } of updates.sort((a, b) => a.range.index - b.range.index)) {
+      if (delta) for (; i < range.index; i++) this.ranges.get(items[i])!.from += delta;
+      i = range.index + 1;
+      const old = range.from;
+      range.from += delta;
+      if ('mid' in it) {   // a streamed message only grows, just before its closing newline
+        // CRLF may straddle chunks. Replace the trailing CR picture when its LF arrives.
+        const back = it.text[range.chars - 1] === '\r' && it.text[range.chars] === '\n' ? 1 : 0;
+        const text = acpIndent(it.text.slice(range.chars - back));
+        if (text) ops.push([range.from + range.length - 1 - back, back, text]);
+        range.length += text.length - back; range.chars = it.text.length; delta += text.length - back;
+      } else {
+        const text = acpReaderText(it);
+        const prev = buf.rope.slice(old, old + range.length);
+        if (prev === text) continue;
+        let pre = 0, suf = 0;
+        while (pre < prev.length && pre < text.length && prev[pre] === text[pre]) pre++;
+        while (suf < prev.length - pre && suf < text.length - pre && prev[prev.length - 1 - suf] === text[text.length - 1 - suf]) suf++;
+        ops.push([range.from + pre, prev.length - pre - suf, text.slice(pre, text.length - suf)]);
+        delta += text.length - range.length; range.length = text.length;
+      }
+    }
+    if (delta) for (; i < this.ranges.size; i++) this.ranges.get(items[i])!.from += delta;
+    this.end += delta;
+    if (added.length) {
+      const from = this.end, parts: string[] = [];
+      for (const it of added) {
+        const text = acpReaderText(it);
+        this.ranges.set(it, { index: this.ranges.size, from: this.end, length: text.length, chars: 'mid' in it ? it.text.length : 0 });
+        this.end += text.length; parts.push(text);
+      }
+      ops.push([from, 0, parts.join('')]);
+    }
+    let waiting = '';
+    for (const p of pending.values()) waiting += p.kind === 'permission' ? '· Permission: waiting\n' : '· Elicitation: waiting\n';
+    if (waiting !== this.waiting) { ops.push([this.end, this.waiting.length, waiting]); this.waiting = waiting; }
+    if (!ops.length) return;
+
+    // Edwin shifts point like an after-marker and does not shift window start. Keep the reader on the old text,
+    // except at EOF. Positions inside a replaced span retain their offset as far as the replacement permits.
+    const Ed = FR.Ed!, frame = this.frame, w = Ed.leaves(frame.wroot).find(w => w.buffer === buf);
+    let pt = frame.buffer === buf ? frame.point() : buf.pt, mark = buf.mark, start = w?.start ?? 0;
+    const tail = buf.rope.length - pt, follow = tail <= 1;
+    for (const [pos, n, text] of ops) {
+      const move = (p: number, after = false) => p < pos || (p === pos && !after) ? p
+        : p >= pos + n ? p + text.length - n : pos + Math.min(p - pos, text.length);
+      pt = move(pt); if (mark != null) mark = move(mark);
+      start = move(start, !follow && !n && text.endsWith('\n'));
+    }
+    Ed.applyOps(buf, ops, 'agent');
+    buf.mark = mark;
+    if (w) w.start = start;
+    if (frame.buffer === buf) frame.setPoint(follow ? buf.rope.length - tail : pt);
+  }
+}
+
 class AcpBackend implements CardBackend {
   declare n: AcpNode; declare L: AcpLive; declare spawn: boolean;
   declare seq: number; declare epoch: number | null; declare sum: SessionSummary | null; declare session: AcpSessionInfo;
@@ -926,13 +1037,18 @@ class AcpBackend implements CardBackend {
   declare ended?: number | null; declare cleared?: boolean; declare authNeeded?: boolean;
   declare modeSeen?: string; declare modeWanted?: string | null; declare planKey?: string; declare stateKey?: string;
   editor: AcpEditor | null = null;
+  transcript: AcpTranscript | null = null;
+  transcriptTried = false;
   editPrefix = 0;
-  constructor(n: AcpNode, L: AcpLive) {
+  readonly agents: boolean;
+  constructor(n: AcpNode, L: AcpLive, agents: boolean) {
+    this.agents = agents;
     this.n = n; this.L = L; this.spawn = !!n._spawn; delete n._spawn;   // spawn fields only for a card made in this page (SEC-2)
     this.seq = 0; this.epoch = null; this.sum = null; this.session = {}; this.tries = 0; this.rid = 0; this.rids = new Map();
     this.items = []; this.changed = new Set(); this.byMsg = new Map(); this.byTool = new Map(); this.pending = new Map(); this.waiting = new Map();
     this.panels = new Map(); this.draft = null; this.seenSent = 0;
     ACP_COMPOSERS.add(this); this.editorAvailability();
+    this.mountTranscript();
     this.connect();
   }
   get dead() { return this.gone || this.missing || !this.sum?.alive; }
@@ -1028,7 +1144,7 @@ class AcpBackend implements CardBackend {
   }
   setInfo(info: AcpInfo) {
     const { session, ...sum } = info;
-    if (session) this.session = { ...session, configOptions: session.configOptions ?? this.session.configOptions };
+    if (session) this.session = session;
     this.sum = sum; sessPut(sum); this.schedule();
   }
   refresh() {   // sessChanged: /rpc may carry a fresher summary of the same incarnation
@@ -1056,6 +1172,47 @@ class AcpBackend implements CardBackend {
     const b = $('.ag-edit', this.L.body) as HTMLButtonElement | null; if (!b) return;
     b.hidden = !frPromptAvailable();
     b.disabled = !!this.disposed || this.L.ta.disabled || this.draft != null || !!this.editor;
+  }
+  mountTranscript() {
+    if (!this.agents || this.transcriptTried || this.disposed || !frPromptAvailable()) return;
+    this.transcriptTried = true;   // decide on the first ready transition, never after the user leaves a control
+    if (this.L.el.contains(document.activeElement) || this.editor
+        || [...this.pending.values()].some(p => p.kind === 'elicitation' && p.request.mode !== 'url')) return;
+    const Ed = FR.Ed!, L = FR.L!, host = el('div', 'ag-reader');
+    let buf: EdwinBuffer | null = null, frame: EdwinFrame | null = null;
+    try {
+      frTranscriptKeymap();
+      buf = L.call('get-buffer-create', [L.call('generate-new-buffer-name', [' *agent-transcript ' + this.n.id + '*'])]) as EdwinBuffer;
+      buf.mode = 'wb-agent-transcript-mode';
+      Object.defineProperty(buf, 'readOnly', { value: true, writable: false });
+      host.setAttribute('role', 'region'); host.setAttribute('aria-label', 'Agent transcript');
+      frame = Ed.makeFrame(host, { buffer: buf, kind: 'card', fontSize: FR_FONT });
+      $('.ed-input', host)!.setAttribute('aria-label', 'Agent transcript keyboard input');
+    } catch (e) {
+      this.destroyTranscript(buf, frame ?? Ed.E.frames.find(f => f.root === host) ?? null);
+      console.warn('agent transcript: Edwin frame not loaded', e);
+      return;
+    }
+    this.transcript = new AcpTranscript(buf, frame);
+    ACP_READERS.set(buf, this);
+    this.L.logEl.replaceWith(host);
+    this.L.logEl.replaceChildren();
+    for (const it of this.items) delete it.el;
+    this.changed = new Set(this.items);
+    this.schedule();
+  }
+  destroyTranscript(buf: EdwinBuffer | null, frame: EdwinFrame | null) {
+    try { frame?.destroy(); } catch (e) { console.warn('agent transcript: could not destroy frame', e); }
+    if (buf) {
+      ACP_READERS.delete(buf);
+      try { if (FR.Ed!.E.buffers.includes(buf)) FR.L!.call('kill-buffer', [buf]); } catch (e) { console.warn('agent transcript: could not kill buffer', e); }
+    }
+  }
+  fallbackTranscript(reader: AcpTranscript) {
+    this.transcript = null;
+    this.destroyTranscript(reader.buf, reader.frame);
+    reader.frame.root.replaceWith(this.L.logEl);
+    this.changed = new Set(this.items);
   }
   composerKey(e: KeyboardEvent): boolean {
     if (!frPromptAvailable() || e.isComposing) { this.editPrefix = 0; return false; }
@@ -1142,11 +1299,18 @@ class AcpBackend implements CardBackend {
     this.dispose();
     if (!ended) new Reap('/acp', { t: 'open', id: this.n.id, since: this.seq }, { t: 'kill', forget: true }, (m: Extract<AcpServerMsg, { t: 'hello' }>) => epoch == null || m.info?.createdAt === epoch);
   }
-  stop() { this.disposed = true; this.finishPrompt(false, false); ACP_COMPOSERS.delete(this); clearTimeout(this.timer); WAKE.delete(this); cancelAnimationFrame(this.raf!); }
+  stop() {
+    this.disposed = true;
+    ACP_COMPOSERS.delete(this); clearTimeout(this.timer); WAKE.delete(this); cancelAnimationFrame(this.raf!);
+    try { this.finishPrompt(false, false); } finally {
+      const reader = this.transcript;
+      if (reader) { this.transcript = null; this.destroyTranscript(reader.buf, reader.frame); reader.frame.root.remove(); }
+    }
+  }
   dispose() { this.stop(); try { this.ws?.close(); } catch {} }   // the card went in another tab: close here, the session is not ours to end
   maybeSeen() {   // seen only when the user can see the result (§3.4.6)
     const s = this.sum, a = s?.acp;
-    if (!a || !(VIEW === 'canvas' && activeId === this.n.id || VIEW === 'agents' && live.$agents === this.L) || document.visibilityState !== 'visible' || !document.hasFocus()) return;
+    if (!a || !(VIEW === 'canvas' && activeId === this.n.id || VIEW === 'agents' && live.$agents === this.L && !this.L.el.hidden) || document.visibilityState !== 'visible' || !document.hasFocus()) return;
     if ((s.state !== 'done' && s.state !== 'error') || a.headSeq <= a.seenSeq || this.seenSent >= a.headSeq) return;
     if (this.send({ t: 'seen', seq: a.headSeq })) this.seenSent = a.headSeq;
   }
@@ -1213,10 +1377,11 @@ class AcpBackend implements CardBackend {
       }
       case 'spawn': this.authNeeded = false; this.add({ k: 'note', text: ev.via === 'revive' ? 'agent restarted to revive the session' : 'agent started' }); break;
       case 'session':
-        if (ev.configOptions) this.session.configOptions = ev.configOptions;
+        this.session.configOptions = ev.configOptions;
         this.authNeeded = false; this.add({ k: 'note', text: ev.via === 'load' ? 'resumed via load' : ev.via === 'resume' ? 'resumed' : 'session ready' }); break;
       case 'authenticate': this.add({ k: 'note', text: 'authenticating…' }); break;
       case 'mode': this.modeSeen = vtext(ev.modeId); this.add({ k: 'note', text: 'mode: ' + vtext((this.session.modes?.availableModes || []).find(x => x?.id === ev.modeId)?.name || ev.modeId) }); break;
+      case 'config': this.session.configOptions = ev.configOptions; break;
       case 'notice': this.add({ k: 'note', cls: ev.level === 'error' ? 'err' : ev.level === 'warn' ? 'warn' : '', text: vtext(ev.text) }); break;
       case 'exit': this.add({ k: 'note', text: 'agent exited' + (ev.reason ? ' (' + vtext(ev.reason) + ')' : '') }); break;
     }
@@ -1244,11 +1409,25 @@ class AcpBackend implements CardBackend {
   schedule() { if (!this.raf && !this.disposed) this.raf = requestAnimationFrame(() => { this.raf = 0; this.render(); }); }
   render() {
     const L = this.L, log = L.logEl; if (this.disposed || !log) return;
-    const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
-    if (this.cleared) { this.cleared = false; log.replaceChildren(); }
-    for (const it of this.changed) { if (!it.el) log.append(it.el = acpItemEl(it)); acpFill(it); }
-    this.changed.clear();
-    if (stick) log.scrollTop = log.scrollHeight;
+    const reader = this.transcript;
+    if (reader) {
+      if (reader.frame.buffer !== reader.buf || !FR.Ed!.E.buffers.includes(reader.buf)) this.fallbackTranscript(reader);
+      else try {
+        reader.render(this.items, this.changed, this.pending, !!this.cleared);
+        this.cleared = false;
+        if (this.changed.size) this.schedule();
+      } catch (e) {
+        this.fallbackTranscript(reader);
+        console.warn('agent transcript: Edwin paint failed', e);
+      }
+    }
+    if (!this.transcript) {
+      const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+      if (this.cleared) { this.cleared = false; log.replaceChildren(); }
+      for (const it of this.changed) { if (!it.el) log.append(it.el = acpItemEl(it)); acpFill(it); }
+      this.changed.clear();
+      if (stick) log.scrollTop = log.scrollHeight;
+    }
     this.renderPlan(); this.renderPending(); this.paint();
     if (live.$agents === L) meshRender();
   }
@@ -1386,24 +1565,60 @@ function acpItemEl(it: AcpItem): HTMLElement {
   if (it.k === 'thought') { const d = el('details', 'ag-thought'); d.append(el('summary', '', 'thinking'), el('div', 'ag-msg')); return d; }
   return el('div', ({ user: 'ag-msg ag-user', asst: 'ag-msg ag-asst', tool: 'ag-tool', sep: 'ag-sep' } as Record<string, string>)[it.k] || 'ag-note');
 }
+function acpToolStatus(it: AcpToolItem) {
+  const status = vtext(it.status);
+  return Object.hasOwn(TOOL_GLYPH, status) ? status : 'pending';
+}
+function acpToolLocations(it: AcpToolItem) {
+  const locs = Array.isArray(it.locations) ? it.locations as (AcpToolLocation | null)[] : [];
+  return locs.length ? locs.map(l => vtext(l?.path) + (l?.line != null ? ':' + vtext(l.line) : '')).join('  ') : null;
+}
+function acpToolText(item: JsonValue) {
+  const c = item as JsonObject | null;
+  return c?.type === 'terminal' ? '[terminal output not available]' : blockText(c?.content);
+}
+
+function acpReaderText(it: AcpItem): string {
+  if (it.k === 'user') return 'Prompt: ' + acpIndent(it.text) + '\n';
+  if (it.k === 'asst' || it.k === 'thought') return (it.k === 'asst' ? 'Assistant:' : 'Thinking:') + '\n  ' + acpIndent(it.text) + '\n';
+  if (it.k === 'note') return '· ' + acpIndent(it.text) + '\n';
+  if (it.k === 'sep') return '\n';
+  if (it.k !== 'tool') return '';
+  const locs = acpToolLocations(it);
+  let text = 'Tool: ' + acpIndent(vtext(it.kind) || 'tool') + ' [' + acpToolStatus(it) + '] ' + acpIndent(vtext(it.title)) + '\n';
+  if (locs != null) text += '  Location: ' + acpIndent(locs) + '\n';
+  for (const c of Array.isArray(it.content) ? it.content : []) {
+    if ((c as AcpDiffContent | null)?.type === 'diff') {
+      const { title, lines, large } = acpDiff(c as AcpDiffContent, acpReaderField);
+      if (large == null) text += '  Diff: ' + acpIndent(title) + '\n';
+      for (const [, line] of lines) text += '  ' + acpIndent(line) + '\n';
+    } else {
+      const output = acpToolText(c);
+      if (output) text += '  Output:\n  ' + acpIndent(output) + '\n';
+    }
+  }
+  return text;
+}
 function acpFill(it: AcpItem) {
   const e = it.el!;
   if (it.k === 'user' || it.k === 'asst') e.textContent = it.text;
   else if (it.k === 'thought') e.lastChild!.textContent = it.text;
   else if (it.k === 'note') { e.textContent = it.text; e.classList.toggle('err', it.cls === 'err'); e.classList.toggle('warn', it.cls === 'warn'); }
   else if (it.k === 'tool') {
-    const st = TOOL_GLYPH[it.status as string] ? it.status as string : 'pending', h = el('div', 'th'), locs = Array.isArray(it.locations) ? it.locations as (AcpToolLocation | null)[] : [];
+    const st = acpToolStatus(it), h = el('div', 'th'), locs = acpToolLocations(it);
     h.append(el('span', 'tg ' + st, TOOL_GLYPH[st]), el('b', '', vtext(it.kind) || 'tool'), el('span', 'tt', vtext(it.title)));
     const parts: HTMLElement[] = [h];
-    if (locs.length) parts.push(el('div', 'tl', locs.map(l => vtext(l?.path) + (l?.line != null ? ':' + vtext(l.line) : '')).join('  ')));
+    if (locs != null) parts.push(el('div', 'tl', locs));
     for (const c of Array.isArray(it.content) ? it.content : []) parts.push(toolContent(c));
     e.replaceChildren(...parts); e.dataset.status = st;
   }
 }
-function toolContent(c: any): HTMLElement {   // any: a tool call's content item from the agent, read by duck typing
+function toolContent(item: JsonValue): HTMLElement {
+  const c = item as JsonObject | null;
   if (c?.type === 'diff') return lineDiff(c);
-  if (c?.type === 'terminal') return el('div', 'ag-note', '[terminal output not available]');
-  const t = blockText(c?.content), lines = t.split('\n').length, pre = el('pre', lines > 20 ? 'clip' : '', t);
+  const t = acpToolText(item);
+  if (c?.type === 'terminal') return el('div', 'ag-note', t);
+  const lines = t.split('\n').length, pre = el('pre', lines > 20 ? 'clip' : '', t);
   if (lines <= 20) return pre;
   const box = el('div'), more = el('button', 'more', 'show all ' + lines + ' lines');
   more.type = 'button'; more.onclick = () => { pre.classList.remove('clip'); more.remove(); };
@@ -1424,15 +1639,14 @@ function acpStatePanel(box: HTMLElement, sp: AcpStateSpec | null, b: AcpBackend)
 }
 // A tool call's diff content (30 §1.2): common prefix and suffix trimmed, an LCS over the middle when it is small enough,
 // 3 lines of context around each change.
-function lineDiff(d: AcpDiffContent): HTMLElement {
-  const box = el('div', 'ag-diff'), path = vtext(d.path), oldT = d.oldText == null ? null : vtext(d.oldText), newT = vtext(d.newText);
-  const a = oldT == null ? [] : oldT.split('\n'), b = newT.split('\n');
-  box.append(el('div', 'dp', path + (oldT == null ? ' (new file)' : '')));
+function acpDiff(d: AcpDiffContent, format?: (text: string) => string): { title: string; lines: [string, string][]; large?: string } {
+  const path = vtext(d.path), oldT = d.oldText == null ? null : vtext(d.oldText), newT = vtext(d.newText), title = path + (oldT == null ? ' (new file)' : '');
   if ((oldT || '').length + newT.length > 200000) {
-    box.append(el('div', 'gap', 'diff too large: ' + path + ' (' + a.length + ' → ' + b.length + ' lines)'));
-    const t = el('button', 'more', 'show new text'); t.type = 'button'; t.onclick = () => t.replaceWith(el('pre', '', newT));
-    box.append(t); return box;
+    const count = (text: string) => { let n = 1; for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) n++; return n; };
+    return { title, lines: [['gap', 'diff too large: ' + path + ' (' + (oldT == null ? 0 : count(oldT)) + ' → ' + count(newT) + ' lines)']], large: newT };
   }
+  const split = (text: string) => (format ? format(text) : text).split('\n');
+  const a = oldT == null ? [] : split(oldT), b = split(newT);
   let p = 0; while (p < a.length && p < b.length && a[p] === b[p]) p++;
   let s = 0; while (s < a.length - p && s < b.length - p && a[a.length - 1 - s] === b[b.length - 1 - s]) s++;
   const am = a.slice(p, a.length - s), bm = b.slice(p, b.length - s), ops = a.slice(0, p).map(x => ['=', x]), m = am.length, n = bm.length;
@@ -1447,13 +1661,27 @@ function lineDiff(d: AcpDiffContent): HTMLElement {
   for (const x of a.slice(a.length - s)) ops.push(['=', x]);
   const keep = ops.map(() => false);
   ops.forEach(([o], i) => { if (o !== '=') for (let k = Math.max(0, i - 3); k <= Math.min(ops.length - 1, i + 3); k++) keep[k] = true; });
-  const pre = el('pre');
+  const lines: [string, string][] = [];
   for (let i = 0; i < ops.length;) {
-    if (keep[i]) { const [o, t] = ops[i++]; pre.append(el('div', o === '+' ? 'add' : o === '-' ? 'del' : 'ctx', (o === '=' ? ' ' : o) + ' ' + t)); continue; }
+    if (keep[i]) { const [o, t] = ops[i++]; lines.push([o === '+' ? 'add' : o === '-' ? 'del' : 'ctx', (o === '=' ? ' ' : o) + ' ' + t]); continue; }
     let j = i; while (j < ops.length && !keep[j]) j++;
-    pre.append(el('div', 'gap', '… ' + (j - i) + ' unchanged line' + (j - i === 1 ? '' : 's'))); i = j;
+    lines.push(['gap', '… ' + (j - i) + ' unchanged line' + (j - i === 1 ? '' : 's')]); i = j;
   }
-  box.append(pre); return box;
+  return { title, lines };
+}
+function lineDiff(d: AcpDiffContent): HTMLElement {
+  const { title, lines, large } = acpDiff(d), box = el('div', 'ag-diff');
+  box.append(el('div', 'dp', title));
+  if (large != null) {
+    box.append(el('div', 'gap', lines[0][1]));
+    const t = el('button', 'more', 'show new text'); t.type = 'button'; t.onclick = () => t.replaceWith(el('pre', '', large));
+    box.append(t);
+  } else {
+    const pre = el('pre');
+    for (const [cls, text] of lines) pre.append(el('div', cls, text));
+    box.append(pre);
+  }
+  return box;
 }
 // An elicitation form from requestedSchema (30 §1.4): one control per property, in object order.
 /* A field of an elicitation form: its schema, its control and how to read its value; and what the form's check says. */
@@ -1552,13 +1780,13 @@ function adoptOrphan(s: SessionSummary) {
   const n = addNode({ id: s.sid, name: (acp ? 'agent' : 'shell') + (nodeList().length + 1), ...base, ...freeSpot(c.x - w / 2, c.y - h / 2, w, h), w, h, adopted: true, _spawn: false });
   jumpNode(n);
 }
-function mountAcp(n: AcpNode, L: LiveEntry) {
+function mountAcp(n: AcpNode, L: LiveEntry, agents = false) {
   if (!DAEMON) { L.body!.append(el('div', 'ag-note', 'Agent cards run on the Workbench server.')); return; }
   L.body!.innerHTML = '<div class="ag-plan" hidden></div><div class="ag-transcript"><div class="ag-log" aria-live="polite"></div></div><div class="ag-pend"><div class="ag-state" hidden></div></div>'
     + '<form class="ag-in"><textarea rows="2"></textarea><div class="ag-row"><select class="ag-mode" title="Agent mode" hidden></select>'
     + '<button type="button" class="ag-edit" title="Edit prompt in Edwin (C-c C-e)" hidden>Edwin</button><button type="button" class="stop" hidden>Stop</button><button type="submit" class="go">Send</button></div></form>';
   L.logEl = $('.ag-log', L.body)!; L.ta = $('textarea', L.body) as HTMLTextAreaElement;
-  const b = L.backend = new AcpBackend(n, L as AcpLive);
+  const b = L.backend = new AcpBackend(n, L as AcpLive, agents);
   $('.ag-in', L.body)!.addEventListener('submit', e => { e.preventDefault(); b.submit(); });
   L.ta.addEventListener('keydown', e => { if (b.composerKey(e)) return; if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); b.submit(); } });
   $('.ag-edit', L.body)!.onclick = () => b.editPrompt();
@@ -4155,10 +4383,17 @@ function toggleDockTerm() {
 // ------------------------------------------------------------------ agents on the mesh: every session the hub runs or is told of (§3.8.3, F-A47)
 // Observed sessions from /rpc: observed replaces, observed_put upserts, observed_gone deletes.
 const OBS: Record<string, ObservedSession> = {};
-const MESH: { open: string | null; ended: boolean; shape: string; graph: string; topo: string; t: number } = { open: null, ended: false, shape: '', graph: '', topo: '', t: 0 };
-const MESH_PANE: { row: string | null; key: string; actions: string; node: TermNode | AcpNode | null; attach: boolean; rows: string[] } = { row: null, key: '', actions: '', node: null, attach: false, rows: [] };
+const MESH: { open: string | null; ended: boolean; facts: boolean; collapsed: Set<string>; graph: string; topo: string; t: number } = { open: null, ended: false, facts: false, collapsed: new Set(), graph: '', topo: '', t: 0 };
+const MESH_ROWS = new Map<string, HTMLElement>(), MESH_GROUPS = new Map<string, HTMLElement>();
+const MESH_PANE: { row: string | null; hubKey: string; actions: string; node: TermNode | AcpNode | null; attach: string; committed: boolean; terminal: boolean; rows: string[] } =
+  { row: null, hubKey: '', actions: '', node: null, attach: '', committed: false, terminal: false, rows: [] };
 // The hub session an observed one runs in: its WB_SESSION, believed only from the host that session is on.
-function obsSess(o: ObservedSession): SessionSummary | null { const s = !o.parent && o.wbSession ? SESS[o.wbSession] : undefined; return s && s.host === o.host ? s : null; }
+function obsSess(o: ObservedSession): SessionSummary | null {
+  // A subagent can inherit the enclosing hub sid even when its parent was never reported.
+  if (!o.wbSession || o.parent) return null;
+  const s = SESS[o.wbSession];
+  return s && s.host === o.host ? s : null;
+}
 function obsPut(o: ObservedSession | undefined, was = o && OBS[o.id]?.state): void {
   if (!o?.id) return;
   OBS[o.id] = o; meshChanged();
@@ -4174,18 +4409,39 @@ function meshChanged(): void { if (!MESH.t) MESH.t = setTimeout(() => { MESH.t =
 // The overview's rows: observed sessions with their subagents under them, then the agent sessions of the hub that
 // no harness reports. Either side saying a session waits for you makes it waiting.
 function meshRows(): MeshRow[] {
-  const rows = new Map<string, MeshRow>(), joined = new Set<string>(), top: MeshRow[] = [];
+  const rows = new Map<string, MeshRow>(), aliases = new Map<string, MeshRow>(), joined = new Set<string>(), top: MeshRow[] = [];
   for (const o of Object.values(OBS)) {
     const sess = obsSess(o), acp = sess?.kind === 'acp' ? sess : null, ended = o.endedAt != null; if (sess) joined.add(sess.sid);
-    rows.set(o.id, { id: o.id, host: o.host, harness: o.harness, project: o.project, title: o.title, state: acp && (ended || ACP_BAD.has(acp.state)) ? acp.state : o.state,
-      since: o.startedAt, at: o.lastAt, live: ended ? !!acp?.alive : true, obs: o, sess, card: (sess && S?.nodes[sess.sid]) || null, kids: [] });   // a record that went silent ends; the agent the hub still runs has not
+    const r: MeshRow = { id: o.id, host: o.host, harness: o.harness, project: o.project, repo: o.repo || o.project,
+      repoRoot: o.repoRoot || null, worktree: o.worktree || null, branch: o.branch || null,
+      parent: o.parent || sess?.parent || null, title: o.title, state: acp && (ended || ACP_BAD.has(acp.state)) ? acp.state : o.state,
+      since: o.startedAt, at: o.lastAt, live: ended ? !!acp?.alive : true, obs: o, sess, card: (sess && S?.nodes[sess.sid]) || null, kids: [] };
+    rows.set(r.id, r); if (sess && !aliases.has(sess.sid)) aliases.set(sess.sid, r);
   }
   for (const s of Object.values(SESS)) if (s.kind === 'acp' && !joined.has(s.sid)) {
-    const card = S?.nodes[s.sid] || null, agent = agentLabel(s.acp?.agent);
-    rows.set(s.sid, { id: s.sid, host: s.host, harness: agent, project: s.cwd?.replace(/\/+$/, '').split('/').pop() || '(no cwd)', title: s.acp?.title || card?.name || agent, state: s.state,
-      since: s.createdAt, at: s.updatedAt, live: s.alive, obs: null, sess: s, card, kids: [] });
+    const card = S?.nodes[s.sid] || null, agent = agentLabel(s.acp?.agent), project = s.project || (s.projectRoot || s.cwd)?.replace(/\/+$/, '').split('/').pop() || '(no cwd)';
+    rows.set(s.sid, { id: s.sid, host: s.host, harness: agent, project, repo: s.repo || project,
+      repoRoot: s.repoRoot || null, worktree: s.worktree || null, branch: s.branch || null, parent: s.parent || null,
+      title: s.acp?.title || card?.name || agent, state: s.state, since: s.createdAt, at: s.updatedAt, live: s.alive, obs: null, sess: s, card, kids: [] });
   }
-  for (const r of rows.values()) { const up = r.obs?.parent ? rows.get(r.obs.parent) : undefined; (up ? up.kids : top).push(r); }
+  for (const r of rows.values()) aliases.set(r.id, r);
+  const parents = new Map<string, MeshRow>();
+  for (const r of rows.values()) {
+    const up = r.parent ? aliases.get(r.parent) : undefined;
+    r.parent = up?.id || r.parent;   // retain ended/unknown lineage for the detail facts
+    if (up?.live && up !== r) parents.set(r.id, up);
+  }
+  // Break cycles before building children, including cycles through a joined hub sid alias.
+  const done = new Set<string>();
+  for (const r of rows.values()) {
+    const path = new Set<string>(); let cur: MeshRow | undefined = r;
+    while (cur && !done.has(cur.id)) {
+      if (path.has(cur.id)) { parents.delete(cur.id); break; }
+      path.add(cur.id); cur = parents.get(cur.id);
+    }
+    for (const id of path) done.add(id);
+  }
+  for (const r of rows.values()) (parents.get(r.id)?.kids || top).push(r);
   return top;
 }
 function meshFlat(rows: MeshRow[] = meshRows()): MeshRow[] { return rows.flatMap(r => [r, ...meshFlat(r.kids)]); }
@@ -4201,25 +4457,57 @@ function meshDoing(r: MeshRow): string {
   if (r.state === 'running') return o?.tool ? line(o.tool.name, o.tool.input) : 'working';
   return r.state === 'done' ? 'finished' : r.state.replace(/_/g, ' ');
 }
-function meshRowEl(r: MeshRow, depth: number): HTMLElement {
-  const row = el('div', 'mesh-row'), main = el('div', 'mesh-main'), sub = el('span', 'mesh-sub'); row.dataset.id = r.id; row.style.setProperty('--d', String(depth)); row.setAttribute('role', 'listitem');
-  sub.append(el('span', 'mesh-harness'), ' · ', el('span', 'mesh-model'), el('span', 'mesh-doing'));
-  main.append(el('b'), sub); row.append(el('i', 'dot'), main, el('span', 'mesh-at'));
-  if (r.card) { const go = el('button', 'mini', '↗'); go.title = 'Show its card on the canvas'; go.onclick = e => { e.stopPropagation(); const n = S.nodes[r.card!.id]; if (n) { setView('canvas'); jumpNode(n); } }; row.append(go); }
-  row.onclick = () => meshSelect(r.id);
+function meshRowEl(r: MeshRow): HTMLElement {
+  const row = el('div', 'mesh-row'), main = el('div', 'mesh-main'), sub = el('span', 'mesh-sub'), context = el('span', 'mesh-context');
+  const toggle = el('button', 'mini mesh-collapse'), go = el('button', 'mini mesh-canvas', '↗');
+  row.dataset.id = r.id; row.setAttribute('role', 'listitem');
+  context.append(el('span', 'mesh-repo'), el('span', 'mesh-worktree'), el('span', 'mesh-branch'));
+  sub.append(context, el('span', 'mesh-harness'), ' · ', el('span', 'mesh-model'), el('span', 'mesh-doing'));
+  main.append(el('b'), sub, el('span', 'mesh-collapsed')); row.append(toggle, el('i', 'dot'), main, el('span', 'mesh-at'), go);
+  toggle.onclick = e => {
+    e.stopPropagation();
+    if (MESH.collapsed.has(r.id)) MESH.collapsed.delete(r.id);
+    else {
+      MESH.collapsed.add(r.id);
+      const current = meshFlat().find(x => x.id === r.id);
+      if (current && meshFlat(current.kids).some(x => x.id === MESH.open)) MESH.open = r.id;
+    }
+    meshRender();
+  };
+  go.title = 'Show its card on the canvas';
+  go.onclick = e => { e.stopPropagation(); const n = row.dataset.card && S.nodes[row.dataset.card]; if (n) { setView('canvas'); jumpNode(n); } };
+  row.onclick = () => meshSelect(r.id, true);
   return row;
 }
 // A row's texts, set in place: a row under the pointer is not replaced while its session works.
-function meshFill(row: HTMLElement, r: MeshRow, depth: number): void {
+function meshFill(row: HTMLElement, r: MeshRow, depth: number, groupRepo: string | undefined, visible: Set<string>): void {
   row.className = 'mesh-row' + (r.live ? '' : ' ended') + (meshBad(r) ? ' bad' : '') + (r.id === MESH.open ? ' on' : '');
+  row.style.setProperty('--d', String(depth)); row.dataset.depth = String(depth); row.dataset.card = r.card?.id || '';
   row.setAttribute('aria-current', r.id === MESH.open ? 'true' : 'false');
   $('.dot', row)!.className = 'dot st-' + (r.live ? r.state : 'exited');
   const set = (sel: string, text: string) => { const e = $(sel, row)!; if (e.textContent !== text) e.textContent = text; return e; };
-  set('b', r.title); set('.mesh-at', agoShort(r.at));
+  set('b', r.title).title = r.title; set('.mesh-at', agoShort(r.at));
   const model = meshConfig(r, 'model') || r.obs?.model || '', harness = depth && r.obs?.agentType ? r.harness + '/' + r.obs.agentType : r.harness;
   set('.mesh-harness', meshShort(harness)).title = harness; set('.mesh-model', model ? meshShort(model) + ' · ' : '').title = model;
   set('.mesh-doing', [...(depth ? [] : ['@' + r.host]), meshDoing(r)].join(' · '));
+  const worktree = r.worktree?.replace(/\/+$/, '').split('/').pop() || '', branch = r.branch && r.branch !== r.worktree ? r.branch : '';
+  set('.mesh-repo', depth && r.repo !== groupRepo ? meshShort(r.repo) + ' · ' : '').title = r.repo;
+  set('.mesh-worktree', worktree ? meshShort(worktree) + ' · ' : '').title = r.worktree || '';
+  set('.mesh-branch', branch ? meshShort(branch) + ' · ' : '').title = r.branch || '';
+  const toggle = $('.mesh-collapse', row) as HTMLButtonElement, collapsed = MESH.collapsed.has(r.id), descendants = meshFlat(r.kids).filter(k => MESH.ended || k.live || k.id === MESH.open);
+  toggle.hidden = !descendants.length; toggle.textContent = collapsed ? '▸' : '▾';
+  toggle.title = (collapsed ? 'Expand' : 'Collapse') + ' descendants'; toggle.setAttribute('aria-label', toggle.title);
+  toggle.setAttribute('aria-expanded', String(!collapsed));
+  const summary = $('.mesh-collapsed', row)!; summary.hidden = !collapsed || !descendants.length;
+  if (!summary.hidden) {
+    const worst = descendants.reduce((a, b) => meshSeverity(b) < meshSeverity(a) ? b : a);
+    summary.dataset.count = String(descendants.length); summary.dataset.hidden = String(descendants.filter(x => !visible.has(x.id)).length);
+    summary.dataset.state = worst.live ? worst.state : 'exited';
+    set('.mesh-collapsed', `${descendants.length} descendant${descendants.length === 1 ? '' : 's'} · ${meshBad(worst) ? meshWants(worst.state) : worst.live ? worst.state.replace(/_/g, ' ') : 'ended'}`);
+  }
+  ($('.mesh-canvas', row) as HTMLButtonElement).hidden = !r.card;
 }
+const meshSeverity = (r: MeshRow): number => !r.live ? 7 : r.state === 'error' ? 0 : r.state === 'waiting_permission' ? 1 : r.state === 'waiting_input' ? 2 : r.state === 'running' ? 3 : r.state === 'done' ? 5 : 4;
 const meshShort = (s: string): string => s.length > 32 ? s.slice(0, 15) + '…' + s.slice(-16) : s;
 function meshConfig(r: MeshRow, category: string): string {
   const b = MESH_PANE.row === r.id ? live.$agents?.backend : r.sess && live[r.sess.sid]?.backend, opts = b?.session?.configOptions;
@@ -4231,101 +4519,227 @@ function meshInfo(box: HTMLElement, r: MeshRow): void {
   const o = r.obs, b = MESH_PANE.row === r.id ? live.$agents?.backend as AcpBackend | undefined : undefined, out: HTMLElement[] = [], kv = (k: string, v: string | null | undefined | false) => { if (v) { const d = el('div', 'mesh-kv'); d.append(el('span', '', k), el('code', '', v)); out.push(d); } };
   kv('harness', r.harness); kv('model', meshConfig(r, 'model') || o?.model); kv('host', r.host);
   kv('folder', o?.cwd || r.sess?.cwd); kv('mode', b instanceof AcpBackend ? b.mode() || o?.permissionMode : o?.permissionMode); kv('reasoning', meshConfig(r, 'thinking'));
+  kv('repo', r.repo); kv('repo root', r.repoRoot); kv('worktree', r.worktree); kv('branch', r.branch);
+  const parent = r.parent && meshFlat().find(x => x.id === r.parent);
+  if (parent) {
+    const d = el('div', 'mesh-kv'), go = el('button', 'mesh-parent', parent.title);
+    go.title = parent.id; go.onclick = () => meshSelect(parent.id); d.append(el('span', '', 'started by'), go); out.push(d);
+  }
   kv('waiting', meshBad(r) && meshDoing(r)); kv('prompt', o?.lastPrompt); kv('reply', o?.lastMessage);
   kv('started', new Date(r.since).toLocaleString()); kv('last active', new Date(r.at).toLocaleString());
   if (o) kv('counts', o.counts.prompts + ' prompt(s), ' + o.counts.tools + ' tool call(s)' + (o.counts.toolFailures ? ', ' + o.counts.toolFailures + ' failed' : ''));
   if (o?.tail.length) out.push(el('pre', '', o.tail.slice(-12).map(t => hhmm(t.at) + ' ' + t.kind.replace(/_/g, ' ') + (t.text ? ' ' + t.text : '')).join('\n')));
   box.replaceChildren(...out);
 }
+function meshHeader(r: MeshRow): void {
+  const box = $('#mesh-detail')!, title = $('h3', box)!, meta = $('.mesh-meta', box)!, b = live.$agents?.backend;
+  if (title.textContent !== r.title) title.textContent = r.title; title.title = r.title;
+  const values = [r.harness, meshConfig(r, 'model') || r.obs?.model, r.host, r.obs?.cwd || r.sess?.cwd,
+    b instanceof AcpBackend ? b.mode() || r.obs?.permissionMode : r.obs?.permissionMode, r.live ? r.state : 'ended'];
+  const parts = values.flatMap((v, i) => {
+    if (!v) return []; const s = el('span', i === 3 ? 'mesh-folder' : ''); s.title = v;
+    if (i === 3) { const path = el('bdi', '', v); path.dir = 'ltr'; s.append(path); } else s.textContent = v;
+    return [s];
+  });
+  meta.replaceChildren(...parts.flatMap((s, i) => i ? [' · ', s] : [s]));
+}
+function meshFactsMode(): void {
+  const box = $('#mesh-detail')!, mounted = !!meshViewer();
+  box.classList.toggle('mounted', mounted);
+  const toggle = $('.mesh-disclose', box)!;
+  toggle.hidden = !mounted; toggle.setAttribute('aria-expanded', String(MESH.facts));
+  $('.mesh-info', box)!.hidden = mounted && !MESH.facts;
+}
+function meshViewer(): LiveEntry | undefined {
+  return live.$agentsAttach || (live.$agents?.el?.hidden ? undefined : live.$agents);
+}
+function meshUnmount(slot: '$agents' | '$agentsAttach'): void {
+  const L = live[slot]; if (!L) return;
+  delete live[slot];
+  if (slot === '$agentsAttach') L.backend?.kill?.(); else L.backend?.dispose?.();
+  L.ro?.disconnect(); clearTimeout(L.fitT); L.el.remove();
+  // xterm 5.5 queues its first viewport sync in a timer that disposal does not cancel.
+  if (L.term) setTimeout(() => L.term!.dispose(), 0);
+}
 function meshClose(): void {
-  const L = live.$agents;
-  if (L) {
-    if (MESH_PANE.attach) L.backend?.kill?.(); else L.backend?.dispose?.();
-    L.ro?.disconnect(); clearTimeout(L.fitT); L.term?.dispose(); delete live.$agents;
-    L.el.remove();
-  }
-  MESH_PANE.row = null; MESH_PANE.key = ''; MESH_PANE.actions = ''; MESH_PANE.node = null; MESH_PANE.attach = false;
+  meshUnmount('$agentsAttach'); meshUnmount('$agents');
+  MESH_PANE.row = null; MESH_PANE.hubKey = ''; MESH_PANE.actions = ''; MESH_PANE.node = null;
+  MESH_PANE.attach = ''; MESH_PANE.committed = false; MESH_PANE.terminal = false;
+  $('#mesh-detail')!.classList.remove('mounted');
 }
 function meshMount(r: MeshRow, attach = false): void {
-  const box = $('#mesh-detail')!, host = el('div', 'mesh-live ' + (r.sess?.kind === 'acp' && !attach ? 'k-acp' : 'k-term')), hdr = el('div', 'hdr'), body = el('div', 'body');
+  const box = $('#mesh-detail .mesh-viewers')!, host = el('div', 'mesh-live ' + (r.sess?.kind === 'acp' && !attach ? 'k-acp' : 'k-term')), hdr = el('div', 'hdr'), body = el('div', 'body');
   const sid = attach ? 'attach_' + r.id + '_' + crypto.randomUUID() : r.sess!.sid, base = { id: sid, name: r.title, x: 0, y: 0, w: 560, h: 520 };   // o_ + 16 hex digits and a UUID: 62 sid-safe ASCII characters
   const n: TermNode | AcpNode = r.sess?.kind === 'acp' && !attach ? { ...base, kind: 'acp', agent: r.sess.acp?.agent || '', cwd: r.sess.cwd || '' }
     : { ...base, kind: 'term', backend: 'pty', env: {}, ...(attach ? { _spawn: true, _attach: r.id } : {}) };
   hdr.append(el('i', 'dot'), el('span', 'badge')); host.append(hdr, body); box.append(host);
-  MESH_PANE.node = n; MESH_PANE.attach = attach;
-  const L = live.$agents = { el: host, hdr, body };
-  if (n.kind === 'acp') mountAcp(n, L); else mountTerm(n, L);
+  if (!attach) MESH_PANE.node = n;
+  const L = live[attach ? '$agentsAttach' : '$agents'] = { el: host, hdr, body };
+  if (n.kind === 'acp') mountAcp(n, L, true); else mountTerm(n, L);
 }
-const meshPaneKey = (r: MeshRow): string => [r.id, r.sess?.sid || '', r.sess?.kind || '', r.sess?.createdAt ?? ''].join(' ');
-const meshActionKey = (r: MeshRow): string => [r.card?.id || '', !!r.obs?.attach, !!INFO?.attach, r.live].join(' ');
-function meshActions(r: MeshRow): void {
-  MESH_PANE.actions = meshActionKey(r);
-  const box = $('#mesh-detail')!, acts = $('.ex-btns', box)!, sid = r.sess?.sid,
-    reachable = r.sess?.kind === 'acp' || r.sess?.kind === 'pty' && r.sess.host === INFO?.host;
+const MESH_SETUP = 'Start a Claude background session, use tmux, or run in a Workbench shell or agent card to control it here.';
+function meshAttachReason(r: MeshRow): string {
+  if (r.obs?.endedAt != null) return 'The observed session has ended.';
+  if (!r.obs?.attach) return 'Started in a terminal the hub cannot reach.';
+  if (!INFO?.attach) return 'Terminal attachment is not configured.';
+  return '';
+}
+function meshReconcile(r: MeshRow): void {
+  const hub = r.sess?.kind === 'acp' || r.sess?.kind === 'pty' && r.sess.host === INFO?.host ? r.sess : null;
+  const hubKey = hub ? [hub.sid, hub.kind, hub.createdAt].join(' ') : '';
+  if (hubKey !== MESH_PANE.hubKey) {
+    meshUnmount('$agents'); MESH_PANE.node = null; MESH_PANE.hubKey = hubKey;
+    if (hub) { MESH_PANE.terminal = false; meshMount(r); }
+  }
+  const claude = r.obs?.harness === 'claude' || r.obs?.attach?.kind === 'claude';
+  const reason = meshAttachReason(r), canAttach = !reason && hub?.kind !== 'pty';
+  const terminal = hub?.kind !== 'pty' && (MESH_PANE.terminal || !hub && MESH_PANE.committed && claude);
+  const attach = terminal && canAttach ? JSON.stringify(r.obs!.attach) : '';
+  if (attach !== MESH_PANE.attach) {
+    meshUnmount('$agentsAttach'); MESH_PANE.attach = attach;
+    if (attach) meshMount(r, true);
+  }
+  const transcript = live.$agents?.el;
+  if (transcript && transcript.hidden !== terminal) {
+    transcript.hidden = terminal;
+    transcript.inert = terminal;
+    if (!terminal) live.$agents?.backend?.maybeSeen?.();
+  }
+  const backend = live.$agentsAttach?.backend, error = backend instanceof PtyBackend ? backend.attachError : '';
+  const switchTo = hub?.kind === 'acp' && (canAttach || terminal) ? terminal ? 'Transcript' : 'Terminal' : '';
+  const manual = canAttach && !hub && !claude && !terminal;
+  let hint = '';
+  if (error) hint = 'Terminal attachment failed: ' + error;
+  else if (attach || manual) hint = 'Closing this terminal leaves the agent running.';
+  else if (!hub || terminal) hint = reason ? reason + ' ' + MESH_SETUP : 'Click this session or press Enter to open its terminal.';
+  const key = JSON.stringify([r.card?.id, r.sess?.sid, !!hub && r.live, switchTo, manual, !!error, hint]);
+  if (key !== MESH_PANE.actions) {
+    MESH_PANE.actions = key; meshActions(r, !!hub, switchTo, manual, !!error, hint);
+  }
+  meshFactsMode();
+}
+function meshActions(r: MeshRow, reachable: boolean, switchTo: string, manual: boolean, retry: boolean, hint: string): void {
+  const box = $('#mesh-detail')!, acts = $('.ex-btns', box)!, sid = r.sess?.sid;
   acts.replaceChildren(); $('.mesh-hint', box)?.remove();
   const B = (label: string, fn: () => unknown) => { const b = el('button', 'tb', label); b.onclick = fn; acts.append(b); return b; };
   if (r.card) B('Show on canvas', () => { const n = sid && S.nodes[sid]; if (n) { setView('canvas'); jumpNode(n); } });
   else if (sid) B('Add its card', () => { if (SESS[sid]) { setView('canvas'); adoptOrphan(SESS[sid]); } });
   B('Copy id', () => copyText(r.obs?.key || r.id));
   if (reachable && r.live) B('Kill session', () => { const n = MESH_PANE.node, L = live.$agents; if (n && L) confirmSessionKill(n, L); }).classList.add('mesh-kill');
-  if (reachable) return;
-  if (r.obs?.attach && INFO?.attach && r.live) {
-    const open = B('Open terminal', () => { open.disabled = true; meshMount(r, true); meshEnter(); }); open.disabled = MESH_PANE.attach;
-    box.append(el('div', 'mesh-hint', 'Closing this terminal leaves the agent running.'));
-  } else box.append(el('div', 'mesh-hint', 'Started in a terminal the hub cannot reach. Start a Claude background session, use tmux, or run in a Workbench shell or agent card to control it here.'));
+  if (switchTo) {
+    const button = B(switchTo, () => {
+      const focused = document.activeElement === button;
+      meshSetTerminal(switchTo === 'Terminal');
+      if (focused) $('.mesh-switch', acts)?.focus();
+    });
+    button.classList.add('mesh-switch'); button.title = 'Switch between Transcript and Terminal (t)';
+  }
+  if (manual) B('Open terminal', () => { meshSetTerminal(true); meshFocus(); });
+  if (retry) B('Retry', () => { meshUnmount('$agentsAttach'); MESH_PANE.attach = ''; meshRender(); meshFocus(); });
+  if (hint) $('.mesh-head', box)!.append(el('div', 'mesh-hint', hint));
+}
+function meshSetTerminal(terminal: boolean): void {
+  MESH_PANE.terminal = terminal; $('#v-agents')!.classList.add('detail-open'); meshRender();
 }
 function meshDetail(r: MeshRow): void {
-  meshClose(); MESH_PANE.row = r.id; MESH_PANE.key = meshPaneKey(r);
-  const box = $('#mesh-detail')!, back = el('button', 'tb mesh-back', '← Sessions');
-  back.onclick = meshBack; box.replaceChildren(back, el('h3', '', r.title), el('div', 'mesh-info'), el('div', 'ex-btns'));
-  meshActions(r); if (r.sess?.kind === 'acp' || r.sess?.kind === 'pty' && r.sess.host === INFO?.host) meshMount(r);
+  meshClose(); MESH_PANE.row = r.id;
+  const box = $('#mesh-detail')!, head = el('div', 'mesh-head'), back = el('button', 'tb mesh-back', '← Sessions'), toggle = el('button', 'tb mesh-disclose', 'Details'), info = el('div', 'mesh-info');
+  info.id = 'mesh-info'; toggle.setAttribute('aria-controls', info.id);
+  toggle.onclick = () => { MESH.facts = !MESH.facts; meshFactsMode(); meshViewer()?.fitNow?.(); };
+  back.onclick = meshBack; head.append(el('h3', '', r.title), el('div', 'ex-btns'), toggle, el('div', 'mesh-meta'), info); box.replaceChildren(back, head, el('div', 'mesh-viewers'));
 }
-function meshSelect(id: string): void {
-  MESH.open = id; $('#v-agents')!.classList.add('detail-open'); meshRender();
+function meshSelect(id: string, commit = false): void {
+  const all = meshRows(), flat = meshFlat(all), row = flat.find(r => r.id === id || r.sess?.sid === id);
+  if (row) {
+    id = row.id;
+    const expand = (rows: MeshRow[]): boolean => rows.some(r => {
+      if (r.id === id) return true;
+      if (!expand(r.kids)) return false;
+      MESH.collapsed.delete(r.id); return true;
+    });
+    expand(all);
+  }
+  MESH.open = id; $('#v-agents')!.classList.add('detail-open'); meshRender(commit);
   $(`#mesh-list .mesh-row[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'nearest' });
+  if (commit) {
+    const list = $('#mesh-list')!;
+    if (list.getClientRects().length) list.focus({ preventScroll: true });
+    else if (live.$agentsAttach) meshFocus();   // the single-pane layout hides the list
+  }
 }
-function meshBack(): void { $('#v-agents')!.classList.remove('detail-open'); $('#mesh-list')!.focus(); }
+function meshBack(): void {
+  $('#v-agents')!.classList.remove('detail-open');
+  if (MESH_PANE.committed || MESH_PANE.terminal) {
+    MESH_PANE.committed = false; MESH_PANE.terminal = false; meshRender();
+  }
+  $('#mesh-list')!.focus();
+}
 function meshMove(by: number): void {
   const rows = MESH_PANE.rows; if (!rows.length) return;
   const i = Math.max(0, rows.indexOf(MESH.open || '')); meshSelect(rows[clamp(i + by, 0, rows.length - 1)]); $('#mesh-list')!.focus();
   $('#v-agents')!.classList.remove('detail-open');
 }
-function meshEnter(): void { $('#v-agents')!.classList.add('detail-open'); const L = live.$agents; if (L?.ta) L.ta.focus(); else if (L?.term) { L.fitNow?.(); L.term.focus(); } else $('#mesh-detail button:not(.mesh-back)')?.focus(); }
+function meshFocus(): void {
+  const L = meshViewer();
+  if (L?.ta) L.ta.focus(); else if (L?.term) { L.fitNow?.(); L.term.focus(); }
+  else $('#mesh-detail button:not(.mesh-back)')?.focus();
+}
+function meshEnter(): void {
+  $('#v-agents')!.classList.add('detail-open'); meshRender(true); meshFocus();
+}
 addEventListener('pagehide', meshClose);
-$('#mesh-detail')!.addEventListener('keydown', e => { if (e.key === 'Escape' && (e.target as Element).matches('textarea')) { e.preventDefault(); meshBack(); } });
-function meshRender(): void {
+$('#mesh-detail')!.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && (e.target as Element).matches('.ag-in textarea')) { e.preventDefault(); meshBack(); }
+});
+function meshRender(commit = false): void {
   const box = $('#mesh-list');
   if (!box || VIEW !== 'agents') return;
-  const shown = (r: MeshRow): boolean => MESH.ended || r.live || r.id === MESH.open || r.kids.some(shown);
-  const rank = (r: MeshRow) => meshBad(r) || r.kids.some(meshBad) ? 0 : !r.live ? 3 : r.state === 'running' ? 1 : 2;   // waiting for you first, a list that does not reorder as sessions work
+  if (!document.body.classList.contains('pane-drag')) setMeshW(S.meshW);
+  const shown = (r: MeshRow): boolean => MESH.ended || r.live || r.id === MESH.open;
+  const all = meshRows(), flat = meshFlat(all), waiting = new Map<string, boolean>(), groups = new Map<string, MeshRow[]>();
+  const waits = (r: MeshRow): boolean => {
+    const cached = waiting.get(r.id); if (cached != null) return cached;
+    const value = meshBad(r) || r.kids.some(waits); waiting.set(r.id, value); return value;
+  };
+  const rank = (r: MeshRow) => waits(r) ? 0 : !r.live ? 3 : r.state === 'running' ? 1 : 2;
   const order = (a: MeshRow, b: MeshRow) => rank(a) - rank(b) || b.since - a.since || a.id.localeCompare(b.id);
-  const all = meshRows(), groups = new Map<string, MeshRow[]>();
-  for (const r of all.filter(shown).sort(order)) { const g = groups.get(r.project); if (g) g.push(r); else groups.set(r.project, [r]); }
-  const lines: { r: MeshRow; d: number; head?: string }[] = [];
-  const walk = (r: MeshRow, d: number, head?: string) => { lines.push({ r, d, head }); r.kids.filter(shown).sort(order).forEach(k => walk(k, d + 1)); };
+  for (const r of all.filter(shown).sort(order)) { const g = groups.get(r.repo); if (g) g.push(r); else groups.set(r.repo, [r]); }
+  const lines: { r: MeshRow; d: number; head?: string; groupRepo?: string }[] = [];
+  const walk = (r: MeshRow, d: number, head?: string, groupRepo = r.repo) => {
+    lines.push({ r, d, head, groupRepo });
+    if (!MESH.collapsed.has(r.id)) r.kids.filter(shown).sort(order).forEach(k => walk(k, d + 1, undefined, groupRepo));
+  };
   for (const [name, rows] of groups) rows.forEach((r, i) => walk(r, 0, i ? undefined : name));
   MESH_PANE.rows = lines.map(l => l.r.id);
-  if (!MESH.open || !lines.some(l => l.r.id === MESH.open)) MESH.open = lines[0]?.r.id || null;
-  const live = meshFlat(all).filter(r => r.live), bad = live.filter(meshBad).length, hosts = new Set(live.map(r => r.host)).size;
+  const visible = new Set(MESH_PANE.rows), present = new Set(flat.map(r => r.id));
+  if (!MESH.open || !visible.has(MESH.open)) MESH.open = lines[0]?.r.id || null;
+  const live = flat.filter(r => r.live), bad = live.filter(meshBad).length, hosts = new Set(live.map(r => r.host)).size;
   $('#mesh-sum')!.textContent = live.length ? `${live.length} session${live.length === 1 ? '' : 's'} on ${hosts} host${hosts === 1 ? '' : 's'}` + (bad ? ` · ${bad} waiting for you` : '') : 'No agent is running.';
-  const shape = lines.map(l => [l.head ?? '', l.r.id, l.d, l.r.card?.id || '', l.r.sess?.sid || ''].join(' ')).join('\n');   // selection and changing texts do not replace rows
-  if (shape !== MESH.shape) {
-    MESH.shape = shape; box.replaceChildren();
-    for (const l of lines) {
-      if (l.head != null) box.append(el('div', 'mesh-group', l.head));
-      box.append(meshRowEl(l.r, l.d));
+  // Reconcile by id even when shape/order/actions change: activity never replaces an existing row.
+  const elements: HTMLElement[] = [];
+  for (const l of lines) {
+    if (l.head != null) {
+      let group = MESH_GROUPS.get(l.head); if (!group) { group = el('div', 'mesh-group', l.head); group.title = l.head; MESH_GROUPS.set(l.head, group); }
+      elements.push(group);
     }
-    if (!lines.length) box.append(el('p', 'muted', 'A session shows here when a harness on any host of the mesh reports to this hub, or when an agent card starts.'));
+    let row = MESH_ROWS.get(l.r.id); if (!row) { row = meshRowEl(l.r); MESH_ROWS.set(l.r.id, row); }
+    elements.push(row);
   }
+  const retained = new Set(elements);
+  for (const child of Array.from(box.children)) if (!retained.has(child as HTMLElement)) child.remove();
+  elements.forEach((e, i) => { if (box.children[i] !== e) box.insertBefore(e, box.children[i] || null); });
+  for (const id of MESH_ROWS.keys()) if (!present.has(id)) { MESH_ROWS.delete(id); MESH.collapsed.delete(id); }
+  for (const name of MESH_GROUPS.keys()) if (!groups.has(name)) MESH_GROUPS.delete(name);
+  if (!lines.length && !box.children.length) box.append(el('p', 'muted', 'A session shows here when a harness on any host of the mesh reports to this hub, or when an agent card starts.'));
   const selected = lines.find(l => l.r.id === MESH.open)?.r;
   if (selected) {
-    if (meshPaneKey(selected) !== MESH_PANE.key) meshDetail(selected);
-    else if (meshActionKey(selected) !== MESH_PANE.actions) meshActions(selected);
-    const title = $('#mesh-detail h3'); if (title && title.textContent !== selected.title) title.textContent = selected.title;
+    if (selected.id !== MESH_PANE.row) meshDetail(selected);
+    if (commit) MESH_PANE.committed = true;
+    meshReconcile(selected);
+    meshHeader(selected);
     meshInfo($('#mesh-detail .mesh-info')!, selected);
   } else { meshClose(); $('#mesh-detail')!.replaceChildren(el('p', 'muted', 'Select a session.')); $('#v-agents')!.classList.remove('detail-open'); }
-  const rows = $$('.mesh-row', box) as HTMLElement[];
-  lines.forEach((l, i) => meshFill(rows[i], l.r, l.d));
+  lines.forEach(l => meshFill(MESH_ROWS.get(l.r.id)!, l.r, l.d, l.groupRepo, visible));
 }
 // Open the Agents view, selecting the named session without adding a card.
 function meshOpen(id?: string | null): void {
@@ -4335,7 +4749,7 @@ function meshOpen(id?: string | null): void {
 // The graph follows the mesh: a session that starts or ends moves the layout, a change of state or title only redraws.
 function graphMesh(): void {
   if (VIEW !== 'graph' || !INFO?.mesh || !($('#g-mesh') as HTMLInputElement).checked) return;
-  const rows = meshFlat().filter(r => r.live), topo = rows.map(r => [r.id, r.host, r.project, r.card?.id || ''].join(' ')).join('\n'), sig = topo + '\n' + rows.map(r => r.state + ' ' + r.title).join('\n');
+  const rows = meshFlat().filter(r => r.live), topo = rows.map(r => [r.id, r.host, r.repo, r.parent || '', r.card?.id || ''].join(' ')).join('\n'), sig = topo + '\n' + rows.map(r => r.state + ' ' + r.title).join('\n');
   const sel = rows.find(r => 'mesh:' + r.id === G.sel), pre = sel && $('#g-card pre');
   if (sig !== MESH.graph) { const moved = topo !== MESH.topo; MESH.graph = sig; MESH.topo = topo; graphRebuild(moved); if (G.sel && (moved || G.sel.startsWith('mesh:'))) graphSelect(G.sel); }   // the open card names its neighbours
   else if (sel && pre && pre.textContent !== meshText(sel)) pre.textContent = meshText(sel);   // its text in place: the card's buttons stay under the pointer
@@ -4343,7 +4757,7 @@ function graphMesh(): void {
 // A session in a few lines, for its card in the graph.
 function meshText(r: MeshRow): string { const o = r.obs; return [meshDoing(r), o?.cwd || r.sess?.cwd, o?.lastPrompt && '› ' + o.lastPrompt, ...(o?.tail.slice(-5).map(t => hhmm(t.at) + ' ' + t.kind.replace(/_/g, ' ') + (t.text ? ' ' + t.text : '')) || [])].filter(Boolean).join('\n'); }
 $('#mesh-ended')!.onchange = e => { MESH.ended = (e.target as HTMLInputElement).checked; meshRender(); };
-setInterval(meshRender, 30000);   // the ages
+setInterval(() => meshRender(), 30000);   // the ages
 cmd('Agents: every session', () => meshOpen(), '@view.agents');
 
 // ------------------------------------------------------------------ chrome: docks, theme
@@ -4547,7 +4961,7 @@ function graphData() {
     if (!r.live) return r.kids.forEach(k => mesh(k));
     const id = 'mesh:' + r.id; add(id, r.title.slice(0, 40), 'session', null)!.state = r.state;
     if (up) link(up, id, 'spawn');
-    else { link(add('host:' + r.host, '@' + r.host, 'host', null)!.id, id, 'mesh'); link(add('proj:' + r.project, r.project, 'project', null)!.id, id, 'mesh'); if (r.card) link(r.card.id, id, 'mesh'); }
+    else { link(add('host:' + r.host, '@' + r.host, 'host', null)!.id, id, 'mesh'); link(add('proj:' + r.repo, r.repo, 'project', null)!.id, id, 'mesh'); if (r.card) link(r.card.id, id, 'mesh'); }
     r.kids.forEach(k => mesh(k, id));
   };
   if (INFO?.mesh && ($('#g-mesh') as HTMLInputElement).checked) meshRows().forEach(r => mesh(r));
@@ -4995,9 +5409,27 @@ function setPaneW(w: number, save?: boolean) {
   if (save && S) { S.paneW = w; dirty(); }
   if (VIEW === 'graph') { clearTimeout((setPaneW as PaneWidthFn).t); (setPaneW as PaneWidthFn).t = setTimeout(graphDraw, 60); }
 }
+function setMeshW(w?: number, save = false): void {
+  const box = $('#v-agents')!, width = box.getBoundingClientRect().width; if (width < 700) return;
+  const max = Math.max(200, Math.floor(width - 366));
+  w = Math.round(clamp(Number.isFinite(w) ? w! : Math.max(260, width * .34), 200, max));
+  box.style.setProperty('--mesh-w', w + 'px');
+  const grip = $('#mesh-grip')!;
+  grip.setAttribute('aria-valuemin', '200'); grip.setAttribute('aria-valuemax', String(max)); grip.setAttribute('aria-valuenow', String(w));
+  if (save) { S.meshW = w; dirty(); }
+  meshViewer()?.fitNow?.();
+}
 function wirePaneGrip() {
   wireGrip($('#side-grip')!, ev => innerWidth - ev.clientX, setPaneW, PANE_W);
   wireGrip($('#tree-grip')!, ev => ev.clientX - $('#tree-pane')!.getBoundingClientRect().left, setTreeW, TREE_W);
+  const grip = $('#mesh-grip')!;
+  wireGrip(grip, ev => ev.clientX - $('#v-agents')!.getBoundingClientRect().left, setMeshW, NaN);
+  grip.addEventListener('keydown', e => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault(); e.stopPropagation();
+    setMeshW($('.mesh-side')!.getBoundingClientRect().width + (e.key === 'ArrowLeft' ? -16 : 16), true);
+  });
+  new ResizeObserver(() => { if (!document.body.classList.contains('pane-drag')) setMeshW(S.meshW); }).observe($('#v-agents')!);
   $('#pick-chip [data-act=compact]')!.onclick = () => compact('selection');
   $('#pick-chip [data-act=clear]')!.onclick = () => pickClear();
   const wu = $('#ws-up'); if (wu) wu.onclick = () => wsLeave();
@@ -5023,6 +5455,18 @@ AGENT_TOOLS.push({
     if (!DAEMON) throw new Error('PDFs on the host need a Workbench server');
     if (!/\.pdf$/i.test(str(file))) throw new Error('not a .pdf file: ' + file);
     return pathOf(pdfFromPath(str(file)).id);
+  },
+}, {
+  name: 'open_file', description: 'Open a file on this host in an Edwin frame, or focus its existing frame. Use an absolute path or ~/ for the home directory. An optional line moves point to that line (from 1). Answers the file and line.',
+  inputSchema: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'integer', minimum: 1 } }, required: ['file'] },
+  run: async ({ file, line }: { file: string; line?: number }) => {
+    if (typeof file !== 'string' || !/^(\/|~(?:\/|$))/.test(file)) throw new Error('file must be an absolute path or start with ~/');
+    if (line !== undefined && (!Number.isInteger(line) || line < 1)) throw new Error('line must be a positive integer');
+    const c = viewCenterWorld();
+    const n = await frFileOpen(file, freeSpot(c.x - 210, c.y - 150, 420, 300), line, message => { throw new Error(message); });
+    if (!n || !(await frWhenWritable(n))) throw new Error(frDown() ? 'edwind is not running' : `Could not open ${file} in Edwin`);
+    const doc = pageState(n)!.doc;
+    return { file, line: line === undefined ? doc.lineAt(pagePoint(n)).number : Math.min(line, doc.lines) };
   },
 });
 AGENT_TOOLS.push({
@@ -5967,6 +6411,37 @@ function frPromptKeymap() {
   }
   L.set('wb-agent-prompt-mode-map', map); frPromptKeys = true;
 }
+let frTranscriptKeys = false;
+function frTranscriptKeymap() {
+  if (frTranscriptKeys) return;
+  const Ed = FR.Ed!, L = FR.L!, map = new Ed.Keymap('wb-agent-transcript-mode-map'), name = 'wb-agent-transcript-edit-prompt';
+  L.CMD(name, '', '', 'Edit an unsent prompt for this agent.', () => {
+    const b = ACP_READERS.get(L.call('current-buffer') as EdwinBuffer);
+    if (b) setTimeout(() => b.editPrompt());
+    return false;
+  });
+  L.call('define-key', [map, 'C-c C-e', L.intern(name)]);
+  L.set('wb-agent-transcript-mode-map', map);
+  for (const cmd of ['save-buffer', 'write-file']) L.call('advice-add', [L.intern(cmd), L.intern(':before'), () => {
+    if (ACP_READERS.has(L.call('current-buffer') as EdwinBuffer)) throw new Error('Agent transcripts do not visit files');
+    return false;
+  }]);
+  L.call('add-hook!', [L.intern('kill-buffer-hook'), () => {
+    ACP_READERS.get(L.call('current-buffer') as EdwinBuffer)?.schedule();
+    return false;
+  }]);
+  const post = Ed.hooks.postCommand;
+  Ed.hooks.postCommand = (cmd, b, failed) => {
+    // An async editor command can straddle a journal paint and mistake it for its own edit.
+    const reader = ACP_READERS.get(b);
+    if (reader) {
+      b.undo.length = b.redo.length = 0; b.pendingUndo = null;
+      if (reader.transcript?.frame.buffer !== b) reader.schedule();
+    }
+    post?.(cmd, b, failed);
+  };
+  frTranscriptKeys = true;
+}
 // This browser profile's device id (R9.16), made once; the per-tab client id lives in sessionStorage so a reload keeps it (R7.16).
 function deviceId() { let d = store.get('wb-device'); if (!d) { d = uid('d'); store.set('wb-device', d); } return d; }
 const frSession = { get(k: string): string | null { try { return sessionStorage.getItem(k); } catch { return null; } }, set(k: string, v: string) { try { sessionStorage.setItem(k, v); } catch {} }, del(k: string) { try { sessionStorage.removeItem(k); } catch {} } };
@@ -6044,7 +6519,7 @@ function frStateChanged(s: string) {
   if (FR.online) { const w = FR.waiters.splice(0); for (const r of w) r(); }
   else if (FR.tried) frDownNow();
   frOffRender();
-  for (const b of ACP_COMPOSERS) b.editorAvailability();
+  for (const b of ACP_COMPOSERS) { b.editorAvailability(); b.mountTranscript(); }
   document.body.classList.toggle('edit-off', FR.ready && !FR.online);
   statusRender();
 }
@@ -6218,6 +6693,7 @@ function frLeave(f: EdwinFrame | null | undefined) {
   const id = frame ? FR.byFrame.get(frame) : null;
   if (frame) frame.blur();
   if (document.activeElement && document.activeElement !== document.body) (document.activeElement as HTMLElement).blur();
+  if (VIEW === 'agents' && frame?.root.matches('.ag-reader')) { meshBack(); return; }
   if (id && live[id]) activate(id);
 }
 // ---- snapshots (Q8: the raw first 12 lines) and the node's cached head for a replica that is not open yet (R9.6)
@@ -6413,15 +6889,21 @@ async function frOpenToday() {
 // ---- notes and files open as pages (noteOpen, ghostOpen): edwind's visit-id names the id it would visit FILE under, or
 // refuses it (the refusal list, not UTF-8 text, missing) or answers read-only (outside its writable paths, over 32 MiB).
 // Then, and while edwind is down, nothing opens and a toast says why (the host has no other editor for a card).
-// LINE > 1 puts the frame's point at the start of that line.
+// A positive LINE puts the frame's point at the start of that line; zero leaves it where Edwin puts it.
 // Only the first connection attempt is waited for (3 s at most); once it was made or failed, edwind down falls back at once.
-async function frFileOpen(file: string, props: { x?: number; y?: number; w?: number; h?: number }, line: number): Promise<PageNode | null> {
-  if (!FR.tried && !FR.failed) await Promise.race([frWhenReady(), new Promise(r => setTimeout(r, 3000))]);
+async function frFileOpen(file: string, props: { x?: number; y?: number; w?: number; h?: number }, line = 0, refuse = (message: string) => toast(message, 6000)): Promise<PageNode | null> {
+  if (FR.on && !FR.tried && !FR.failed) await Promise.race([frWhenReady(), new Promise(r => setTimeout(r, 3000))]);
   const r = FR.online ? await FR.Ed!.sync.call({ cmd: 'visit-id', args: [file], ctx: {} }) : null;
   const id = r && !r.error && r.value && !r.value.readOnly ? r.value.buf : null;
-  if (!id) { toast(`${file} does not open as a page: ${!r ? 'edwind is not running' : r.error ? (r.error.message || r.error) : r.value?.readOnly ? 'edwind has it read-only' : 'edwind refused it'}.`, 6000); return null; }
+  if (!id) {
+    const error = r?.error;
+    const why = !r ? 'edwind is not running' : error
+      ? error.condition === 'no_buffer' ? 'file not found' : /: (EACCES|EPERM)$/.test(error.report) ? 'file is not readable' : error.report || error.message || 'edwind refused it'
+      : r.value?.readOnly ? `edwind has it read-only (${r.value.readOnly})` : 'edwind refused it';
+    refuse(`${file} does not open as a page: ${why}.`); return null;
+  }
   const n = nodeList().find(m => m.kind === 'buffer' && m.buf && frBufNow(m.buf) === id) as PageNode | undefined || addNode({ kind: 'buffer', name: clean(id.replace(/^.*\//, '').replace(/\.(md|org)$/, '')), w: 420, h: 300, ...props, buf: id } as AddNodeArg) as PageNode;
-  const at = line > 1 ? (f: EdwinFrame, b: EdwinBuffer) => { const d = new TextDoc(b.text); f.setPoint(d.line(Math.min(line, d.lines)).from); } : undefined;
+  const at = line > 0 ? (f: EdwinFrame, b: EdwinBuffer) => { const d = pageState(n)?.doc || new TextDoc(b.text); f.setPoint(d.line(Math.min(line, d.lines)).from); } : undefined;
   jumpNode(n, 1, () => frFocus(n, at));
   return n;
 }
@@ -9148,6 +9630,7 @@ const KC: Record<string, KeyCmdFn> = {
   },
   ...Object.fromEntries(VIEWS.map(v => ['view.' + v, () => setView(v)])),
   'agents.next': () => meshMove(1), 'agents.prev': () => meshMove(-1), 'agents.enter': () => meshEnter(), 'agents.back': () => meshBack(),
+  'agents.source': () => $('#mesh-detail .mesh-switch')?.click(),
   ...Object.fromEntries([0, 1, 2, 3, 4, 5, 6, 7, 8, 9].flatMap(i => [['desk.' + i, () => deskGo(i)], ['desk.send.' + i, () => deskSend(i)],
     ['desk.follow.' + i, () => deskSend(i, { follow: true })], ['desk.also.' + i, () => deskSend(i, { keep: true })]])),
   'desk.prev': () => deskBack(), 'desk.new': () => deskNew(), 'desk.query': () => deskQueryAsk(), 'desk.rename': () => deskRename(), 'desk.pin': () => deskPin(),
@@ -9966,7 +10449,7 @@ function noteOpen(r: { path: string; line: number; board?: PageNode }) {
   if (r.board) { edOpen(r.board, r.line > 1 ? r.line : undefined); return r.board; }
   if (!DAEMON) { toast('That note is not on the board.'); return null; }
   if (!FR.on) { toast('Notes open as pages, which need edwind.'); return null; }
-  const c = viewCenterWorld(); return frFileOpen(r.path, freeSpot(c.x - 210, c.y - 150, 420, 300), r.line);   // a page when edwind edits it
+  const c = viewCenterWorld(); return frFileOpen(r.path, freeSpot(c.x - 210, c.y - 150, 420, 300), r.line > 1 ? r.line : 0);   // a page when edwind edits it
 }
 // go to an address: board nodes on the canvas, everything else in the navigator
 function goAddr(addr: string, push = true): boolean {

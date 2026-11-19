@@ -1,14 +1,44 @@
 //! Strict, non-coercing validation of ACP v1 session configuration option lists.
 
+use std::io::{self, Write};
+
 use serde_json::Value;
+use wb_proto::limits::{ACP_CONFIG_OPTIONS_BYTES, ACP_CONFIG_OPTIONS_MAX};
 
 /// Validates the complete list before it can replace the last known good state.
 /// ACP 1.11.0 permits either flat choices or groups, not a mixture of both.
 /// Unlike the schema's tolerant deserializer, invalid items are never discarded.
 pub(super) fn valid_options(value: &Value) -> bool {
-    value
+    within_limits(value)
+        && value
+            .as_array()
+            .is_some_and(|options| options.iter().all(valid_option))
+}
+
+pub(super) fn within_limits(value: &Value) -> bool {
+    if value
         .as_array()
-        .is_some_and(|options| options.iter().all(valid_option))
+        .is_some_and(|options| options.len() > ACP_CONFIG_OPTIONS_MAX)
+    {
+        return false;
+    }
+    serde_json::to_writer(&mut Budget(ACP_CONFIG_OPTIONS_BYTES), value).is_ok()
+}
+
+struct Budget(usize);
+
+impl Write for Budget {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
+            .ok_or(io::ErrorKind::FileTooLarge)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn valid_option(option: &Value) -> bool {
@@ -83,6 +113,41 @@ mod tests {
     fn assert_invalid(option: Value) {
         let options = json!([option]);
         assert!(!valid_options(&options), "accepted {options}");
+    }
+
+    #[test]
+    fn offerings_are_bounded_by_count_and_serialized_bytes() {
+        let mut options = json!(
+            (0..ACP_CONFIG_OPTIONS_MAX)
+                .map(|id| {
+                    let mut option = boolean();
+                    option["id"] = json!(id.to_string());
+                    option
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(valid_options(&options));
+        options.as_array_mut().unwrap().push(boolean());
+        assert!(!valid_options(&options));
+
+        let mut options = json!([boolean()]);
+        options[0]["description"] = json!("");
+        let overhead = serde_json::to_vec(&options).unwrap().len();
+        // Serialized bytes, not characters: quotes escape and UTF-8 stays multi-byte.
+        let prefix = "\"\nø";
+        let escaped = serde_json::to_string(prefix).unwrap().len() - 2;
+        options[0]["description"] = json!(format!(
+            "{prefix}{}",
+            "x".repeat(ACP_CONFIG_OPTIONS_BYTES - overhead - escaped)
+        ));
+        assert_eq!(
+            serde_json::to_vec(&options).unwrap().len(),
+            ACP_CONFIG_OPTIONS_BYTES
+        );
+        assert!(valid_options(&options));
+        let description = options[0]["description"].as_str().unwrap().to_owned() + "x";
+        options[0]["description"] = json!(description);
+        assert!(!valid_options(&options));
     }
 
     #[test]

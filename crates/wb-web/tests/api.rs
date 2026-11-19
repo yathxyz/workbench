@@ -611,6 +611,57 @@ async fn a_post_starts_an_agent() {
 }
 
 #[tokio::test]
+async fn startup_configuration_requires_the_hubs_advertised_support() {
+    let api = Api::start_with(Hello {
+        acp_config: None,
+        ..Hello::default()
+    })
+    .await;
+    let before = api.hub.requests().len();
+    let res = api
+        .req("POST", "/v1/sessions", OWNER)
+        .body(
+            json!({"agent": "claude", "cwd": "/x", "sid": "old",
+                     "config": {"model": "large"}})
+            .to_string(),
+        )
+        .send()
+        .await;
+    assert_eq!(
+        (res.status, res.json()),
+        (
+            400,
+            json!({
+                "error": "hub does not support session configuration"
+            })
+        )
+    );
+    assert!(
+        api.hub
+            .requests()
+            .into_iter()
+            .skip(before)
+            .all(|(_, r)| matches!(r, HubRequest::Hello { .. }))
+    );
+
+    for config in [None, Some(json!({}))] {
+        let mut body = json!({"agent": "claude", "cwd": "/x", "sid": "old"});
+        if let Some(config) = config {
+            body["config"] = config;
+        }
+        let (_, res) = api
+            .answered(
+                api.req("POST", "/v1/sessions", OWNER)
+                    .body(body.to_string()),
+                |rid| HubMessage::ok(rid, &open_reply("old", "testhost", true)),
+            )
+            .await;
+        assert_eq!(res.status, 201);
+        assert_eq!(res.json()["configErrors"], json!([]));
+    }
+}
+
+#[tokio::test]
 async fn a_hub_that_lists_no_hosts_is_never_asked_for_one() {
     let api = Api::start().await;
     let body = json!({"agent": "claude", "cwd": "/x", "host": "laptop"}).to_string();

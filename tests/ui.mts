@@ -38,7 +38,10 @@ const until = async <T,>(f: () => T | PromiseLike<T>, ms = 10000, step = 100): P
 const browser = await chromium.launch();
 process.on('uncaughtException', e => { console.log('UNCAUGHT', e); process.exit(2); });   // the harness stops when our end of its stdin closes
 const errors: string[] = [];
-const watchErrors = (p: import('playwright-core').Page): void => { p.on('pageerror', e => errors.push(String(e.stack || e))); p.on('console', m => { if (m.type() === 'error') errors.push('console: ' + m.text()); }); };
+const watchErrors = (p: import('playwright-core').Page): void => {
+  p.on('pageerror', e => errors.push(String(e.stack || e)));
+  p.on('console', m => { if (m.type() === 'error') { const loc = m.location(); errors.push(`console: ${m.text()}\n    at ${loc.url || p.url()}:${loc.lineNumber + 1}:${loc.columnNumber + 1}`); } });
+};
 async function page(url: string, w = 1500, h = 950): Promise<import('playwright-core').Page> {
   const p = await browser.newPage({ viewport: { width: w, height: h } });
   watchErrors(p);
@@ -2914,11 +2917,54 @@ await section('frames', async () => {
   await A2.evaluate((id: string) => { const C = window.__canvas; for (const n of Object.values<BoardNode & { block?: ArtifactNode['block'] }>(C.S.nodes)) if (n.block?.page === id) C.removeNode(n.id); C.removeNode(id); }, blk);
   await settled(A2); await settled(B2);
 
+  // N79: a host process opens a file the same way as a click, through the leader tab.
+  const openFile = (input: AgentToolInput) => {
+    const { promise, resolve } = Promise.withResolvers<{ code: number | null; out: string; err: string }>();
+    const c = spawn('wb', ['open_file', '--socket', H.webSocket, '--json', JSON.stringify(input)]);
+    let out = '', err = '';
+    c.stdout.on('data', d => { out += d; }); c.stderr.on('data', d => { err += d; });
+    c.on('error', e => resolve({ code: -1, out, err: String(e) })); c.on('close', code => resolve({ code, out, err }));
+    return promise;
+  };
+  const name79 = 'n79-open-file.md', rel79 = '~/' + name79;
+  const home79 = (await (await api('/api/info')).json()).home as string, abs79 = path.join(home79, name79);
+  fs.writeFileSync(abs79, 'first\nsecond\nthird\nfourth');
+  fs.writeFileSync(noteFile('bin.md'), Buffer.from([0xff, 0xfe, 0x00, 0x41]));
+  fs.mkdirSync(path.join(home79, '.ssh'), { recursive: true });
+  fs.writeFileSync(path.join(home79, '.ssh', name79), 'refused');
+  await A2.bringToFront(); await A2.evaluate(() => dispatchEvent(new Event('focus'))); await sleep(300);
+  const frame79 = () => A2.evaluate((buf: string) => Object.values<BoardNode>(window.__canvas.S.nodes).flatMap(n => {
+    if (n.kind !== 'buffer' || n.buf !== buf) return [];
+    const l = window.__canvas.live[n.id], frame = l?.frame;
+    return [{ id: n.id, focused: frame?.focused, point: frame?.point(), frames: l?.el?.querySelectorAll('.edwin-frame').length }];
+  }), rel79);
+  const point79 = (pt: number) => until(async () => { const frames = await frame79(); return frames.some(f => f.focused && f.point === pt) ? frames : null; }, 10000);
+  const result79 = (r: Awaited<ReturnType<typeof openFile>>, file: string, line: number) => r.code === 0 && r.out.trim() === JSON.stringify({ file, line });
+  const open79 = await openFile({ file: abs79, line: 3 }), at3 = await point79('first\nsecond\n'.length);
+  check('N79: wb open_file over web.sock opens the file in a focused Edwin frame at line 3', result79(open79, abs79, 3) && at3?.length === 1 && at3[0].frames === 1, JSON.stringify({ open79, at3 }));
+  const reopen79 = await openFile({ file: rel79, line: 1 }), at1 = await point79(0);
+  check('N79: opening the same file via ~/ moves point to line 1 without a second frame', result79(reopen79, rel79, 1) && at1?.length === 1 && at1[0].id === at3?.[0].id && at1[0].frames === 1, JSON.stringify({ reopen79, at1 }));
+  const past79 = await openFile({ file: rel79, line: 99 }), atEnd = await point79('first\nsecond\nthird\n'.length);
+  await leave(A2);
+  const keep79 = await openFile({ file: rel79 }), kept = await point79('first\nsecond\nthird\n'.length);
+  check('N79: open_file reports the clamped line and leaves point where a click would if line is omitted', result79(past79, rel79, 4) && atEnd?.length === 1 && result79(keep79, rel79, 4) && kept?.length === 1, JSON.stringify({ past79, atEnd, keep79, kept }));
+  const refuse79 = async (input: AgentToolInput, why: RegExp) => {
+    const r = await openFile(input);
+    check(`N79: open_file refuses ${JSON.stringify(input)} with ${why.source}`, r.code === 1 && why.test(r.err), JSON.stringify(r));
+  };
+  await refuse79({ file: path.join(home79, 'n79-missing.md') }, /file not found/);
+  await refuse79({ file: noteFile('bin.md') }, /not UTF-8 text/);
+  await refuse79({ file: '~/.ssh/' + name79 }, /: refused/);
+  await refuse79({ file: name79 }, /absolute path/);
+  for (const line of [0, -1, 1.5, '2', null]) await refuse79({ file: abs79, line }, /line must be a positive integer/);
+  await leave(A2);
+  await A2.evaluate((ids: string[]) => { for (const id of ids) window.__canvas.removeNode(id); }, (await frame79()).map(f => f.id));
+  await settled(A2); await settled(B2);
+
   // (j) notes and files open as Edwin pages (noteOpen, ghostOpen); the frame starts at the note's line. A file edwind
   // will not edit (here: not UTF-8 text) opens nothing: no card, and a toast says why.
   fs.writeFileSync(noteFile('open-me.md'), '# open me\n\nsecond body line\nthird');
   fs.writeFileSync(noteFile('ghost-me.md'), '# ghost me\n');
-  fs.writeFileSync(noteFile('bin.md'), Buffer.from([0xff, 0xfe, 0x00, 0x41]));
   await A2.bringToFront();
   const opened = await A2.evaluate(async () => { const n = await window.__canvas.noteOpen({ path: 'open-me.md', line: 3 }); return n && { id: n.id, kind: n.kind, buf: n.buf || null }; });
   const openPt = opened && await until(() => A2.evaluate((id: string) => { const L = window.__canvas.live[id]; return L?.frame?.focused ? L.frame.point() : null; }, opened.id), 10000);
@@ -2978,6 +3024,8 @@ await section('frames', async () => {
   // A note opened while edwind is down says so at once (no wait for a connection that was up before) and opens nothing.
   const downOpen = await A2.evaluate(async () => { const t0 = performance.now(); const n = await window.__canvas.noteOpen({ path: 'ghost-me.md' }); return { opened: !!n, ms: performance.now() - t0, toast: document.querySelector('#toast')?.textContent || '' }; });
   check('frames: with edwind down a note opens nothing at once and the toast says edwind is not running', !downOpen.opened && downOpen.ms < 1000 && /edwind is not running/.test(downOpen.toast), JSON.stringify(downOpen));
+  await A2.evaluate(() => dispatchEvent(new Event('focus'))); await sleep(300);
+  await refuse79({ file: abs79 }, /edwind is not running/);
   check('frames: with edwind down the page card shows the notice that editing is off, the mode line says offline and typing still goes into the page (unacked)', st.stopped?.event === 'stopped' && st.offA && st.offB && st.notice?.shown && !st.notice.hidden && st.notice.text === 'Editing is off: edwind is not running' && st.noticeB?.shown && /while-down$/.test(st.text) && /•/.test(st.sync) && /⚠ offline/.test(st.sync) && st.body && !st.status?.up && st.info.edit === true && st.info.editUp === false, JSON.stringify({ ...st, text: st.text.slice(-30), info: { edit: st.info.edit, editUp: st.info.editUp } }));
 
   // (c) edwind back: both tabs reconnect, the unacked edit is acked, reaches the other tab and the file on disk
@@ -3706,7 +3754,7 @@ await section('N77', async () => {
       C.meshOpen(); await new Promise(r => setTimeout(r, 400));
       out.pane = { view: C.S.view, hidden: document.querySelector<HTMLElement>('#v-agents')!.hidden, sum: document.querySelector('#mesh-sum')!.textContent };
       out.groups = $$('#mesh-list .mesh-group').map(e => e.textContent).filter(t => t === 'beta' || t === 'alpha');
-      out.rows = $$('#mesh-list .mesh-row').filter(e => !!C.OBS[e.dataset.id!]).map(e => ({ id: e.dataset.id, cls: e.className, title: e.querySelector('b')!.textContent, sub: e.querySelector('.mesh-sub')!.textContent, d: e.style.getPropertyValue('--d'), card: !!e.querySelector('button') }));
+      out.rows = $$('#mesh-list .mesh-row').filter(e => !!C.OBS[e.dataset.id!]).map(e => ({ id: e.dataset.id, cls: e.className, title: e.querySelector('b')!.textContent, sub: e.querySelector('.mesh-sub')!.textContent, d: e.style.getPropertyValue('--d'), card: !!e.querySelector('.mesh-canvas:not([hidden])') }));
       out.ids = ids;
       document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${ids.a2}"]`)!.click();
       out.detail = document.querySelector('#mesh-detail')?.textContent; out.sameRow = document.querySelector('#mesh-list .mesh-row.on')?.getAttribute('data-id');
@@ -3767,7 +3815,8 @@ await section('N77', async () => {
 // N78 (F-A48): real, externally started ACP/PTY sessions and observed attachments, never implicit board cards.
 await section('N78', async () => {
   if (!STUB) return skip('N78', 'no `stub` agent (wb-fake-acp) in /api/info.agents');
-  const D = await dpage(), owner = await dpage(), sid = 'attach_n78_api';
+  const { P: D, g } = await gatedPage(), owner = await dpage(), sid = 'attach_n78_api';
+  record(D);
   let externalPty: string | undefined, owned: string | undefined, ownedPty: string | undefined, unloadPage: TailPage | undefined;
   const model = 'claude-opus-4-1-20250805', cwd = fs.mkdtempSync(path.join(TMP, 'n78-project-'));
   const meshApi = (url: string, method = 'GET', body?: Record<string, unknown>) => fetch(H.api + '/v1' + url, {
@@ -3780,14 +3829,44 @@ await section('N78', async () => {
     ws.onmessage = e => { const m = JSON.parse(e.data); if (m.t === 'hello') { ws.close(); resolve(); } else if (m.t === 'error') { ws.close(); reject(new Error(m.error)); } };
     ws.onerror = () => reject(new Error('external PTY open failed'));
   }), id);
-  const report = async (who: 'near' | 'far', session: string, more: Record<string, unknown> = {}, kind = 'prompt') =>
+  const report = async (who: 'near' | 'far', session: string, more: Record<string, unknown> = {}, kind = 'prompt', text = 'n78 observed prompt') =>
     (await fetch(H.api + '/v1/events', { method: 'POST', headers: { Authorization: 'Bearer ' + fs.readFileSync(H.apiTokenFiles[who], 'utf8').trim(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ harness: 'pi', payload: { session_id: session, kind, cwd, model, permission_mode: 'default', text: 'n78 observed prompt' }, ...more }) })).status;
+      body: JSON.stringify({ harness: 'pi', payload: { session_id: session, kind, cwd, model, permission_mode: 'default', text }, ...more }) })).status;
+  const reportClaude = (session: string, more: Record<string, unknown> = {}, hook = 'UserPromptSubmit') =>
+    report('near', session, { harness: 'claude', payload: { session_id: session, hook_event_name: hook, cwd, model, prompt: 'n78 Claude prompt', tool_name: 'Edit' }, ...more });
   const row = (id: string) => D.locator(`#mesh-list .mesh-row[data-id="${id}"]`);
   const info = () => D.evaluate(() => Object.fromEntries([...document.querySelectorAll('#mesh-detail .mesh-info .mesh-kv')].map(e => [e.querySelector('span')!.textContent!, e.querySelector('code')!.textContent!])));
   const nodes = () => D.evaluate(() => Object.keys(window.__canvas.S.nodes).sort().join());
   const liveText = () => termText(D, '$agents');
+  const attachSid = (P = D) => P.evaluate((): string => window.__canvas.live.$agentsAttach?.backend.n.id || '');
+  const attachText = (P = D) => termText(P, '$agentsAttach');
+  const terminalFocused = () => D.evaluate(() => !!document.activeElement?.closest('#mesh-detail .xterm'));
+  const attachOpens = () => ptyOf(D).filter(w => w.open?.spawn && w.open.attach);
+  const forgot = (sid: string) => until(async () => !(await sessions()).some(s => s.sid === sid), 15000);
+  const attachButton = () => D.getByRole('button', { name: 'Open terminal', exact: true });
+  const switchButton = (name: 'Transcript' | 'Terminal') => D.getByRole('button', { name, exact: true });
   const composer = '#mesh-detail .mesh-live .ag-in textarea';
+  const reader = '#mesh-detail .ag-reader', log = '#mesh-detail .ag-log';
+  const readerText = () => D.evaluate(() => window.__canvas.live.$agents?.backend.transcript?.buf.text as string | undefined);
+  const journalText = async () => await readerText() ?? await D.locator(log).textContent();
+  const readerState = () => D.evaluate(async () => {
+    await new Promise<void>(r => requestAnimationFrame(() => r()));
+    const { buf, frame } = window.__canvas.live.$agents.backend.transcript as { buf: EdwinBuffer; frame: EdwinFrame };
+    return { point: frame.point(), mark: buf.mark, end: buf.rope.length, undo: buf.undo.length,
+      first: frame.root.querySelector('.ln')?.textContent, focused: frame.root.contains(document.activeElement) };
+  });
+  const readUntil = (text: string) => D.waitForFunction(text => window.__canvas.live.$agents?.backend.transcript?.buf.text.includes(text), text);
+  // Deliver real hub frames through one selected event. This lets the reader move between chunks, not race the agent.
+  const releaseThrough = async (test: (ev: AcpEvOf<'update'>) => boolean) => {
+    const hit = await until(() => {
+      for (const s of g.socks) {
+        const i = s.buf.findIndex(m => { const f = JSON.parse(String(m)); return f.t === 'ev' && f.ev.e === 'update' && test(f.ev); });
+        if (i >= 0) return { s, i };
+      }
+    });
+    if (!hit) throw new Error('N78 expected a held ACP update');
+    for (const m of hit.s.buf.splice(0, hit.i + 1)) hit.s.ws.send(m);
+  };
   const liveView = () => acpView(D, '$agents');
   const liveIdle = () => acpIdle(D, '$agents');
   const isAlive = async (id: string) => (await sessions()).some(s => s.sid === id && s.alive);
@@ -3822,28 +3901,66 @@ await section('N78', async () => {
     if (created.status !== 201) throw new Error('N78 API ACP spawn: ' + created.status + ' ' + await created.text());
     const ready = await until(async () => { const s = (await sessions()).find(s => s.sid === sid); return s?.acp?.agentSessionId && s.acp.activity === 'none'; }, 15000);
     if (!ready) throw new Error('N78 external ACP did not finish setup');
-    const original = await meshApi('/sessions/' + sid + '/prompt', 'POST', { text: 'n78 original conversation' });
+    const original = await meshApi('/sessions/' + sid + '/prompt', 'POST', {
+      text: ['n78 original conversation', ...Array.from({ length: 70 }, (_, i) => 'replay line ' + i)].join('\n'),
+    });
     if (!original.ok) throw new Error('N78 external prompt: ' + original.status + ' ' + await original.text());
     externalPty = 'n78_external_pty';
     await startPty(externalPty);
     const sent = [await report('near', 'n78-readonly'), await report('near', 'n78-claude', { attach: { kind: 'claude', id: 'deadbeef' } }),
       await report('far', 'n78-tmux', { attach: { kind: 'tmux', socket: '/tmp/n78-tmux/default', pane: 12 } }),
-      await report('near', 'n78-hubpty', { wbSession: externalPty })];
+      await report('near', 'n78-hubpty', { wbSession: externalPty, attach: { kind: 'claude', id: '0123abcd' } }),
+      await reportClaude('n78-claude-tmux', { attach: { kind: 'tmux', socket: '/tmp/n78-tmux/default', pane: 7 } }, 'PermissionRequest'),
+      await report('near', 'n78-fail', { attach: { kind: 'claude', id: 'badc0ffe' } })];
     const ids = await until(() => D.evaluate((sid: string) => {
       const ids: Record<string, string> = {};
       for (const o of Object.values<ObservedSession>(window.__canvas.OBS)) if (o.sessionId.startsWith('n78-')) ids[o.sessionId] = o.id;
-      return Object.keys(ids).length === 4 && window.__canvas.SESS[sid] ? ids : null;
+      return Object.keys(ids).length === 6 && window.__canvas.SESS[sid] ? ids : null;
     }, sid), 10000);
     if (!ids) throw new Error('N78 observed sessions did not arrive');
+    const edwin = await D.evaluate(() => window.__canvas.FR.on);
+    if (edwin) await D.waitForFunction(() => window.__canvas.FR.ready && window.__canvas.FR.online, undefined, { timeout: 30000 });
     await D.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
     await D.keyboard.press('Alt+Digit8');
     await D.waitForSelector('#v-agents:not([hidden])');
+    await row(ids['n78-claude-tmux']).waitFor();
+    const highlights = await D.locator('#mesh-list .mesh-row').evaluateAll(es => es.map(e => (e as HTMLElement).dataset.id));
+    const first = await D.locator('#mesh-list .mesh-row.on').getAttribute('data-id');
+    const selectedIds = [first], hasTerminal = () => D.locator('#mesh-detail .xterm').isVisible();
+    let terminalOnHighlight = !!await attachSid();
+    await D.locator('#mesh-list').focus();
+    for (let i = 1; i <= highlights.indexOf(ids['n78-claude']); i++) {
+      await D.keyboard.press(i % 2 ? 'ArrowDown' : 'j');
+      selectedIds.push(await D.locator('#mesh-list .mesh-row.on').getAttribute('data-id'));
+      terminalOnHighlight ||= !!await attachSid();
+    }
+    const highlightedSummary = await D.locator('#mesh-detail .mesh-hint').innerText();
+    check('N78: automatic and keyboard highlights across eligible Claude rows show a summary, without opening any viewer',
+      first === ids['n78-claude-tmux'] && selectedIds.at(-1) === ids['n78-claude'] && !terminalOnHighlight && !attachOpens().length
+      && /press Enter/.test(highlightedSummary), JSON.stringify({ selectedIds, terminalOnHighlight, highlightedSummary }));
+    await reportClaude('n78-claude-tmux');
+    await until(() => D.evaluate((id: string) => window.__canvas.OBS[id]?.state === 'running', ids['n78-claude-tmux']), 10000);
     await row(sid).click(); await liveIdle();
-    const initial = await D.locator('#mesh-detail .ag-log').textContent();
+    const noSwitch = !await D.locator('#mesh-detail .mesh-switch').count();
+    await D.keyboard.press('t');
+    const selectedAfterT = await D.locator('#mesh-list .mesh-row.on').getAttribute('data-id');
+    check('N78: t on a hub ACP row without an observed attach leaves the selection and transcript unchanged',
+      noSwitch && selectedAfterT === sid && await D.locator(composer).isVisible() && !await hasTerminal() && !attachOpens().length,
+      JSON.stringify({ noSwitch, selectedAfterT, opens: attachOpens().length }));
+    const initial = await journalText();
+    if (edwin) {
+      const local = await D.evaluate((sid: string) => {
+        const b = window.__canvas.live.$agents.backend.transcript?.buf;
+        return b && !b.shared && b.file === null && b.mode === 'wb-agent-transcript-mode' && b.name.includes(sid);
+      }, sid);
+      check('N78: the local transcript frame replaces the DOM journal and displays replay',
+        local && await D.locator(reader + '.edwin-frame').count() === 1 && !await D.locator(log).count()
+        && initial?.includes('Assistant:\n  echo: n78 original conversation'), { local, initial: initial?.slice(0, 200) });
+    }
     const rowEl = await row(sid).elementHandle(), controlEl = await D.locator(composer).elementHandle();
     await D.fill(composer, 'n78 shared conversation'); await D.press(composer, 'Enter');
     const shared = await until(async () => {
-      const v = await liveView(), text = await D.locator('#mesh-detail .ag-log').textContent();
+      const v = await liveView(), text = await journalText();
       return v?.promptable && v.items.includes('asst:echo: n78 shared conversation') && text?.includes('echo: n78 shared conversation') ? { items: v.items, text } : null;
     }, 20000);
     const stable = { row: await rowEl!.evaluate((e, sid: string) => e === document.querySelector(`#mesh-list .mesh-row[data-id="${sid}"]`), sid),
@@ -3851,7 +3968,7 @@ await section('N78', async () => {
     const listed = await D.evaluate(({ sid, ids }) => ({ view: window.__canvas.S.view, ids: [...document.querySelectorAll<HTMLElement>('#mesh-list .mesh-row')].map(e => e.dataset.id),
       expected: [sid, ...Object.values(ids)], card: !!window.__canvas.S.nodes[sid] }), { sid, ids });
     check('N78: Alt-8 opens Agents; an API-started ACP session replays and accepts real prompts without a card, preserving row and composer identity during activity',
-      sent.every(s => s === 204) && listed.view === 'agents' && listed.expected.every(id => listed.ids.includes(id)) && !listed.card && initial?.includes('echo: n78 original conversation') && !!shared && stable.row && stable.control && await nodes() === before,
+      sent.every(s => s === 204) && listed.view === 'agents' && listed.expected.every(id => listed.ids.includes(id)) && !listed.card && noSwitch && initial?.includes('echo: n78 original conversation') && !!shared && stable.row && stable.control && await nodes() === before,
       JSON.stringify({ sent, listed, initial, shared, stable, nodes: await nodes(), before }));
     const prefixOrphan = await D.evaluate((sid: string) => window.__canvas.attnItems().some((i: RgEntry) => i.key === 'orphan:' + sid), sid);
     check('N78: an ordinary hub ACP session whose id starts attach_ remains in Agents and Attention as an orphan',
@@ -3867,20 +3984,186 @@ await section('N78', async () => {
       !!harnessLabel && !!hubInfo && hubInfo.harness === harnessLabel && hubInfo.host === H.host && hubInfo.folder === cwd && hubInfo.mode === known.mode && hubInfo.model === known.model && hubInfo.reasoning === known.reasoning
       && known.model === 'stub-model' && known.reasoning === 'high' && !!hubInfo.started && !!hubInfo['last active'] && hubRow.harness === harnessLabel && hubRow.model === known.model, JSON.stringify({ hubInfo, known, hubRow, harnessLabel }));
 
+    await section('N78 transcript reader', async () => {
+      if (!edwin) return;
+      const input = D.locator(reader + ' .ed-input'), key = (k: string) => D.keyboard.press(k);
+      await D.locator(composer).focus();
+      await key('Shift+Tab');
+      const tabbed = await input.evaluate(e => e === document.activeElement);
+      const beforeTyping = await readerText();
+      await key('i'); await D.keyboard.type('do not insert'); await key('Escape'); await key('u');
+      const unchanged = beforeTyping === await readerText();
+      await key('j'); await key('Enter');
+      const stayed = await input.evaluate(e => e === document.activeElement) && await D.evaluate(() => window.__canvas.MESH.open === 'attach_n78_api');
+      await key('Control+Space'); await key('Escape');
+      const left = await D.locator('#mesh-list').evaluate(e => e === document.activeElement);
+      check('N78: Shift-Tab reaches the reader; editor keys stay inside, insert and undo cannot change text, and leader Escape returns to the list',
+        tabbed && unchanged && stayed && left, { tabbed, unchanged, stayed, left });
+
+      const say = async (text: string) => { await D.fill(composer, text); await D.press(composer, 'Enter'); };
+      g.hold = true;
+      try {
+        await say('stream');
+        await releaseThrough(ev => ev.update?.content?.text === 'Streaming ');
+        await readUntil('  Streaming ');
+        await input.focus();
+        await key('g'); await key('g'); await key('4'); await key('0'); await key('j'); await key('z'); await key('z');
+        await key('v'); await key('l');
+        const middle = await readerState();
+        await releaseThrough(ev => ev.update?.content?.text === 'three ');
+        await readUntil('  Streaming three ');
+        const kept = await readerState();
+        check('N78: a streamed chunk extends the message while point, mark, first visible line and focus stay put',
+          middle.point > 0 && middle.point < middle.end && !!middle.first && middle.mark != null && kept.point === middle.point && kept.mark === middle.mark
+          && kept.first === middle.first && kept.focused && kept.end > middle.end, { middle, kept });
+        await key('Escape');
+        await key('Shift+G');
+        const tail = await readerState();
+        await releaseThrough(ev => ev.update?.content?.text === 'chunks.');
+        await readUntil('  Streaming three chunks.');
+        const followed = await readerState();
+        const visible = await D.locator(reader + ' .ln').allTextContents();
+        check('N78: G returns to the tail and resumes following without making undo history',
+          tail.point === tail.end - 1 && followed.point === followed.end - 1 && followed.end > tail.end && followed.undo === 0
+          && visible.some(line => line.includes('Streaming three chunks.')), { tail, followed, visible });
+      } finally { g.release(); }
+      await liveIdle();
+
+      g.hold = true;
+      try {
+        await say('tool');
+        await releaseThrough(ev => ev.update?.sessionUpdate === 'tool_call' && ev.update?.title === 'Edit notes.txt');
+        const pending = 'Tool: edit [pending] Edit notes.txt';
+        await readUntil(pending);
+        const prefix = (await readerText())!.split(pending)[0];
+        await releaseThrough(ev => ev.update?.sessionUpdate === 'tool_call_update' && ev.update?.status === 'completed');
+        await readUntil('  + BETA');
+        const done = (await readerText())!;
+        check('N78: a tool update replaces its heading and diff in place, without duplicating the call',
+          done.startsWith(prefix + 'Tool: edit [completed] Edit notes.txt\n  Location: ' + cwd + '/notes.txt')
+          && done.split('Edit notes.txt').length === 2 && done.includes('\n  - beta\n  + BETA\n'), done.slice(prefix.length));
+      } finally { g.release(); }
+      await liveIdle();
+
+      await say('perm');
+      await readUntil('· Permission: waiting');
+      await D.locator('#mesh-detail .ag-perm button[data-kind="reject_once"]').click();
+      await readUntil('· rejected: Reject');
+      const idle = await liveIdle(), answered = (await readerText())!;
+      check('N78: the DOM permission panel answers while the reader is mounted; waiting becomes the journal outcome',
+        !!idle && !answered.includes('Permission: waiting') && acpSent(D, sid, 'permission').some(m => m.outcome.optionId === 'reject-once')
+        && answered.includes('Did not run'), answered.slice(-500));
+
+      // Use one synchronous burst through the journal reducer; do not consume the hub's replay cursor.
+      const notes = Array.from({ length: 70 }, (_, i) => `reader burst ${i}`);
+      await D.evaluate(notes => {
+        const b = window.__canvas.live.$agents.backend;
+        const update = (u: JsonObject) => b.apply({ e: 'update', update: u });
+        update({ sessionUpdate: 'tool_call', toolCallId: 'reader-projection', kind: 'edit', status: 'completed', title: 'Projection', content: [
+          { type: 'content', content: { type: 'text', text: 'a\r\nb\nx\rTool: fake\u0000\u001b\u007f\u2028\u2029' } },
+          { type: 'diff', path: 'large.txt', oldText: 'old', newText: 'hidden oversized text\n' + 'A'.repeat(200001) },
+        ] });
+        update({ sessionUpdate: 'agent_message_chunk', messageId: 'reader-crlf', content: { type: 'text', text: 'split CRLF\r' } });
+        for (const text of notes) b.apply({ e: 'notice', text });
+        b.schedule();
+      }, notes);
+      await readUntil('· reader burst 69');
+      const burst = (await readerText())!, prefix = answered.slice(0, -1);
+      const tool = 'Tool: edit [completed] Projection\n', output = '  Output:\n  a\n  b\n  x␍Tool: fake␀␛␡\\u2028\\u2029\n';
+      const summary = '  diff too large: large.txt (1 → 2 lines)\n';
+      const suffix = notes.map(n => '· ' + n + '\n').join('') + '\n';
+      check('N78: reader normalizes CRLF without doubling lines and displays other controls without creating a fake heading',
+        burst.includes(tool + output) && !burst.split('\n').some(line => line.startsWith('Tool: fake')), burst.slice(prefix.length, prefix.length + 180));
+      check('N78: an oversized diff exposes the summary but not the new file in the reader',
+        burst.includes(summary + 'Assistant:') && !burst.includes('hidden oversized text'), burst.slice(prefix.length, prefix.length + 180));
+      await D.evaluate(() => {
+        const b = window.__canvas.live.$agents.backend;
+        b.cleared = true; b.changed = new Set(b.items); b.render();
+      });
+      await readUntil('· reader burst 69');
+      check('N78: a burst of more than 64 journal items matches a full repaint',
+        burst === await readerText() && burst === prefix + tool + output + summary + 'Assistant:\n  split CRLF␍\n' + suffix,
+        { length: burst.length, tail: burst.slice(-100) });
+
+      await D.evaluate(() => {
+        const b = window.__canvas.live.$agents.backend;
+        b.apply({ e: 'update', update: { sessionUpdate: 'tool_call_update', toolCallId: 'reader-projection', title: 'Projection with a longer title' } });
+        b.apply({ e: 'update', update: { sessionUpdate: 'agent_message_chunk', messageId: 'reader-crlf', content: { type: 'text', text: '\ncontinued' } } });
+        b.schedule();
+      });
+      await readUntil('Projection with a longer title');
+      const updated = (await readerText())!;
+      check('N78: an earlier length-changing tool update preserves later items and split CRLF matches a full repaint',
+        updated === prefix + tool.replace('Projection', 'Projection with a longer title') + output + summary + 'Assistant:\n  split CRLF\n  continued\n' + suffix,
+        updated.slice(prefix.length, prefix.length + 240));
+
+      await D.evaluate(() => window.L.call('kill-buffer', [window.__canvas.live.$agents.backend.transcript.buf]));
+      const fallback = await until(async () => await D.locator(log).count() === 1 && (await D.locator(log).textContent())?.includes('reader burst 69'), 3000);
+      check('N78: killing the reader buffer immediately restores the DOM journal with its items and original diff disclosure',
+        fallback && !await D.locator(reader).count() && await D.getByRole('button', { name: 'show new text', exact: true }).count() === 1);
+      await D.locator('#mesh-list').focus(); await open(ids['n78-readonly']); await open(sid); await liveIdle();
+      await input.focus(); await key('Control+x'); await key('b'); await key('Enter');
+      const switched = await until(async () => await D.locator(log).count() === 1 && (await D.locator(log).textContent())?.includes('n78 original conversation'), 3000);
+      check('N78: switching the reader frame to another buffer restores the DOM journal without waiting for activity',
+        switched && !await D.locator(reader).count());
+      await D.locator('#mesh-list').focus(); await open(ids['n78-readonly']); await open(sid); await liveIdle();
+    });
+
+    await section('N78 fallback journal', async () => {
+      const P = await ctx.newPage(); watchErrors(P);
+      let allowEdwin!: () => void, edit: TailPw.WebSocketRoute | undefined, online = true;
+      const gate = new Promise<void>(r => { allowEdwin = r; });
+      try {
+        await P.route('**/edwin/manifest.json', async route => { await gate; await route.continue(); });
+        await P.routeWebSocket(/\/edit$/, ws => {
+          if (!online) { ws.close({ code: 1011 }); return; }
+          edit = ws; ws.connectToServer();
+        });
+        await P.goto(ORIGIN + '/'); await P.waitForFunction(() => window.__canvas?.BOOTED);
+        await P.waitForFunction(sid => !!window.__canvas.SESS[sid], sid);
+        await P.evaluate(sid => window.__canvas.meshOpen(sid), sid);
+        const initial = !!await acpIdle(P, '$agents') && (await P.locator(log).textContent())?.includes('echo: n78 original conversation');
+        await P.fill(composer, 'n78 DOM journal'); await P.press(composer, 'Enter');
+        const reply = await until(async () => (await P.locator(log).textContent())?.includes('echo: n78 DOM journal'));
+        check('N78: without ready Edwin the DOM journal still replays and displays a new prompt and reply', initial && reply && !await P.locator(reader).count());
+        if (!edwin) return;
+        allowEdwin();
+        await P.waitForFunction(() => window.__canvas.FR.ready && window.__canvas.FR.online);
+        const focused = await P.locator(composer).evaluate(e => e === document.activeElement);
+        await P.locator(composer).press('Escape');
+        const kept = await P.locator(log).count() === 1 && !await P.locator(reader).count();
+        await P.evaluate(({ sid, other }) => { window.__canvas.meshOpen(other); window.__canvas.meshOpen(sid); }, { sid, other: ids['n78-readonly'] });
+        const mounted = await P.locator(reader + '.edwin-frame').elementHandle();
+        check('N78: readiness does not replace the focused DOM viewer, but the next mount uses Edwin', focused && kept && !!mounted && !await P.locator(log).count());
+
+        online = false; edit!.close({ code: 1011 });
+        if (!await acpIdle(P, '$agents')) throw new Error('N78 remounted ACP viewer did not finish replay');
+        await P.waitForFunction(() => !window.__canvas.FR.online);
+        await P.fill(composer, 'n78 local reader offline'); await P.press(composer, 'Enter');
+        await P.waitForFunction(() => window.__canvas.live.$agents?.backend.transcript?.buf.text.includes('echo: n78 local reader offline'));
+        check('N78: the same local reader continues receiving ACP text after losing edwind',
+          await mounted?.evaluate(e => e === document.querySelector('#mesh-detail .ag-reader')) && !await P.locator(log).count());
+      } finally { allowEdwin(); await P.close(); }
+    });
+
     // All neighbour expectations come from the actual ordered rows, not the ages of unrelated sessions.
+    await D.bringToFront(); await open(sid);
     await D.locator('#mesh-list').focus();
-    const next = await row(sid).evaluate(e => { let n = e.nextElementSibling; while (n && !n.classList.contains('mesh-row')) n = n.nextElementSibling; return (n as HTMLElement | null)?.dataset.id; });
-    await D.keyboard.press('ArrowDown'); const down = await D.evaluate(() => window.__canvas.MESH.open);
-    await D.keyboard.press('ArrowUp'); const up = await D.evaluate(() => window.__canvas.MESH.open);
-    await D.keyboard.press('j'); const j = await D.evaluate(() => window.__canvas.MESH.open);
-    await D.keyboard.press('k'); const k = await D.evaluate(() => window.__canvas.MESH.open);
+    const { near, after } = await row(sid).evaluate(e => {
+      const rows = [...e.parentElement!.querySelectorAll<HTMLElement>('.mesh-row')], i = rows.indexOf(e as HTMLElement);
+      return { near: (rows[i + 1] ?? rows[i - 1])?.dataset.id, after: i + 1 < rows.length };
+    });
+    await D.keyboard.press(after ? 'ArrowDown' : 'ArrowUp'); const arrow = await D.evaluate(() => window.__canvas.MESH.open);
+    await D.keyboard.press(after ? 'ArrowUp' : 'ArrowDown'); const back = await D.evaluate(() => window.__canvas.MESH.open);
+    await D.keyboard.press(after ? 'j' : 'k'); const vim = await D.evaluate(() => window.__canvas.MESH.open);
+    await D.keyboard.press(after ? 'k' : 'j'); const returned = await D.evaluate(() => window.__canvas.MESH.open);
     await liveIdle();
     await D.keyboard.press('Enter');
-    const entered = await D.locator(composer).evaluate(e => e === document.activeElement);
+    const entered = await D.evaluate(composer => document.activeElement?.matches(composer), composer);
     await D.keyboard.press('Escape');
     const escaped = await D.evaluate(() => !document.querySelector('#v-agents')!.classList.contains('detail-open'));
     check('N78: Up/Down and j/k navigate ordered rows; Enter focuses the live composer and Escape returns to the list',
-      !!next && down === next && up === sid && j === next && k === sid && entered && escaped, JSON.stringify({ next, down, up, j, k, entered, escaped }));
+      !!near && arrow === near && back === sid && vim === near && returned === sid && entered && escaped, { near, arrow, back, vim, returned, entered, escaped });
     await open(sid); await liveIdle();
     await D.fill(composer, 'n78 unsent draft');
     const draftControl = await D.locator(composer).elementHandle(), draftViewer = await D.locator('#mesh-detail .mesh-live').elementHandle();
@@ -3920,15 +4203,151 @@ await section('N78', async () => {
       }, 20000);
       await D.fill(composer, 'n78 editor restores');
       const prompts = acpSent(D, sid, 'prompt').length;
-      await D.press(composer, 'Control+c'); await D.press(composer, 'Control+e'); await D.waitForSelector('#mesh-detail .ag-editor-host.edwin-frame');
+      if (edwin) await D.locator(reader + ' .ed-input').focus();
+      await D.keyboard.press('Control+c'); await D.keyboard.press('Control+e'); await D.waitForSelector('#mesh-detail .ag-editor-host.edwin-frame');
       await D.keyboard.type(' edited'); await D.keyboard.press('Control+c'); await D.keyboard.press('Control+k');
       const restored = await until(async () => !await D.locator('#mesh-detail .ag-editor').count() && await D.inputValue(composer) === 'n78 editor restores edited', 10000);
       check('N78: a local unsaved Edwin prompt sends with C-c C-c; C-c C-k restores the current text without sending',
         local && !!sent && !!restored && acpSent(D, sid, 'prompt').length === prompts && await nodes() === before, JSON.stringify({ local, sent, restored, prompts, now: acpSent(D, sid, 'prompt').length }));
     });
 
+    await section('N78 layout', async () => {
+      const viewport = D.viewportSize()!, prompt = 'Long observed prompt '.repeat(100).slice(0, 2000);
+      await D.evaluate(() => { if (document.body.classList.contains('side-open')) window.__canvas.toggleDockTerm(); });   // measure Agents, not the dock's overlay
+      const created = await meshApi('/sessions', 'POST', { sid: 'n78_layout_api', agent: 'stub', cwd });
+      if (created.status !== 201) throw new Error('N78 layout ACP spawn: ' + created.status);
+      await report('near', 'n78-layout', { wbSession: 'n78_layout_api' }, 'prompt', prompt);
+      const id = await until(() => D.evaluate((prompt: string) => Object.values<ObservedSession>(window.__canvas.OBS).find(o => o.sessionId === 'n78-layout' && o.lastPrompt === prompt)?.id, prompt), 10000);
+      if (!id) throw new Error('N78 layout session did not arrive');
+      const layout = () => D.evaluate(() => {
+        const rect = (s: string) => document.querySelector(s)!.getBoundingClientRect(), view = rect('#v-agents'), pane = rect('#mesh-detail'), live = rect('.mesh-live > .body'), input = rect('#mesh-detail .ag-in');
+        const buttons = [...document.querySelectorAll<HTMLElement>('.mesh-head button')].filter(e => !e.hidden).map(e => {
+          const r = e.getBoundingClientRect(); return { text: e.textContent, x: r.x, y: r.y, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
+        });
+        const overflow = [...document.querySelectorAll<HTMLElement>('#v-agents *')].filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.right > view.right + 1; }).map(e => e.id || e.className);
+        return { buttons, overflow, width: view.width, inside: buttons.every(r => r.width > 0 && r.height > 0 && r.x >= pane.left && r.right <= pane.right && r.y >= pane.top && r.bottom <= pane.bottom && r.x >= view.left && r.right <= view.right && r.y >= 0 && r.bottom <= innerHeight),
+          pane: pane.height, live: live.height, gap: pane.bottom - input.bottom, facts: !document.querySelector<HTMLElement>('.mesh-info')!.hidden };
+      });
+      const widths = () => D.evaluate(() => ({ list: document.querySelector('.mesh-side')!.getBoundingClientRect().width, pane: document.querySelector('#mesh-detail')!.getBoundingClientRect().width }));
+      const drag = async (x: number) => { const r = (await D.locator('#mesh-grip').boundingBox())!; await D.mouse.move(r.x + r.width / 2, r.y + 100); await D.mouse.down(); await D.mouse.move(x, r.y + 100, { steps: 8 }); await D.mouse.up(); };
+      for (const size of [{ width: 1280, height: 800 }, { width: 900, height: 700 }]) {
+        await D.setViewportSize(size); await open(id); await liveIdle();
+        const closed = await layout();
+        await D.getByRole('button', { name: 'Details', exact: true }).click();
+        const expanded = await layout(), promptShown = await D.locator('.mesh-info .mesh-kv').filter({ hasText: /^prompt/ }).locator('code').textContent();
+        const facts = await D.locator('.mesh-info').evaluate(e => ({ height: e.getBoundingClientRect().height, scroll: getComputedStyle(e).overflowY }));
+        check(`N78: ${size.width}×${size.height} compact header contains every action, gives the session half the pane and keeps a composer gap; disclosure reveals 2,000 characters without shifting actions`,
+          !closed.facts && closed.inside && closed.live >= closed.pane / 2 && closed.gap >= 8 && expanded.facts && expanded.inside && expanded.live >= expanded.pane / 2
+          && Math.abs(expanded.live - closed.live) <= 1 && promptShown === prompt && facts.height <= size.height * .35 && facts.scroll === 'auto' && JSON.stringify(closed.buttons) === JSON.stringify(expanded.buttons),
+          JSON.stringify({ closed, expanded, facts, promptLength: promptShown?.length }));
+        await open(sid); await liveIdle(); await open(id); await liveIdle();
+        check('N78: disclosure stays open across selection during this page lifetime', (await layout()).facts);
+        await D.getByRole('button', { name: 'Details', exact: true }).click();
+        await drag(10); const min = await widths();
+        await drag(size.width - 10); const max = await widths();
+        check(`N78: ${size.width}px divider clamps list to 200px and pane to 360px`, Math.abs(min.list - 200) <= 1 && Math.abs(max.pane - 360) <= 1, JSON.stringify({ min, max }));
+        await D.locator('#mesh-grip').dblclick();
+        const reset = await widths(); await D.locator('#mesh-grip').focus(); await D.keyboard.press('ArrowRight'); const right = await widths(); await D.keyboard.press('ArrowLeft'); const left = await widths();
+        check('N78: divider resets to default and keyboard arrows move 16px', Math.abs(reset.list - Math.max(260, Math.round(size.width * .34))) <= 1 && right.list === reset.list + 16 && left.list === reset.list, JSON.stringify({ reset, right, left }));
+      }
+      await D.evaluate(() => { const C = window.__canvas; C.CMDS.find((c: PaletteItem) => c.l === 'Side pane: reset width')!.run(); C.toggleDockTerm(); });
+      await D.waitForSelector('#mesh-grip', { state: 'hidden' });
+      const docked = await layout(), dockDetail = await D.locator('#mesh-detail').isVisible(), dockList = await D.locator('.mesh-side').isVisible();
+      await D.getByRole('button', { name: '← Sessions', exact: true }).click();
+      const dockBack = !await D.locator('#mesh-detail').isVisible() && await D.locator('.mesh-side').isVisible();
+      const dockListFits = await D.locator('#v-agents').evaluate(e => [...e.querySelectorAll('*')].every(child => { const r = child.getBoundingClientRect(); return !r.width || !r.height || r.right <= e.getBoundingClientRect().right + 1; }));
+      await row(id).click(); await liveIdle();
+      await D.evaluate(() => window.__canvas.toggleDockTerm());
+      await D.waitForSelector('#mesh-grip', { state: 'visible' });
+      const undocked = await widths(), undockedLayout = await layout();
+      check('N78: 900×700 with the default 400px dock shows one contained pane with Sessions back; closing the dock restores both columns',
+        docked.width === 500 && docked.inside && docked.overflow.length === 0 && dockDetail && !dockList && dockBack && dockListFits
+        && await D.locator('.mesh-side').isVisible() && await D.locator('#mesh-detail').isVisible() && !await D.locator('.mesh-back').isVisible()
+        && undocked.list >= 200 && undocked.pane >= 360 && undockedLayout.inside && undockedLayout.overflow.length === 0,
+        JSON.stringify({ docked, dockDetail, dockList, dockBack, dockListFits, undocked, undockedLayout }));
+      const before = await widths(), savedBefore = await D.evaluate(() => window.__canvas.S.meshW), heldGrip = (await D.locator('#mesh-grip').boundingBox())!;
+      await D.mouse.move(heldGrip.x + heldGrip.width / 2, heldGrip.y + 100); await D.mouse.down(); await D.mouse.move(before.list + 70, heldGrip.y + 100, { steps: 8 });
+      const changed = await widths(), dragPrompt = 'During drag: ' + prompt.slice(13);
+      const activity = await report('near', 'n78-layout', { wbSession: 'n78_layout_api' }, 'prompt', dragPrompt);
+      const rendered = await until(async () => (await info()).prompt === dragPrompt, 10000);
+      const duringUpdate = await widths(), savedDuring = await D.evaluate(() => window.__canvas.S.meshW);
+      await D.setViewportSize({ width: 920, height: 700 });
+      await D.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      const duringResize = await widths();
+      await D.mouse.up(); const savedAfter = await D.evaluate(() => window.__canvas.S.meshW);
+      await D.setViewportSize({ width: 900, height: 700 });
+      check('N78: mesh activity and view resize preserve an in-progress divider drag; release saves the dragged width',
+        activity === 204 && rendered && changed.list > before.list + 60 && savedDuring === savedBefore && changed.list !== savedBefore
+        && Math.abs(duringUpdate.list - changed.list) <= 1 && Math.abs(duringResize.list - changed.list) <= 1 && Math.abs(savedAfter! - changed.list) <= 1,
+        JSON.stringify({ activity, rendered, before, changed, savedBefore, savedDuring, duringUpdate, duringResize, savedAfter }));
+      await reload(); await open(id); await liveIdle(); const restored = await widths();
+      check('N78: dragging changes list width and survives reload; disclosure resets closed', changed.list > before.list + 60 && restored.list === changed.list && !(await layout()).facts, JSON.stringify({ before, changed, restored }));
+      const cdp = await D.context().newCDPSession(D), grip = (await D.locator('#mesh-grip').boundingBox())!, x = grip.x + grip.width / 2, y = grip.y + 100;
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y, id: 1 }] });
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: x - 40, y, id: 1 }] });
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }); await cdp.detach();
+      const touched = await widths();
+      check('N78: touch narrows the list while preserving both pane minima', touched.list <= restored.list - 32 && touched.list >= 200 && touched.pane >= 360, JSON.stringify({ restored, touched }));
+      for (const width of [600, 320]) {
+        await D.setViewportSize({ width, height: 700 }); await open(id); await liveIdle();
+        const detail = await D.locator('#mesh-detail').isVisible(), list = await D.locator('.mesh-side').isVisible(), fits = await layout();
+        await D.getByRole('button', { name: '← Sessions', exact: true }).click();
+        check(`N78: ${width}px has no divider, one pane at a time and contained actions`, !await D.locator('#mesh-grip').isVisible() && detail && !list && fits.inside && fits.overflow.length === 0 && !await D.locator('#mesh-detail').isVisible() && await D.locator('.mesh-side').isVisible(), JSON.stringify(fits));
+      }
+      await D.setViewportSize(viewport);
+      await report('near', 'n78-layout', { attach: { kind: 'claude', id: 'cafefeed' } });
+      await row(id).click(); await switchButton('Terminal').waitFor();
+      const defaultTranscript = await D.locator(composer).isVisible() && !await hasTerminal();
+      let savedReader: { text: string; first: string; top: string | null | undefined } | undefined;
+      if (edwin) {
+        const text = Array.from({ length: 90 }, (_, i) => 'two-source line ' + i).join('\n');
+        const reply = await meshApi('/sessions/n78_layout_api/prompt', 'POST', { text });
+        if (!reply.ok) throw new Error('N78 two-source ACP prompt: ' + reply.status + ' ' + await reply.text());
+        await readUntil('  two-source line 89');
+        await liveIdle();
+        await D.locator(reader + ' .ed-input').focus();
+        await D.keyboard.press('g'); await D.keyboard.press('g');
+        const top = (await readerState()).first;
+        await D.keyboard.press('4'); await D.keyboard.press('0'); await D.keyboard.press('j');
+        await D.keyboard.press('z'); await D.keyboard.press('z');
+        const first = (await readerState()).first;
+        if (!first || first === top) throw new Error('N78 two-source reader did not scroll away from the top');
+        savedReader = { text: (await readerText())!, first, top };
+      }
+      await D.fill(composer, 'n78 two-source draft');
+      const dualComposer = await D.locator(composer).elementHandle();
+      await D.locator('#mesh-list').focus(); await D.keyboard.press('t');
+      const firstViewer = await attachSid();
+      const attached = await until(async () => (await attachText()).includes(H.host + ':claude:cafefeed'), 15000);
+      const tucked = await dualComposer!.evaluate(e => e.isConnected) && !await D.locator(composer).isVisible();
+      const readerHidden = !await D.locator(reader).isVisible();
+      await D.keyboard.press('t');
+      const returnedByKey = await D.locator(composer).isVisible() && !!firstViewer && await forgot(firstViewer);
+      await switchButton('Terminal').click(); const secondViewer = await attachSid();
+      const attachedAgain = await until(() => isAlive(secondViewer), 15000);
+      await switchButton('Transcript').click();
+      const restoredDraft = await dualComposer!.evaluate(e => e === document.querySelector('#mesh-detail .ag-in textarea') && (e as HTMLTextAreaElement).value === 'n78 two-source draft');
+      check('N78: a joined ACP/observed row defaults to Transcript; t from the list and the button switch both ways without remounting the composer or losing its draft',
+        defaultTranscript && !!attached && tucked && !!returnedByKey && !!attachedAgain && secondViewer !== firstViewer
+        && !!await forgot(secondViewer) && await D.locator(composer).isVisible() && restoredDraft && await isAlive('n78_layout_api'),
+        JSON.stringify({ defaultTranscript, firstViewer, secondViewer, attached, tucked, returnedByKey, attachedAgain, restoredDraft }));
+      if (savedReader) {
+        const shown = await D.locator(reader).isVisible();
+        const first = shown ? (await readerState()).first : undefined, text = await readerText();
+        check('N78: switching to Terminal and back shows the reader with the same text and first visible line',
+          readerHidden && shown && first === savedReader.first && text === savedReader.text,
+          { readerHidden, shown, first, before: savedReader.first, top: savedReader.top, sameText: text === savedReader.text });
+      }
+      await report('near', 'n78-layout', {}, 'end');
+      await meshApi('/sessions/n78_layout_api?forget=true', 'DELETE');
+      await open(sid); await liveIdle(); await D.locator('#mesh-grip').dblclick();
+    });
+
+    const transcriptName = await D.evaluate(() => window.__canvas.live.$agents.backend.transcript?.buf.name as string | undefined);
     await row(ids['n78-readonly']).click();
     const detached = await until(async () => !await D.locator(composer).count() && await isAlive(sid), 10000);
+    if (edwin) check('N78: selecting another row destroys the transcript frame and kills its local buffer', !!transcriptName
+      && !await D.locator(reader).count() && await D.evaluate(name => !window.Ed.E.buffers.some(b => b.name === name), transcriptName));
     await open(sid); await liveIdle();
     await D.evaluate(() => window.__canvas.setView('canvas'));
     const leftHub = await until(async () => !await D.locator(composer).count() && await isAlive(sid), 10000);
@@ -3945,17 +4364,52 @@ await section('N78', async () => {
       metadata.harness === 'pi' && metadata.harnessTitle === 'pi' && !!metadata.model && metadata.modelTitle === model && roInfo.harness === 'pi' && roInfo.model === model && roInfo.host === H.host && roInfo.folder === cwd && roInfo.mode === 'default' && !('reasoning' in roInfo) && !!roInfo.started && !!roInfo['last active']
       && /Started in a terminal the hub cannot reach/.test(ro || '') && /Claude background session/.test(ro || '') && /tmux/.test(ro || '') && !await D.locator('#mesh-detail .ag-in textarea, #mesh-detail .xterm').count()
       && !await D.getByRole('button', { name: 'Open terminal', exact: true }).count(), JSON.stringify({ metadata, roInfo, ro }));
-    await D.evaluate(() => { if (document.body.classList.contains('side-open')) window.__canvas.toggleDockTerm(); });   // the dock covers the whole phone viewport
+    await section('N78 phone', async () => {
+      // Start from the saved board, not the tab used for the cross-tab board edits above.
+      const P = await dpage();
+      try {
+        await P.setViewportSize({ width: 390, height: 844 });
+        await P.waitForFunction(sid => !!window.__canvas.SESS[sid], sid);
+        if (edwin) await P.waitForFunction(() => window.__canvas.FR.ready && window.__canvas.FR.online);
+        await P.evaluate(other => {
+          const C = window.__canvas;
+          if (document.body.classList.contains('side-open')) C.toggleDockTerm();
+          C.meshOpen(other);
+        }, ids['n78-readonly']);
+        const back = P.locator('#mesh-detail .mesh-back');
+        await back.click();
+        const listPhone = await P.evaluate(() => { const v = document.querySelector('#v-agents')!, l = document.querySelector('#mesh-list')!; return !v.classList.contains('detail-open') && l.getBoundingClientRect().width <= innerWidth && l.getBoundingClientRect().width > 0; });
+        await P.locator(`#mesh-list .mesh-row[data-id="${sid}"]`).click();
+        if (edwin) await P.locator(reader + '.edwin-frame').waitFor();
+        const detailPhone = await P.evaluate((reader: string) => {
+          const v = document.querySelector('#v-agents')!, d = document.querySelector('#mesh-detail')!, f = document.querySelector(reader), box = d.getBoundingClientRect();
+          return v.classList.contains('detail-open') && box.width <= innerWidth && box.width > 0 && d.scrollWidth <= d.clientWidth
+            && document.documentElement.scrollWidth <= innerWidth && (!f || (f as HTMLElement).offsetWidth === (f.parentElement as HTMLElement).clientWidth);
+        }, reader);
+        await back.click();
+        check('N78: below 700 px the list and selected detail fit the screen, and Sessions returns to the list',
+          listPhone && detailPhone && await P.locator(`#mesh-list .mesh-row[data-id="${ids['n78-readonly']}"]`).isVisible(), { listPhone, detailPhone });
+      } finally { await P.close(); }
+    });
+
+    await D.bringToFront();
+    await D.evaluate(() => { if (document.body.classList.contains('side-open')) window.__canvas.toggleDockTerm(); });
     await D.setViewportSize({ width: 390, height: 844 });
+    if (await D.locator('#mesh-detail .mesh-back').isVisible()) await D.locator('#mesh-detail .mesh-back').click();
+    const phoneRow = row(ids['n78-claude-tmux']);
+    await phoneRow.scrollIntoViewIfNeeded();
+    const phoneRect = (await phoneRow.locator('.mesh-main').boundingBox())!, touch = await D.context().newCDPSession(D);
+    await touch.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: phoneRect.x + 10, y: phoneRect.y + phoneRect.height / 2 }] });
+    await touch.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }); await touch.detach();
+    await D.locator('#mesh-detail .xterm').waitFor(); const phoneSid = await attachSid();
+    const tapped = await until(() => isAlive(phoneSid), 15000);
+    const phoneFocused = await terminalFocused();
     await D.locator('#mesh-detail .mesh-back').click();
-    const listPhone = await D.evaluate(() => { const v = document.querySelector('#v-agents')!, l = document.querySelector('#mesh-list')!; return !v.classList.contains('detail-open') && l.getBoundingClientRect().width <= innerWidth && l.getBoundingClientRect().width > 0; });
-    await row(ids['n78-readonly']).click();
-    const detailPhone = await D.evaluate(() => { const v = document.querySelector('#v-agents')!, d = document.querySelector('#mesh-detail')!; return v.classList.contains('detail-open') && d.getBoundingClientRect().width <= innerWidth && d.getBoundingClientRect().width > 0 && document.documentElement.scrollWidth <= innerWidth; });
-    await D.locator('#mesh-detail .mesh-back').click();
-    check('N78: below 700 px the list and selected detail fit the screen, and Sessions returns to the list', listPhone && detailPhone && await row(ids['n78-readonly']).isVisible(), JSON.stringify({ listPhone, detailPhone }));
+    check('N78: a phone tap opens and focuses the Claude terminal and Sessions back kills and forgets the viewer',
+      !!tapped && phoneFocused && !!await forgot(phoneSid) && await phoneRow.isVisible() && !await hasTerminal(), JSON.stringify({ phoneSid, tapped, phoneFocused }));
     await D.setViewportSize({ width: 1500, height: 950 });
 
-    await open(ids['n78-hubpty']);
+    await row(ids['n78-hubpty']).click();
     const ptyReady = await until(() => ptyOf(D, externalPty).some(w => w.hello && !w.closed));
     await D.locator('#mesh-detail .xterm-helper-textarea').focus();
     await D.keyboard.type("printf 'n78-hub-pty-%s\\n' output"); await D.keyboard.press('Enter');
@@ -3963,35 +4417,74 @@ await section('N78', async () => {
     await row(ids['n78-readonly']).click();
     const ptySurvived = await isAlive(externalPty);
     check('N78: an externally owned hub PTY is interactive without adding a card or spawning; deselecting does not kill it',
-      !!ptyReady && !!ptyOutput && ptySurvived && ptyOf(D, externalPty).every(w => w.open?.spawn === false) && await nodes() === before,
+      !!ptyReady && !!ptyOutput && ptySurvived && ptyOf(D, externalPty).every(w => w.open?.spawn === false)
+      && !attachOpens().some(w => w.open?.attach === ids['n78-hubpty']) && await nodes() === before,
       JSON.stringify({ ptyReady, ptyOutput, ptySurvived, opens: ptyOf(D, externalPty).map(w => w.open) }));
-    await open(ids['n78-claude']);
+    // Track the fixture's output on the wire because moving the highlight disposes its xterm.
+    let output = '', typedIntoTerminal = false;
+    const trackAttach = (ws: import('playwright-core').WebSocket) => {
+      if (!ws.url().endsWith('/pty')) return;
+      let tracked = false;
+      ws.on('framesent', f => {
+        const m = JSON.parse(f.payload as string) as PtyClientMsg;
+        if (m.t === 'open') tracked = m.attach === ids['n78-claude-tmux'];
+        if (tracked && m.t === 'in') typedIntoTerminal = true;
+      });
+      ws.on('framereceived', f => {
+        const m = JSON.parse(f.payload as string) as PtyServerMsg;
+        if (!tracked) return;
+        if (m.t === 'hello') output += m.replay || '';
+        if (m.t === 'out') output += m.d;
+      });
+    };
+    D.on('websocket', trackAttach);
+    const clickRow = row(ids['n78-claude-tmux']);
+    await clickRow.click();
+    const clickSid = await attachSid(), clickAddress = H.host + ':tmux:7:/tmp/n78-tmux/default';
+    const catReady = await until(() => output.includes(clickAddress), 15000);
+    const beforeJ = output, clickFocusedTerminal = await terminalFocused();
+    const nextRow = await clickRow.evaluate(e => {
+      const rows = [...e.parentElement!.querySelectorAll<HTMLElement>('.mesh-row')];
+      return rows[rows.indexOf(e as HTMLElement) + 1]?.dataset.id;
+    });
+    await D.keyboard.press('j');
+    const selectedAfterJ = await D.locator('#mesh-list .mesh-row.on').getAttribute('data-id');
+    const clickClosed = await until(() => ptyOf(D, clickSid).some(w => w.closed));
+    D.off('websocket', trackAttach);
+    check('N78: a Claude row click opens the terminal without focusing it; j highlights the next row without typing into cat',
+      !!catReady && !clickFocusedTerminal && !!nextRow && selectedAfterJ === nextRow && !!clickClosed && !typedIntoTerminal && output === beforeJ,
+      JSON.stringify({ catReady, clickFocusedTerminal, nextRow, selectedAfterJ, clickClosed, typedIntoTerminal, beforeJ, output }));
+
+    await row(ids['n78-claude']).click();
+    const endingSid = await attachSid(), beforeEnd = await until(() => isAlive(endingSid), 15000);
     const observedTitle = await D.locator('#mesh-detail h3').elementHandle();
     const endedReport = await report('near', 'n78-claude', {}, 'end');
-    const endedAction = await until(async () => await D.evaluate((id: string) => window.__canvas.OBS[id].endedAt !== null, ids['n78-claude'])
-      && !await D.getByRole('button', { name: 'Open terminal', exact: true }).count() && /Started in a terminal the hub cannot reach/.test(await D.locator('#mesh-detail .mesh-hint').innerText()), 10000);
-    const revivedReport = await report('near', 'n78-claude', { attach: { kind: 'claude', id: 'deadbeef' } });
-    const revivedAction = await until(async () => await D.evaluate((id: string) => window.__canvas.OBS[id].endedAt === null, ids['n78-claude'])
-      && await D.getByRole('button', { name: 'Open terminal', exact: true }).isEnabled() && /Closing this terminal leaves the agent running/.test(await D.locator('#mesh-detail .mesh-hint').innerText()), 10000);
+    const endedAction = await until(async () => !await hasTerminal() && /observed session has ended/i.test(await D.locator('#mesh-detail .mesh-hint').innerText())
+      && await D.locator('#mesh-detail .mesh-info').isVisible(), 10000);
+    const endedViewer = await forgot(endingSid);
+    const revivedReport = await report('near', 'n78-claude');
+    const revivedSid = await until(async () => (await attachText()).includes(H.host + ':claude:deadbeef') && await attachSid(), 15000);
     const observedDetailStable = await observedTitle!.evaluate(e => e === document.querySelector('#mesh-detail h3'));
-    check('N78: ending and reviving the selected observed session removes and restores Open terminal and its hint in place without rebuilding detail',
-      endedReport === 204 && revivedReport === 204 && !!endedAction && !!revivedAction && observedDetailStable,
-      JSON.stringify({ endedReport, revivedReport, endedAction, revivedAction, observedDetailStable }));
+    check('N78: ending the selected observed session kills its viewer and explains why; reviving reopens a fresh viewer without rebuilding detail',
+      !!beforeEnd && endedReport === 204 && !!endedAction && !!endedViewer && revivedReport === 204 && !!revivedSid && revivedSid !== endingSid && observedDetailStable,
+      JSON.stringify({ beforeEnd, endedReport, endedAction, endedViewer, revivedReport, revivedSid, observedDetailStable }));
 
-    const attach = async (id: string, address: string, input: string, P = D) => {
-      await P.evaluate((id: string) => window.__canvas.meshOpen(id), id); await P.getByRole('button', { name: 'Open terminal', exact: true }).click();
-      const sid = await P.evaluate(() => window.__canvas.live.$agents.backend.n.id);
-      const printed = await until(async () => (await termText(P, '$agents')).includes(address), 15000);
-      await P.locator('#mesh-detail .mesh-live .xterm-helper-textarea').focus();
+    const attach = async (address: string, input: string, P = D) => {
+      const sid = await attachSid(P);
+      const printed = await until(async () => (await attachText(P)).includes(address), 15000);
+      await P.locator('#mesh-detail .mesh-live .xterm-screen').click();
       await P.keyboard.type(input); await P.keyboard.press('Enter');
-      const echoed = await until(async () => (await termText(P, '$agents')).split(input).length >= 3, 10000);
+      const echoed = await until(async () => (await attachText(P)).split(input).length >= 3, 10000);
       const hidden = await P.evaluate((sid: string) => !window.__canvas.attnItems().some((i: RgEntry) => i.key === 'orphan:' + sid) && !document.querySelector(`#mesh-list .mesh-row[data-id="${sid}"]`), sid);
-      return { printed, echoed, hidden, text: await termText(P, '$agents'), sid, opens: ptyOf(P, sid).map(w => w.open) };
+      return { printed, echoed, hidden, text: await attachText(P), sid, opens: ptyOf(P, sid).map(w => w.open) };
     };
-    const claude = await attach(ids['n78-claude'], H.host + ':claude:deadbeef', 'n78-cat-claude');
-    check('N78: observed Claude attach prints its safe address, carries PTY input/output, has no browser cmd or canvas card and is not an orphan',
-      !!claude.printed && !!claude.echoed && claude.hidden && claude.opens.some(o => o?.spawn && o.attach === ids['n78-claude'] && !('cmd' in o)) && await nodes() === before, JSON.stringify(claude));
-    const other = await attach(ids['n78-claude'], H.host + ':claude:deadbeef', 'n78-cat-other-page', owner);
+    const claude = await attach(H.host + ':claude:deadbeef', 'n78-cat-claude');
+    check('N78: clicking a Claude-address row opens an interactive terminal without a button, browser cmd, canvas card or orphan entry',
+      !!claude.printed && !!claude.echoed && claude.hidden && !await attachButton().count()
+      && claude.opens.some(o => o?.spawn && o.attach === ids['n78-claude'] && !('cmd' in o)) && await nodes() === before, JSON.stringify(claude));
+    await owner.evaluate((id: string) => window.__canvas.meshOpen(id), ids['n78-claude']);
+    await owner.locator(`#mesh-list .mesh-row[data-id="${ids['n78-claude']}"]`).click();
+    const other = await attach(H.host + ':claude:deadbeef', 'n78-cat-other-page', owner);
     const both = await isAlive(claude.sid) && await isAlive(other.sid);
     check('N78: two pages opening the same observed row get distinct live, sid-safe attach PTYs',
       !!other.printed && !!other.echoed && other.hidden && both && claude.sid !== other.sid
@@ -4001,28 +4494,86 @@ await section('N78', async () => {
     const deselected = await until(async () => !(await sessions()).some(s => s.sid === claude.sid) && !await D.locator('#mesh-detail .xterm').count(), 15000);
     const still = await D.evaluate((id: string) => { const o = window.__canvas.OBS[id]; return !!o && o.endedAt === null; }, ids['n78-claude']);
     await owner.locator('#mesh-detail .mesh-live .xterm-helper-textarea').focus(); await owner.keyboard.type('n78-still-other-page'); await owner.keyboard.press('Enter');
-    const otherSurvived = await until(async () => await isAlive(other.sid) && (await termText(owner, '$agents')).split('n78-still-other-page').length >= 3, 10000);
+    const otherSurvived = await until(async () => await isAlive(other.sid) && (await attachText(owner)).split('n78-still-other-page').length >= 3, 10000);
     check('N78: deselecting terminates only that page\'s attach PTY, leaving the other page\'s viewer interactive and the observed and hub sessions live',
       !!deselected && still && !!otherSurvived && await isAlive(sid), JSON.stringify({ deselected, still, otherSurvived }));
     await owner.evaluate(() => window.__canvas.setView('canvas'));
     const otherLeft = await until(async () => !(await sessions()).some(s => s.sid === other.sid), 15000);
     check('N78: leaving the second page terminates only its separate attach PTY', !!otherLeft && still, JSON.stringify({ otherLeft, sid: other.sid }));
     await syncBoard(owner, D);   // View changes are shared-board writes; do not race the two pages' saves.
-    const tmux = await attach(ids['n78-tmux'], 'farbox:tmux:12:/tmp/n78-tmux/default', 'n78-cat-tmux');
+    await open(ids['n78-claude-tmux']);
+    await D.locator('#mesh-list').focus(); await D.keyboard.press('Enter');
+    const enterFocused = await terminalFocused();
+    const enteredClaude = await attach(H.host + ':tmux:7:/tmp/n78-tmux/default', 'n78-cat-enter');
+    check('N78: Enter on a highlighted Claude Code row with a tmux address opens and focuses its terminal without a button',
+      enterFocused && !!enteredClaude.printed && !!enteredClaude.echoed && !await attachButton().count(), JSON.stringify({ enterFocused, enteredClaude }));
+    await row(ids['n78-tmux']).click();
+    const manual = await attachButton().isEnabled() && !await hasTerminal() && !attachOpens().some(w => w.open?.attach === ids['n78-tmux']);
+    await attachButton().click();
+    const tmux = await attach('farbox:tmux:12:/tmp/n78-tmux/default', 'n78-cat-tmux');
     await D.evaluate(() => (document.activeElement as HTMLElement | null)?.blur()); await D.keyboard.press('Alt+Digit1');
     const left = await until(async () => !(await sessions()).some(s => s.sid === tmux.sid) && !await D.locator('#mesh-detail .xterm').count(), 15000);
-    check('N78: remote tmux attach prints the resolved address and carries input; leaving Agents terminates only its temporary PTY',
-      !!tmux.printed && !!tmux.echoed && tmux.hidden && !!left && await isAlive(sid) && await nodes() === before, JSON.stringify({ tmux, left }));
+    check('N78: non-Claude tmux needs Open terminal; leaving Agents terminates its temporary PTY and the previous viewer is forgotten',
+      manual && !!tmux.printed && !!tmux.echoed && tmux.hidden && !!left && !!await forgot(enteredClaude.sid)
+      && await isAlive(sid) && await nodes() === before, JSON.stringify({ manual, tmux, left }));
     await syncBoard(D, owner);
     unloadPage = await dpage(); await unloadPage.evaluate((id: string) => window.__canvas.meshOpen(id), ids['n78-claude']);
-    await unloadPage.getByRole('button', { name: 'Open terminal', exact: true }).click();
-    const unloadingSid = await unloadPage.evaluate(() => window.__canvas.live.$agents.backend.n.id);
+    await unloadPage.locator(`#mesh-list .mesh-row[data-id="${ids['n78-claude']}"]`).click();
+    const unloadingSid = await attachSid(unloadPage);
     const unloading = await until(() => isAlive(unloadingSid), 15000);
     await syncBoard(unloadPage, D);
     await unloadPage.close(); unloadPage = undefined;
     const unloaded = await until(async () => !(await sessions()).some(s => s.sid === unloadingSid), 15000);
     check('N78: page unload terminates and forgets the attach viewer, leaving its observed session live',
       !!unloading && !!unloaded && unloadingSid !== claude.sid && unloadingSid !== other.sid && await D.evaluate((id: string) => window.__canvas.OBS[id]?.endedAt === null, ids['n78-claude']), JSON.stringify({ unloading, unloaded, unloadingSid }));
+
+    await open(ids['n78-fail']); await row(ids['n78-fail']).click();
+    const retry = D.getByRole('button', { name: 'Retry', exact: true });
+    await retry.waitFor();
+    const failedSid = await attachSid(), failure = await D.locator('#mesh-detail .mesh-hint').innerText();
+    await D.locator('#mesh-detail .xterm-helper-textarea').focus(); await D.keyboard.press('Enter');
+    await sleep(500);
+    const shellOffer = /press Enter/i.test(await attachText()), failedOpens = attachOpens().filter(w => w.open?.attach === ids['n78-fail']);
+    const stayedFailed = failedOpens.length === 1 && failedOpens[0].open?.id === failedSid && await attachSid() === failedSid && await retry.isVisible();
+    await retry.click(); await retry.waitFor();
+    const retriedSid = await attachSid();
+    check('N78: a failed attach stays failed without starting a shell on Enter or retrying by itself; Retry opens a fresh attach sid',
+      /exited with code 23/.test(failure) && !shellOffer && stayedFailed && retriedSid !== failedSid && !!await forgot(failedSid)
+      && attachOpens().some(w => w.open?.id === retriedSid && w.open.attach === ids['n78-fail']), JSON.stringify({ failure, failedSid, retriedSid, shellOffer, stayedFailed, failedOpens: failedOpens.map(w => w.open) }));
+    await row(ids['n78-readonly']).click();
+
+    // Delay hello only at the app's message handler. The browser and relay still use the real socket.
+    const pendingSid = await D.evaluate((id: string): string => {
+      document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${id}"]`)!.click();
+      const b = window.__canvas.live.$agentsAttach.backend;
+      const onmessage = b.ws.onmessage!;
+      b.ws.onmessage = function (this: WebSocket, e: MessageEvent<string>) {
+        if ((JSON.parse(e.data) as PtyServerMsg).t !== 'hello') onmessage.call(this, e);
+      };
+      return b.n.id;
+    }, ids['n78-claude']);
+    const received = await until(() => ptyOf(D, pendingSid).some(w => w.hello), 15000);
+    const pending = await D.evaluate(() => !window.__canvas.live.$agentsAttach.backend.helloSeen);
+    const running = await isAlive(pendingSid);
+    await row(ids['n78-readonly']).click();
+    check('N78: deselecting while the attach hello is pending kills and forgets the PTY',
+      !!received && pending && running && !!await forgot(pendingSid) && !await hasTerminal(),
+      JSON.stringify({ pendingSid, received, pending, running }));
+
+    // Switch between two attaches in the mount task, before xterm's initial viewport sync.
+    const lastId = ids['n78-claude-tmux'];
+    const [firstSid, lastSid] = await D.evaluate((ids: string[]) => ids.map(id => {
+      document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${id}"]`)!.click();
+      return window.__canvas.live.$agentsAttach?.backend.n.id || '';
+    }), [ids['n78-claude'], lastId]);
+    const onlyLastViewer = await until(async () => {
+      const viewers = (await sessions()).filter(s => s.kind === 'pty' && s.sid.startsWith('attach_'));
+      return viewers.length === 1 && viewers[0].sid === lastSid && viewers[0].alive;
+    }, 15000);
+    check('N78: two rapid Claude row clicks leave exactly one attach viewer, for the last row',
+      !!firstSid && firstSid !== lastSid && !!onlyLastViewer && lastSid.startsWith('attach_' + lastId + '_') && await attachSid() === lastSid,
+      JSON.stringify({ firstSid, lastSid, lastId, onlyLastViewer }));
+    await row(ids['n78-readonly']).click(); await forgot(lastSid);
 
     // Borrowed ownership is part of the saved board, not the backend's lifetime in this page.
     await open(sid); await D.getByRole('button', { name: 'Add its card', exact: true }).click();
@@ -4184,10 +4735,283 @@ await section('N78', async () => {
     await D.evaluate((ids: (string | undefined)[]) => { const C = window.__canvas; C.setView('canvas'); for (const id of ids) if (id && C.S.nodes[id]) C.removeNode(id); }, [sid, externalPty, owned, ownedPty]);
     if (externalPty) await meshApi('/sessions/' + externalPty + '?forget=true', 'DELETE');
     await meshApi('/sessions/' + sid + '?forget=true', 'DELETE');
+    await meshApi('/sessions/n78_layout_api?forget=true', 'DELETE');
     for (const id of [owned, ownedPty]) if (id) await meshApi('/sessions/' + id + '?forget=true', 'DELETE');
-    for (const id of ['n78-readonly', 'n78-claude', 'n78-hubpty']) await report('near', id, {}, 'end');
+    for (const id of ['n78-readonly', 'n78-claude', 'n78-hubpty', 'n78-layout', 'n78-fail']) await report('near', id, {}, 'end');
+    await reportClaude('n78-claude-tmux', {}, 'SessionEnd');
     await report('far', 'n78-tmux', {}, 'end');
     await settled(D); await owner.close(); await D.close();
+  }
+});
+await section('N78 config revive', async () => {
+  if (!STUB) return skip('N78 config revive', 'no `stub` agent (wb-fake-acp) in /api/info.agents');
+  const P = await dpage(), sid = 'n78_config_revive', cwd = fs.mkdtempSync(path.join(TMP, 'n78-config-'));
+  record(P);
+  const api = (url: string, method: string, body?: Record<string, unknown>) => fetch(H.api + '/v1/sessions' + url, {
+    method, headers: { Authorization: 'Bearer ' + fs.readFileSync(H.apiTokenFiles.near, 'utf8').trim(), 'Content-Type': 'application/json' },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const info = () => P.evaluate(() => Object.fromEntries([...document.querySelectorAll('#mesh-detail .mesh-info .mesh-kv')].map(e => [e.querySelector('span')!.textContent!, e.querySelector('code')!.textContent!])));
+  try {
+    const started = await api('', 'POST', { sid, agent: 'config-revive-malformed', cwd });
+    if (started.status !== 201) throw new Error('N78 config spawn: ' + started.status + ' ' + await started.text());
+    await P.waitForFunction((sid: string) => !!window.__canvas.SESS[sid], sid);
+    await P.waitForFunction(() => !window.__canvas.FR.on || window.__canvas.FR.ready && window.__canvas.FR.online);
+    await P.evaluate((sid: string) => window.__canvas.meshOpen(sid), sid);
+    if (!await acpIdle(P, '$agents')) throw new Error('N78 config viewer did not finish replay');
+    const edwin = await P.evaluate(() => window.__canvas.FR.on), reader = edwin ? await P.locator('#mesh-detail .ag-reader').elementHandle() : null;
+    await P.locator('#mesh-detail .mesh-disclose').click();
+    const before = await until(async () => { const i = await info(); return i.model === 'stub-model' && i.reasoning === 'high' ? i : null; });
+    const stopped = await api('/' + sid, 'DELETE');
+    if (!stopped.ok) throw new Error('N78 config kill: ' + stopped.status);
+    const dead = await until(async () => { const v = await acpView(P, '$agents'); return v && !v.alive; });
+    if (!dead) throw new Error('N78 config session did not stop');
+    const revived = await api('/' + sid + '/revive', 'POST');
+    if (!revived.ok) throw new Error('N78 config revive: ' + revived.status);
+    const ready = await acpIdle(P, '$agents');
+    const cleared = await until(async () => {
+      const i = await info(), meta = await P.locator('#mesh-detail .mesh-meta').textContent();
+      return !i.model && !i.reasoning && !meta?.includes('stub-model') ? i : null;
+    });
+    const session = acpEvs(P, sid, 'session').at(-1);
+    await P.fill('#mesh-detail .ag-in textarea', 'after malformed revive'); await P.press('#mesh-detail .ag-in textarea', 'Enter');
+    const reply = await until(() => P.evaluate(() => {
+      const b = window.__canvas.live.$agents.backend;
+      return (b.transcript?.buf.text ?? document.querySelector('#mesh-detail .ag-log')?.textContent)?.includes('Streaming three chunks.');
+    }));
+    check('N78: a malformed revive offering clears the previous model and reasoning in detail and header while the transcript remains usable',
+      !!before && !!ready && !!cleared && session?.via === 'load' && session.configOptions == null && !!reply
+      && (!edwin || !!reader && await reader.evaluate(e => e === document.querySelector('#mesh-detail .ag-reader'))),
+      { before, cleared, session, ready: !!ready, reply, edwin });
+  } finally {
+    await api('/' + sid + '?forget=true', 'DELETE');
+    await settled(P); await P.close();
+  }
+});
+await section('N78 config replay', async () => {
+  if (!STUB) return skip('N78 config replay', 'no `stub` agent (wb-fake-acp) in /api/info.agents');
+  const { P, g } = await gatedPage(), sid = 'n78_config_replay', cwd = fs.mkdtempSync(path.join(TMP, 'n78-config-replay-'));
+  const api = (url: string, method: string, body?: Record<string, unknown>) => fetch(H.api + '/v1/sessions' + url, {
+    method, headers: { Authorization: 'Bearer ' + fs.readFileSync(H.apiTokenFiles.near, 'utf8').trim(), 'Content-Type': 'application/json' },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  try {
+    // A result-only agent cannot repair the replay with a config_option_update.
+    const started = await api('', 'POST', { sid, agent: 'config-result', cwd });
+    if (started.status !== 201) throw new Error('N78 config replay spawn: ' + started.status + ' ' + await started.text());
+    await P.waitForFunction((sid: string) => {
+      const s = window.__canvas.SESS[sid]; return s?.acp?.agentSessionId && s.acp.activity === 'none';
+    }, sid);
+    const changed = await api('/' + sid + '/config', 'POST', { id: 'model', value: 'large' });
+    if (!changed.ok) throw new Error('N78 config replay set: ' + changed.status + ' ' + await changed.text());
+    g.hold = true;
+    await P.evaluate((sid: string) => window.__canvas.meshOpen(sid), sid);
+    const replay = await until(() => g.socks.find(s =>
+      s.buf.some(m => { const f = JSON.parse(String(m)); return f.t === 'hello' && f.info.sid === sid; })
+      && s.buf.some(m => JSON.parse(String(m)).t === 'replayed')));
+    if (!replay) throw new Error('N78 config replay did not arrive');
+    const delivered: AcpServerMsg[] = [];
+    for (const m of replay.buf.splice(0)) {
+      const frame = JSON.parse(String(m)) as AcpServerMsg;
+      if (frame.t === 'info') replay.buf.push(m);
+      else { delivered.push(frame); replay.ws.send(m); }
+    }
+    const idle = await acpIdle(P, '$agents');
+    await P.locator('#mesh-detail .mesh-disclose').click();
+    const detail = await until(() => P.evaluate(() => {
+      const facts = Object.fromEntries([...document.querySelectorAll('#mesh-detail .mesh-info .mesh-kv')].map(e => [e.querySelector('span')!.textContent!, e.querySelector('code')!.textContent!]));
+      return facts.model === 'large' ? facts : null;
+    }));
+    const header = await P.locator('#mesh-detail .mesh-meta').textContent();
+    const configSeq = delivered.flatMap(m => m.t === 'ev' && m.ev.e === 'config' ? [m.ev.seq] : []).at(-1);
+    check('N78: full journal replay applies a set-config result to detail and header before any later info',
+      !!idle && configSeq != null && idle.seq >= configSeq && !!detail && !!header?.includes('large')
+      && g.sent.some(m => m?.t === 'open' && m.id === sid && m.since === 0),
+      { detail, header, configSeq, seq: idle?.seq });
+  } finally {
+    // Held frames may belong to viewers already closed; discard them by closing the page, not releasing the gate.
+    await P.close();
+    await api('/' + sid + '?forget=true', 'DELETE');
+  }
+});
+// N77/N78 hierarchy: real reports and a handwritten checkout/linked worktree, isolated from N77's graph/count fixtures.
+await section('N77/N78 hierarchy', async () => {
+  const P = await ctx.newPage(); watchErrors(P);
+  const prefix = 'n77-tree-', sid = 'n78_hierarchy_api', repo = 'example/hierarchy', otherRepo = 'example/other';
+  const dir = fs.mkdtempSync(path.join(TMP, 'n77-hierarchy-')), checkout = path.join(dir, 'checkout'), git = path.join(checkout, '.git');
+  const worktrees = ['observed-one', 'observed-two', 'hub-worktree'].map(n => path.join(dir, n)), hubGit = path.join(git, 'worktrees', 'hub-worktree');
+  fs.mkdirSync(hubGit, { recursive: true });
+  for (const cwd of worktrees) fs.mkdirSync(cwd, { recursive: true });
+  fs.writeFileSync(path.join(git, 'config'), '[core]\n\tbare = false\n[remote "origin"]\n\turl = git@example.invalid:example/hierarchy.git\n');
+  fs.writeFileSync(path.join(git, 'HEAD'), 'ref: refs/heads/main\n');
+  fs.writeFileSync(path.join(worktrees[2], '.git'), 'gitdir: ' + hubGit + '\n');
+  fs.writeFileSync(path.join(hubGit, 'commondir'), '../..\n');
+  fs.writeFileSync(path.join(hubGit, 'gitdir'), path.join(worktrees[2], '.git') + '\n');
+  fs.writeFileSync(path.join(hubGit, 'HEAD'), 'ref: refs/heads/topic/hub\n');
+  const ids: Record<string, string> = {};
+  // Reports currently expose only direct subagents. Rewrite only existing parent edges on the real RPC feed to
+  // exercise its arbitrary-depth consumer contract, without adding a parent/title API or inventing session records.
+  const hierarchy = (o: ObservedSession): void => {
+    if (!o.sessionId.startsWith(prefix)) return;
+    const name = o.key.endsWith('/cross') ? 'cross' : o.sessionId.slice(prefix.length);
+    ids[name] = o.id;
+    const parent = name === 'deep' ? ids.cross : name === 'waiting' ? ids.deep : name === 'quiet' ? ids.root : name === 'missing' ? 'o_missing_hierarchy_parent' : undefined;
+    if (parent) o.parent = parent;
+  };
+  await P.routeWebSocket(/\/rpc$/, ws => {
+    const server = ws.connectToServer();
+    server.onMessage(message => {
+      const m = JSON.parse(message as string) as HubMsg;
+      if (m.t === 'observed') { m.sessions.forEach(hierarchy); ws.send(JSON.stringify(m)); }
+      else if (m.t === 'observed_put') { hierarchy(m.session); ws.send(JSON.stringify(m)); }
+      else ws.send(message);
+    });
+  });
+  const meshApi = (url: string, method = 'GET', body?: Record<string, unknown>) => fetch(H.api + '/v1' + url, {
+    method, headers: { Authorization: 'Bearer ' + fs.readFileSync(H.apiTokenFiles.near, 'utf8').trim(), 'Content-Type': 'application/json' },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const report = async (name: string, payload: Record<string, unknown> = {}, metadata: Record<string, unknown> = {}) =>
+    (await meshApi('/events', 'POST', { harness: 'pi', payload: { session_id: prefix + name, kind: 'prompt', text: 'hierarchy ' + name, ...payload }, ...metadata })).status;
+  const reported = async (name: string, payload: Record<string, unknown>, metadata: Record<string, unknown>) => {
+    const status = await report(name, payload, metadata);
+    if (status !== 204 || !await until(() => ids[name], 8000)) throw new Error('hierarchy report ' + name + ': ' + status);
+  };
+  const metadata = (i: number) => ({ repoRoot: checkout, repo, worktree: path.basename(worktrees[i]), branch: i ? 'topic/two' : 'topic/one', projectRoot: worktrees[i] });
+  const row = (name: string) => P.locator(`#mesh-list .mesh-row[data-id="${ids[name] || name}"]`);
+  const group = (name: string) => row(name).evaluate(e => { let prev = e.previousElementSibling; while (prev && !prev.classList.contains('mesh-group')) prev = prev.previousElementSibling; return prev?.textContent; });
+  try {
+    await P.goto(ORIGIN + '/'); await P.waitForFunction(() => window.__canvas?.BOOTED); await settled(P);
+    // N77's assertions are finished; end its remaining waiting fixture so the status chip has one unambiguous target.
+    await fetch(H.api + '/v1/events', { method: 'POST', headers: { Authorization: 'Bearer ' + fs.readFileSync(H.apiTokenFiles.far, 'utf8').trim(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ harness: 'pi', payload: { session_id: 'a1', kind: 'end' } }) });
+    await reported('root', { cwd: worktrees[0] }, metadata(0));
+    await reported('two', { cwd: worktrees[1] }, metadata(1));
+    const crossStatus = await report('root', { kind: 'subagent_start', agent_id: 'cross', agent_type: 'explorer', cwd: '/srv/other' },
+      { repoRoot: '/srv/other', repo: otherRepo, worktree: 'other-tree', branch: 'topic/other', projectRoot: '/srv/other' });
+    if (crossStatus !== 204 || !await until(() => ids.cross, 8000)) throw new Error('hierarchy cross-repo subagent did not arrive');
+    await reported('deep', { cwd: '/srv/deep' }, { repo: 'example/deep', branch: 'topic/deep' });
+    await reported('waiting', { cwd: '/srv/waiting' }, { repo: 'example/waiting', branch: 'topic/waiting' });
+    await reported('quiet', { cwd: worktrees[0] }, metadata(0));
+    await reported('missing', { cwd: '/srv/missing' }, { repo: 'example/missing' });
+    await reported('legacy', { cwd: '/srv/n77-legacy' }, {});
+    await report('waiting', { kind: 'permission', tool: { name: 'Bash', input: { command: 'hierarchy permission' } } });
+    await P.evaluate(() => window.__canvas.meshOpen());
+    await row('waiting').waitFor();
+    const ready = await until(() => row('waiting').evaluate(e => e.classList.contains('bad')), 8000);
+    const observed = await P.evaluate((ids: Record<string, string>) => Object.fromEntries(['root', 'two', 'cross', 'deep', 'waiting', 'quiet', 'missing', 'legacy'].map(name => {
+      const e = document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${ids[name]}"]`)!;
+      return [name, { depth: e.dataset.depth, branch: e.querySelector('.mesh-branch')?.getAttribute('title'), repo: e.querySelector('.mesh-repo')?.getAttribute('title'), worktree: e.querySelector('.mesh-worktree')?.getAttribute('title'), context: e.querySelector('.mesh-context')?.textContent || '' }];
+    })), ids);
+    const groups = await P.locator('#mesh-list .mesh-group').allTextContents();
+    check('N77: observed worktrees share one repository group with distinct branch/worktree labels; older reports fall back to project',
+      ready && groups.filter(g => g === repo).length === 1 && await group('root') === repo && await group('two') === repo
+      && observed.root.branch === 'topic/one' && observed.two.branch === 'topic/two' && observed.root.worktree === 'observed-one' && observed.two.worktree === 'observed-two'
+      && observed.root.context.includes('topic/one') && observed.two.context.includes('topic/two') && observed.root.context.includes('observed-one') && observed.two.context.includes('observed-two')
+      && await group('legacy') === 'n77-legacy' && !observed.legacy.branch && !observed.legacy.worktree, JSON.stringify({ groups, observed }));
+    check('N77: a cross-repository parent chain nests at arbitrary depth; a missing parent promotes its child to a root',
+      observed.root.depth === '0' && observed.cross.depth === '1' && observed.deep.depth === '2' && observed.waiting.depth === '3' && observed.missing.depth === '0'
+      && observed.cross.repo === otherRepo && await group('cross') === repo && !groups.includes(otherRepo), JSON.stringify(observed));
+    await row('deep').click();
+    await P.locator('#mesh-detail .mesh-parent').click();
+    check('N77: the detail parent link selects the cross-repository parent', await row('cross').evaluate(e => e.classList.contains('on')));
+    await row('root').click(); await row('root').locator('.mesh-collapse').click();
+    const collapsed = await row('root').locator('.mesh-collapsed').evaluate(e => ({ count: e.getAttribute('data-count'), state: e.getAttribute('data-state'), hidden: e.getAttribute('data-hidden'), text: e.textContent }));
+    check('N77: collapsing hides the subtree while its summary retains descendant count and worst waiting state',
+      collapsed.count === '4' && collapsed.state === 'waiting_permission' && collapsed.hidden === '4' && /4 descendants/.test(collapsed.text || '')
+      && !await row('quiet').count() && !await row('cross').count() && !await row('deep').count() && !await row('waiting').count(),
+      JSON.stringify(collapsed));
+    await P.evaluate(() => window.__canvas.statusRender());
+    await P.locator('#st-host .stc').filter({ hasText: /^mesh \d+/ }).click();
+    const firstWaiting = await row('waiting').evaluate(e => e.classList.contains('on'));
+    const expanded = await row('root').locator('.mesh-collapse').getAttribute('aria-expanded');
+    check('N77: first-waiting opens the deep descendant and expands its ancestors', firstWaiting && expanded === 'true' && await row('quiet').count() === 1, JSON.stringify({ firstWaiting, expanded }));
+    await row('root').locator('.mesh-collapse').click(); await row('root').locator('.mesh-collapse').click();
+    check('N77: expanding restores quiet descendants at their original depth', await row('quiet').getAttribute('data-depth') === '1' && !await row('root').locator('.mesh-collapsed').isVisible());
+    await row('cross').click(); await P.locator('#mesh-list').focus(); await P.keyboard.press('ArrowDown');
+    const down = await row('deep').evaluate(e => e.classList.contains('on'));
+    await P.keyboard.press('k');
+    const up = await row('cross').evaluate(e => e.classList.contains('on'));
+    const stableRow = await row('cross').elementHandle(), stableDetail = await P.locator('#mesh-detail h3').elementHandle();
+    const count = await P.evaluate((id: string) => window.__canvas.OBS[id].counts.events, ids.cross);
+    const update = await report('root', { kind: 'note', agent_id: 'cross', text: 'hierarchy stable activity' });
+    const updated = await until(() => P.evaluate(({ id, count }) => window.__canvas.OBS[id].counts.events > count, { id: ids.cross, count }), 8000);
+    check('N77: keyboard follows the expanded tree and an ordinary report preserves selected row/detail DOM and valid metadata',
+      down && up && update === 204 && !!updated && await stableRow!.evaluate(e => e.isConnected && e === document.querySelector('#mesh-list .mesh-row.on'))
+      && await stableDetail!.evaluate(e => e === document.querySelector('#mesh-detail h3'))
+      && await row('cross').locator('.mesh-repo').getAttribute('title') === otherRepo && await row('cross').locator('.mesh-branch').getAttribute('title') === 'topic/other', JSON.stringify({ down, up, update, updated }));
+
+    if (STUB) {
+      const created = await meshApi('/sessions', 'POST', { sid, agent: 'stub', cwd: worktrees[2] });
+      if (created.status !== 201) throw new Error('hierarchy hub ACP: ' + created.status + ' ' + await created.text());
+      const joined = await until(async () => await row(sid).count() && await row(sid).locator('.mesh-branch').getAttribute('title') === 'topic/hub' && (await row(sid).textContent())?.includes('topic/hub'), 15000);
+      const hubMetadata = await P.evaluate((sid: string) => { const s = window.__canvas.SESS[sid]; return { repoRoot: s?.repoRoot, repo: s?.repo, worktree: s?.worktree, branch: s?.branch, card: !!window.__canvas.S.nodes[sid] }; }, sid);
+      check('N78: a hub ACP in a handwritten linked worktree derives repository metadata and joins observed worktrees without a board card',
+        !!joined && await group(sid) === repo && hubMetadata.repoRoot === checkout && hubMetadata.repo === repo && hubMetadata.worktree === 'hub-worktree' && hubMetadata.branch === 'topic/hub' && !hubMetadata.card,
+        JSON.stringify(hubMetadata));
+      // The only report for this session is a real child event: its parent must never enter OBS.
+      await P.evaluate(({ sid, cwd }) => {
+        const C = window.__canvas; C.setView('canvas');
+        C.addNode({ id: sid, kind: 'acp', name: 'hierarchy hub card', agent: 'stub', cwd, x: 100, y: 100, w: 560, h: 520, adopted: true, _spawn: false });
+      }, { sid, cwd: worktrees[2] });
+      try {
+        await acpIdle(P, sid);
+        const hubState = await P.evaluate((sid: string) => window.__canvas.SESS[sid].state, sid);
+        const started = await report('orphan', { kind: 'subagent_start', agent_id: 'child', agent_type: 'explorer', cwd: worktrees[0] }, { ...metadata(0), wbSession: sid });
+        if (started !== 204 || !await until(() => ids.orphan, 8000)) throw new Error('hierarchy orphan subagent did not arrive: ' + started);
+        const permission = await report('orphan', { kind: 'permission', agent_id: 'child', tool: { name: 'Bash', input: { command: 'orphan permission' } } }, { wbSession: sid });
+        await P.evaluate((id: string) => window.__canvas.meshOpen(id), ids.orphan);
+        await row('orphan').waitFor();
+        const waiting = await until(() => row('orphan').evaluate(e => e.classList.contains('bad')), 8000);
+        await P.evaluate((sid: string) => window.__canvas.meshOpen(sid), sid);
+        const separate = await P.evaluate(({ id, sid, sessionId }) => {
+          const C = window.__canvas, o = C.OBS[id], s = C.SESS[sid];
+          const child = document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${id}"]`);
+          const hub = document.querySelector<HTMLElement>(`#mesh-list .mesh-row[data-id="${sid}"]`);
+          return { parent: o.parent, parentAbsent: !!o.parent && !C.OBS[o.parent],
+            onlyChild: Object.values<ObservedSession>(C.OBS).filter(o => o.sessionId === sessionId).every(o => !!o.parent),
+            sameHost: o.host === s.host, wbSession: o.wbSession, observedState: o.state, hubState: s.state,
+            child: child && { depth: child.dataset.depth, card: child.dataset.card, dot: child.querySelector('.dot')?.className },
+            hub: hub && { card: hub.dataset.card, dot: hub.querySelector('.dot')?.className, selected: hub.classList.contains('on') },
+            selected: C.MESH.open, cardPresent: C.S.nodes[sid]?.kind === 'acp' };
+        }, { id: ids.orphan, sid, sessionId: prefix + 'orphan' });
+        check('N77/N78: an unreported parent cannot let its child inherit a same-host hub session, card, alias, or state',
+          permission === 204 && !!waiting && separate.parentAbsent && separate.onlyChild && separate.sameHost && separate.wbSession === sid
+          && separate.child?.depth === '0' && separate.child.card === '' && separate.child.dot === 'dot st-waiting_permission'
+          && separate.observedState === 'waiting_permission' && separate.hubState === hubState && separate.hub?.card === sid
+          && separate.hub.dot === 'dot st-' + hubState && separate.hub.selected && separate.selected === sid && separate.cardPresent,
+          JSON.stringify({ hubState, separate }));
+      } finally {
+        await report('orphan', { kind: 'end', agent_id: 'child' });
+        await P.evaluate((sid: string) => { const C = window.__canvas; if (C.S.nodes[sid]) C.removeNode(sid); }, sid);
+      }
+      const hubRow = await row(sid).elementHandle();
+      fs.writeFileSync(path.join(hubGit, 'HEAD'), 'ref: refs/heads/topic/switched\n');
+      const refreshed = await until(async () => await row(sid).locator('.mesh-branch').getAttribute('title') === 'topic/switched', 15000);
+      check('N78: a quiet hub session refreshes a filesystem branch change over RPC without an activity event or row remount',
+        !!refreshed && await hubRow!.evaluate(e => e.isConnected && e === document.querySelector(`#mesh-list .mesh-row[data-id="${e.getAttribute('data-id')}"]`)));
+    } else skip('N78 hierarchy hub', 'no `stub` agent (wb-fake-acp) in /api/info.agents');
+
+    await P.evaluate(() => window.__canvas.setView('graph'));
+    const graphed = await until(() => P.evaluate((repo: string) => window.__canvas.G.N.has('proj:' + repo), repo), 8000);
+    const graph = await P.evaluate(({ ids, repo, sid }: { ids: Record<string, string>; repo: string; sid: string }) => {
+      const C = window.__canvas, edge = (a: string, b: string, type: string) => C.G.E.some((e: { a: string; b: string; type: string }) => e.type === type && ((e.a === a && e.b === b) || (e.a === b && e.b === a)));
+      return { groups: [...C.G.N.keys()].filter(k => k === 'proj:' + repo), one: edge('proj:' + repo, 'mesh:' + ids.root, 'mesh'), two: edge('proj:' + repo, 'mesh:' + ids.two, 'mesh'),
+        cross: edge('mesh:' + ids.root, 'mesh:' + ids.cross, 'spawn'), deep: edge('mesh:' + ids.cross, 'mesh:' + ids.deep, 'spawn'), hub: edge('proj:' + repo, 'mesh:' + sid, 'mesh') };
+    }, { ids, repo, sid });
+    check('N77/N78: the graph shares one repository node across worktrees and preserves cross-repository spawn ancestry',
+      !!graphed && graph.groups.length === 1 && graph.one && graph.two && graph.cross && graph.deep && (!STUB || graph.hub), JSON.stringify(graph));
+    await P.evaluate((id: string) => window.__canvas.meshOpen(id), ids.two);
+    await row('two').click();
+    await report('deep', { kind: 'end' });
+    const promoted = await until(() => row('waiting').getAttribute('data-depth').then(d => d === '0'), 8000);
+    check('N77: a child of an ended, hidden parent is promoted to its own repository root', !!promoted && !await row('deep').count() && await group('waiting') === 'example/waiting');
+  } finally {
+    await P.evaluate(() => window.__canvas.setView('canvas'));
+    await meshApi('/sessions/' + sid + '?forget=true', 'DELETE');
+    for (const name of ['root', 'two', 'deep', 'waiting', 'quiet', 'missing', 'legacy']) await report(name, { kind: 'end' });
+    await settled(P); await P.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 // M5-W3: the host trees. A board shell's process is listed with its card; units answer their shape whatever the host has.

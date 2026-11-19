@@ -152,6 +152,53 @@ async fn quiet(ws: &mut Ws) {
     }
 }
 
+#[tokio::test]
+async fn startup_configuration_is_not_forwarded_to_an_older_hub() {
+    let hub = FakeHub::start_with(common::Hello {
+        acp_config: None,
+        ..common::Hello::default()
+    });
+    let web = Web::start(&hub.path);
+    web.wait_hub("up").await;
+    let mut ws = web.ws("/acp").await;
+    send_json(
+        &mut ws,
+        json!({
+            "t": "open", "id": "old", "since": 0, "agent": "claude", "cwd": "/x",
+            "rid": 17, "config": [{"id": "model", "value": "large"}]
+        }),
+    )
+    .await;
+    let (closed, messages) = read_to_close(&mut ws).await;
+    assert_eq!(
+        messages,
+        [json!({
+            "t": "error", "code": "bad_request", "rid": 17,
+            "error": "hub does not support session configuration"
+        })]
+    );
+    assert_eq!(closed, 1008);
+    assert!(!hub.requests().iter().any(|(_, r)| is_acp(r)));
+
+    let mut ws = web.ws("/acp").await;
+    send_json(
+        &mut ws,
+        json!({
+            "t": "open", "id": "empty", "since": 0, "agent": "claude", "cwd": "/x",
+            "config": []
+        }),
+    )
+    .await;
+    let (conn, req) = hub
+        .wait_for(|r| {
+            matches!(r,
+        HubRequest::AcpOpen { sid, .. } if sid == "empty")
+        })
+        .await;
+    hub.send(conn, HubMessage::ok(rid_of(&req), &reply("empty")));
+    assert_eq!(next_json(&mut ws).await["t"], "hello");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_fields_go_only_with_agent_and_cwd() {
     let (hub, web) = up().await;
@@ -279,6 +326,8 @@ async fn hello_carries_state_and_session_and_info_omits_an_unchanged_session() {
                 "configOptions": null,
             },
             "state": state,
+            "repoRoot": null, "repo": null, "worktree": null, "branch": null,
+            "projectRoot": null, "project": "src",
         })
     };
     let mut want = info("setup", 3, "running");

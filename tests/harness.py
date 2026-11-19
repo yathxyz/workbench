@@ -31,9 +31,10 @@ Agents: `stub` runs wb-fake-acp (the scripted test agent, the package's `fake` o
 --scenario kill-stubborn (it ignores stdin EOF and SIGTERM, and its prompts never end), for the
 ui check N39. `reconnect` runs it with --scenario permission-reconnect (a prompt streams 116
 chunks, asks a permission and streams 80 more), for the ui check N27. `config` runs it with
---scenario config for mutable configuration checks. `omp` runs the keyword fake under the
-configured key needed for permission-policy execute coverage. Test mode refuses to start
-without the fake agent; --dogfood registers no agent.
+--scenario config for mutable configuration checks. `config-result` returns configuration only in
+the RPC result, for the journal replay check. `config-revive-malformed` returns an invalid offering
+on revive, for the Agents metadata reset check. Test mode refuses to start without the fake agent;
+--dogfood registers no agent.
 
 Test mode (the default) gives the hub a temporary HOME and environment canaries, and exits
 when stdin closes. Control lines on stdin, one per line, each acknowledged with one JSON line on
@@ -183,6 +184,8 @@ class Harness:
                 "stuck": {"label": "Stuck", "argv": [fake, "--scenario", "kill-stubborn"], "env": {}},
                 "reconnect": {"label": "Reconnect", "argv": [fake, "--scenario", "permission-reconnect"], "env": {}},
                 "config": {"label": "Config", "argv": [fake, "--scenario", "config"], "env": {}},
+                "config-result": {"label": "Config result", "argv": [fake, "--scenario", "config-result"], "env": {}},
+                "config-revive-malformed": {"label": "Config revive", "argv": [fake, "--scenario", "config-revive-malformed"], "env": {}},
             }
         self.root = Path(tempfile.mkdtemp(prefix="wb-"))
         self.secret = secrets.token_hex(32)
@@ -201,9 +204,9 @@ class Harness:
             (self.root / d).mkdir(mode=0o700, parents=True)
         for d in (self.boards_dir, self.notes_dir) + (() if dogfood else (self.home,)):
             d.mkdir(mode=0o700)
-        # A real PTY child: the suite reads the resolved address, then sends input through cat.
+        # A real PTY child: print the resolved address, then echo input, except for the failure fixture.
         attach = self.root / "attach"
-        attach.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\"\nexec cat\n")
+        attach.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\"\ncase \"$1\" in *:claude:badc0ffe) exit 23;; esac\nexec cat\n")
         attach.chmod(0o700)
         fd = os.open(self.secret_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
         with os.fdopen(fd, "w") as f:

@@ -82,6 +82,8 @@ pub struct HubInfo {
     pub agents: Vec<Agent>,
     /// The other hosts the hub starts agents on (§3.8.5); empty from an older hub.
     pub hosts: Vec<Host>,
+    /// Whether the hub applies ordered startup configuration.
+    pub acp_config: bool,
     /// The shells a spawn may name; DELTA-1 §B.
     pub shells: Vec<String>,
     /// Empty from a hub that predates shell choice.
@@ -159,6 +161,7 @@ impl HubConn {
             shells,
             default_shell,
             hosts,
+            acp_config,
             ..
         }) = hello
         else {
@@ -183,6 +186,7 @@ impl HubConn {
             host,
             agents,
             hosts,
+            acp_config,
             shells,
             default_shell,
         };

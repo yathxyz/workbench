@@ -1164,6 +1164,7 @@ impl Acp {
                 to_agent(held.kind, cancelled(held.kind)),
             ));
         }
+        self.fail_startup_config(ErrorCode::Faulted, JOURNAL_FAILED);
         self.stop_agent(Cause::Fault);
         self.probe_at = Some(Instant::now() + PROBE_EVERY);
         self.publish();
@@ -2346,7 +2347,10 @@ impl Acp {
             via,
             session_id: session_id.clone(),
             modes: field("modes"),
-            config_options: field("configOptions"),
+            config_options: result
+                .get("configOptions")
+                .filter(|options| config::valid_options(options))
+                .cloned(),
         });
         if !recorded {
             return;

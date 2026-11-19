@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+#[cfg(debug_assertions)]
 use common::acp::stub;
 use common::acp::{fold_equals_live, group_members};
 use common::fake::{Agent, text_of, updates};
@@ -2229,6 +2230,7 @@ fn hub_startup_config_setup_failures_and_death_account_for_every_entry() {
         let code = match *agent {
             "config-exit" => "not_alive",
             "missing" => "spawn_failed",
+            "config-new-malformed" => "bad_option",
             _ => "agent_error",
         };
         assert!(errors.iter().all(|error| error["code"] == code));
@@ -2239,11 +2241,105 @@ fn hub_startup_config_setup_failures_and_death_account_for_every_entry() {
             usize::from(*agent == "config-exit")
         );
         if *agent == "config-new-malformed" {
-            assert!(!hub.kinds(&sid).iter().any(|kind| kind == "session"));
+            assert!(hub.kinds(&sid).iter().any(|kind| kind == "session"));
+            assert_eq!(c.summary(&sid)["alive"], true);
+            assert_eq!(c.acp_prompt(&sid, "still usable")["t"], "ok");
+            c.event(&sid, "turn_end");
         }
     }
     drop(c);
     fold_equals_live(&mut hub);
+}
+
+#[test]
+fn hub_invalid_setup_options_do_not_kill_new_or_revived_sessions() {
+    let mut hub = Hub::with_scenarios(&["config-new-malformed", "config-revive-malformed"]);
+    let mut c = hub.connect();
+    for (sid, agent, via) in [
+        ("resume", "config-new-malformed", "resume"),
+        ("load", "config-revive-malformed", "load"),
+    ] {
+        ready(&mut c, &hub, sid, agent);
+        turn_then_kill(&mut c, sid);
+        let evs = revive(&mut c, sid);
+        let session = evs.iter().find(|ev| ev["e"] == "session").unwrap();
+        assert_eq!(session["via"], via);
+        assert!(session.get("configOptions").is_none());
+        let summary = c.summary(sid);
+        assert_eq!(summary["alive"], true);
+        assert!(summary["acp"]["configOptions"].is_null());
+        assert_eq!(c.acp_prompt(sid, "still usable")["t"], "ok");
+        c.event(sid, "turn_end");
+    }
+    assert_eq!(
+        hub.received_calls("config-revive-malformed", "session/resume")
+            .len(),
+        1
+    );
+    assert_eq!(
+        hub.received_calls("config-revive-malformed", "session/load")
+            .len(),
+        1
+    );
+    drop(c);
+    fold_equals_live(&mut hub);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hub_spawn_failure_with_journal_fault_releases_config_before_and_after_probe() {
+    let hub = Hub::start_with_env(
+        |cfg| {
+            cfg["agents"]["missing"] =
+                json!({"label": "Missing", "argv": ["/nonexistent/wb-agent"]});
+        },
+        &[("WB_HUB_TEST_FAIL_WRITE_AT", "1")],
+    );
+    let mut c = hub.connect();
+    let opened = spawn_config(
+        &mut c,
+        &hub,
+        "a1",
+        "missing",
+        json!([
+            {"id": "model", "value": "large"}, {"id": "thinking", "value": true}
+        ]),
+    );
+    assert!(
+        opened["configErrors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|error| error["code"] == "faulted")
+    );
+    assert_eq!(opened["configErrors"][0]["id"], "model");
+    assert_eq!(opened["configErrors"][1]["id"], "thinking");
+    assert_eq!(opened["summary"]["alive"], false);
+    assert_eq!(opened["summary"]["fault"]["code"], "journal_write");
+    assert_eq!(opened["summary"]["acp"]["activity"], "none");
+    c.replay("a1");
+    assert_eq!(c.acp_prompt("a1", "before probe")["code"], "faulted");
+    // Revive triggers the same probe as the timer, without waiting a minute.
+    assert_eq!(
+        c.request(json!({"t": "acp.revive", "sid": "a1"}))["code"],
+        "not_revivable"
+    );
+    let summary = c.summary("a1");
+    assert!(summary["fault"].is_null());
+    assert_eq!(summary["acp"]["activity"], "none");
+    assert_eq!(c.acp_prompt("a1", "after probe")["code"], "not_alive");
+    assert_eq!(
+        c.request(json!({"t": "acp.revive", "sid": "a1"}))["code"],
+        "not_revivable"
+    );
+    assert_eq!(hub.kinds("a1"), ["notice"]);
+    c.ok(json!({"t": "acp.kill", "sid": "a1", "forget": true}));
+    assert!(
+        c.ok(json!({"t": "list"}))["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
