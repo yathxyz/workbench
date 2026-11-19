@@ -1,5 +1,5 @@
 import { check, section, until } from '../../shared.mts';
-import { acpSent, type AcpEvOf } from '../../acp.mts';
+import { acpEvs, acpSent, type AcpEvOf } from '../../acp.mts';
 import type { N78Fixture } from './fixtures.mts';
 
 export default async function run({
@@ -79,12 +79,15 @@ export default async function run({
     await liveIdle();
 
     await say('perm');
-    await readUntil('· Permission: waiting');
+    const req = await until(() => acpEvs(D, sid, 'permission').at(-1)?.seq);
+    if (!req) throw new Error('N78 expected a journal permission');
+    const heading = `Permission #${req}: `;
+    await readUntil(heading + 'waiting');
     await D.locator('#mesh-detail .ag-perm button[data-kind="reject_once"]').click();
-    await readUntil('· rejected: Reject');
+    await readUntil(heading + 'rejected: Reject');
     const idle = await liveIdle(), answered = (await readerText())!;
     check('N78: the DOM permission panel answers while the reader is mounted; waiting becomes the journal outcome',
-      !!idle && !answered.includes('Permission: waiting') && acpSent(D, sid, 'permission').some(m => m.outcome.optionId === 'reject-once')
+      !!idle && !answered.includes(heading + 'waiting') && acpSent(D, sid, 'permission').some(m => m.req === req && m.outcome.optionId === 'reject-once')
       && answered.includes('Did not run'), answered.slice(-500));
 
     // Use one synchronous burst through the journal reducer; do not consume the hub's replay cursor.

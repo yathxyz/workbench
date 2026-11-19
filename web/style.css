@@ -694,12 +694,15 @@ body.listening #st-buf-text { color: var(--ink-red); }
 .mesh-live .xterm { height: 100%; padding: 8px; box-sizing: border-box; }
 .mesh-live > .hdr { position: static; flex: none; display: flex; gap: 8px; align-items: center; }
 .mesh-back { display: none; }
+.ag-reader-actions { display: none; }
 @container (width < 700px) {
   .mesh-layout { grid-template-columns: minmax(0, 1fr); }
   #mesh-grip { display: none; }
   #v-agents:not(.detail-open) .mesh-detail, #v-agents.detail-open .mesh-side { display: none; }
   .mesh-back { display: inline-block; align-self: flex-start; }
   .mesh-row { min-height: 44px; }
+  .ag-reader-actions { display: flex; justify-content: flex-start; gap: 4px; padding-block: 2px; }
+  .ag-reader-actions .tb { min-width: 44px; height: 44px; padding-inline: 4px; font-size: 12px; }
 }
 #side-term .xterm { padding: 8px 6px 6px 10px; height: 100%; box-sizing: border-box; }
 

@@ -424,6 +424,8 @@ function sessShown(): void {
 }
 function sessPut(x: SessionSummary | undefined, was = x && SESS[x.sid]?.state): void {
   if (!x?.sid || TOMBS.has(x.sid + ' ' + x.createdAt)) return;
+  const choices = ACP_FOLD_CHOICES.get(x.sid);
+  if (choices && choices.epoch !== x.createdAt) ACP_FOLD_CHOICES.delete(x.sid);
   SESS[x.sid] = x; sessChanged(x.sid); attnSignal(x.sid, was, x.state);
   // Without a card that signal has no name: the harness's own record of the session has one (F-A47).
   const o = x.kind === 'acp' && ACP_BAD.has(x.state) && !S?.nodes[x.sid] ? Object.values(OBS).find(o => obsSess(o) === x) : undefined;
@@ -432,10 +434,20 @@ function sessPut(x: SessionSummary | undefined, was = x && SESS[x.sid]?.state): 
 type RpcEventHandlers = { [K in HubMsg['t']]?: (m: Extract<HubMsg, { t: K }>) => void };
 const RPC_EVENTS: RpcEventHandlers = {
   hub: m => hubStatus(m),
-  sessions: m => { const was: Record<string, SessionState> = {}; for (const k in SESS) { was[k] = SESS[k].state; delete SESS[k]; } (m.sessions || []).forEach(x => sessPut(x, was[x.sid])); statusRender(); },
+  sessions: m => {
+    const was: Record<string, SessionState> = {}; for (const k in SESS) { was[k] = SESS[k].state; delete SESS[k]; }
+    (m.sessions || []).forEach(x => sessPut(x, was[x.sid]));
+    for (const sid of ACP_FOLD_CHOICES.keys()) if (!SESS[sid]) {
+      ACP_FOLD_CHOICES.delete(sid);
+      const b = live.$agents?.backend;
+      if (b instanceof AcpBackend && b.n.id === sid) b.transcript?.forgetChoices();
+    }
+    statusRender();
+  },
   session: m => sessPut(m.session),
   gone: m => {
     TOMBS.add(m.sid + ' ' + m.epoch);
+    if (ACP_FOLD_CHOICES.get(m.sid)?.epoch === m.epoch) ACP_FOLD_CHOICES.delete(m.sid);
     if (SESS[m.sid]?.createdAt === m.epoch) delete SESS[m.sid];
     live[m.sid]?.backend?.goneElsewhere?.(m.epoch); if (MESH_PANE.node?.id === m.sid) live.$agents?.backend?.goneElsewhere?.(m.epoch); sessChanged(m.sid);
     const attach = live.$agentsAttach?.backend;
@@ -904,16 +916,21 @@ class PtyBackend implements CardBackend, Wakeable {
 // ------------------------------------------------------------------ agent cards: the `acp` kind (30 §1, DESIGN §3.5.2)
 // Agent output is untrusted. Every string from the agent, its tool calls and its requests reaches the page through
 // textContent (el()), never innerHTML. URLs stay text; only an https: one opens, and only on an explicit click (F-A19).
-/* A line of an agent card's transcript (AcpBackend.items); el is its DOM once rendered. */
-interface AcpChunkItem { k: 'user' | 'asst' | 'thought'; text: string; mid?: string | null; closed?: boolean; el?: HTMLElement }
-interface AcpNoteItem { k: 'note'; text: string; cls?: string; host?: string; el?: HTMLElement }
-interface AcpSepItem { k: 'sep'; el?: HTMLElement }
-interface AcpToolItem { k: 'tool'; id: string; status: JsonValue; title?: JsonValue; kind?: JsonValue; content?: JsonValue; locations?: JsonValue; el?: HTMLElement }
-type AcpItem = AcpChunkItem | AcpNoteItem | AcpSepItem | AcpToolItem;
+/* Items keep the sequence of their first journal event, including across updates to their text. */
+interface AcpItemBase { seq: number; el?: HTMLElement }
+interface AcpChunkStamp { through: number; ts: number; text: string }
+interface AcpFirstChunk extends AcpChunkStamp { sessionId?: string; joined?: AcpChunkStamp }
+interface AcpChunkItem extends AcpItemBase { k: 'user' | 'asst' | 'thought'; text: string; mid?: string | null; closed?: boolean; journalKey?: string; first?: AcpFirstChunk }
+interface AcpNoteItem extends AcpItemBase { k: 'note'; text: string; cls?: string; host?: string; request?: 'Permission' | 'Elicitation' }
+interface AcpSepItem extends AcpItemBase { k: 'sep' }
+interface AcpToolItem extends AcpItemBase { k: 'tool'; id: string; status: JsonValue; title?: JsonValue; kind?: JsonValue; content?: JsonValue; locations?: JsonValue; rawInput?: JsonValue; rawOutput?: JsonValue; bodyVersion?: number }
+interface AcpStatusItem extends AcpItemBase { k: 'status'; plan: string; settings: string }
+type AcpItem = AcpChunkItem | AcpNoteItem | AcpSepItem | AcpToolItem | AcpStatusItem;
+type AcpItemSeed<T = AcpItem> = T extends AcpItem ? Omit<T, 'seq'> : never;
 /* A permission or elicitation request waiting for its answer, keyed by its journal seq (AcpBackend.pending). */
 interface AcpPermPending { kind: 'permission'; toolCall: JsonObject; options: JsonObject[]; request?: undefined; sent?: boolean }
 interface AcpElicitPending { kind: 'elicitation'; request: JsonObject; toolCall?: undefined; options?: undefined; sent?: boolean }
-type AcpPending = AcpPermPending | AcpElicitPending;
+type AcpPending = (AcpPermPending | AcpElicitPending) & { item?: AcpNoteItem };
 /* What a request sent with a rid was, so its error can be reported (AcpBackend.rids). */
 interface AcpReqCtx { t: 'prompt' | 'set_mode' | 'revive' | 'authenticate' | 'kill' | 'end' | 'permission' | 'elicitation'; req?: number; epoch?: number | null }
 /* The state panel over the composer (stateSpec, acpStatePanel): a message, a hint and buttons [label, handler, class]. */
@@ -940,77 +957,527 @@ const blockText = (b: any): string => !b || typeof b !== 'object' ? '' : b.type 
 const urlHost = (u: JsonValue | undefined): string => { try { return new URL(u as string).host || 'the page'; } catch { return 'the page'; } };
 
 type AcpSplice = [pos: number, remove: number, insert: string];
-interface AcpRange { index: number; from: number; length: number; chars: number }
-const ACP_PAINT_BATCH = 64;
+interface AcpRange {
+  item: AcpItem; key: string; index: number; length: number; chars: number;
+  heading: number; toolHeader: number; bodyVersion?: number;
+}
+interface AcpReplayAnchor { key: string; offset: number; range?: AcpRange }
+interface AcpReplayPlace {
+  point?: AcpReplayAnchor; mark?: AcpReplayAnchor; start?: AcpReplayAnchor;
+  expectedPoint: number; expectedMark: number | null;
+}
+// Only the Agents detail pane has a foldable reader. Its most recent 16 non-default sessions (including
+// the mounted one, if any) survive remount. No journal item, reader or editor is retained by this cache.
+const ACP_FOLD_LIMIT = 16;
+type AcpOverrides = Map<string, true | AcpFirstChunk>;
+const ACP_FOLD_CHOICES = new Map<string, { epoch: number; items: AcpOverrides }>();
+function acpItemKey(item: AcpItem) {
+  if (item.k === 'tool') return 'tool:' + item.id;
+  return ('journalKey' in item && item.journalKey) || item.k + ':' + item.seq;
+}
+// Preserve the wire content, not the projection (which renders every image as "[image]").
+// For text, keep metadata before the text so that two differently coalesced runs can be compared.
+function acpTextBlock(block: JsonValue): block is JsonObject & { type: 'text'; text: string } {
+  return !!block && typeof block === 'object' && !Array.isArray(block) && block.type === 'text' && typeof block.text === 'string';
+}
+function acpJournalBlock(block: JsonValue): string {
+  if (!acpTextBlock(block)) return 'j' + JSON.stringify(block);
+  if (Object.keys(block).length === 2) return 't' + block.text;
+  const { text, ...metadata } = block;
+  return 'm' + JSON.stringify(metadata) + '\n' + text;
+}
+function acpSameChoice(choice: true | AcpFirstChunk | undefined, item: AcpItem) {
+  if (choice === true) return true;
+  if (!choice || item.k !== 'thought' || !item.first) return false;
+  const now = item.first;
+  // A coalesced event exposes only its terminal timestamp. Match its entire covered
+  // payload and timestamp against a run we actually received, never just a common prefix.
+  const known = choice.through === now.through ? choice : choice.joined;
+  return choice.sessionId === now.sessionId && !!known && known.through === now.through && known.ts === now.ts && known.text === now.text;
+}
+const ACP_PAINT_BATCH = 128, ACP_PAINT_CHARS = 64 * 1024, ACP_PAINT_MS = 5;
 function acpReaderField(text: string): string {
   return text.replace(/\r\n|[\u0000-\u0008\u000b-\u001f\u007f\u2028\u2029]/g, c =>
     c === '\r\n' ? '\n' : c === '\x7f' ? '␡' : c === '\u2028' ? '\\u2028' : c === '\u2029' ? '\\u2029' : String.fromCharCode(0x2400 + c.charCodeAt(0)));
 }
 const acpIndent = (text: string) => acpReaderField(text).replaceAll('\n', '\n  ');
 
-// The journal owns the items. Keep just their positions and the lengths of painted chunks, not a second text model.
+// Append-only item order. A prefix-sum tree maps item index -> Edwin offset without walking the
+// suffix of the journal when an early message grows. Text lives in the journal and Edwin's rope.
 class AcpTranscript {
-  readonly ranges = new Map<AcpItem, AcpRange>();
-  end = 0;   // end of journal items, before the held-request lines
-  waiting = '';
+  private ranges = new Map<AcpItem, AcpRange>();
+  private sums = [0];
+  private sections: AcpRange[] = [];
+  private turns: AcpRange[] = [];
+  private tools: AcpRange[] = [];
+  private preferences?: AcpOverrides;
+  private candidates: AcpRange[] = []; // includes closed children currently hidden inside a closed turn
+  private owners: AcpRange[] = []; // parallel to the exact, disjoint pairs supplied to Edwin
+  private folds: { s: number; e: number }[] = [];
+  private foldFrom = 0; // first item whose published offsets may have changed
+  private warnedFolds = false;
+  private epoch: number | null = null;
+  private place?: AcpReplayPlace;
+  private remainder: { range: AcpRange; text: string; offset: number; lastNewline: number; more?: Generator<string, string> } | null = null;
+  private replacement: Generator<void, void> | null = null;
   readonly buf: EdwinBuffer;
   readonly frame: EdwinFrame;
-  constructor(buf: EdwinBuffer, frame: EdwinFrame) { this.buf = buf; this.frame = frame; }
-  render(items: AcpItem[], dirty: Set<AcpItem>, pending: Map<number, AcpPending>, reset: boolean) {
-    const ops: AcpSplice[] = [], buf = this.buf;
-    // Leave an empty last line for Evil's G, which skips the virtual line after the final newline.
-    if (reset || !buf.rope.length) { ops.push([0, buf.rope.length, '\n']); this.ranges.clear(); this.end = 0; this.waiting = ''; }
-    const updates: { it: AcpItem; range: AcpRange }[] = [], added: AcpItem[] = [];
-    for (const it of dirty) {
-      const range = this.ranges.get(it);
-      if (range) updates.push({ it, range }); else added.push(it);
-      dirty.delete(it);
-      if (updates.length + added.length === ACP_PAINT_BATCH) break;
-    }
-    let delta = 0, i = 0;
-    for (const { it, range } of updates.sort((a, b) => a.range.index - b.range.index)) {
-      if (delta) for (; i < range.index; i++) this.ranges.get(items[i])!.from += delta;
-      i = range.index + 1;
-      const old = range.from;
-      range.from += delta;
-      if ('mid' in it) {   // a streamed message only grows, just before its closing newline
-        // CRLF may straddle chunks. Replace the trailing CR picture when its LF arrives.
-        const back = it.text[range.chars - 1] === '\r' && it.text[range.chars] === '\n' ? 1 : 0;
-        const text = acpIndent(it.text.slice(range.chars - back));
-        if (text) ops.push([range.from + range.length - 1 - back, back, text]);
-        range.length += text.length - back; range.chars = it.text.length; delta += text.length - back;
-      } else {
-        const text = acpReaderText(it);
-        const prev = buf.rope.slice(old, old + range.length);
-        if (prev === text) continue;
-        let pre = 0, suf = 0;
-        while (pre < prev.length && pre < text.length && prev[pre] === text[pre]) pre++;
-        while (suf < prev.length - pre && suf < text.length - pre && prev[prev.length - 1 - suf] === text[text.length - 1 - suf]) suf++;
-        ops.push([range.from + pre, prev.length - pre - suf, text.slice(pre, text.length - suf)]);
-        delta += text.length - range.length; range.length = text.length;
+  private readonly sid: string;
+  private scrollPaused = false;
+  constructor(sid: string, buf: EdwinBuffer, frame: EdwinFrame) {
+    this.sid = sid; this.buf = buf; this.frame = frame;
+    this.wireScroll();
+  }
+  // Edwin virtualizes lines, not scrollTop. Its wheel moves point only in the selected frame,
+  // and a touch drag does not scroll its window. Use the same shown-line motion for both
+  // inputs without selecting the frame (the composer may have focus). All listeners are
+  // owned by the disposable reader root, never by the document or a shared Edwin hook.
+  private wireScroll() {
+    const { frame, buf } = this, Ed = FR.Ed!, root = frame.root;
+    const view = (e: Event) => frame.buffer === buf && e.target instanceof Node && frame.sel.view?.contains(e.target);
+    let pixels = 0;
+    const scroll = (dy: number, mode: number) => {
+      const w = frame.sel, lh = parseFloat(getComputedStyle(w.view).lineHeight), rows = Ed.windowRows(w);
+      pixels += dy * (mode === 1 ? lh : mode === 2 ? rows * lh : 1);
+      const lines = Math.trunc(pixels / lh);
+      if (!lines) return;
+      pixels -= lines * lh;
+      const tail = Math.max(0, buf.rope.length - 1), first = Ed.vLineNo(buf, w.start);
+      const bottom = Math.max(1, Ed.vLineNo(buf, tail) - rows + 1);
+      const next = clamp(first + lines, 1, Math.max(first, bottom));
+      const pt = frame.point(), line = Ed.vLineNo(buf, pt);
+      if (next !== first) { this.place = undefined; w.start = Ed.vLineStart(buf, next); }
+      if (lines > 0 && next >= bottom) {
+        this.scrollPaused = false; frame.setPoint(tail);
+      } else if (next !== first) {
+        const visible = clamp(line, next, next + rows - 1);
+        this.scrollPaused = visible === line && pt >= tail;
+        frame.setPoint(visible === line ? pt : Ed.vLineStart(buf, visible));
       }
+    };
+    root.addEventListener('wheel', e => {
+      if (!view(e) || !e.deltaY) return;
+      e.preventDefault(); e.stopPropagation(); // do not also apply Edwin's native wheel step
+      scroll(e.deltaY, e.deltaMode);
+    }, { capture: true, passive: false });
+    let finger: Touch | null = null;
+    root.addEventListener('touchstart', e => {
+      finger = e.touches.length === 1 && view(e) ? e.touches[0] : null; pixels = 0;
+    }, { passive: true });
+    root.addEventListener('touchmove', e => {
+      if (!finger || e.touches.length !== 1) return;
+      const to = e.touches[0], dy = finger.clientY - to.clientY;
+      if (!dy || Math.abs(to.clientX - finger.clientX) > Math.abs(dy)) return;
+      e.preventDefault(); finger = to; scroll(dy, 0);
+    }, { passive: false });
+    const end = () => { finger = null; };
+    root.addEventListener('touchend', end); root.addEventListener('touchcancel', end);
+  }
+  private readingPoint(pt: number) {
+    // A short scroll can leave point on the empty tail sentinel. At the next edit anchor
+    // to the last item's terminator instead: appending *before* the sentinel must not drag
+    // point (and therefore Edwin's viewport) through all the new rows.
+    return this.scrollPaused ? Math.min(pt, Math.max(0, this.buf.rope.length - 2)) : pt;
+  }
+  afterCommand(cmd: unknown, failed: boolean) {
+    // A short scroll can leave G targeting the very same point. Counted G into history
+    // and unrelated commands at the sentinel are not requests to follow.
+    if (!failed && this.scrollPaused && this.frame.buffer === this.buf && this.buf.rope.length - this.frame.point() <= 1) {
+      const name = FR.L!.cmdName(cmd);
+      if (name === 'evil-goto-line' || name === 'end-of-buffer') this.scrollPaused = false;
     }
-    if (delta) for (; i < this.ranges.size; i++) this.ranges.get(items[i])!.from += delta;
-    this.end += delta;
-    if (added.length) {
-      const from = this.end, parts: string[] = [];
-      for (const it of added) {
-        const text = acpReaderText(it);
-        this.ranges.set(it, { index: this.ranges.size, from: this.end, length: text.length, chars: 'mid' in it ? it.text.length : 0 });
-        this.end += text.length; parts.push(text);
+    this.readFolds();
+  }
+  get canFold() { return !!(FR.Ed!.setBufferFolds && FR.Ed!.getBufferFolds); }
+  get painting() { return !!(this.remainder || this.replacement); }
+  private start(index: number) {
+    let sum = 0;
+    for (; index > 0; index &= index - 1) sum += this.sums[index];
+    return sum;
+  }
+  private grow(range: AcpRange, n: number) {
+    range.length += n;
+    for (let i = range.index + 1; i < this.sums.length; i += i & -i) this.sums[i] += n;
+    this.invalidateFolds(range);
+  }
+  private register(item: AcpItem, text: string, toolHeader: number): AcpRange {
+    const key = acpItemKey(item);
+    const index = this.ranges.size, range: AcpRange = { item, key, index, length: 0, chars: 'mid' in item ? item.text.length : 0,
+      heading: text.indexOf('\n'), toolHeader, bodyVersion: item.k === 'tool' ? item.bodyVersion : undefined };
+    this.sums.push(this.start(index) - this.start(index & (index + 1)));
+    this.ranges.set(item, range);
+    if (this.isTurn(item)) this.turns.push(range);
+    if (item.k === 'tool') this.tools.push(range);
+    if (this.isTurn(item) || item.k === 'tool' || item.k === 'thought') {
+      this.sections.push(range); this.indexChoice(item, this.folded(item));
+    }
+    if (this.place) {
+      for (const a of [this.place.point, this.place.mark, this.place.start]) if (a?.key === key) a.range = range;
+    }
+    return range;
+  }
+  private isTurn(it: AcpItem) { return it.k === 'user' && it.closed; }
+  private folded(item: AcpItem) {
+    const closed = !this.isTurn(item);
+    if (!this.preferences) return closed;
+    return acpSameChoice(this.preferences.get(this.ranges.get(item)?.key ?? acpItemKey(item)), item) ? !closed : closed;
+  }
+  private choose(item: AcpItem, closed: boolean) {
+    this.storeChoice(item, closed);
+    this.indexChoice(item, closed);
+  }
+  private storeChoice(item: AcpItem, closed: boolean) {
+    const key = this.ranges.get(item)?.key ?? acpItemKey(item);
+    if (closed === !this.isTurn(item)) {
+      if (this.preferences?.delete(key)) this.dropEmptyChoices();
+    } else {
+      if (!this.preferences) {
+        this.preferences = new Map();
+        const s = SESS[this.sid];
+        if (this.epoch !== null && (!s || s.createdAt === this.epoch) && !ACP_READERS.get(this.buf)?.gone && !TOMBS.has(this.sid + ' ' + this.epoch)) {
+          ACP_FOLD_CHOICES.set(this.sid, { epoch: this.epoch, items: this.preferences });
+          if (ACP_FOLD_CHOICES.size > ACP_FOLD_LIMIT) ACP_FOLD_CHOICES.delete(ACP_FOLD_CHOICES.keys().next().value!);
+        }
       }
-      ops.push([from, 0, parts.join('')]);
+      this.preferences.set(key, item.k === 'thought' && item.first || true);
     }
-    let waiting = '';
-    for (const p of pending.values()) waiting += p.kind === 'permission' ? '· Permission: waiting\n' : '· Elicitation: waiting\n';
-    if (waiting !== this.waiting) { ops.push([this.end, this.waiting.length, waiting]); this.waiting = waiting; }
-    if (!ops.length) return;
+  }
+  private dropEmptyChoices() {
+    if (!this.preferences || this.preferences.size) return;
+    if (ACP_FOLD_CHOICES.get(this.sid)?.items === this.preferences) ACP_FOLD_CHOICES.delete(this.sid);
+    this.preferences = undefined;
+  }
+  forgetChoices() {
+    this.preferences = undefined;
+    this.candidates = this.sections.filter(r => !this.isTurn(r.item));
+    this.foldFrom = 0;
+    this.publishFolds();
+  }
+  finishReplay() {
+    if (!this.preferences?.size) return;
+    const absent = new Set(this.preferences.keys());
+    for (const { key, item } of this.sections) if (acpSameChoice(this.preferences.get(key), item)) absent.delete(key);
+    for (const key of absent) this.preferences.delete(key);
+    this.dropEmptyChoices();
+  }
+  private bound(rows: AcpRange[], pos: number, inclusive: boolean) {
+    let lo = 0, hi = rows.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1, at = this.start(rows[mid].index);
+      if (at < pos || inclusive && at === pos) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+  }
+  private lowerIndex(rows: AcpRange[], index: number) {
+    let lo = 0, hi = rows.length;
+    while (lo < hi) { const m = (lo + hi) >>> 1; if (rows[m].index < index) lo = m + 1; else hi = m; }
+    return lo;
+  }
+  private invalidateFolds(r: AcpRange) {
+    const parent = this.turns[this.lowerIndex(this.turns, r.index + 1) - 1];
+    const first = parent && this.candidates[this.lowerIndex(this.candidates, parent.index)] === parent ? parent : r;
+    this.foldFrom = Math.min(this.foldFrom, first.index);
+  }
+  private indexChoice(item: AcpItem, closed: boolean) {
+    const r = this.ranges.get(item);
+    if (!r) return; // received but not painted; register will pick up the choice
+    const i = this.lowerIndex(this.candidates, r.index);
+    if ((this.candidates[i] === r) === closed) return;
+    if (closed) this.candidates.splice(i, 0, r); else this.candidates.splice(i, 1);
+    this.invalidateFolds(r);
+  }
+  private publishFolds() {
+    const set = FR.Ed!.setBufferFolds;
+    if (!set) return;
+    const keep = this.lowerIndex(this.owners, this.foldFrom);
+    this.folds.length = this.owners.length = keep;
+    for (let i = this.lowerIndex(this.candidates, this.foldFrom); i < this.candidates.length;) {
+      const r = this.candidates[i++], turn = this.isTurn(r.item);
+      const after = turn ? this.turns[this.lowerIndex(this.turns, r.index + 1)]?.index ?? this.ranges.size : r.index + 1;
+      const s = this.start(r.index) + r.heading;
+      const end = this.remainder && after === this.ranges.size
+        ? this.start(this.remainder.range.index) + this.remainder.lastNewline : this.start(after) - 1;
+      if (end <= s) continue;
+      this.folds.push({ s, e: end }); this.owners.push(r);
+      if (turn) i = this.lowerIndex(this.candidates, after);
+    }
+    this.foldFrom = Infinity;
+    // Edwin invalidates *all* supplied ranges on edit, so the setter still needs the full list.
+    try { set(this.buf, this.folds); }
+    catch (e) {
+      this.folds.length = this.owners.length = this.foldFrom = 0;
+      if (!this.warnedFolds) { this.warnedFolds = true; console.warn('agent transcript: fold publication rejected', e); }
+      try { set(this.buf, []); } catch { /* The reader still works if the fold API is unavailable. */ }
+    }
+  }
+  // A foreign range is not evidence about any item, even if it shares a header newline.
+  readFolds(republish = true) {
+    if (!this.folds.length) return;
+    const closed = FR.Ed!.getBufferFolds!(this.buf);
+    let i = 0, opened = false;
+    for (let j = 0; j < this.folds.length; j++) {
+      const { s, e } = this.folds[j];
+      while (i < closed.length && closed[i].s < s) i++;
+      if (closed[i]?.s === s && closed[i].e === e) i++;
+      else { this.choose(this.owners[j].item, false); opened = true; }
+    }
+    if (opened && republish) this.publishFolds(); // reveal individually folded children of an opened turn
+  }
+  navigate(action: AcpNavigationAction, desired?: boolean, nativeOpen?: string) {
+    this.place = undefined;
+    const frame = this.frame, backend = ACP_READERS.get(this.buf)!;
+    if (action === 'follow') { this.scrollPaused = false; frame.setPoint(Math.max(0, this.buf.rope.length - 1)); return; }
+    const tools = action.endsWith('tool');
+    if (action === 'fold' || action === 'fold-all' || tools) {
+      // Before the scheduled first/reset paint, point and preferences can still belong to
+      // the old generation. Use the normal render transition before acting on the new one.
+      if (this.epoch !== backend.epoch || backend.cleared) {
+        backend.render();
+        if (backend.transcript !== this) return;
+      }
+      this.readFolds(); // an unfinished native command may have opened another item
+    }
+    const pt = frame.point();
+    if (action === 'fold' || action === 'fold-all') {
+      if (!this.canFold) return;
+      const r = this.sections[this.bound(this.sections, pt, true) - 1];
+      const turn = this.turns[this.bound(this.turns, pt, true) - 1];
+      const target = r && pt < this.start(r.index + 1) ? r : turn;
+      if (action === 'fold-all') {
+        const items = backend.items; // includes journal records queued for a later paint
+        const section = (it: AcpItem) => this.isTurn(it) || it.k === 'tool' || it.k === 'thought';
+        const fold = desired ?? items.some(it => section(it) && !this.folded(it));
+        for (const it of items) if (section(it)) this.storeChoice(it, fold);
+        this.candidates = fold ? this.sections.slice() : [];
+        this.foldFrom = 0;
+        if (fold && (turn || target)) frame.setPoint(this.start((turn || target).index));
+      } else if (target) {
+        const fold = desired ?? !this.folded(target.item);
+        const i = this.lowerIndex(this.owners, target.index);
+        if (!fold && nativeOpen && this.owners[i] === target) {
+          // The native catalogue is disjoint and only includes the last supplied closed targets.
+          // Point can be on a message inside this turn; address its visible semantic header.
+          if (pt > this.folds[i].s) frame.setPoint(this.start(target.index));
+          FR.L!.call(nativeOpen, []);
+          this.readFolds();
+          return;
+        }
+        this.choose(target.item, fold);
+        if (fold) frame.setPoint(this.start(target.index));
+      }
+      this.publishFolds(); return;
+    }
+    const rows = tools ? this.tools : this.turns;
+    const next = action.startsWith('next'), r = rows[this.bound(rows, pt, next) - (next ? 0 : 1)];
+    if (!r) return;
+    const pos = this.start(r.index);
+    if (tools && this.canFold) {
+      const parent = this.turns[this.bound(this.turns, pos, true) - 1];
+      if (parent && this.folded(parent.item)) { this.choose(parent.item, false); this.publishFolds(); }
+    }
+    frame.setPoint(pos);
+  }
+  private rememberPlace() {
+    const expectedPoint = this.frame.point(), point = this.readingPoint(expectedPoint), mark = this.buf.mark;
+    const w = FR.Ed!.leaves(this.frame.wroot).find(w => w.buffer === this.buf), tail = this.buf.rope.length - point <= 1;
+    const place: AcpReplayPlace = { expectedPoint, expectedMark: mark };
+    let at = 0;
+    for (const r of this.ranges.values()) {
+      const anchor = (p: number) => ({ key: r.key, offset: p - at });
+      if (!tail && point >= at && point < at + r.length) place.point = anchor(point);
+      if (!tail && w && w.start >= at && w.start < at + r.length) place.start = anchor(w.start);
+      if (mark != null && mark >= at && mark < at + r.length) place.mark = anchor(mark);
+      at += r.length;
+    }
+    this.place = place;
+  }
+  private restorePlace(done: boolean) {
+    const p = this.place;
+    if (!p) return;
+    const pos = (a?: AcpReplayAnchor) => a?.range ? this.start(a.range.index) + Math.min(a.offset, a.range.length - 1) : undefined;
+    const ready = (a?: AcpReplayAnchor) => !a || a.range && (a.range !== this.remainder?.range || a.offset < a.range.length);
+    if (done || ready(p.point) && ready(p.mark) && ready(p.start)) {
+      const pt = pos(p.point), mark = pos(p.mark), start = pos(p.start);
+      if (mark != null) this.buf.mark = mark;
+      const w = FR.Ed!.leaves(this.frame.wroot).find(w => w.buffer === this.buf);
+      if (w && start != null) w.start = start;
+      if (pt != null) this.frame.setPoint(pt);
+      this.place = undefined;
+    } else {
+      p.expectedPoint = this.frame.point(); p.expectedMark = this.buf.mark;
+    }
+  }
+  render(dirty: Set<AcpItem>, reset: boolean, epoch: number | null, replayed: boolean) {
+    const buf = this.buf;
+    // A pending editor command may already have opened a fold but not yet run its post-command hook.
+    // Read before an epoch switch or the first splice: the splice invalidates every owner range.
+    if (reset || dirty.size || this.painting) this.readFolds(false);
+    if (epoch !== this.epoch) {
+      const saved = ACP_FOLD_CHOICES.get(this.sid);
+      this.preferences = saved?.epoch === epoch ? saved.items : undefined;
+      if (saved && this.preferences) { ACP_FOLD_CHOICES.delete(this.sid); ACP_FOLD_CHOICES.set(this.sid, saved); }
+      this.place = undefined; this.epoch = epoch;
+    } else if (reset && this.ranges.size) this.rememberPlace();
+    else if (this.place && (this.frame.point() !== this.place.expectedPoint || buf.mark !== this.place.expectedMark)) this.place = undefined;
+    if (!reset && buf.rope.length && !this.painting && !dirty.size) { this.restorePlace(replayed); return; }
+    // runCallback renders in its finally. Never let it draw between a splice and its folds.
+    // Its undo transaction belongs to the Lisp current buffer. Do not finish a draft's undo
+    // group if the reader streams in the background; set-buffer selects no frame or window.
+    const L = FR.L!, saved = L.call('current-buffer') as EdwinBuffer;
+    if (saved !== buf) L.call('set-buffer', [buf]);
+    try {
+      if (!FR.Ed!.runCallback(() => { this.paint(dirty, reset, replayed); return true; }))
+        throw new Error('Edwin could not update the transcript');
+    } finally {
+      if (saved !== buf) L.call('set-buffer', [saved]);
+      buf.undo.length = buf.redo.length = 0; buf.pendingUndo = null;
+    }
+  }
+  private paint(dirty: Set<AcpItem>, reset: boolean, replayed: boolean) {
+    const buf = this.buf, ops: AcpSplice[] = [];
+    if (reset || !buf.rope.length) {
+      // An empty final line is the tail target for Evil's G.
+      ops.push([0, buf.rope.length, '\n']); this.ranges.clear(); this.sums = [0];
+      this.turns = []; this.tools = []; this.sections = []; this.remainder = this.replacement = null;
+      this.candidates.length = this.owners.length = this.folds.length = this.foldFrom = 0;
+    }
+    const deadline = performance.now() + ACP_PAINT_MS;
+    let chars = 0, count = 0, from = this.start(this.ranges.size);
+    const parts: string[] = [];
+    const flush = () => {
+      if (parts.length) { ops.push([from, 0, parts.join('')]); parts.length = 0; }
+      if (ops.length) { this.splice(ops); ops.length = 0; }
+      from = this.start(this.ranges.size);
+    };
+    const queue = dirty.values();
+    while (count < ACP_PAINT_BATCH && chars < ACP_PAINT_CHARS && (!count || performance.now() < deadline)) {
+      count++;
+      if (this.replacement) {
+        // Only the final step edits Edwin. The old body and its fold remain valid while preparing.
+        if (this.replacement.next().done) { this.replacement = null; from = this.start(this.ranges.size); }
+        continue;
+      }
+      if (!this.remainder) {
+        const entry = queue.next();
+        if (entry.done) break;
+        const it = entry.value, r = this.ranges.get(it);
+        dirty.delete(it);
+        if (r) {
+          flush();   // the rope now agrees with every offset in the index
+          chars += this.patch(r);
+          from = this.start(this.ranges.size);
+          continue;
+        }
+        if (it.k === 'tool') {
+          const header = acpToolHeader(it), body = acpToolBody(it), first = body.next();
+          this.remainder = { range: this.register(it, header, header.length), text: header + first.value,
+            more: first.done ? undefined : body, offset: 0, lastNewline: -1 };
+        } else {
+          const text = acpReaderText(it);
+          this.remainder = { range: this.register(it, text, 0), text, offset: 0, lastNewline: -1 };
+        }
+      }
+      const pending = this.remainder;
+      if (pending.more && pending.offset === pending.text.length) {
+        const next = pending.more.next();
+        pending.text = next.value; pending.offset = 0;
+        if (next.done) pending.more = undefined;
+      }
+      const { text, offset } = pending;
+      let end = Math.min(text.length, offset + ACP_PAINT_CHARS - chars);
+      if (end < text.length && /[\ud800-\udbff]/.test(text[end - 1])) end++;
+      const part = text.slice(offset, end);
+      parts.push(part);
+      if (pending.more || end < text.length) {
+        const newline = part.lastIndexOf('\n'); // inspect only this batch, never rescan a long unterminated line
+        if (newline >= 0) pending.lastNewline = pending.range.length + newline;
+      }
+      this.grow(pending.range, end - offset); chars += end - offset;
+      if (!pending.more && end === text.length) this.remainder = null; else pending.offset = end;
+    }
+    flush();
+    if (this.canFold && (count || reset)) this.publishFolds();
+    this.restorePlace(replayed && !this.painting && !dirty.size);
+  }
+  private patch(r: AcpRange): number {
+    const it = r.item, at = this.start(r.index);
+    let pos = at, remove = r.length, text: string;
+    if ('mid' in it) {
+      // CRLF can straddle chunks: replace the CR picture with the single newline.
+      const back = it.text[r.chars - 1] === '\r' && it.text[r.chars] === '\n' ? 1 : 0;
+      pos += r.length - 1 - back; remove = back;
+      text = acpIndent(it.text.slice(r.chars - back)); r.chars = it.text.length;
+    } else {
+      if (it.k === 'tool') {
+        const header = acpToolHeader(it);
+        if (r.bodyVersion === it.bodyVersion) { remove = r.toolHeader; text = header; }
+        else {
+          const body = acpToolBody(it), first = body.next();
+          if (!first.done) {
+            this.replacement = this.replaceTool(r, header, it.bodyVersion, first.value, body);
+            return 0;
+          }
+          text = header + first.value; r.bodyVersion = it.bodyVersion;
+        }
+        r.toolHeader = header.length; r.heading = header.indexOf('\n');
+      } else text = acpReaderText(it);
+      const old = this.buf.rope.slice(at, at + remove);
+      if (text === old) return 0;
+      let pre = 0, suf = 0;
+      while (pre < old.length && pre < text.length && old[pre] === text[pre]) pre++;
+      while (suf < old.length - pre && suf < text.length - pre && old[old.length - suf - 1] === text[text.length - suf - 1]) suf++;
+      pos += pre; remove -= pre + suf; text = text.slice(pre, text.length - suf);
+    }
+    if (remove || text.length) {
+      this.splice([[pos, remove, text]]);
+      this.grow(r, text.length - remove);
+    }
+    return Math.max(remove, text.length);
+  }
+  private *replaceTool(r: AcpRange, header: string, version: number | undefined, first: string, body: Generator<string, string>) {
+    const parts = [header, first];
+    for (;;) {
+      const next = body.next(); parts.push(next.value);
+      if (next.done) break;
+      yield;
+    }
+    const text = parts.join(''), at = this.start(r.index), rope = this.buf.rope, limit = Math.min(text.length, r.length);
+    // Compare rope windows rather than materializing a second multi-MiB string; trim both
+    // ends so point/mark/viewport on the unchanged suffix keep following the same text.
+    let pre = 0, suf = 0;
+    while (pre < limit) {
+      const end = Math.min(limit, pre + ACP_PAINT_CHARS), old = rope.slice(at + pre, at + end);
+      if (old !== text.slice(pre, end)) {
+        const start = pre;
+        while (old[pre - start] === text[pre]) pre++;
+        break;
+      }
+      pre = end; yield;
+    }
+    while (suf < limit - pre) {
+      const end = Math.min(limit - pre, suf + ACP_PAINT_CHARS), old = rope.slice(at + r.length - end, at + r.length - suf);
+      if (old !== text.slice(text.length - end, text.length - suf)) {
+        const start = suf;
+        while (old[old.length - 1 - (suf - start)] === text[text.length - 1 - suf]) suf++;
+        break;
+      }
+      suf = end; yield;
+    }
+    r.heading = header.indexOf('\n'); r.toolHeader = header.length; r.bodyVersion = version;
+    if (pre + suf !== text.length || pre + suf !== r.length) {
+      this.splice([[at + pre, r.length - pre - suf, text.slice(pre, text.length - suf)]]);
+      this.grow(r, text.length - r.length);
+    }
+  }
+  private splice(ops: AcpSplice[]) {
+    const buf = this.buf;
 
     // Edwin shifts point like an after-marker and does not shift window start. Keep the reader on the old text,
     // except at EOF. Positions inside a replaced span retain their offset as far as the replacement permits.
     const Ed = FR.Ed!, frame = this.frame, w = Ed.leaves(frame.wroot).find(w => w.buffer === buf);
-    let pt = frame.buffer === buf ? frame.point() : buf.pt, mark = buf.mark, start = w?.start ?? 0;
-    const tail = buf.rope.length - pt, follow = tail <= 1;
+    let pt = this.readingPoint(frame.buffer === buf ? frame.point() : buf.pt), mark = buf.mark, start = w?.start ?? 0;
+    this.scrollPaused = false; // point now has before-gravity on the old text; normal motion to EOF resumes follow
+    const tail = buf.rope.length - pt, follow = !this.place?.point && tail <= 1;
     for (const [pos, n, text] of ops) {
       const move = (p: number, after = false) => p < pos || (p === pos && !after) ? p
         : p >= pos + n ? p + text.length - n : pos + Math.min(p - pos, text.length);
@@ -1027,9 +1494,13 @@ class AcpTranscript {
 class AcpBackend implements CardBackend {
   declare n: AcpNode; declare L: AcpLive; declare spawn: boolean;
   declare seq: number; declare epoch: number | null; declare sum: SessionSummary | null; declare session: AcpSessionInfo;
+  private replayFrom = 0;
+  private replacingJournal = false;
   declare tries: number; declare rid: number; declare rids: Map<number, AcpReqCtx>;
   declare items: AcpItem[]; declare changed: Set<AcpItem>; declare byMsg: Map<string, AcpChunkItem>; declare byTool: Map<string, AcpToolItem>;
   declare pending: Map<number, AcpPending>; declare waiting: Map<string, AcpNoteItem>; declare panels: Map<number, HTMLElement>;
+  readonly unheld = new Map<number, AcpPending>();   // unanswerable since hello; retain metadata for the replayed outcome
+  statusItem?: AcpStatusItem;
   declare draft: string | null; declare seenSent: number;
   declare ws: WebSocket | null; declare timer: number | undefined; declare raf: number | undefined;
   declare waitHub: boolean; declare final: boolean; declare opened: boolean; declare helloSeen: boolean; declare replayed: boolean;
@@ -1078,15 +1549,20 @@ class AcpBackend implements CardBackend {
       this.helloSeen = true; this.tries = 0; this.spawn = false; this.missing = false; this.gone = false; this.failed = null;
       this.L.el.classList.remove('net-wait');
       if (m.reset) this.clear();   // F-A1: transcript, pending and cursor, before the replay
+      this.replayed = false; this.replayFrom = m.from;
+      if (!this.seq) this.replacingJournal = true; // fresh attach or reset, not a since-cursor catch-up
       if (info.createdAt !== this.epoch) this.seenSent = 0;
       this.epoch = info.createdAt ?? null;   // F-A2: sent on reopen, permission and elicitation
       if (m.from > this.seq + 1) this.add({ k: 'note', text: '… earlier messages not shown (replay truncated)' });
       // An answer may have been lost with the old socket: what the hub still holds can be answered again, the rest is gone
-      const held = new Set((Array.isArray(info.acp?.pending) ? info.acp.pending : []).map(x => x?.req));
-      for (const [req, p] of this.pending) if (held.has(req)) p.sent = false; else this.pending.delete(req);
+      const held = new Set((Array.isArray(info.acp?.pending) ? info.acp.pending : []).map(x => Number(x?.req)));
+      for (const [req, p] of this.pending) if (held.has(req)) p.sent = false; else this.retireRequest(req);
       this.setInfo(info);
     } else if (m.t === 'ev') this.fold(m.ev);
-    else if (m.t === 'replayed') { this.seq = Math.max(this.seq, m.head || 0); this.replayed = true; if (this.draft != null) this.draftBack(); this.schedule(); }
+    else if (m.t === 'replayed') {
+      this.seq = Math.max(this.seq, m.head || 0); this.replayed = true; this.unheld.clear(); this.syncStatus();
+      if (this.draft != null) this.draftBack(); this.schedule();
+    }
     else if (m.t === 'info') this.setInfo(m.info || {} as AcpInfo);
     else if (m.t === 'error') this.onError(m);
     else if (m.t === 'gone') this.goneElsewhere(m.epoch);
@@ -1109,7 +1585,7 @@ class AcpBackend implements CardBackend {
     else if (ctx) toast(name + ': ' + why);
     else this.add({ k: 'note', cls: 'err', text: why });
     const p = ctx?.req != null && ctx.epoch === this.epoch ? this.pending.get(ctx.req) : null;
-    if (p) { if (m.code === 'stale' || m.code === 'already_resolved') this.pending.delete(ctx!.req!); else p.sent = false; }
+    if (p) { if (m.code === 'stale' || m.code === 'already_resolved') this.retireRequest(ctx!.req!); else p.sent = false; }
     if (ctx?.t === 'prompt') this.draftBack();
     if (ctx?.t === 'set_mode') this.modeWanted = null;
     this.schedule();
@@ -1135,6 +1611,7 @@ class AcpBackend implements CardBackend {
   reconnect() { if (!this.disposed && this.ws?.readyState! > 1) { this.tries = 0; this.failed = null; this.connect(); } }
   // /rpc or /acp `gone`: the session was forgotten in another tab or by wb; never respawn on our own (ROB-19)
   goneElsewhere(epoch?: number | null) {
+    if (epoch != null && ACP_FOLD_CHOICES.get(this.n.id)?.epoch === epoch) ACP_FOLD_CHOICES.delete(this.n.id);
     if (this.disposed || this.restarting || this.gone) return;
     if (epoch != null && (epoch === this.ended || (this.epoch != null && epoch !== this.epoch))) return;   // F-A3: our own restart's old epoch
     this.gone = true; this.final = true; clearTimeout(this.timer); WAKE.delete(this); this.L.el.classList.remove('net-wait');
@@ -1180,28 +1657,31 @@ class AcpBackend implements CardBackend {
         || [...this.pending.values()].some(p => p.kind === 'elicitation' && p.request.mode !== 'url')) return;
     const Ed = FR.Ed!, L = FR.L!, host = el('div', 'ag-reader');
     let buf: EdwinBuffer | null = null, frame: EdwinFrame | null = null;
+    let reader: AcpTranscript;
     try {
-      frTranscriptKeymap();
       buf = L.call('get-buffer-create', [L.call('generate-new-buffer-name', [' *agent-transcript ' + this.n.id + '*'])]) as EdwinBuffer;
       buf.mode = 'wb-agent-transcript-mode';
       Object.defineProperty(buf, 'readOnly', { value: true, writable: false });
       host.setAttribute('role', 'region'); host.setAttribute('aria-label', 'Agent transcript');
       frame = Ed.makeFrame(host, { buffer: buf, kind: 'card', fontSize: FR_FONT });
       $('.ed-input', host)!.setAttribute('aria-label', 'Agent transcript keyboard input');
+      reader = new AcpTranscript(this.n.id, buf, frame);
+      frTranscriptKeymap(reader.canFold);
     } catch (e) {
       this.destroyTranscript(buf, frame ?? Ed.E.frames.find(f => f.root === host) ?? null);
       console.warn('agent transcript: Edwin frame not loaded', e);
       return;
     }
-    this.transcript = new AcpTranscript(buf, frame);
+    this.transcript = reader;
     ACP_READERS.set(buf, this);
-    this.L.logEl.replaceWith(host);
+    this.L.logEl.replaceWith(acpReaderActions(reader), host);
     this.L.logEl.replaceChildren();
     for (const it of this.items) delete it.el;
     this.changed = new Set(this.items);
     this.schedule();
   }
   destroyTranscript(buf: EdwinBuffer | null, frame: EdwinFrame | null) {
+    $('.ag-reader-actions', this.L.body)?.remove();
     try { frame?.destroy(); } catch (e) { console.warn('agent transcript: could not destroy frame', e); }
     if (buf) {
       ACP_READERS.delete(buf);
@@ -1325,49 +1805,82 @@ class AcpBackend implements CardBackend {
   }
   clear() {   // the panels go at once: no button of the old incarnation survives until the next frame
     this.items = []; this.changed.clear(); this.byMsg.clear(); this.byTool.clear(); this.pending.clear(); this.waiting.clear();
+    this.unheld.clear(); this.statusItem = undefined;
     for (const P of this.panels.values()) P.remove();
     this.panels.clear();
     this.seq = 0; this.cleared = true; this.authNeeded = false; this.modeSeen = undefined;
   }
-  add<T extends AcpItem>(it: T): T { this.items.push(it); this.changed.add(it); return it; }
+  add<T extends AcpItemSeed>(seed: T, seq = this.seq): T & { seq: number } {
+    const it = Object.assign(seed, { seq }); this.items.push(it); this.changed.add(it); return it;
+  }
+  holdRequest(req: number, p: AcpPending, title: string) {
+    this.pending.set(req, p);
+    if (this.agents) p.item = this.add({ k: 'note', cls: 'held', request: p.kind === 'permission' ? 'Permission' : 'Elicitation', text: 'waiting' + (title ? ' — ' + title : '') }, req);
+  }
+  retireRequest(req: number) {
+    const p = this.pending.get(req);
+    this.pending.delete(req);
+    if (p?.item) { this.unheld.set(req, p); p.item.text = 'no longer pending'; delete p.item.cls; this.changed.add(p.item); }
+  }
+  resolveRequest(req: number, label: 'Permission' | 'Elicitation', p: AcpPending | undefined, outcome: string): AcpNoteItem {
+    this.pending.delete(req); this.unheld.delete(req);
+    if (!p?.item) return this.add({ k: 'note', text: outcome, request: this.agents ? label : undefined }, req);
+    p.item.text = outcome; delete p.item.cls; this.changed.add(p.item); return p.item;
+  }
   fold(ev: JournalEvent | undefined) {
     if (!ev || !(ev.seq > this.seq)) return;   // the cursor: an event never applies twice
+    // The hub stamps a coalesced text run with its last event's seq and timestamp; hello.from
+    // is the first covered seq of the retained suffix, even when pinned requests precede it.
+    const from = this.replayed ? ev.seq : Math.min(ev.seq, Math.max(this.seq + 1, this.replayFrom));
     this.seq = ev.seq;
-    try { this.apply(ev); } catch (e) { console.warn('acp: event ' + ev.seq + ' not shown', e); }
-    this.schedule();
+    try { this.apply(ev, from); } catch (e) { console.warn('acp: event ' + ev.seq + ' not shown', e); }
+    const update = ev.e === 'update' && ev.update?.sessionUpdate;
+    this.schedule(typeof update === 'string' && (Object.hasOwn(CHUNK_KIND, update) || update === 'tool_call' || update === 'tool_call_update'));
   }
-  apply(ev: JournalEvent) {
+  apply(ev: JournalEvent, from: number) {
     switch (ev.e) {
       case 'prompt': {
-        const text = (Array.isArray(ev.prompt) ? ev.prompt : []).map(blockText).join('');
-        this.add({ k: 'user', text, closed: true });
+        this.byMsg.clear();
+        const blocks = Array.isArray(ev.prompt) ? ev.prompt : [], text = blocks.map(blockText).join('');
+        this.add({ k: 'user', text, closed: true, journalKey: this.agents
+          ? 'prompt:' + ev.seq + ':' + ev.ts + ':' + (blocks.length === 1 ? acpJournalBlock(blocks[0]) : JSON.stringify(blocks)) : undefined });
         if (this.draft != null && text === this.draft) this.echoed();
         break;
       }
-      case 'update': this.update(ev.update || {}); break;
+      case 'update': this.update(ev.update || {}, from, ev.ts, ev.sessionId); break;
       case 'turn_end': this.add(ev.stopReason === 'end_turn' ? { k: 'sep' } : { k: 'note', text: 'stopped: ' + vtext(ev.stopReason) }); break;
       case 'turn_error': this.add({ k: 'note', cls: 'err', text: 'turn failed: ' + vtext(ev.message) }); break;
       case 'setup_error':
         this.add({ k: 'note', cls: 'err', text: (ev.code === 'revive_failed' ? 'could not revive: ' : 'setup failed: ') + vtext(ev.message) });
         if (ev.code === 'auth_required') this.authNeeded = true;
         break;
-      case 'permission':
-        this.pending.set(ev.seq, { kind: 'permission', toolCall: ev.toolCall && typeof ev.toolCall === 'object' ? ev.toolCall : {}, options: Array.isArray(ev.options) ? ev.options : [] });
-        if (ev.toolCall?.toolCallId != null) this.tool(ev.toolCall);
-        break;
-      case 'permission_resolved': {
-        const p = this.pending.get(ev.req as number), o: JsonObject = ev.outcome as JsonObject || {}, opt = p?.options?.find(x => x?.optionId === o.optionId), by = ev.by && ev.by !== 'user' ? ' (by ' + vtext(ev.by) + ')' : '';   // p may be an elicitation, which has no options
-        this.pending.delete(ev.req as number);
-        const verb = /^allow/.test(vtext(opt?.kind)) ? 'allowed' : /^reject/.test(vtext(opt?.kind)) ? 'rejected' : 'answered';
-        this.add({ k: 'note', text: o.outcome === 'selected' ? verb + ': ' + vtext(opt?.name || o.optionId) + by : 'permission cancelled' + by });
+      case 'permission': {
+        const toolCall = ev.toolCall && typeof ev.toolCall === 'object' ? ev.toolCall : {};
+        if (toolCall.toolCallId != null) this.tool(toolCall);
+        this.holdRequest(ev.seq, { kind: 'permission', toolCall, options: Array.isArray(ev.options) ? ev.options : [] }, vtext(toolCall.title));
         break;
       }
-      case 'elicitation': this.pending.set(ev.seq, { kind: 'elicitation', request: ev.request && typeof ev.request === 'object' ? ev.request : {} }); break;
+      case 'permission_resolved': {
+        const req = Number(ev.req), p = this.pending.get(req) ?? this.unheld.get(req), o = ev.outcome as JsonObject | null;
+        const opt = p?.options?.find(x => x?.optionId === o?.optionId), by = ev.by && ev.by !== 'user' ? ' (by ' + vtext(ev.by) + ')' : '';
+        const verb = /^allow/.test(vtext(opt?.kind)) ? 'allowed' : /^reject/.test(vtext(opt?.kind)) ? 'rejected' : 'answered';
+        this.resolveRequest(req, 'Permission', p, o?.outcome === 'selected' ? verb + ': ' + vtext(opt?.name || o.optionId) + by : 'permission cancelled' + by);
+        break;
+      }
+      case 'elicitation': {
+        const request = ev.request && typeof ev.request === 'object' ? ev.request : {};
+        this.holdRequest(ev.seq, { kind: 'elicitation', request }, vtext(request.message)); break;
+      }
       case 'elicitation_resolved': {
-        const q: JsonObject = this.pending.get(ev.req as number)?.request || {}, r: JsonObject = ev.response as JsonObject || {}, by = ev.by && ev.by !== 'user' ? ' (by ' + vtext(ev.by) + ')' : '';
-        this.pending.delete(ev.req as number);
-        if (q.mode === 'url' && r.action === 'accept') { const host = urlHost(q.url); this.waiting.set(vtext(q.elicitationId), this.add({ k: 'note', text: 'waiting for ' + host + '…', host })); }
-        else this.add({ k: 'note', text: 'question ' + (({ accept: 'answered', decline: 'declined', cancel: 'cancelled' } as Record<string, string>)[r.action as string] || 'answered') + by });
+        const req = Number(ev.req), p = this.pending.get(req) ?? this.unheld.get(req), q = p?.request, r = ev.response as JsonObject | null;
+        const by = ev.by && ev.by !== 'user' ? ' (by ' + vtext(ev.by) + ')' : '';
+        if (q?.mode === 'url' && r?.action === 'accept') {
+          const host = urlHost(q.url), it = this.resolveRequest(req, 'Elicitation', p, 'waiting for ' + host + '…');
+          it.host = host; this.waiting.set(vtext(q.elicitationId), it);
+        } else {
+          const action = r?.action === 'decline' ? 'declined' : r?.action === 'cancel' ? 'cancelled' : 'answered';
+          this.resolveRequest(req, 'Elicitation', p, 'question ' + action + by);
+        }
         break;
       }
       case 'elicitation_complete': {
@@ -1376,46 +1889,76 @@ class AcpBackend implements CardBackend {
         break;
       }
       case 'spawn': this.authNeeded = false; this.add({ k: 'note', text: ev.via === 'revive' ? 'agent restarted to revive the session' : 'agent started' }); break;
-      case 'session':
+      case 'session': {
+        const mode = (ev.modes as JsonObject | null)?.currentModeId;
         this.session.configOptions = ev.configOptions;
+        this.modeSeen = typeof mode === 'string' ? mode : undefined;
+        this.syncStatus();
         this.authNeeded = false; this.add({ k: 'note', text: ev.via === 'load' ? 'resumed via load' : ev.via === 'resume' ? 'resumed' : 'session ready' }); break;
+      }
       case 'authenticate': this.add({ k: 'note', text: 'authenticating…' }); break;
-      case 'mode': this.modeSeen = vtext(ev.modeId); this.add({ k: 'note', text: 'mode: ' + vtext((this.session.modes?.availableModes || []).find(x => x?.id === ev.modeId)?.name || ev.modeId) }); break;
-      case 'config': this.session.configOptions = ev.configOptions; break;
+      case 'mode':
+        this.modeSeen = vtext(ev.modeId);
+        if (this.agents) this.syncStatus();
+        else this.add({ k: 'note', text: 'mode: ' + vtext((this.session.modes?.availableModes || []).find(x => x?.id === ev.modeId)?.name || ev.modeId) });
+        break;
+      case 'config': this.session.configOptions = ev.configOptions; this.syncStatus(); break;
       case 'notice': this.add({ k: 'note', cls: ev.level === 'error' ? 'err' : ev.level === 'warn' ? 'warn' : '', text: vtext(ev.text) }); break;
       case 'exit': this.add({ k: 'note', text: 'agent exited' + (ev.reason ? ' (' + vtext(ev.reason) + ')' : '') }); break;
     }
   }
-  update(u: JsonObject) {
-    const k = CHUNK_KIND[u.sessionUpdate as string];
+  update(u: JsonObject, from: number, ts: number, sessionId?: string) {
+    const tag = u.sessionUpdate, k = typeof tag === 'string' && Object.hasOwn(CHUNK_KIND, tag) ? CHUNK_KIND[tag] : undefined;
     if (k) {   // a chunk joins the open item of its kind and messageId, else the last item when neither has one
       const mid = u.messageId == null ? null : vtext(u.messageId), key = k + '\n' + mid, last = this.items[this.items.length - 1];
       let it = mid != null ? this.byMsg.get(key) : last?.k === k && last.mid == null && !last.closed ? last : null;
-      if (!it) { it = this.add({ k, text: '', mid }); if (mid != null) this.byMsg.set(key, it); }
-      it.text += blockText(u.content); this.changed.add(it);
+      const text = blockText(u.content);
+      if (!it) {
+        it = this.add({ k, text: '', mid });
+        if (this.agents) {
+          it.journalKey = k + ':' + from + (mid == null ? '' : ':msg:' + mid);
+          if (k === 'thought') it.first = { through: this.seq, ts, sessionId, text: acpJournalBlock(u.content) };
+        }
+        if (mid != null) this.byMsg.set(key, it);
+      } else if (it.first && it.first.sessionId === sessionId && it.first.text[0] !== 'j'
+          && from === (it.first.joined ?? it.first).through + 1 && acpTextBlock(u.content)) {
+        // Only adjacent text chunks can be one hub replay event. A messageId can also
+        // join chunks across intervening records on screen; those are not a replay run.
+        const run = it.first.joined ??= { through: this.seq, ts, text: it.first.text };
+        run.through = this.seq; run.ts = ts; run.text += text;
+      }
+      it.text += text; this.changed.add(it);
       return;
     }
     if (u.sessionUpdate === 'tool_call' || u.sessionUpdate === 'tool_call_update') this.tool(u);
-    else if (u.sessionUpdate === 'plan') this.session = { ...this.session, plan: { entries: Array.isArray(u.entries) ? u.entries : [] } };
-    else if (u.sessionUpdate === 'current_mode_update') this.modeSeen = vtext(u.currentModeId);
-    else if (u.sessionUpdate === 'config_option_update') this.session.configOptions = u.configOptions;
+    else if (u.sessionUpdate === 'plan') { this.session.plan = { entries: Array.isArray(u.entries) ? u.entries : [] }; this.syncStatus(); }
+    else if (u.sessionUpdate === 'current_mode_update') { this.modeSeen = vtext(u.currentModeId); this.syncStatus(); }
+    else if (u.sessionUpdate === 'config_option_update') { this.session.configOptions = u.configOptions; this.syncStatus(); }
   }
   tool(u: JsonObject) {   // tool_call and tool_call_update merge into one item per toolCallId; content replaces (ACP)
     const id = vtext(u.toolCallId); let it = this.byTool.get(id);
     if (!it) { it = this.add({ k: 'tool', id, status: 'pending' }); this.byTool.set(id, it); }
-    for (const f of ['title', 'kind', 'status', 'content', 'locations'] as const) if (u[f] != null) it[f] = u[f];
+    for (const f of ['title', 'kind', 'status'] as const) if (u[f] != null) it[f] = u[f];
+    for (const f of ['content', 'locations', 'rawInput', 'rawOutput'] as const) if (u[f] != null && it[f] !== u[f]) {
+      it[f] = u[f]; it.bodyVersion = (it.bodyVersion ?? 0) + 1;
+    }
     this.changed.add(it);
   }
-  schedule() { if (!this.raf && !this.disposed) this.raf = requestAnimationFrame(() => { this.raf = 0; this.render(); }); }
+  private controlsDirty = true;
+  schedule(textOnly = false) {
+    if (!textOnly) this.controlsDirty = true;
+    if (!this.raf && !this.disposed) this.raf = requestAnimationFrame(() => { this.raf = 0; this.render(); });
+  }
   render() {
     const L = this.L, log = L.logEl; if (this.disposed || !log) return;
     const reader = this.transcript;
     if (reader) {
       if (reader.frame.buffer !== reader.buf || !FR.Ed!.E.buffers.includes(reader.buf)) this.fallbackTranscript(reader);
       else try {
-        reader.render(this.items, this.changed, this.pending, !!this.cleared);
+        reader.render(this.changed, !!this.cleared, this.epoch, !!this.replayed);
         this.cleared = false;
-        if (this.changed.size) this.schedule();
+        if (this.changed.size || reader.painting) this.schedule(true);
+        else if (this.replacingJournal && this.replayed) { reader.finishReplay(); this.replacingJournal = false; }
       } catch (e) {
         this.fallbackTranscript(reader);
         console.warn('agent transcript: Edwin paint failed', e);
@@ -1428,15 +1971,35 @@ class AcpBackend implements CardBackend {
       this.changed.clear();
       if (stick) log.scrollTop = log.scrollHeight;
     }
+    if (!this.controlsDirty) return;
+    this.controlsDirty = false;
     this.renderPlan(); this.renderPending(); this.paint();
     if (live.$agents === L) meshRender();
   }
+  syncStatus() {
+    if (!this.agents) return;   // canvas cards keep their existing DOM plan and mode picker
+    const entries = acpPlanEntries(this.session);
+    const active = entries.find(e => e?.status === 'in_progress')?.content;
+    const plan = entries.length ? entries.filter(e => e?.status === 'completed').length + '/' + entries.length + ' completed' + (active ? ' · ' + vtext(active) : '') : '';
+    const mode = this.modeNow(), fields = mode ? ['Mode=' + mode] : [];
+    for (const o of Array.isArray(this.session.configOptions) ? this.session.configOptions : []) {
+      if (!o || typeof o !== 'object' || Array.isArray(o) || o.currentValue == null || !(o.name || o.id)) continue;
+      fields.push(vtext(o.name || o.id) + '=' + vtext(o.currentValue));
+    }
+    const settings = fields.join(' · ');
+    if (this.statusItem) {
+      if (this.statusItem.plan === plan && this.statusItem.settings === settings) return;
+      this.statusItem.plan = plan; this.statusItem.settings = settings; this.changed.add(this.statusItem);
+    } else if (plan || settings) this.statusItem = this.add({ k: 'status', plan, settings });
+  }
   renderPlan() {
-    const box = $('.ag-plan', this.L.body)!, es: any[] = Array.isArray((this.session.plan as any)?.entries) ? (this.session.plan as any).entries : [], key = JSON.stringify(es);   // any: plan entries from the agent, read by duck typing
+    const box = $('.ag-plan', this.L.body)!;
+    if (this.transcript) { box.hidden = true; this.planKey = undefined; return; }
+    const es = acpPlanEntries(this.session), key = JSON.stringify(es);
     if (key === this.planKey) return; this.planKey = key;
     box.hidden = !es.length;
     let d = box.firstChild as HTMLDetailsElement | null; if (!d) { d = el('details'); d.open = true; box.append(d); }
-    const st = (e: any): string => (PLAN_GLYPH[e?.status] ? e.status : 'pending');   // any: one of those plan entries
+    const st = (e: JsonObject | null) => Object.hasOwn(PLAN_GLYPH, vtext(e?.status)) ? vtext(e?.status) : 'pending';
     d.replaceChildren(el('summary', '', 'Plan ' + es.filter(e => e?.status === 'completed').length + '/' + es.length), ...es.map(e => el('div', 'pe ' + st(e), PLAN_GLYPH[st(e)] + ' ' + vtext(e?.content))));
   }
   renderPending() {
@@ -1565,12 +2128,16 @@ function acpItemEl(it: AcpItem): HTMLElement {
   if (it.k === 'thought') { const d = el('details', 'ag-thought'); d.append(el('summary', '', 'thinking'), el('div', 'ag-msg')); return d; }
   return el('div', ({ user: 'ag-msg ag-user', asst: 'ag-msg ag-asst', tool: 'ag-tool', sep: 'ag-sep' } as Record<string, string>)[it.k] || 'ag-note');
 }
+function acpPlanEntries(session: AcpSessionInfo): (JsonObject | null)[] {
+  const entries = (session.plan as JsonObject | null)?.entries;
+  return Array.isArray(entries) ? entries as (JsonObject | null)[] : [];
+}
 function acpToolStatus(it: AcpToolItem) {
   const status = vtext(it.status);
   return Object.hasOwn(TOOL_GLYPH, status) ? status : 'pending';
 }
-function acpToolLocations(it: AcpToolItem) {
-  const locs = Array.isArray(it.locations) ? it.locations as (AcpToolLocation | null)[] : [];
+function acpToolLocations(locations: AcpToolItem['locations']) {
+  const locs = Array.isArray(locations) ? locations as (AcpToolLocation | null)[] : [];
   return locs.length ? locs.map(l => vtext(l?.path) + (l?.line != null ? ':' + vtext(l.line) : '')).join('  ') : null;
 }
 function acpToolText(item: JsonValue) {
@@ -1578,24 +2145,48 @@ function acpToolText(item: JsonValue) {
   return c?.type === 'terminal' ? '[terminal output not available]' : blockText(c?.content);
 }
 
-function acpReaderText(it: AcpItem): string {
-  if (it.k === 'user') return 'Prompt: ' + acpIndent(it.text) + '\n';
+function acpReaderText(it: Exclude<AcpItem, AcpToolItem>): string {
+  if (it.k === 'user') return (it.closed ? 'Prompt: ' : 'User:\n  ') + acpIndent(it.text) + '\n';
   if (it.k === 'asst' || it.k === 'thought') return (it.k === 'asst' ? 'Assistant:' : 'Thinking:') + '\n  ' + acpIndent(it.text) + '\n';
-  if (it.k === 'note') return '· ' + acpIndent(it.text) + '\n';
-  if (it.k === 'sep') return '\n';
-  if (it.k !== 'tool') return '';
-  const locs = acpToolLocations(it);
-  let text = 'Tool: ' + acpIndent(vtext(it.kind) || 'tool') + ' [' + acpToolStatus(it) + '] ' + acpIndent(vtext(it.title)) + '\n';
-  if (locs != null) text += '  Location: ' + acpIndent(locs) + '\n';
-  for (const c of Array.isArray(it.content) ? it.content : []) {
+  if (it.k === 'note') return (it.request ? it.request + ' #' + it.seq + ': ' : '· ') + acpIndent(it.text) + '\n';
+  if (it.k === 'status') return (it.plan ? 'Plan: ' + acpIndent(it.plan) + '\n' : '') + (it.settings ? 'Settings: ' + acpIndent(it.settings) + '\n' : '');
+  return '\n';   // normal turn end
+}
+function acpToolHeader(it: AcpToolItem): string {
+  return 'Tool: ' + acpIndent(vtext(it.kind) || 'tool') + ' [' + acpIndent(vtext(it.status) || 'pending') + '] ' + acpIndent(vtext(it.title)) + '\n';
+}
+// The reducer replaces fields on the same item between paints. Capture the header's body
+// revision by reference before yielding; formatting can still proceed one field at a time.
+function* acpToolFields({ locations, rawInput, content, rawOutput }: AcpToolItem): Generator<[string, string]> {
+  const locs = acpToolLocations(locations);
+  if (locs != null) yield ['  Location: ', locs];
+  if (rawInput != null) yield ['  Input:\n  ', vtext(rawInput)];
+  for (const c of Array.isArray(content) ? content : []) {
     if ((c as AcpDiffContent | null)?.type === 'diff') {
       const { title, lines, large } = acpDiff(c as AcpDiffContent, acpReaderField);
-      if (large == null) text += '  Diff: ' + acpIndent(title) + '\n';
-      for (const [, line] of lines) text += '  ' + acpIndent(line) + '\n';
+      if (large == null) yield ['  Diff: ', title];
+      for (const [, line] of lines) yield ['  ', line];
     } else {
       const output = acpToolText(c);
-      if (output) text += '  Output:\n  ' + acpIndent(output) + '\n';
+      if (output) yield ['  Output:\n  ', output];
     }
+  }
+  if (rawOutput != null) yield ['  Output:\n  ', vtext(rawOutput)];
+}
+// Format long fields as the paint cursor consumes them; never flatten a multi-MiB
+// indented string before yielding the first piece.
+function* acpToolBody(it: AcpToolItem): Generator<string, string> {
+  let text = '';
+  for (const [label, field] of acpToolFields(it)) {
+    text += label;
+    for (let i = 0; i < field.length;) {
+      let j = Math.min(i + ACP_PAINT_CHARS, field.length);
+      // CRLF must normalize together; never split a surrogate pair between rope pieces.
+      if (j < field.length && (field[j - 1] === '\r' && field[j] === '\n' || /[\ud800-\udbff]/.test(field[j - 1]))) j++;
+      text += acpIndent(field.slice(i, j)); i = j;
+      if (text.length >= ACP_PAINT_CHARS) { yield text; text = ''; }
+    }
+    text += '\n';
   }
   return text;
 }
@@ -1603,9 +2194,13 @@ function acpFill(it: AcpItem) {
   const e = it.el!;
   if (it.k === 'user' || it.k === 'asst') e.textContent = it.text;
   else if (it.k === 'thought') e.lastChild!.textContent = it.text;
-  else if (it.k === 'note') { e.textContent = it.text; e.classList.toggle('err', it.cls === 'err'); e.classList.toggle('warn', it.cls === 'warn'); }
+  else if (it.k === 'note') {
+    e.hidden = it.cls === 'held';   // the pending panel already displays the request in the DOM fallback
+    e.textContent = it.text; e.classList.toggle('err', it.cls === 'err'); e.classList.toggle('warn', it.cls === 'warn');
+  }
+  else if (it.k === 'status') e.hidden = true;   // the DOM fallback has its own plan and settings
   else if (it.k === 'tool') {
-    const st = acpToolStatus(it), h = el('div', 'th'), locs = acpToolLocations(it);
+    const st = acpToolStatus(it), h = el('div', 'th'), locs = acpToolLocations(it.locations);
     h.append(el('span', 'tg ' + st, TOOL_GLYPH[st]), el('b', '', vtext(it.kind) || 'tool'), el('span', 'tt', vtext(it.title)));
     const parts: HTMLElement[] = [h];
     if (locs != null) parts.push(el('div', 'tl', locs));
@@ -6445,8 +7040,33 @@ function frPromptKeymap() {
   }
   L.set('wb-agent-prompt-mode-map', map); frPromptKeys = true;
 }
+const ACP_NAVIGATION = [
+  ['previous-turn', 'C-c p', 'Previous turn', '↑ Turn'],
+  ['next-turn', 'C-c n', 'Next turn', '↓ Turn'],
+  ['previous-tool', 'C-c [', 'Previous tool', '↑ Tool'],
+  ['next-tool', 'C-c ]', 'Next tool', '↓ Tool'],
+  ['follow', 'C-c f', 'Follow tail', 'Follow'],
+] as const;
+const ACP_NAVIGATION_WITH_FOLDS = [...ACP_NAVIGATION,
+  ['fold', 'C-c TAB', 'Toggle fold at point', 'Fold'],
+  ['fold-all', 'C-c a', 'Toggle all folds', 'Fold all'],
+] as const;
+type AcpNavigationAction = (typeof ACP_NAVIGATION_WITH_FOLDS)[number][0];
+
+function acpReaderActions(reader: AcpTranscript): HTMLElement {
+  const bar = el('div', 'ex-btns ag-reader-actions');
+  bar.setAttribute('role', 'group'); bar.setAttribute('aria-label', 'Transcript navigation');
+  for (const [action, key, label, short] of reader.canFold ? ACP_NAVIGATION_WITH_FOLDS : ACP_NAVIGATION) {
+    const b = el('button', 'tb', short);
+    b.type = 'button'; b.title = `${label} (${key})`; b.setAttribute('aria-label', label);
+    b.onpointerdown = e => e.preventDefault();   // navigate without blurring a draft or summoning a keyboard
+    b.onclick = () => reader.navigate(action);
+    bar.append(b);
+  }
+  return bar;
+}
 let frTranscriptKeys = false;
-function frTranscriptKeymap() {
+function frTranscriptKeymap(canFold: boolean) {
   if (frTranscriptKeys) return;
   const Ed = FR.Ed!, L = FR.L!, map = new Ed.Keymap('wb-agent-transcript-mode-map'), name = 'wb-agent-transcript-edit-prompt';
   L.CMD(name, '', '', 'Edit an unsent prompt for this agent.', () => {
@@ -6455,7 +7075,31 @@ function frTranscriptKeymap() {
     return false;
   });
   L.call('define-key', [map, 'C-c C-e', L.intern(name)]);
+  for (const [action, key, label] of canFold ? ACP_NAVIGATION_WITH_FOLDS : ACP_NAVIGATION) {
+    const cmd = 'wb-agent-transcript-' + action;
+    L.CMD(cmd, '', '', label + '.', () => {
+      ACP_READERS.get(L.call('current-buffer') as EdwinBuffer)?.transcript?.navigate(action);
+      return false;
+    });
+    L.call('define-key', [map, key, L.intern(cmd)]);
+  }
   L.set('wb-agent-transcript-mode-map', map);
+  if (canFold) {
+    // Open items (and a parent that contains a closed child) cannot be listed in a disjoint
+    // closed-range catalogue. Resolve those against journal headings, never agent-supplied text.
+    for (const [keys, action, desired, native] of [
+      ['z a', 'fold', undefined, 'evil-toggle-fold'], ['TAB', 'fold', undefined, 'org-cycle'],
+      ['z c', 'fold', true], ['z o', 'fold', false, 'evil-open-fold'], ['z O', 'fold', false, 'evil-open-fold-rec'],
+      ['z M', 'fold-all', true], ['z R', 'fold-all', false],
+    ] as const) {
+      const cmd = 'wb-agent-transcript-fold-key-' + keys.replace(' ', '-');
+      L.CMD(cmd, '', '', 'Change transcript fold visibility.', () => {
+        ACP_READERS.get(L.call('current-buffer') as EdwinBuffer)?.transcript?.navigate(action, desired, native);
+        return false;
+      });
+      for (const state of ['normal', 'motion']) L.call('evil-define-key', [L.intern(state), L.intern('wb-agent-transcript-mode'), keys, L.intern(cmd)]);
+    }
+  }
   for (const cmd of ['save-buffer', 'write-file']) L.call('advice-add', [L.intern(cmd), L.intern(':before'), () => {
     if (ACP_READERS.has(L.call('current-buffer') as EdwinBuffer)) throw new Error('Agent transcripts do not visit files');
     return false;
@@ -6466,13 +7110,14 @@ function frTranscriptKeymap() {
   }]);
   const post = Ed.hooks.postCommand;
   Ed.hooks.postCommand = (cmd, b, failed) => {
+    post?.(cmd, b, failed);
     // An async editor command can straddle a journal paint and mistake it for its own edit.
     const reader = ACP_READERS.get(b);
     if (reader) {
       b.undo.length = b.redo.length = 0; b.pendingUndo = null;
+      reader.transcript?.afterCommand(cmd, failed);
       if (reader.transcript?.frame.buffer !== b) reader.schedule();
     }
-    post?.(cmd, b, failed);
   };
   frTranscriptKeys = true;
 }

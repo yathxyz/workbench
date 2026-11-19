@@ -870,11 +870,17 @@ check('F-A19 (no server): a url request can be opened only when it is https:, sh
   st.js.off && st.data.off && st.http.off && !st.https.off && st.https.host === 'example.org' && st.js.host === null && [st.js, st.data, st.http, st.https].every(u => u.links === 0), JSON.stringify({ js: st.js, data: st.data, http: st.http, https: st.https }));
 check('fix 1 (no server): agent text in a permission request stays text; allow_always says remembered; reject is not the primary button; the Agent button is off in the demo',
   st.markup === 0 && st.title.startsWith('<img') && await p.evaluate(() => window.__xss === undefined) && st.btns[0] === 'go|allow_once|Allow' && st.btns[1] === 'go|allow_always|Always · remembered by stub' && st.btns[2] === '-|reject_once|Reject' && st.button === true, JSON.stringify({ markup: st.markup, btns: st.btns, button: st.button }));
-st = await p.evaluate(() => { const A = window.__canvas.AcpBackend.prototype;   // apply on a stand-in: the two requests waiting, and the notes it adds
-  const fake = { pending: new Map<number, object>([[5, { kind: 'elicitation', request: { message: 'q' } }], [7, { kind: 'permission', toolCall: {}, options: [{ optionId: 'y', name: 'Allow', kind: 'allow_once' }] }]]), items: [] as { text?: string }[], add(it: { text?: string }) { this.items.push(it); return it; } };
-  let threw: string | null = null; try { A.apply.call(fake, { e: 'permission_resolved', seq: 6, req: 5, outcome: { outcome: 'selected', optionId: 'y' } }); A.apply.call(fake, { e: 'permission_resolved', seq: 8, req: 7, outcome: { outcome: 'selected', optionId: 'y' } }); } catch (e) { threw = String(e); }
-  return { threw, notes: fake.items.map(i => i.text), left: fake.pending.size }; });
-check('fix 1 (no server): a permission_resolved that names an elicitation is noted as answered instead of throwing; one that names a permission still says allowed', st.threw === null && st.notes.join('|') === 'answered: y|allowed: Allow' && st.left === 0, JSON.stringify(st));
+st = await p.evaluate(() => {
+  // Use the production reducer and request lifecycle, without opening a socket in the offline demo.
+  const b = Object.assign(Object.create(window.__canvas.AcpBackend.prototype), {
+    agents: false, pending: new Map(), unheld: new Map(), items: [], changed: new Set(),
+  });
+  b.apply({ e: 'elicitation', seq: 5, request: { message: 'q' } });
+  b.apply({ e: 'permission', seq: 7, toolCall: {}, options: [{ optionId: 'y', name: 'Allow', kind: 'allow_once' }] });
+  for (const req of [5, 7]) b.apply({ e: 'permission_resolved', seq: req + 3, req, outcome: { outcome: 'selected', optionId: 'y' } });
+  return { notes: b.items.map((i: { text: string }) => i.text), left: b.pending.size };
+});
+check('fix 1 (no server): a permission_resolved that names an elicitation is noted as answered instead of throwing; one that names a permission still says allowed', st.notes.join('|') === 'answered: y|allowed: Allow' && st.left === 0, JSON.stringify(st));
 await p.close();
 check('N16 demo: the inlined page asks fonts.googleapis.com for nothing', !demoHosts.has('fonts.googleapis.com'), [...demoHosts].join());
 
