@@ -156,6 +156,7 @@ mod tests {
             title: None,
             mode_id: None,
             config_options: None,
+            managed_worktree: None,
         };
         edit(&mut facts);
         Summary {

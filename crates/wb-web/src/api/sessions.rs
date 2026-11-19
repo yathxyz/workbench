@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, MapAccess, Visitor};
@@ -15,10 +15,10 @@ use serde_json::{Value, json};
 use tokio::time::timeout;
 use wb_proto::hub::{
     AcpOpenReply, ConfigOption, ConfigValue, ErrorCode, HubMessage, HubRequest, Kind, SpawnAcp,
-    Summary,
+    Summary, WorktreeRequest,
 };
 use wb_proto::journal::{EventBody, JournalEvent};
-use wb_proto::limits::{ACP_CONFIG_MAX, CAPTURE_MAX};
+use wb_proto::limits::{ACP_CONFIG_MAX, CAPTURE_MAX, GIT_ADD_TIMEOUT, GIT_TIMEOUT};
 
 use super::{ApiState, Control, Read};
 use crate::AppState;
@@ -50,20 +50,20 @@ pub fn routes() -> Router<ApiState> {
         .route("/sessions/{sid}/mode", post(mode))
         .route("/sessions/{sid}/config", post(config))
         .route("/sessions/{sid}/revive", post(revive))
+        .route("/sessions/{sid}/worktree", delete(remove_worktree))
 }
 
 /// The status a hub error becomes (§3.8.1).
 fn status_of(code: ErrorCode) -> StatusCode {
     use ErrorCode::{
-        AlreadyResolved, BadOption, BadRequest, Busy, Faulted, KindMismatch, NotAlive, NotFound,
-        NotRevivable, Stale, Timeout, UnknownAgent,
+        AlreadyResolved, BadOption, BadRequest, Busy, Conflict, Faulted, KindMismatch, NotAlive,
+        NotFound, NotRevivable, Stale, Timeout, UnknownAgent,
     };
     match code {
         BadRequest | BadOption | UnknownAgent => StatusCode::BAD_REQUEST,
         NotFound => StatusCode::NOT_FOUND,
-        KindMismatch | Busy | NotAlive | AlreadyResolved | Stale | NotRevivable | Faulted => {
-            StatusCode::CONFLICT
-        }
+        Conflict | KindMismatch | Busy | NotAlive | AlreadyResolved | Stale | NotRevivable
+        | Faulted => StatusCode::CONFLICT,
         Timeout => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::BAD_GATEWAY,
     }
@@ -98,11 +98,25 @@ async fn connect(app: &AppState) -> Result<(HubConn, HubInfo), ApiError> {
         })
 }
 
+fn require_worktree(info: &HubInfo) -> Result<(), ApiError> {
+    if info.acp_worktree {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "hub does not support managed worktrees",
+        ))
+    }
+}
+
 /// Sends `req` (its rid is [`RID`]) on a connection of its own and answers `{}` for
 /// the hub's `ok`.
 async fn act(app: &AppState, req: HubRequest, wait: Duration) -> Result<Json<Value>, ApiError> {
     let call = async {
-        let (mut conn, _) = connect(app).await?;
+        let (mut conn, info) = connect(app).await?;
+        if matches!(req, HubRequest::AcpRemoveWorktree { .. }) {
+            require_worktree(&info)?;
+        }
         conn.request(&req, RID).await.map_err(call_error)
     };
     timeout(wait, call)
@@ -291,6 +305,8 @@ struct Create {
     sid: Option<String>,
     #[serde(default)]
     config: StartConfig,
+    #[serde(default, deserialize_with = "WorktreeRequest::deserialize_option")]
+    worktree: Option<WorktreeRequest>,
 }
 
 /// JSON member order matters: changing a model may change the remaining options.
@@ -363,7 +379,18 @@ async fn create(
         })?,
     };
     let config = body.config.0;
-    let wait = acp_open_timeout(config.len());
+    let mut wait = acp_open_timeout(config.len());
+    if let Some(worktree) = &body.worktree {
+        if !worktree.valid() {
+            return Err(
+                ApiError::new(StatusCode::BAD_REQUEST, "invalid worktree branch or base")
+                    .code(ErrorCode::BadRequest),
+            );
+        }
+        // A linked checkout with a separate main gitdir can take seven queries,
+        // plus worktree add and a possible rollback before the reply.
+        wait += GIT_TIMEOUT * 8 + GIT_ADD_TIMEOUT;
+    }
     let open = async {
         let (mut conn, info) = connect(&api.app).await?;
         if !config.is_empty() && !info.acp_config {
@@ -371,6 +398,16 @@ async fn create(
                 StatusCode::BAD_REQUEST,
                 "hub does not support session configuration",
             ));
+        }
+        let host = spawn_host(&info, body.host)?;
+        if body.worktree.is_some() {
+            require_worktree(&info)?;
+            if host.is_some() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "managed worktrees require a local host",
+                ));
+            }
         }
         let req = HubRequest::AcpOpen {
             rid: RID,
@@ -380,8 +417,9 @@ async fn create(
             spawn: Some(SpawnAcp {
                 agent: body.agent,
                 cwd: body.cwd,
-                host: spawn_host(&info, body.host)?,
+                host,
                 config,
+                worktree: body.worktree,
             }),
         };
         let reply = conn.request(&req, RID).await.map_err(call_error)?;
@@ -564,6 +602,20 @@ async fn revive(
     .await
 }
 
+async fn remove_worktree(
+    _: Control,
+    State(api): State<ApiState>,
+    Param(id): Param<String>,
+) -> Result<Json<Value>, ApiError> {
+    let sid = sid_of(id)?;
+    act(
+        &api.app,
+        HubRequest::AcpRemoveWorktree { rid: RID, sid },
+        GIT_TIMEOUT + REPLY_TIMEOUT,
+    )
+    .await
+}
+
 #[derive(Deserialize)]
 struct KillQuery {
     forget: Option<bool>,
@@ -612,6 +664,7 @@ mod tests {
             (BadOption, 400),
             (UnknownAgent, 400),
             (NotFound, 404),
+            (Conflict, 409),
             (KindMismatch, 409),
             (Busy, 409),
             (NotAlive, 409),
@@ -643,6 +696,7 @@ mod tests {
             host: "hubhost".into(),
             agents: Vec::new(),
             acp_config: true,
+            acp_worktree: true,
             hosts: hosts
                 .iter()
                 .map(|name| Host {

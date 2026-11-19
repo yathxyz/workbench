@@ -93,7 +93,7 @@ fn server_hello() {
         "agents": [{"name": "claude", "label": "Claude"}, {"name": "codex", "label": "Codex"}],
         "shells": ["bash", "nu", "zsh"], "defaultShell": "bash",
         "hosts": [{"name": "laptop", "agents": [{"name": "pi", "label": "pi"}]}],
-        "acpConfig": true
+        "acpConfig": true, "acpWorktree": true
     }));
     let HubMessage::Hello {
         proto,
@@ -104,6 +104,7 @@ fn server_hello() {
         default_shell,
         hosts,
         acp_config,
+        acp_worktree,
         ..
     } = msg
     else {
@@ -116,6 +117,7 @@ fn server_hello() {
     assert_eq!(shells, ["bash", "nu", "zsh"]);
     assert_eq!(default_shell, "bash");
     assert!(acp_config);
+    assert!(acp_worktree);
     assert_eq!(
         hosts,
         [Host {
@@ -150,6 +152,7 @@ fn server_hello_from_an_older_hub_without_shells_or_hosts() {
         default_shell,
         hosts,
         acp_config,
+        acp_worktree,
         ..
     } = &msg
     else {
@@ -159,6 +162,7 @@ fn server_hello_from_an_older_hub_without_shells_or_hosts() {
     assert_eq!(default_shell, "");
     assert!(hosts.is_empty());
     assert!(!acp_config);
+    assert!(!acp_worktree);
     // A newer hub always sends these fields.
     let back: Value = serde_json::from_slice(&line::encode(&msg)).unwrap();
     assert_eq!(back["shells"], json!([]));
@@ -259,6 +263,7 @@ fn every_error_code() {
         ("kind_mismatch", ErrorCode::KindMismatch),
         ("not_alive", ErrorCode::NotAlive),
         ("busy", ErrorCode::Busy),
+        ("conflict", ErrorCode::Conflict),
         ("already_resolved", ErrorCode::AlreadyResolved),
         ("bad_option", ErrorCode::BadOption),
         ("not_revivable", ErrorCode::NotRevivable),
@@ -806,6 +811,64 @@ fn acp_spawn_config_defaults_and_omits_empty() {
 }
 
 #[test]
+fn worktree_branch_and_base_have_the_same_restricted_grammar() {
+    let long = "a".repeat(256);
+    for name in [
+        "",
+        "-x",
+        "--upload-pack=x",
+        "/x",
+        "x/",
+        "x//y",
+        "..",
+        "a..b",
+        "a/../b",
+        ".x",
+        "a/.x",
+        "x.lock",
+        "a.lock/x",
+        "HEAD",
+        "a b",
+        "a@{1}",
+        "x^",
+        "x~1",
+        "x:y",
+        "\0",
+        "\n",
+        "\u{7f}",
+        "ä",
+        &long,
+    ] {
+        for (branch, base) in [(name, "ok"), ("ok", name)] {
+            assert!(
+                !WorktreeRequest {
+                    branch: branch.into(),
+                    base: Some(base.into())
+                }
+                .valid(),
+                "{name:?}"
+            );
+        }
+    }
+    for name in [
+        "a",
+        "feat/ABC_1.2-3",
+        "origin/main",
+        "deadbeef",
+        &long[..255],
+    ] {
+        assert!(
+            WorktreeRequest {
+                branch: name.into(),
+                base: Some(name.into())
+            }
+            .valid(),
+            "{name:?}"
+        );
+    }
+}
+
+#[test]
 fn acp_spawn_config_preserves_order_and_duplicates() {
     let req: HubRequest = round_trip(json!({
         "t": "acp.open", "rid": 8, "sid": "n_agent1", "since": 0,
@@ -866,6 +929,7 @@ fn acp_open_requests() {
                 cwd: "/home/alice/proj/x".into(),
                 host: None,
                 config: Vec::new(),
+                worktree: None,
             })
         }
     );
@@ -1125,6 +1189,13 @@ fn acp_requests() {
                 rid: 22,
                 sid: sid(),
                 forget: false,
+            },
+        ),
+        (
+            json!({"t": "acp.remove_worktree", "rid": 23, "sid": "n_agent1"}),
+            HubRequest::AcpRemoveWorktree {
+                rid: 23,
+                sid: sid(),
             },
         ),
     ] {

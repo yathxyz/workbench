@@ -41,6 +41,8 @@ pub struct Config {
     /// Other hosts of the mesh whose agents the hub can start (DESIGN §3.8.5).
     #[serde(default)]
     pub hosts: BTreeMap<String, HostConfig>,
+    /// Absolute git executable for managed local ACP worktrees, if enabled.
+    pub git: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +135,13 @@ impl Config {
         }
         if !self.state_dir.is_absolute() {
             bail!("stateDir must be an absolute path");
+        }
+        if self
+            .git
+            .as_deref()
+            .is_some_and(|p| !p.is_absolute() || p.as_os_str().as_encoded_bytes().contains(&0))
+        {
+            bail!("git must be an absolute executable path without NUL");
         }
         let mut seen = BTreeSet::new();
         for shell in &self.shells {
@@ -291,6 +300,20 @@ mod tests {
         assert!(cfg.child.pass_env.is_empty() && cfg.child.set_env.is_empty());
         assert!(cfg.agents.is_empty());
         assert!(cfg.hosts.is_empty());
+    }
+
+    #[test]
+    fn git_must_be_an_absolute_path_when_configured() {
+        for path in ["git", "", "/bin/git\0"] {
+            assert!(with(|v| v["git"] = path.into()).is_err());
+        }
+        assert_eq!(
+            with(|v| v["git"] = "/bin/git".into())
+                .unwrap()
+                .git
+                .as_deref(),
+            Some(Path::new("/bin/git"))
+        );
     }
 
     /// The example of DESIGN §3.8.5 under `hosts`.

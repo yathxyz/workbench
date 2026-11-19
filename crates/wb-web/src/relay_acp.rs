@@ -113,6 +113,7 @@ fn spawn(
             cwd,
             host: None,
             config,
+            worktree: None,
         }),
         _ => None,
     }
@@ -510,6 +511,7 @@ mod tests {
                 cwd: "/home/alice".into(),
                 host: None,
                 config: Vec::new(),
+                worktree: None,
             })
         );
     }
@@ -588,6 +590,7 @@ mod tests {
                 title: None,
                 mode_id: None,
                 config_options: None,
+                managed_worktree: None,
             }),
         }
     }

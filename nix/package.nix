@@ -3,6 +3,7 @@
   stdenv,
   rustPlatform,
   nodejs,
+  git,
   edwind,
 }:
 let
@@ -34,6 +35,7 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../Cargo.lock;
 
   nativeBuildInputs = [ nodejs ];
+  nativeCheckInputs = [ git ];
 
   # wb-hub sends it in its hello and wb-web compares it with its own (option_env!).
   # The hash part of the hub source's store path.

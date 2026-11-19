@@ -162,6 +162,7 @@ in
           pkgs.python3
           pkgs.bashInteractive
           pkgs.coreutils
+          pkgs.git
           pkgs.caddy
           workbench
           workbench.fake

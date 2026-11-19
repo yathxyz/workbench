@@ -30,6 +30,12 @@ pub const ACP_CONFIG_MAX: usize = 16;
 pub const ACP_CONFIG_OPTIONS_MAX: usize = 64;
 /// Largest serialized agent configuration offering. Larger is malformed.
 pub const ACP_CONFIG_OPTIONS_BYTES: usize = 64 * KIB;
+/// Maximum byte length of a requested worktree branch or base.
+pub const GIT_NAME_MAX: usize = 255;
+/// Deadline for a git invocation other than checking out a worktree.
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for `git worktree add`, which populates the checkout.
+pub const GIT_ADD_TIMEOUT: Duration = Duration::from_secs(120);
 /// Scrollback lines kept by the VT state.
 pub const VT_SCROLLBACK: usize = 1000;
 /// Largest snapshot. The scrollback budget is halved until it fits.

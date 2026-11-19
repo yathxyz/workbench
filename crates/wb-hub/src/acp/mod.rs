@@ -11,6 +11,7 @@ mod journal;
 mod lines;
 mod replay;
 mod rpc;
+mod worktree;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
@@ -32,7 +33,8 @@ use tokio::time::Instant;
 use tracing::{Instrument, error, info, info_span, warn};
 use wb_proto::hub::{
     AcpFacts, AcpOpenReply, AcpSessionInfo, Activity, ConfigError, ConfigOption, ErrorCode,
-    ExitReason, Fault, FaultCode, HubMessage, Kind, PendingKind, SpawnAcp, Summary,
+    ExitReason, Fault, FaultCode, HubMessage, Kind, ManagedWorktree, PendingKind, SpawnAcp,
+    Summary,
 };
 use wb_proto::journal::{
     EventBody, JournalEvent, NoticeLevel, ResolvedBy, SessionVia, SetupErrorCode, SpawnVia,
@@ -98,6 +100,7 @@ const HISTORY: [&str; 6] = [
 /// The files of a session, by extension.
 const FILES: [&str; 4] = ["json", "jsonl", "stderr.log", "stderr.log.1"];
 const JOURNAL_FAILED: &str = "the journal could not be written";
+const NO_WORKTREE_GIT: &str = "git is not configured for managed worktrees";
 
 /// A request to a session actor.
 pub enum Cmd {
@@ -150,6 +153,7 @@ pub enum Act {
     Kill {
         forget: bool,
     },
+    RemoveWorktree,
 }
 
 impl Cmd {
@@ -186,6 +190,21 @@ pub fn open(ctx: Arc<Ctx>, sid: String, open: Open) -> Pin<Box<dyn Future<Output
                 return open
                     .reply
                     .err(ErrorCode::BadRequest, "config has duplicate ids");
+            }
+            if let Some(request) = &spawn.worktree {
+                if !request.valid() {
+                    return open
+                        .reply
+                        .err(ErrorCode::BadRequest, "invalid worktree branch or base");
+                }
+                if spawn.host.as_ref().is_some_and(|h| *h != ctx.cfg.host) {
+                    return open
+                        .reply
+                        .err(ErrorCode::BadRequest, "managed worktrees are local only");
+                }
+                if ctx.cfg.git.is_none() {
+                    return open.reply.err(ErrorCode::BadRequest, NO_WORKTREE_GIT);
+                }
             }
         }
         // The second round covers an actor that was forgotten between the lookup and
@@ -261,6 +280,8 @@ struct Meta {
     /// The last `initialize` result, verbatim.
     init: Option<Value>,
     seen_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_worktree: Option<ManagedWorktree>,
 }
 
 /// Reads the session `sid` off the calling task and completes a journal that a hub
@@ -764,7 +785,7 @@ impl Acp {
                 () = sleep_until(probe_at) => Event::Probe,
             };
             match event {
-                Event::Cmd(Some(cmd)) => self.command(cmd),
+                Event::Cmd(Some(cmd)) => self.command(cmd).await,
                 Event::Cmd(None) => return,
                 Event::Replayed(r) => self.replayed(&r),
                 Event::Out(Some(Out::Msg(msg))) => self.agent_message(msg),
@@ -825,7 +846,7 @@ impl Acp {
         }
     }
 
-    fn command(&mut self, cmd: Cmd) {
+    async fn command(&mut self, cmd: Cmd) {
         if self.stopping.is_some() {
             return cmd.refuse(ErrorCode::Internal, "hub stopping");
         }
@@ -837,7 +858,7 @@ impl Acp {
                     reply.done();
                 }
             }
-            Cmd::Act { act, reply } => self.act(act, reply),
+            Cmd::Act { act, reply } => self.act(act, reply).await,
             Cmd::Shutdown { done } => self.shutdown(done),
         }
     }
@@ -851,39 +872,55 @@ impl Acp {
     async fn create(&mut self, mut o: Open) {
         let Some(spawn) = o.spawn.take() else {
             let msg = format!("no session {}", self.sid);
-            return self.abandon(o.reply, ErrorCode::NotFound, msg);
+            return self.abandon(o.reply, ErrorCode::NotFound, msg).await;
         };
         let host = spawn.host.filter(|h| *h != self.ctx.cfg.host);
         if let Some(host) = &host {
             if let Err((code, msg)) = self.check_remote(host, &spawn.agent, &spawn.cwd) {
-                return self.abandon(o.reply, code, msg);
+                return self.abandon(o.reply, code, msg).await;
             }
         } else {
             if !self.ctx.cfg.agents.contains_key(&spawn.agent) {
                 let msg = format!("no agent {}", spawn.agent);
-                return self.abandon(o.reply, ErrorCode::UnknownAgent, msg);
+                return self.abandon(o.reply, ErrorCode::UnknownAgent, msg).await;
             }
             if !spawn.cwd.starts_with('/') || !Path::new(&spawn.cwd).is_dir() {
                 let msg = "cwd must be an absolute path of an existing directory".to_owned();
-                return self.abandon(o.reply, ErrorCode::BadRequest, msg);
+                return self.abandon(o.reply, ErrorCode::BadRequest, msg).await;
             }
         }
+        let (cwd, managed_worktree) = if let Some(request) = &spawn.worktree {
+            let git = self
+                .ctx
+                .cfg
+                .git
+                .as_deref()
+                .expect("validated worktree request");
+            match worktree::create(git, Path::new(&spawn.cwd), request).await {
+                Ok(record) => (record.path.clone(), Some(record)),
+                Err((code, msg)) => return self.abandon(o.reply, code, msg).await,
+            }
+        } else {
+            (spawn.cwd, None)
+        };
         self.meta = Meta {
             sid: self.sid.clone(),
             agent: spawn.agent,
-            cwd: spawn.cwd,
+            cwd,
             host,
             created_at: self.created_at,
+            managed_worktree,
             ..Meta::default()
         };
         let (dir, sid) = (self.ctx.acp_dir.clone(), self.sid.clone());
-        let json = serde_json::to_vec(&self.meta).unwrap_or_default();
+        let json = serde_json::to_vec(&self.meta);
         let made = tokio::task::spawn_blocking(move || {
             // Files an earlier incarnation failed to delete must not leak into this one.
             delete(&dir, &sid)?;
-            write_atomic(&dir, &format!("{sid}.json"), &json)?;
-            let opened = Journal::open(&dir.join(format!("{sid}.jsonl")));
-            let opened = opened.map_err(|e| io::Error::other(format!("{e:#}")));
+            let opened = write_atomic(&dir, &format!("{sid}.json"), &json?).and_then(|()| {
+                Journal::open(&dir.join(format!("{sid}.jsonl")))
+                    .map_err(|e| io::Error::other(format!("{e:#}")))
+            });
             if opened.is_err() {
                 let _ = delete(&dir, &sid);
             }
@@ -896,7 +933,7 @@ impl Acp {
             Err(e) => {
                 warn!("creating the session's files: {e}");
                 let msg = format!("creating the session's files: {e}");
-                return self.abandon(o.reply, ErrorCode::Internal, msg);
+                return self.abandon(o.reply, ErrorCode::Internal, msg).await;
             }
         }
         if spawn.config.is_empty() {
@@ -931,8 +968,13 @@ impl Acp {
         Ok(())
     }
 
-    /// Answers the open that would have created this session and removes it again.
-    fn abandon(&mut self, reply: Reply, code: ErrorCode, message: String) {
+    /// Rolls back any worktree created for a refused open before releasing its sid.
+    async fn abandon(&mut self, reply: Reply, code: ErrorCode, mut message: String) {
+        if let Some(record) = &self.meta.managed_worktree
+            && let Err((_, e)) = self.remove_record(record).await
+        {
+            message = format!("{message}; worktree left at {}: {e}", record.path);
+        }
         reply.err(code, message);
         if self.ctx.registry.abandon(&self.sid, self.created_at) {
             self.phase = Phase::Abandoned;
@@ -1210,6 +1252,7 @@ impl Acp {
                 title: facts.title.clone(),
                 mode_id: facts.mode_id.clone(),
                 config_options: facts.config_options.clone(),
+                managed_worktree: self.meta.managed_worktree.clone(),
             }),
         };
         let init = self.meta.init.as_ref();
@@ -1399,7 +1442,7 @@ impl Acp {
         }
     }
 
-    fn act(&mut self, act: Act, reply: Reply) {
+    async fn act(&mut self, act: Act, reply: Reply) {
         if self.startup_config.is_some()
             && matches!(
                 &act,
@@ -1441,6 +1484,7 @@ impl Acp {
             Act::Revive => self.revive(reply),
             Act::Authenticate(method_id) => self.authenticate(&method_id, reply),
             Act::Kill { forget } => self.kill(forget, reply),
+            Act::RemoveWorktree => self.remove_worktree(reply).await,
         }
     }
 
@@ -1811,22 +1855,22 @@ impl Acp {
     }
 
     async fn save_meta(&mut self) {
+        if let Err(e) = self.write_meta().await {
+            warn!("writing the session record: {e}");
+        }
+    }
+
+    async fn write_meta(&mut self) -> io::Result<()> {
         self.meta_at = None;
         // A session whose files failed to load has no record of its own to write.
         if self.journal.is_none() {
-            return;
+            return Ok(());
         }
-        let json = match serde_json::to_vec(&self.meta) {
-            Ok(json) => json,
-            Err(e) => return warn!("encoding the session record: {e}"),
-        };
+        let json = serde_json::to_vec(&self.meta)?;
         let (dir, name) = (self.ctx.acp_dir.clone(), format!("{}.json", self.sid));
-        let saved = tokio::task::spawn_blocking(move || write_atomic(&dir, &name, &json))
+        tokio::task::spawn_blocking(move || write_atomic(&dir, &name, &json))
             .await
-            .unwrap_or_else(|e| Err(io::Error::other(e)));
-        if let Err(e) = saved {
-            warn!("writing the session record: {e}");
-        }
+            .map_err(io::Error::other)?
     }
 
     fn revive(&mut self, reply: Reply) {
@@ -1901,6 +1945,35 @@ impl Acp {
             self.phase = Phase::Forget;
         } else {
             reply.done();
+        }
+    }
+
+    async fn remove_record(&self, record: &ManagedWorktree) -> Result<(), (ErrorCode, String)> {
+        let Some(git) = self.ctx.cfg.git.as_deref() else {
+            return Err((ErrorCode::BadRequest, NO_WORKTREE_GIT.into()));
+        };
+        worktree::remove(git, record).await
+    }
+
+    async fn remove_worktree(&mut self, reply: Reply) {
+        let Some(record) = &self.meta.managed_worktree else {
+            return reply.err(ErrorCode::NotFound, "the session has no managed worktree");
+        };
+        if self.proc.is_some() {
+            return reply.err(ErrorCode::Conflict, "the agent is still running");
+        }
+        if let Err((code, msg)) = self.remove_record(record).await {
+            return reply.err(code, msg);
+        }
+        self.meta.managed_worktree = None;
+        let saved = self.write_meta().await;
+        self.publish();
+        match saved {
+            Ok(()) => reply.done(),
+            Err(e) => reply.err(
+                ErrorCode::Internal,
+                format!("worktree removed but writing the session record failed: {e}"),
+            ),
         }
     }
 
@@ -2811,6 +2884,7 @@ mod tests {
             agent_session_id: Some("s-1".into()),
             init: Some(json!({"protocolVersion": 1})),
             seen_seq: 3,
+            managed_worktree: None,
         };
         let v = serde_json::to_value(&meta).unwrap();
         assert_eq!(
@@ -2827,5 +2901,24 @@ mod tests {
         let v = serde_json::to_value(&remote).unwrap();
         assert_eq!(v["host"], "laptop");
         assert_eq!(serde_json::from_value::<Meta>(v).unwrap(), remote);
+    }
+
+    #[test]
+    fn the_session_record_keeps_the_managed_worktree() {
+        let meta = Meta {
+            cwd: "/home/alice/project-wt/feature-a".into(),
+            managed_worktree: Some(ManagedWorktree {
+                path: "/home/alice/project-wt/feature-a".into(),
+                branch: "feature/a".into(),
+                main_root: "/home/alice/project".into(),
+            }),
+            ..Meta::default()
+        };
+        let v = serde_json::to_value(&meta).unwrap();
+        assert_eq!(
+            v["managedWorktree"],
+            json!({"path": meta.cwd, "branch": "feature/a", "mainRoot": "/home/alice/project"})
+        );
+        assert_eq!(serde_json::from_value::<Meta>(v).unwrap(), meta);
     }
 }

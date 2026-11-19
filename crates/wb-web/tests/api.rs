@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use wb_proto::hub::{
     AcpFacts, AcpOpenReply, AcpSessionInfo, Activity, Agent, ErrorCode, Host, HubMessage,
-    HubRequest, Kind, SpawnAcp, Summary,
+    HubRequest, Kind, ManagedWorktree, SpawnAcp, Summary, WorktreeRequest,
 };
 use wb_proto::journal::{EventBody, JournalEvent};
 
@@ -141,6 +141,7 @@ fn rid_of(r: &HubRequest) -> u64 {
         | HubRequest::AcpSetMode { rid, .. }
         | HubRequest::AcpSetConfigOption { rid, .. }
         | HubRequest::AcpRevive { rid, .. }
+        | HubRequest::AcpRemoveWorktree { rid, .. }
         | HubRequest::AcpKill { rid, .. }
         | HubRequest::PtyKill { rid, .. } => *rid,
         other => panic!("no rid in {other:?}"),
@@ -172,6 +173,7 @@ fn summary(sid: &str, host: &str) -> Summary {
             title: None,
             mode_id: Some("default".into()),
             config_options: None,
+            managed_worktree: None,
         }),
     }
 }
@@ -264,6 +266,13 @@ async fn scopes_paths_and_methods_are_checked_after_the_token() {
             json!("forbidden"),
         ),
         ("DELETE", "/v1/sessions/a", READER, 403, json!("forbidden")),
+        (
+            "DELETE",
+            "/v1/sessions/a/worktree",
+            READER,
+            403,
+            json!("forbidden"),
+        ),
         ("POST", "/v1/events", READER, 403, json!("forbidden")),
         ("POST", "/v1/events", OWNER, 403, json!("forbidden")),
         // The scope comes before the body and the sid.
@@ -425,6 +434,7 @@ async fn without_a_hub_the_hubs_endpoints_are_503() {
         ("GET", "/v1/sessions/a1/capture"),
         ("POST", "/v1/sessions/a1/cancel"),
         ("DELETE", "/v1/sessions/a1"),
+        ("DELETE", "/v1/sessions/a1/worktree"),
     ] {
         let res = api.req(method, path, OWNER).send().await;
         assert_eq!(res.status, 503, "{method} {path}");
@@ -484,6 +494,7 @@ async fn a_post_starts_an_agent() {
             cwd: "/home/alice/src".into(),
             host: None,
             config: Vec::new(),
+            worktree: None,
         })
     );
     assert_eq!(res.status, 201);
@@ -577,6 +588,191 @@ async fn a_post_starts_an_agent() {
         acp.into_iter()
             .all(|(_, r)| matches!(r, HubRequest::Hello { .. })),
         "a refused request reached the hub"
+    );
+}
+
+#[tokio::test]
+async fn worktree_spawns_pass_names_and_return_the_hubs_record() {
+    let api = Api::start().await;
+    let branch = "feature/a";
+    let main_root = "/srv/project";
+    let path = "/srv/project-wt/feature-a";
+    for (host, base) in [(None, None), (Some("testhost"), Some("origin/main"))] {
+        let mut body = json!({
+            "agent": "claude", "cwd": "/srv/project/subdir", "sid": "mine",
+            "worktree": {"branch": branch}
+        });
+        if let Some(host) = host {
+            body["host"] = json!(host);
+        }
+        if let Some(base) = base {
+            body["worktree"]["base"] = json!(base);
+        }
+        let req = api
+            .req("POST", "/v1/sessions", OWNER)
+            .body(body.to_string());
+        let (asked, res) = api
+            .answered(req, |rid| {
+                let mut reply = open_reply("mine", "testhost", true);
+                reply.summary.cwd = path.into();
+                reply.summary.acp.as_mut().unwrap().managed_worktree = Some(ManagedWorktree {
+                    path: path.into(),
+                    branch: branch.into(),
+                    main_root: main_root.into(),
+                });
+                HubMessage::ok(rid, &reply)
+            })
+            .await;
+        let HubRequest::AcpOpen {
+            spawn: Some(spawn), ..
+        } = asked
+        else {
+            panic!("{asked:?}");
+        };
+        assert_eq!(spawn.host, None);
+        assert_eq!(spawn.cwd, "/srv/project/subdir");
+        assert_eq!(
+            spawn.worktree,
+            Some(WorktreeRequest {
+                branch: branch.into(),
+                base: base.map(str::to_owned)
+            })
+        );
+        assert_eq!(res.status, 201);
+        let session = &res.json()["session"];
+        assert_eq!(session["cwd"], path);
+        assert_eq!(
+            session["acp"]["managedWorktree"],
+            json!({"path": path, "branch": branch, "mainRoot": main_root})
+        );
+        // The separate, derived top-level field is still present, null when uncached.
+        assert_eq!(session.get("worktree"), Some(&Value::Null));
+    }
+    let req = api.req("POST", "/v1/sessions", OWNER).body(
+        json!({"agent": "claude", "cwd": main_root, "worktree": {"branch": branch}}).to_string(),
+    );
+    let (_, res) = api
+        .answered(
+            req,
+            refusal(ErrorCode::Conflict, "branch already checked out"),
+        )
+        .await;
+    assert_eq!(res.status, 409);
+    assert_eq!(
+        res.json(),
+        json!({"error": "branch already checked out", "code": "conflict"})
+    );
+}
+
+#[tokio::test]
+async fn worktree_actions_require_the_current_hubs_capability() {
+    for advertised in [None, Some(false)] {
+        let api = Api::start_with(Hello {
+            acp_worktree: advertised,
+            ..Hello::default()
+        })
+        .await;
+        let post = |body: Value| {
+            api.req("POST", "/v1/sessions", OWNER)
+                .body(body.to_string())
+        };
+        for req in [
+            post(json!({"agent": "claude", "cwd": "/x", "worktree": {"branch": "topic"}})),
+            api.req("DELETE", "/v1/sessions/a/worktree", OWNER),
+        ] {
+            let res = req.send().await;
+            assert_eq!(res.status, 400);
+            assert_eq!(
+                res.json()["error"],
+                "hub does not support managed worktrees"
+            );
+        }
+        assert!(
+            api.hub
+                .requests()
+                .iter()
+                .all(|(_, r)| matches!(r, HubRequest::Hello { .. } | HubRequest::Watch { .. }))
+        );
+        // A hub without worktrees can still start an ordinary session.
+        let (asked, res) = api
+            .answered(
+                post(json!({"agent": "claude", "cwd": "/x", "sid": "a"})),
+                |rid| HubMessage::ok(rid, &open_reply("a", "testhost", true)),
+            )
+            .await;
+        assert!(matches!(
+            asked,
+            HubRequest::AcpOpen {
+                spawn: Some(SpawnAcp { worktree: None, .. }),
+                ..
+            }
+        ));
+        assert_eq!(res.status, 201);
+        assert!(
+            res.json()["session"]["acp"]
+                .get("managedWorktree")
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_and_remote_worktree_spawns_are_not_sent() {
+    let api = Api::start_with(Hello {
+        hosts: vec![Host {
+            name: "laptop".into(),
+            agents: Vec::new(),
+        }],
+        ..Hello::default()
+    })
+    .await;
+    let post = |body: Value| {
+        api.req("POST", "/v1/sessions", OWNER)
+            .body(body.to_string())
+    };
+    for worktree in [
+        Value::Null,
+        json!("topic"),
+        json!(["topic", "main"]),
+        json!({}),
+        json!({"branch": 1}),
+        json!({"branch": "topic", "base": null}),
+        json!({"branch": "topic", "path": "/caller/path"}),
+    ] {
+        let res = post(json!({"agent": "claude", "cwd": "/x", "worktree": worktree}))
+            .send()
+            .await;
+        assert_eq!(
+            (res.status, res.json()),
+            (400, json!({"error": "bad body"})),
+            "{worktree}"
+        );
+    }
+    for worktree in [
+        json!({"branch": "-bad"}),
+        json!({"branch": "topic", "base": "a..b"}),
+    ] {
+        let res = post(json!({"agent": "claude", "cwd": "/x", "worktree": worktree}))
+            .send()
+            .await;
+        assert_eq!(res.status, 400, "{worktree}");
+        assert_eq!(res.json()["code"], "bad_request");
+    }
+    let res = post(json!({
+        "agent": "claude", "cwd": "/x", "host": "laptop", "worktree": {"branch": "topic"}
+    }))
+    .send()
+    .await;
+    assert_eq!(res.status, 400);
+    assert_eq!(
+        res.json()["error"],
+        "managed worktrees require a local host"
+    );
+    assert!(
+        api.hub
+            .requests()
+            .iter()
+            .all(|(_, r)| matches!(r, HubRequest::Hello { .. } | HubRequest::Watch { .. }))
     );
 }
 
@@ -730,6 +926,12 @@ async fn actions_are_the_hubs_requests() {
         ),
         (
             "DELETE",
+            "/v1/sessions/a1/worktree",
+            Value::Null,
+            HubRequest::AcpRemoveWorktree { rid: 1, sid: sid() },
+        ),
+        (
+            "DELETE",
             "/v1/sessions/a1",
             Value::Null,
             HubRequest::AcpKill {
@@ -797,6 +999,15 @@ async fn actions_are_the_hubs_requests() {
         res.json(),
         json!({"error": "a turn is running", "code": "busy"})
     );
+    for (code, status, message) in [
+        (ErrorCode::Conflict, 409, "worktree is not clean"),
+        (ErrorCode::NotFound, 404, "no managed worktree"),
+    ] {
+        let req = api.req("DELETE", "/v1/sessions/a1/worktree", OWNER);
+        let (_, res) = api.answered(req, refusal(code, message)).await;
+        assert_eq!(res.status, status);
+        assert_eq!(res.json(), json!({"code": code, "error": message}));
+    }
 
     // Bodies that are not what the endpoint takes never reach the hub.
     let asked = api.hub.requests().len();

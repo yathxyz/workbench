@@ -146,6 +146,9 @@ pub enum HubRequest {
     /// End the agent; with `forget`, also delete the session. Reply: `{}`.
     #[serde(rename = "acp.kill")]
     AcpKill { rid: u64, sid: String, forget: bool },
+    /// Remove only this dead session's recorded managed worktree. Reply: `{}`.
+    #[serde(rename = "acp.remove_worktree")]
+    AcpRemoveWorktree { rid: u64, sid: String },
     /// Any request type this version does not know.
     #[serde(other)]
     Unknown,
@@ -183,6 +186,9 @@ pub enum HubMessage {
         /// False from an older hub.
         #[serde(default)]
         acp_config: bool,
+        /// The hub has git configured for local ACP worktrees.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        acp_worktree: bool,
     },
     /// Success reply to the request with this `rid`; `result` holds the reply fields.
     #[serde(rename = "ok")]
@@ -269,6 +275,8 @@ impl HubMessage {
 pub enum ErrorCode {
     /// Malformed request or a limit exceeded.
     BadRequest,
+    /// The worktree path, branch or session state prevents this operation.
+    Conflict,
     /// Unknown sid, or an open without spawn fields for an unknown sid.
     NotFound,
     /// The sid exists with the other kind.
@@ -400,6 +408,75 @@ pub struct SpawnAcp {
     /// Startup options, applied sequentially in the supplied order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config: Vec<ConfigOption>,
+    /// Create a local git worktree and start the agent at its root.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "WorktreeRequest::deserialize_option"
+    )]
+    pub worktree: Option<WorktreeRequest>,
+}
+
+/// A branch to check out and, for a new branch, the revision to start it at.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeRequest {
+    pub branch: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_string"
+    )]
+    pub base: Option<String>,
+}
+
+fn present_string<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(de).map(Some)
+}
+
+impl WorktreeRequest {
+    /// An omitted request is optional; a present one must be an object, not null
+    /// or serde's positional array representation of a struct.
+    pub fn deserialize_option<'de, D: serde::Deserializer<'de>>(
+        de: D,
+    ) -> Result<Option<Self>, D::Error> {
+        use serde::de::{MapAccess, Visitor, value::MapAccessDeserializer};
+        struct Object;
+        impl<'de> Visitor<'de> for Object {
+            type Value = WorktreeRequest;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a worktree object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                WorktreeRequest::deserialize(MapAccessDeserializer::new(map))
+            }
+        }
+        de.deserialize_map(Object).map(Some)
+    }
+
+    /// Both names use the same restricted grammar before they ever reach git.
+    pub fn valid(&self) -> bool {
+        fn valid_name(s: &str) -> bool {
+            (1..=crate::limits::GIT_NAME_MAX).contains(&s.len())
+                && s != "HEAD"
+                && !s.starts_with('-')
+                && !s.contains("..")
+                && s.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._/-".contains(&c))
+                && s.split('/')
+                    .all(|p| !p.is_empty() && !p.starts_with('.') && !p.ends_with(".lock"))
+        }
+        valid_name(&self.branch) && self.base.as_deref().is_none_or(valid_name)
+    }
+}
+
+/// The checkout made for this session, not git metadata inferred from its cwd.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedWorktree {
+    pub path: String,
+    pub branch: String,
+    pub main_root: String,
 }
 
 /// Where a viewer's terminal stopped: honoured if `stream` matches and the ring still
@@ -521,6 +598,8 @@ pub struct AcpFacts {
     pub title: Option<String>,
     pub mode_id: Option<String>,
     pub config_options: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_worktree: Option<ManagedWorktree>,
 }
 
 /// What is outstanding to the agent.

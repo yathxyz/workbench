@@ -92,6 +92,9 @@ let
         argv = [ (agentArgv0 name a) ] ++ a.args;
       }) cfg.agents;
     }
+    // lib.optionalAttrs (cfg.gitPackage != null) {
+      git = "/etc/workbench/bin/git";
+    }
     # Only when set, so that a hub without hosts keeps its config, and its sessions.
     // lib.optionalAttrs (cfg.hosts != { }) {
       hosts = lib.mapAttrs (_: h: {
@@ -212,6 +215,13 @@ in
       default = self.packages.${system}.workbench;
       defaultText = lib.literalExpression "workbench.packages.\${system}.workbench";
       description = "The package providing wb-hub, wb-web and wb.";
+    };
+
+    gitPackage = mkOption {
+      type = types.nullOr types.package;
+      default = pkgs.git;
+      defaultText = lib.literalExpression "pkgs.git";
+      description = "Git used by the hub to create and remove local ACP worktrees; null disables this capability.";
     };
 
     webPackage = mkOption {
@@ -690,6 +700,9 @@ in
     environment.etc = {
       "workbench/hub.json".source = hubJson;
       "workbench/web.json".source = webJson;
+    }
+    // lib.optionalAttrs (cfg.gitPackage != null) {
+      "workbench/bin/git".source = lib.getExe' cfg.gitPackage "git";
     }
     // lib.optionalAttrs (edit.socket != null) {
       "workbench/agents.md".source = agentsMd;
