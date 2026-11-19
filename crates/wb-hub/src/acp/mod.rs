@@ -241,7 +241,13 @@ pub fn open(
                     }
                 }
                 Route::Created { created_at, rx } => {
-                    return start(ctx.clone(), sid, created_at, rx, Start::Create(open));
+                    return start(
+                        ctx.clone(),
+                        sid,
+                        created_at,
+                        rx,
+                        Start::Create(Box::new(open)),
+                    );
                 }
                 Route::NotFound => {
                     return open
@@ -282,7 +288,7 @@ pub async fn load(ctx: &Arc<Ctx>, sid: String) {
 /// What a session's actor starts from.
 enum Start {
     /// A new sid, and the open with spawn fields that created it.
-    Create(Open),
+    Create(Box<Open>),
     /// A session read from the state directory: a dead one.
     Loaded(Box<Loaded>),
     /// A session whose files failed to load and were quarantined; the reason.
@@ -819,7 +825,7 @@ impl Acp {
     /// Takes on the starting state; the open of a new session is returned to `run`.
     fn begin(&mut self, from: Start) -> Option<Open> {
         match from {
-            Start::Create(o) => return Some(o),
+            Start::Create(o) => return Some(*o),
             Start::Loaded(loaded) => {
                 let Loaded {
                     meta,
