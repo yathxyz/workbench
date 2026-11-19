@@ -13,9 +13,11 @@ Prints one line per check and exits 1 if any failed.
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 
@@ -444,11 +446,14 @@ def worktrees(t, h):
     repo.mkdir()
     git_bin = h.bin("git")
 
-    def git(*args):
+    def run_git(*args, check=True):
         # No inherited GIT_DIR, config, identity or cwd from the developer's checkout.
-        return subprocess.run([git_bin, *args], cwd=repo, check=True, capture_output=True,
+        return subprocess.run([git_bin, *args], cwd=repo, check=check, capture_output=True,
                               text=True, timeout=15, env={"HOME": str(h.home), "LC_ALL": "C",
-                                                         "GIT_CONFIG_NOSYSTEM": "1"}).stdout.strip()
+                                                         "GIT_CONFIG_NOSYSTEM": "1"})
+
+    def git(*args):
+        return run_git(*args).stdout.strip()
 
     git("init", "-b", "main")
     (repo / "seed").write_text("seed contents\n")
@@ -504,14 +509,14 @@ def worktrees(t, h):
     t.check("worktree: configured hub advertises capability", restart_hub().get("acpWorktree") is True)
     refused("wt_remote", host=remote)
 
-    # Verify the HTTP status and error produced by git, not a simulated hub refusal.
+    # Give a stable diagnosis even when the conflicting checkout isn't at the derived path.
     error = api("POST", "sessions", 409, {"agent": "stub", "sid": "wt_checked_out", "cwd": str(repo),
                                          "worktree": {"branch": "main"}})
     t.check("worktree: existing checkout refuses a second checkout of its branch",
-            error.get("code") == "conflict" and error["error"].startswith("fatal:")
+            error.get("code") == "conflict" and error["error"] == "branch main is already checked out in another worktree"
             and not (sibling / "main").exists(), repr(error))
     occupied = sibling / "occupied"
-    occupied.mkdir()
+    occupied.mkdir(parents=True)
     witness = occupied / "keep"
     witness.write_text("original")
     error = api("POST", "sessions", 409, {"agent": "stub", "sid": "wt_occupied", "cwd": str(repo),
@@ -564,6 +569,22 @@ def worktrees(t, h):
             str(path) in error["error"] and "left" in error["error"].lower() and registered(path)
             and (path / "rollback-witness").read_text() == "seed contents\n"
             and not any(s["sid"] == failed for s in wbctl.hub_sessions(h.hub_sock)), repr(error))
+
+    failed = "wt_missing_filter"
+    git("config", "--local", "filter.rollback-test.smudge", str(h.root / "missing-smudge"))
+    git("config", "--local", "filter.rollback-test.required", "true")
+    try:
+        # Use this version of git's own diagnostic, without relying on how it spells ENOENT.
+        probe = run_git("cat-file", "--filters", "HEAD:seed", check=False)
+        first = next(line for line in probe.stderr.splitlines() if line.startswith(("error:", "fatal:")))
+        error = api("POST", "sessions", 502, {"sid": failed, "cwd": str(repo), "agent": "stub",
+                                              "worktree": {"branch": failed}})
+        t.check("worktree: missing required filter returns git's first error, not checkout progress",
+                probe.returncode != 0 and error.get("code") == "internal" and error["error"] == first
+                and not any(s["sid"] == failed for s in wbctl.hub_sessions(h.hub_sock)), repr((error, first)))
+    finally:
+        git("config", "--local", "--unset", "filter.rollback-test.smudge")
+        git("config", "--local", "--unset", "filter.rollback-test.required")
 
     sid, branch = "wt_managed", "feat/session"
     session = "sessions/" + sid
@@ -627,7 +648,7 @@ def worktrees(t, h):
             and untracked.read_text() == "keep this\n" and registered(wt)
             and api("GET", session, 200)["acp"].get("managedWorktree") == managed, repr(error))
     untracked.unlink()
-    api("DELETE", session + "/worktree", 200)
+    t.check("worktree: clean removal replies with an empty object", api("DELETE", session + "/worktree", 200) == {})
     wait_summary(session, lambda s: not s["alive"] and s["acp"].get("managedWorktree") is None,
                  "cleared managed worktree record")
     restart_hub()
@@ -636,6 +657,60 @@ def worktrees(t, h):
     api("DELETE", session + "/worktree", 404)
     t.check("worktree: clean removal clears record and registration but retains branch",
             not wt.exists() and not registered(wt) and git("rev-parse", "refs/heads/" + branch) == head)
+    error = api("POST", session + "/revive", 409)
+    t.check("worktree: reviving after removal explains the missing working directory",
+            error.get("code") == "not_revivable" and error["error"] == f"session working directory no longer exists: {wt}",
+            repr(error))
+
+    stale_sessions = []
+    for replacement in ("absent", "session", "manual", "directory"):
+        branch = "stale-" + replacement
+        owner = "wt_" + branch
+        old = "sessions/" + owner
+        path = sibling / branch
+        spawn = {"agent": "missing", "cwd": str(repo), "worktree": {"branch": branch}}
+        # The missing agent makes an accepted, already-dead session that owns this checkout.
+        made = api("POST", "sessions", 201, dict(sid=owner, **spawn))["session"]
+        record = {"mainRoot": str(repo), "branch": branch, "path": str(path)}
+        t.check(f"worktree ({replacement}): stale case starts with an owned checkout",
+                made["acp"].get("managedWorktree") == record and registered(path), repr(made))
+        git("worktree", "remove", "--", str(path))
+        if replacement == "session":
+            api("POST", "sessions", 201, dict(sid="wt_new_owner", **spawn))
+        elif replacement == "manual":
+            git("worktree", "add", "--", str(path), branch)
+        elif replacement == "directory":
+            path.mkdir()
+            (path / "keep").write_text("not a checkout")
+
+        error = api("DELETE", old + "/worktree", 404)
+        t.check(f"worktree ({replacement}): DELETE identifies a stale record, not a failed git command",
+                error.get("code") == "not_found"
+                and error["error"] == "session worktree already gone; record cleared; nothing deleted", repr(error))
+        wait_summary(old, lambda s: s["acp"].get("managedWorktree") is None, "stale record cleared")
+        stale_sessions.append(old)
+        if replacement in ("session", "manual"):
+            t.check(f"worktree ({replacement}): the replacement checkout and registration survive",
+                    registered(path) and (path / "seed").read_text() == "seed contents\n"
+                    and git("-C", str(path), "symbolic-ref", "HEAD") == "refs/heads/" + branch)
+        elif replacement == "directory":
+            t.check("worktree: a replacement ordinary directory survives",
+                    not registered(path) and (path / "keep").read_text() == "not a checkout")
+        else:
+            t.check("worktree: no missing path or registration is recreated", not registered(path) and not path.exists())
+        t.check(f"worktree ({replacement}): stale removal retains the branch", git("rev-parse", branch) == head)
+
+    restart_hub()
+    t.check("worktree: all stale records stay cleared after restart",
+            all(api("GET", s, 200)["acp"].get("managedWorktree") is None for s in stale_sessions))
+    replacement = sibling / "stale-session"
+    record = api("GET", "sessions/wt_new_owner", 200)["acp"].get("managedWorktree")
+    t.check("worktree: replacement session retains its own durable record",
+            record == {"mainRoot": str(repo), "branch": "stale-session", "path": str(replacement)}
+            and registered(replacement), repr(record))
+    api("DELETE", "sessions/wt_new_owner/worktree", 200)
+    t.check("worktree: only the new owner can remove the replacement",
+            not replacement.exists() and not registered(replacement))
 
     forgotten = "wt_forget"
     path = sibling / forgotten
@@ -646,6 +721,39 @@ def worktrees(t, h):
     t.check("worktree: forgetting a live session leaves its checkout and branch",
             (path / ".git").is_file() and registered(path) and git("rev-parse", "refs/heads/" + forgotten) == head
             and not any(s["sid"] == forgotten for s in wbctl.hub_sessions(h.hub_sock)))
+
+    # Park a *real* git checkout in a repository-local smudge filter. The worktree
+    # is registered, but no session has been published to the web's watch yet.
+    gate, started = h.home / "hold-checkout", h.home / "checkout-started"
+    gate.touch()
+    smudge = h.root / "hold-smudge"
+    smudge.write_text(f'#!{h.bash}\n: > "$HOME/checkout-started"\n'
+                      f'while [ -f "$HOME/hold-checkout" ]; do {shlex.quote(h.bin("sleep"))} 0.05; done\n'
+                      f'exec {shlex.quote(h.bin("cat"))}\n')
+    smudge.chmod(0o700)
+    git("config", "--local", "filter.rollback-test.smudge", shlex.quote(str(smudge)))
+    pending = "wt_pending"
+    spawn = {"sid": pending, "agent": "stub", "cwd": str(repo), "worktree": {"branch": pending}}
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            opening = pool.submit(api, "POST", "sessions", 409, spawn)
+            try:
+                harness.wait_until(started.is_file, "git checkout in smudge filter", h.hub)
+                api("GET", "sessions/" + pending, 404)
+                busy = api("POST", "sessions", 409, spawn)
+                t.check("worktree: a second HTTP create conflicts while checkout is private",
+                        busy.get("code") == "conflict" and busy["error"] == "worktree operation in progress", repr(busy))
+                t.check("worktree: HTTP DELETE can cancel an unpublished session",
+                        api("DELETE", "sessions/" + pending + "?forget=true", 200) == {})
+                t.check("worktree: cancellation cleans checkout and registration before DELETE replies",
+                        not (sibling / pending).exists() and not registered(sibling / pending))
+                error = opening.result()
+                t.check("worktree: the original HTTP create reports cancellation", error.get("code") == "conflict", repr(error))
+                api("GET", "sessions/" + pending, 404)
+            finally:
+                gate.unlink()
+    finally:
+        git("config", "--local", "--unset", "filter.rollback-test.smudge")
 
 
 SECTIONS = [board, fs, session_config, configured_open, worktrees]

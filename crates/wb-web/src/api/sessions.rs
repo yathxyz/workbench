@@ -18,7 +18,7 @@ use wb_proto::hub::{
     Summary, WorktreeRequest,
 };
 use wb_proto::journal::{EventBody, JournalEvent};
-use wb_proto::limits::{ACP_CONFIG_MAX, CAPTURE_MAX, GIT_ADD_TIMEOUT, GIT_TIMEOUT};
+use wb_proto::limits::{ACP_CONFIG_MAX, CAPTURE_MAX, GIT_TIMEOUT, GIT_WORKTREE_TIMEOUT};
 
 use super::{ApiState, Control, Read};
 use crate::AppState;
@@ -387,9 +387,9 @@ async fn create(
                     .code(ErrorCode::BadRequest),
             );
         }
-        // A linked checkout with a separate main gitdir can take seven queries,
-        // plus worktree add and a possible rollback before the reply.
-        wait += GIT_TIMEOUT * 8 + GIT_ADD_TIMEOUT;
+        // Up to nine discovery/ref calls, an add, and (on interruption)
+        // one list, an unlock and a remove. Do not mask git's cleanup result.
+        wait += GIT_TIMEOUT * 11 + GIT_WORKTREE_TIMEOUT * 2;
     }
     let open = async {
         let (mut conn, info) = connect(&api.app).await?;
@@ -611,7 +611,7 @@ async fn remove_worktree(
     act(
         &api.app,
         HubRequest::AcpRemoveWorktree { rid: RID, sid },
-        GIT_TIMEOUT + REPLY_TIMEOUT,
+        GIT_WORKTREE_TIMEOUT + REPLY_TIMEOUT,
     )
     .await
 }
@@ -621,7 +621,7 @@ struct KillQuery {
     forget: Option<bool>,
 }
 
-/// `acp.kill` or `pty.kill`, by the kind the control connection last heard.
+/// An unpublished sid can already have an ACP actor preparing its worktree.
 async fn kill(
     _: Control,
     State(api): State<ApiState>,
@@ -630,25 +630,39 @@ async fn kill(
 ) -> Result<Json<Value>, ApiError> {
     let sid = sid_of(id)?;
     let forget = query.forget.unwrap_or(false);
-    let req = match summary(&api.app, &sid)?.kind {
-        Kind::Acp => HubRequest::AcpKill {
+    let kind = api
+        .app
+        .hub
+        .sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&sid)
+        .map(|s| s.kind);
+    let req = match kind {
+        Some(Kind::Acp) | None => HubRequest::AcpKill {
             rid: RID,
             sid,
             forget,
         },
-        Kind::Pty => HubRequest::PtyKill {
+        Some(Kind::Pty) => HubRequest::PtyKill {
             rid: RID,
             sid,
             forget,
         },
-        Kind::Unknown => {
+        Some(Kind::Unknown) => {
             return Err(ApiError::new(
                 StatusCode::BAD_GATEWAY,
                 "a session of a kind this version does not know",
             ));
         }
     };
-    act(&api.app, req, REPLY_TIMEOUT).await
+    let wait = if kind.is_none() {
+        // Cancelling a pending creation waits for cleanup of the unpublished checkout.
+        GIT_TIMEOUT * 2 + GIT_WORKTREE_TIMEOUT + REPLY_TIMEOUT
+    } else {
+        REPLY_TIMEOUT
+    };
+    act(&api.app, req, wait).await
 }
 
 #[cfg(test)]

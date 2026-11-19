@@ -984,7 +984,12 @@ async fn actions_are_the_hubs_requests() {
             forget: true
         }
     );
-    let res = api.req("DELETE", "/v1/sessions/nope", OWNER).send().await;
+    // An unpublished sid can be an in-flight worktree creation: ask its actor.
+    let req = api.req("DELETE", "/v1/sessions/nope", OWNER);
+    let (kill, res) = api
+        .answered(req, refusal(ErrorCode::NotFound, "no session nope"))
+        .await;
+    assert!(matches!(kill, HubRequest::AcpKill { sid, .. } if sid == "nope"));
     assert_eq!(res.status, 404);
 
     // The hub's refusal, with its code and the status of §3.8.1.

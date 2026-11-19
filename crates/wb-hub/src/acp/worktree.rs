@@ -1,24 +1,42 @@
-//! Explicitly managed local git worktrees. No shell, force, fetch or branch deletion.
+//! Explicitly managed local git worktrees. Only a killed, unpublished add can force-remove.
 
 use std::env;
+use std::ffi::OsStr;
+use std::fs::Metadata;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
-use std::process::{Output, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
+use rustix::fs::OFlags;
 use rustix::process::Signal;
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{ChildStdout, Command};
+use tokio::sync::oneshot;
 use wb_proto::hub::{ErrorCode, ManagedWorktree, WorktreeRequest};
-use wb_proto::limits::{GIT_ADD_TIMEOUT, GIT_TIMEOUT};
+use wb_proto::limits::{GIT_TIMEOUT, GIT_WORKTREE_TIMEOUT};
 
 use super::agent::signal_group;
 
 type Error = (ErrorCode, String);
 const PIPE_BYTES: usize = 8192;
 const ERROR_CHARS: usize = 512;
+const MARKER: &str = "workbench-session";
+pub(super) const CANCELLED: &str = "worktree creation cancelled";
+
+fn cancelled() -> Error {
+    (ErrorCode::Conflict, CANCELLED.into())
+}
+
+#[derive(Debug)]
+struct Output<T> {
+    status: ExitStatus,
+    stdout: T,
+    stderr: Vec<u8>,
+}
 
 fn internal(e: io::Error) -> Error {
     (ErrorCode::Internal, e.to_string())
@@ -76,7 +94,14 @@ impl Drop for KillGroup {
     }
 }
 
-async fn run(git: &Path, cwd: &Path, args: &[&str], limit: Duration) -> Result<Output, Error> {
+async fn run_with<T>(
+    git: &Path,
+    cwd: &Path,
+    args: &[&str],
+    limit: Duration,
+    cancel: Option<&mut oneshot::Receiver<()>>,
+    read_stdout: impl AsyncFnOnce(ChildStdout) -> io::Result<T>,
+) -> Result<Output<T>, Error> {
     let mut cmd = Command::new(git);
     cmd.current_dir(cwd)
         .args(["--no-lazy-fetch", "-c", "core.hooksPath=/dev/null"])
@@ -102,7 +127,7 @@ async fn run(git: &Path, cwd: &Path, args: &[&str], limit: Duration) -> Result<O
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
-    for key in ["HOME", "XDG_CONFIG_HOME"] {
+    for key in ["HOME", "XDG_CONFIG_HOME", "PATH"] {
         if let Some(value) = env::var_os(key) {
             cmd.env(key, value);
         }
@@ -111,25 +136,55 @@ async fn run(git: &Path, cwd: &Path, args: &[&str], limit: Duration) -> Result<O
     let mut group = KillGroup(child.id());
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let output = tokio::time::timeout(limit, async {
+    let collect = async {
         // Don't reap the group leader until the pipes close: a filter can inherit a
         // pipe, outlive git and hang the request. Its group ID stays ours to kill.
-        let (stdout, stderr) = tokio::try_join!(prefix(stdout), first_error(stderr))?;
+        let (stdout, stderr) = tokio::try_join!(read_stdout(stdout), first_error(stderr))?;
         let status = child.wait().await?;
-        Ok(Output {
+        io::Result::Ok(Output {
             status,
             stdout,
             stderr,
         })
-    })
-    .await
-    .map_err(|_| (ErrorCode::Timeout, format!("git {} timed out", args[0])))?
-    .map_err(internal)?;
-    group.0 = None;
-    Ok(output)
+    };
+    let result = tokio::select! {
+        // If git already completed, let the actor roll it back normally.
+        biased;
+        out = collect => out.map_err(internal),
+        _ = async {
+            match cancel {
+                Some(rx) => { let _ = rx.await; }
+                None => std::future::pending().await,
+            }
+        } => Err(cancelled()),
+        _ = tokio::time::sleep(limit) => {
+            let command = match args {
+                [.., "worktree", op, "--", _] | ["worktree", op, ..] => format!("worktree {op}"),
+                _ => args[0].to_string(),
+            };
+            Err((ErrorCode::Timeout, format!("git {command} timed out")))
+        }
+    };
+    if result.is_ok() {
+        group.0 = None;
+    } else {
+        // Reap the killed command before starting any cleanup of its registration.
+        drop(group);
+        let _ = child.wait().await;
+    }
+    result
 }
 
-fn failure(output: &Output, code: ErrorCode) -> Error {
+async fn run(
+    git: &Path,
+    cwd: &Path,
+    args: &[&str],
+    limit: Duration,
+) -> Result<Output<Vec<u8>>, Error> {
+    run_with(git, cwd, args, limit, None, prefix).await
+}
+
+fn failure<T>(output: &Output<T>, code: ErrorCode) -> Error {
     let mut message: String = String::from_utf8_lossy(&output.stderr)
         .chars()
         .filter(|c| !c.is_control())
@@ -141,7 +196,7 @@ fn failure(output: &Output, code: ErrorCode) -> Error {
     (code, message)
 }
 
-fn checked(output: Output, code: ErrorCode) -> Result<Vec<u8>, Error> {
+fn checked<T>(output: Output<T>, code: ErrorCode) -> Result<T, Error> {
     if output.status.success() {
         Ok(output.stdout)
     } else {
@@ -154,6 +209,93 @@ fn absolute_path(bytes: &[u8]) -> Result<&str, Error> {
         .ok()
         .filter(|s| Path::new(s).is_absolute())
         .ok_or_else(|| (ErrorCode::BadRequest, "invalid git worktree path".into()))
+}
+
+#[derive(Default)]
+struct Worktrees {
+    main: Vec<u8>,
+    main_bare: bool,
+    branch_busy: bool,
+    // None if not registered; otherwise this path's lock state.
+    locked: Option<bool>,
+}
+
+// A busy branch may be in the last of arbitrarily many records. Stream them
+// all, retaining only the first root, the current field and the requested facts.
+async fn scan(
+    pipe: impl AsyncRead + Unpin,
+    branch: Option<&str>,
+    target: Option<&Path>,
+) -> io::Result<Worktrees> {
+    let mut pipe = BufReader::new(pipe);
+    let mut list = Worktrees::default();
+    let mut main = true;
+    let mut matching_path = false;
+    let mut field = Vec::new();
+    let mut truncated = false;
+    loop {
+        let bytes = pipe.fill_buf().await?;
+        if bytes.is_empty() {
+            if !field.is_empty() {
+                return Err(io::Error::other("incomplete git worktree list"));
+            }
+            return Ok(list);
+        }
+        let end = bytes.iter().position(|b| *b == 0);
+        let count = end.unwrap_or(bytes.len());
+        let keep = count.min(PIPE_BYTES - field.len());
+        truncated |= keep < count;
+        field.extend_from_slice(&bytes[..keep]);
+        pipe.consume(count + usize::from(end.is_some()));
+        if end.is_none() {
+            continue;
+        }
+        if field.is_empty() {
+            main = false;
+            matching_path = false;
+        } else if let Some(path) = field.strip_prefix(b"worktree ") {
+            if main && list.main.is_empty() && !truncated {
+                list.main.extend_from_slice(path);
+            }
+            matching_path = !truncated && target.is_some_and(|p| path == p.as_os_str().as_bytes());
+            if matching_path {
+                list.locked = Some(false);
+            }
+        } else if matching_path && (field == b"locked" || field.starts_with(b"locked ")) {
+            list.locked = Some(true);
+        } else if main && field == b"bare" {
+            list.main_bare = true;
+        } else if let Some(name) = field.strip_prefix(b"branch refs/heads/") {
+            list.branch_busy |= !truncated && branch.is_some_and(|b| name == b.as_bytes());
+        }
+        field.clear();
+        truncated = false;
+    }
+}
+
+async fn worktrees(
+    git: &Path,
+    cwd: &Path,
+    branch: Option<&str>,
+    target: Option<&Path>,
+) -> Result<Worktrees, Error> {
+    let out = run_with(
+        git,
+        cwd,
+        &["worktree", "list", "--porcelain", "-z"],
+        GIT_TIMEOUT,
+        None,
+        async move |pipe| scan(pipe, branch, target).await,
+    )
+    .await?;
+    let list = checked(out, ErrorCode::Internal)?;
+    if list.main.is_empty() {
+        return Err((
+            ErrorCode::Internal,
+            "missing main git worktree record".into(),
+        ));
+    }
+    Ok(list)
 }
 
 async fn main_checkout(git: &Path, cwd: &Path) -> Result<String, Error> {
@@ -175,6 +317,16 @@ async fn main_checkout(git: &Path, cwd: &Path) -> Result<String, Error> {
             )
         })?;
     let root = absolute_path(root)?;
+    let superproject = run(
+        git,
+        cwd,
+        &["rev-parse", "--show-superproject-working-tree"],
+        GIT_TIMEOUT,
+    )
+    .await?;
+    if !checked(superproject, ErrorCode::BadRequest)?.is_empty() {
+        return Err((ErrorCode::BadRequest, "cwd is inside a submodule".into()));
+    }
     // A linked checkout's private git dir has a commondir file. In a main
     // checkout use its actual top level, including for --separate-git-dir.
     let common_file = run(
@@ -199,34 +351,11 @@ async fn main_checkout(git: &Path, cwd: &Path) -> Result<String, Error> {
     {
         return Ok(root.to_owned());
     }
-    let list = run(
-        git,
-        cwd,
-        &["worktree", "list", "--porcelain", "-z"],
-        GIT_TIMEOUT,
-    )
-    .await?;
-    let bytes = checked(list, ErrorCode::BadRequest)?;
-    // The first record is the main worktree. -z avoids Git's path quoting and
-    // preserves spaces and newlines in paths; later records need not fit in our cap.
-    let end = bytes
-        .windows(2)
-        .position(|pair| pair == b"\0\0")
-        .ok_or_else(|| {
-            (
-                ErrorCode::BadRequest,
-                "no complete main worktree record".into(),
-            )
-        })?;
-    let mut fields = bytes[..end].split(|b| *b == 0);
-    let root = fields
-        .next()
-        .and_then(|s| s.strip_prefix(b"worktree "))
-        .ok_or_else(|| (ErrorCode::BadRequest, "invalid main worktree record".into()))?;
-    if fields.any(|s| s == b"bare") {
+    let list = worktrees(git, cwd, None, None).await?;
+    if list.main_bare {
         return Err((ErrorCode::BadRequest, "repository is bare".into()));
     }
-    let root = absolute_path(root)?;
+    let root = absolute_path(&list.main)?;
     if fs::try_exists(Path::new(root).join(".git"))
         .await
         .map_err(internal)?
@@ -256,8 +385,28 @@ async fn main_checkout(git: &Path, cwd: &Path) -> Result<String, Error> {
     Ok(top.to_owned())
 }
 
-async fn add(git: &Path, cwd: &Path, path: &str, request: &WorktreeRequest) -> Result<(), Error> {
+async fn prepare_branch(
+    git: &Path,
+    cwd: &Path,
+    request: &WorktreeRequest,
+    target: &Path,
+) -> Result<(), Error> {
     let branch = &request.branch;
+    let list = worktrees(git, cwd, Some(branch), Some(target)).await?;
+    if list.branch_busy {
+        return Err((
+            ErrorCode::Conflict,
+            format!("branch {branch} is already checked out in another worktree"),
+        ));
+    }
+    // A locked/prunable registration can outlive its checkout. Our interrupted
+    // add must never unlock or force-remove an earlier user's registration.
+    if list.locked.is_some() {
+        return Err((
+            ErrorCode::Conflict,
+            format!("worktree path is already registered: {}", target.display()),
+        ));
+    }
     let local = format!("refs/heads/{branch}");
     let exists = run(
         git,
@@ -302,14 +451,153 @@ async fn add(git: &Path, cwd: &Path, path: &str, request: &WorktreeRequest) -> R
         }
         _ => return Err(failure(&exists, ErrorCode::BadRequest)),
     }
-    let added = run(
-        git,
-        cwd,
-        &["worktree", "add", "--", path, branch],
-        GIT_ADD_TIMEOUT,
-    )
-    .await?;
-    checked(added, ErrorCode::Conflict)?;
+    Ok(())
+}
+
+// Resolve this exact checkout's .git file rather than discovering a repository
+// above it: the old path can have become an ordinary directory in another repo.
+async fn marker_path(path: &Path) -> Result<Option<PathBuf>, Error> {
+    if !optional(fs::symlink_metadata(path).await)?.is_some_and(|m| m.is_dir()) {
+        return Ok(None);
+    }
+    let dot_git = path.join(".git");
+    if !optional(fs::symlink_metadata(&dot_git).await)?.is_some_and(|m| m.is_file()) {
+        return Ok(None);
+    }
+    let Some(mut bytes) = read_regular(&dot_git, PIPE_BYTES).await? else {
+        return Ok(None);
+    };
+    if bytes.len() > PIPE_BYTES {
+        return Ok(None);
+    }
+    // Git strips trailing CR/LF but not spaces. Relative backlinks are based
+    // at the directory containing the gitfile, not at the process's cwd.
+    while matches!(bytes.last(), Some(b'\r' | b'\n')) {
+        bytes.pop();
+    }
+    let Some(dir) = bytes
+        .strip_prefix(b"gitdir: ")
+        .filter(|p| !p.is_empty() && !p.contains(&0))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(path.join(OsStr::from_bytes(dir)).join(MARKER)))
+}
+
+async fn read_regular(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, Error> {
+    // Guard against replaced metadata, including a FIFO. A pre-open stat
+    // alone would let a replacement race block a tokio filesystem worker.
+    let flags = OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::NOFOLLOW;
+    let Some(file) = optional(
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags.bits() as i32)
+            .open(path)
+            .await,
+    )?
+    else {
+        return Ok(None);
+    };
+    if !file.metadata().await.map_err(internal)?.is_file() {
+        return Err((
+            ErrorCode::Internal,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(internal)?;
+    Ok(Some(bytes))
+}
+
+async fn mark(path: &Path, sid: &str) -> Result<(), Error> {
+    let marker = marker_path(path).await?.ok_or_else(|| {
+        (
+            ErrorCode::Internal,
+            "git did not create a worktree backlink".into(),
+        )
+    })?;
+    let mut file = fs::File::create_new(marker).await.map_err(internal)?;
+    file.write_all(sid.as_bytes()).await.map_err(internal)?;
+    file.flush().await.map_err(internal)
+}
+
+fn optional<T>(r: io::Result<T>) -> Result<Option<T>, Error> {
+    match r {
+        Ok(value) => Ok(Some(value)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(internal(e)),
+    }
+}
+
+async fn still_reserved(path: &str, ours: &Metadata) -> Result<bool, Error> {
+    Ok(optional(fs::symlink_metadata(path).await)?
+        .is_some_and(|m| (m.dev(), m.ino()) == (ours.dev(), ours.ino())))
+}
+
+enum Undo {
+    Reservation,
+    InterruptedAdd(PathBuf),
+    UnmarkedCheckout,
+}
+
+async fn rollback(
+    git: &Path,
+    cwd: &Path,
+    path: &str,
+    ours: &Metadata,
+    undo: Undo,
+) -> Result<(), Error> {
+    let locked = if let Undo::InterruptedAdd(target) = &undo {
+        worktrees(git, cwd, None, Some(target)).await?.locked
+    } else {
+        None
+    };
+    if !still_reserved(path, ours).await? {
+        return if locked.is_some() || matches!(undo, Undo::UnmarkedCheckout) {
+            Err((
+                ErrorCode::Internal,
+                "directory no longer matches the reservation; nothing removed".into(),
+            ))
+        } else {
+            Ok(()) // Git cleaned up or the path was replaced. Don't touch it.
+        };
+    }
+    if let Some(is_locked) = locked {
+        if is_locked {
+            let out = run(git, cwd, &["worktree", "unlock", "--", path], GIT_TIMEOUT).await?;
+            checked(out, ErrorCode::Internal)?;
+            if !still_reserved(path, ours).await? {
+                return Err((
+                    ErrorCode::Internal,
+                    "directory changed after unlock; nothing removed".into(),
+                ));
+            }
+        }
+        // Only for an interrupted add, before any agent could have seen the
+        // directory. Neither explicit removal nor ordinary rollback can force.
+        let out = run(
+            git,
+            cwd,
+            &["worktree", "remove", "--force", "--", path],
+            GIT_WORKTREE_TIMEOUT,
+        )
+        .await?;
+        checked(out, ErrorCode::Internal)?;
+    } else if matches!(undo, Undo::UnmarkedCheckout) {
+        remove_clean(git, cwd, path).await?;
+    } else {
+        optional(fs::remove_dir(path).await)?; // Never recurse through an unregistered path.
+    }
     Ok(())
 }
 
@@ -317,6 +605,19 @@ pub(super) async fn create(
     git: &Path,
     cwd: &Path,
     request: &WorktreeRequest,
+    sid: &str,
+    cancel: oneshot::Receiver<()>,
+) -> Result<ManagedWorktree, Error> {
+    create_with_timeout(git, cwd, request, sid, cancel, GIT_WORKTREE_TIMEOUT).await
+}
+
+async fn create_with_timeout(
+    git: &Path,
+    cwd: &Path,
+    request: &WorktreeRequest,
+    sid: &str,
+    mut cancel: oneshot::Receiver<()>,
+    add_timeout: Duration,
 ) -> Result<ManagedWorktree, Error> {
     if !request.valid() {
         return Err((
@@ -324,7 +625,11 @@ pub(super) async fn create(
             "invalid worktree branch or base".into(),
         ));
     }
-    let main_root = main_checkout(git, cwd).await?;
+    let main_root = tokio::select! {
+        biased;
+        _ = &mut cancel => return Err(cancelled()),
+        root = main_checkout(git, cwd) => root?,
+    };
     let parent = format!("{main_root}-wt");
     let path = format!("{parent}/{}", request.branch.replace('/', "-"));
     fs::create_dir_all(&parent).await.map_err(internal)?;
@@ -340,25 +645,64 @@ pub(super) async fn create(
             internal(e)
         }
     })?;
-    let reservation = fs::File::open(&path).await.map_err(internal)?;
-    let ours = reservation.metadata().await.map_err(internal)?;
-    if let Err((code, message)) = add(git, cwd, &path, request).await {
-        // Git may already have removed its junk. Never recursively delete a
-        // partial/dirty checkout or clean up another request's replacement directory.
-        match fs::symlink_metadata(&path).await {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-            Ok(m) if (m.dev(), m.ino()) == (ours.dev(), ours.ino()) => {
-                if let Err(e) = fs::remove_dir(&path).await
-                    && e.kind() != io::ErrorKind::NotFound
-                {
-                    return Err((
-                        code,
-                        format!("{message}; worktree path left at {path}: {e}"),
-                    ));
-                }
+    let reservation_error = |e: io::Error| {
+        (
+            ErrorCode::Internal,
+            format!("could not inspect reserved worktree path {path}: {e}"),
+        )
+    };
+    let reservation = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlags::DIRECTORY | OFlags::NOFOLLOW).bits() as i32)
+        .open(&path)
+        .await
+        .map_err(reservation_error)?;
+    let ours = reservation.metadata().await.map_err(reservation_error)?;
+    let mut undo = Undo::Reservation;
+    let setup = async {
+        let target = fs::canonicalize(&path).await.map_err(internal)?;
+        tokio::select! {
+            biased;
+            _ = &mut cancel => return Err(cancelled()),
+            result = prepare_branch(git, cwd, request, &target) => result?,
+        }
+        if !still_reserved(&path, &ours).await? {
+            return Err((
+                ErrorCode::Conflict,
+                format!("worktree reservation changed: {path}"),
+            ));
+        }
+        let added = run_with(
+            git,
+            cwd,
+            &["worktree", "add", "--", &path, &request.branch],
+            add_timeout,
+            Some(&mut cancel),
+            prefix,
+        )
+        .await
+        .inspect_err(|e| {
+            if e.0 == ErrorCode::Timeout || e.1 == CANCELLED {
+                undo = Undo::InterruptedAdd(target);
             }
-            Ok(_) => (),
-            Err(e) => return Err((code, format!("{message}; could not inspect {path}: {e}"))),
+        })?;
+        checked(added, ErrorCode::Internal)?;
+        undo = Undo::UnmarkedCheckout;
+        if !still_reserved(&path, &ours).await? {
+            return Err((
+                ErrorCode::Internal,
+                "worktree directory changed during add".into(),
+            ));
+        }
+        mark(Path::new(&path), sid).await
+    }
+    .await;
+    if let Err((code, message)) = setup {
+        if let Err((_, detail)) = rollback(git, cwd, &path, &ours, undo).await {
+            return Err((
+                code,
+                format!("{message}; worktree path left at {path}: {detail}"),
+            ));
         }
         return Err((code, message));
     }
@@ -369,426 +713,39 @@ pub(super) async fn create(
     })
 }
 
-pub(super) async fn remove(git: &Path, record: &ManagedWorktree) -> Result<(), Error> {
+async fn remove_clean(git: &Path, cwd: &Path, path: &str) -> Result<(), Error> {
     // worktree remove's internal `git status --porcelain` otherwise honors a
     // status.showUntrackedFiles=no setting and deletes non-ignored untracked files.
     let removed = run(
         git,
-        Path::new(&record.main_root),
+        cwd,
         &[
             "-c",
             "status.showUntrackedFiles=all",
             "worktree",
             "remove",
             "--",
-            &record.path,
+            path,
         ],
-        GIT_TIMEOUT,
+        GIT_WORKTREE_TIMEOUT,
     )
     .await?;
     checked(removed, ErrorCode::Conflict)?;
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use std::fs::{self, Permissions};
-    use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    use super::*;
-
-    fn program(name: &str) -> PathBuf {
-        env::split_paths(&env::var_os("PATH").unwrap())
-            .filter(|dir| dir.is_absolute())
-            .map(|dir| dir.join(name))
-            .find(|path| path.is_file())
-            .unwrap_or_else(|| panic!("{name} missing from test PATH"))
+/// False means this record is stale; no removal was attempted. A git or I/O
+/// failure is not evidence of a stale record and must not make the actor clear it.
+pub(super) async fn remove(git: &Path, record: &ManagedWorktree, sid: &str) -> Result<bool, Error> {
+    let Some(marker) = marker_path(Path::new(&record.path)).await? else {
+        return Ok(false);
+    };
+    if read_regular(&marker, sid.len()).await?.as_deref() != Some(sid.as_bytes()) {
+        return Ok(false);
     }
-
-    struct Fixture {
-        temp: PathBuf,
-        git: PathBuf,
-    }
-
-    impl Fixture {
-        fn new() -> Self {
-            static NEXT: AtomicU32 = AtomicU32::new(0);
-            let parent = env::temp_dir().canonicalize().unwrap();
-            // Even the not-in-a-checkout case must never discover this checkout.
-            assert!(!parent.ancestors().any(|dir| dir.join(".git").exists()
-                || (dir.join("HEAD").exists() && dir.join("objects").is_dir())));
-            loop {
-                let n = NEXT.fetch_add(1, Ordering::Relaxed);
-                let temp = parent.join(format!("wb-worktree-{}-{n}", std::process::id()));
-                match fs::create_dir(&temp) {
-                    Ok(()) => {
-                        return Self {
-                            temp,
-                            git: program("git"),
-                        };
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                    Err(e) => panic!("create fixture: {e}"),
-                }
-            }
-        }
-
-        fn git(&self, cwd: &Path, args: &[&str]) -> String {
-            assert!(cwd.starts_with(&self.temp));
-            let out = std::process::Command::new(&self.git)
-                .current_dir(cwd)
-                .env_clear()
-                .env("HOME", &self.temp)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .args([
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-c",
-                    "user.name=Test",
-                    "-c",
-                    "user.email=test@example.invalid",
-                ])
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8(out.stdout)
-                .unwrap()
-                .trim_end_matches('\n')
-                .to_owned()
-        }
-
-        fn repo(&self) -> PathBuf {
-            let repo = self.temp.join("main repo");
-            fs::create_dir(&repo).unwrap();
-            self.git(&repo, &["init", "-b", "main"]);
-            fs::write(repo.join("tracked"), "clean\n").unwrap();
-            self.git(&repo, &["add", "tracked"]);
-            self.git(&repo, &["commit", "-m", "first"]);
-            repo
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.temp).unwrap();
-        }
-    }
-
-    fn request(branch: &str, base: Option<&str>) -> WorktreeRequest {
-        WorktreeRequest {
-            branch: branch.into(),
-            base: base.map(str::to_owned),
-        }
-    }
-
-    fn script(path: &Path, body: &str) {
-        fs::write(path, format!("#!{}\n{body}\n", program("sh").display())).unwrap();
-        fs::set_permissions(path, Permissions::from_mode(0o700)).unwrap();
-    }
-
-    #[tokio::test]
-    async fn new_branches_use_checkout_head_named_base_or_id_without_tracking() {
-        let f = Fixture::new();
-        let repo = f.repo();
-        let first = f.git(&repo, &["rev-parse", "HEAD"]);
-        f.git(&repo, &["tag", "release"]);
-        f.git(&repo, &["remote", "add", "origin", "./unused"]);
-        f.git(&repo, &["update-ref", "refs/remotes/origin/main", &first]);
-        f.git(&repo, &["config", "branch.autoSetupMerge", "always"]);
-        f.git(&repo, &["commit", "--allow-empty", "-m", "second"]);
-        let head = f.git(&repo, &["rev-parse", "HEAD"]);
-        let nested = repo.join("one/two");
-        fs::create_dir_all(&nested).unwrap();
-        for (branch, base, expected) in [
-            ("topic/default", None, &head),
-            ("from-tag", Some("release"), &first),
-            ("from-id", Some(first.as_str()), &first),
-            ("from-remote", Some("origin/main"), &first),
-        ] {
-            let record = create(&f.git, &nested, &request(branch, base))
-                .await
-                .unwrap();
-            let wt = Path::new(&record.path);
-            assert_eq!(
-                wt,
-                f.temp.join("main repo-wt").join(branch.replace('/', "-"))
-            );
-            assert_eq!(Path::new(&record.main_root), repo);
-            assert_eq!(record.branch, branch);
-            assert_eq!(&f.git(wt, &["rev-parse", "HEAD"]), expected);
-            assert_eq!(
-                f.git(wt, &["symbolic-ref", "HEAD"]),
-                format!("refs/heads/{branch}")
-            );
-            assert!(
-                f.git(
-                    wt,
-                    &[
-                        "for-each-ref",
-                        "--format=%(upstream)",
-                        &format!("refs/heads/{branch}")
-                    ]
-                )
-                .is_empty()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn linked_subdirectory_uses_linked_head_but_main_checkout_sibling() {
-        let f = Fixture::new();
-        let repo = f.repo();
-        let old = f.git(&repo, &["rev-parse", "HEAD"]);
-        let linked = f.temp.join("linked");
-        f.git(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                "--",
-                linked.to_str().unwrap(),
-                &old,
-            ],
-        );
-        f.git(&repo, &["commit", "--allow-empty", "-m", "second"]);
-        let cwd = linked.join("dir");
-        fs::create_dir(&cwd).unwrap();
-        let record = create(&f.git, &cwd, &request("linked-head", None))
-            .await
-            .unwrap();
-        assert_eq!(Path::new(&record.main_root), repo);
-        assert_eq!(
-            Path::new(&record.path),
-            f.temp.join("main repo-wt/linked-head")
-        );
-        assert_eq!(f.git(Path::new(&record.path), &["rev-parse", "HEAD"]), old);
-    }
-
-    #[tokio::test]
-    async fn existing_local_branch_is_attached_not_reset_or_detached_at_same_named_tag() {
-        let f = Fixture::new();
-        let repo = f.repo();
-        let first = f.git(&repo, &["rev-parse", "HEAD"]);
-        let branch = &first[..8]; // Also resolves as an abbreviated commit name.
-        f.git(&repo, &["tag", branch]);
-        f.git(&repo, &["commit", "--allow-empty", "-m", "second"]);
-        let second = f.git(&repo, &["rev-parse", "HEAD"]);
-        f.git(&repo, &["branch", branch]);
-        let record = create(&f.git, &repo, &request(branch, Some("missing-base")))
-            .await
-            .unwrap();
-        let wt = Path::new(&record.path);
-        assert_eq!(f.git(wt, &["rev-parse", "HEAD"]), second);
-        assert_eq!(
-            f.git(wt, &["symbolic-ref", "HEAD"]),
-            format!("refs/heads/{branch}")
-        );
-
-        let (code, msg) = create(&f.git, &repo, &request("main", None))
-            .await
-            .unwrap_err();
-        assert_eq!(code, ErrorCode::Conflict);
-        assert!(msg.starts_with("fatal:"), "{msg}");
-        assert!(!f.temp.join("main repo-wt/main").exists());
-    }
-
-    #[tokio::test]
-    async fn reserves_path_without_touching_any_existing_entry() {
-        let f = Fixture::new();
-        let repo = f.repo();
-        let parent = f.temp.join("main repo-wt");
-        fs::create_dir(&parent).unwrap();
-        fs::create_dir(parent.join("empty")).unwrap();
-        fs::write(parent.join("file"), b"keep").unwrap();
-        symlink("missing", parent.join("dangling")).unwrap();
-        for name in ["empty", "file", "dangling"] {
-            let err = create(&f.git, &repo, &request(name, None))
-                .await
-                .unwrap_err();
-            assert_eq!(err.0, ErrorCode::Conflict);
-            assert!(f.git(&repo, &["branch", "--list", name]).is_empty());
-        }
-        assert_eq!(fs::read_dir(parent.join("empty")).unwrap().count(), 0);
-        assert_eq!(fs::read(parent.join("file")).unwrap(), b"keep");
-        assert_eq!(
-            fs::read_link(parent.join("dangling")).unwrap(),
-            Path::new("missing")
-        );
-
-        let a = request("a/b", None);
-        let b = request("a-b", None);
-        let (one, two) = tokio::join!(create(&f.git, &repo, &a), create(&f.git, &repo, &b));
-        match (one, two) {
-            (Ok(rec), Err(err)) | (Err(err), Ok(rec)) => {
-                assert_eq!(err.0, ErrorCode::Conflict);
-                assert_eq!(
-                    f.git(Path::new(&rec.path), &["symbolic-ref", "--short", "HEAD"]),
-                    rec.branch
-                );
-            }
-            results => panic!("exactly one request must claim the path: {results:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn refuses_non_checkout_bare_and_missing_base() {
-        let f = Fixture::new();
-        let repo = f.repo();
-        let bare = f.temp.join("bare");
-        fs::create_dir(&bare).unwrap();
-        f.git(&bare, &["init", "--bare"]);
-        for cwd in [&f.temp, &bare, &repo.join(".git")] {
-            assert_eq!(
-                create(&f.git, cwd, &request("no", None))
-                    .await
-                    .unwrap_err()
-                    .0,
-                ErrorCode::BadRequest
-            );
-        }
-        assert_eq!(
-            create(&f.git, &repo, &request("no", Some("nowhere")))
-                .await
-                .unwrap_err()
-                .0,
-            ErrorCode::BadRequest
-        );
-        assert!(!f.temp.join("main repo-wt/no").exists());
-        assert!(f.git(&repo, &["branch", "--list", "no"]).is_empty());
-    }
-
-    #[tokio::test]
-    async fn invalid_names_are_refused_before_git_runs() {
-        let f = Fixture::new();
-        let missing = f.temp.join("there-is-no-git");
-        for name in [
-            "",
-            "-x",
-            "--upload-pack=x",
-            "..",
-            "a/../b",
-            ".x",
-            "a/.x",
-            "x.lock",
-            "a.lock/b",
-            "HEAD",
-            "a b",
-            "a@{1}",
-            "a\nb",
-            "a\0b",
-            "/a",
-            "a/",
-            "a//b",
-            "a~1",
-            "a^",
-            "a:b",
-            &"a".repeat(256),
-        ] {
-            for req in [request(name, None), request("valid", Some(name))] {
-                assert_eq!(
-                    create(&missing, &f.temp, &req).await.unwrap_err().0,
-                    ErrorCode::BadRequest,
-                    "{name:?}"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn hooks_are_disabled_and_only_clean_worktrees_can_be_removed() {
-        let f = Fixture::new();
-        let repo = f.repo();
-        let hooks = f.temp.join("hooks");
-        fs::create_dir(&hooks).unwrap();
-        f.git(
-            &repo,
-            &["config", "core.hooksPath", hooks.to_str().unwrap()],
-        );
-        f.git(
-            &repo,
-            &["config", "hook.fixture.command", ": > hook-ran; exit 1"],
-        );
-        f.git(&repo, &["config", "hook.fixture.event", "post-checkout"]);
-        f.git(&repo, &["config", "status.showUntrackedFiles", "no"]);
-        script(&hooks.join("post-checkout"), ": > hook-ran\nexit 1");
-        let fsmonitor = hooks.join("fsmonitor");
-        script(&fsmonitor, ": > fsmonitor-ran\nexit 1");
-        f.git(
-            &repo,
-            &["config", "core.fsmonitor", fsmonitor.to_str().unwrap()],
-        );
-        let record = create(&f.git, &repo, &request("keep-branch", None))
-            .await
-            .unwrap();
-        let wt = Path::new(&record.path);
-        assert!(!wt.join("hook-ran").exists());
-        assert!(!wt.join("fsmonitor-ran").exists());
-        for dirty in ["tracked", "untracked"] {
-            fs::write(wt.join(dirty), b"keep").unwrap();
-            let (code, msg) = remove(&f.git, &record).await.unwrap_err();
-            assert_eq!(code, ErrorCode::Conflict);
-            assert!(msg.starts_with("fatal:"), "{msg}");
-            assert_eq!(fs::read(wt.join(dirty)).unwrap(), b"keep");
-            if dirty == "tracked" {
-                fs::write(wt.join(dirty), b"clean\n").unwrap();
-            } else {
-                fs::remove_file(wt.join(dirty)).unwrap();
-            }
-        }
-        remove(&f.git, &record).await.unwrap();
-        assert!(!wt.exists());
-        assert_eq!(
-            f.git(&repo, &["rev-parse", "refs/heads/keep-branch"]),
-            f.git(&repo, &["rev-parse", "HEAD"])
-        );
-    }
-
-    #[tokio::test]
-    async fn git_deadline_includes_descendants_holding_the_pipes() {
-        let f = Fixture::new();
-        let fake = f.temp.join("sleeping-git");
-        // The group leader exits before its helper. Killing just the direct child
-        // would leave the pipe open and let the helper create its marker.
-        script(
-            &fake,
-            &format!(
-                "( '{}' 2 && : > survived ) &\n: > started\nexit 0",
-                program("sleep").display()
-            ),
-        );
-        let (code, _) = run(&fake, &f.temp, &["sleep"], Duration::from_millis(500))
-            .await
-            .unwrap_err();
-        assert_eq!(code, ErrorCode::Timeout);
-        assert!(f.temp.join("started").is_file());
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert!(!f.temp.join("survived").exists());
-    }
-
-    #[tokio::test]
-    async fn output_and_error_lines_are_bounded_and_strip_controls() {
-        let f = Fixture::new();
-        let fake = f.temp.join("noisy-git");
-        script(
-            &fake,
-            "printf 'Preparing worktree\\nfatal: \\033\\r\\tx' >&2\ni=0\nwhile [ \"$i\" -lt 3000 ]; do printf '12345678'; printf '12345678' >&2; i=$((i+1)); done\nexit 1",
-        );
-        let output = run(&fake, &f.temp, &["noisy"], GIT_TIMEOUT).await.unwrap();
-        assert_eq!(
-            (output.stdout.len(), output.stderr.len()),
-            (PIPE_BYTES, PIPE_BYTES / 2)
-        );
-        let (_, msg) = failure(&output, ErrorCode::Conflict);
-        assert!(msg.starts_with("fatal: x"));
-        assert!(!msg.chars().any(char::is_control));
-        assert_eq!(msg.len(), ERROR_CHARS);
-    }
+    remove_clean(git, Path::new(&record.main_root), &record.path).await?;
+    Ok(true)
 }
+
+#[cfg(test)]
+mod tests;

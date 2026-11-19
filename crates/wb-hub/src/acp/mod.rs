@@ -29,6 +29,7 @@ use rustix::process::Signal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::{JoinError, JoinSet};
 use tokio::time::Instant;
 use tracing::{Instrument, error, info, info_span, warn};
 use wb_proto::hub::{
@@ -101,6 +102,7 @@ const HISTORY: [&str; 6] = [
 const FILES: [&str; 4] = ["json", "jsonl", "stderr.log", "stderr.log.1"];
 const JOURNAL_FAILED: &str = "the journal could not be written";
 const NO_WORKTREE_GIT: &str = "git is not configured for managed worktrees";
+const WORKTREE_BUSY: &str = "worktree operation in progress";
 
 /// A request to a session actor.
 pub enum Cmd {
@@ -615,8 +617,32 @@ struct StartupConfig {
     errors: Vec<ConfigError>,
 }
 
+/// The request stays with the actor while git runs. In particular shutdown can
+/// refuse it explicitly, even when it has to abort a rollback.
+enum WorktreeOp {
+    Create {
+        open: Open,
+        cancel: Option<oneshot::Sender<()>>,
+    },
+    Remove(Reply),
+    Rollback {
+        reply: Reply,
+        code: ErrorCode,
+        message: String,
+        path: String,
+    },
+}
+
+enum WorktreeChange {
+    Created(ManagedWorktree),
+    Removed(bool),
+}
+
+type WorktreeResult = Result<WorktreeChange, (ErrorCode, String)>;
+
 enum Event {
     Cmd(Option<Cmd>),
+    Worktree(Result<WorktreeResult, JoinError>),
     Replayed(Replayed),
     Out(Option<Out>),
     Exited(io::Result<ExitStatus>),
@@ -637,7 +663,7 @@ struct Acp {
     phase: Phase,
     shared: Arc<Shared>,
     meta: Meta,
-    /// `None` only for a session whose files failed to load.
+    /// `None` until creation succeeds, or for a session whose files failed to load.
     journal: Option<Journal>,
     facts: Facts,
     /// The kind of every permission and elicitation request ever announced, by `req`.
@@ -647,6 +673,11 @@ struct Acp {
     fault_exit: Option<(Option<i32>, Option<i32>, ExitReason)>,
     proc: Option<Proc>,
     startup_config: Option<StartupConfig>,
+    worktree_op: Option<WorktreeOp>,
+    /// The first kill of an unpublished checkout waits through its cleanup.
+    create_kill: Option<Reply>,
+    /// At most one git task; dropping the actor also aborts it and its process group.
+    git: JoinSet<WorktreeResult>,
     /// The agent's requests waiting for an answer, by `req`.
     held: BTreeMap<u64, HeldReq>,
     /// A `session` event follows the last `spawn`.
@@ -694,6 +725,9 @@ impl Acp {
             fault_exit: None,
             proc: None,
             startup_config: None,
+            worktree_op: None,
+            create_kill: None,
+            git: JoinSet::new(),
             held: BTreeMap::new(),
             has_session: false,
             load_filter: false,
@@ -773,6 +807,7 @@ impl Acp {
             };
             let event = tokio::select! {
                 cmd = rx.recv() => Event::Cmd(cmd),
+                Some(result) = self.git.join_next(), if self.worktree_op.is_some() => Event::Worktree(result),
                 Some(r) = self.replayed_rx.recv() => Event::Replayed(r),
                 out = recv(out) => Event::Out(out),
                 st = wait(child) => Event::Exited(st),
@@ -787,6 +822,7 @@ impl Acp {
             match event {
                 Event::Cmd(Some(cmd)) => self.command(cmd).await,
                 Event::Cmd(None) => return,
+                Event::Worktree(result) => self.worktree_done(result).await,
                 Event::Replayed(r) => self.replayed(&r),
                 Event::Out(Some(Out::Msg(msg))) => self.agent_message(msg),
                 Event::Out(Some(Out::Eof) | None) => self.stdout_closed(),
@@ -850,6 +886,40 @@ impl Acp {
         if self.stopping.is_some() {
             return cmd.refuse(ErrorCode::Internal, "hub stopping");
         }
+        if let Some(op) = &mut self.worktree_op {
+            match cmd {
+                // Kill/forget cancels an unpublished create. Once rolling back, we
+                // only need to wait; never interrupt the cleanup to answer a kill.
+                Cmd::Act {
+                    act: Act::Kill { .. },
+                    reply,
+                } if self.journal.is_none() => {
+                    if self.create_kill.is_some() {
+                        return reply.err(ErrorCode::Conflict, WORKTREE_BUSY);
+                    }
+                    if let WorktreeOp::Create { cancel, .. } = op
+                        && let Some(cancel) = cancel.take()
+                    {
+                        let _ = cancel.send(());
+                    }
+                    self.create_kill = Some(reply);
+                    return;
+                }
+                Cmd::Open(o)
+                    if self.journal.is_none()
+                        || o.spawn.as_ref().is_some_and(|s| s.worktree.is_some()) =>
+                {
+                    return o.reply.err(ErrorCode::Conflict, WORKTREE_BUSY);
+                }
+                Cmd::Act { act, reply }
+                    if self.journal.is_none()
+                        || matches!(act, Act::Revive | Act::Kill { .. } | Act::RemoveWorktree) =>
+                {
+                    return reply.err(ErrorCode::Conflict, WORKTREE_BUSY);
+                }
+                _ => {}
+            }
+        }
         match cmd {
             Cmd::Open(o) => self.open(o, false),
             Cmd::Detach { conn, reply } => {
@@ -858,8 +928,8 @@ impl Acp {
                     reply.done();
                 }
             }
-            Cmd::Act { act, reply } => self.act(act, reply).await,
-            Cmd::Shutdown { done } => self.shutdown(done),
+            Cmd::Act { act, reply } => self.act(act, reply),
+            Cmd::Shutdown { done } => self.shutdown(done).await,
         }
     }
 
@@ -870,44 +940,57 @@ impl Acp {
     /// Creates the session of a new sid: its record and journal, then the agent. A
     /// failed spawn is journaled, and the session stays.
     async fn create(&mut self, mut o: Open) {
-        let Some(spawn) = o.spawn.take() else {
+        let Some(spawn) = &mut o.spawn else {
             let msg = format!("no session {}", self.sid);
-            return self.abandon(o.reply, ErrorCode::NotFound, msg).await;
+            return self.abandon(o.reply, ErrorCode::NotFound, msg, true);
         };
-        let host = spawn.host.filter(|h| *h != self.ctx.cfg.host);
-        if let Some(host) = &host {
+        if spawn.host.as_ref() == Some(&self.ctx.cfg.host) {
+            spawn.host = None;
+        }
+        if let Some(host) = &spawn.host {
             if let Err((code, msg)) = self.check_remote(host, &spawn.agent, &spawn.cwd) {
-                return self.abandon(o.reply, code, msg).await;
+                return self.abandon(o.reply, code, msg, true);
             }
         } else {
             if !self.ctx.cfg.agents.contains_key(&spawn.agent) {
                 let msg = format!("no agent {}", spawn.agent);
-                return self.abandon(o.reply, ErrorCode::UnknownAgent, msg).await;
+                return self.abandon(o.reply, ErrorCode::UnknownAgent, msg, true);
             }
             if !spawn.cwd.starts_with('/') || !Path::new(&spawn.cwd).is_dir() {
                 let msg = "cwd must be an absolute path of an existing directory".to_owned();
-                return self.abandon(o.reply, ErrorCode::BadRequest, msg).await;
+                return self.abandon(o.reply, ErrorCode::BadRequest, msg, true);
             }
         }
-        let (cwd, managed_worktree) = if let Some(request) = &spawn.worktree {
-            let git = self
-                .ctx
-                .cfg
-                .git
-                .as_deref()
-                .expect("validated worktree request");
-            match worktree::create(git, Path::new(&spawn.cwd), request).await {
-                Ok(record) => (record.path.clone(), Some(record)),
-                Err((code, msg)) => return self.abandon(o.reply, code, msg).await,
-            }
+        if let Some(request) = spawn.worktree.take() {
+            let ctx = self.ctx.clone();
+            let sid = self.sid.clone();
+            let cwd = std::mem::take(&mut spawn.cwd);
+            let (cancel, cancelled) = oneshot::channel();
+            self.worktree_op = Some(WorktreeOp::Create {
+                open: o,
+                cancel: Some(cancel),
+            });
+            self.git.spawn(async move {
+                let git = ctx.cfg.git.as_deref().expect("validated worktree request");
+                worktree::create(git, Path::new(&cwd), &request, &sid, cancelled)
+                    .await
+                    .map(WorktreeChange::Created)
+            });
         } else {
-            (spawn.cwd, None)
-        };
+            self.finish_create(o, None).await;
+        }
+    }
+
+    async fn finish_create(&mut self, mut o: Open, managed_worktree: Option<ManagedWorktree>) {
+        let spawn = o.spawn.take().expect("validated creating open");
+        let cwd = managed_worktree
+            .as_ref()
+            .map_or(spawn.cwd, |r| r.path.clone());
         self.meta = Meta {
             sid: self.sid.clone(),
             agent: spawn.agent,
             cwd,
-            host,
+            host: spawn.host,
             created_at: self.created_at,
             managed_worktree,
             ..Meta::default()
@@ -933,7 +1016,12 @@ impl Acp {
             Err(e) => {
                 warn!("creating the session's files: {e}");
                 let msg = format!("creating the session's files: {e}");
-                return self.abandon(o.reply, ErrorCode::Internal, msg).await;
+                if let Some(record) = self.meta.managed_worktree.take() {
+                    self.rollback(record, o.reply, ErrorCode::Internal, msg);
+                } else {
+                    self.abandon(o.reply, ErrorCode::Internal, msg, true);
+                }
+                return;
             }
         }
         if spawn.config.is_empty() {
@@ -968,17 +1056,19 @@ impl Acp {
         Ok(())
     }
 
-    /// Rolls back any worktree created for a refused open before releasing its sid.
-    async fn abandon(&mut self, reply: Reply, code: ErrorCode, mut message: String) {
-        if let Some(record) = &self.meta.managed_worktree
-            && let Err((_, e)) = self.remove_record(record).await
-        {
-            message = format!("{message}; worktree left at {}: {e}", record.path);
-        }
-        reply.err(code, message);
+    /// Releases the unpublished sid only after cleanup, before clients can retry.
+    fn abandon(&mut self, reply: Reply, code: ErrorCode, message: String, clean: bool) {
         if self.ctx.registry.abandon(&self.sid, self.created_at) {
             self.phase = Phase::Abandoned;
         }
+        if let Some(kill) = self.create_kill.take() {
+            if clean {
+                kill.done();
+            } else {
+                kill.err(code, message.clone());
+            }
+        }
+        reply.err(code, message);
     }
 
     /// Starts the agent and sends `initialize`. A failure is journaled as
@@ -1442,7 +1532,7 @@ impl Acp {
         }
     }
 
-    async fn act(&mut self, act: Act, reply: Reply) {
+    fn act(&mut self, act: Act, reply: Reply) {
         if self.startup_config.is_some()
             && matches!(
                 &act,
@@ -1484,7 +1574,7 @@ impl Acp {
             Act::Revive => self.revive(reply),
             Act::Authenticate(method_id) => self.authenticate(&method_id, reply),
             Act::Kill { forget } => self.kill(forget, reply),
-            Act::RemoveWorktree => self.remove_worktree(reply).await,
+            Act::RemoveWorktree => self.remove_worktree(reply),
         }
     }
 
@@ -1862,7 +1952,7 @@ impl Acp {
 
     async fn write_meta(&mut self) -> io::Result<()> {
         self.meta_at = None;
-        // A session whose files failed to load has no record of its own to write.
+        // An unpublished or quarantined session has no record of its own to write.
         if self.journal.is_none() {
             return Ok(());
         }
@@ -1877,6 +1967,15 @@ impl Acp {
         self.probe();
         if self.fault.is_some() {
             return reply.err(ErrorCode::Faulted, "the session has a fault");
+        }
+        if self.proc.is_none() && self.meta.host.is_none() && !Path::new(&self.meta.cwd).is_dir() {
+            return reply.err(
+                ErrorCode::NotRevivable,
+                format!(
+                    "session working directory no longer exists: {}",
+                    self.meta.cwd
+                ),
+            );
         }
         if self.proc.is_some() || !self.facts.revivable(self.meta.init.as_ref()) {
             return reply.err(ErrorCode::NotRevivable, "the session cannot be revived");
@@ -1948,39 +2047,151 @@ impl Acp {
         }
     }
 
-    async fn remove_record(&self, record: &ManagedWorktree) -> Result<(), (ErrorCode, String)> {
-        let Some(git) = self.ctx.cfg.git.as_deref() else {
-            return Err((ErrorCode::BadRequest, NO_WORKTREE_GIT.into()));
+    fn rollback(
+        &mut self,
+        record: ManagedWorktree,
+        reply: Reply,
+        code: ErrorCode,
+        message: String,
+    ) {
+        let op = WorktreeOp::Rollback {
+            reply,
+            code,
+            message,
+            path: record.path.clone(),
         };
-        worktree::remove(git, record).await
+        self.start_remove(op, record);
     }
 
-    async fn remove_worktree(&mut self, reply: Reply) {
+    fn start_remove(&mut self, op: WorktreeOp, record: ManagedWorktree) {
+        let ctx = self.ctx.clone();
+        let sid = self.sid.clone();
+        self.worktree_op = Some(op);
+        self.git.spawn(async move {
+            let git = ctx.cfg.git.as_deref().expect("configured worktree removal");
+            worktree::remove(git, &record, &sid)
+                .await
+                .map(WorktreeChange::Removed)
+        });
+    }
+
+    fn remove_worktree(&mut self, reply: Reply) {
         let Some(record) = &self.meta.managed_worktree else {
             return reply.err(ErrorCode::NotFound, "the session has no managed worktree");
         };
         if self.proc.is_some() {
             return reply.err(ErrorCode::Conflict, "the agent is still running");
         }
-        if let Err((code, msg)) = self.remove_record(record).await {
-            return reply.err(code, msg);
+        if self.ctx.cfg.git.is_none() {
+            return reply.err(ErrorCode::BadRequest, NO_WORKTREE_GIT);
         }
-        self.meta.managed_worktree = None;
-        let saved = self.write_meta().await;
-        self.publish();
-        match saved {
-            Ok(()) => reply.done(),
-            Err(e) => reply.err(
+        self.start_remove(WorktreeOp::Remove(reply), record.clone());
+    }
+
+    async fn worktree_done(&mut self, joined: Result<WorktreeResult, JoinError>) {
+        use WorktreeChange::{Created, Removed};
+        let op = self
+            .worktree_op
+            .take()
+            .expect("git completion without a request");
+        let result =
+            joined.unwrap_or_else(|e| Err((ErrorCode::Internal, format!("git task failed: {e}"))));
+        match (op, result) {
+            (WorktreeOp::Create { open, .. }, Ok(Created(record))) => {
+                if self.create_kill.is_none() {
+                    self.finish_create(open, Some(record)).await;
+                } else {
+                    // The add won its race with cancellation. Undo the owned checkout
+                    // before releasing the sid or answering either request.
+                    self.rollback(
+                        record,
+                        open.reply,
+                        ErrorCode::Conflict,
+                        worktree::CANCELLED.into(),
+                    );
+                }
+            }
+            (WorktreeOp::Create { open, .. }, Err((code, message))) => {
+                let clean = message == worktree::CANCELLED;
+                self.abandon(open.reply, code, message, clean);
+            }
+            (
+                WorktreeOp::Rollback {
+                    reply,
+                    code,
+                    message,
+                    path,
+                },
+                result,
+            ) => match result {
+                Ok(Removed(true)) => self.abandon(reply, code, message, true),
+                Ok(Removed(false)) => self.abandon(
+                    reply,
+                    code,
+                    format!("{message}; worktree at {path} no longer owned; nothing deleted"),
+                    false,
+                ),
+                Err((_, error)) => self.abandon(
+                    reply,
+                    code,
+                    format!("{message}; worktree left at {path}: {error}"),
+                    false,
+                ),
+                Ok(Created(_)) => unreachable!("rollback completed an add"),
+            },
+            (WorktreeOp::Remove(reply), Ok(Removed(deleted))) => {
+                self.removed(reply, deleted).await;
+            }
+            (WorktreeOp::Remove(reply), Err((code, message))) => reply.err(code, message),
+            _ => unreachable!("git result does not match request"),
+        }
+    }
+
+    async fn removed(&mut self, reply: Reply, deleted: bool) {
+        let record = self.meta.managed_worktree.take();
+        let meta_at = self.meta_at;
+        if let Err(e) = self.write_meta().await {
+            // Preserve the last committed record so the caller can retry the clear.
+            self.meta.managed_worktree = record;
+            self.meta_at = meta_at;
+            let state = if deleted {
+                "worktree removed"
+            } else {
+                "session worktree already gone; nothing deleted"
+            };
+            return reply.err(
                 ErrorCode::Internal,
-                format!("worktree removed but writing the session record failed: {e}"),
-            ),
+                format!("{state}, but writing the session record failed: {e}"),
+            );
+        }
+        self.publish();
+        if deleted {
+            reply.done();
+        } else {
+            reply.err(
+                ErrorCode::NotFound,
+                "session worktree already gone; record cleared; nothing deleted",
+            );
         }
     }
 
     /// The hub is stopping: close the agent's stdin so it saves its own state, then
     /// SIGTERM and SIGKILL its group (10-hub §8).
-    fn shutdown(&mut self, done: oneshot::Sender<()>) {
+    async fn shutdown(&mut self, done: oneshot::Sender<()>) {
         self.stopping = Some(done);
+        if let Some(op) = self.worktree_op.take() {
+            // Wait for the aborted future to drop its git process-group guard before
+            // acknowledging shutdown; never wait for the git command's own timeout.
+            self.git.shutdown().await;
+            let reply = match op {
+                WorktreeOp::Create { open, .. } => open.reply,
+                WorktreeOp::Remove(reply) | WorktreeOp::Rollback { reply, .. } => reply,
+            };
+            reply.err(ErrorCode::Internal, "hub stopping");
+            if let Some(reply) = self.create_kill.take() {
+                reply.err(ErrorCode::Internal, "hub stopping");
+            }
+        }
         if self.proc.is_none() {
             self.phase = Phase::Stopped;
         } else if matches!(self.stage, None | Some((Stage::Close, _))) {
