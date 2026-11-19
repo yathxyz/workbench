@@ -52,7 +52,11 @@ def sample_process(pid):
         runqueue_ns += wait
     rss_kib = next(int(s.split()[1]) for s in (proc / 'smaps_rollup').read_text().splitlines()
                    if s.startswith('Rss:'))
-    return cpu_ns, runqueue_ns, rss_kib
+    hwm_kib = next(int(s.split()[1]) for s in (proc / 'status').read_text().splitlines()
+                   if s.startswith('VmHWM:'))
+    io = {k.rstrip(':'): int(v) for k, v in (s.split() for s in (proc / 'io').read_text().splitlines())
+          if k in ('syscr:', 'syscw:', 'rchar:', 'wchar:')}
+    return {'cpu': cpu_ns, 'wait': runqueue_ns, 'rss': rss_kib, 'peak': hwm_kib, 'io': io}
 
 
 class Viewer:
@@ -92,7 +96,7 @@ class Viewer:
 def measure(h, viewers, samples, burst):
     elapsed = []
     frames = json_bytes = 0
-    before, wait, _ = sample_process(h.web.pid)
+    before = sample_process(h.web.pid)
     for i in range(samples):
         key = '!' if burst else chr(65 + i % 26)
         expected = BURST if burst else key.encode()
@@ -103,10 +107,10 @@ def measure(h, viewers, samples, burst):
             frames += n
             json_bytes += size
         elapsed.append(time.perf_counter_ns() - start)
-    after, wait_after, rss = sample_process(h.web.pid)
+    after = sample_process(h.web.pid)
     seconds = sum(elapsed) / 1e9
     elapsed.sort()
-    cpu_ms = (after - before) / 1e6
+    cpu_ms = (after['cpu'] - before['cpu']) / 1e6
     source_bytes = samples * len(expected)
     return {
         'samples': samples,
@@ -114,7 +118,10 @@ def measure(h, viewers, samples, burst):
         'sourceBytes': source_bytes, 'deliveredMiBPerSec': round(source_bytes * len(viewers) / (2**20 * seconds), 2),
         'outFrames': frames, 'outJsonBytes': json_bytes,
         'webCpuMs': round(cpu_ms, 2), 'webCpuMsPerViewer': round(cpu_ms / len(viewers), 2),
-        'webRunqueueMs': round((wait_after - wait) / 1e6, 2), 'webRssKiB': rss,
+        'webRunqueueMs': round((after['wait'] - before['wait']) / 1e6, 2),
+        'webRssKiB': after['rss'], 'webVmHWMKiB': after['peak'],
+        # proc/io counts read/write-like syscalls; not all socket send/recv variants.
+        'webProcIoDelta': {k: v - before['io'][k] for k, v in after['io'].items()},
     }
 
 
@@ -128,7 +135,7 @@ def run(binary, count, keys, bursts):
         cmd = (f'IFS= read -r -d "" chunk < {shlex.quote(str(corpus))}; '
                'stty raw -echo || exit; printf "~"; while IFS= read -r -n1 key; do '
                'if [[ $key == ! ]]; then printf %s "$chunk"; else printf %s "$key"; fi; done')
-        _, _, idle = sample_process(h.web.pid)
+        idle = sample_process(h.web.pid)['rss']
         viewers = [Viewer(stack, ep, i == 0, cmd) for i in range(count)]
         measure(h, viewers, 10, False)
         measure(h, viewers, 4, True)
