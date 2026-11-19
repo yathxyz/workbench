@@ -93,9 +93,9 @@ let
         FONTCONFIG_FILE = pkgs.makeFontsConf { fontDirectories = [ pkgs.liberation_ttf ]; };
       }
       ''
-        export HOME=$TMPDIR BASH=${pkgs.bashInteractive}/bin/bash
+        export HOME=$TMPDIR BASH=${pkgs.bashInteractive}/bin/bash WB_UI_SHOTS="$out"
+        mkdir -p "$WB_UI_SHOTS"
         node ${tests}/ui.mts
-        touch $out
       '';
 in
 {
