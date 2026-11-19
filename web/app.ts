@@ -4934,6 +4934,10 @@ function rgShellHere() {
     cwd: fsDir ? fsDir.replace(/^~/, DAEMON ? '~' : '/home/me') : DAEMON ? undefined : '/home/me', in: folder ? folder.id : undefined });
   jumpNode(n, 1, () => live[n.id]?.term?.focus());
 }
+function rgSelect(j: number): void {
+  if (j !== RG.sel[RG.dir]) hashCancelRestore();
+  RG.sel[RG.dir] = j; renderRanger();
+}
 function rgKey(e: KeyboardEvent): boolean {
   const k = e.key, { list, i, e: cur } = rgCur();
   if (RG.filtering) {
@@ -4945,7 +4949,7 @@ function rgKey(e: KeyboardEvent): boolean {
     renderRanger(); return true;
   }
   const seq = RG.seq + k; RG.seq = '';
-  const sel = (j: number) => { RG.sel[RG.dir] = clamp(j, 0, Math.max(0, list.length - 1)); renderRanger(); };
+  const sel = (j: number) => rgSelect(clamp(j, 0, Math.max(0, list.length - 1)));
   const half = Math.max(1, Math.floor(($('#rg-cur')!.clientHeight / 30) / 2));
   if (seq === 'gg') return sel(0), true;
   if (seq === 'gh') return rgGo(FS_PREFIX + rgHome()), true;
@@ -4991,7 +4995,7 @@ function rgKey(e: KeyboardEvent): boolean {
   }
   return false;
 }
-$('#rg-cur')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; if (!r) return; const l = rgList(), j = l.findIndex(x => x.key === r.dataset.key); if (j >= 0) { RG.sel[RG.dir] = j; renderRanger(); if (MODE.v === 'phone' && l[j].kind === 'iattn' && l[j].n) rgOpen(l[j]); } });   // F-A13: on a phone one tap opens an Attention card
+$('#rg-cur')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; if (!r) return; const l = rgList(), j = l.findIndex(x => x.key === r.dataset.key); if (j >= 0) { rgSelect(j); if (MODE.v === 'phone' && l[j].kind === 'iattn' && l[j].n) rgOpen(l[j]); } });   // F-A13: on a phone one tap opens an Attention card
 $('#rg-cur')!.addEventListener('dblclick', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row'); if (r) rgOpen(rgCur().e); });
 $('#rg-parent')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; if (!r) return; const p = rgParent(RG.dir); if (p) rgGo(p, r.dataset.key); });
 $('#rg-prev')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; const cur = rgCur().e; if (r && cur?.dir) rgGo(cur.key, r.dataset.key); });
@@ -5499,6 +5503,7 @@ function edEnsure() {
 }
 function edOpen(n: BoardNode | null | undefined, pos?: number) {
   if (!n || n.kind !== 'buffer') return;
+  hashCancelRestore();
   ED.next = n;
   if (VIEW !== 'editor') setView('editor');
   edLoad(n, pos);
@@ -11225,8 +11230,9 @@ function hashSync(addr?: string | null, push?: boolean): void {
 function hashInit(): void {
   const start = decodeURIComponent(location.hash.slice(1)), a = parseAddr(start);
   if (a?.kind === 'note' && a.path && !NOTES.at) {
-    HASH.pending = start; notesReady().then(() => hashRestore('note'));
+    HASH.pending = start; notesReady().then(() => hashRestore('note'), hashCancelRestore);
   } else if (a && !goAddr(start, false) && a.kind === 'board' && DAEMON) HASH.pending = start;
+  if (HASH.pending) setTimeout(hashCancelRestore, 5000);   // only boot can arm a restore
   addEventListener('hashchange', () => { hashCancelRestore(); if (HASH.busy) return; const a = decodeURIComponent(location.hash.slice(1)); if (a && parseAddr(a) && a !== HASH.last) { HASH.last = a; goAddr(a, false); } });
   setInterval(() => { if (!HASH.pending && !HASH.busy && !document.hidden) hashSync(); }, 1500);
 }
