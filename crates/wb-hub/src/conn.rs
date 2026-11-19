@@ -14,8 +14,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 use wb_proto::hub::{
-    Agent, ErrorCode, Host, HubMessage, HubRequest, Kind, PROTO, Resume, SessionsReply, SpawnAcp,
-    SpawnPty,
+    Agent, ErrorCode, Host, HubMessage, HubRequest, Kind, PROTO, Resume, SpawnAcp, SpawnPty,
 };
 use wb_proto::limits::{CAPTURE_MAX, HELLO_TIMEOUT, MAX_LINE, PTY_INPUT_FRAME, REQS_IN_FLIGHT};
 use wb_proto::line::encode;
@@ -92,7 +91,7 @@ impl Drop for Reply {
 }
 
 /// One encoded message line, ready to share between connections.
-pub fn line(msg: &HubMessage) -> Arc<[u8]> {
+pub fn line(msg: &impl Serialize) -> Arc<[u8]> {
     encode(msg).into()
 }
 
@@ -298,11 +297,7 @@ impl Conn {
                 let msg = "hello was already exchanged".into();
                 self.error(None, None, ErrorCode::BadRequest, msg);
             }
-            HubRequest::List { rid } => {
-                let sessions = self.ctx.registry.list();
-                self.outq
-                    .push_reply(line(&HubMessage::ok(rid, &SessionsReply { sessions })));
-            }
+            HubRequest::List { rid } => self.outq.push_reply(self.ctx.registry.list(rid)),
             HubRequest::Watch { rid } => self.ctx.registry.watch(self.viewer(), rid),
             HubRequest::PtyOpen {
                 rid,

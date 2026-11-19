@@ -6,10 +6,11 @@
 //! critical section.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use serde::{Serialize, Serializer};
 use tokio::sync::mpsc;
-use wb_proto::hub::{ErrorCode, HubMessage, Kind, SessionsReply, Summary};
+use wb_proto::hub::{ErrorCode, HubMessage, Kind, Summary};
 
 use crate::conn::{ConnId, Viewer, line};
 use crate::{acp, lock, now_ms, pty};
@@ -32,12 +33,18 @@ struct Inner {
     stopping: bool,
 }
 
+impl Inner {
+    fn summaries(&self) -> impl Clone + Iterator<Item = &Arc<Summary>> {
+        self.sessions.values().filter_map(|e| e.summary.as_ref())
+    }
+}
+
 struct Entry {
     created_at: u64,
     tx: Tx,
     /// `None` until the actor's first publish: the session is still being created and
     /// is invisible to `list` and `watch`.
-    summary: Option<Summary>,
+    summary: Option<Arc<Summary>>,
 }
 
 impl Entry {
@@ -119,26 +126,51 @@ pub enum Route<C> {
     Stopping,
 }
 
+/// Encode the complete, sid-sorted snapshot directly rather than materializing it
+/// as a tree of JSON values in `HubMessage::ok`.
+fn sessions_line<'a>(
+    rid: u64,
+    sessions: impl Clone + Iterator<Item = &'a Arc<Summary>>,
+) -> Arc<[u8]> {
+    #[derive(Serialize)]
+    #[serde(tag = "t", rename = "ok")]
+    struct Snapshot<T> {
+        rid: u64,
+        sessions: T,
+    }
+
+    struct Summaries<I>(I);
+    impl<'a, I: Clone + Iterator<Item = &'a Arc<Summary>>> Serialize for Summaries<I> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_seq(self.0.clone().map(Arc::as_ref))
+        }
+    }
+
+    line(&Snapshot {
+        rid,
+        sessions: Summaries(sessions),
+    })
+}
+
 impl Registry {
-    pub fn list(&self) -> Vec<Summary> {
-        lock(&self.inner)
-            .sessions
-            .values()
-            .filter_map(|e| e.summary.clone())
-            .collect()
+    pub fn published_count(&self) -> usize {
+        lock(&self.inner).summaries().count()
+    }
+
+    pub fn list(&self, rid: u64) -> Arc<[u8]> {
+        let inner = lock(&self.inner);
+        let mut snapshot = Vec::with_capacity(inner.sessions.len());
+        snapshot.extend(inner.summaries().cloned());
+        drop(inner);
+        sessions_line(rid, snapshot.iter())
     }
 
     /// Replies to `watch` with every Summary and subscribes `viewer` to later changes.
     pub fn watch(&self, viewer: Viewer, rid: u64) {
         let mut inner = lock(&self.inner);
-        let sessions = inner
-            .sessions
-            .values()
-            .filter_map(|e| e.summary.clone())
-            .collect();
         viewer
             .outq
-            .push_reply(line(&HubMessage::ok(rid, &SessionsReply { sessions })));
+            .push_reply(sessions_line(rid, inner.summaries()));
         inner.watchers.retain(|w| w.id != viewer.id);
         inner.watchers.push(viewer);
     }
@@ -220,21 +252,26 @@ impl Registry {
     }
 
     /// Stores a session's new Summary and sends it to the watchers.
-    pub fn publish(&self, summary: &Summary) {
-        let mut inner = lock(&self.inner);
-        let Some(entry) = inner.sessions.get_mut(&summary.sid) else {
+    pub fn publish(&self, summary: Arc<Summary>) {
+        let Inner {
+            sessions, watchers, ..
+        } = &mut *lock(&self.inner);
+        let Some(entry) = sessions.get_mut(&summary.sid) else {
             return;
         };
         if entry.created_at != summary.created_at {
             return;
         }
-        entry.summary = Some(summary.clone());
-        let msg = line(&HubMessage::Session {
-            session: Box::new(summary.clone()),
-        });
-        inner
-            .watchers
-            .retain(|w| w.outq.push_event(msg.clone()).is_ok());
+        let session = entry.summary.insert(summary);
+        if !watchers.is_empty() {
+            #[derive(Serialize)]
+            #[serde(tag = "t", rename = "session")]
+            struct Update<'a> {
+                session: &'a Summary,
+            }
+            let msg = line(&Update { session });
+            watchers.retain(|w| w.outq.push_event(msg.clone()).is_ok());
+        }
     }
 
     /// Removes a session that is being forgotten and sends `gone` to the watchers and

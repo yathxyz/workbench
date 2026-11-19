@@ -1008,7 +1008,7 @@ impl Pty {
     fn publish(&mut self) {
         self.updated_at = now_ms().max(self.updated_at);
         let viewers = lock(&self.viewers).len();
-        self.ctx.registry.publish(&Summary {
+        self.ctx.registry.publish(Arc::new(Summary {
             sid: self.sid.clone(),
             kind: Kind::Pty,
             host: self.ctx.cfg.host.clone(),
@@ -1028,7 +1028,7 @@ impl Pty {
                 exit: self.rec.exit.clone(),
             }),
             acp: None,
-        });
+        }));
     }
 }
 

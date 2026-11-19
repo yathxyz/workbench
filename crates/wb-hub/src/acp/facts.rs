@@ -60,8 +60,9 @@ impl Default for Facts {
 }
 
 impl Facts {
-    /// Folds one event into the facts. Pure: no I/O, no clock.
-    pub fn apply(&mut self, ev: &JournalEvent) {
+    /// Folds one event into the facts. Pure: no I/O, no clock. Returns whether a
+    /// field other than `head_seq` may have changed.
+    pub fn apply(&mut self, ev: &JournalEvent) -> bool {
         self.head_seq = ev.seq;
         match &ev.body {
             EventBody::Spawn { .. } => {
@@ -97,7 +98,7 @@ impl Facts {
             }
             EventBody::Authenticate { .. } => self.activity = Activity::Setup,
             EventBody::Prompt { .. } => self.activity = Activity::Turn,
-            EventBody::Update { update, .. } => self.apply_update(update),
+            EventBody::Update { update, .. } => return self.apply_update(update),
             EventBody::TurnEnd { stop_reason } => {
                 self.activity = Activity::None;
                 self.last = Some(Last {
@@ -145,8 +146,9 @@ impl Facts {
             EventBody::ElicitationComplete { .. }
             | EventBody::PermissionAuto { .. }
             | EventBody::Notice { .. }
-            | EventBody::Unknown => {}
+            | EventBody::Unknown => return false,
         }
+        true
     }
 
     /// Whether `acp.revive` may run (DESIGN §3.4.6, H-12): the session has an agent
@@ -218,7 +220,7 @@ impl Facts {
         }
     }
 
-    fn apply_update(&mut self, update: &Value) {
+    fn apply_update(&mut self, update: &Value) -> bool {
         match update.get("sessionUpdate").and_then(Value::as_str) {
             Some("session_info_update") => match update.get("title") {
                 Some(Value::String(t)) => self.title = Some(t.clone()),
@@ -240,8 +242,9 @@ impl Facts {
                 self.available_commands = update.get("availableCommands").cloned();
             }
             Some("usage_update") => self.usage = Some(without_tag(update)),
-            _ => {}
+            _ => return false,
         }
+        true
     }
 
     /// Sets the mode id, and the current mode id inside `modes`, which

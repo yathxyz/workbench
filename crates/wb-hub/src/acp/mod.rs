@@ -361,13 +361,12 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
     if meta.sid != sid {
         bail!("{name} holds sid {:?}", meta.sid);
     }
-    let (mut journal, events) = Journal::open(&dir.join(format!("{sid}.jsonl")))?;
     let mut facts = Facts::default();
     let mut announced = BTreeMap::new();
     let mut policy_notice = false;
-    for ev in &events {
-        facts.apply(ev);
-        announce(&mut announced, ev);
+    let mut journal = Journal::open(&dir.join(format!("{sid}.jsonl")), |ev| {
+        facts.apply(&ev);
+        announce(&mut announced, &ev);
         match &ev.body {
             // The fold already validated it; nonempty rules folding to none were invalid.
             EventBody::Policy { policy } => {
@@ -379,7 +378,7 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
             } if text == INVALID_POLICY_NOTICE => policy_notice = false,
             _ => {}
         }
-    }
+    })?;
     let policy = facts
         .policy
         .as_ref()
@@ -398,7 +397,7 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
             level: NoticeLevel::Warn,
             text: INVALID_POLICY_NOTICE.into(),
         };
-        match journal.append(&notice, now_ms()) {
+        match journal.append(notice, now_ms()) {
             Ok(ev) => {
                 facts.apply(&ev);
                 appended = true;
@@ -1103,7 +1102,7 @@ impl Acp {
             // Files an earlier incarnation failed to delete must not leak into this one.
             delete(&dir, &sid)?;
             let opened = write_atomic(&dir, &format!("{sid}.json"), &json?).and_then(|()| {
-                Journal::open(&dir.join(format!("{sid}.jsonl")))
+                Journal::open(&dir.join(format!("{sid}.jsonl")), drop)
                     .map_err(|e| io::Error::other(format!("{e:#}")))
             });
             if opened.is_err() {
@@ -1114,7 +1113,7 @@ impl Acp {
         .await
         .unwrap_or_else(|e| Err(io::Error::other(e)));
         match made {
-            Ok((journal, _)) => self.journal = Some(journal),
+            Ok(journal) => self.journal = Some(journal),
             Err(e) => {
                 warn!("creating the session's files: {e}");
                 let msg = format!("creating the session's files: {e}");
@@ -1324,7 +1323,7 @@ impl Acp {
         let Some(journal) = &mut self.journal else {
             return false;
         };
-        match journal.append(&body, now_ms()) {
+        match journal.append(body, now_ms()) {
             Ok(ev) => {
                 self.applied(ev);
                 true
@@ -1369,13 +1368,20 @@ impl Acp {
             drop(journal.sync());
         }
         announce(&mut self.announced, &ev);
-        self.facts.apply(&ev);
+        let materialized = self.facts.apply(&ev);
+        // A session/update has no actor-side Summary changes outside the fold. Other
+        // records can accompany one (e.g. a notice after taking startup_config).
+        let head_only_update = !materialized && matches!(ev.body, EventBody::Update { .. });
         let msg = line(&HubMessage::AcpEv {
             sid: self.sid.clone(),
             ev: Box::new(ev),
         });
-        self.fan_out(&msg);
-        self.publish();
+        let dropped = self.fan_out(&msg);
+        if dropped || !head_only_update {
+            self.publish();
+        } else if !self.quiet && !self.defer_head() {
+            self.flush_info();
+        }
         if let Some((code, message)) = setup_error {
             self.fail_startup_config(code, &message);
         }
@@ -1440,7 +1446,7 @@ impl Acp {
             let Some(journal) = &mut self.journal else {
                 return;
             };
-            match journal.append(&body, now_ms()) {
+            match journal.append(body, now_ms()) {
                 Ok(ev) => self.applied(ev),
                 Err(f) => {
                     warn!("the journal still fails: {}", f.error);
@@ -1524,32 +1530,44 @@ impl Acp {
         if self.quiet {
             return;
         }
-        let (summary, session) = self.snapshot();
-        if let Some((last, last_session)) = &self.published {
-            if *last == summary && *last_session == session {
-                return;
-            }
-            let mut same = summary.clone();
-            if let (Some(now), Some(then)) = (&mut same.acp, &last.acp) {
-                now.head_seq = then.head_seq;
-            }
-            let next = self.published_at.map(|at| at + INFO_EVERY);
-            if same == *last
+        let (mut summary, session) = self.snapshot();
+        if let Some((last, last_session)) = &self.published
+            && let (Some(now), Some(then)) = (&mut summary.acp, &last.acp)
+        {
+            // Compare at the published head without copying the rest of the Summary.
+            now.head_seq = then.head_seq;
+            if summary == *last
                 && session == *last_session
-                && let Some(next) = next.filter(|&at| at > Instant::now())
+                && (self.facts.head_seq == then.head_seq || self.defer_head())
             {
-                self.info_at = Some(self.info_at.unwrap_or(next));
                 return;
             }
+            summary.acp.as_mut().unwrap().head_seq = self.facts.head_seq;
         }
-        self.flush_info();
+        self.send_info(summary, session);
+    }
+
+    /// Arms the deadline relative to the last publication, not the latest event.
+    fn defer_head(&mut self) -> bool {
+        if let Some(next) = self.published_at.map(|at| at + INFO_EVERY)
+            && next > Instant::now()
+        {
+            self.info_at = Some(next);
+            return true;
+        }
+        false
     }
 
     fn flush_info(&mut self) {
+        let (summary, session) = self.snapshot();
+        self.send_info(summary, session);
+    }
+
+    fn send_info(&mut self, mut summary: Summary, session: AcpSessionInfo) {
         self.info_at = None;
         self.updated_at = now_ms().max(self.updated_at);
-        let (summary, session) = self.snapshot();
-        self.ctx.registry.publish(&summary);
+        summary.updated_at = self.updated_at;
+        self.ctx.registry.publish(Arc::new(summary.clone()));
         let msg = line(&HubMessage::AcpInfo {
             sid: self.sid.clone(),
             summary: Box::new(summary.clone()),
@@ -1632,6 +1650,7 @@ impl Acp {
         let pump = Pump {
             sid: self.sid.clone(),
             path: self.path("jsonl"),
+            offset: self.journal.as_ref().map_or(0, |j| j.replay_offset(since)),
             since,
             pinned: self.facts.pending.iter().map(|p| p.req).collect(),
             ok,
@@ -2800,7 +2819,7 @@ impl Acp {
                     let written = if self.fault.is_none() {
                         self.journal
                             .as_mut()
-                            .map(|journal| journal.append(&body, now_ms()))
+                            .map(|journal| journal.append(body, now_ms()))
                     } else {
                         None
                     };
@@ -3013,6 +3032,7 @@ impl Acp {
 struct Pump {
     sid: String,
     path: PathBuf,
+    offset: u64,
     since: u64,
     pinned: Vec<u64>,
     ok: AcpOpenReply,
@@ -3028,6 +3048,7 @@ impl Pump {
         let Pump {
             sid,
             path,
+            offset,
             since,
             pinned,
             mut ok,
@@ -3046,7 +3067,7 @@ impl Pump {
             })
         } else {
             tokio::task::spawn_blocking(move || {
-                replay::scan(&path, since, head, &pinned, ACP_REPLAY_MAX)
+                replay::scan(&path, offset, since, head, &pinned, ACP_REPLAY_MAX)
             })
             .await
             .unwrap_or_else(|e| Err(anyhow!("the replay panicked: {e}")))
@@ -3218,6 +3239,71 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_heads_wait_but_materialized_changes_and_viewer_drops_do_not() {
+        let ctx = Arc::new(Ctx {
+            cfg: serde_json::from_value(json!({
+                "stateDir": "/", "host": "host", "shells": [], "defaultShell": "", "child": {}
+            }))
+            .unwrap(),
+            ident: crate::env::Identity {
+                home: "/".into(),
+                user: "user".into(),
+                logname: "user".into(),
+            },
+            child_umask: rustix::fs::Mode::empty(),
+            registry: Default::default(),
+            started_at: 1,
+            pty_dir: PathBuf::new(),
+            acp_dir: PathBuf::new(),
+            #[cfg(debug_assertions)]
+            test_panic_input: None,
+        });
+        let mut acp = Acp::new(ctx, "a".into(), 1, Arc::default());
+        let viewer = Viewer {
+            id: 1,
+            outq: Arc::default(),
+        };
+        let queue = viewer.outq.clone();
+        lock(&acp.shared.viewers).push(Attached {
+            viewer,
+            backlog: None,
+        });
+        let event = |seq, update| JournalEvent {
+            seq,
+            ts: seq,
+            body: EventBody::Update {
+                update,
+                session_id: None,
+            },
+        };
+        let chunk = || json!({"sessionUpdate": "agent_message_chunk", "content": {"text": "a"}});
+        let title = || json!({"sessionUpdate": "session_info_update", "title": "t"});
+        let head = |acp: &Acp| {
+            let (summary, _) = acp.published.as_ref().unwrap();
+            summary.acp.as_ref().unwrap().head_seq
+        };
+
+        acp.publish();
+        let deadline = Instant::now() + INFO_EVERY;
+        acp.applied(event(1, chunk()));
+        tokio::time::advance(INFO_EVERY / 2).await;
+        acp.applied(event(2, chunk()));
+        assert_eq!((head(&acp), acp.info_at), (0, Some(deadline)));
+        tokio::time::advance(INFO_EVERY / 2).await;
+        acp.flush_info();
+        assert_eq!((head(&acp), acp.info_at), (2, None));
+
+        acp.applied(event(3, title()));
+        assert_eq!((head(&acp), acp.info_at), (3, None));
+        acp.applied(event(4, title()));
+        assert_eq!(head(&acp), 3, "an identical title only advances the head");
+        queue.close();
+        acp.applied(event(5, chunk()));
+        assert_eq!(acp.published.as_ref().unwrap().0.viewers, 0);
+        assert_eq!((head(&acp), acp.info_at), (5, None));
+    }
 
     #[test]
     fn prompt_rules() {
