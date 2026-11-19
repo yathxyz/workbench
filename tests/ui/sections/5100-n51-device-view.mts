@@ -62,6 +62,28 @@ await section('N51', async () => {
       });
       await settled(D);
       await until(() => remover.evaluate(id => !!window.__canvas.S.nodes[id], fixture.fg));
+      if (source === 'remote') {
+        const card = D.locator('.node.focused'), before = await card.boundingBox();
+        const viewportWidth = await D.locator('#viewport').evaluate(e => e.clientWidth);
+        const incoming = await remover.evaluate(id => {
+          const C = window.__canvas, n = C.S.nodes[id]; C.moveTree(n, 750, -310); n.w += 95; n.h += 65;
+          C.placeAny(n); C.dirty(); return [n.x, n.y, n.w, n.h];
+        }, fixture.fg);
+        await settled(remover);
+        const tag = await remover.evaluate(() => window.__canvas.BOARD_ETAG);
+        const adopted = await until(() => D!.evaluate(tag => window.__canvas.BOARD_ETAG === tag, tag));
+        let after: typeof before = null;
+        const filled = await until(async () => { after = await card.boundingBox(); return JSON.stringify(after) === JSON.stringify(before); }, 2000);
+        const back = await D.evaluate(id => {
+          const C = window.__canvas, saved = JSON.parse(C.serialize()).nodes[id]; C.focusHide();
+          const n = C.S.nodes[id], restored = [n.x, n.y, n.w, n.h]; C.focusOpen(n);
+          return { saved: [saved.x, saved.y, saved.w, saved.h], restored };
+        }, fixture.fg);
+        check('N51: a remote move and resize preserves the foreground viewport and restores the incoming board rectangle',
+          adopted && before?.width === viewportWidth && filled &&
+          [back.saved, back.restored].every(r => JSON.stringify(r) === JSON.stringify(incoming)), JSON.stringify({ before, after, incoming, back }));
+        await settled(D);
+      }
       for (const id of [fixture.bg, fixture.fg]) {
         await remover.evaluate(id => window.__canvas.removeNode(id), id);
         await until(() => D!.evaluate(id => !window.__canvas.S.nodes[id], id));

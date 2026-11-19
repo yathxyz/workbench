@@ -341,6 +341,8 @@ function boardAdopt(b: Board): void {
     if (p !== 'manual') { perspBuild(p); S.persp = p; perspChip(); wsApply(false); }
     if (dk) { const d = dk.smart ? dk : deskList().find(x => x === dk || (deskPinned(x) && x.slot === dk.slot)); if (d) { if (d.smart) DESK.smart = d; deskApply(d); } }   // a pinned desk comes back as the other device saved it
     deskRefresh(true);
+    const focused = FOCUS.cur && S.nodes[FOCUS.cur];
+    if (focused) { focusRememberRect(focused); focusGeometry(focused); }
     refreshBlockCards();   // a page the other tab removed, restored or rewrote
     if (roChanged) { scheduleCrossRefresh(); if (VIEW === 'tasks') renderTasks(); }   // backlinks and the views over the pages, as a local edit does
     restack(); updateAllTitles(); renderTree(); renderLinks(); renderInk(null);
@@ -9136,6 +9138,7 @@ function focusStrip() {
     strip.append(b);
   }
 }
+function focusRememberRect({ x, y, w, h }: BoardNode) { FOCUS.rect = { x, y, w, h }; }
 function focusGeometry(n: BoardNode) {
   const w = Math.max(200, VW() - 2), h = Math.max(120, VH() - FT_TOP - FT_H - FT_BOTTOM - 2);
   n.w = w; n.h = h; placeAny(n);
@@ -9149,7 +9152,7 @@ function focusShow(id: string) {
   const flight = camStop(false);
   if (!FOCUS.cur) FOCUS.saved = { ...(flight?.target ?? cam()) };
   else if (FOCUS.cur !== id) focusRestoreNode();
-  if (FOCUS.cur !== id) { reveal(n); FOCUS.rect = { x: n.x, y: n.y, w: n.w, h: n.h }; }
+  if (FOCUS.cur !== id) { reveal(n); focusRememberRect(n); }
   FOCUS.cur = id; activate(id);
   live[id]?.el!.classList.add('focused'); document.body.classList.add('focus');
   focusGeometry(n); focusStrip(); ringNote();
