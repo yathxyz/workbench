@@ -886,6 +886,23 @@ fn hub_action_epoch_keeps_late_acp_actions_out_of_the_replacement() {
 }
 
 #[test]
+fn session_kill_selects_the_current_kind_by_epoch() {
+    let hub = Hub::with_scenarios(&["basic"]);
+    let mut c = hub.connect();
+    let kill = |epoch| json!({"t": "session.kill", "sid": "s", "epoch": epoch, "forget": true});
+    let agent = epoch(&ready(&mut c, &hub, "s", "basic"));
+    c.ok(kill(agent));
+
+    let replacement = c.spawn("s", &["bash"]);
+    let shell = replacement["epoch"].as_u64().unwrap();
+    assert_ne!(agent, shell);
+    assert_eq!(c.request(kill(agent))["code"], "stale");
+    assert_eq!(c.attach("s")["pid"], replacement["pid"]);
+    c.ok(kill(shell));
+    assert_eq!(c.request(kill(shell))["code"], "not_found");
+}
+
+#[test]
 fn hub_action_epoch_checks_pty_kill_and_wrong_kind_before_acting() {
     let hub = Hub::with_scenarios(&[]);
     let mut c = hub.connect();
@@ -1120,6 +1137,45 @@ fn answers_bind_to_the_announced_question_across_cancel_and_recreation() {
         c.event(sid, "turn_end");
         assert_eq!(c.summary(sid)["acp"]["pending"], json!([]));
     }
+}
+
+#[test]
+fn hub_action_epoch_answers_after_restart_remember_each_announced_kind() {
+    let mut hub = Hub::with_scenarios(&[]);
+    let sid = "questions";
+    let mut c = hub.connect();
+    let epoch = epoch(&ready(&mut c, &hub, sid, "stub"));
+    assert_eq!(c.acp_prompt(sid, "ask-permission")["t"], "ok");
+    let permission = c.event(sid, "permission")["seq"].as_u64().unwrap();
+    let answer_permission = |req| {
+        json!({"t": "acp.permission", "sid": sid, "epoch": epoch,
+               "req": req, "outcome": selected("allow-once")["outcome"]})
+    };
+    c.ok(answer_permission(permission));
+    c.event(sid, "turn_end");
+    assert_eq!(c.acp_prompt(sid, "form")["t"], "ok");
+    let elicitation = c.event(sid, "elicitation")["seq"].as_u64().unwrap();
+    let answer_elicitation = |req| {
+        json!({"t": "acp.elicitation", "sid": sid, "epoch": epoch,
+               "req": req, "response": {"action": "decline"}})
+    };
+
+    // One question was answered by a user and the other was pending at shutdown.
+    // Neither is held by the new process: it must look up their kinds by journal seq.
+    drop(c);
+    hub.terminate();
+    hub.restart();
+    let mut c = hub.connect();
+    let journal = hub.journal(sid);
+    for (answer, expected) in [
+        (answer_permission(permission), "already_resolved"),
+        (answer_elicitation(elicitation), "already_resolved"),
+        (answer_permission(elicitation), "bad_request"),
+        (answer_elicitation(permission), "bad_request"),
+    ] {
+        assert_eq!(c.request(answer)["code"], expected);
+    }
+    assert_eq!(hub.journal(sid), journal, "no second resolution");
 }
 
 #[test]

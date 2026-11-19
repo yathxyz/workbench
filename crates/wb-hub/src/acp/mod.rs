@@ -3233,26 +3233,128 @@ mod tests {
 
     use super::*;
 
+    // A registered, dead ACP session with a real journal. Hold its receiver until
+    // the test has queued everything: no timing or scheduler assumption about when
+    // the actor stops handling commands and starts draining them.
+    async fn dormant(dir: &Path) -> (Acp, mpsc::Receiver<Cmd>) {
+        let mut ctx = Ctx::for_test(dir);
+        // Kill/forget is valid for dead sessions; no external agent is needed.
+        ctx.cfg.agents.insert(
+            "offline".into(),
+            serde_json::from_value(json!({"label": "offline", "argv": [dir.join("absent")]}))
+                .unwrap(),
+        );
+        let ctx = Arc::new(ctx);
+        let (epoch, rx) = ctx.registry.load("a", None);
+        let mut acp = Acp::new(ctx, "a".into(), epoch, Arc::default());
+        acp.meta = Meta {
+            sid: acp.sid.clone(),
+            created_at: epoch,
+            agent: "offline".into(),
+            cwd: dir.to_str().unwrap().into(),
+            ..Meta::default()
+        };
+        acp.journal = Some(Journal::open(&acp.path("jsonl"), drop).unwrap());
+        assert!(acp.record(EventBody::Task {
+            task: Some("original".into()),
+        }));
+        acp.write_meta().await.unwrap();
+        (acp, rx)
+    }
+
+    fn guarded_forget(epoch: u64) -> (Cmd, Arc<OutQ>) {
+        let outq = Arc::new(OutQ::default());
+        let cmd = Cmd::Act {
+            epoch: Some(epoch),
+            act: Act::Kill { forget: true },
+            reply: Reply::for_test(1, outq.clone()),
+        };
+        (cmd, outq)
+    }
+
+    async fn next_reply(outq: &OutQ) -> Value {
+        let line = tokio::time::timeout(Duration::from_secs(5), outq.pop())
+            .await
+            .expect("actor did not reply")
+            .unwrap();
+        serde_json::from_slice(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn hub_action_epoch_forget_drains_queued_open_then_guarded_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, rx) = dormant(dir.path()).await;
+        let ctx = old.ctx.clone();
+        let epoch = old.created_at;
+        let (forget, forgotten) = guarded_forget(epoch);
+        ctx.registry.deliver("a", forget).await;
+        let opening = Arc::new(OutQ::default());
+        let create = Open {
+            viewer: Viewer {
+                id: 1,
+                outq: opening.clone(),
+            },
+            since: 0,
+            epoch: None,
+            spawn: Some(
+                serde_json::from_value(json!({
+                    "agent": "offline", "cwd": dir.path(), "task": "replacement"
+                }))
+                .unwrap(),
+            ),
+            reply: Reply::for_test(2, opening.clone()),
+        };
+        open(ctx.clone(), "a".into(), create).await;
+        let (late, rejected) = guarded_forget(epoch);
+        ctx.registry.deliver("a", late).await;
+        assert_eq!(rx.len(), 3, "all three commands must be in the old mailbox");
+
+        old.run(rx, None).await;
+        assert_eq!(next_reply(&forgotten).await["t"], "ok");
+        assert_eq!(next_reply(&rejected).await["code"], "stale");
+        let opened = next_reply(&opening).await;
+        assert_eq!(opened["new"], true, "{opened}");
+        let current = opened["summary"]["createdAt"].as_u64().unwrap();
+        assert_ne!(current, epoch);
+        assert_eq!(opened["summary"]["acp"]["task"], "replacement");
+        assert!(ctx.acp_dir.join("a.jsonl").is_file());
+
+        // Same action, now naming the right incarnation, actually deletes it.
+        let (forget, forgotten) = guarded_forget(current);
+        ctx.registry.deliver("a", forget).await;
+        assert_eq!(next_reply(&forgotten).await["t"], "ok");
+        assert!(ctx.registry.kind("a").is_none());
+        assert!(!ctx.acp_dir.join("a.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn hub_action_epoch_shutdown_drains_guarded_kill_without_forgetting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, mut rx) = dormant(dir.path()).await;
+        let ctx = old.ctx.clone();
+        let journal = old.path("jsonl");
+        let before = fs::read(&journal).unwrap();
+        let (done, stopped) = oneshot::channel();
+        ctx.registry.deliver("a", Cmd::Shutdown { done }).await;
+        let (forget, rejected) = guarded_forget(old.created_at);
+        ctx.registry.deliver("a", forget).await;
+        assert_eq!(rx.len(), 2, "shutdown must have the guarded kill behind it");
+        rx.close(); // The stopped actor exits once it has refused its whole mailbox.
+
+        old.run(rx, None).await;
+        stopped.await.unwrap();
+        let reply = next_reply(&rejected).await;
+        assert_eq!(reply["code"], "internal");
+        assert_eq!(reply["message"], "hub stopping"); // not Reply::drop on a lost command
+        assert_eq!(ctx.registry.kind("a"), Some(Kind::Acp));
+        assert!(ctx.acp_dir.join("a.json").is_file());
+        assert_eq!(fs::read(journal).unwrap(), before);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn stream_heads_wait_but_materialized_changes_and_viewer_drops_do_not() {
-        let ctx = Arc::new(Ctx {
-            cfg: serde_json::from_value(json!({
-                "stateDir": "/", "host": "host", "shells": [], "defaultShell": "", "child": {}
-            }))
-            .unwrap(),
-            ident: crate::env::Identity {
-                home: "/".into(),
-                user: "user".into(),
-                logname: "user".into(),
-            },
-            child_umask: rustix::fs::Mode::empty(),
-            registry: Default::default(),
-            started_at: 1,
-            pty_dir: PathBuf::new(),
-            acp_dir: PathBuf::new(),
-            #[cfg(debug_assertions)]
-            test_panic_input: None,
-        });
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(Ctx::for_test(dir.path()));
         let mut acp = Acp::new(ctx, "a".into(), 1, Arc::default());
         let viewer = Viewer {
             id: 1,

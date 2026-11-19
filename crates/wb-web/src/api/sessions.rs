@@ -42,10 +42,12 @@ pub fn routes() -> Router<ApiState> {
         .route("/info", get(info))
         .route("/sessions", get(list).post(create))
         .route("/sessions/{sid}", get(one).delete(kill))
+        .route("/sessions/{sid}/epochs/{epoch}", delete(kill))
         .route("/sessions/{sid}/events", get(events))
         .route("/sessions/{sid}/capture", get(capture))
         .route("/sessions/{sid}/prompt", post(prompt))
         .route("/sessions/{sid}/cancel", post(cancel))
+        .route("/sessions/{sid}/epochs/{epoch}/cancel", post(cancel))
         .route("/sessions/{sid}/permission", post(permission))
         .route("/sessions/{sid}/elicitation", post(elicitation))
         .route("/sessions/{sid}/mode", post(mode))
@@ -127,8 +129,7 @@ async fn act(app: &AppState, req: HubRequest, wait: Duration) -> Result<Json<Val
                 check_epoch_first: true,
                 ..
             }
-            | HubRequest::AcpKill { epoch: Some(_), .. }
-            | HubRequest::PtyKill { epoch: Some(_), .. }
+            | HubRequest::SessionKill { .. }
                 if !info.session_action_epoch =>
             {
                 return Err(ApiError::new(
@@ -552,6 +553,23 @@ async fn prompt(
     act(&api.app, req, REPLY_TIMEOUT).await
 }
 
+/// The legacy route has only `sid`. On the guarded route axum requires the epoch
+/// segment and deserializes it before the handler can run.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionPath {
+    sid: String,
+    epoch: Option<u64>,
+}
+
+fn reject_query_epoch(epoch: Option<u64>) -> Result<(), ApiError> {
+    if epoch.is_some() {
+        Err(ApiError::new(StatusCode::BAD_REQUEST, "use the epoch path"))
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Deserialize)]
 struct CancelQuery {
     epoch: Option<u64>,
@@ -560,16 +578,17 @@ struct CancelQuery {
 async fn cancel(
     _: Control,
     State(api): State<ApiState>,
-    Param(id): Param<String>,
+    Param(path): Param<ActionPath>,
     ApiQuery(query): ApiQuery<CancelQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let sid = sid_of(id)?;
+    reject_query_epoch(query.epoch)?;
+    let sid = sid_of(path.sid)?;
     act(
         &api.app,
         HubRequest::AcpCancel {
             rid: RID,
             sid,
-            epoch: query.epoch,
+            epoch: path.epoch,
         },
         REPLY_TIMEOUT,
     )
@@ -777,11 +796,25 @@ struct KillQuery {
 async fn kill(
     _: Control,
     State(api): State<ApiState>,
-    Param(id): Param<String>,
+    Param(path): Param<ActionPath>,
     ApiQuery(query): ApiQuery<KillQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let sid = sid_of(id)?;
+    reject_query_epoch(query.epoch)?;
+    let sid = sid_of(path.sid)?;
     let forget = query.forget.unwrap_or(false);
+    // A kill during worktree preparation can wait for cleanup of the checkout.
+    let worktree_wait = GIT_TIMEOUT * 2 + GIT_WORKTREE_TIMEOUT + REPLY_TIMEOUT;
+    if let Some(epoch) = path.epoch {
+        // Only the hub can choose the kind for this incarnation. Its watch can
+        // still list the previous kind, or nothing, when the request arrives.
+        let req = HubRequest::SessionKill {
+            rid: RID,
+            sid,
+            epoch,
+            forget,
+        };
+        return act(&api.app, req, worktree_wait).await;
+    }
     let kind = api
         .app
         .hub
@@ -794,13 +827,13 @@ async fn kill(
         Some(Kind::Acp) | None => HubRequest::AcpKill {
             rid: RID,
             sid,
-            epoch: query.epoch,
+            epoch: None,
             forget,
         },
         Some(Kind::Pty) => HubRequest::PtyKill {
             rid: RID,
             sid,
-            epoch: query.epoch,
+            epoch: None,
             forget,
         },
         Some(Kind::Unknown) => {
@@ -811,8 +844,7 @@ async fn kill(
         }
     };
     let wait = if kind.is_none() {
-        // Cancelling a pending creation waits for cleanup of the unpublished checkout.
-        GIT_TIMEOUT * 2 + GIT_WORKTREE_TIMEOUT + REPLY_TIMEOUT
+        worktree_wait
     } else {
         REPLY_TIMEOUT
     };

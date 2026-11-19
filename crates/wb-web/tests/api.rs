@@ -86,7 +86,7 @@ impl Api {
         self.req("GET", path, OWNER).send().await
     }
 
-    /// Sends `req`, answers the one `acp.*` request it causes with `reply(rid)`, and
+    /// Sends `req`, answers the one action it causes with `reply(rid)`, and
     /// returns that request and the response.
     async fn answered(
         &self,
@@ -146,6 +146,7 @@ fn rid_of(r: &HubRequest) -> u64 {
         | HubRequest::AcpRevive { rid, .. }
         | HubRequest::AcpRemoveWorktree { rid, .. }
         | HubRequest::AcpKill { rid, .. }
+        | HubRequest::SessionKill { rid, .. }
         | HubRequest::PtyKill { rid, .. } => *rid,
         other => panic!("no rid in {other:?}"),
     }
@@ -472,7 +473,9 @@ async fn without_a_hub_the_hubs_endpoints_are_503() {
         ("GET", "/v1/sessions/a1/events"),
         ("GET", "/v1/sessions/a1/capture"),
         ("POST", "/v1/sessions/a1/cancel"),
+        ("POST", "/v1/sessions/a1/epochs/7/cancel"),
         ("DELETE", "/v1/sessions/a1"),
+        ("DELETE", "/v1/sessions/a1/epochs/7"),
         ("DELETE", "/v1/sessions/a1/worktree"),
     ] {
         let res = api.req(method, path, OWNER).send().await;
@@ -1393,13 +1396,13 @@ async fn live_config_preserves_agent_errors_and_exposes_current_options() {
 const GUARDED_ACTIONS: &[(&str, &str, &str, &str)] = &[
     (
         "DELETE",
-        "/v1/sessions/p1?epoch=7&forget=true",
+        "/v1/sessions/p1/epochs/7?forget=true",
         "",
-        "pty.kill",
+        "session.kill",
     ),
     (
         "POST",
-        "/v1/sessions/a1/cancel?epoch=7",
+        "/v1/sessions/a1/epochs/7/cancel",
         "ignored body",
         "acp.cancel",
     ),
@@ -1423,9 +1426,9 @@ const GUARDED_ACTIONS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "DELETE",
-        "/v1/sessions/a1?forget=true&epoch=7",
+        "/v1/sessions/a1/epochs/7?forget=true",
         "",
-        "acp.kill",
+        "session.kill",
     ),
 ];
 
@@ -1440,6 +1443,78 @@ async fn action_epoch_api() -> Api {
     api
 }
 
+#[tokio::test]
+async fn incarnation_paths_require_control_before_reaching_the_hub() {
+    let api = action_epoch_api().await;
+    let before = api.hub.requests().len();
+    for (method, path) in [
+        ("POST", "/v1/sessions/a1/epochs/7/cancel"),
+        ("DELETE", "/v1/sessions/a1/epochs/7"),
+    ] {
+        let res = api.req(method, path, READER).send().await;
+        assert_eq!(res.status, 403, "{path}");
+    }
+    assert_eq!(api.hub.requests().len(), before);
+}
+
+#[tokio::test]
+async fn session_action_epoch_paths_reject_bad_parameters_before_connecting() {
+    let api = action_epoch_api().await;
+    let before = api.hub.requests().len();
+    for (method, path) in [
+        // The old query spelling must never degrade to an unguarded action.
+        ("DELETE", "/v1/sessions/p1?forget=true&epoch=7"),
+        ("POST", "/v1/sessions/a1/cancel?epoch=7"),
+        ("DELETE", "/v1/sessions/a1/epochs/18446744073709551616"),
+        ("DELETE", "/v1/sessions/a1/epochs/0?forget=yes"),
+        ("POST", "/v1/sessions/a1/epochs/-1/cancel"),
+        ("POST", "/v1/sessions/a1/epochs/1.5/cancel"),
+        ("DELETE", "/v1/sessions/a%2Fb/epochs/7"),
+        ("POST", "/v1/sessions/a%2Fb/epochs/7/cancel"),
+    ] {
+        let res = api.req(method, path, OWNER).send().await;
+        assert_eq!(res.status, 400, "{path}");
+    }
+    assert_eq!(api.hub.requests().len(), before);
+}
+
+#[tokio::test]
+async fn guarded_delete_ignores_a_stale_or_absent_watch_entry() {
+    let api = action_epoch_api().await;
+    // The fake hub now has an ACP at p1, but has not pushed the change to the watch.
+    let mut replacement = summary("p1", "testhost");
+    replacement.created_at = u64::MAX;
+    replacement.updated_at = u64::MAX;
+    api.hub.set_sessions(vec![replacement]);
+    let watched = api.get("/v1/sessions/p1").await.json();
+    assert_eq!(watched["kind"], "pty");
+    assert_eq!(watched["createdAt"], EPOCH);
+    let req = api.req(
+        "DELETE",
+        "/v1/sessions/p1/epochs/18446744073709551615",
+        OWNER,
+    );
+    let (kill, res) = api.answered(req, ok).await;
+    assert_eq!((res.status, res.json()), (200, json!({})));
+    assert_eq!(
+        kill,
+        HubRequest::SessionKill {
+            rid: 1,
+            sid: "p1".into(),
+            epoch: u64::MAX,
+            forget: false,
+        }
+    );
+
+    let req = api.req("DELETE", "/v1/sessions/unseen/epochs/0", OWNER);
+    let (kill, res) = api
+        .answered(req, refusal(ErrorCode::NotFound, "no session unseen"))
+        .await;
+    assert_eq!(res.status, 404);
+    assert_eq!(res.json()["code"], "not_found");
+    assert!(matches!(kill, HubRequest::SessionKill { sid, epoch: 0, .. } if sid == "unseen"));
+}
+
 /// Each guarded HTTP action names the epoch the caller saw, not a newer one
 /// that happens to be in the session list.
 #[tokio::test]
@@ -1447,21 +1522,11 @@ async fn session_action_epoch_reaches_the_hub_and_preserves_stale() {
     let api = action_epoch_api().await;
     for &(method, path, body, tag) in GUARDED_ACTIONS {
         let call = api.req(method, path, OWNER).body(body);
-        let req = if tag == "pty.kill" {
-            // The fake hub automatically acknowledges PTY kill.
-            assert_eq!(call.send().await.status, 200);
-            api.hub
-                .wait_for(|r| matches!(r, HubRequest::PtyKill { .. }))
-                .await
-                .1
-        } else {
-            let (req, res) = api
-                .answered(call, refusal(ErrorCode::Stale, "replaced"))
-                .await;
-            assert_eq!(res.status, 409);
-            assert_eq!(res.json(), json!({"error":"replaced","code":"stale"}));
-            req
-        };
+        let (req, res) = api
+            .answered(call, refusal(ErrorCode::Stale, "replaced"))
+            .await;
+        assert_eq!(res.status, 409);
+        assert_eq!(res.json(), json!({"error":"replaced","code":"stale"}));
         let wire = serde_json::to_value(req).unwrap();
         assert_eq!(wire["t"], tag);
         assert_eq!(wire["epoch"], 7, "{path}");

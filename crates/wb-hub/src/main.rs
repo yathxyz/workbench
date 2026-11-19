@@ -51,6 +51,34 @@ pub struct Ctx {
     pub test_panic_input: Option<String>,
 }
 
+#[cfg(test)]
+impl Ctx {
+    fn for_test(dir: &std::path::Path) -> Self {
+        let pty_dir = dir.join("pty");
+        let acp_dir = dir.join("acp");
+        std::fs::create_dir(&pty_dir).unwrap();
+        std::fs::create_dir(&acp_dir).unwrap();
+        Self {
+            cfg: serde_json::from_value(serde_json::json!({
+                "stateDir": dir, "host": "host", "shells": [], "defaultShell": "", "child": {}
+            }))
+            .unwrap(),
+            ident: Identity {
+                home: dir.to_str().unwrap().into(),
+                user: "user".into(),
+                logname: "user".into(),
+            },
+            child_umask: Mode::empty(),
+            registry: Registry::default(),
+            started_at: 1,
+            pty_dir,
+            acp_dir,
+            #[cfg(debug_assertions)]
+            test_panic_input: None,
+        }
+    }
+}
+
 /// Milliseconds since the Unix epoch.
 pub fn now_ms() -> u64 {
     SystemTime::now()

@@ -288,7 +288,7 @@ The error codes are a closed set:
 - **`Pending`:**
   - `kind` is `"permission"` or `"elicitation"`;
   - `req` is the seq of the immutable journal event that announced the question, not the agent's JSON-RPC id;
-  - `(sid, epoch, req)` identifies exactly one question: answering or cancelling consumes it, and another question gets a fresh seq even if the agent reuses its id;
+  - within the same incarnation and journal history, `(sid, epoch, req)` identifies exactly one question: answering or cancelling consumes it, and another question gets a fresh seq even if the agent reuses its id;
   - `title` is the permission's `toolCall.title` or the elicitation's `message`, cut to 200 characters for both kinds. It is `""` when the request has none.
 - **`AcpSessionInfo`:** `{protocolVersion, agentInfo, agentCapabilities, promptCapabilities, authMethods, modes, configOptions, availableCommands, plan, usage}`. It holds the latest materialised values; absent optional values are omitted. `Summary.acp.configOptions` is always present, with `null` when absent.
 - **`Summary.acp.managedWorktree`** is present only for a recorded worktree: `{path, branch, mainRoot}`, with both paths absolute.
@@ -305,6 +305,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | t | Fields | ok reply | Semantics |
 |---|---|---|---|
 | `list` | – | `{sessions: Summary[]}` | every known session |
+| `session.kill` | `sid, epoch, forget` | `{}` | End the matching incarnation, whether PTY or ACP; the hub selects its kind and checks `createdAt` in the same registry lookup. `forget` has the same semantics as the corresponding kind-specific kill below. |
 | `watch` | – | `{sessions}` | then `session` on every Summary change and `gone` on forget |
 | `pty.open` | `sid, cols, rows, spawn?: SpawnPty, resume?: {stream, out}` | `{new, pid?, cwd, exit?, epoch, stream, out, resumed, replay?}` | rules below |
 | `pty.detach` | `sid` | `{}` | |
@@ -329,7 +330,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `acp.remove_worktree` | `sid` | `{}` | Verify `workbench-session` in the recorded checkout's private git directory, remove without force, then persist and publish the cleared record; an absent record is `not_found`, a running agent or dirty worktree is `conflict`. A missing checkout, missing marker or different sid clears the record without deletion and returns `not_found`: “session worktree already gone; record cleared; nothing deleted”. |
 
 **Caller-supplied action precondition.**
-On prompt, cancel, set_mode and either kill, an optional `epoch` binds the action to that session's `createdAt`.
+On prompt, cancel, set_mode and the kind-specific kills, an optional `epoch` binds the action to that session's `createdAt`; the kind-independent `session.kill` always requires it.
 On set_config_option the wire epoch has always been required; `checkEpochFirst:true` selects the same precondition semantics instead of the legacy check order below.
 For these guarded actions, an unknown sid gives `not_found`; an existing sid with a different epoch gives `stale` before kind or actor-state checks, with no action on the replacement.
 This holds even if a command was queued as the old session was being forgotten.
@@ -1199,7 +1200,8 @@ A sid in a path that does not match `^[A-Za-z0-9_-]{1,64}$` is 400 "bad id". Req
 | `GET /v1/stream` | read | Server-sent events (§3.8.4). |
 | `POST /v1/sessions` | control | Starts an ACP agent. Body `{agent, cwd, host?, sid?, config?: {optionId: string\|boolean}, task?: string, policy?: Policy, worktree?: {branch, base?}}`. `sid` defaults to `api_` and 16 random hex digits. `host` absent, or the hub's own, starts it on the hub's host; another name must be one of the hub's `hosts` as its hello lists them, else 400 "no host H" (so a hub that predates §3.8.5 is never asked). 201 `{sid, session: Summary+state, configErrors:[{id, value, code, error}]}`; configuration and worktree rules below. A sid that an agent session has is 409 "session exists", and one that a shell has is 409 with the hub's `kind_mismatch`; that session is left as it is. Policy validation, including all regex compilation and limits, precedes spawn; invalid policy is 400 "bad body". |
 | `POST /v1/sessions/{sid}/prompt` | control | Body `{text, epoch?}` or `{blocks:[ContentBlock], epoch?}`, exactly one of `text` and `blocks`; `text` becomes one text block. `acp.prompt`. 200 `{}`. |
-| `POST /v1/sessions/{sid}/cancel?epoch=N` | control | `acp.cancel`; optional epoch in the query, not the body. 200 `{}`. |
+| `POST /v1/sessions/{sid}/cancel` | control | `acp.cancel` without an incarnation precondition. 200 `{}`. |
+| `POST /v1/sessions/{sid}/epochs/{epoch}/cancel` | control | `acp.cancel` only for the named incarnation. 200 `{}`. |
 | `POST /v1/sessions/{sid}/permission` | control | Body `{req, epoch, outcome}`: `acp.permission`. 200 `{}`. |
 | `POST /v1/sessions/{sid}/elicitation` | control | Body `{req, epoch, response}`: `acp.elicitation`. 200 `{}`. |
 | `POST /v1/sessions/{sid}/mode` | control | Body `{modeId, epoch?}`: `acp.set_mode`. 200 `{}`. |
@@ -1207,7 +1209,8 @@ A sid in a path that does not match `^[A-Za-z0-9_-]{1,64}$` is 400 "bad id". Req
 | `POST /v1/sessions/{sid}/task` | control | Body `{"task": string\|null}`, with the member required. Sends `acp.set_task`; 200 `{}` after the replacement or clear is journaled. |
 | `POST /v1/sessions/{sid}/policy` | control | Body `{policy: Policy}`: `acp.set_policy{sid, epoch: current Summary.createdAt, policy}`. No request-body epoch is accepted. 200 `{}` after journaling; `{policy:{rules:[]}}` removes it. Strict unknown-field/shape/limit/regex validation gives 400 "bad body". Read via session details' `acp.policy`; pending requests remain unchanged. |
 | `POST /v1/sessions/{sid}/revive` | control | `acp.revive`. 200 `{}`. |
-| `DELETE /v1/sessions/{sid}?forget=true\|false&epoch=N` | control | `acp.kill` or `pty.kill` by the session's kind; both query parameters are optional, `forget` defaulting to `false`. 200 `{}`; 404 for a sid the hub does not know. |
+| `DELETE /v1/sessions/{sid}?forget=true\|false` | control | `acp.kill` or `pty.kill` by the session's kind, without an incarnation precondition; `forget` defaults to `false`. 200 `{}`; 404 for an unknown sid. |
+| `DELETE /v1/sessions/{sid}/epochs/{epoch}?forget=true\|false` | control | `session.kill` only for the named incarnation, independent of the web's watch cache; `forget` defaults to `false`. 200 `{}`; 404 for an unknown sid. |
 | `DELETE /v1/sessions/{sid}/worktree` | control | `acp.remove_worktree`; 200 `{}` after deletion, 409 while the agent runs, a worktree operation is in progress or git refuses non-forced removal, 404 for an unknown sid or absent record. A missing or replaced checkout gives a distinct 404 after clearing the record (§3.2.7). |
 | `POST /v1/events` | events | One session event (§3.8.3). 204. |
 
@@ -1220,8 +1223,10 @@ The API starts no PTY and sends no PTY input: a shell on the mesh is what ssh is
 Pass the observed `createdAt` as `epoch` (unsigned integer); a mismatch is HTTP 409 with `code:"stale"`, and nothing is sent to or changed in the replacement session.
 If a guarded action's own connection to the hub does not advertise `sessionActionEpoch:true`, the API returns 400 without forwarding the request.
 Omission retains the old behavior and does not require a hub upgrade.
-Clients relying on this feature must use a web API that implements it: older web servers ignore unrecognized query parameters on cancel and DELETE.
-For permission and elicitation answers, the already-required `epoch` and `req` are sufficient: a later answer for a resolved or withdrawn question in that incarnation is HTTP 409 `already_resolved`, even if there is a new pending question of the same kind.
+For guarded cancel and DELETE, use the `/epochs/{epoch}` paths: a previous web router returns 404 rather than matching the unguarded route.
+Never pass `?epoch=` on the unguarded paths: this web rejects it, but older web versions can ignore it and perform the action.
+For permission and elicitation answers, the already-required `epoch` and `req` identify the published question.
+A later answer for a resolved or withdrawn question in that incarnation and journal history is HTTP 409 `already_resolved`, even if there is a new pending question of the same kind.
 
 **Configuration on create.** `config`, when present, is a JSON object with at most **16 distinct option ids**, each value a string or boolean. A non-object, another value type, duplicate id or a seventeenth option is 400 "bad body", before any spawn. The web retains the input object's member order and passes it as the hub's ordered `SpawnAcp.config` array `[{id, value}]`; it does not wait for setup events and issue its own configuration RPCs. With no config or `{}`, create keeps its immediate post-open behaviour and does not wait for ACP setup. With non-empty config, the hub delays the initiating `acp.open` reply until setup and the ordered batch end or terminate (§3.4.5), blocking prompts and the other listed live actions from every client in the meantime. The API waits up to `40 s × (1 + number of options)` for that reply, then returns its resulting session and opener `configErrors` verbatim. This outer HTTP wait is not a total setup timeout: the hub still uses `SETUP_IDLE_TIMEOUT`, which can be extended by agent messages or paused for pending requests. Individual configuration failures and setup failure do not turn accepted creation into a failed start: the response remains 201, with every unapplied option accounted for and `configErrors:[]` when all succeeded. Later option validation uses the latest authoritative full list. Create never sends a prompt, with or without configuration.
 

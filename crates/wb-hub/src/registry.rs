@@ -12,7 +12,7 @@ use serde::{Serialize, Serializer};
 use tokio::sync::mpsc;
 use wb_proto::hub::{ErrorCode, HubMessage, Kind, Summary};
 
-use crate::conn::{ConnId, Viewer, line};
+use crate::conn::{ConnId, Reply, Viewer, line};
 use crate::{acp, lock, now_ms, pty};
 
 /// Commands a session actor buffers before senders wait.
@@ -36,6 +36,18 @@ struct Inner {
 impl Inner {
     fn summaries(&self) -> impl Clone + Iterator<Item = &Arc<Summary>> {
         self.sessions.values().filter_map(|e| e.summary.as_ref())
+    }
+
+    /// Look up an incarnation even before its first Summary is published.
+    fn action_sender(&self, sid: &str, epoch: Option<u64>) -> Result<&Tx, (ErrorCode, String)> {
+        let entry = self
+            .sessions
+            .get(sid)
+            .ok_or_else(|| (ErrorCode::NotFound, format!("no session {sid}")))?;
+        if epoch.is_some_and(|epoch| epoch != entry.created_at) {
+            return Err((ErrorCode::Stale, "the session was created again".into()));
+        }
+        Ok(&entry.tx)
     }
 }
 
@@ -206,27 +218,16 @@ impl Registry {
             .and_then(|e| C::unwrap(&e.tx))
     }
 
-    /// Compare `epoch` and take the matching actor's sender in one critical section,
-    /// even for a registered session whose first Summary hasn't been published yet.
+    /// Compare the epoch and pin the actor's sender under the same lock.
     fn action_sender<C: SessionCmd>(
         &self,
         sid: &str,
         epoch: Option<u64>,
     ) -> Result<mpsc::Sender<C>, (ErrorCode, String)> {
         let inner = lock(&self.inner);
-        let entry = inner
-            .sessions
-            .get(sid)
-            .ok_or_else(|| (ErrorCode::NotFound, format!("no session {sid}")))?;
-        if epoch.is_some_and(|epoch| epoch != entry.created_at) {
-            return Err((ErrorCode::Stale, "the session was created again".into()));
-        }
-        C::unwrap(&entry.tx).ok_or_else(|| {
-            let kind = if entry.tx.kind() == Kind::Pty {
-                "pty"
-            } else {
-                "acp"
-            };
+        let tx = inner.action_sender(sid, epoch)?;
+        C::unwrap(tx).ok_or_else(|| {
+            let kind = if tx.kind() == Kind::Pty { "pty" } else { "acp" };
             (
                 ErrorCode::KindMismatch,
                 format!("{sid} is a {kind} session"),
@@ -236,14 +237,41 @@ impl Registry {
 
     pub async fn deliver<C: SessionCmd>(&self, sid: &str, cmd: C) {
         match self.action_sender::<C>(sid, cmd.expected_epoch()) {
-            Ok(tx) => {
-                if let Err(unsent) = tx.send(cmd).await {
-                    unsent
-                        .0
-                        .refuse(ErrorCode::NotFound, format!("no session {sid}"));
-                }
-            }
+            Ok(tx) => send_to(sid, tx, cmd).await,
             Err((code, msg)) => cmd.refuse(code, msg),
+        }
+    }
+
+    /// A guarded DELETE names an incarnation, not a kind inferred by its caller.
+    pub async fn kill(&self, sid: &str, epoch: u64, forget: bool, reply: Reply) {
+        let tx = lock(&self.inner).action_sender(sid, Some(epoch)).cloned();
+        let epoch = Some(epoch);
+        match tx {
+            Ok(Tx::Pty(tx)) => {
+                send_to(
+                    sid,
+                    tx,
+                    pty::Cmd::Kill {
+                        epoch,
+                        forget,
+                        reply,
+                    },
+                )
+                .await
+            }
+            Ok(Tx::Acp(tx)) => {
+                send_to(
+                    sid,
+                    tx,
+                    acp::Cmd::Act {
+                        epoch,
+                        act: acp::Act::Kill { forget },
+                        reply,
+                    },
+                )
+                .await
+            }
+            Err((code, msg)) => reply.err(code, msg),
         }
     }
 
@@ -405,5 +433,13 @@ impl Registry {
         let mut inner = lock(&self.inner);
         inner.stopping = true;
         inner.sessions.values().map(|e| e.tx.clone()).collect()
+    }
+}
+
+async fn send_to<C: SessionCmd>(sid: &str, tx: mpsc::Sender<C>, cmd: C) {
+    if let Err(unsent) = tx.send(cmd).await {
+        unsent
+            .0
+            .refuse(ErrorCode::NotFound, format!("no session {sid}"));
     }
 }

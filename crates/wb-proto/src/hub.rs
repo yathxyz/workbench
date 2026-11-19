@@ -31,6 +31,14 @@ pub enum HubRequest {
     /// Like `list`, then a `session` event on every Summary change and `gone` on forget.
     #[serde(rename = "watch")]
     Watch { rid: u64 },
+    /// End the session of either kind matching `epoch`; `forget` also deletes it.
+    #[serde(rename = "session.kill")]
+    SessionKill {
+        rid: u64,
+        sid: String,
+        epoch: u64,
+        forget: bool,
+    },
     /// Attach to a PTY session. Only a request with `spawn` starts a process.
     /// Reply: [`PtyOpenReply`].
     #[serde(rename = "pty.open")]
