@@ -1548,7 +1548,7 @@ impl Acp {
         self.info_at = None;
         self.updated_at = now_ms().max(self.updated_at);
         let (summary, session) = self.snapshot();
-        self.ctx.registry.publish(&summary);
+        self.ctx.registry.publish(Arc::new(summary.clone()));
         let msg = line(&HubMessage::AcpInfo {
             sid: self.sid.clone(),
             summary: Box::new(summary.clone()),
