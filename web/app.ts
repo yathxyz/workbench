@@ -4170,7 +4170,11 @@ const FS_PREFIX = 'fs:';
 const rgHome = () => RG.home || (DAEMON ? '~' : '/home/me');
 const isFs = (k: string) => k.startsWith(FS_PREFIX);
 function rgEntryOf(n: BoardNode): RgEntry { return { key: n.id, name: n.name, kind: n.kind, dir: n.kind === 'frame', n }; }
-function rgSort(list: RgEntry[]): RgEntry[] { return list.sort((a, b) => ((b.dir as unknown as number) - (a.dir as unknown as number)) || a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })); }
+function rgSort(list: RgEntry[]): RgEntry[] {
+  if (list.length < 2) return list;
+  const byName = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' }).compare;
+  return list.sort((a, b) => Number(b.dir) - Number(a.dir) || byName(a.name, b.name));
+}
 function rgEntries(key: string): RgEntry[] {
   if (key === 'root') {
     const roots = Object.values(S.nodes).filter(n => !n.in || !S.nodes[n.in]).map(rgEntryOf);
