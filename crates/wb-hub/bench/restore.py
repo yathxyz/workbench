@@ -1,5 +1,7 @@
 """Startup with tool-heavy journals, including one much larger than the replay cap."""
 
+from time import monotonic
+
 from fleet import check_summary, seed
 
 
@@ -15,6 +17,9 @@ def restore(h):
     h.start()
     with h.connect() as c:
         summaries = c.call({'t': 'list'})['sessions']
+        deadline = monotonic() + 30
+        while len(summaries) < len(counts) and monotonic() < deadline:
+            summaries = c.call({'t': 'list'})['sessions']
         assert len(summaries) == len(counts)
         for s in summaries:
             check_summary(s, s['sid'], counts[s['sid']], [])
