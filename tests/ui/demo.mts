@@ -214,9 +214,12 @@ check('enter workspace: outside dims, breadcrumb in the status bar, persisted', 
 await p.keyboard.press('Escape'); await sleep(700);
 v10 = await p.evaluate(() => ({ inws: document.body.classList.contains('in-ws'), out: document.querySelectorAll('.outside').length, st: document.querySelector('#st-ws')!.textContent, ws: window.__canvas.S.ws }));
 check('Esc leaves the workspace', !v10.inws && v10.out === 0 && v10.st === '' && !v10.ws, JSON.stringify(v10));
-v10 = await p.evaluate(() => {
+v10 = await p.evaluate(async () => {
   const C = window.__canvas, S = C.S; const n = Object.values<BoardNode>(S.nodes).find(n => n.kind === 'buffer' || n.kind === 'term')!;
-  const before = { x: n.x, y: n.y, w: n.w, h: n.h }; C.focusOpen(n);
+  const before = { x: n.x, y: n.y, w: n.w, h: n.h };
+  C.goAddr('board:/', false);   // a camera flight is pending, as when restoring the address after a reload
+  C.focusOpen(n);
+  await new Promise(requestAnimationFrame);
   const vw = document.querySelector('#viewport')!.clientWidth;
   const el = document.querySelector(`.node[data-id="${n.id}"]`)!;
   const r = el.getBoundingClientRect(), vr = document.querySelector('#viewport')!.getBoundingClientRect();

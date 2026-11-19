@@ -7209,7 +7209,6 @@ async function boot() {
   // No /api/hosts at boot: wb-web answers it 404 by design (multi-host is a v1 non-goal; DESIGN §3.5.5), so the call
   // only put an error in the console of every load.
   perspChip(); acpButton();
-  hashInit();
   { const f = new URLSearchParams(location.search).get('focus'); if (f) { history.replaceState(null, '', location.pathname + location.hash); setTimeout(() => attnFocus(f), 600); } }   // opened by a notification (F-A12)
   if (separateAll()) { restack(); renderLinks(); }
   S.views = S.views || {}; S.strokes = S.strokes || []; S.fs = S.fs || seedFs(); S.shapes = S.shapes || [];
@@ -7240,6 +7239,7 @@ async function boot() {
   deskRestore(view); winInit();
   wsRestore(); focusRestoreTabs();
   BOOTED = true; SAVE.lastJson = serialize(); viewSave();
+  hashInit();   // navigate the mounted board before a later user action can take over
 }
 // ------------------------------------------------------------------ node kinds around terminals: browser, artifacts, sketch
 // Browser window: a page in a frame. Sites that send X-Frame-Options or a frame-ancestors CSP stay blank; ↗ opens them outside.
@@ -8447,6 +8447,7 @@ function focusShow(id: string) {
   const n = S.nodes[id]; if (!n || n.kind === 'frame') return;
   if (VIEW !== 'canvas') setView('canvas');
   deskReveal(n);
+  camStop(false);
   if (FOCUS.cur && FOCUS.cur !== id) focusRestoreNode();
   if (!FOCUS.cur) FOCUS.saved = { ...cam() };
   if (FOCUS.cur !== id) { reveal(n); FOCUS.rect = { x: n.x, y: n.y, w: n.w, h: n.h }; }
@@ -10509,7 +10510,7 @@ function hashSync(addr?: string | null, push?: boolean): void {
 }
 function hashInit(): void {
   const start = decodeURIComponent(location.hash.slice(1));
-  if (start && parseAddr(start)) setTimeout(() => goAddr(start, false), 400);
+  if (start && parseAddr(start)) goAddr(start, false);
   addEventListener('hashchange', () => { if (HASH.busy) return; const a = decodeURIComponent(location.hash.slice(1)); if (a && parseAddr(a) && a !== HASH.last) { HASH.last = a; goAddr(a, false); } });
   setInterval(() => { if (!HASH.busy && !document.hidden) hashSync(); }, 1500);
 }
