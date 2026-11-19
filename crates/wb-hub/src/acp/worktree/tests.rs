@@ -106,7 +106,12 @@ async fn create(
     request: &WorktreeRequest,
 ) -> Result<ManagedWorktree, Error> {
     let (_tx, rx) = oneshot::channel();
-    super::create(git, cwd, request, SID, rx).await
+    super::create(git, cwd, request, SID, rx)
+        .await
+        .map_err(|failure| match failure {
+            CreateFailure::Clean(err) => err,
+            CreateFailure::PossibleLeftover(err) => panic!("unexpected leftover: {err:?}"),
+        })
 }
 
 fn script(path: &Path, body: &str) {
@@ -338,6 +343,31 @@ async fn lookup_errors_do_not_invalidate_ownership() {
     assert!(Path::new(&record.path).join("tracked").is_file());
 }
 
+async fn wait_for(what: &str, ready: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+// Pause only once the subprocess is ready. Tokio's paused clock otherwise
+// auto-advances while the runtime is idle waiting on real git or its pipes.
+async fn expire_when_ready<F: Future, R: Future>(command: F, ready: R) -> (F::Output, R::Output) {
+    tokio::pin!(command);
+    let observed = tokio::select! {
+        _ = &mut command => panic!("git finished before the fixture was ready"),
+        observed = ready => observed,
+    };
+    tokio::time::pause();
+    tokio::time::advance(GIT_WORKTREE_TIMEOUT).await;
+    tokio::time::resume();
+    // Real time is running again before any rollback command starts.
+    (command.await, observed)
+}
+
 // Run every normal git command unchanged; intercept precisely the add. The
 // real git has registered and populated the worktree before the fake sleeps.
 fn slow_add(f: &Fixture, branch: &str, body: &str) -> PathBuf {
@@ -365,15 +395,16 @@ async fn timed_out_add_unlocks_and_force_removes_only_the_reserved_checkout() {
         "\"$git\" \"$@\"\n\"$git\" worktree lock -- \"$wt\"\n: > \"$wt/untracked\"",
     );
     let req = request("timed", None);
-    let (_tx, rx) = oneshot::channel();
-    let err = create_with_timeout(&fake, &repo, &req, SID, rx, Duration::from_secs(2))
-        .await
-        .unwrap_err();
+    let ready = repo.join("ready");
+    let (result, ()) = expire_when_ready(
+        create(&fake, &repo, &req),
+        wait_for("registered, locked checkout", || ready.is_file()),
+    )
+    .await;
     assert_eq!(
-        err,
+        result.unwrap_err(),
         (ErrorCode::Timeout, "git worktree add timed out".into())
     );
-    assert!(repo.join("ready").is_file());
     assert!(!f.temp.join("main repo-wt/timed").exists());
     assert!(
         !f.git(&repo, &["worktree", "list", "--porcelain"])
@@ -402,31 +433,30 @@ async fn cancel_unregistered_unlocked_and_replaced_add() {
         let req = request(branch, None);
         let (tx, rx) = oneshot::channel();
         let creation = super::create(&fake, &repo, &req, SID, rx);
+        let ready = repo.join("ready");
         let interrupt = async {
-            tokio::time::timeout(Duration::from_secs(10), async {
-                while !repo.join("ready").exists() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
+            wait_for("interrupted add fixture", || ready.is_file()).await;
             tx.send(()).unwrap();
         };
         let (result, ()) = tokio::join!(creation, interrupt);
         let err = result.unwrap_err();
         let wt = f.temp.join("main repo-wt").join(branch);
         if branch == "replaced" {
+            let CreateFailure::PossibleLeftover((code, message)) = err else {
+                panic!("replacement must report a leftover: {err:?}");
+            };
+            assert_eq!(code, ErrorCode::Conflict);
             assert!(
-                err.1.starts_with(&format!(
+                message.starts_with(&format!(
                     "{CANCELLED}; worktree path left at {}:",
                     wt.display()
                 )),
-                "{err:?}"
+                "{message}"
             );
             assert!(wt.join("keep").exists());
             assert!(wt.with_extension("old").join("tracked").is_file());
         } else {
-            assert_eq!(err, cancelled());
+            assert_eq!(err, CreateFailure::Clean(cancelled()));
             assert!(!wt.exists());
             assert!(
                 !f.git(&repo, &["worktree", "list", "--porcelain"])
@@ -697,20 +727,29 @@ async fn hooks_are_disabled_and_only_clean_worktrees_can_be_removed() {
     );
 }
 
+// The exited git can still be a zombie: run() waits for EOF before reaping it.
+fn exited(pid: u32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat.rsplit_once(')').unwrap().1.starts_with(" Z "),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+        Err(e) => panic!("inspect pid {pid}: {e}"),
+    }
+}
+
 #[tokio::test]
 async fn git_deadline_includes_descendants_holding_the_pipes() {
     let f = Fixture::new();
     let fake = f.temp.join("sleeping-git");
-    // The group leader exits before its helper. Killing just the direct child
-    // would leave the pipe open and let the helper create its marker.
+    // The helper inherits both pipes. Its natural lifetime is longer than the
+    // fixture waits, but finite in case group termination regresses.
     script(
         &fake,
         &format!(
-            "( '{}' 2 && : > survived ) &\n: > started\nexit 0",
+            "'{}' 90 &\nprintf '%s %s\\n' \"$$\" \"$!\" > pids\n: > started\nexit 0",
             program("sleep").display()
         ),
     );
-    let (code, msg) = run(
+    let command = run(
         &fake,
         &f.temp,
         &[
@@ -721,15 +760,23 @@ async fn git_deadline_includes_descendants_holding_the_pipes() {
             "--",
             "target",
         ],
-        Duration::from_millis(500),
-    )
-    .await
-    .unwrap_err();
+        GIT_WORKTREE_TIMEOUT,
+    );
+    let started = f.temp.join("started");
+    let (result, child) = expire_when_ready(command, async {
+        wait_for("git helper holding the pipes", || started.is_file()).await;
+        let pids = fs::read_to_string(f.temp.join("pids")).unwrap();
+        let (leader, child) = pids.trim().split_once(' ').unwrap();
+        let (leader, child) = (leader.parse().unwrap(), child.parse().unwrap());
+        wait_for("git leader to exit", || exited(leader)).await;
+        assert!(!exited(child), "git helper no longer holds the pipes");
+        child
+    })
+    .await;
+    let (code, msg) = result.unwrap_err();
     assert_eq!(code, ErrorCode::Timeout);
     assert_eq!(msg, "git worktree remove timed out");
-    assert!(f.temp.join("started").is_file());
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(!f.temp.join("survived").exists());
+    wait_for("timeout to kill the helper", || exited(child)).await;
 }
 
 #[tokio::test]

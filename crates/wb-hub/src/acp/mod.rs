@@ -50,6 +50,7 @@ use self::facts::Facts;
 use self::journal::{Journal, WriteFault};
 use self::replay::Replay;
 use self::rpc::Incoming;
+use self::worktree::CreateFailure::{self, Clean, PossibleLeftover};
 use crate::conn::{ConnId, Reply, Viewer, line};
 use crate::outq::OutQ;
 use crate::registry::Route;
@@ -633,12 +634,10 @@ enum WorktreeOp {
     },
 }
 
-enum WorktreeChange {
-    Created(ManagedWorktree),
-    Removed(bool),
+enum WorktreeResult {
+    Created(Result<ManagedWorktree, CreateFailure>),
+    Removed(Result<bool, (ErrorCode, String)>),
 }
-
-type WorktreeResult = Result<WorktreeChange, (ErrorCode, String)>;
 
 enum Event {
     Cmd(Option<Cmd>),
@@ -942,23 +941,23 @@ impl Acp {
     async fn create(&mut self, mut o: Open) {
         let Some(spawn) = &mut o.spawn else {
             let msg = format!("no session {}", self.sid);
-            return self.abandon(o.reply, ErrorCode::NotFound, msg, true);
+            return self.abandon(o.reply, Clean((ErrorCode::NotFound, msg)));
         };
         if spawn.host.as_ref() == Some(&self.ctx.cfg.host) {
             spawn.host = None;
         }
         if let Some(host) = &spawn.host {
-            if let Err((code, msg)) = self.check_remote(host, &spawn.agent, &spawn.cwd) {
-                return self.abandon(o.reply, code, msg, true);
+            if let Err(error) = self.check_remote(host, &spawn.agent, &spawn.cwd) {
+                return self.abandon(o.reply, Clean(error));
             }
         } else {
             if !self.ctx.cfg.agents.contains_key(&spawn.agent) {
                 let msg = format!("no agent {}", spawn.agent);
-                return self.abandon(o.reply, ErrorCode::UnknownAgent, msg, true);
+                return self.abandon(o.reply, Clean((ErrorCode::UnknownAgent, msg)));
             }
             if !spawn.cwd.starts_with('/') || !Path::new(&spawn.cwd).is_dir() {
                 let msg = "cwd must be an absolute path of an existing directory".to_owned();
-                return self.abandon(o.reply, ErrorCode::BadRequest, msg, true);
+                return self.abandon(o.reply, Clean((ErrorCode::BadRequest, msg)));
             }
         }
         if let Some(request) = spawn.worktree.take() {
@@ -972,9 +971,9 @@ impl Acp {
             });
             self.git.spawn(async move {
                 let git = ctx.cfg.git.as_deref().expect("validated worktree request");
-                worktree::create(git, Path::new(&cwd), &request, &sid, cancelled)
-                    .await
-                    .map(WorktreeChange::Created)
+                WorktreeResult::Created(
+                    worktree::create(git, Path::new(&cwd), &request, &sid, cancelled).await,
+                )
             });
         } else {
             self.finish_create(o, None).await;
@@ -1019,7 +1018,7 @@ impl Acp {
                 if let Some(record) = self.meta.managed_worktree.take() {
                     self.rollback(record, o.reply, ErrorCode::Internal, msg);
                 } else {
-                    self.abandon(o.reply, ErrorCode::Internal, msg, true);
+                    self.abandon(o.reply, Clean((ErrorCode::Internal, msg)));
                 }
                 return;
             }
@@ -1057,10 +1056,14 @@ impl Acp {
     }
 
     /// Releases the unpublished sid only after cleanup, before clients can retry.
-    fn abandon(&mut self, reply: Reply, code: ErrorCode, message: String, clean: bool) {
+    fn abandon(&mut self, reply: Reply, failure: CreateFailure) {
         if self.ctx.registry.abandon(&self.sid, self.created_at) {
             self.phase = Phase::Abandoned;
         }
+        let ((code, message), clean) = match failure {
+            Clean(error) => (error, true),
+            PossibleLeftover(error) => (error, false),
+        };
         if let Some(kill) = self.create_kill.take() {
             if clean {
                 kill.done();
@@ -2069,9 +2072,7 @@ impl Acp {
         self.worktree_op = Some(op);
         self.git.spawn(async move {
             let git = ctx.cfg.git.as_deref().expect("configured worktree removal");
-            worktree::remove(git, &record, &sid)
-                .await
-                .map(WorktreeChange::Removed)
+            WorktreeResult::Removed(worktree::remove(git, &record, &sid).await)
         });
     }
 
@@ -2089,15 +2090,21 @@ impl Acp {
     }
 
     async fn worktree_done(&mut self, joined: Result<WorktreeResult, JoinError>) {
-        use WorktreeChange::{Created, Removed};
+        use WorktreeResult::{Created, Removed};
         let op = self
             .worktree_op
             .take()
             .expect("git completion without a request");
-        let result =
-            joined.unwrap_or_else(|e| Err((ErrorCode::Internal, format!("git task failed: {e}"))));
+        let result = joined.unwrap_or_else(|e| {
+            let error = (ErrorCode::Internal, format!("git task failed: {e}"));
+            match op {
+                // A failed task cannot attest to cleanup of its private checkout.
+                WorktreeOp::Create { .. } => Created(Err(PossibleLeftover(error))),
+                WorktreeOp::Rollback { .. } | WorktreeOp::Remove(_) => Removed(Err(error)),
+            }
+        });
         match (op, result) {
-            (WorktreeOp::Create { open, .. }, Ok(Created(record))) => {
+            (WorktreeOp::Create { open, .. }, Created(Ok(record))) => {
                 if self.create_kill.is_none() {
                     self.finish_create(open, Some(record)).await;
                 } else {
@@ -2111,9 +2118,8 @@ impl Acp {
                     );
                 }
             }
-            (WorktreeOp::Create { open, .. }, Err((code, message))) => {
-                let clean = message == worktree::CANCELLED;
-                self.abandon(open.reply, code, message, clean);
+            (WorktreeOp::Create { open, .. }, Created(Err(failure))) => {
+                self.abandon(open.reply, failure);
             }
             (
                 WorktreeOp::Rollback {
@@ -2122,27 +2128,28 @@ impl Acp {
                     message,
                     path,
                 },
-                result,
+                Removed(result),
             ) => match result {
-                Ok(Removed(true)) => self.abandon(reply, code, message, true),
-                Ok(Removed(false)) => self.abandon(
+                Ok(true) => self.abandon(reply, Clean((code, message))),
+                Ok(false) => self.abandon(
                     reply,
-                    code,
-                    format!("{message}; worktree at {path} no longer owned; nothing deleted"),
-                    false,
+                    PossibleLeftover((
+                        code,
+                        format!("{message}; worktree at {path} no longer owned; nothing deleted"),
+                    )),
                 ),
                 Err((_, error)) => self.abandon(
                     reply,
-                    code,
-                    format!("{message}; worktree left at {path}: {error}"),
-                    false,
+                    PossibleLeftover((
+                        code,
+                        format!("{message}; worktree left at {path}: {error}"),
+                    )),
                 ),
-                Ok(Created(_)) => unreachable!("rollback completed an add"),
             },
-            (WorktreeOp::Remove(reply), Ok(Removed(deleted))) => {
+            (WorktreeOp::Remove(reply), Removed(Ok(deleted))) => {
                 self.removed(reply, deleted).await;
             }
-            (WorktreeOp::Remove(reply), Err((code, message))) => reply.err(code, message),
+            (WorktreeOp::Remove(reply), Removed(Err((code, message)))) => reply.err(code, message),
             _ => unreachable!("git result does not match request"),
         }
     }

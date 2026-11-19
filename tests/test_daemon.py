@@ -471,9 +471,10 @@ def worktrees(t, h):
     headers = [("Host", f"{harness.API_ADDR[0]}:{harness.API_ADDR[1]}"),
                ("Authorization", "Bearer " + auth), ("Content-Type", "application/json")]
 
-    def api(method, path, want, body=None):
+    def api(method, path, want, body=None, *, timeout=10.0):
         status, _, data = wbctl.http_request(harness.API_ADDR, method, "/v1/" + path, headers,
-                                             json.dumps(body).encode() if body is not None else None)
+                                             json.dumps(body).encode() if body is not None else None,
+                                             timeout=timeout)
         if status != want:
             raise AssertionError(f"{method} {path}: expected {want}, got {status}: {data!r}")
         return body_json(data)
@@ -736,9 +737,10 @@ def worktrees(t, h):
     spawn = {"sid": pending, "agent": "stub", "cwd": str(repo), "worktree": {"branch": pending}}
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
-            opening = pool.submit(api, "POST", "sessions", 409, spawn)
+            # This request is deliberately parked while the test sends other requests.
+            opening = pool.submit(api, "POST", "sessions", 409, spawn, timeout=120)
             try:
-                harness.wait_until(started.is_file, "git checkout in smudge filter", h.hub)
+                harness.wait_until(started.is_file, "git checkout in smudge filter", h.hub, timeout=30)
                 api("GET", "sessions/" + pending, 404)
                 busy = api("POST", "sessions", 409, spawn)
                 t.check("worktree: a second HTTP create conflicts while checkout is private",

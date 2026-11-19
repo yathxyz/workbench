@@ -22,6 +22,15 @@ use wb_proto::limits::{GIT_TIMEOUT, GIT_WORKTREE_TIMEOUT};
 use super::agent::signal_group;
 
 type Error = (ErrorCode, String);
+
+/// Failure of an unpublished creation. The creator's error is independent of
+/// whether a concurrent kill needs to report an incomplete cleanup.
+#[derive(Debug, PartialEq)]
+pub(super) enum CreateFailure {
+    Clean(Error),
+    PossibleLeftover(Error),
+}
+
 const PIPE_BYTES: usize = 8192;
 const ERROR_CHARS: usize = 512;
 const MARKER: &str = "workbench-session";
@@ -94,6 +103,20 @@ impl Drop for KillGroup {
     }
 }
 
+enum RunError {
+    Io(io::Error),
+    Interrupted(Error),
+}
+
+impl RunError {
+    fn into_error(self) -> Error {
+        match self {
+            Self::Io(e) => internal(e),
+            Self::Interrupted(error) => error,
+        }
+    }
+}
+
 async fn run_with<T>(
     git: &Path,
     cwd: &Path,
@@ -101,7 +124,7 @@ async fn run_with<T>(
     limit: Duration,
     cancel: Option<&mut oneshot::Receiver<()>>,
     read_stdout: impl AsyncFnOnce(ChildStdout) -> io::Result<T>,
-) -> Result<Output<T>, Error> {
+) -> Result<Output<T>, RunError> {
     let mut cmd = Command::new(git);
     cmd.current_dir(cwd)
         .args(["--no-lazy-fetch", "-c", "core.hooksPath=/dev/null"])
@@ -132,7 +155,7 @@ async fn run_with<T>(
             cmd.env(key, value);
         }
     }
-    let mut child = cmd.spawn().map_err(internal)?;
+    let mut child = cmd.spawn().map_err(RunError::Io)?;
     let mut group = KillGroup(child.id());
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
@@ -150,19 +173,19 @@ async fn run_with<T>(
     let result = tokio::select! {
         // If git already completed, let the actor roll it back normally.
         biased;
-        out = collect => out.map_err(internal),
+        out = collect => out.map_err(RunError::Io),
         _ = async {
             match cancel {
                 Some(rx) => { let _ = rx.await; }
                 None => std::future::pending().await,
             }
-        } => Err(cancelled()),
+        } => Err(RunError::Interrupted(cancelled())),
         _ = tokio::time::sleep(limit) => {
             let command = match args {
                 [.., "worktree", op, "--", _] | ["worktree", op, ..] => format!("worktree {op}"),
                 _ => args[0].to_string(),
             };
-            Err((ErrorCode::Timeout, format!("git {command} timed out")))
+            Err(RunError::Interrupted((ErrorCode::Timeout, format!("git {command} timed out"))))
         }
     };
     if result.is_ok() {
@@ -181,7 +204,9 @@ async fn run(
     args: &[&str],
     limit: Duration,
 ) -> Result<Output<Vec<u8>>, Error> {
-    run_with(git, cwd, args, limit, None, prefix).await
+    run_with(git, cwd, args, limit, None, prefix)
+        .await
+        .map_err(RunError::into_error)
 }
 
 fn failure<T>(output: &Output<T>, code: ErrorCode) -> Error {
@@ -287,7 +312,8 @@ async fn worktrees(
         None,
         async move |pipe| scan(pipe, branch, target).await,
     )
-    .await?;
+    .await
+    .map_err(RunError::into_error)?;
     let list = checked(out, ErrorCode::Internal)?;
     if list.main.is_empty() {
         return Err((
@@ -606,50 +632,43 @@ pub(super) async fn create(
     cwd: &Path,
     request: &WorktreeRequest,
     sid: &str,
-    cancel: oneshot::Receiver<()>,
-) -> Result<ManagedWorktree, Error> {
-    create_with_timeout(git, cwd, request, sid, cancel, GIT_WORKTREE_TIMEOUT).await
-}
-
-async fn create_with_timeout(
-    git: &Path,
-    cwd: &Path,
-    request: &WorktreeRequest,
-    sid: &str,
     mut cancel: oneshot::Receiver<()>,
-    add_timeout: Duration,
-) -> Result<ManagedWorktree, Error> {
+) -> Result<ManagedWorktree, CreateFailure> {
+    use CreateFailure::{Clean, PossibleLeftover};
+
     if !request.valid() {
-        return Err((
+        return Err(Clean((
             ErrorCode::BadRequest,
             "invalid worktree branch or base".into(),
-        ));
+        )));
     }
     let main_root = tokio::select! {
         biased;
-        _ = &mut cancel => return Err(cancelled()),
-        root = main_checkout(git, cwd) => root?,
+        _ = &mut cancel => return Err(Clean(cancelled())),
+        root = main_checkout(git, cwd) => root.map_err(Clean)?,
     };
     let parent = format!("{main_root}-wt");
     let path = format!("{parent}/{}", request.branch.replace('/', "-"));
-    fs::create_dir_all(&parent).await.map_err(internal)?;
+    fs::create_dir_all(&parent)
+        .await
+        .map_err(|e| Clean(internal(e)))?;
     // A check followed by `git worktree add` is racy: git accepts existing empty
     // directories. Atomically reserve this name, including against dangling links.
     fs::create_dir(&path).await.map_err(|e| {
-        if e.kind() == io::ErrorKind::AlreadyExists {
+        Clean(if e.kind() == io::ErrorKind::AlreadyExists {
             (
                 ErrorCode::Conflict,
                 format!("worktree path already exists: {path}"),
             )
         } else {
             internal(e)
-        }
+        })
     })?;
     let reservation_error = |e: io::Error| {
-        (
+        PossibleLeftover((
             ErrorCode::Internal,
             format!("could not inspect reserved worktree path {path}: {e}"),
-        )
+        ))
     };
     let reservation = fs::OpenOptions::new()
         .read(true)
@@ -676,15 +695,16 @@ async fn create_with_timeout(
             git,
             cwd,
             &["worktree", "add", "--", &path, &request.branch],
-            add_timeout,
+            GIT_WORKTREE_TIMEOUT,
             Some(&mut cancel),
             prefix,
         )
         .await
-        .inspect_err(|e| {
-            if e.0 == ErrorCode::Timeout || e.1 == CANCELLED {
+        .map_err(|e| {
+            if matches!(e, RunError::Interrupted(_)) {
                 undo = Undo::InterruptedAdd(target);
             }
+            e.into_error()
         })?;
         checked(added, ErrorCode::Internal)?;
         undo = Undo::UnmarkedCheckout;
@@ -699,12 +719,12 @@ async fn create_with_timeout(
     .await;
     if let Err((code, message)) = setup {
         if let Err((_, detail)) = rollback(git, cwd, &path, &ours, undo).await {
-            return Err((
+            return Err(PossibleLeftover((
                 code,
                 format!("{message}; worktree path left at {path}: {detail}"),
-            ));
+            )));
         }
-        return Err((code, message));
+        return Err(Clean((code, message)));
     }
     Ok(ManagedWorktree {
         path,

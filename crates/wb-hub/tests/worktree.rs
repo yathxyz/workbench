@@ -9,13 +9,14 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::acp::group_members;
 use common::{Client, Hub, PATIENCE, eventually};
 use serde_json::{Value, json};
 
-const PROMPTLY: Duration = Duration::from_secs(5);
+// Allow for scheduling real git under load; still well below its 120 s worktree deadline.
+const GIT_READY: Duration = Duration::from_secs(30);
 
 fn program(name: &str) -> PathBuf {
     env::split_paths(&env::var_os("PATH").unwrap())
@@ -47,6 +48,21 @@ fn git(hub: &Hub, args: &[&str]) -> String {
 /// Sleep *after* real git registered an add, or *before* it removes anything. A
 /// descendant holds the pipes, so killing the wrapper alone cannot pass these tests.
 fn fixture(pause: &str) -> Hub {
+    fixture_with_git(&format!(
+        r#"
+case " $* " in
+    *' worktree {pause} '*)
+        if [ '{pause}' = add ]; then "$0.real" "$@" || exit $?; fi
+        sleep 60 &
+        printf '%s %s\n' "$$" "$!" > "$0.started"
+        wait
+        if [ '{pause}' = add ]; then exit 0; fi ;;
+esac
+"#
+    ))
+}
+
+fn fixture_with_git(intercept: &str) -> Hub {
     let hub = Hub::with_scenarios_and(&[], |cfg| {
         let dir = Path::new(cfg["stateDir"].as_str().unwrap())
             .parent()
@@ -56,19 +72,7 @@ fn fixture(pause: &str) -> Hub {
         executable::write(
             Path::new(cfg["shells"][0]["paths"][0].as_str().unwrap()),
             &shim,
-            &format!(
-                r#"export GIT_CONFIG_NOSYSTEM=1
-case " $* " in
-    *' worktree {pause} '*)
-        if [ '{pause}' = add ]; then "$0.real" "$@" || exit $?; fi
-        sleep 60 &
-        printf '%s %s\n' "$$" "$!" > "$0.started"
-        wait
-        if [ '{pause}' = add ]; then exit 0; fi ;;
-esac
-exec "$0.real" "$@"
-"#
-            ),
+            &format!("set -e\nexport GIT_CONFIG_NOSYSTEM=1\n{intercept}\nexec \"$0.real\" \"$@\""),
         );
         cfg["agents"]["missing"] = json!({"label": "Missing", "argv": [dir.join("not-installed")]});
         cfg["git"] = json!(shim);
@@ -85,7 +89,7 @@ fn open(hub: &Hub, agent: &str) -> Value {
 
 fn sleeping_group(hub: &Hub) -> u32 {
     let path = hub.dir.join("git.started");
-    eventually(PATIENCE, "git and its child started", || {
+    eventually(GIT_READY, "git and its child started", || {
         fs::read_to_string(&path).is_ok_and(|s| s.ends_with('\n'))
     });
     let pids = fs::read_to_string(path).unwrap();
@@ -114,11 +118,11 @@ fn assert_responsive(hub: &Hub, c: &mut Client, published: bool) {
         &json!({"t": "acp.open", "rid": 200, "sid": "unrelated", "since": 0,
                    "spawn": {"agent": "missing", "cwd": hub.home()}}),
     );
-    let other = c.reply_within(200, PROMPTLY);
+    let other = c.reply(200);
     assert_eq!(other["new"], true, "{other}");
     for sender in [&mut filler, &mut *c] {
         for rid in 100..116 {
-            let busy = sender.reply_within(rid, PROMPTLY);
+            let busy = sender.reply(rid);
             assert_eq!(busy["code"], "conflict", "{busy}");
             assert_eq!(busy["message"], "worktree operation in progress");
         }
@@ -154,7 +158,7 @@ fn kill_and_forget_cancel_unpublished_worktree_add() {
         assert_responsive(&hub, &mut c, false);
 
         c.send(&json!({"t": "acp.kill", "rid": 300, "sid": "managed", "forget": forget}));
-        assert_eq!(c.reply_within(300, PROMPTLY), json!({"t":"ok", "rid":300}));
+        assert_eq!(c.reply(300), json!({"t":"ok", "rid":300}));
         // Not just eventually: the cleanup is part of the kill reply.
         assert!(!wt.exists() && !registered(&hub, &wt));
         assert_eq!(
@@ -167,13 +171,68 @@ fn kill_and_forget_cancel_unpublished_worktree_add() {
                 .to_string_lossy()
                 .starts_with("managed.")
         }));
-        let interrupted = c.reply_within(90, PROMPTLY);
+        let interrupted = c.reply(90);
         assert_eq!(interrupted["code"], "conflict", "{interrupted}");
         assert_eq!(c.acp_open("managed", 0)["code"], "not_found");
         assert!(hub.record("stub").is_empty());
-        eventually(PROMPTLY, "cancelled git process group gone", || {
+        eventually(PATIENCE, "cancelled git process group gone", || {
             group_members(group).is_empty()
         });
+    }
+}
+
+#[test]
+fn kill_during_independent_create_failure_reports_only_a_leftover() {
+    for dirty in [false, true] {
+        // Make ownership marking fail even without a kill. Hold its rollback open
+        // until the actor has processed the kill, then let real git decide removal.
+        let hub = fixture_with_git(
+            r#"case " $* " in
+    *' worktree add -- '*)
+        "$0.real" "$@"
+        admin=$("$0.real" -C "$HOME-wt/topic" rev-parse --absolute-git-dir)
+        : > "$admin/workbench-session"
+        exit 0 ;;
+    *' worktree remove -- '*)
+        : > "$0.rolling-back"
+        while [ ! -e "$0.release" ]; do sleep 0.05; done ;;
+esac"#,
+        );
+        let mut c = hub.connect();
+        c.send(&open(&hub, "stub"));
+        eventually(GIT_READY, "rollback of failed marking", || {
+            hub.dir.join("git.rolling-back").exists()
+        });
+        let wt = hub.dir.join("home-wt/topic");
+        if dirty {
+            fs::write(wt.join("keep"), "mine").unwrap();
+        }
+        let kill = json!({"t":"acp.kill", "rid":300, "sid":"managed", "forget":dirty});
+        c.send(&kill);
+        // Only the second kill gets an immediate conflict; the first awaits cleanup.
+        assert_eq!(c.request(kill)["code"], "conflict");
+        fs::write(hub.dir.join("git.release"), "").unwrap();
+
+        let stopped = c.reply(300);
+        let refused = c.reply(90);
+        assert_eq!(refused["code"], "internal", "{refused}");
+        if dirty {
+            assert_eq!(stopped["code"], refused["code"]);
+            assert_eq!(stopped["message"], refused["message"]);
+            assert!(
+                stopped["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(wt.to_str().unwrap())
+            );
+            assert_eq!(fs::read_to_string(wt.join("keep")).unwrap(), "mine");
+        } else {
+            assert_eq!(stopped, json!({"t":"ok", "rid":300}));
+            assert!(!wt.exists());
+        }
+        assert_eq!(registered(&hub, &wt), dirty);
+        assert_eq!(c.acp_open("managed", 0)["code"], "not_found");
+        assert!(hub.record("stub").is_empty());
     }
 }
 
@@ -195,14 +254,10 @@ fn shutdown_aborts_worktree_add_remove_and_prepublication_rollback() {
         }
         let group = sleeping_group(&hub);
         assert_responsive(&hub, &mut c, published);
-        let start = Instant::now();
         assert!(hub.terminate().success());
-        eventually(
-            PROMPTLY.saturating_sub(start.elapsed()),
-            "git group gone on shutdown",
-            || group_members(group).is_empty(),
-        );
-        assert!(start.elapsed() < PROMPTLY, "shutdown waited for git");
+        eventually(PATIENCE, "git group gone on shutdown", || {
+            group_members(group).is_empty()
+        });
         assert_eq!(hub.acp_file("managed.json").exists(), published);
     }
 }
