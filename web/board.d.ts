@@ -574,6 +574,7 @@ type JournalEvent = { seq: number; ts: number } & (
   | { e: 'elicitation_resolved'; req: number | string; response: JsonValue; by: string }
   | { e: 'elicitation_complete'; elicitationId: string }
   | { e: 'mode'; modeId: string }
+  | { e: 'config'; configOptions: JsonValue }
   | { e: 'notice'; level: string; text: string }
   | { e: 'exit'; code: number | null; signal: string | null; reason: string }
 );

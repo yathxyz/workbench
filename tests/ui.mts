@@ -4829,9 +4829,9 @@ await section('N78 config replay', async () => {
       && g.sent.some(m => m?.t === 'open' && m.id === sid && m.since === 0),
       { detail, header, configSeq, seq: idle?.seq });
   } finally {
-    g.release();
+    // Held frames may belong to viewers already closed; discard them by closing the page, not releasing the gate.
+    await P.close();
     await api('/' + sid + '?forget=true', 'DELETE');
-    await settled(P); await P.close();
   }
 });
 // N77/N78 hierarchy: real reports and a handwritten checkout/linked worktree, isolated from N77's graph/count fixtures.
