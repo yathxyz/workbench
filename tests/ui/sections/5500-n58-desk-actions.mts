@@ -74,6 +74,20 @@ await section('N58', async () => {
     const nx = await D.evaluate(() => { const C = window.__canvas, n = C.S.nodes[C.activeId] || null; return { cur: C.DESK.cur, act: n?.id, bad: C.attnItems().some((i: RgEntry) => i.attn === 'bad' && i.n?.id === n?.id), shown: n && !C.stashed(n) }; });
     check('N58: a shell that ended puts a 9 with a badge in the pager; leader 9 shows it on the tiled attention desk; leader ! from desk 3 goes to a card that needs a look, shown',
       pg?.bad! >= 1 && d9.cur === 9 && d9.shown && d9.layout === 'tile' && nx.bad && nx.shown, JSON.stringify({ pg, d9, nx }));
+    await D.evaluate(() => window.__canvas.deskGo(3, true));
+    const original = await rect(D, a), sibling = await rect(D, b), size = D.viewportSize()!;
+    await D.evaluate((id: string) => window.__canvas.focusOpen(window.__canvas.S.nodes[id]), a);
+    await D.setViewportSize({ width: size.width + 360, height: size.height + 180 });
+    await D.waitForFunction(({ id, w }) => window.__canvas.S.nodes[id].w !== w, { id: b, w: sibling[2] }); // the debounced retile ran
+    const focused = await D.evaluate((id: string) => {
+      const C = window.__canvas, r = C.live[id].el.getBoundingClientRect(), width = document.getElementById('viewport')!.clientWidth;
+      return { id: C.FOCUS.cur, width: r.width, viewport: width };
+    }, a);
+    await D.evaluate((id: string) => window.__canvas.focusClose(id), a);
+    const cell = await rect(D, a);
+    check('N58: resizing a tiled desk keeps the focused card at viewport width; closing it restores its resized tile',
+      focused.id === a && Math.abs(focused.width - focused.viewport) <= 2 && cell[2] !== original[2] && cell[2] < focused.viewport,
+      JSON.stringify({ focused, cell, original }));
     await D.evaluate(({ tid, s }: { tid: string; s: string }) => { const C = window.__canvas; C.deskGo(0, true); C.removeNode(tid); C.pickClear(); C.activate(s); }, { tid, s }); tid = null;
     await leader(D, 'd', 's');
     await D.evaluate(() => { const C = window.__canvas; C.deskGo(3, true); C.deskDelete(); });

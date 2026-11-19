@@ -166,14 +166,16 @@ function camTarget(x: number, y: number, w: number, h: number, maxZ = 1): Cam {
   const z = clamp(Math.min(maxZ, vw * 0.88 / w, vh * 0.86 / h), 0.08, 3);
   return { z, x: x + w / 2 - (left + vw / 2) / z, y: y + h / 2 - (top + vh / 2) / z };
 }
-function fitAll(animate = true) {
-  leaveFocus();   // fit the board rectangles, not the temporary full-screen card
+function fitAll(navigate = true) {
+  if (navigate) leaveFocus();   // explicit board navigation, not an automatic desk fit
   const items = Object.values(S.nodes).filter(n => !stashed(n));
   if (!items.length) return;
   const x0 = Math.min(...items.map(n => n.x)), y0 = Math.min(...items.map(n => n.y - (n.kind === 'frame' ? LABEL_H : 0)));
   const x1 = Math.max(...items.map(n => n.x + n.w)), y1 = Math.max(...items.map(n => n.y + n.h));
   const t = camTarget(x0 - 30, y0 - 30, x1 - x0 + 60, y1 - y0 + 60, 1);
-  if (animate) { pushHistory(); animateTo(t); } else { Object.assign(cam(), t); applyCam(); }
+  if (navigate) { pushHistory(); animateTo(t); }
+  else if (FOCUS.cur) FOCUS.saved = t;   // use the new fit when the tab returns to the desk
+  else { Object.assign(cam(), t); applyCam(); }
 }
 
 // ------------------------------------------------------------------ persistence
@@ -9558,10 +9560,14 @@ function deskTile(quiet?: boolean) {
   const d = deskAt(DESK.cur); if (!d) return;
   const ns = deskTops().sort((a, b) => (a.y - (a.kind === 'frame' ? LABEL_H : 0)) - (b.y - (b.kind === 'frame' ? LABEL_H : 0)) || a.x - b.x);
   DESK.tiled = deskSig(); if (!ns.length) return;
+  const focused = !ADOPTING && FOCUS.cur && S.nodes[FOCUS.cur];   // boardAdopt handles its own focus geometry
+  if (focused) Object.assign(focused, FOCUS.rect);
   const a = camArea(), x0 = Math.min(...ns.map(n => n.x)), y0 = Math.min(...ns.map(n => n.y - (n.kind === 'frame' ? LABEL_H : 0)));
   tileRects(ns.length, Math.round(a.vw * 0.88), Math.round(a.vh * 0.86), x0, y0).forEach(([x, y, w, h], i) => deskPut(ns[i], x, y, w, h));
+  if (focused) focusRememberRect(focused);
   deskRecord();
   if (!quiet) { renderLinks(); fitAll(false); dirty(); viewSave(); }
+  if (focused) focusGeometry(focused);
 }
 function deskLayout() {
   const d = deskAt(DESK.cur); if (!d) return toast('The Board has no layout of its own: its folders have modes (leader t tiles one).');
