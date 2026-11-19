@@ -51,5 +51,57 @@ await section('N51', async () => {
       !!took && a3.persp === 'tag' && a3.derived > 0 && bar.hidden && b3.persp === 'manual' && !b3.derived && back === mv.x && a4.persp === 'manual', JSON.stringify({ took, a3, b3, bar, back, mv, a4 }));
     await D.evaluate(() => { const C = window.__canvas, n = Object.values<BoardNode>(C.S.nodes).find(n => (n.tags || []).includes('n51')); if (n) C.setTags(n, ['n51'], { remove: true }); });
     await settled(D);
+    for (const [source, remover] of [['local', D], ['remote', B]] as const) {
+      const fixture = await D.evaluate(async () => {
+        const C = window.__canvas;
+        const card = (name: string, x: number) => C.addNode({ kind: 'sketch', name, in: null, x, y: 14500, w: 360, h: 240 });
+        const bg = card('n51-background', 13000), fg = card('n51-current', 14600);
+        await new Promise<void>(done => C.jumpNode(bg, 1, done));
+        const world = document.getElementById('world')!.style.transform;
+        C.focusOpen(bg); C.focusOpen(fg); return { bg: bg.id, fg: fg.id, world };
+      });
+      await settled(D);
+      await until(() => remover.evaluate(id => !!window.__canvas.S.nodes[id], fixture.fg));
+      if (source === 'remote') {
+        const card = D.locator('.node.focused'), before = await card.boundingBox();
+        const viewportWidth = await D.locator('#viewport').evaluate(e => e.clientWidth);
+        const incoming = await remover.evaluate(id => {
+          const C = window.__canvas, n = C.S.nodes[id]; C.moveTree(n, 750, -310); n.w += 95; n.h += 65;
+          C.placeAny(n); C.dirty(); return [n.x, n.y, n.w, n.h];
+        }, fixture.fg);
+        await settled(remover);
+        const tag = await remover.evaluate(() => window.__canvas.BOARD_ETAG);
+        const adopted = await until(() => D!.evaluate(tag => window.__canvas.BOARD_ETAG === tag, tag));
+        let after: typeof before = null;
+        const filled = await until(async () => { after = await card.boundingBox(); return JSON.stringify(after) === JSON.stringify(before); }, 2000);
+        const back = await D.evaluate(id => {
+          const C = window.__canvas, saved = JSON.parse(C.serialize()).nodes[id]; C.focusHide();
+          const n = C.S.nodes[id], restored = [n.x, n.y, n.w, n.h]; C.focusOpen(n);
+          return { saved: [saved.x, saved.y, saved.w, saved.h], restored };
+        }, fixture.fg);
+        check('N51: a remote move and resize preserves the foreground viewport and restores the incoming board rectangle',
+          adopted && before?.width === viewportWidth && filled &&
+          [back.saved, back.restored].every(r => JSON.stringify(r) === JSON.stringify(incoming)), JSON.stringify({ before, after, incoming, back }));
+        await settled(D);
+      }
+      for (const id of [fixture.bg, fixture.fg]) {
+        await remover.evaluate(id => window.__canvas.removeNode(id), id);
+        await until(() => D!.evaluate(id => !window.__canvas.S.nodes[id], id));
+        const view = await D.evaluate(({ id, fg }) => {
+          const C = window.__canvas, world = document.getElementById('world')!;
+          const before = world.style.transform;
+          document.getElementById('viewport')!.dispatchEvent(new WheelEvent('wheel', { deltaY: 32, bubbles: true, cancelable: true }));
+          return { cur: C.FOCUS.cur, focused: document.body.classList.contains('focus'), tab: C.FOCUS.tabs.includes(id),
+            stored: JSON.parse(localStorage.getItem(C.viewKey())!).focusTabs.includes(id),
+            strip: [...document.querySelectorAll('#focus-tabs [role=tab]')].some(e => e.textContent?.includes(id === fg ? 'n51-current' : 'n51-background')),
+            before, panned: world.style.transform !== before };
+        }, { id, fg: fixture.fg });
+        const current = id === fixture.fg;
+        check(`N51: ${source} removal closes the ${current ? 'current' : 'background'} focus tab on this device`,
+          !view.tab && !view.stored && !view.strip && (current ? !view.cur && !view.focused && view.before === fixture.world && view.panned : view.cur === fixture.fg && view.focused && !view.panned), JSON.stringify(view));
+      }
+      await D.evaluate(() => window.__canvas.focusHide()); // reset the device even if a close failed
+      await settled(remover);
+    }
   } finally { await B?.close(); await D?.close(); await ctx2.close(); }
 });

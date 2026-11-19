@@ -60,6 +60,7 @@ function s2w(sx: number, sy: number): BoardPoint { return { x: sx / cam().z + ca
 function w2s(wx: number, wy: number): BoardPoint { return { x: (wx - cam().x) * cam().z, y: (wy - cam().y) * cam().z }; }
 let lastLod: boolean | null = null, lodTimer: number | null = null;
 function applyCam() {
+  hashCancelRestore();
   const c = cam();
   world.style.transform = `translate(${-c.x * c.z}px, ${-c.y * c.z}px) scale(${c.z})`;
   world.style.setProperty('--iz', String(1 / c.z)); // folder tabs keep their screen size at every zoom
@@ -107,7 +108,8 @@ function zoomAt(sx: number, sy: number, f: number): void {
   c.x = w.x - sx / c.z; c.y = w.y - sy / c.z;
   applyCam();
 }
-let anim: number | null = null, animDone: (() => void) | null = null;
+interface CamFlight { raf: number; target: Cam; card?: string; done?: () => unknown }
+let anim: CamFlight | null = null;
 const GLIDE = { raf: 0, ok: false, trail: [] as [number, number, number][] };   // a flicked one-finger pan carrying on; trail: its last moves, [time, x, y]
 // R1: a mouse wheel's zoom notch eases to its target about the pointer over MOTION.fast; a notch during the ease adds to
 // the target. at: the last wheel event (the far-zoom swap waits for the wheel to rest, LOD.busy).
@@ -124,28 +126,36 @@ function zoomPath(cx0: number, cy0: number, w0: number, cx1: number, cy1: number
   const r0 = -Math.asinh(b0), r1 = -Math.asinh(b1), S = (r1 - r0) / RHO;   // ln(√(b²+1) − b), without the cancellation
   return k => { const s = k * S, u = w0 / (r2 * d) * (Math.cosh(r0) * Math.tanh(RHO * s + r0) - Math.sinh(r0)); return [cx0 + u * dx, cy0 + u * dy, w0 * Math.cosh(r0) / Math.cosh(RHO * s + r0)]; };
 }
-function animateTo(t: Cam, done?: (() => void) | null): void {
+function animateTo(t: Cam, done?: () => unknown, card?: string): void {
   camStop(false);
   const c = cam(), T = reduceMotion ? 0 : MOTION.slow, t0 = performance.now(), W = VW(), H = VH();
   // the path runs on the screen centre and the width of world in view
   const path = zoomPath(c.x + W / 2 / c.z, c.y + H / 2 / c.z, W / c.z, t.x + W / 2 / t.z, t.y + H / 2 / t.z, W / t.z);
-  animDone = done || null;
+  const flight = anim = { raf: 0, target: t, card, done };
   const step: FrameRequestCallback = now => {
     const k = T ? clamp((now - t0) / T, 0, 1) : 1, e = 1 - Math.pow(1 - k, 3);
     if (k < 1) { const [cx, cy, w] = path(e); c.z = W / w; c.x = cx - W / 2 / c.z; c.y = cy - H / 2 / c.z; }
     else { c.x = t.x; c.y = t.y; c.z = t.z; }   // land exactly on the target
     applyCam();
-    if (k < 1) anim = requestAnimationFrame(step); else { anim = null; const d = animDone; animDone = null; lodSettle(); d?.(); }   // the near look first: a done step may focus a card's body, which the far look hides
+    if (k < 1) flight.raf = requestAnimationFrame(step); else { anim = null; lodSettle(); done?.(); }   // the near look first: a done step may focus a card's body, which the far look hides
   };
-  anim = requestAnimationFrame(step);
+  flight.raf = requestAnimationFrame(step);
 }
 // stop whatever moves the camera on its own (a flight, a glide); a cut-short flight still runs its done step
 function camStop(finish = true) {
-  if (anim) { cancelAnimationFrame(anim); anim = null; const d = animDone; animDone = null; if (finish) { lodSettle(); d?.(); } }
+  const flight = anim;
+  if (flight) { cancelAnimationFrame(flight.raf); anim = null; if (finish) { lodSettle(); flight.done?.(); } }
   if (GLIDE.raf) { cancelAnimationFrame(GLIDE.raf); GLIDE.raf = 0; }
   if (WHEEL.raf) { cancelAnimationFrame(WHEEL.raf); WHEEL.raf = 0; }
+  return flight;
 }
+function cancelCardFlight(id: string) { if (anim?.card === id) { camStop(false); lodSettle(); } }
 function pushHistory() { camBack.push({ ...cam() }); if (camBack.length > 60) camBack.shift(); camFwd.length = 0; }
+function leaveFocus() { if (FOCUS.cur) focusHide(); }
+function cameraHistory(from: Cam[], to: Cam[]) {
+  const target = from.pop(); if (!target) return;
+  leaveFocus(); to.push({ ...cam() }); animateTo(target);
+}
 function camArea(): { left: number; top: number; vw: number; vh: number } {   // the part of the viewport a fit aims at
   const left = document.body.classList.contains('tree-open') && VW() > 900 ? (S?.treeW || TREE_W) + 16 : 0;  // the folder tree floats over the left edge
   const top = 56, bottom = 34; return { left, top, vw: VW() - left, vh: VH() - top - bottom };
@@ -156,13 +166,16 @@ function camTarget(x: number, y: number, w: number, h: number, maxZ = 1): Cam {
   const z = clamp(Math.min(maxZ, vw * 0.88 / w, vh * 0.86 / h), 0.08, 3);
   return { z, x: x + w / 2 - (left + vw / 2) / z, y: y + h / 2 - (top + vh / 2) / z };
 }
-function fitAll(animate = true) {
+function fitAll(navigate = true) {
+  if (navigate) leaveFocus();   // explicit board navigation, not an automatic desk fit
   const items = Object.values(S.nodes).filter(n => !stashed(n));
   if (!items.length) return;
   const x0 = Math.min(...items.map(n => n.x)), y0 = Math.min(...items.map(n => n.y - (n.kind === 'frame' ? LABEL_H : 0)));
   const x1 = Math.max(...items.map(n => n.x + n.w)), y1 = Math.max(...items.map(n => n.y + n.h));
   const t = camTarget(x0 - 30, y0 - 30, x1 - x0 + 60, y1 - y0 + 60, 1);
-  if (animate) { pushHistory(); animateTo(t); } else { Object.assign(cam(), t); applyCam(); }
+  if (navigate) { pushHistory(); animateTo(t); }
+  else if (FOCUS.cur) FOCUS.saved = t;   // use the new fit when the tab returns to the desk
+  else { Object.assign(cam(), t); applyCam(); }
 }
 
 // ------------------------------------------------------------------ persistence
@@ -179,8 +192,10 @@ function dirtyCam() { clearTimeout(camT); camT = setTimeout(() => DAEMON ? store
 const VIEW_KEYS = ['ws', 'focusTabs', 'persp', 'manual'];
 const viewKey = () => 'wb-view-' + (INFO?.host || location.host);
 function viewLoad(): Partial<BoardViewState> | null { try { const v: unknown = JSON.parse(store.get(viewKey())!); if (v && typeof v === 'object') return v as Partial<BoardViewState>; } catch {} return null; }
+let viewSaveDeferred = false;
 function viewSave() {
   if (!S || !BOOTED) return;
+  if (ADOPTING) { viewSaveDeferred = true; return; }
   store.set(viewKey(), JSON.stringify({ ws: S.ws || null, focusTabs: S.focusTabs || [], persp: perspCur(), desk: DESK.cur, prevDesk: DESK.prev, scratch: DESK.scratch, deskCams: DESK.cams, ring: RING.list, overlay: OVL.ids }));
   winSave();
 }
@@ -328,14 +343,20 @@ function boardAdopt(b: Board): void {
     if (p !== 'manual') { perspBuild(p); S.persp = p; perspChip(); wsApply(false); }
     if (dk) { const d = dk.smart ? dk : deskList().find(x => x === dk || (deskPinned(x) && x.slot === dk.slot)); if (d) { if (d.smart) DESK.smart = d; deskApply(d); } }   // a pinned desk comes back as the other device saved it
     deskRefresh(true);
+    const focused = FOCUS.cur && S.nodes[FOCUS.cur];
+    if (focused) { focusRememberRect(focused); focusGeometry(focused); }
     refreshBlockCards();   // a page the other tab removed, restored or rewrote
     if (roChanged) { scheduleCrossRefresh(); if (VIEW === 'tasks') renderTasks(); }   // backlinks and the views over the pages, as a local edit does
     restack(); updateAllTitles(); renderTree(); renderLinks(); renderInk(null);
     SAVE.lastJson = serialize();
     if (edStale) { const e = edStale; setTimeout(() => { if (ED.node === e && ED.pre && VIEW === 'editor') frEdLoad(e); }); }   // the read-only Editor shows the newer text
   } finally { ADOPTING = false; }
+  if (viewSaveDeferred) { viewSaveDeferred = false; ringRecord(); viewSave(); }
+  hashRestore('board');
 }
 function unmountQuiet(id: string): void {   // the card went in another tab: drop it here without killing its session
+  cancelCardFlight(id);
+  focusClose(id);
   const L = live[id]; if (!L) return;
   pdfClose(L); L.backend?.dispose?.(); L.ro?.disconnect(); L.term?.dispose(); if (L.frame?.contentWindow) HOSTS.delete(L.frame.contentWindow);
   if (FR.on) frUnmount(id);
@@ -2973,6 +2994,7 @@ function pullCard(ev: PointerEvent, row: HTMLElement, deck: FrameNode, k: BoardN
 }
 function jumpFolder(f: FrameNode) {
   if (VIEW !== 'canvas') setView('canvas');
+  leaveFocus();
   reveal(f); pushHistory(); activate(f.id);
   animateTo(camTarget(f.x, f.y - LABEL_H, f.w, f.h + LABEL_H, 1));
 }
@@ -3250,6 +3272,7 @@ document.addEventListener('pointerdown', () => { PDOWN.on = true; PDOWN.then = n
 for (const t of ['pointerup', 'pointercancel']) document.addEventListener(t, () => { PDOWN.on = false; const f = PDOWN.then; PDOWN.then = null; if (f) setTimeout(f, 0); }, true);
 function activate(id: string) {
   if (activeId && live[activeId]) live[activeId].el!.classList.remove('active');
+  hashCancelRestore();
   activeId = id;
   const L = live[id]; if (!L) return;
   L.el!.classList.add('active');
@@ -3337,6 +3360,8 @@ function cardGhost(e: HTMLElement) {
   nodesEl.append(g); setTimeout(() => g.remove(), MOTION.fast + 40);
 }
 function removeNode(id: string) {
+  cancelCardFlight(id);
+  focusClose(id);
   PICKED.delete(id); pickChip();
   const gone = S.nodes[id], parent = gone?.in && S.nodes[gone.in] as FrameNode;
   if (gone?.kind === 'frame') {
@@ -3451,7 +3476,12 @@ function anchorAtCursor(n: PageNode) {
 }
 
 // ------------------------------------------------------------------ jumping
-function jumpNode(n: BoardNode, maxZ = 1, done?: () => unknown) { if (VIEW !== 'canvas') setView('canvas'); reveal(n); pushHistory(); activate(n.id); animateTo(camTarget(n.x, n.y, n.w, n.h, maxZ), done); }
+function jumpNode(n: BoardNode, maxZ = 1, done?: () => unknown) {
+  if (VIEW !== 'canvas') setView('canvas');
+  leaveFocus();
+  reveal(n); pushHistory(); activate(n.id);
+  animateTo(camTarget(n.x, n.y, n.w, n.h, maxZ), done, n.id);
+}
 function jumpBuffer(n: PageNode, pos: number) {
   if (VIEW === 'editor') return edOpen(n, pos);
   jumpNode(n, 1, () => {
@@ -4045,7 +4075,7 @@ function palSearch(q: string): PaletteItem[] {
   let m = raw.match(/^(.+)\/([A-Za-z]{1,2})(\d{1,3})$/);
   if (m) { const f = findFolder(m[1]); if (f) { const cx = f.x + colIndex(m[2]) * GRID, cy = f.y + (+m[3] - 1) * GRID; out.push({ k: 'cell', l: `${f.name}/${m[2].toUpperCase()}${m[3]}`, s: 'folder cell', score: 1e6, run: onCanvas(() => { pushHistory(); animateTo(camTarget(cx, cy, GRID, GRID, 1.6)); }) }); } }
   m = raw.match(/^@\s*(-?\d+)\s*,\s*(-?\d+)$/);
-  if (m) out.push({ k: 'point', l: `@${m[1]},${m[2]}`, s: 'world coordinates', score: 1e6, run: onCanvas(() => { pushHistory(); animateTo(camTarget(+m[1] - 200, +m[2] - 150, 400, 300, cam().z)); }) });
+  if (m) out.push({ k: 'point', l: `@${m[1]},${m[2]}`, s: 'world coordinates', score: 1e6, run: onCanvas(() => { leaveFocus(); pushHistory(); animateTo(camTarget(+m[1] - 200, +m[2] - 150, 400, 300, cam().z)); }) });
   const cands: PaletteItem[] = [];
   for (const n of nodeList()) cands.push({ k: n.kind === 'term' ? 'shell' : n.kind === 'buffer' ? 'page' : n.kind, l: pathOf(n.id), s: (folderPath(n) ? folderPath(n) + '/' : '') + (deskOff(n) ? ' (not on this desk)' : stashed(n) ? ' (in a deck)' : ''), run: () => (n.kind === 'buffer' && VIEW === 'editor' ? edOpen(n) : jumpNode(n)) });
   for (const f of frameList()) cands.push({ k: 'folder', l: fullPath(f) + '/', s: `${f.mode || 'free'} · ${kidsOf(f.id).length} item(s)`, run: () => jumpFolder(f) });
@@ -4053,7 +4083,7 @@ function palSearch(q: string): PaletteItem[] {
     const pst = n.kind === 'buffer' && pageState(n); if (!pst) continue;
     for (const a of pageAnchors(n)) if (a.label) cands.push({ k: 'anchor', l: `${n.name}#${a.label}`, s: fmtAddr(bufferAddress(n, pst, a.pos)), run: () => jumpBuffer(n, a.pos) });
   }
-  for (const [name, v] of Object.entries(S.views)) cands.push({ k: 'view', l: name, s: `saved view · ${Math.round(v.z * 100)}%`, run: onCanvas(() => { pushHistory(); animateTo(v); }) });
+  for (const [name, v] of Object.entries(S.views)) cands.push({ k: 'view', l: name, s: `saved view · ${Math.round(v.z * 100)}%`, run: onCanvas(() => { leaveFocus(); pushHistory(); animateTo(v); }) });
   if (!ql) {
     const recent = (S.recentCmds || []).map(t => CMDS.find(c => c.l === t)).filter(c => c && (!c.when || c.when())) as PaletteItem[];
     return [...recent.map(c => ({ ...c, s: 'recent' })), ...cands.slice(0, 30)];
@@ -4193,7 +4223,7 @@ cmd('Folder: pull the walls in to fit', () => setMode(activeFolder()!, 'free'), 
 cmd('Folder: change shape', () => { const f = activeFolder()!; f.shape = FSHAPES[(FSHAPES.indexOf(f.shape || 'folder') + 1) % FSHAPES.length]; placeFrame(f); dirty(); }, '', () => !!activeFolder());
 cmd('Fit everything', onCanvas(() => fitAll()), '@fit');
 cmd('Save this view as…', () => setTimeout(() => openPalette('>save '), 0));
-cmd('Back to the previous view', onCanvas(() => { const t = camBack.pop(); if (t) { camFwd.push({ ...cam() }); animateTo(t); } }), '@camera.back');
+cmd('Back to the previous view', onCanvas(() => cameraHistory(camBack, camFwd)), '@camera.back');
 cmd('Export as JSON Canvas', async () => { syncBuffers(); ($('#ex-text') as HTMLTextAreaElement).value = await toJsonCanvas(); $('#export-box')!.hidden = false; });
 cmd('Theme: Modus Operandi (light)', () => setTheme('light'));
 cmd('Theme: Modus Vivendi (dark)', () => setTheme('dark'));
@@ -4880,6 +4910,7 @@ function renderRanger() {
   $('#rg-info')!.textContent = info.join('   ');
 }
 function rgGo(key: string, selKey?: string) {
+  hashCancelRestore();
   RG.dir = key; RG.filter = ''; RG.filtering = false;
   if (selKey) { const j = rgEntries(key).findIndex(x => x.key === selKey); if (j >= 0) RG.sel[key] = j; }
   renderRanger();
@@ -4905,6 +4936,10 @@ function rgShellHere() {
     cwd: fsDir ? fsDir.replace(/^~/, DAEMON ? '~' : '/home/me') : DAEMON ? undefined : '/home/me', in: folder ? folder.id : undefined });
   jumpNode(n, 1, () => live[n.id]?.term?.focus());
 }
+function rgSelect(j: number): void {
+  if (j !== RG.sel[RG.dir]) hashCancelRestore();
+  RG.sel[RG.dir] = j; renderRanger();
+}
 function rgKey(e: KeyboardEvent): boolean {
   const k = e.key, { list, i, e: cur } = rgCur();
   if (RG.filtering) {
@@ -4916,7 +4951,7 @@ function rgKey(e: KeyboardEvent): boolean {
     renderRanger(); return true;
   }
   const seq = RG.seq + k; RG.seq = '';
-  const sel = (j: number) => { RG.sel[RG.dir] = clamp(j, 0, Math.max(0, list.length - 1)); renderRanger(); };
+  const sel = (j: number) => rgSelect(clamp(j, 0, Math.max(0, list.length - 1)));
   const half = Math.max(1, Math.floor(($('#rg-cur')!.clientHeight / 30) / 2));
   if (seq === 'gg') return sel(0), true;
   if (seq === 'gh') return rgGo(FS_PREFIX + rgHome()), true;
@@ -4962,7 +4997,7 @@ function rgKey(e: KeyboardEvent): boolean {
   }
   return false;
 }
-$('#rg-cur')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; if (!r) return; const l = rgList(), j = l.findIndex(x => x.key === r.dataset.key); if (j >= 0) { RG.sel[RG.dir] = j; renderRanger(); if (MODE.v === 'phone' && l[j].kind === 'iattn' && l[j].n) rgOpen(l[j]); } });   // F-A13: on a phone one tap opens an Attention card
+$('#rg-cur')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; if (!r) return; const l = rgList(), j = l.findIndex(x => x.key === r.dataset.key); if (j >= 0) { rgSelect(j); if (MODE.v === 'phone' && l[j].kind === 'iattn' && l[j].n) rgOpen(l[j]); } });   // F-A13: on a phone one tap opens an Attention card
 $('#rg-cur')!.addEventListener('dblclick', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row'); if (r) rgOpen(rgCur().e); });
 $('#rg-parent')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; if (!r) return; const p = rgParent(RG.dir); if (p) rgGo(p, r.dataset.key); });
 $('#rg-prev')!.addEventListener('click', (e: MouseEvent) => { const r = (e.target as Element).closest('.rg-row') as HTMLElement | null; const cur = rgCur().e; if (r && cur?.dir) rgGo(cur.key, r.dataset.key); });
@@ -5427,6 +5462,7 @@ const isJournal = (n: BoardNode): boolean => /^\d{4}-\d\d-\d\d$/.test(n.name);
 function sortPages(list: PageNode[]): PageNode[] { return list.sort((a, b) => (isJournal(b) as unknown as number - (isJournal(a) as unknown as number)) || (isJournal(a) ? b.name.localeCompare(a.name) : a.name.localeCompare(b.name))); }
 function setView(v: string) {
   if (!VIEWS.includes(v as ViewName)) return;
+  if (v !== VIEW) hashCancelRestore();
   ringNote();   // the place being left, so the first switch away from it can come back
   const prev = VIEW; VIEW = v as ViewName;
   if (S && S.view !== v) { S.view = v as ViewName; dirty(); }
@@ -5469,6 +5505,7 @@ function edEnsure() {
 }
 function edOpen(n: BoardNode | null | undefined, pos?: number) {
   if (!n || n.kind !== 'buffer') return;
+  hashCancelRestore();
   ED.next = n;
   if (VIEW !== 'editor') setView('editor');
   edLoad(n, pos);
@@ -7854,7 +7891,6 @@ async function boot() {
   // No /api/hosts at boot: wb-web answers it 404 by design (multi-host is a v1 non-goal; DESIGN §3.5.5), so the call
   // only put an error in the console of every load.
   perspChip(); acpButton();
-  hashInit();
   { const f = new URLSearchParams(location.search).get('focus'); if (f) { history.replaceState(null, '', location.pathname + location.hash); setTimeout(() => attnFocus(f), 600); } }   // opened by a notification (F-A12)
   if (separateAll()) { restack(); renderLinks(); }
   S.views = S.views || {}; S.strokes = S.strokes || []; S.fs = S.fs || seedFs(); S.shapes = S.shapes || [];
@@ -7885,6 +7921,7 @@ async function boot() {
   deskRestore(view); winInit();
   wsRestore(); focusRestoreTabs();
   BOOTED = true; SAVE.lastJson = serialize(); viewSave();
+  hashInit();   // navigate the mounted board before a later user action can take over
 }
 // ------------------------------------------------------------------ node kinds around terminals: browser, artifacts, sketch
 // Browser window: a page in a frame. Sites that send X-Frame-Options or a frame-ancestors CSP stay blank; ↗ opens them outside.
@@ -8329,28 +8366,39 @@ function mountPdf(n: PdfNode, L: LiveEntry) {
   L.ro = new ResizeObserver(() => { if (pdfLayout(n)) pdfSoon(60); }); L.ro.observe(L.body!);
   P.load = pdfOpen(n, L);
 }
-function pdfFail(L: LiveEntry, msg: string) { if (L.pdf) L.pdf.err = msg; if (L.note) { L.note.hidden = false; L.note.textContent = msg; } }
+function pdfSetError(L: LiveEntry, msg: string, bitmap?: number) {
+  L.pdf!.err = msg; L.pdf!.errBitmap = bitmap;
+  L.note!.textContent = msg; L.note!.hidden = !msg;
+}
+function pdfError(n: PdfNode, P: PdfLive, cause: unknown, bitmap?: number) {
+  const L = live[n.id]; if (L?.pdf !== P) return;   // an error from a removed or remounted card
+  const m = String(cause && typeof cause === 'object' && 'message' in cause ? cause.message : cause);
+  pdfSetError(L, /Missing PDF|Unexpected server response \((400|404)\)/.test(m) ? `Cannot open ${n.path || 'the PDF'}: the file is missing or not a PDF.` : 'Cannot open the PDF: ' + m, bitmap);
+}
 async function pdfOpen(n: PdfNode, L: LiveEntry): Promise<PdfJsDocument | null> {
-  const url = pdfUrl(n); if (!url) { pdfFail(L, 'This card names no PDF.'); return null; }
-  let doc: PdfJsDocument;
+  const url = pdfUrl(n); if (!url) { pdfSetError(L, 'This card names no PDF.'); return null; }
+  let doc: PdfJsDocument, first: PdfJsPage;
   try {
     const lib = await pdfLib().catch(() => { throw new Error('pdf.js is not in this build of Workbench'); });
+    if (live[n.id] !== L) return null;
     const src = url.startsWith('data:') ? { data: Uint8Array.from(atob(url.slice(url.indexOf(',') + 1)), c => c.charCodeAt(0)) } : { url };
     const task = L.pdf!.task = lib.getDocument({ ...src, enableXfa: false, cMapUrl: new URL('vendor/pdfjs/cmaps/', location.href).href, cMapPacked: true });
     doc = await task.promise;
+    if (live[n.id] !== L) return null;
+    first = await doc.getPage(1);
   } catch (e) {
-    const m = String(e?.message || e);
-    pdfFail(L, /Missing PDF|Unexpected server response \((400|404)\)/.test(m) ? `Cannot open ${n.path || 'the PDF'}: the file is missing or not a PDF.` : 'Cannot open the PDF: ' + m);
+    if (live[n.id] !== L) return null;   // pdfClose destroyed the task while it was loading
+    pdfClose(L); pdfError(n, L.pdf!, e);
     return null;
   }
-  if (live[n.id] !== L) return null;   // the card went while the file loaded (pdfClose destroyed the task)
-  const P = L.pdf!, first = await doc.getPage(1), vp = first.getViewport({ scale: 1 });
+  if (live[n.id] !== L) return null;
+  const P = L.pdf!, vp = first.getViewport({ scale: 1 });
   P.doc = doc; P.texts = new Array(doc.numPages).fill(null);
   P.pages = Array.from({ length: doc.numPages }, (_, i) => {
     const box = el('div', 'pdf-page'); box.dataset.page = String(i + 1);
     box.append(el('span', 'pdf-ph', 'p. ' + (i + 1)));
     P.scroll.append(box);
-    return { i, page: i ? null : first, el: box, pw: vp.width, ph: vp.height, canvas: null, r: 0, task: null, text: null, links: false, used: 0 };
+    return { i, page: i ? null : first, el: box, pw: vp.width, ph: vp.height, canvas: null, r: 0, task: null, text: null, links: null, used: 0 };
   });
   if (n.pages !== doc.numPages) { n.pages = doc.numPages; dirty(); }
   L.note!.hidden = true; P.w = 0; pdfLayout(n);
@@ -8360,8 +8408,8 @@ async function pdfOpen(n: PdfNode, L: LiveEntry): Promise<PdfJsDocument | null> 
 }
 function pdfClose(L: LiveEntry) {
   const P = L.pdf; if (!P) return;
-  for (const p of P.pages) { p.task?.cancel(); if (p.canvas) p.canvas.width = 0; }
-  P.task?.destroy(); P.task = null; P.doc = null; P.pages = []; clearTimeout(P.posT);
+  for (const p of P.pages) pdfEvict(p);
+  P.task?.destroy().catch(() => {}); P.task = null; P.doc = null; P.pages = []; clearTimeout(P.posT);
 }
 // the page boxes at the card's width; true when it changed (the text layers and links are made again at the new scale)
 function pdfLayout(n: PdfNode): boolean {
@@ -8374,7 +8422,7 @@ function pdfLayout(n: PdfNode): boolean {
     const k = w / p.pw;
     Object.assign(p.el.style, { width: w + 'px', height: Math.round(p.ph * k) + 'px' });
     p.el.style.setProperty('--total-scale-factor', String(k));
-    p.text?.remove(); p.text = null; p.el.querySelector('.pdf-links')?.remove(); p.links = false;
+    p.text?.remove(); p.text = null; p.links?.remove(); p.links = null;
   }
   if (at) pdfGo(n, at.page - 1, at.y, true);
   return true;
@@ -8448,7 +8496,9 @@ async function pdfPage(P: PdfLive, p: PdfPageLive): Promise<PdfJsPage | null> {
   return page;
 }
 async function pdfDraw(n: PdfNode, P: PdfLive, p: PdfPageLive) {
-  const page = await pdfPage(P, p); if (!page || !P.doc) return;
+  let page: PdfJsPage | null;
+  try { page = await pdfPage(P, p); } catch (e) { pdfError(n, P, e); return; }
+  if (!page || !P.doc) return;
   const k = P.w / p.pw, r = Math.min(k * cam().z * Math.min(devicePixelRatio || 1, 3), PDF_MAXPX / p.pw, PDF_MAXPX / p.ph);
   if (!(p.canvas && Math.abs(p.r - r) / r < 0.12) && !(p.task && p.taskR && Math.abs(p.taskR - r) / r < 0.12)) {
     p.task?.cancel();
@@ -8457,9 +8507,14 @@ async function pdfDraw(n: PdfNode, P: PdfLive, p: PdfPageLive) {
     const task = page.render({ canvasContext: c.getContext('2d')!, viewport: vp }); p.task = task; p.taskR = r;
     task.promise.then(() => {
       if (p.task !== task) { c.width = 0; return; }
+      if (P.errBitmap === p.i) pdfSetError(live[n.id], '');
       p.task = null; if (p.canvas) { p.canvas.width = 0; p.canvas.remove(); }
       p.el.querySelector('.pdf-ph')?.remove(); p.el.prepend(c); p.canvas = c; p.r = r;
-    }, () => { c.width = 0; });
+    }, e => {
+      c.width = 0; if (p.task !== task) return;
+      p.task = null;
+      if (e?.name !== 'RenderingCancelledException') pdfError(n, P, e, p.i);
+    });
   }
   if (!p.text) pdfTextLayer(P, p, page);
   if (!p.links) pdfLinks(n, P, p, page);
@@ -8469,10 +8524,10 @@ function pdfTextLayer(P: PdfLive, p: PdfPageLive, page: PdfJsPage) {
   p.textReady = pdfLib().then(lib => new lib.TextLayer({ textContentSource: page.streamTextContent(), container: div, viewport: page.getViewport({ scale: P.w / p.pw }) }).render()).catch(() => {});
 }
 async function pdfLinks(n: PdfNode, P: PdfLive, p: PdfPageLive, page: PdfJsPage) {
-  p.links = true;
-  const box = el('div', 'pdf-links'), vp = page.getViewport({ scale: P.w / p.pw });
+  const doc = P.doc, box = p.links = el('div', 'pdf-links'), vp = page.getViewport({ scale: P.w / p.pw });
   let anns: Awaited<ReturnType<PdfJsPage['getAnnotations']>> = [];
   try { anns = await page.getAnnotations(); } catch {}
+  if (P.doc !== doc || p.links !== box) return;   // closed document or a newer layout's overlay
   for (const a of anns) {
     if (a.subtype !== 'Link' || !(a.dest || (a.url && /^https?:\/\//i.test(a.url)))) continue;
     const [x1, y1] = vp.convertToViewportPoint(a.rect[0], a.rect[1]), [x2, y2] = vp.convertToViewportPoint(a.rect[2], a.rect[3]), l = el('a', 'pdf-link');
@@ -8481,16 +8536,16 @@ async function pdfLinks(n: PdfNode, P: PdfLive, p: PdfPageLive, page: PdfJsPage)
     else { l.title = a.url!; l.onclick = e => { e.preventDefault(); window.open(a.url!, '_blank', 'noopener'); }; }
     box.append(l);
   }
-  if (p.text?.isConnected || p.el.isConnected) p.el.append(box);
+  p.el.append(box);
 }
 // a page's text, whitespace made single spaces: what quotes are anchored in and agents read
 async function pdfPageText(n: PdfNode, i: number): Promise<string> {
-  const L = live[n.id], P = L?.pdf; if (!P) return '';
+  const P = live[n.id]?.pdf; if (!P) return '';
   if (!P.doc) await P.load;
-  if (!P.doc || i < 0 || i >= P.pages.length) return '';
+  if (live[n.id]?.pdf !== P || !P.doc || i < 0 || i >= P.pages.length) return '';
   if (P.texts[i] == null) {
-    const page = await pdfPage(P, P.pages[i]); if (!page) return '';
-    const tc = await page.getTextContent();
+    const page = await pdfPage(P, P.pages[i]); if (!page || live[n.id]?.pdf !== P) return '';
+    const tc = await page.getTextContent(); if (live[n.id]?.pdf !== P) return '';
     P.texts[i] = tc.items.map(t => (t.str || '') + (t.hasEOL ? '\n' : '')).join(' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/[ \t]+/g, ' ').trim();
   }
   return P.texts[i]!;
@@ -8519,7 +8574,11 @@ function pdfSel(n: PdfNode): { text: string; p: PdfPageLive } | null {
 }
 async function pdfQuote(n: PdfNode) {
   const s = pdfSel(n); if (!s) return toast('Select some text in the PDF first.');
-  const full = flat(await pdfPageText(n, s.p.i)), k = full.indexOf(s.text);
+  const P = live[n.id].pdf!;
+  let full: string;
+  try { full = flat(await pdfPageText(n, s.p.i)); } catch (e) { pdfError(n, P, e); return; }
+  if (live[n.id]?.pdf !== P) return;
+  const k = full.indexOf(s.text);
   const prefix = k > 0 ? full.slice(Math.max(0, k - PDF_CTX), k) : '', suffix = k >= 0 ? full.slice(k + s.text.length, k + s.text.length + PDF_CTX) : '';
   const kids = childrenOf(n.id, 'ref').filter(c => c.kind === 'ref'), lines = Math.ceil(s.text.length / 44);
   const r: RefNode = { id: uid('n'), kind: 'ref', in: n.in, name: uniqueName(`${n.name}-q${kids.length + 1}`, 'ref'), text: s.text, src: { node: n.id, page: s.p.i + 1, prefix, suffix },
@@ -8535,15 +8594,17 @@ async function pdfQuote(n: PdfNode) {
 async function pdfFind(n: PdfNode, text: string, i: number, prefix = '', suffix = ''): Promise<boolean> {
   const P = live[n.id]?.pdf; if (!P) return false;
   if (!P.doc) await P.load;
-  if (!P.doc) return false;
+  if (live[n.id]?.pdf !== P || !P.doc) return false;
   const want = flat(text), order = [i, ...P.pages.map(p => p.i).filter(j => j !== i)];
   for (const j of order) {
     if (j < 0 || j >= P.pages.length) continue;
-    const t = flat(await pdfPageText(n, j)); let k = t.indexOf(flat(prefix) + want + flat(suffix));
+    const t = flat(await pdfPageText(n, j)); if (live[n.id]?.pdf !== P) return false;
+    let k = t.indexOf(flat(prefix) + want + flat(suffix));
     k = k >= 0 ? k + flat(prefix).length : t.indexOf(want);
     if (k < 0) continue;
     pdfGo(n, j, 0, true);
-    const p = P.pages[j]; await pdfDraw(n, P, p); await p.textReady;
+    const p = P.pages[j]; await pdfDraw(n, P, p); if (live[n.id]?.pdf !== P) return false;
+    await p.textReady; if (live[n.id]?.pdf !== P) return false;
     const spans = [...(p.text?.querySelectorAll<HTMLElement>('span:not(.markedContent)') || [])];
     // the text layer's spans as one flat string, each character remembering its span
     let s = '', own: number[] = [];
@@ -8558,29 +8619,35 @@ async function pdfFind(n: PdfNode, text: string, i: number, prefix = '', suffix 
   return false;
 }
 function pdfJumpQuote(r: RefNode, n: PdfNode) {
+  const P = live[n.id]?.pdf; if (!P) return;
   jumpNode(n, 1, async () => {
-    if (!await pdfFind(n, r.text, (r.src.page || 1) - 1, r.src.prefix, r.src.suffix)) { pdfGo(n, (r.src.page || 1) - 1); toast('The quote is no longer in the PDF; here is the page it came from.'); }
-    live[n.id]?.pdf?.scroll.focus({ preventScroll: true });
+    if (live[n.id]?.pdf !== P) return;
+    const i = (r.src.page || 1) - 1;
+    const found = await pdfFind(n, r.text, i, r.src.prefix, r.src.suffix).catch(e => pdfError(n, P, e));
+    if (live[n.id]?.pdf !== P || found == null) return;
+    if (!found) { pdfGo(n, i); toast('The quote is no longer in the PDF; here is the page it came from.'); }
+    P.scroll.focus({ preventScroll: true });
   });
 }
 const PDF_FIND: { q: string; id: string; page: number } = { q: '', id: '', page: -1 };
 function pdfFindAsk(n: PdfNode) {
+  const P = live[n.id]?.pdf; if (!P) return;
   ask('Find in ' + n.name, PDF_FIND.id === n.id ? PDF_FIND.q : '', async q => {
-    q = flat(q); if (!q) return;
-    const P = live[n.id]?.pdf; if (!P?.doc) return;
+    q = flat(q); if (!q || live[n.id]?.pdf !== P || !P.doc) return;
     const again = PDF_FIND.id === n.id && PDF_FIND.q === q, start = again ? PDF_FIND.page + 1 : pdfWhere(n).page - 1;
     Object.assign(PDF_FIND, { q, id: n.id });
-    for (let s = 0; s < P.pages.length; s++) {
-      const j = (start + s) % P.pages.length;
-      if (flat(await pdfPageText(n, j)).toLowerCase().includes(q.toLowerCase())) {
+    try {
+      for (let s = 0; s < P.pages.length; s++) {
+        const j = (start + s) % P.pages.length, t = flat(await pdfPageText(n, j));
+        if (live[n.id]?.pdf !== P) return;
+        const k = t.toLowerCase().indexOf(q.toLowerCase()); if (k < 0) continue;
+        if (!await pdfFind(n, t.slice(k, k + q.length), j) || live[n.id]?.pdf !== P) return;
         PDF_FIND.page = j;
-        const t = flat(await pdfPageText(n, j)), k = t.toLowerCase().indexOf(q.toLowerCase());
-        await pdfFind(n, t.slice(k, k + q.length), j);
         P.scroll.focus({ preventScroll: true });
         return toast(`p. ${j + 1}: found. / and Enter again for the next one.`);
       }
-    }
-    toast(`"${q}" is not in ${n.name}.`);
+      toast(`"${q}" is not in ${n.name}.`);
+    } catch (e) { pdfError(n, P, e); }
   });
 }
 // A peek: the place a link points at, drawn into an image card beside the PDF (so it can be kept, moved, copied or sent on)
@@ -9078,6 +9145,7 @@ function focusStrip() {
     strip.append(b);
   }
 }
+function focusRememberRect({ x, y, w, h }: BoardNode) { FOCUS.rect = { x, y, w, h }; }
 function focusGeometry(n: BoardNode) {
   const w = Math.max(200, VW() - 2), h = Math.max(120, VH() - FT_TOP - FT_H - FT_BOTTOM - 2);
   n.w = w; n.h = h; placeAny(n);
@@ -9088,12 +9156,14 @@ function focusShow(id: string) {
   const n = S.nodes[id]; if (!n || n.kind === 'frame') return;
   if (VIEW !== 'canvas') setView('canvas');
   deskReveal(n);
-  if (FOCUS.cur && FOCUS.cur !== id) focusRestoreNode();
-  if (!FOCUS.cur) FOCUS.saved = { ...cam() };
-  if (FOCUS.cur !== id) { reveal(n); FOCUS.rect = { x: n.x, y: n.y, w: n.w, h: n.h }; }
+  const flight = camStop(false);
+  if (!FOCUS.cur) FOCUS.saved = { ...(flight?.target ?? cam()) };
+  else if (FOCUS.cur !== id) focusRestoreNode();
+  if (FOCUS.cur !== id) { reveal(n); focusRememberRect(n); }
   FOCUS.cur = id; activate(id);
   live[id]?.el!.classList.add('focused'); document.body.classList.add('focus');
   focusGeometry(n); focusStrip(); ringNote();
+  if (flight?.card === id) flight.done?.();   // the card is at reading size; finish its quote jump, cursor placement, etc.
 }
 function focusRestoreNode() {
   const n = FOCUS.cur && S.nodes[FOCUS.cur]; const L = n && live[n.id];
@@ -9120,6 +9190,7 @@ function focusHide() {
   focusStrip(); renderLinks(); dirty(); ringNote();
 }
 function focusClose(id: string | null) {
+  if (!id || (FOCUS.cur !== id && !FOCUS.tabs.includes(id))) return;
   const wasCur = FOCUS.cur === id;
   FOCUS.tabs = FOCUS.tabs.filter(x => x !== id);
   if (wasCur) focusHide(); else focusStrip();
@@ -9250,6 +9321,7 @@ function deskGo(slot: number | string, quiet?: boolean) {
   if (slot === DESK.cur && perspCur() === 'manual') { if (!quiet) toast('Already on desk ' + deskName(deskAt(slot)) + '.'); return; }
   let d = slot === 9 ? deskAttention() : deskAt(slot), made = false;
   if (slot === 9 && !d) { toast('Nothing on the board needs a look: the attention desk is empty.'); return; }
+  camStop(false); hashCancelRestore();
   if (VIEW !== 'canvas') setView('canvas');
   if (FOCUS.cur) focusHide();
   if (WS.cur) { WS.cur = null; WS.last = null; wsApply(false); }
@@ -9488,10 +9560,14 @@ function deskTile(quiet?: boolean) {
   const d = deskAt(DESK.cur); if (!d) return;
   const ns = deskTops().sort((a, b) => (a.y - (a.kind === 'frame' ? LABEL_H : 0)) - (b.y - (b.kind === 'frame' ? LABEL_H : 0)) || a.x - b.x);
   DESK.tiled = deskSig(); if (!ns.length) return;
+  const focused = !ADOPTING && FOCUS.cur && S.nodes[FOCUS.cur];   // boardAdopt handles its own focus geometry
+  if (focused) Object.assign(focused, FOCUS.rect);
   const a = camArea(), x0 = Math.min(...ns.map(n => n.x)), y0 = Math.min(...ns.map(n => n.y - (n.kind === 'frame' ? LABEL_H : 0)));
   tileRects(ns.length, Math.round(a.vw * 0.88), Math.round(a.vh * 0.86), x0, y0).forEach(([x, y, w, h], i) => deskPut(ns[i], x, y, w, h));
+  if (focused) focusRememberRect(focused);
   deskRecord();
   if (!quiet) { renderLinks(); fitAll(false); dirty(); viewSave(); }
+  if (focused) focusGeometry(focused);
 }
 function deskLayout() {
   const d = deskAt(DESK.cur); if (!d) return toast('The Board has no layout of its own: its folders have modes (leader t tiles one).');
@@ -9700,7 +9776,11 @@ function placeLabel(k: PlaceKey): string {
   if (k.startsWith('persp:')) return 'perspective · ' + v;
   return 'desk · ' + (+v === 9 ? '9 attention' : deskName(deskAt(+v)));
 }
-function ringNote() { if (!S || !BOOTED) return; const k = placeNow(); if (RING.list[0] === k) return; RING.list = [k, ...RING.list.filter(x => x !== k)].slice(0, RING_MAX); viewSave(); }
+function ringRecord(): boolean {
+  const k = placeNow(); if (RING.list[0] === k) return false;
+  RING.list = [k, ...RING.list.filter(x => x !== k)].slice(0, RING_MAX); return true;
+}
+function ringNote() { if (S && BOOTED && !ADOPTING && ringRecord()) viewSave(); }
 function ringGo(k: PlaceKey) {
   const v = k.slice(k.indexOf(':') + 1);
   if (k.startsWith('view:')) return setView(v as ViewName);
@@ -10345,8 +10425,8 @@ const KC: Record<string, KeyCmdFn> = {
   'zoom.in': () => zoomAt(VW() / 2, VH() / 2, 1.25), 'zoom.out': () => zoomAt(VW() / 2, VH() / 2, 0.8),
   'zoom.card': () => { const n = activeNode(); if (!n) return toast('Select a card first: h j k l, or f for hints.'); jumpNode(n, 1); },
   fit: () => fitAll(),
-  'camera.back': () => { const t = camBack.pop(); if (t) { camFwd.push({ ...cam() }); animateTo(t); } },
-  'camera.forward': () => { const t = camFwd.pop(); if (t) { camBack.push({ ...cam() }); animateTo(t); } },
+  'camera.back': () => cameraHistory(camBack, camFwd),
+  'camera.forward': () => cameraHistory(camFwd, camBack),
   compact: () => compact(PICKED.size ? 'selection' : 'all'),
   'optimise.board': () => optimise(null),
   'optimise.folder': () => { const f = activeFolderOf(); f ? optimise(f) : toast('Pick a folder or something inside one.'); },
@@ -10952,6 +11032,8 @@ function notesDemoRows(): NoteRow[] {
     lines.forEach((ln, i) => { const m = ln.match(/^(#{1,6}) (.*)$/); if (m) rows.push({ id: p.id + '#' + (i + 1), path: p.name + '.md', title: m[2].replace(/\s*\^[\w-]+$/, ''), kind: 'heading', level: m[1].length, tags: [], body: lines.slice(i + 1, i + 6).join('\n'), line: i + 1, board: p }); }); }
   return rows;
 }
+let coldNotes: Promise<NoteRow[]> | null = null;
+function notesReady(): Promise<NoteRow[]> { return coldNotes ??= notesLoad().finally(() => { coldNotes = null; }); }
 async function notesLoad(force?: boolean): Promise<NoteRow[]> {
   if (!force && Date.now() - NOTES.at < 30000) return NOTES.rows;
   if (!DAEMON) NOTES.rows = notesDemoRows();
@@ -11025,7 +11107,7 @@ const noteKids = (r: NoteRow): NoteRow[] => (noteTree(r.path).kids[r.id] || []);
 const noteParent = (r: NoteRow): NoteRow | null => { const p = noteTree(r.path).parent[r.id]; return p ? noteById(p) : null; };
 function noteEntry(r: NoteRow): RgEntry { const kids = noteKids(r), bl = r.kind === 'file' ? backlinkCount(r) : 0; return { key: 'note:' + r.id, name: r.title, kind: r.kind === 'file' ? 'inote' : 'iblock', dir: kids.length > 0, note: r, meta: [r.kind === 'file' ? (kids.length ? String(kids.length) : '') : (r.kind === 'item' ? 'item' : 'h' + r.level), bl ? '← ' + bl : ''].filter(Boolean).join(' · ') }; }
 function rgPerspRoots(): RgEntry[] {
-  if (!NOTES.at) notesLoad();
+  if (!NOTES.at) notesReady();
   const out: RgEntry[] = [{ key: 'tag:', name: '# tags', kind: 'persp', dir: true, meta: 'tag:' }, { key: 'note:', name: '¶ notes', kind: 'persp', dir: true, meta: 'note:' }, { key: 'journal:', name: '▦ journal', kind: 'persp', dir: true, meta: 'journal:' }, { key: 'link:', name: '⇄ links', kind: 'persp', dir: true, meta: 'link:' }];
   out.push({ key: 'proc:', name: '⚙ processes', kind: 'persp', dir: true, meta: 'proc:' }, { key: 'unit:', name: '⊙ units', kind: 'persp', dir: true, meta: 'unit:' }, { key: 'attn:', name: '! attention', kind: 'persp', dir: true, meta: attnCount() ? String(attnCount()) : '' });
   return out;
@@ -11133,6 +11215,7 @@ function noteOpen(r: { path: string; line: number; board?: PageNode }) {
 }
 // go to an address: board nodes on the canvas, everything else in the navigator
 function goAddr(addr: string, push = true): boolean {
+  hashCancelRestore();
   const r = resolveAddr(addr); if (r.error) { toast(r.error); return false; }
   if (r.n && !isFs(r.key)) { r.n.kind === 'frame' ? (VIEW === 'ranger' ? rgGo(r.key) : jumpFolder(r.n)) : (VIEW === 'ranger' ? rgGo(rgParent(r.key) || 'root', r.key) : jumpNode(r.n)); }
   else if (r.key === 'root') { if (VIEW === 'ranger') rgGo('root'); else fitAll(); }
@@ -11140,7 +11223,13 @@ function goAddr(addr: string, push = true): boolean {
   if (push) hashSync(r.addr, true);
   return true;
 }
-const HASH = { busy: false, last: '' };
+const HASH = { busy: false, last: '', pending: '' };
+function hashCancelRestore(): void { if (!ADOPTING) HASH.pending = ''; }
+function hashRestore(kind: 'note' | 'board'): void {
+  const addr = HASH.pending; if (!addr.startsWith(kind + ':')) return;
+  HASH.pending = '';
+  if (decodeURIComponent(location.hash.slice(1)) === addr && (kind !== 'board' || addrToKey(addr))) goAddr(addr, false);
+}
 function currentAddr(): string { if (VIEW === 'ranger') return keyToAddr(RG.dir); const n = activeId && S.nodes[activeId]; return n ? addrOf(n) : (WS.cur && S.nodes[WS.cur] ? addrOf(S.nodes[WS.cur]) : 'board:/'); }
 function hashSync(addr?: string | null, push?: boolean): void {
   addr = addr || currentAddr(); if (!addr || addr === HASH.last) return;
@@ -11149,10 +11238,13 @@ function hashSync(addr?: string | null, push?: boolean): void {
   setTimeout(() => { HASH.busy = false; }, 0);
 }
 function hashInit(): void {
-  const start = decodeURIComponent(location.hash.slice(1));
-  if (start && parseAddr(start)) setTimeout(() => goAddr(start, false), 400);
-  addEventListener('hashchange', () => { if (HASH.busy) return; const a = decodeURIComponent(location.hash.slice(1)); if (a && parseAddr(a) && a !== HASH.last) { HASH.last = a; goAddr(a, false); } });
-  setInterval(() => { if (!HASH.busy && !document.hidden) hashSync(); }, 1500);
+  const start = decodeURIComponent(location.hash.slice(1)), a = parseAddr(start);
+  if (a?.kind === 'note' && a.path && !NOTES.at) {
+    HASH.pending = start; notesReady().then(() => hashRestore('note'), hashCancelRestore);
+  } else if (a && !goAddr(start, false) && a.kind === 'board' && DAEMON) HASH.pending = start;
+  if (HASH.pending) setTimeout(hashCancelRestore, 5000);   // only boot can arm a restore
+  addEventListener('hashchange', () => { hashCancelRestore(); if (HASH.busy) return; const a = decodeURIComponent(location.hash.slice(1)); if (a && parseAddr(a) && a !== HASH.last) { HASH.last = a; goAddr(a, false); } });
+  setInterval(() => { if (!HASH.pending && !HASH.busy && !document.hidden) hashSync(); }, 1500);
 }
 cmd('Go to address…', () => askName('Address (board:/path · fs:@host/dir · note:Title#Heading · tag:x · journal:2026/10/10 · link:Page · proc:@host/PID · unit:@host/NAME)', currentAddr(), v => goAddr(v)), 'Ctrl-Space a · ga in the navigator');
 cmd('Copy the address of the active node', () => { const n = activeId && S.nodes[activeId]; if (n) { copyText(addrOf(n)); toast(addrOf(n)); } else toast('Pick a node first.'); });

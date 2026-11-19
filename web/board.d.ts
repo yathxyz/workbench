@@ -356,6 +356,7 @@ interface PdfLive {
   load: Promise<PdfJsDocument | null> | null;
   task?: PdfJsLoadingTask | null;      // pdf.js's loading task: destroying it lets go of the document and its worker
   err: string;
+  errBitmap?: number;                  // the page whose bitmap retry can clear this error
   scroll: HTMLElement;                 // the card body's scroller (.pdf-pages), which takes the keyboard
   pages: PdfPageLive[];
   w: number;                           // the page width in CSS px the boxes were laid out for
@@ -370,7 +371,7 @@ interface PdfPageLive {
   canvas: HTMLCanvasElement | null; r: number;   // the drawn bitmap and its pixels per PDF unit
   task: PdfJsRenderTask | null; taskR?: number;  // the bitmap being drawn and its pixels per PDF unit
   textReady?: Promise<void>;           // the text layer, once its spans are in
-  text: HTMLElement | null; links: boolean; used: number;
+  text: HTMLElement | null; links: HTMLElement | null; used: number;
 }
 /* A media card's controls. */
 interface OpLive { prompt: HTMLTextAreaElement; out: HTMLElement; ins: HTMLElement; run: HTMLButtonElement; busy: boolean }
