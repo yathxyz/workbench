@@ -41,6 +41,7 @@ use wb_proto::journal::{
 use wb_proto::limits::{
     ACP_CONFIG_MAX, ACP_REPLAY_MAX, CONN_QUEUE, PROMPT_MAX, SETUP_IDLE_TIMEOUT,
 };
+use wb_proto::policy::{CompiledPolicy, Policy, PolicyMatch};
 
 use self::agent::{Agent, Out};
 use self::facts::Facts;
@@ -55,6 +56,8 @@ use crate::{Ctx, lock, now_ms};
 
 /// Longest `cwd` of a spawn on another host, in bytes.
 const REMOTE_CWD_MAX: usize = 4096;
+
+const INVALID_POLICY_NOTICE: &str = "stored permission policy is no longer valid and was cleared during replay; requests ask unless a later valid policy is set";
 
 /// How long `session/set_mode` may take.
 const SET_MODE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -144,6 +147,10 @@ pub enum Act {
         config_id: String,
         value: Value,
     },
+    SetPolicy {
+        epoch: u64,
+        policy: Policy,
+    },
     Seen(u64),
     Revive,
     Authenticate(String),
@@ -186,6 +193,11 @@ pub fn open(ctx: Arc<Ctx>, sid: String, open: Open) -> Pin<Box<dyn Future<Output
                 return open
                     .reply
                     .err(ErrorCode::BadRequest, "config has duplicate ids");
+            }
+            if let Some(policy) = &spawn.policy
+                && let Err(message) = policy.validate()
+            {
+                return open.reply.err(ErrorCode::BadRequest, message);
             }
         }
         // The second round covers an actor that was forgotten between the lookup and
@@ -241,6 +253,7 @@ struct Loaded {
     meta: Meta,
     journal: Journal,
     facts: Facts,
+    policy: Option<CompiledPolicy>,
     announced: BTreeMap<u64, PendingKind>,
     /// Startup normalisation could not complete the journal.
     fault: Option<String>,
@@ -303,21 +316,56 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
     let (mut journal, events) = Journal::open(&dir.join(format!("{sid}.jsonl")))?;
     let mut facts = Facts::default();
     let mut announced = BTreeMap::new();
+    let mut policy_notice = false;
     for ev in &events {
         facts.apply(ev);
         announce(&mut announced, ev);
+        match &ev.body {
+            // The fold already validated it; nonempty rules folding to none were invalid.
+            EventBody::Policy { policy } => {
+                policy_notice = !policy.rules.is_empty() && facts.policy.is_none();
+            }
+            EventBody::Notice {
+                level: NoticeLevel::Warn,
+                text,
+            } if text == INVALID_POLICY_NOTICE => policy_notice = false,
+            _ => {}
+        }
     }
-    let (appended, fault) = match journal.normalise(&mut facts, now_ms()) {
+    let policy = facts
+        .policy
+        .as_ref()
+        .map(|policy| CompiledPolicy::new(policy, &meta.cwd, meta.agent == "omp"))
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    let (mut appended, mut fault) = match journal.normalise(&mut facts, now_ms()) {
         Ok(written) => (!written.is_empty(), None),
         Err(f) => {
             error!(%sid, "completing the journal: {}", f.error);
             (false, Some(fault_message(&f)))
         }
     };
+    if policy_notice && fault.is_none() {
+        let notice = EventBody::Notice {
+            level: NoticeLevel::Warn,
+            text: INVALID_POLICY_NOTICE.into(),
+        };
+        match journal.append(&notice, now_ms()) {
+            Ok(ev) => {
+                facts.apply(&ev);
+                appended = true;
+            }
+            Err(f) => {
+                error!(%sid, "recording the cleared policy notice: {}", f.error);
+                fault = Some(fault_message(&f));
+            }
+        }
+    }
     let loaded = Loaded {
         meta,
         journal,
         facts,
+        policy,
         announced,
         fault,
     };
@@ -327,7 +375,7 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
 /// Notes the kind of a permission or elicitation request by its `req`.
 fn announce(announced: &mut BTreeMap<u64, PendingKind>, ev: &JournalEvent) {
     let kind = match ev.body {
-        EventBody::Permission { .. } => PendingKind::Permission,
+        EventBody::Permission { .. } | EventBody::PermissionAuto { .. } => PendingKind::Permission,
         EventBody::Elicitation { .. } => PendingKind::Elicitation,
         _ => return,
     };
@@ -626,6 +674,9 @@ struct Acp {
     fault_exit: Option<(Option<i32>, Option<i32>, ExitReason)>,
     proc: Option<Proc>,
     startup_config: Option<StartupConfig>,
+    policy: Option<CompiledPolicy>,
+    /// A cancelled turn may still deliver requests before its prompt response.
+    turn_cancelled: bool,
     /// The agent's requests waiting for an answer, by `req`.
     held: BTreeMap<u64, HeldReq>,
     /// A `session` event follows the last `spawn`.
@@ -673,6 +724,8 @@ impl Acp {
             fault_exit: None,
             proc: None,
             startup_config: None,
+            policy: None,
+            turn_cancelled: false,
             held: BTreeMap::new(),
             has_session: false,
             load_filter: false,
@@ -701,12 +754,14 @@ impl Acp {
                     meta,
                     journal,
                     facts,
+                    policy,
                     announced,
                     fault,
                 } = *loaded;
                 self.meta = meta;
                 self.journal = Some(journal);
                 self.facts = facts;
+                self.policy = policy;
                 self.announced = announced;
                 if let Some(message) = fault {
                     self.fault = Some(Fault {
@@ -868,6 +923,15 @@ impl Acp {
                 return self.abandon(o.reply, ErrorCode::BadRequest, msg);
             }
         }
+        self.policy = match spawn
+            .policy
+            .as_ref()
+            .map(|policy| CompiledPolicy::new(policy, &spawn.cwd, spawn.agent == "omp"))
+            .transpose()
+        {
+            Ok(policy) => policy,
+            Err(message) => return self.abandon(o.reply, ErrorCode::BadRequest, message),
+        };
         self.meta = Meta {
             sid: self.sid.clone(),
             agent: spawn.agent,
@@ -898,6 +962,22 @@ impl Acp {
                 let msg = format!("creating the session's files: {e}");
                 return self.abandon(o.reply, ErrorCode::Internal, msg);
             }
+        }
+        if let Some(policy) = spawn.policy
+            && !self.record(EventBody::Policy { policy })
+        {
+            let errors = spawn
+                .config
+                .into_iter()
+                .map(|option| ConfigError {
+                    id: option.id,
+                    value: option.value,
+                    code: ErrorCode::Faulted,
+                    error: JOURNAL_FAILED.into(),
+                })
+                .collect();
+            self.open_with_config_errors(o, true, errors);
+            return;
         }
         if spawn.config.is_empty() {
             let _ = self.spawn(SpawnVia::New);
@@ -1081,6 +1161,7 @@ impl Acp {
                 | EventBody::TurnEnd { .. }
                 | EventBody::TurnError { .. }
                 | EventBody::Config { .. }
+                | EventBody::Policy { .. }
                 | EventBody::Exit { .. }
         );
         if durable && let Some(journal) = &self.journal {
@@ -1209,6 +1290,7 @@ impl Acp {
                 seen_seq: self.meta.seen_seq,
                 title: facts.title.clone(),
                 mode_id: facts.mode_id.clone(),
+                policy: facts.policy.clone(),
                 config_options: facts.config_options.clone(),
             }),
         };
@@ -1427,6 +1509,7 @@ impl Acp {
                 response,
             } => self.answer(req, epoch, PendingKind::Elicitation, response, reply),
             Act::SetMode(mode_id) => self.set_mode(mode_id, reply),
+            Act::SetPolicy { epoch, policy } => self.set_policy(epoch, policy, reply),
             Act::SetConfigOption {
                 epoch,
                 config_id,
@@ -1482,6 +1565,7 @@ impl Acp {
         }) {
             return reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
         }
+        self.turn_cancelled = false;
         self.set_seen(self.facts.head_seq);
         match self.request(Purpose::Prompt, |id| rpc::prompt(id, &session, blocks)) {
             Ok(()) => reply.done(),
@@ -1490,6 +1574,9 @@ impl Acp {
     }
 
     fn cancel(&mut self, reply: Reply) {
+        if self.facts.activity == Activity::Turn {
+            self.turn_cancelled = true;
+        }
         if self.facts.activity == Activity::Turn
             && let Some(session) = &self.facts.agent_session_id
         {
@@ -1566,6 +1653,24 @@ impl Acp {
             self.setup_at = Some(Instant::now() + SETUP_IDLE_TIMEOUT);
         }
         true
+    }
+    fn set_policy(&mut self, epoch: u64, policy: Policy, reply: Reply) {
+        if epoch != self.created_at {
+            return reply.err(ErrorCode::Stale, "the session was created again");
+        }
+        if self.fault.is_some() {
+            return reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
+        }
+        let compiled = match CompiledPolicy::new(&policy, &self.meta.cwd, self.meta.agent == "omp")
+        {
+            Ok(compiled) => compiled,
+            Err(message) => return reply.err(ErrorCode::BadRequest, message),
+        };
+        if !self.record(EventBody::Policy { policy }) {
+            return reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
+        }
+        self.policy = Some(compiled);
+        reply.done();
     }
 
     fn set_mode(&mut self, mode_id: String, reply: Reply) {
@@ -2317,6 +2422,52 @@ impl Acp {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
+                let decision = params
+                    .get("sessionId")
+                    .filter(|_| self.facts.activity == Activity::Turn && !self.turn_cancelled)
+                    .and_then(Value::as_str)
+                    .is_some_and(|session| Some(session) == self.facts.agent_session_id.as_deref())
+                    .then(|| self.policy.as_ref()?.decide(&tool_call, &options))
+                    .flatten();
+                if let Some(decision) = decision {
+                    let outcome = serde_json::json!({
+                        "outcome": "selected", "optionId": decision.option_id,
+                    });
+                    let policy = PolicyMatch {
+                        rule: decision.rule,
+                        action: decision.action,
+                    };
+                    let body = EventBody::PermissionAuto {
+                        tool_call,
+                        options,
+                        outcome: outcome.clone(),
+                        policy,
+                    };
+                    let written = if self.fault.is_none() {
+                        self.journal
+                            .as_mut()
+                            .map(|journal| journal.append(&body, now_ms()))
+                    } else {
+                        None
+                    };
+                    match written {
+                        Some(Ok(ev)) => {
+                            self.applied(ev);
+                            self.send(&rpc::result(&id, rpc::permission_result(&outcome)));
+                        }
+                        failure => {
+                            // Cancel before journal_fault closes the agent's stdin.
+                            self.send(&rpc::result(
+                                &id,
+                                rpc::permission_result(&rpc::permission_cancelled()),
+                            ));
+                            if let Some(Err(fault)) = failure {
+                                self.journal_fault(&fault);
+                            }
+                        }
+                    }
+                    return;
+                }
                 let option_ids = options
                     .iter()
                     .filter_map(|o| o.get("optionId")?.as_str().map(str::to_owned))

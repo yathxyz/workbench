@@ -30,6 +30,44 @@ pub const ACP_CONFIG_MAX: usize = 16;
 pub const ACP_CONFIG_OPTIONS_MAX: usize = 64;
 /// Largest serialized agent configuration offering. Larger is malformed.
 pub const ACP_CONFIG_OPTIONS_BYTES: usize = 64 * KIB;
+/// Largest serialized permission policy; excess is `bad_request`.
+pub const POLICY_MAX: usize = 256 * KIB;
+/// Most ordered rules in a session permission policy; excess is `bad_request`.
+pub const POLICY_RULES_MAX: usize = 64;
+/// Most command regular expressions across one policy; excess is `bad_request`.
+pub const POLICY_PATTERNS_MAX: usize = 128;
+/// Most UTF-8 bytes in one command regular expression.
+pub const POLICY_PATTERN_MAX: usize = 4096;
+/// Largest compiled command regular expression; excess is `bad_request`.
+pub const POLICY_REGEX_SIZE_MAX: usize = 64 * KIB;
+/// Most UTF-8 bytes in one permission root.
+pub const POLICY_ROOT_MAX: usize = 4096;
+/// Most roots, tool kinds or programs in one permission rule.
+pub const POLICY_SELECTORS_MAX: usize = 64;
+/// Most UTF-8 bytes in one tool kind.
+pub const POLICY_KIND_MAX: usize = 64;
+/// Most UTF-8 bytes in one permitted program name or path.
+pub const POLICY_PROGRAM_MAX: usize = 256;
+/// Largest command eligible for automatic policy evaluation; excess asks.
+pub const POLICY_COMMAND_MAX: usize = 64 * KIB;
+/// Largest raw command evaluated by regex conditions; excess asks at that rule.
+pub const POLICY_REGEX_COMMAND_MAX: usize = 8 * KIB;
+/// Deadline checked before every regex evaluation; expiration asks at that rule.
+pub const POLICY_DECISION_TIMEOUT: Duration = Duration::from_millis(100);
+/// Most shell words, including redirection targets; excess asks.
+pub const POLICY_COMMAND_WORDS_MAX: usize = 1024;
+/// Most path candidate resolutions, including reported locations; excess asks.
+pub const POLICY_PATHS_MAX: usize = 2048;
+/// Aggregate candidate bytes plus relative-path cwd bytes to normalize; excess asks.
+pub const POLICY_PATH_BYTES_MAX: usize = 256 * KIB;
+/// Most delimiter fragments considered, including duplicates; excess asks.
+pub const POLICY_FRAGMENTS_MAX: usize = 2048;
+/// Aggregate delimiter-fragment bytes charged before set insertion; excess asks.
+pub const POLICY_FRAGMENT_BYTES_MAX: usize = 256 * KIB;
+/// Most path/root comparisons across all rules for one request; excess asks.
+pub const POLICY_PATH_CHECKS_MAX: usize = 64 * KIB;
+/// Most possible shell working directories after conditional or failed cd; excess asks.
+pub const POLICY_CWDS_MAX: usize = 32;
 /// Scrollback lines kept by the VT state.
 pub const VT_SCROLLBACK: usize = 1000;
 /// Largest snapshot. The scrollback budget is halved until it fits.

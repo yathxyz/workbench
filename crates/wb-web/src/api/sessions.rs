@@ -19,6 +19,7 @@ use wb_proto::hub::{
 };
 use wb_proto::journal::{EventBody, JournalEvent};
 use wb_proto::limits::{ACP_CONFIG_MAX, CAPTURE_MAX};
+use wb_proto::policy::Policy;
 
 use super::{ApiState, Control, Read};
 use crate::AppState;
@@ -49,6 +50,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/sessions/{sid}/elicitation", post(elicitation))
         .route("/sessions/{sid}/mode", post(mode))
         .route("/sessions/{sid}/config", post(config))
+        .route("/sessions/{sid}/policy", post(policy))
         .route("/sessions/{sid}/revive", post(revive))
 }
 
@@ -291,6 +293,8 @@ struct Create {
     sid: Option<String>,
     #[serde(default)]
     config: StartConfig,
+    #[serde(default, deserialize_with = "wb_proto::policy::deserialize_optional")]
+    policy: Option<Policy>,
 }
 
 /// JSON member order matters: changing a model may change the remaining options.
@@ -355,6 +359,9 @@ async fn create(
     Body(body): Body,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let body: Create = parse(&body)?;
+    if let Some(policy) = &body.policy {
+        validate_policy(policy)?;
+    }
     let sid = match body.sid {
         Some(sid) => sid_of(sid)?,
         None => random_sid().map_err(|e| {
@@ -382,6 +389,7 @@ async fn create(
                 cwd: body.cwd,
                 host: spawn_host(&info, body.host)?,
                 config,
+                policy: body.policy,
             }),
         };
         let reply = conn.request(&req, RID).await.map_err(call_error)?;
@@ -548,6 +556,37 @@ async fn config(
         value: body.value.into(),
     };
     act(&api.app, req, CONFIG_TIMEOUT).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetPolicy {
+    policy: Policy,
+}
+
+fn validate_policy(policy: &Policy) -> Result<(), ApiError> {
+    policy
+        .validate()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "bad body"))
+}
+
+async fn policy(
+    _: Control,
+    State(api): State<ApiState>,
+    Param(id): Param<String>,
+    Body(body): Body,
+) -> Result<Json<Value>, ApiError> {
+    let sid = sid_of(id)?;
+    let body: SetPolicy = parse(&body)?;
+    validate_policy(&body.policy)?;
+    let epoch = summary(&api.app, &sid)?.created_at;
+    let req = HubRequest::AcpSetPolicy {
+        rid: RID,
+        sid,
+        epoch,
+        policy: body.policy,
+    };
+    act(&api.app, req, REPLY_TIMEOUT).await
 }
 
 async fn revive(

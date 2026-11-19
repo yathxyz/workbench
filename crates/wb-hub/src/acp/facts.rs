@@ -4,6 +4,7 @@
 use serde_json::{Value, json};
 use wb_proto::hub::{Activity, Last, LastError, Pending, PendingKind};
 use wb_proto::journal::{EventBody, JournalEvent, ResolvedBy, SetupErrorCode, TurnErrorCode};
+use wb_proto::policy::Policy;
 
 use super::config::{valid_options, within_limits};
 
@@ -24,6 +25,7 @@ pub struct Facts {
     pub mode_id: Option<String>,
     pub modes: Option<Value>,
     pub config_options: Option<Value>,
+    pub policy: Option<Policy>,
     pub available_commands: Option<Value>,
     pub plan: Option<Value>,
     pub usage: Option<Value>,
@@ -45,6 +47,7 @@ impl Default for Facts {
             mode_id: None,
             modes: None,
             config_options: None,
+            policy: None,
             available_commands: None,
             plan: None,
             usage: None,
@@ -128,11 +131,16 @@ impl Facts {
             }
             EventBody::Mode { mode_id } => self.set_mode(mode_id),
             EventBody::Config { config_options } => self.set_config_options(config_options),
+            EventBody::Policy { policy } => {
+                self.policy =
+                    (policy.validate().is_ok() && !policy.rules.is_empty()).then(|| policy.clone());
+            }
             EventBody::Exit { .. } => {
                 self.activity = Activity::None;
                 self.running = false;
             }
             EventBody::ElicitationComplete { .. }
+            | EventBody::PermissionAuto { .. }
             | EventBody::Notice { .. }
             | EventBody::Unknown => {}
         }
@@ -300,6 +308,48 @@ mod tests {
             f.apply(&ev(i as u64 + 1, b));
         }
         f
+    }
+
+    #[test]
+    fn invalid_policy_events_clear_policy_until_a_later_valid_event() {
+        let good: Policy = serde_json::from_value(json!({"rules":[{"action":"allow"}]})).unwrap();
+        let oversized: Policy = serde_json::from_value(json!({"rules":[
+            {"action":"allow", "roots":vec![format!("/{}", "r".repeat(4095));64]}
+        ]}))
+        .unwrap();
+        let malformed: Policy = serde_json::from_value(json!({"rules":[
+            {"action":"allow", "command":{"matches":["["]}}
+        ]}))
+        .unwrap();
+        let too_big: Policy = serde_json::from_value(json!({"rules":[
+            {"action":"allow", "command":{"matches":[r"\w+\s+\w+"]}}
+        ]}))
+        .unwrap();
+        assert!(serde_json::to_vec(&oversized).unwrap().len() > wb_proto::limits::POLICY_MAX);
+        for invalid in [oversized, malformed, too_big] {
+            let bad = EventBody::Policy { policy: invalid };
+            assert_eq!(fold(vec![bad.clone()]).policy, None);
+            let mut facts = fold(vec![EventBody::Policy {
+                policy: good.clone(),
+            }]);
+            facts.apply(&ev(2, bad));
+            assert_eq!(facts.policy, None);
+            assert_eq!(facts.head_seq, 2);
+            facts.apply(&ev(
+                3,
+                EventBody::Policy {
+                    policy: good.clone(),
+                },
+            ));
+            assert_eq!(facts.policy.as_ref(), Some(&good));
+            facts.apply(&ev(
+                4,
+                EventBody::Policy {
+                    policy: Policy::default(),
+                },
+            ));
+            assert_eq!(facts.policy, None);
+        }
     }
 
     fn spawn() -> EventBody {
@@ -896,7 +946,7 @@ mod tests {
                 EventBody::PermissionResolved {
                     req: 4,
                     outcome: json!({"outcome": "cancelled"}),
-                    by: ResolvedBy::Hub
+                    by: ResolvedBy::Hub,
                 },
                 EventBody::ElicitationResolved {
                     req: 5,

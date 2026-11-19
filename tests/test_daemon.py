@@ -4,10 +4,10 @@
   python3 -I tests/test_daemon.py --web-root DIR [--bin-dir DIR]
 
 Sections: board (through Caddy, so ETags round-trip through the proxy), fs (direct, with the proxy
-secret), and session configuration (through /acp, the hub and the fake ACP agent). Each section is a
-function of (suite, harness) listed in SECTIONS. In test mode the harness gives wb-web a temporary
-HOME, so `~` and the mv denylist act on throwaway directories. Prints one line per check and exits
-1 if any failed.
+secret), session configuration and session permission policy (through /acp, the hub and the fake
+ACP agent). Each section is a function of (suite, harness) listed in SECTIONS. In test mode the
+harness gives wb-web a temporary HOME, so `~` and the mv denylist act on throwaway directories.
+Prints one line per check and exits 1 if any failed.
 """
 
 import argparse
@@ -436,7 +436,257 @@ def configured_open(t, h):
             wbctl.acp_session(ep, sid, kill=True)
 
 
-SECTIONS = [board, fs, session_config, configured_open]
+def session_policy(t, h):
+    ep = wbctl.Endpoint(ORIGIN, unix=h.caddy_sock)
+    cwd = str(h.home.resolve())
+    empty = {"rules": []}
+    allow = {"rules": [{"action": "allow", "kinds": ["execute"], "roots": ["$cwd"],
+                        "programs": ["rm"],
+                        "command": {"matches": ["rm -rf build"], "notMatches": ["sudo"]}}]}
+    reject = {"rules": [{"action": "reject", "kinds": ["execute"], "roots": ["$cwd"],
+                         "programs": ["rm"]}]}
+    ask = {"rules": [{"action": "ask"}, {"action": "allow"}]}
+    fallback = {"rules": [{"action": "allow", "roots": [cwd + "/elsewhere"]}]}
+    programs_fallback = {"rules": [{"action": "allow", "kinds": ["execute"], "roots": ["$cwd"],
+                                    "programs": ["git"],
+                                    "command": {"matches": ["rm -rf build"]}}]}
+
+    class PolicyCard(wbctl.AcpCard):
+        def __init__(self, sid):
+            self.snapshots = []
+            super().__init__(ep, sid, timeout=60.0)
+
+        def handle(self, message):
+            if message.get("t") in ("hello", "info"):
+                self.snapshots.append(message.get("info") or {})
+            super().handle(message)
+
+    def request(kind, **fields):
+        hub = wbctl.HubClient(h.hub_sock)
+        try:
+            return hub.request({"t": kind, "rid": 1, **fields})[0]
+        finally:
+            hub.close()
+
+    def summary(sid):
+        return next((s for s in wbctl.hub_sessions(h.hub_sock) if s.get("sid") == sid), {})
+
+    def set_policy(card, policy, epoch=None):
+        return request("acp.set_policy", sid=card.sid, policy=policy,
+                       epoch=card.epoch() if epoch is None else epoch)
+
+    def start_turn(card):
+        mark = card.cursor()
+        card.send("prompt", blocks=[{"type": "text", "text": "perm"}])
+        return mark
+
+    def auto_turn(card, action):
+        mark = start_turn(card)
+        ended = card.wait(lambda: card.since(mark, wbctl.TURN_END))
+        automatic = card.since(mark, ("permission_auto",))
+        expected = {"rule": 0, "action": action}
+        kind = "allow_once" if action == "allow" else "reject_once"
+        option = next((o.get("optionId") for p in automatic for o in p.get("options", [])
+                       if o.get("kind") == kind), None)
+        status = "completed" if action == "allow" else "failed"
+        updates = [e.get("update", {}) for e in card.since(mark, ("update",))]
+        t.check(f"policy ({card.sid}): {action} selects only {kind} and the agent finishes",
+                ended and len(automatic) == 1 and option is not None
+                and automatic[0].get("outcome") == {"outcome": "selected", "optionId": option}
+                and any(u.get("sessionUpdate") == "tool_call_update" and u.get("status") == status
+                        for u in updates),
+                repr(card.since(mark, ("permission_auto", "update", "turn_end"))))
+        t.check(f"policy ({card.sid}): one atomic auto event journals the matching rule and answer",
+                len(automatic) == 1 and automatic[0].get("policy") == expected
+                and automatic[0].get("toolCall", {}).get("rawInput", {}).get("command") == "rm -rf build"
+                and not card.since(mark, ("permission", "permission_resolved")),
+                repr(card.since(mark, ("permission_auto", "permission", "permission_resolved"))))
+        current = summary(card.sid)
+        t.check(f"policy ({card.sid}): auto answers never appear in a pending snapshot",
+                ended and not card.pending_permissions() and current.get("acp", {}).get("pending") == []
+                and all(not s.get("acp", {}).get("pending") for s in card.snapshots),
+                repr((card.snapshots, current)))
+        if automatic:
+            late = request("acp.permission", sid=card.sid, req=automatic[0]["seq"], epoch=card.epoch(),
+                           outcome={"outcome": "selected", "optionId": option})
+            t.check(f"policy ({card.sid}): a viewer cannot answer an automatically resolved request",
+                    late.get("code") == "already_resolved", repr(late))
+
+    def pending_turn(card):
+        mark = start_turn(card)
+        waiting = card.wait(lambda: card.since(mark, ("permission",)))
+        permissions = card.since(mark, ("permission",))
+        permission = permissions[0] if permissions else None
+        current = summary(card.sid)
+        t.check(f"policy ({card.sid}): ask fallback leaves an unannotated user-answerable request",
+                waiting and permission is not None and "policy" not in permission
+                and not card.since(mark, ("permission_resolved",))
+                and [p.get("req") for p in current.get("acp", {}).get("pending", [])]
+                == [permission["seq"]],
+                repr((permissions, current)))
+        return mark, permission
+
+    def answer_turn(card, mark, permission):
+        if permission is None:
+            return False
+        card.answer(permission, "allow_once")
+        ended = card.wait(lambda: card.since(mark, wbctl.TURN_END))
+        resolved = card.since(mark, ("permission_resolved",))
+        return (ended and len(resolved) == 1 and resolved[0].get("req") == permission["seq"]
+                and resolved[0].get("by") == "user" and "policy" not in resolved[0]
+                and not card.pending_permissions())
+
+    def replay_policy(card, expected):
+        replay = PolicyCard(card.sid)
+        try:
+            opened = replay.open()
+            kinds = ("policy", "permission_auto", "permission", "permission_resolved")
+            journal = [e for e in card.result["events"] if e.get("e") in kinds]
+            replayed = [e for e in replay.result["events"] if e.get("e") in kinds]
+            facts = (replay.result["hello"] or {}).get("info", {}).get("acp", {})
+            t.check(f"policy ({card.sid}): replay preserves policy changes and decision evidence",
+                    opened and replayed == journal and bool(journal)
+                    and facts.get("policy") == expected and facts.get("pending") == [],
+                    repr((replayed, facts)))
+        finally:
+            replay.close()
+
+    invalid_programs = [None, "rm", [1], [""], ["rm -rf"], ["rm\tbuild"], ["rm\nbuild"],
+                        ["rm\u00a0build"], ["rm\u2003build"], ["r\0m"], ["x" * 257],
+                        ["é" * 129], ["rm"] * 65]
+    for programs in invalid_programs:
+        invalid = {"rules": [{"action": "allow", "programs": programs}]}
+        refused = request("acp.open", sid="conformance_policy_invalid", since=0,
+                          spawn={"agent": "stub", "cwd": cwd, "policy": invalid})
+        t.check(f"policy: invalid programs {programs!r} is rejected before spawn",
+                refused.get("code") == "bad_request" and not summary("conformance_policy_invalid"),
+                repr(refused))
+
+    for name, policy in (("allow", allow), ("reject", reject), ("fallback", fallback),
+                         ("programs_fallback", programs_fallback), ("ask", ask),
+                         ("unexamined_agent", allow)):
+        sid = "conformance_policy_" + name
+        card = PolicyCard(sid)
+        agent = "stub" if name == "unexamined_agent" else "omp"
+        try:
+            opened = request("acp.open", sid=sid, since=0,
+                             spawn={"agent": agent, "cwd": cwd, "policy": policy})
+            attached = card.open()
+            ready = attached and card.wait(lambda: card.since(0, wbctl.SETUP_END))
+            t.check(f"policy ({name}): hub spawn installs and journals policy before requests",
+                    opened.get("t") == "ok" and opened.get("new") is True and ready
+                    and opened.get("summary", {}).get("acp", {}).get("policy") == policy
+                    and [e.get("policy") for e in card.since(0, ("policy",))] == [policy]
+                    and summary(sid).get("acp", {}).get("policy") == policy,
+                    repr((opened, card.result)))
+            if not ready:
+                continue
+            if name in ("allow", "reject"):
+                if name == "allow":
+                    mark = card.cursor()
+                    ignored = request("acp.open", sid=sid, since=mark,
+                                      spawn={"agent": "stub", "cwd": cwd, "policy": reject})
+                    t.check("policy: spawn policy on an existing attach is ignored",
+                            ignored.get("t") == "ok" and ignored.get("new") is False
+                            and ignored.get("summary", {}).get("acp", {}).get("policy") == allow
+                            and summary(sid).get("acp", {}).get("policy") == allow,
+                            repr(ignored))
+                auto_turn(card, name)
+                t.check(f"policy ({name}): attaches and turns do not silently replace the spawn policy",
+                        [e.get("policy") for e in card.since(0, ("policy",))] == [policy],
+                        repr(card.since(0, ("policy",))))
+                replay_policy(card, policy)
+                continue
+
+            mark, permission = pending_turn(card)
+            if name in ("fallback", "programs_fallback", "unexamined_agent"):
+                reason = {"fallback": "unmatched roots", "programs_fallback": "unlisted program",
+                          "unexamined_agent": "unexamined agent execution"}[name]
+                t.check(f"policy: {reason} retains ordinary user resolution",
+                        answer_turn(card, mark, permission), repr(card.result))
+                replay_policy(card, policy)
+                continue
+
+            old_pending = summary(sid).get("acp", {}).get("pending")
+            replacement_mark = card.cursor()
+            replacement = set_policy(card, allow)
+            replaced = card.wait(lambda: card.since(replacement_mark, ("policy",)))
+            current = summary(sid)
+            t.check("policy: epoch-checked replacement is journaled without answering existing pending",
+                    replacement.get("t") == "ok" and replaced
+                    and [e.get("policy") for e in card.since(replacement_mark, ("policy",))] == [allow]
+                    and current.get("acp", {}).get("policy") == allow
+                    and current.get("acp", {}).get("pending") == old_pending and bool(old_pending)
+                    and not card.since(mark, ("permission_resolved",)),
+                    repr((replacement, current, card.result)))
+            t.check("policy: a request pending across replacement still accepts a user answer",
+                    answer_turn(card, mark, permission), repr(card.result))
+            # Earlier snapshots correctly contain the manually pending request; only subsequent
+            # snapshots must remain empty for automatically answered requests.
+            card.snapshots.clear()
+            auto_turn(card, "allow")
+
+            stale_mark = card.cursor()
+            stale = set_policy(card, reject, epoch=card.epoch() + 1)
+            t.check("policy: stale replacement is refused and does not change current policy",
+                    stale.get("code") == "stale" and summary(sid).get("acp", {}).get("policy") == allow,
+                    repr(stale))
+            replacement = set_policy(card, reject)
+            replaced = card.wait(lambda: card.since(stale_mark, ("policy",)))
+            t.check("policy: replacement affects future requests and stale writes add no policy event",
+                    replacement.get("t") == "ok" and replaced
+                    and [e.get("policy") for e in card.since(stale_mark, ("policy",))] == [reject],
+                    repr((stale, replacement, card.since(stale_mark, ("policy",)))))
+            card.snapshots.clear()
+            auto_turn(card, "reject")
+
+            remove_mark = card.cursor()
+            removed = set_policy(card, empty)
+            removal_seen = card.wait(lambda: card.since(remove_mark, ("policy",)))
+            t.check("policy: an empty replacement removes policy and journals its explicit empty value",
+                    removed.get("t") == "ok" and removal_seen
+                    and [e.get("policy") for e in card.since(remove_mark, ("policy",))] == [empty]
+                    and "policy" not in summary(sid).get("acp", {}),
+                    repr((removed, summary(sid))))
+            mark, permission = pending_turn(card)
+            t.check("policy: removal restores ordinary manual permission handling",
+                    answer_turn(card, mark, permission), repr(card.result))
+            replay_policy(card, None)
+
+            old_epoch = card.epoch()
+            forgotten = request("acp.kill", sid=sid, forget=True)
+            reborn = request("acp.open", sid=sid, since=0,
+                             spawn={"agent": "omp", "cwd": cwd, "policy": allow})
+            stale = set_policy(card, reject, epoch=old_epoch)
+            t.check("policy: a prior incarnation cannot replace a recreated session's policy",
+                    forgotten.get("t") == "ok" and reborn.get("t") == "ok"
+                    and reborn.get("summary", {}).get("createdAt") != old_epoch
+                    and stale.get("code") == "stale"
+                    and summary(sid).get("acp", {}).get("policy") == allow,
+                    repr((forgotten, reborn, stale)))
+        finally:
+            card.close()
+            wbctl.acp_session(ep, sid, kill=True)
+
+    sid = "conformance_policy_relay"
+    card = PolicyCard(sid)
+    try:
+        card.send("open", id=sid, since=0, agent="omp", cwd=cwd, policy=allow)
+        opened = card.wait(lambda: card.result["replayed"] is not None)
+        ready = opened and card.wait(lambda: card.since(0, wbctl.SETUP_END))
+        t.check("policy: /acp spawning open forwards policy to the hub",
+                ready and (card.result["hello"] or {}).get("status") == "new"
+                and (card.result["info"] or {}).get("acp", {}).get("policy") == allow,
+                repr(card.result))
+        if ready:
+            auto_turn(card, "allow")
+            replay_policy(card, allow)
+    finally:
+        card.close()
+        wbctl.acp_session(ep, sid, kill=True)
+
+
+SECTIONS = [board, fs, session_config, configured_open, session_policy]
 
 
 def main():
