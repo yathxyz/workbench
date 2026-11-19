@@ -1368,13 +1368,20 @@ impl Acp {
             drop(journal.sync());
         }
         announce(&mut self.announced, &ev);
-        self.facts.apply(&ev);
+        let materialized = self.facts.apply(&ev);
+        // A session/update has no actor-side Summary changes outside the fold. Other
+        // records can accompany one (e.g. a notice after taking startup_config).
+        let head_only_update = !materialized && matches!(ev.body, EventBody::Update { .. });
         let msg = line(&HubMessage::AcpEv {
             sid: self.sid.clone(),
             ev: Box::new(ev),
         });
-        self.fan_out(&msg);
-        self.publish();
+        let dropped = self.fan_out(&msg);
+        if dropped || !head_only_update {
+            self.publish();
+        } else if !self.quiet && !self.defer_head() {
+            self.flush_info();
+        }
         if let Some((code, message)) = setup_error {
             self.fail_startup_config(code, &message);
         }
@@ -1523,31 +1530,43 @@ impl Acp {
         if self.quiet {
             return;
         }
-        let (summary, session) = self.snapshot();
-        if let Some((last, last_session)) = &self.published {
-            if *last == summary && *last_session == session {
-                return;
-            }
-            let mut same = summary.clone();
-            if let (Some(now), Some(then)) = (&mut same.acp, &last.acp) {
-                now.head_seq = then.head_seq;
-            }
-            let next = self.published_at.map(|at| at + INFO_EVERY);
-            if same == *last
+        let (mut summary, session) = self.snapshot();
+        if let Some((last, last_session)) = &self.published
+            && let (Some(now), Some(then)) = (&mut summary.acp, &last.acp)
+        {
+            // Compare at the published head without copying the rest of the Summary.
+            now.head_seq = then.head_seq;
+            if summary == *last
                 && session == *last_session
-                && let Some(next) = next.filter(|&at| at > Instant::now())
+                && (self.facts.head_seq == then.head_seq || self.defer_head())
             {
-                self.info_at = Some(self.info_at.unwrap_or(next));
                 return;
             }
+            summary.acp.as_mut().unwrap().head_seq = self.facts.head_seq;
         }
-        self.flush_info();
+        self.send_info(summary, session);
+    }
+
+    /// Arms the deadline relative to the last publication, not the latest event.
+    fn defer_head(&mut self) -> bool {
+        if let Some(next) = self.published_at.map(|at| at + INFO_EVERY)
+            && next > Instant::now()
+        {
+            self.info_at = Some(next);
+            return true;
+        }
+        false
     }
 
     fn flush_info(&mut self) {
+        let (summary, session) = self.snapshot();
+        self.send_info(summary, session);
+    }
+
+    fn send_info(&mut self, mut summary: Summary, session: AcpSessionInfo) {
         self.info_at = None;
         self.updated_at = now_ms().max(self.updated_at);
-        let (summary, session) = self.snapshot();
+        summary.updated_at = self.updated_at;
         self.ctx.registry.publish(Arc::new(summary.clone()));
         let msg = line(&HubMessage::AcpInfo {
             sid: self.sid.clone(),
@@ -3220,6 +3239,71 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_heads_wait_but_materialized_changes_and_viewer_drops_do_not() {
+        let ctx = Arc::new(Ctx {
+            cfg: serde_json::from_value(json!({
+                "stateDir": "/", "host": "host", "shells": [], "defaultShell": "", "child": {}
+            }))
+            .unwrap(),
+            ident: crate::env::Identity {
+                home: "/".into(),
+                user: "user".into(),
+                logname: "user".into(),
+            },
+            child_umask: rustix::fs::Mode::empty(),
+            registry: Default::default(),
+            started_at: 1,
+            pty_dir: PathBuf::new(),
+            acp_dir: PathBuf::new(),
+            #[cfg(debug_assertions)]
+            test_panic_input: None,
+        });
+        let mut acp = Acp::new(ctx, "a".into(), 1, Arc::default());
+        let viewer = Viewer {
+            id: 1,
+            outq: Arc::default(),
+        };
+        let queue = viewer.outq.clone();
+        lock(&acp.shared.viewers).push(Attached {
+            viewer,
+            backlog: None,
+        });
+        let event = |seq, update| JournalEvent {
+            seq,
+            ts: seq,
+            body: EventBody::Update {
+                update,
+                session_id: None,
+            },
+        };
+        let chunk = || json!({"sessionUpdate": "agent_message_chunk", "content": {"text": "a"}});
+        let title = || json!({"sessionUpdate": "session_info_update", "title": "t"});
+        let head = |acp: &Acp| {
+            let (summary, _) = acp.published.as_ref().unwrap();
+            summary.acp.as_ref().unwrap().head_seq
+        };
+
+        acp.publish();
+        let deadline = Instant::now() + INFO_EVERY;
+        acp.applied(event(1, chunk()));
+        tokio::time::advance(INFO_EVERY / 2).await;
+        acp.applied(event(2, chunk()));
+        assert_eq!((head(&acp), acp.info_at), (0, Some(deadline)));
+        tokio::time::advance(INFO_EVERY / 2).await;
+        acp.flush_info();
+        assert_eq!((head(&acp), acp.info_at), (2, None));
+
+        acp.applied(event(3, title()));
+        assert_eq!((head(&acp), acp.info_at), (3, None));
+        acp.applied(event(4, title()));
+        assert_eq!(head(&acp), 3, "an identical title only advances the head");
+        queue.close();
+        acp.applied(event(5, chunk()));
+        assert_eq!(acp.published.as_ref().unwrap().0.viewers, 0);
+        assert_eq!((head(&acp), acp.info_at), (5, None));
+    }
 
     #[test]
     fn prompt_rules() {
