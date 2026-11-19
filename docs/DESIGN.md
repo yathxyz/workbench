@@ -14,7 +14,7 @@ Edwin (edwind, its frame runtime and "the edwind spec") lives in its own reposit
 | `F-An` | Frontend amendments (§6.1) |
 | `N-n` | Nix and deploy design points (§7) |
 | `T-Sn` | Security regression cases (§9.3) |
-| `Nn` | Frontend `tests/ui.mts` checks. N1-N26 are the baseline checks of that file; new checks are documented as described in §9.5. |
+| `Nn` | Frontend UI suite checks, run by `tests/ui.mts`. N1-N26 are the baseline checks of that suite; new checks are documented as described in §9.5. |
 | `Mn-X` | Build-plan work packages of v1 (§10; the list is in git history) |
 
 ---
@@ -1620,7 +1620,7 @@ The test runs numbered steps. The steps this design pins down:
 ### 9.5 UI checks
 
 Each documented UI check has its own file in [docs/ui-checks/](ui-checks/), named by its check number.
-N1-N26 are the baseline checks of `tests/ui.mts`.
+N1-N26 are the baseline checks of the UI suite run by `tests/ui.mts`.
 N12-N15 were written anew for M5-F.
 
 ### 9.6 v1 acceptance

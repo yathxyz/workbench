@@ -18,7 +18,16 @@ Each amendment or UI check has its own Markdown file, named by its identifier.
 Write one sentence per line in those files. Add a new file for a new amendment or check; do not add it to an index or extend a numbered range.
 
 The orchestrator allocates numbers. The task brief names the `F-A` and `N` numbers the task may use.
-Never pick a number yourself. Ask the orchestrator if you need a number the brief did not assign.
+Never pick an `F-A` or `N` number yourself. Ask the orchestrator if you need one the brief did not assign.
+
+## UI checks
+
+- Add a new check as `tests/ui/sections/NNNN-short-name.mts`. Section files run one at a time in filename order.
+- Pick any unused four-digit prefix after the checks it depends on and below 9000. Prefixes 9000 and up are for checks that must run last.
+- A duplicate prefix, a misnamed section file, or a section file that throws while loading fails the run.
+- Put state shared between sections on the exported `state` object in `tests/ui/shared.mts`.
+- Use `await shot(page, 'name')` to write `name.png` to the `ui` flake check's output.
+- The check's specification is `docs/ui-checks/N<n>.md`, using the number assigned in the brief.
 
 ## Flake checks
 
