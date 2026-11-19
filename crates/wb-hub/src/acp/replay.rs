@@ -12,6 +12,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use wb_proto::journal::{EventBody, JournalEvent};
 
+use super::journal::checkpoint_seq;
+
 /// The `sessionUpdate` variants whose text runs are coalesced.
 const CHUNKS: [&str; 3] = [
     "agent_message_chunk",
@@ -38,7 +40,9 @@ pub struct Replay {
 ///
 /// A `since` above `head` counts as 0; the caller reports that as `reset`. Lines after
 /// `head` are never used, so a line being appended meanwhile does not matter.
-/// `offset` is a validated line boundary at or before the first requested event.
+/// A nonzero `offset` is only a hint: verify the boundary and sequence in the
+/// opened file or restart at zero. A valid seek won't detect in-place corruption
+/// in the skipped prefix that leaves byte positions intact; startup validates it all.
 pub fn scan(
     path: &Path,
     offset: u64,
@@ -54,34 +58,41 @@ pub fn scan(
     };
     let mut replay = Builder::new(since, cap);
     if since < head {
-        let mut file =
-            File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-        if at != 0 {
-            file.seek(SeekFrom::Start(at))?;
-        }
+        let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         let mut reader = BufReader::new(file);
         let mut line = Vec::new();
-        loop {
-            line.clear();
-            let n = reader
-                .read_until(b'\n', &mut line)
-                .with_context(|| format!("cannot read {}", path.display()))?;
-            if line.last() != Some(&b'\n') {
-                break;
+        let mut first = None;
+        if at != 0 {
+            first = seek_checkpoint(&mut reader, at, checkpoint_seq(since) + 1, &mut line);
+            if first.is_none() {
+                reader.rewind()?;
+                at = 0;
             }
+        }
+        loop {
             let bad = || {
                 format!(
                     "{}: the line at byte {at} is not a journal event",
                     path.display()
                 )
             };
-            let text = &line[..n - 1];
-            let seq = serde_json::from_slice::<Seq>(text).with_context(bad)?.seq;
+            let seq = if let Some(seq) = first.take() {
+                seq
+            } else {
+                line.clear();
+                reader
+                    .read_until(b'\n', &mut line)
+                    .with_context(|| format!("cannot read {}", path.display()))?;
+                let Some(text) = line.strip_suffix(b"\n") else {
+                    break;
+                };
+                serde_json::from_slice::<Seq>(text).with_context(bad)?.seq
+            };
             if seq > head {
                 break;
             }
             if seq > since {
-                let ev: JournalEvent = serde_json::from_slice(text).with_context(bad)?;
+                let ev: JournalEvent = serde_json::from_slice(&line).with_context(bad)?;
                 if pending.contains(&seq) {
                     replay.pin(ev);
                 } else {
@@ -91,10 +102,30 @@ pub fn scan(
             if seq == head {
                 break;
             }
-            at += n as u64;
+            at += line.len() as u64;
         }
     }
     Ok(replay.finish())
+}
+
+/// On success `line` holds the first complete record for the scan to consume.
+/// Any failed probe leaves the caller to rewind the same file and scan normally.
+fn seek_checkpoint(
+    reader: &mut BufReader<File>,
+    offset: u64,
+    expected_seq: u64,
+    line: &mut Vec<u8>,
+) -> Option<u64> {
+    reader.seek(SeekFrom::Start(offset - 1)).ok()?;
+    if !reader.fill_buf().ok()?.starts_with(b"\n") {
+        return None;
+    }
+    reader.consume(1);
+    reader.read_until(b'\n', line).ok()?;
+    let seq = serde_json::from_slice::<Seq>(line.strip_suffix(b"\n")?)
+        .ok()?
+        .seq;
+    (seq == expected_seq).then_some(seq)
 }
 
 /// The seq of a line, read without building the rest of the event.

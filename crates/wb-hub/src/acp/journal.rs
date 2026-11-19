@@ -28,6 +28,11 @@ const HUB_RESTART: &str = "interrupted by a hub restart";
 /// One byte offset per 128 committed lines, rebuilt by the validation pass at open.
 const CHECKPOINT_STRIDE: u64 = 128;
 
+/// Last indexed sequence at or before `since` (zero before the first checkpoint).
+pub(super) fn checkpoint_seq(since: u64) -> u64 {
+    since - since % CHECKPOINT_STRIDE
+}
+
 fn checkpoint(offsets: &mut Vec<u64>, seq: u64, end: u64) {
     if seq.is_multiple_of(CHECKPOINT_STRIDE) {
         offsets.push(end);
@@ -186,13 +191,14 @@ impl Journal {
         self.head
     }
 
-    /// A line boundary at or before the first event requested by this cursor.
+    /// An offset hint after `checkpoint_seq(since)`, or zero if not indexed.
     pub fn replay_offset(&self, since: u64) -> u64 {
-        debug_assert!(since <= self.head);
-        match since / CHECKPOINT_STRIDE {
-            0 => 0,
-            block => self.offsets[block as usize - 1],
-        }
+        let block = checkpoint_seq(since) / CHECKPOINT_STRIDE;
+        block
+            .checked_sub(1)
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| self.offsets.get(i).copied())
+            .unwrap_or(0)
     }
 
     /// One `pwrite(2)` of `bytes` at the end of the last complete line; a short write
@@ -477,6 +483,59 @@ mod tests {
         check(&j);
         drop(j);
         check(&Journal::open(&path, drop).unwrap());
+    }
+
+    #[test]
+    fn stale_replay_checkpoint_cannot_skip_requested_records() {
+        use super::super::replay::scan;
+
+        let path = fresh_dir("seek-shift").join("s.jsonl");
+        let since = CHECKPOINT_STRIDE;
+        let head = since + 2;
+        let mut journal = Journal::open(&path, drop).unwrap();
+        for seq in 1..=head {
+            journal.append(prompt(), seq).unwrap();
+        }
+        let boundary = journal.replay_offset(since) as usize;
+        drop(journal);
+        let compact = fs::read(&path).unwrap();
+        let tail = &compact[boundary..];
+        let next_len = tail.iter().position(|&b| b == b'\n').unwrap() + 1;
+        let full = scan(&path, 0, since, head, &[], usize::MAX).unwrap();
+        assert!(full.events.iter().map(|e| e.seq).eq(since + 1..=head));
+
+        // Index a longer first record, then shorten it without changing any seq.
+        // The stale offset lands inside record 129, on record 130, or at EOF.
+        for shift in [1, next_len, tail.len()] {
+            let mut padded = vec![b' '; shift];
+            padded.extend_from_slice(&compact);
+            fs::write(&path, padded).unwrap();
+            let journal = Journal::open(&path, drop).unwrap();
+            let offset = journal.replay_offset(since);
+            assert_eq!(offset as usize, boundary + shift);
+            fs::write(&path, &compact).unwrap();
+            assert_eq!(
+                scan(&path, offset, since, head, &[], usize::MAX).unwrap(),
+                full
+            );
+        }
+    }
+
+    #[test]
+    fn missing_replay_checkpoint_scans_from_zero() {
+        let path = fresh_dir("seek-missing").join("s.jsonl");
+        let mut journal = Journal::open(&path, drop).unwrap();
+        let since = CHECKPOINT_STRIDE;
+        for seq in 1..=since + 1 {
+            journal.append(prompt(), seq).unwrap();
+        }
+        journal.offsets.clear();
+        let offset = journal.replay_offset(since);
+        assert_eq!(offset, 0);
+        let replay =
+            super::super::replay::scan(&path, offset, since, journal.len(), &[], usize::MAX)
+                .unwrap();
+        assert!(replay.events.iter().map(|e| e.seq).eq([since + 1]));
     }
 
     #[test]

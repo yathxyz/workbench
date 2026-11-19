@@ -65,15 +65,17 @@ The stream wrote 5.41 journal bytes per raw chunk-text byte (376,832 raw bytes; 
 
 Same harness and release compiler (rustc 1.98.1), private instances, five AB/BA pairs for each workload. B = original, F = final. Wall-clock samples per binary: 40,960 chunks, 320 permission answers, 320 large outputs, 100 full and 100 recent attaches, 80 lists, 80 watches, 640 changes, five restores, 120 PTY bursts. For event metrics the table gives the median of five per-run percentiles; the last columns show the full range of per-run medians. For restore, percentiles are across the five process starts themselves. At 16 or 20 samples/run a p99 is the slowest sample, not a precise estimate of a population tail.
 
+The replay rows below are a fresh comparison of the same original binary against the checked seek, including fresh allocation and trace passes. Other workloads retain their original runs. Across all five replay pairs the checked binary read exactly 188,793,341 bytes per mixed run: 20 bytes more than the unchecked seek, one preceding byte per indexed attach. Each complete first record is reused rather than read or parsed for its sequence twice.
+
 | Latency (ms) | B p50 / p95 / p99 | F p50 / p95 / p99 | B p50 range | F p50 range |
 |---|---:|---:|---:|---:|
 | agent_chunk_to_client | 1.65 / 6.04 / 9.6 | 0.94 / 3.65 / 5.82 | 1.56–2.35 | 0.65–1.2 |
 | answer_to_agent | 1.68 / 4.27 / 8.09 | 1.12 / 2.4 / 3.03 | 1.42–2.15 | 1.03–1.29 |
 | agent_output_to_client | 14.74 / 30.68 / 36.84 | 16.09 / 24.92 / 33.59 | 13.92–17.47 | 12.75–19.94 |
-| full_first_replay | 22.77 / 27.17 / 28.8 | 23.57 / 30.25 / 36.06 | 20.04–25.18 | 19.52–25.43 |
-| near_head_first_replay | 6.38 / 9.01 / 10.22 | 2.04 / 3.01 / 3.02 | 6.05–7.3 | 0.92–2.85 |
-| full_complete | 43.99 / 54.24 / 59.59 | 43.05 / 53.91 / 66.39 | 38.33–47.52 | 35.96–44.91 |
-| near_head_complete | 6.53 / 9.16 / 10.47 | 2.18 / 3.15 / 3.16 | 6.16–7.45 | 1.08–2.98 |
+| full_first_replay | 7.019 / 8.539 / 8.614 | 6.899 / 8.307 / 9.478 | 6.957–7.093 | 6.778–6.969 |
+| near_head_first_replay | 2.176 / 2.394 / 2.478 | .302 / .442 / .445 | 2.052–2.422 | .265–.360 |
+| full_complete | 11.663 / 15.698 / 16.007 | 11.431 / 15.282 / 17.158 | 11.542–13.515 | 11.169–14.118 |
+| near_head_complete | 2.265 / 2.450 / 2.526 | .351 / .521 / .560 | 2.154–2.514 | .323–.467 |
 | list | 9.57 / 13.32 / 13.32 | 6.17 / 9.19 / 9.19 | 9.37–10.36 | 5.93–6.64 |
 | watch | 9.86 / 14.19 / 14.19 | 6.13 / 9.53 / 9.53 | 9.47–10.31 | 6.01–6.66 |
 | change_delivery | 2.22 / 7.79 / 10.67 | 2.13 / 6.96 / 8.79 | 2.12–3.09 | 1.88–2.5 |
@@ -84,25 +86,27 @@ Same harness and release compiler (rustc 1.98.1), private instances, five AB/BA 
 |---|---:|---:|---:|---:|---:|---:|
 | stream | 869.8 [845.9–892.5] | 226.4 [214.7–236.7] | 11444 | 11068 | 9284.5 [8998–9486.8] | 9454.2 [9392.5–9517.6] |
 | large | 438.1 [424.8–460.5] | 390.7 [350.2–421] | 15520 | 13300 | 43.9 [41.6–47.9] | 46.6 [36.9–55.7] |
-| replay | 622.8 [610.7–720] | 614.9 [501.9–632.2] | 18376 | 18616 | 88.4 [75.9–101.3] | 91.4 [84.5–96.8] |
+| replay | 294.6 [292.0–318.9] | 253.4 [247.7–275.1] | 17356 | 16556 | 309.8 [291.7–323.7] | 315.6 [288.5–333.8] |
 | fleet | 209.9 [206.3–225.3] | 94.1 [87.3–101.2] | 33628 | 30212 | 323.9 [302.1–337.9] | 454.6 [390.6–476.7] |
 | restore | 167.1 [162.6–186.8] | 107.9 [106.6–112.7] | 84428 | 7632 | 402.5 [306.4–447.7] | 628.7 [583–704.9] |
 | pty | 285.8 [250.2–299.9] | 268.8 [245–292.9] | 17596 | 17260 | 3.9 [2.9–6.7] | 4.1 [3.2–5.3] |
 
-Throughput: chunks/s for stream, changes/s for fleet, MiB/s otherwise. Replay throughput above is full-cursor only; recent replay 4.33 [4.10–5.05] → 14.05 [12.19–29.77] MiB/s. Restore CPU/HWM are sampled at socket ready. Before any attach or snapshot in the mixed fleet, RSS was 19,488 [19,084–19,776] → 19,428 [19,364–19,584] KiB: **no demonstrated detached steady-state saving**. Time to the first complete fleet list 306 [182–350] → 242 [191–339] ms; overlap. Stream still delivered 216 info/432 watch updates and wrote 2,039,592 journal bytes (medians); large still delivered 96 info updates and wrote 52,801,904 bytes.
+Throughput: chunks/s for stream, changes/s for fleet, MiB/s otherwise. Replay throughput above is full-cursor only; recent replay 14.10 [11.65–14.80] → 80.81 [65.76–95.13] MiB/s. Restore CPU/HWM are sampled at socket ready. Before any attach or snapshot in the mixed fleet, RSS was 19,488 [19,084–19,776] → 19,428 [19,364–19,584] KiB: **no demonstrated detached steady-state saving**. Time to the first complete fleet list 306 [182–350] → 242 [191–339] ms; overlap. Stream still delivered 216 info/432 watch updates and wrote 2,039,592 journal bytes (medians); large still delivered 96 info updates and wrote 52,801,904 bytes.
 
 | Workload | B alloc k calls / MB | F alloc k calls / MB | B logical R/W/storage W (MB) | F logical R/W/storage W (MB) | B runnable delay ms | F runnable delay ms | F trace pwrite/data-sync/fsync/futex |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | stream | 7640 / 803.1 | 630.9 / 82.4 | 2.359/2.05/2.097 | 2.359/2.049/2.097 | 1224.5 | 748 | 8488/32/88/2883 |
 | large | 354.8 / 462.6 | 144.1 / 390 | 52.804/52.808/52.937 | 52.804/52.808/52.937 | 579.5 | 514.5 | 195/35/9/1098 |
-| replay | 516.8 / 501.3 | 500.5 / 500.9 | 342.763/0.014/0 | 188.793/0.013/0 | 595.3 | 554.4 | 0/1/2/8385 |
+| replay | 516.8 / 501.3 | 500.4 / 500.8 | 342.763/0.031/0 | 188.793/0.032/0 | .70 | .17 | 0/1/2/13569 |
 | fleet | 1260 / 247.8 | 410.6 / 131.1 | 0/0.009/0.131 | 0/0.009/0.131 | 407.2 | 384.2 | 128/384/512/10910 |
 | restore | 226.6 / 353.2 | 226 / 350.8 | 86.129/0/0 | 86.129/0/0 | 47.2 | 39.8 | 0/8/16/204 |
 | pty | 124.5 / 280.9 | 123.8 / 280.7 | 6.488/0.021/0.004 | 6.488/0.021/0.004 | 1703.9 | 1398.2 | 0/0/8/3371 |
 
-All storage-accounted reads were zero in this warm-cache comparison. Storage bytes are dirty-byte accounting, not a device write-amplification estimate. No direct lock-residence measurements; the fleet update delivery distribution includes queueing during list/watch. Whole-run baseline futex counts in table order: 3,771, 1,093, 11,919, 10,866, 275, 5,917. Small differences in PTY syscall/frame counts depend on how reads split and how long the process lives (snapshot timers). No throughput claim from an instrumented run.
+All storage-accounted reads were zero in this warm-cache comparison. Storage bytes are dirty-byte accounting, not a device write-amplification estimate. No direct lock-residence measurements; the fleet update delivery distribution includes queueing during list/watch. Whole-run baseline futex counts in table order: 3,771, 1,093, 13,809, 10,866, 275, 5,917. Small differences in PTY syscall/frame counts depend on how reads split and how long the process lives (snapshot timers). No throughput claim from an instrumented run.
 
-**Regressions and noise.** Large-tool p50 moved 14.74 → 16.09 ms despite lower CPU and better p95; both medians lie within the other binary's range. Full replay first-event p99 rose 28.80 [25.01–37.69] → 36.06 [29.17–47.99] ms; completion p99 59.59 [54.40–70.60] → 66.39 [53.15–70.65] ms, and peak RSS rose 240 KiB. No full-attach improvement claimed. PTY burst p95 was flat to slightly worse (109.45 → 109.66 ms). Both binaries ran far slower than the initial PTY baseline with much more scheduler delay; ranges overlap and no PTY-output optimization landed. CPU, allocation traffic, replay reads and restore memory are stronger evidence than unpaired wall-clock comparisons.
+**Regressions and noise.** Large-tool p50 moved 14.74 → 16.09 ms despite lower CPU and better p95; both medians lie within the other binary's range. Full replay first-event p99 rose 8.614 [7.247–10.938] → 9.478 [8.420–10.483] ms; completion p99 16.007 [14.668–18.230] → 17.158 [15.214–18.588] ms. Ranges overlap; no full-attach improvement claimed. PTY burst p95 was flat to slightly worse (109.45 → 109.66 ms). Both binaries ran far slower than the initial PTY baseline with much more scheduler delay; ranges overlap and no PTY-output optimization landed. CPU, allocation traffic, replay reads and restore memory are stronger evidence than unpaired wall-clock comparisons.
+
+**Replay seek trade-off.** An indexed attach checks the preceding newline and the first complete record's sequence in the file it actually opened; a missing checkpoint or failed probe means scanning that file from byte zero. A valid seek does not detect corruption in an earlier, unrequested record when byte positions are intact. The former scan parsed every preceding record's sequence. Startup still validates the entire journal.
 
 ## Decisions that need an owner
 
@@ -113,6 +117,6 @@ All storage-accounted reads were zero in this warm-cache comparison. Storage byt
 
 ## Verification
 
-`export BASH=$(command -v bash); cargo test --offline -p wb-hub -- --test-threads=4`: 326 passed (179 unit, 101 ACP, 3 config limit, 37 PTY, 6 worktree); `peer_probe` is an ignored subprocess helper. Includes `replay_crosses_checkpoints_after_a_write_fault_and_reload` and `stream_heads_wait_but_materialized_changes_and_viewer_drops_do_not`. All six end-to-end workload validators passed with both release binaries in every final comparison.
+`export BASH=$(command -v bash); cargo test --offline -p wb-hub -- --test-threads=4`: 328 passed (181 unit, 101 ACP, 3 config limit, 37 PTY, 6 worktree); `peer_probe` is an ignored subprocess helper. The checkpoint regression cases shorten record 1 so the old offset hits the interior of record 129, the start of 130 or EOF; each replay matches a scan from zero, including `from` and the returned events. A missing index entry also replays from zero. All six original workload comparisons passed; after adding the seek validation, the replay workload passed again for both binaries in all five pairs.
 
 `nix build --no-link .#checks.x86_64-linux.<name>`, one check at a time after the hub tests: `package`, `clippy`, `fmt`, `web-keys`, `typecheck`, `edit-address`, `conformance`, `security`, `ui`, `adapters`, `vm`, `module`. All twelve passed; none skipped or blocked.
