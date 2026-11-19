@@ -1,10 +1,12 @@
 //! The hub must keep reading a session's mailbox while git holds an operation open.
 
 mod common;
+#[path = "common/script.rs"]
+mod executable;
 
 use std::env;
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -51,11 +53,11 @@ fn fixture(pause: &str) -> Hub {
             .unwrap();
         let shim = dir.join("git");
         symlink(program("git"), dir.join("git.real")).unwrap();
-        fs::write(
+        executable::write(
+            Path::new(cfg["shells"][0]["paths"][0].as_str().unwrap()),
             &shim,
-            format!(
-                r#"#!{}
-export GIT_CONFIG_NOSYSTEM=1
+            &format!(
+                r#"export GIT_CONFIG_NOSYSTEM=1
 case " $* " in
     *' worktree {pause} '*)
         if [ '{pause}' = add ]; then "$0.real" "$@" || exit $?; fi
@@ -65,12 +67,9 @@ case " $* " in
         if [ '{pause}' = add ]; then exit 0; fi ;;
 esac
 exec "$0.real" "$@"
-"#,
-                cfg["shells"][0]["paths"][0].as_str().unwrap()
+"#
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         cfg["agents"]["missing"] = json!({"label": "Missing", "argv": [dir.join("not-installed")]});
         cfg["git"] = json!(shim);
     });

@@ -1,9 +1,12 @@
-use std::fs::{self, Permissions};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::*;
+
+#[path = "../../../tests/common/script.rs"]
+mod executable;
 
 fn program(name: &str) -> PathBuf {
     env::split_paths(&env::var_os("PATH").unwrap())
@@ -107,8 +110,7 @@ async fn create(
 }
 
 fn script(path: &Path, body: &str) {
-    fs::write(path, format!("#!{}\n{body}\n", program("sh").display())).unwrap();
-    fs::set_permissions(path, Permissions::from_mode(0o700)).unwrap();
+    executable::write(&program("sh"), path, body);
 }
 
 #[tokio::test]
