@@ -59,7 +59,7 @@ fn summary_acp() -> Value {
             "last": {"seq": 790, "ts": 1791460100000u64, "outcome": "end_turn", "error": null},
             "headSeq": 815, "seenSeq": 790,
             "title": "Fix flaky test",
-            "modeId": "default", "configOptions": []
+            "modeId": "default", "configOptions": [], "task": "issue 44"
         }
     })
 }
@@ -93,7 +93,7 @@ fn server_hello() {
         "agents": [{"name": "claude", "label": "Claude"}, {"name": "codex", "label": "Codex"}],
         "shells": ["bash", "nu", "zsh"], "defaultShell": "bash",
         "hosts": [{"name": "laptop", "agents": [{"name": "pi", "label": "pi"}]}],
-        "acpConfig": true, "acpWorktree": true
+        "acpConfig": true, "acpWorktree": true, "acpTask": true
     }));
     let HubMessage::Hello {
         proto,
@@ -105,6 +105,7 @@ fn server_hello() {
         hosts,
         acp_config,
         acp_worktree,
+        acp_task,
         ..
     } = msg
     else {
@@ -118,6 +119,7 @@ fn server_hello() {
     assert_eq!(default_shell, "bash");
     assert!(acp_config);
     assert!(acp_worktree);
+    assert!(acp_task);
     assert_eq!(
         hosts,
         [Host {
@@ -135,7 +137,7 @@ fn server_hello_without_build() {
     let msg: HubMessage = round_trip(json!({
         "t": "hello", "proto": 1, "server": "wb-hub", "version": "0.1.0",
         "host": "example", "pid": 1234, "startedAt": 1791460000000u64, "agents": [],
-        "shells": [], "defaultShell": "bash", "hosts": [], "acpConfig": true
+        "shells": [], "defaultShell": "bash", "hosts": [], "acpConfig": true, "acpTask": true
     }));
     assert!(matches!(msg, HubMessage::Hello { build: None, .. }));
 }
@@ -153,6 +155,7 @@ fn server_hello_from_an_older_hub_without_shells_or_hosts() {
         hosts,
         acp_config,
         acp_worktree,
+        acp_task,
         ..
     } = &msg
     else {
@@ -163,6 +166,7 @@ fn server_hello_from_an_older_hub_without_shells_or_hosts() {
     assert!(hosts.is_empty());
     assert!(!acp_config);
     assert!(!acp_worktree);
+    assert!(!acp_task);
     // A newer hub always sends these fields.
     let back: Value = serde_json::from_slice(&line::encode(&msg)).unwrap();
     assert_eq!(back["shells"], json!([]));
@@ -311,6 +315,7 @@ fn summaries() {
     assert_eq!(acp.last.unwrap().outcome, "end_turn");
     assert_eq!((acp.head_seq, acp.seen_seq), (815, 790));
     assert_eq!(acp.mode_id.as_deref(), Some("default"));
+    assert_eq!(acp.task.as_deref(), Some("issue 44"));
 
     let s: Summary = round_trip(summary_acp_fresh_faulted());
     assert_eq!(s.fault.unwrap().code, FaultCode::JournalWrite);
@@ -869,6 +874,33 @@ fn worktree_branch_and_base_have_the_same_restricted_grammar() {
 }
 
 #[test]
+fn task_reference_bounds_and_normalization() {
+    let full = "é".repeat(wb_proto::limits::TASK_MAX / 2);
+    let padded = format!("  {full}  ");
+    assert_eq!(normalize_task(&padded), Ok(Some(full.as_str())));
+    assert!(normalize_task(&format!("{full}a")).is_err());
+    assert_eq!(normalize_task(" \u{2003} "), Ok(None));
+    assert_eq!(normalize_task(" مهمة 44 "), Ok(Some("مهمة 44")));
+    for c in [
+        '\0'..='\u{1f}',
+        '\u{7f}'..='\u{9f}',
+        '\u{061c}'..='\u{061c}',
+        '\u{200e}'..='\u{200f}',
+        '\u{2028}'..='\u{202e}',
+        '\u{2066}'..='\u{2069}',
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(
+            normalize_task(&format!("task{c}")).is_err(),
+            "U+{:04X}",
+            c as u32
+        );
+    }
+}
+
+#[test]
 fn acp_spawn_config_preserves_order_and_duplicates() {
     let req: HubRequest = round_trip(json!({
         "t": "acp.open", "rid": 8, "sid": "n_agent1", "since": 0,
@@ -915,7 +947,7 @@ fn acp_spawn_config_preserves_order_and_duplicates() {
 fn acp_open_requests() {
     let req: HubRequest = round_trip(json!({
         "t": "acp.open", "rid": 8, "sid": "n_agent1", "since": 0,
-        "spawn": {"agent": "claude", "cwd": "/home/alice/proj/x"}
+        "spawn": {"agent": "claude", "cwd": "/home/alice/proj/x", "task": "issue 44"}
     }));
     assert_eq!(
         req,
@@ -930,6 +962,8 @@ fn acp_open_requests() {
                 host: None,
                 config: Vec::new(),
                 worktree: None,
+                task: Some("issue 44".into()),
+                policy: None,
             })
         }
     );
@@ -1153,6 +1187,14 @@ fn acp_requests() {
             },
         ),
         (
+            json!({"t": "acp.set_task", "rid": 23, "sid": "n_agent1", "task": null}),
+            HubRequest::AcpSetTask {
+                rid: 23,
+                sid: sid(),
+                task: None,
+            },
+        ),
+        (
             json!({"t": "acp.seen", "rid": 18, "sid": "n_agent1", "seq": 815}),
             HubRequest::AcpSeen {
                 rid: 18,
@@ -1216,6 +1258,7 @@ fn acp_requests_need_their_fields() {
         r#"{"t":"acp.set_config_option","rid":1,"sid":"n_1","configId":"model","value":"small"}"#,
         r#"{"t":"acp.set_config_option","rid":1,"sid":"n_1","epoch":3,"value":"small"}"#,
         r#"{"t":"acp.set_config_option","rid":1,"sid":"n_1","epoch":3,"configId":"model"}"#,
+        r#"{"t":"acp.set_task","rid":1,"sid":"n_1"}"#,
         r#"{"t":"acp.seen","rid":1,"sid":"n_1"}"#,
         r#"{"t":"acp.kill","rid":1,"sid":"n_1"}"#,
     ] {
@@ -1277,4 +1320,73 @@ fn acp_ev_with_an_unknown_event_kind() {
         panic!("{msg:?}")
     };
     assert_eq!((ev.seq, ev.ts, ev.body), (5, 6, EventBody::Unknown));
+}
+
+#[test]
+fn acp_policy_wire_contract_and_legacy_defaults() {
+    let rules = json!({"rules":[{"action":"allow","kinds":["read"],"roots":["$cwd"]}]});
+    let spawn: SpawnAcp = round_trip(json!({
+        "agent":"claude", "cwd":"/work", "policy":rules
+    }));
+    assert_eq!(serde_json::to_value(spawn.policy.unwrap()).unwrap(), rules);
+    let legacy: SpawnAcp = round_trip(json!({"agent":"claude", "cwd":"/work"}));
+    assert_eq!(legacy.policy, None);
+    assert!(
+        serde_json::from_value::<SpawnAcp>(json!({
+            "agent":"claude", "cwd":"/work", "policy":null
+        }))
+        .is_err()
+    );
+    let empty: SpawnAcp = round_trip(json!({
+        "agent":"claude", "cwd":"/work", "policy":{"rules":[]}
+    }));
+    assert!(empty.policy.unwrap().rules.is_empty());
+
+    let req: HubRequest = round_trip(json!({
+        "t":"acp.set_policy", "rid":24, "sid":"n_agent1", "epoch":42,
+        "policy":rules
+    }));
+    assert!(matches!(
+        req,
+        HubRequest::AcpSetPolicy {
+            rid: 24,
+            epoch: 42,
+            ..
+        }
+    ));
+    let clear: HubRequest = round_trip(json!({
+        "t":"acp.set_policy", "rid":25, "sid":"n_agent1", "epoch":42,
+        "policy":{"rules":[]}
+    }));
+    let HubRequest::AcpSetPolicy { policy, .. } = clear else {
+        panic!("{clear:?}")
+    };
+    assert!(policy.rules.is_empty());
+    for malformed in [json!(null), json!({}), json!({"rules":[], "typo":true})] {
+        assert!(
+            serde_json::from_value::<HubRequest>(json!({
+                "t":"acp.set_policy", "rid":26, "sid":"n_agent1", "epoch":42,
+                "policy":malformed
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn acp_facts_policy_is_optional_and_empty_is_canonicalized() {
+    let legacy: Summary = round_trip(summary_acp());
+    assert_eq!(legacy.acp.unwrap().policy, None);
+    let mut wire = summary_acp();
+    wire["acp"]["policy"] = json!({"rules":[{"action":"reject"}]});
+    let summary: Summary = round_trip(wire);
+    assert_eq!(summary.acp.unwrap().policy.unwrap().rules.len(), 1);
+
+    for empty in [json!({"rules":[]}), Value::Null] {
+        let mut wire = summary_acp();
+        wire["acp"]["policy"] = empty;
+        let summary: Summary = serde_json::from_value(wire).unwrap();
+        assert_eq!(summary.acp.as_ref().unwrap().policy, None);
+        assert_eq!(serde_json::to_value(summary).unwrap(), summary_acp());
+    }
 }

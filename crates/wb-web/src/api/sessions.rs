@@ -15,10 +15,11 @@ use serde_json::{Value, json};
 use tokio::time::timeout;
 use wb_proto::hub::{
     AcpOpenReply, ConfigOption, ConfigValue, ErrorCode, HubMessage, HubRequest, Kind, SpawnAcp,
-    Summary, WorktreeRequest,
+    Summary, WorktreeRequest, normalize_task,
 };
 use wb_proto::journal::{EventBody, JournalEvent};
 use wb_proto::limits::{ACP_CONFIG_MAX, CAPTURE_MAX, GIT_TIMEOUT, GIT_WORKTREE_TIMEOUT};
+use wb_proto::policy::Policy;
 
 use super::{ApiState, Control, Read};
 use crate::AppState;
@@ -49,6 +50,8 @@ pub fn routes() -> Router<ApiState> {
         .route("/sessions/{sid}/elicitation", post(elicitation))
         .route("/sessions/{sid}/mode", post(mode))
         .route("/sessions/{sid}/config", post(config))
+        .route("/sessions/{sid}/task", post(set_task))
+        .route("/sessions/{sid}/policy", post(policy))
         .route("/sessions/{sid}/revive", post(revive))
         .route("/sessions/{sid}/worktree", delete(remove_worktree))
 }
@@ -114,8 +117,10 @@ fn require_worktree(info: &HubInfo) -> Result<(), ApiError> {
 async fn act(app: &AppState, req: HubRequest, wait: Duration) -> Result<Json<Value>, ApiError> {
     let call = async {
         let (mut conn, info) = connect(app).await?;
-        if matches!(req, HubRequest::AcpRemoveWorktree { .. }) {
-            require_worktree(&info)?;
+        match req {
+            HubRequest::AcpRemoveWorktree { .. } => require_worktree(&info)?,
+            HubRequest::AcpSetTask { .. } => require_task(&info)?,
+            _ => {}
         }
         conn.request(&req, RID).await.map_err(call_error)
     };
@@ -137,6 +142,14 @@ fn sid_of(id: String) -> Result<String, ApiError> {
 /// The body as the JSON an endpoint takes, or 400.
 fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
     serde_json::from_slice(body).map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "bad body"))
+}
+
+/// Require named fields for task references: a positional `[null]` must not clear one.
+fn parse_object<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
+    if !body.trim_ascii_start().starts_with(b"{") {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "bad body"));
+    }
+    parse(body)
 }
 
 async fn info(_: Read, State(api): State<ApiState>) -> Json<Value> {
@@ -307,6 +320,10 @@ struct Create {
     config: StartConfig,
     #[serde(default, deserialize_with = "WorktreeRequest::deserialize_option")]
     worktree: Option<WorktreeRequest>,
+    #[serde(default, deserialize_with = "deserialize_task")]
+    task: Option<String>,
+    #[serde(default, deserialize_with = "wb_proto::policy::deserialize_optional")]
+    policy: Option<Policy>,
 }
 
 /// JSON member order matters: changing a model may change the remaining options.
@@ -340,6 +357,40 @@ impl<'de> Deserialize<'de> for StartConfig {
     }
 }
 
+/// Shared by create (optional member) and set (required, nullable member).
+fn deserialize_task<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    struct Task;
+    impl Visitor<'_> for Task {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a task string or null")
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+            normalize_task(s)
+                .map(|task| task.map(str::to_owned))
+                .map_err(E::custom)
+        }
+    }
+    d.deserialize_any(Task)
+}
+
+fn require_task(info: &HubInfo) -> Result<(), ApiError> {
+    if info.acp_task {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "hub does not support session tasks",
+        ))
+    }
+}
+
 /// `api_` and 16 random hex digits.
 fn random_sid() -> std::io::Result<String> {
     let mut bytes = [0u8; 8];
@@ -370,7 +421,10 @@ async fn create(
     State(api): State<ApiState>,
     Body(body): Body,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let body: Create = parse(&body)?;
+    let body: Create = parse_object(&body)?;
+    if let Some(policy) = &body.policy {
+        validate_policy(policy)?;
+    }
     let sid = match body.sid {
         Some(sid) => sid_of(sid)?,
         None => random_sid().map_err(|e| {
@@ -409,6 +463,9 @@ async fn create(
                 ));
             }
         }
+        if body.task.is_some() {
+            require_task(&info)?;
+        }
         let req = HubRequest::AcpOpen {
             rid: RID,
             sid: sid.clone(),
@@ -420,6 +477,8 @@ async fn create(
                 host,
                 config,
                 worktree: body.worktree,
+                task: body.task,
+                policy: body.policy,
             }),
         };
         let reply = conn.request(&req, RID).await.map_err(call_error)?;
@@ -588,6 +647,60 @@ async fn config(
     act(&api.app, req, CONFIG_TIMEOUT).await
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetTask {
+    #[serde(deserialize_with = "deserialize_task")]
+    task: Option<String>,
+}
+
+async fn set_task(
+    _: Control,
+    State(api): State<ApiState>,
+    Param(id): Param<String>,
+    Body(body): Body,
+) -> Result<Json<Value>, ApiError> {
+    let sid = sid_of(id)?;
+    let body: SetTask = parse_object(&body)?;
+    let req = HubRequest::AcpSetTask {
+        rid: RID,
+        sid,
+        task: body.task,
+    };
+    act(&api.app, req, REPLY_TIMEOUT).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetPolicy {
+    policy: Policy,
+}
+
+fn validate_policy(policy: &Policy) -> Result<(), ApiError> {
+    policy
+        .validate()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "bad body"))
+}
+
+async fn policy(
+    _: Control,
+    State(api): State<ApiState>,
+    Param(id): Param<String>,
+    Body(body): Body,
+) -> Result<Json<Value>, ApiError> {
+    let sid = sid_of(id)?;
+    let body: SetPolicy = parse(&body)?;
+    validate_policy(&body.policy)?;
+    let epoch = summary(&api.app, &sid)?.created_at;
+    let req = HubRequest::AcpSetPolicy {
+        rid: RID,
+        sid,
+        epoch,
+        policy: body.policy,
+    };
+    act(&api.app, req, REPLY_TIMEOUT).await
+}
+
 async fn revive(
     _: Control,
     State(api): State<ApiState>,
@@ -711,6 +824,7 @@ mod tests {
             agents: Vec::new(),
             acp_config: true,
             acp_worktree: true,
+            acp_task: true,
             hosts: hosts
                 .iter()
                 .map(|name| Host {

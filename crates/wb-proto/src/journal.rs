@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::hub::ExitReason;
+use crate::policy::{Policy, PolicyMatch};
 
 /// One journal line, also the `ev` of an `acp.ev` event.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -88,6 +89,14 @@ pub enum EventBody {
         outcome: Value,
         by: ResolvedBy,
     },
+    /// A permission request answered by policy atomically, never pending.
+    #[serde(rename = "permission_auto")]
+    PermissionAuto {
+        tool_call: Value,
+        options: Vec<Value>,
+        outcome: Value,
+        policy: PolicyMatch,
+    },
     /// `elicitation/create` arrived, its params verbatim. Its `req` is this event's
     /// `seq`.
     #[serde(rename = "elicitation")]
@@ -108,6 +117,15 @@ pub enum EventBody {
     /// `session/set_config_option` succeeded; the full agent-provided list.
     #[serde(rename = "config")]
     Config { config_options: Value },
+    /// The task reference was set (at creation or later) or explicitly cleared.
+    #[serde(rename = "task")]
+    Task {
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        task: Option<String>,
+    },
+    /// The complete replacement permission policy; an empty list clears it.
+    #[serde(rename = "policy")]
+    Policy { policy: Policy },
     /// A note from the hub, such as the revive method or the agent's last stderr line.
     #[serde(rename = "notice")]
     Notice { level: NoticeLevel, text: String },

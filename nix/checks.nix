@@ -35,6 +35,8 @@ let
       ../tests
       ../tools/vendor-entry.js
       ../tools/strip.mts
+      ../docs/DESIGN.md
+      ../crates/wb-proto/tests/fixtures/design-policies.json
     ];
   };
   # fast-check for the address properties and the TypeScript tools: dev dependencies pinned in
@@ -139,10 +141,12 @@ in
   # tsc --strict over the TypeScript: the page (web/tsconfig.json and tsconfig.sw.json) and the suites
   # (tests/tsconfig.json). Node and tools/strip.mts only strip the types; this checks them. The page's library
   # types come from the vendored packages (tools/vendor-entry.js).
+  # Policy examples agree with the crate fixture here, without making Rust depend on docs.
   typecheck = pkgs.runCommand "workbench-typecheck" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
     cp -r ${typed} src && chmod -R u+w src && cd src
     ln -s ${devDeps}/node_modules tools/node_modules
     for p in web web/tsconfig.sw.json tests; do node tools/node_modules/typescript/bin/tsc -p $p; done
+    node --test tests/design-policies.test.mts
     touch $out
   '';
 

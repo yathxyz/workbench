@@ -44,6 +44,7 @@ use wb_proto::journal::{
 use wb_proto::limits::{
     ACP_CONFIG_MAX, ACP_REPLAY_MAX, CONN_QUEUE, PROMPT_MAX, SETUP_IDLE_TIMEOUT,
 };
+use wb_proto::policy::{CompiledPolicy, Policy, PolicyMatch};
 
 use self::agent::{Agent, Out};
 use self::facts::Facts;
@@ -59,6 +60,8 @@ use crate::{Ctx, lock, now_ms};
 
 /// Longest `cwd` of a spawn on another host, in bytes.
 const REMOTE_CWD_MAX: usize = 4096;
+
+const INVALID_POLICY_NOTICE: &str = "stored permission policy is no longer valid and was cleared during replay; requests ask unless a later valid policy is set";
 
 /// How long `session/set_mode` may take.
 const SET_MODE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -150,6 +153,11 @@ pub enum Act {
         config_id: String,
         value: Value,
     },
+    SetTask(Option<String>),
+    SetPolicy {
+        epoch: u64,
+        policy: Policy,
+    },
     Seen(u64),
     Revive,
     Authenticate(String),
@@ -180,9 +188,13 @@ impl Cmd {
 /// registers the session and starts its actor.
 ///
 /// Boxed because a forgotten actor routes its queued opens through here again.
-pub fn open(ctx: Arc<Ctx>, sid: String, open: Open) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+pub fn open(
+    ctx: Arc<Ctx>,
+    sid: String,
+    mut open: Open,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     Box::pin(async move {
-        if let Some(spawn) = &open.spawn {
+        if let Some(spawn) = &mut open.spawn {
             if spawn.config.len() > ACP_CONFIG_MAX {
                 return open
                     .reply
@@ -209,6 +221,15 @@ pub fn open(ctx: Arc<Ctx>, sid: String, open: Open) -> Pin<Box<dyn Future<Output
                     return open.reply.err(ErrorCode::BadRequest, NO_WORKTREE_GIT);
                 }
             }
+            spawn.task = match checked_task(spawn.task.take()) {
+                Ok(task) => task,
+                Err(msg) => return open.reply.err(ErrorCode::BadRequest, msg),
+            };
+            if let Some(policy) = &spawn.policy
+                && let Err(message) = policy.validate()
+            {
+                return open.reply.err(ErrorCode::BadRequest, message);
+            }
         }
         // The second round covers an actor that was forgotten between the lookup and
         // the send; it removed its registry entry before it stopped receiving.
@@ -232,6 +253,15 @@ pub fn open(ctx: Arc<Ctx>, sid: String, open: Open) -> Pin<Box<dyn Future<Output
         }
         open.reply.err(ErrorCode::Internal, "session actor is gone");
     })
+}
+
+/// Retains the request string when it is already canonical.
+fn checked_task(task: Option<String>) -> Result<Option<String>, &'static str> {
+    let Some(raw) = &task else { return Ok(None) };
+    match wb_proto::hub::normalize_task(raw)? {
+        Some(trimmed) if trimmed.len() == raw.len() => Ok(task),
+        trimmed => Ok(trimmed.map(str::to_owned)),
+    }
 }
 
 /// Registers and starts the session `sid` found in the state directory at startup. A
@@ -263,6 +293,7 @@ struct Loaded {
     meta: Meta,
     journal: Journal,
     facts: Facts,
+    policy: Option<CompiledPolicy>,
     announced: BTreeMap<u64, PendingKind>,
     /// Startup normalisation could not complete the journal.
     fault: Option<String>,
@@ -327,21 +358,56 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
     let (mut journal, events) = Journal::open(&dir.join(format!("{sid}.jsonl")))?;
     let mut facts = Facts::default();
     let mut announced = BTreeMap::new();
+    let mut policy_notice = false;
     for ev in &events {
         facts.apply(ev);
         announce(&mut announced, ev);
+        match &ev.body {
+            // The fold already validated it; nonempty rules folding to none were invalid.
+            EventBody::Policy { policy } => {
+                policy_notice = !policy.rules.is_empty() && facts.policy.is_none();
+            }
+            EventBody::Notice {
+                level: NoticeLevel::Warn,
+                text,
+            } if text == INVALID_POLICY_NOTICE => policy_notice = false,
+            _ => {}
+        }
     }
-    let (appended, fault) = match journal.normalise(&mut facts, now_ms()) {
+    let policy = facts
+        .policy
+        .as_ref()
+        .map(|policy| CompiledPolicy::new(policy, &meta.cwd, meta.agent == "omp"))
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    let (mut appended, mut fault) = match journal.normalise(&mut facts, now_ms()) {
         Ok(written) => (!written.is_empty(), None),
         Err(f) => {
             error!(%sid, "completing the journal: {}", f.error);
             (false, Some(fault_message(&f)))
         }
     };
+    if policy_notice && fault.is_none() {
+        let notice = EventBody::Notice {
+            level: NoticeLevel::Warn,
+            text: INVALID_POLICY_NOTICE.into(),
+        };
+        match journal.append(&notice, now_ms()) {
+            Ok(ev) => {
+                facts.apply(&ev);
+                appended = true;
+            }
+            Err(f) => {
+                error!(%sid, "recording the cleared policy notice: {}", f.error);
+                fault = Some(fault_message(&f));
+            }
+        }
+    }
     let loaded = Loaded {
         meta,
         journal,
         facts,
+        policy,
         announced,
         fault,
     };
@@ -351,7 +417,7 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
 /// Notes the kind of a permission or elicitation request by its `req`.
 fn announce(announced: &mut BTreeMap<u64, PendingKind>, ev: &JournalEvent) {
     let kind = match ev.body {
-        EventBody::Permission { .. } => PendingKind::Permission,
+        EventBody::Permission { .. } | EventBody::PermissionAuto { .. } => PendingKind::Permission,
         EventBody::Elicitation { .. } => PendingKind::Elicitation,
         _ => return,
     };
@@ -628,8 +694,7 @@ enum WorktreeOp {
     Remove(Reply),
     Rollback {
         reply: Reply,
-        code: ErrorCode,
-        message: String,
+        failure: CreateFailure,
         path: String,
     },
 }
@@ -677,6 +742,9 @@ struct Acp {
     create_kill: Option<Reply>,
     /// At most one git task; dropping the actor also aborts it and its process group.
     git: JoinSet<WorktreeResult>,
+    policy: Option<CompiledPolicy>,
+    /// A cancelled turn may still deliver requests before its prompt response.
+    turn_cancelled: bool,
     /// The agent's requests waiting for an answer, by `req`.
     held: BTreeMap<u64, HeldReq>,
     /// A `session` event follows the last `spawn`.
@@ -695,8 +763,8 @@ struct Acp {
     /// What the watchers and viewers last got, and when.
     published: Option<(Summary, AcpSessionInfo)>,
     published_at: Option<Instant>,
-    /// Holds Summaries back while `finalise` writes the death lines, so watchers see
-    /// the end state once, never a user kill's interim `error` (ROB-13).
+    /// Holds Summaries back while creating or finalising a session: watchers see the
+    /// initial task with the spawn, and never a user kill's interim `error` (ROB-13).
     quiet: bool,
     /// When the setup gives up on a silent agent.
     setup_at: Option<Instant>,
@@ -727,6 +795,8 @@ impl Acp {
             worktree_op: None,
             create_kill: None,
             git: JoinSet::new(),
+            policy: None,
+            turn_cancelled: false,
             held: BTreeMap::new(),
             has_session: false,
             load_filter: false,
@@ -755,12 +825,14 @@ impl Acp {
                     meta,
                     journal,
                     facts,
+                    policy,
                     announced,
                     fault,
                 } = *loaded;
                 self.meta = meta;
                 self.journal = Some(journal);
                 self.facts = facts;
+                self.policy = policy;
                 self.announced = announced;
                 if let Some(message) = fault {
                     self.fault = Some(Fault {
@@ -837,8 +909,7 @@ impl Acp {
         }
         match self.phase {
             Phase::Forget => {
-                let (dir, sid) = (self.ctx.acp_dir.clone(), self.sid.clone());
-                if let Ok(Err(e)) = tokio::task::spawn_blocking(move || delete(&dir, &sid)).await {
+                if let Err(e) = self.delete_files().await {
                     warn!("deleting the session's files: {e}");
                 }
                 let viewers = take_viewers(&self.shared);
@@ -936,6 +1007,13 @@ impl Acp {
         self.ctx.acp_dir.join(format!("{}.{ext}", self.sid))
     }
 
+    async fn delete_files(&self) -> io::Result<()> {
+        let (dir, sid) = (self.ctx.acp_dir.clone(), self.sid.clone());
+        tokio::task::spawn_blocking(move || delete(&dir, &sid))
+            .await
+            .map_err(io::Error::other)?
+    }
+
     /// Creates the session of a new sid: its record and journal, then the agent. A
     /// failed spawn is journaled, and the session stays.
     async fn create(&mut self, mut o: Open) {
@@ -1002,6 +1080,17 @@ impl Acp {
             managed_worktree,
             ..Meta::default()
         };
+        self.policy = match spawn
+            .policy
+            .as_ref()
+            .map(|policy| CompiledPolicy::new(policy, &self.meta.cwd, self.meta.agent == "omp"))
+            .transpose()
+        {
+            Ok(policy) => policy,
+            Err(message) => {
+                return self.refuse_create(o.reply, Clean((ErrorCode::BadRequest, message)));
+            }
+        };
         let (dir, sid) = (self.ctx.acp_dir.clone(), self.sid.clone());
         let json = serde_json::to_vec(&self.meta);
         let made = tokio::task::spawn_blocking(move || {
@@ -1023,14 +1112,47 @@ impl Acp {
             Err(e) => {
                 warn!("creating the session's files: {e}");
                 let msg = format!("creating the session's files: {e}");
-                if let Some(record) = self.meta.managed_worktree.take() {
-                    self.rollback(record, o.reply, ErrorCode::Internal, msg);
-                } else {
-                    self.abandon(o.reply, Clean((ErrorCode::Internal, msg)));
-                }
-                return;
+                return self.refuse_create(o.reply, Clean((ErrorCode::Internal, msg)));
             }
         }
+        // A create with a task stays unpublished until both initial events are written.
+        let has_task = spawn.task.is_some();
+        self.quiet = has_task;
+        let written = spawn
+            .task
+            .is_none_or(|task| self.record(EventBody::Task { task: Some(task) }))
+            && spawn
+                .policy
+                .is_none_or(|policy| self.record(EventBody::Policy { policy }));
+        if !written {
+            if has_task {
+                // Nothing has been published. Keep the sid reserved until its files
+                // are gone, so cleanup cannot delete a racing retry's journal.
+                self.journal = None;
+                if let Err(e) = self.delete_files().await {
+                    let msg = format!("deleting the session's files: {e}");
+                    warn!("{msg}");
+                    return self
+                        .refuse_create(o.reply, PossibleLeftover((ErrorCode::Internal, msg)));
+                }
+                return self
+                    .refuse_create(o.reply, Clean((ErrorCode::Faulted, JOURNAL_FAILED.into())));
+            }
+            // A policy-only write fault returns a faulted session with per-option errors.
+            let errors = spawn
+                .config
+                .into_iter()
+                .map(|option| ConfigError {
+                    id: option.id,
+                    value: option.value,
+                    code: ErrorCode::Faulted,
+                    error: JOURNAL_FAILED.into(),
+                })
+                .collect();
+            self.open_with_config_errors(o, true, errors);
+            return;
+        }
+        self.quiet = false;
         if spawn.config.is_empty() {
             let _ = self.spawn(SpawnVia::New);
             self.open(o, true);
@@ -1061,6 +1183,15 @@ impl Acp {
             return Err((ErrorCode::BadRequest, msg));
         }
         Ok(())
+    }
+
+    /// Keep the sid reserved until any unpublished checkout has been rolled back.
+    fn refuse_create(&mut self, reply: Reply, failure: CreateFailure) {
+        if let Some(record) = self.meta.managed_worktree.take() {
+            self.rollback(record, reply, failure);
+        } else {
+            self.abandon(reply, failure);
+        }
     }
 
     /// Releases the unpublished sid only after cleanup, before clients can retry.
@@ -1224,6 +1355,8 @@ impl Acp {
                 | EventBody::TurnEnd { .. }
                 | EventBody::TurnError { .. }
                 | EventBody::Config { .. }
+                | EventBody::Task { .. }
+                | EventBody::Policy { .. }
                 | EventBody::Exit { .. }
         );
         if durable && let Some(journal) = &self.journal {
@@ -1352,8 +1485,10 @@ impl Acp {
                 seen_seq: self.meta.seen_seq,
                 title: facts.title.clone(),
                 mode_id: facts.mode_id.clone(),
+                policy: facts.policy.clone(),
                 config_options: facts.config_options.clone(),
                 managed_worktree: self.meta.managed_worktree.clone(),
+                task: facts.task.clone(),
             }),
         };
         let init = self.meta.init.as_ref();
@@ -1571,6 +1706,7 @@ impl Acp {
                 response,
             } => self.answer(req, epoch, PendingKind::Elicitation, response, reply),
             Act::SetMode(mode_id) => self.set_mode(mode_id, reply),
+            Act::SetPolicy { epoch, policy } => self.set_policy(epoch, policy, reply),
             Act::SetConfigOption {
                 epoch,
                 config_id,
@@ -1578,6 +1714,16 @@ impl Acp {
             } => {
                 self.set_config_option(epoch, config_id, value, reply);
             }
+            Act::SetTask(task) => match checked_task(task) {
+                Err(msg) => reply.err(ErrorCode::BadRequest, msg),
+                Ok(task) => {
+                    if self.record(EventBody::Task { task }) {
+                        reply.done();
+                    } else {
+                        reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
+                    }
+                }
+            },
             Act::Seen(seq) => {
                 self.set_seen(seq);
                 reply.done();
@@ -1627,6 +1773,7 @@ impl Acp {
         }) {
             return reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
         }
+        self.turn_cancelled = false;
         self.set_seen(self.facts.head_seq);
         match self.request(Purpose::Prompt, |id| rpc::prompt(id, &session, blocks)) {
             Ok(()) => reply.done(),
@@ -1635,6 +1782,9 @@ impl Acp {
     }
 
     fn cancel(&mut self, reply: Reply) {
+        if self.facts.activity == Activity::Turn {
+            self.turn_cancelled = true;
+        }
         if self.facts.activity == Activity::Turn
             && let Some(session) = &self.facts.agent_session_id
         {
@@ -1711,6 +1861,24 @@ impl Acp {
             self.setup_at = Some(Instant::now() + SETUP_IDLE_TIMEOUT);
         }
         true
+    }
+    fn set_policy(&mut self, epoch: u64, policy: Policy, reply: Reply) {
+        if epoch != self.created_at {
+            return reply.err(ErrorCode::Stale, "the session was created again");
+        }
+        if self.fault.is_some() {
+            return reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
+        }
+        let compiled = match CompiledPolicy::new(&policy, &self.meta.cwd, self.meta.agent == "omp")
+        {
+            Ok(compiled) => compiled,
+            Err(message) => return reply.err(ErrorCode::BadRequest, message),
+        };
+        if !self.record(EventBody::Policy { policy }) {
+            return reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
+        }
+        self.policy = Some(compiled);
+        reply.done();
     }
 
     fn set_mode(&mut self, mode_id: String, reply: Reply) {
@@ -2058,17 +2226,10 @@ impl Acp {
         }
     }
 
-    fn rollback(
-        &mut self,
-        record: ManagedWorktree,
-        reply: Reply,
-        code: ErrorCode,
-        message: String,
-    ) {
+    fn rollback(&mut self, record: ManagedWorktree, reply: Reply, failure: CreateFailure) {
         let op = WorktreeOp::Rollback {
             reply,
-            code,
-            message,
+            failure,
             path: record.path.clone(),
         };
         self.start_remove(op, record);
@@ -2121,8 +2282,7 @@ impl Acp {
                     self.rollback(
                         record,
                         open.reply,
-                        ErrorCode::Conflict,
-                        worktree::CANCELLED.into(),
+                        Clean((ErrorCode::Conflict, worktree::CANCELLED.into())),
                     );
                 }
             }
@@ -2132,28 +2292,22 @@ impl Acp {
             (
                 WorktreeOp::Rollback {
                     reply,
-                    code,
-                    message,
+                    failure,
                     path,
                 },
                 Removed(result),
-            ) => match result {
-                Ok(true) => self.abandon(reply, Clean((code, message))),
-                Ok(false) => self.abandon(
+            ) => {
+                let leftover = match result {
+                    Ok(true) => return self.abandon(reply, failure),
+                    Ok(false) => format!("worktree at {path} no longer owned; nothing deleted"),
+                    Err((_, error)) => format!("worktree left at {path}: {error}"),
+                };
+                let (Clean((code, message)) | PossibleLeftover((code, message))) = failure;
+                self.abandon(
                     reply,
-                    PossibleLeftover((
-                        code,
-                        format!("{message}; worktree at {path} no longer owned; nothing deleted"),
-                    )),
-                ),
-                Err((_, error)) => self.abandon(
-                    reply,
-                    PossibleLeftover((
-                        code,
-                        format!("{message}; worktree left at {path}: {error}"),
-                    )),
-                ),
-            },
+                    PossibleLeftover((code, format!("{message}; {leftover}"))),
+                );
+            }
             (WorktreeOp::Remove(reply), Removed(Ok(deleted))) => {
                 self.removed(reply, deleted).await;
             }
@@ -2616,6 +2770,52 @@ impl Acp {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
+                let decision = params
+                    .get("sessionId")
+                    .filter(|_| self.facts.activity == Activity::Turn && !self.turn_cancelled)
+                    .and_then(Value::as_str)
+                    .is_some_and(|session| Some(session) == self.facts.agent_session_id.as_deref())
+                    .then(|| self.policy.as_ref()?.decide(&tool_call, &options))
+                    .flatten();
+                if let Some(decision) = decision {
+                    let outcome = serde_json::json!({
+                        "outcome": "selected", "optionId": decision.option_id,
+                    });
+                    let policy = PolicyMatch {
+                        rule: decision.rule,
+                        action: decision.action,
+                    };
+                    let body = EventBody::PermissionAuto {
+                        tool_call,
+                        options,
+                        outcome: outcome.clone(),
+                        policy,
+                    };
+                    let written = if self.fault.is_none() {
+                        self.journal
+                            .as_mut()
+                            .map(|journal| journal.append(&body, now_ms()))
+                    } else {
+                        None
+                    };
+                    match written {
+                        Some(Ok(ev)) => {
+                            self.applied(ev);
+                            self.send(&rpc::result(&id, rpc::permission_result(&outcome)));
+                        }
+                        failure => {
+                            // Cancel before journal_fault closes the agent's stdin.
+                            self.send(&rpc::result(
+                                &id,
+                                rpc::permission_result(&rpc::permission_cancelled()),
+                            ));
+                            if let Some(Err(fault)) = failure {
+                                self.journal_fault(&fault);
+                            }
+                        }
+                    }
+                    return;
+                }
                 let option_ids = options
                     .iter()
                     .filter_map(|o| o.get("optionId")?.as_str().map(str::to_owned))

@@ -4384,7 +4384,8 @@ function toggleDockTerm() {
 // Observed sessions from /rpc: observed replaces, observed_put upserts, observed_gone deletes.
 const OBS: Record<string, ObservedSession> = {};
 const MESH: { open: string | null; ended: boolean; facts: boolean; collapsed: Set<string>; graph: string; topo: string; t: number } = { open: null, ended: false, facts: false, collapsed: new Set(), graph: '', topo: '', t: 0 };
-const MESH_ROWS = new Map<string, HTMLElement>(), MESH_GROUPS = new Map<string, HTMLElement>();
+const MESH_ROWS = new Map<string, HTMLElement>(), MESH_GROUPS = new Map<string | null, HTMLElement>();
+const meshByTask = $<HTMLInputElement>('#mesh-by-task')!;
 const MESH_PANE: { row: string | null; hubKey: string; actions: string; node: TermNode | AcpNode | null; attach: string; committed: boolean; terminal: boolean; rows: string[] } =
   { row: null, hubKey: '', actions: '', node: null, attach: '', committed: false, terminal: false, rows: [] };
 // The hub session an observed one runs in: its WB_SESSION, believed only from the host that session is on.
@@ -4413,6 +4414,7 @@ function meshRows(): MeshRow[] {
   for (const o of Object.values(OBS)) {
     const sess = obsSess(o), acp = sess?.kind === 'acp' ? sess : null, ended = o.endedAt != null; if (sess) joined.add(sess.sid);
     const r: MeshRow = { id: o.id, host: o.host, harness: o.harness, project: o.project, repo: o.repo || o.project,
+      task: acp?.acp?.task ?? o.task ?? null,
       repoRoot: o.repoRoot || null, worktree: o.worktree || null, branch: o.branch || null,
       parent: o.parent || sess?.parent || null, title: o.title, state: acp && (ended || ACP_BAD.has(acp.state)) ? acp.state : o.state,
       since: o.startedAt, at: o.lastAt, live: ended ? !!acp?.alive : true, obs: o, sess, card: (sess && S?.nodes[sess.sid]) || null, kids: [] };
@@ -4421,6 +4423,7 @@ function meshRows(): MeshRow[] {
   for (const s of Object.values(SESS)) if (s.kind === 'acp' && !joined.has(s.sid)) {
     const card = S?.nodes[s.sid] || null, agent = agentLabel(s.acp?.agent), project = s.project || (s.projectRoot || s.cwd)?.replace(/\/+$/, '').split('/').pop() || '(no cwd)';
     rows.set(s.sid, { id: s.sid, host: s.host, harness: agent, project, repo: s.repo || project,
+      task: s.acp?.task ?? null,
       repoRoot: s.repoRoot || null, worktree: s.worktree || null, branch: s.branch || null, parent: s.parent || null,
       title: s.acp?.title || card?.name || agent, state: s.state, since: s.createdAt, at: s.updatedAt, live: s.alive, obs: null, sess: s, card, kids: [] });
   }
@@ -4463,7 +4466,7 @@ function meshRowEl(r: MeshRow): HTMLElement {
   row.dataset.id = r.id; row.setAttribute('role', 'listitem');
   context.append(el('span', 'mesh-repo'), el('span', 'mesh-worktree'), el('span', 'mesh-branch'));
   sub.append(context, el('span', 'mesh-harness'), ' · ', el('span', 'mesh-model'), el('span', 'mesh-doing'));
-  main.append(el('b'), sub, el('span', 'mesh-collapsed')); row.append(toggle, el('i', 'dot'), main, el('span', 'mesh-at'), go);
+  main.append(el('b'), sub, el('span', 'mesh-task'), el('span', 'mesh-collapsed')); row.append(toggle, el('i', 'dot'), main, el('span', 'mesh-at'), go);
   toggle.onclick = e => {
     e.stopPropagation();
     if (MESH.collapsed.has(r.id)) MESH.collapsed.delete(r.id);
@@ -4480,18 +4483,19 @@ function meshRowEl(r: MeshRow): HTMLElement {
   return row;
 }
 // A row's texts, set in place: a row under the pointer is not replaced while its session works.
-function meshFill(row: HTMLElement, r: MeshRow, depth: number, groupRepo: string | undefined, visible: Set<string>): void {
+function meshFill(row: HTMLElement, r: MeshRow, depth: number, showRepo: boolean, visible: Set<string>): void {
   row.className = 'mesh-row' + (r.live ? '' : ' ended') + (meshBad(r) ? ' bad' : '') + (r.id === MESH.open ? ' on' : '');
   row.style.setProperty('--d', String(depth)); row.dataset.depth = String(depth); row.dataset.card = r.card?.id || '';
   row.setAttribute('aria-current', r.id === MESH.open ? 'true' : 'false');
   $('.dot', row)!.className = 'dot st-' + (r.live ? r.state : 'exited');
   const set = (sel: string, text: string) => { const e = $(sel, row)!; if (e.textContent !== text) e.textContent = text; return e; };
   set('b', r.title).title = r.title; set('.mesh-at', agoShort(r.at));
+  set('.mesh-task', r.task || '').title = r.task || '';
   const model = meshConfig(r, 'model') || r.obs?.model || '', harness = depth && r.obs?.agentType ? r.harness + '/' + r.obs.agentType : r.harness;
   set('.mesh-harness', meshShort(harness)).title = harness; set('.mesh-model', model ? meshShort(model) + ' · ' : '').title = model;
   set('.mesh-doing', [...(depth ? [] : ['@' + r.host]), meshDoing(r)].join(' · '));
   const worktree = r.worktree?.replace(/\/+$/, '').split('/').pop() || '', branch = r.branch && r.branch !== r.worktree ? r.branch : '';
-  set('.mesh-repo', depth && r.repo !== groupRepo ? meshShort(r.repo) + ' · ' : '').title = r.repo;
+  set('.mesh-repo', showRepo ? meshShort(r.repo) + ' · ' : '').title = r.repo;
   set('.mesh-worktree', worktree ? meshShort(worktree) + ' · ' : '').title = r.worktree || '';
   set('.mesh-branch', branch ? meshShort(branch) + ' · ' : '').title = r.branch || '';
   const toggle = $('.mesh-collapse', row) as HTMLButtonElement, collapsed = MESH.collapsed.has(r.id), descendants = meshFlat(r.kids).filter(k => MESH.ended || k.live || k.id === MESH.open);
@@ -4516,7 +4520,16 @@ function meshConfig(r: MeshRow, category: string): string {
   return opt?.currentValue == null ? '' : vtext(opt.currentValue);
 }
 function meshInfo(box: HTMLElement, r: MeshRow): void {
-  const o = r.obs, b = MESH_PANE.row === r.id ? live.$agents?.backend as AcpBackend | undefined : undefined, out: HTMLElement[] = [], kv = (k: string, v: string | null | undefined | false) => { if (v) { const d = el('div', 'mesh-kv'); d.append(el('span', '', k), el('code', '', v)); out.push(d); } };
+  const o = r.obs, b = MESH_PANE.row === r.id ? live.$agents?.backend as AcpBackend | undefined : undefined, out: HTMLElement[] = [];
+  const kv = (k: string, v: string | null | undefined | false) => {
+    if (!v) return;
+    const d = el('div', 'mesh-kv'), value = el('code');
+    if (k === 'task' && /^https?:\/\/[^/\s<>"\\][^\s<>"\\]*$/i.test(v) && webUrlOk(v)) {
+      const link = el('a', '', v); link.href = v; link.target = '_blank'; link.rel = 'noopener noreferrer'; value.append(link);
+    } else value.textContent = v;
+    d.append(el('span', '', k), value); out.push(d);
+  };
+  kv('task', r.task);
   kv('harness', r.harness); kv('model', meshConfig(r, 'model') || o?.model); kv('host', r.host);
   kv('folder', o?.cwd || r.sess?.cwd); kv('mode', b instanceof AcpBackend ? b.mode() || o?.permissionMode : o?.permissionMode); kv('reasoning', meshConfig(r, 'thinking'));
   kv('repo', r.repo); kv('repo root', r.repoRoot); kv('worktree', r.worktree); kv('branch', r.branch);
@@ -4696,20 +4709,25 @@ function meshRender(commit = false): void {
   if (!box || VIEW !== 'agents') return;
   if (!document.body.classList.contains('pane-drag')) setMeshW(S.meshW);
   const shown = (r: MeshRow): boolean => MESH.ended || r.live || r.id === MESH.open;
-  const all = meshRows(), flat = meshFlat(all), waiting = new Map<string, boolean>(), groups = new Map<string, MeshRow[]>();
+  const all = meshRows(), flat = meshFlat(all), waiting = new Map<string, boolean>(), groups = new Map<string | null, MeshRow[]>();
   const waits = (r: MeshRow): boolean => {
     const cached = waiting.get(r.id); if (cached != null) return cached;
     const value = meshBad(r) || r.kids.some(waits); waiting.set(r.id, value); return value;
   };
   const rank = (r: MeshRow) => waits(r) ? 0 : !r.live ? 3 : r.state === 'running' ? 1 : 2;
   const order = (a: MeshRow, b: MeshRow) => rank(a) - rank(b) || b.since - a.since || a.id.localeCompare(b.id);
-  for (const r of all.filter(shown).sort(order)) { const g = groups.get(r.repo); if (g) g.push(r); else groups.set(r.repo, [r]); }
-  const lines: { r: MeshRow; d: number; head?: string; groupRepo?: string }[] = [];
-  const walk = (r: MeshRow, d: number, head?: string, groupRepo = r.repo) => {
-    lines.push({ r, d, head, groupRepo });
-    if (!MESH.collapsed.has(r.id)) r.kids.filter(shown).sort(order).forEach(k => walk(k, d + 1, undefined, groupRepo));
+  const byTask = meshByTask.checked;
+  for (const r of all.filter(shown).sort((a, b) => (byTask ? Number(!a.task) - Number(!b.task) : 0) || order(a, b))) {
+    const key = byTask ? r.task : r.repo, group = groups.get(key);
+    if (group) group.push(r); else groups.set(key, [r]);
+  }
+  const lines: { r: MeshRow; d: number; showRepo: boolean; head?: string | null }[] = [];
+  // A repository heading supplies context throughout its tree; in task mode only the immediate parent does.
+  const walk = (r: MeshRow, d: number, contextRepo: string | null, head?: string | null) => {
+    lines.push({ r, d, showRepo: r.repo !== contextRepo && (!byTask || !!r.repo), head });
+    if (!MESH.collapsed.has(r.id)) r.kids.filter(shown).sort(order).forEach(k => walk(k, d + 1, byTask ? r.repo : contextRepo));
   };
-  for (const [name, rows] of groups) rows.forEach((r, i) => walk(r, 0, i ? undefined : name));
+  for (const [name, rows] of groups) rows.forEach((r, i) => walk(r, 0, byTask ? null : r.repo, i ? undefined : name));
   MESH_PANE.rows = lines.map(l => l.r.id);
   const visible = new Set(MESH_PANE.rows), present = new Set(flat.map(r => r.id));
   if (!MESH.open || !visible.has(MESH.open)) MESH.open = lines[0]?.r.id || null;
@@ -4718,8 +4736,8 @@ function meshRender(commit = false): void {
   // Reconcile by id even when shape/order/actions change: activity never replaces an existing row.
   const elements: HTMLElement[] = [];
   for (const l of lines) {
-    if (l.head != null) {
-      let group = MESH_GROUPS.get(l.head); if (!group) { group = el('div', 'mesh-group', l.head); group.title = l.head; MESH_GROUPS.set(l.head, group); }
+    if (l.head !== undefined) {
+      let group = MESH_GROUPS.get(l.head); if (!group) { const label = l.head ?? 'No task'; group = el('div', 'mesh-group', label); group.title = label; MESH_GROUPS.set(l.head, group); }
       elements.push(group);
     }
     let row = MESH_ROWS.get(l.r.id); if (!row) { row = meshRowEl(l.r); MESH_ROWS.set(l.r.id, row); }
@@ -4739,7 +4757,7 @@ function meshRender(commit = false): void {
     meshHeader(selected);
     meshInfo($('#mesh-detail .mesh-info')!, selected);
   } else { meshClose(); $('#mesh-detail')!.replaceChildren(el('p', 'muted', 'Select a session.')); $('#v-agents')!.classList.remove('detail-open'); }
-  lines.forEach(l => meshFill(MESH_ROWS.get(l.r.id)!, l.r, l.d, l.groupRepo, visible));
+  lines.forEach(l => meshFill(MESH_ROWS.get(l.r.id)!, l.r, l.d, l.showRepo, visible));
 }
 // Open the Agents view, selecting the named session without adding a card.
 function meshOpen(id?: string | null): void {
@@ -4757,6 +4775,7 @@ function graphMesh(): void {
 // A session in a few lines, for its card in the graph.
 function meshText(r: MeshRow): string { const o = r.obs; return [meshDoing(r), o?.cwd || r.sess?.cwd, o?.lastPrompt && '› ' + o.lastPrompt, ...(o?.tail.slice(-5).map(t => hhmm(t.at) + ' ' + t.kind.replace(/_/g, ' ') + (t.text ? ' ' + t.text : '')) || [])].filter(Boolean).join('\n'); }
 $('#mesh-ended')!.onchange = e => { MESH.ended = (e.target as HTMLInputElement).checked; meshRender(); };
+meshByTask.onchange = () => { MESH_GROUPS.clear(); meshRender(); };
 setInterval(() => meshRender(), 30000);   // the ages
 cmd('Agents: every session', () => meshOpen(), '@view.agents');
 
@@ -9631,6 +9650,7 @@ const KC: Record<string, KeyCmdFn> = {
   ...Object.fromEntries(VIEWS.map(v => ['view.' + v, () => setView(v)])),
   'agents.next': () => meshMove(1), 'agents.prev': () => meshMove(-1), 'agents.enter': () => meshEnter(), 'agents.back': () => meshBack(),
   'agents.source': () => $('#mesh-detail .mesh-switch')?.click(),
+  'agents.group': () => meshByTask.click(),
   ...Object.fromEntries([0, 1, 2, 3, 4, 5, 6, 7, 8, 9].flatMap(i => [['desk.' + i, () => deskGo(i)], ['desk.send.' + i, () => deskSend(i)],
     ['desk.follow.' + i, () => deskSend(i, { follow: true })], ['desk.also.' + i, () => deskSend(i, { keep: true })]])),
   'desk.prev': () => deskBack(), 'desk.new': () => deskNew(), 'desk.query': () => deskQueryAsk(), 'desk.rename': () => deskRename(), 'desk.pin': () => deskPin(),

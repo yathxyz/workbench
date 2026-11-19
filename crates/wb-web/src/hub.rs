@@ -86,6 +86,8 @@ pub struct HubInfo {
     pub acp_config: bool,
     /// Whether the hub can create and remove managed ACP worktrees.
     pub acp_worktree: bool,
+    /// Whether this connection's hub supports ACP session task references.
+    pub acp_task: bool,
     /// The shells a spawn may name; DELTA-1 §B.
     pub shells: Vec<String>,
     /// Empty from a hub that predates shell choice.
@@ -165,6 +167,7 @@ impl HubConn {
             hosts,
             acp_config,
             acp_worktree,
+            acp_task,
             ..
         }) = hello
         else {
@@ -191,6 +194,7 @@ impl HubConn {
             hosts,
             acp_config,
             acp_worktree,
+            acp_task,
             shells,
             default_shell,
         };

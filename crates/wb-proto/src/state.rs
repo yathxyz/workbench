@@ -157,6 +157,8 @@ mod tests {
             mode_id: None,
             config_options: None,
             managed_worktree: None,
+            task: None,
+            policy: None,
         };
         edit(&mut facts);
         Summary {

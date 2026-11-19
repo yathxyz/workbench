@@ -273,7 +273,7 @@ fn permission_and_resolution() {
         EventBody::PermissionResolved {
             req: 12,
             outcome: selected,
-            by: ResolvedBy::User
+            by: ResolvedBy::User,
         }
     );
     for (wire, by) in [
@@ -365,6 +365,14 @@ fn config() {
             config_options: options
         }
     );
+}
+
+#[test]
+fn task() {
+    for task in [Some("issue 44".to_owned()), None] {
+        let event = round_trip(ev(22, "task", json!({"task": task})));
+        assert_eq!(event.body, EventBody::Task { task });
+    }
 }
 
 #[test]
@@ -477,6 +485,7 @@ fn missing_seq_ts_e_or_payload_fields_are_errors() {
         r#"{"seq":1,"e":"mode","modeId":"plan"}"#,
         r#"{"seq":1,"ts":1,"modeId":"plan"}"#,
         r#"{"seq":1,"ts":1,"e":"mode"}"#,
+        r#"{"seq":1,"ts":1,"e":"task"}"#,
     ] {
         assert!(
             serde_json::from_str::<JournalEvent>(line).is_err(),
@@ -581,4 +590,43 @@ fn unknown_enum_values_are_unknown() {
             ..
         }
     ));
+}
+
+#[test]
+fn policy_replacements_and_atomic_auto_permissions() {
+    let rules = json!({"rules":[{"action":"allow","roots":["$cwd"]}]});
+    let changed = round_trip(ev(21, "policy", json!({"policy":rules})));
+    let EventBody::Policy { policy } = changed.body else {
+        panic!("{changed:?}")
+    };
+    assert_eq!(policy.rules.len(), 1);
+    let cleared = round_trip(ev(22, "policy", json!({"policy":{"rules":[]}})));
+    let EventBody::Policy { policy } = cleared.body else {
+        panic!("{cleared:?}")
+    };
+    assert!(policy.rules.is_empty());
+    for action in ["allow", "reject"] {
+        let outcome = json!({"outcome":"selected", "optionId":action});
+        let automatic = round_trip(ev(
+            23,
+            "permission_auto",
+            json!({
+                "toolCall":tool_call(), "options":options(), "outcome":outcome,
+                "policy":{"rule":2, "action":action}
+            }),
+        ));
+        let EventBody::PermissionAuto {
+            tool_call: call,
+            options,
+            outcome: recorded,
+            policy,
+        } = automatic.body
+        else {
+            panic!("{automatic:?}")
+        };
+        assert_eq!(call["toolCallId"], "call_1");
+        assert_eq!(options.len(), 3);
+        assert_eq!(recorded, outcome);
+        assert_eq!(policy.rule, 2);
+    }
 }

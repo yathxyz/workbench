@@ -507,6 +507,7 @@ interface ObservedSession {
   cwd: string | null; projectRoot: string | null; project: string;
   repoRoot?: string | null; repo?: string | null; worktree?: string | null; branch?: string | null;
   model: string | null; permissionMode: string | null;
+  task?: string;
   title: string; state: SessionState;
   startedAt: number; lastAt: number; endedAt: number | null;
   endReason: null | 'session_end' | 'process_gone' | 'silent' | 'replaced' | 'parent_ended';
@@ -520,6 +521,7 @@ interface ObservedSession {
    or a hub agent session that no harness reports. */
 interface MeshRow {
   id: string; host: string; harness: string; project: string; repo: string; title: string;
+  task: string | null;
   repoRoot: string | null; worktree: string | null; branch: string | null; parent: string | null;
   state: SessionState; since: number; at: number; live: boolean;
   obs: ObservedSession | null; sess: SessionSummary | null; card: BoardNode | null; kids: MeshRow[];
@@ -546,6 +548,7 @@ interface SessionSummary {
     pending: { req: number | string; kind: string; title: string; ts: number }[];
     last: { seq: number; ts: number; outcome: string | null; error: { code?: string; message: string } | null } | null;
     headSeq: number; seenSeq: number; title: string | null; modeId: string | null;
+    task?: string;
   };
 }
 /* What an ACP agent told the hub about itself and the session (info.session). */
@@ -575,6 +578,7 @@ type JournalEvent = { seq: number; ts: number } & (
   | { e: 'elicitation_complete'; elicitationId: string }
   | { e: 'mode'; modeId: string }
   | { e: 'config'; configOptions: JsonValue }
+  | { e: 'task'; task: string | null }
   | { e: 'notice'; level: string; text: string }
   | { e: 'exit'; code: number | null; signal: string | null; reason: string }
 );

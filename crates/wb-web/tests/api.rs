@@ -15,9 +15,10 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use wb_proto::hub::{
     AcpFacts, AcpOpenReply, AcpSessionInfo, Activity, Agent, ErrorCode, Host, HubMessage,
-    HubRequest, Kind, ManagedWorktree, SpawnAcp, Summary, WorktreeRequest,
+    HubRequest, Kind, ManagedWorktree, Pending, PendingKind, SpawnAcp, Summary, WorktreeRequest,
 };
 use wb_proto::journal::{EventBody, JournalEvent};
+use wb_proto::policy::Policy;
 
 const EPOCH: u64 = 1_700_000_000_000;
 /// The tokens of the three clients [`Api::start`] configures.
@@ -140,6 +141,8 @@ fn rid_of(r: &HubRequest) -> u64 {
         | HubRequest::AcpElicitation { rid, .. }
         | HubRequest::AcpSetMode { rid, .. }
         | HubRequest::AcpSetConfigOption { rid, .. }
+        | HubRequest::AcpSetTask { rid, .. }
+        | HubRequest::AcpSetPolicy { rid, .. }
         | HubRequest::AcpRevive { rid, .. }
         | HubRequest::AcpRemoveWorktree { rid, .. }
         | HubRequest::AcpKill { rid, .. }
@@ -174,6 +177,8 @@ fn summary(sid: &str, host: &str) -> Summary {
             mode_id: Some("default".into()),
             config_options: None,
             managed_worktree: None,
+            task: None,
+            policy: None,
         }),
     }
 }
@@ -265,6 +270,20 @@ async fn scopes_paths_and_methods_are_checked_after_the_token() {
             403,
             json!("forbidden"),
         ),
+        (
+            "POST",
+            "/v1/sessions/a/task",
+            READER,
+            403,
+            json!("forbidden"),
+        ),
+        (
+            "POST",
+            "/v1/sessions/a/policy",
+            READER,
+            403,
+            json!("forbidden"),
+        ),
         ("DELETE", "/v1/sessions/a", READER, 403, json!("forbidden")),
         (
             "DELETE",
@@ -302,6 +321,25 @@ async fn scopes_paths_and_methods_are_checked_after_the_token() {
     let from_agents = |method: &str, path: &str| api.req(method, path, AGENTS).from(AGENTS_ADDR);
     assert_eq!(from_agents("GET", "/v1/info").send().await.status, 403);
     assert_eq!(from_agents("GET", "/v1/observed").send().await.status, 403);
+    assert_eq!(
+        from_agents("POST", "/v1/sessions/a/policy")
+            .body(r#"{"policy":{"rules":[]}}"#)
+            .send()
+            .await
+            .status,
+        403
+    );
+    assert_eq!(
+        from_agents("GET", "/v1/sessions/a").send().await.status,
+        403
+    );
+    assert_eq!(
+        from_agents("GET", "/v1/sessions/a/events")
+            .send()
+            .await
+            .status,
+        403
+    );
 
     // The browser's listener knows nothing of /v1, with or without a token.
     let res = api.web.req("GET", "/v1/info").send().await;
@@ -330,10 +368,9 @@ async fn info_and_sessions_are_the_hubs() {
         ..Hello::default()
     };
     let hub = FakeHub::start_with(hello);
-    hub.set_sessions(vec![
-        summary("a1", "testhost"),
-        pty_summary("p1", EPOCH, true, false),
-    ]);
+    let mut agent = summary("a1", "testhost");
+    agent.acp.as_mut().unwrap().task = Some("workbench#44".into());
+    hub.set_sessions(vec![agent, pty_summary("p1", EPOCH, true, false)]);
     let api = Api::without_hub(hub).await;
     api.web.wait_hub("up").await;
 
@@ -359,10 +396,12 @@ async fn info_and_sessions_are_the_hubs() {
         .collect();
     assert_eq!(sids, ["a1", "p1"]);
     assert_eq!(list["sessions"][0]["state"], "idle");
+    assert_eq!(list["sessions"][0]["acp"]["task"], "workbench#44");
 
     let one = api.get("/v1/sessions/a1").await;
     assert_eq!(one.status, 200);
     assert_eq!(one.json()["acp"]["agent"], "claude");
+    assert_eq!(one.json()["acp"]["task"], "workbench#44");
     assert_eq!(one.json()["state"], "idle");
     let res = api.get("/v1/sessions/nope").await;
     assert_eq!(
@@ -495,6 +534,8 @@ async fn a_post_starts_an_agent() {
             host: None,
             config: Vec::new(),
             worktree: None,
+            task: None,
+            policy: None,
         })
     );
     assert_eq!(res.status, 201);
@@ -824,6 +865,152 @@ async fn startup_configuration_requires_the_hubs_advertised_support() {
             .await;
         assert_eq!(res.status, 201);
         assert_eq!(res.json()["configErrors"], json!([]));
+    }
+}
+
+#[tokio::test]
+async fn task_references_are_normalized_on_create_set_and_clear() {
+    let api = Api::start().await;
+    let req = api.req("POST", "/v1/sessions", OWNER).body(
+        json!({"agent": "claude", "cwd": "/x", "sid": "mine", "task": "  workbench#44  "})
+            .to_string(),
+    );
+    let (request, res) = api
+        .answered(req, |rid| {
+            let mut reply = open_reply("mine", "testhost", true);
+            reply.summary.acp.as_mut().unwrap().task = Some("workbench#44".into());
+            HubMessage::ok(rid, &reply)
+        })
+        .await;
+    let HubRequest::AcpOpen {
+        spawn: Some(spawn), ..
+    } = request
+    else {
+        panic!("{request:?}");
+    };
+    assert_eq!(spawn.task.as_deref(), Some("workbench#44"));
+    assert_eq!(res.status, 201);
+    assert_eq!(res.json()["session"]["acp"]["task"], "workbench#44");
+
+    for (task, expected) in [
+        (json!("  issue 45  "), Some("issue 45")),
+        (json!("   "), None),
+        (json!(""), None),
+        (Value::Null, None),
+    ] {
+        let req = api
+            .req("POST", "/v1/sessions/mine/task", OWNER)
+            .body(json!({"task": task}).to_string());
+        let (request, res) = api.answered(req, ok).await;
+        assert_eq!(
+            request,
+            HubRequest::AcpSetTask {
+                rid: 1,
+                sid: "mine".into(),
+                task: expected.map(str::to_owned),
+            }
+        );
+        assert_eq!((res.status, res.json()), (200, json!({})));
+    }
+
+    for (sid, code, status) in [
+        ("gone", ErrorCode::NotFound, 404),
+        ("pty", ErrorCode::KindMismatch, 409),
+    ] {
+        let req = api
+            .req("POST", &format!("/v1/sessions/{sid}/task"), OWNER)
+            .body(r#"{"task":"issue 45"}"#);
+        let (_, res) = api.answered(req, refusal(code, "refused")).await;
+        assert_eq!(res.status, status);
+        assert_eq!(res.json(), json!({"error": "refused", "code": code}));
+    }
+}
+
+#[tokio::test]
+async fn invalid_task_references_do_not_reach_the_hub() {
+    let api = Api::start().await;
+    let before = api.hub.requests().len();
+    for task in [
+        json!(false),
+        json!(["issue 44"]),
+        json!("é".repeat(257)),
+        json!("\nissue 44"),
+        json!("issue\u{7f}44"),
+        json!("https://example.test/\u{202e}44"),
+    ] {
+        for (path, body) in [
+            (
+                "/v1/sessions",
+                json!({"agent": "claude", "cwd": "/x", "task": task}),
+            ),
+            ("/v1/sessions/mine/task", json!({"task": task})),
+        ] {
+            let req = api.req("POST", path, OWNER).body(body.to_string());
+            assert_eq!(req.send().await.status, 400, "{path} {body}");
+        }
+    }
+    for body in [json!({}), json!([null]), json!({"task": null, "extra": 1})] {
+        let req = api
+            .req("POST", "/v1/sessions/mine/task", OWNER)
+            .body(body.to_string());
+        assert_eq!(req.send().await.status, 400, "{body}");
+    }
+    assert_eq!(api.hub.requests().len(), before);
+}
+
+#[tokio::test]
+async fn tasks_require_support_on_the_connection_used_for_the_request() {
+    let api = Api::start().await; // Control's hello advertised acpTask.
+    for acp_task in [None, Some(false)] {
+        api.hub.set_hello(Hello {
+            acp_task,
+            ..Hello::default()
+        });
+        let before = api.hub.requests().len();
+        for (path, body) in [
+            (
+                "/v1/sessions",
+                json!({"agent": "claude", "cwd": "/x", "task": "issue 44"}),
+            ),
+            ("/v1/sessions/mine/task", json!({"task": "issue 44"})),
+            ("/v1/sessions/mine/task", json!({"task": null})),
+            ("/v1/sessions/mine/task", json!({"task": "   "})),
+        ] {
+            let res = api
+                .req("POST", path, OWNER)
+                .body(body.to_string())
+                .send()
+                .await;
+            assert_eq!(
+                (res.status, res.json()),
+                (400, json!({"error": "hub does not support session tasks"}))
+            );
+        }
+        assert!(
+            api.hub
+                .requests()
+                .into_iter()
+                .skip(before)
+                .all(|(_, r)| matches!(r, HubRequest::Hello { .. }))
+        );
+    }
+
+    // With no initial reference there is no feature to require.
+    for task in [None, Some(Value::Null), Some(json!("  "))] {
+        let mut body = json!({"agent": "claude", "cwd": "/x", "sid": "mine"});
+        if let Some(task) = task {
+            body["task"] = task;
+        }
+        let (request, res) = api
+            .answered(
+                api.req("POST", "/v1/sessions", OWNER)
+                    .body(body.to_string()),
+                |rid| HubMessage::ok(rid, &open_reply("mine", "testhost", true)),
+            )
+            .await;
+        assert!(matches!(request, HubRequest::AcpOpen { spawn: Some(s), .. } if s.task.is_none()));
+        assert_eq!(res.status, 201);
+        assert!(res.json()["session"]["acp"].get("task").is_none());
     }
 }
 
@@ -1186,7 +1373,7 @@ async fn events_are_the_journal_after_a_seq() {
     };
     let before = api.hub.requests().len();
     let sent = tokio::spawn(
-        api.req("GET", "/v1/sessions/a1/events?since=1", OWNER)
+        api.req("GET", "/v1/sessions/a1/events?since=1", READER)
             .send(),
     );
     let (conn, hub_req) = api.asked_after(before).await;
@@ -1567,4 +1754,284 @@ async fn rpc_carries_the_observed_sessions() {
 
     let info = api.web.req("GET", "/api/info").send().await.json();
     assert_eq!(info["mesh"], true);
+}
+
+fn session_policy() -> Value {
+    json!({"rules": [
+        {"action": "allow", "kinds": ["read"], "roots": ["$cwd", "/srv/shared"]},
+        {
+            "action": "reject",
+            "kinds": ["execute"],
+            "roots": ["$cwd"],
+            "programs": ["git", "/usr/bin/git", "./tools/git"],
+            "command": {"matches": ["^git\\s"], "notMatches": ["--force"]}
+        },
+        {"action": "ask"}
+    ]})
+}
+
+#[tokio::test]
+async fn invalid_policies_are_bad_bodies_before_any_hub_connection() {
+    let api = Api::start().await;
+    let before = api.hub.requests().len();
+    let mut invalid = vec![
+        Value::Null,
+        json!([]),
+        json!({}),
+        json!({"rules": null}),
+        json!({"rules": [], "extra": true}),
+        json!({"rules": [{"action": "allow", "extra": true}]}),
+        json!({"rules": [{"action": "ALLOW"}]}),
+        json!({"rules": [{"action": "deny"}]}),
+        json!({"rules": [{"action": "allow", "roots": null}]}),
+        json!({"rules": [{"action": "allow", "kinds": null}]}),
+        json!({"rules": [{"action": "allow", "command": null}]}),
+        json!({"rules": [{"action": "allow", "roots": "relative"}]}),
+        json!({"rules": [{"action": "allow", "roots": ["relative"]}]}),
+        json!({"rules": [{"action": "allow", "roots": ["$cwd/child"]}]}),
+        json!({"rules": [{"action": "allow", "roots": [""]}]}),
+        json!({"rules": [{"action": "allow", "roots": ["/a\u{0}b"]}]}),
+        json!({"rules": [{"action": "allow", "roots": [1]}]}),
+        json!({"rules": [{"action": "allow", "kinds": [""]}]}),
+        json!({"rules": [{"action": "allow", "kinds": ["a\u{0}b"]}]}),
+        json!({"rules": [{"action": "allow", "kinds": ["a".repeat(65)]}]}),
+        json!({"rules": [{"action": "allow", "kinds": "read"}]}),
+        json!({"rules": [{"action": "allow", "programs": null}]}),
+        json!({"rules": [{"action": "allow", "programs": "git"}]}),
+        json!({"rules": [{"action": "allow", "programs": [1]}]}),
+        json!({"rules": [{"action": "allow", "programs": [""]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["a\u{0}b"]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["x".repeat(257)]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["é".repeat(129)]}]}),
+        json!({"rules": [{"action": "allow", "programs": vec!["git"; 65]}]}),
+        json!({"rules": [{
+            "action": "allow", "kinds": ["execute"], "command": {"unknown": []}
+        }]}),
+        json!({"rules": [{
+            "action": "allow", "command": {"not_matches": ["danger"]}
+        }]}),
+        json!({"rules": [{
+            "action": "allow", "command": {"matches": null}
+        }]}),
+        json!({"rules": [{
+            "action": "allow", "command": {"notMatches": ["é".repeat(2049)]}
+        }]}),
+        json!({"rules": [{
+            "action": "allow", "kinds": ["execute"], "command": {"matches": ["["]}
+        }]}),
+        json!({"rules": [{
+            "action": "allow", "kinds": ["execute"], "command": {"notMatches": ["("]}
+        }]}),
+        json!({"rules": [{
+            "action": "allow", "kinds": ["execute"], "command": {"matches": ["x".repeat(4097)]}
+        }]}),
+        json!({"rules": [{"action":"allow", "roots":[format!("/{}", "r".repeat(4096))]}]}),
+        json!({"rules": [{"action":"allow", "roots":vec![format!("/{}", "r".repeat(4095));64]}]}),
+        json!({"rules": [{"action":"allow", "command":{"notMatches":["a[a-z]{3637}0"]}}]}),
+        json!({"rules": [{"action":"allow", "command":{"notMatches":["[ab]*a[ab]{3635}c"]}}]}),
+        json!({"rules": vec![json!({"action": "ask"}); 65]}),
+        json!({"rules": [{
+            "action": "allow",
+            "roots": (0..65).map(|i| format!("/root{i}")).collect::<Vec<_>>()
+        }]}),
+        json!({"rules": [{
+            "action": "allow",
+            "kinds": (0..65).map(|i| format!("kind{i}")).collect::<Vec<_>>()
+        }]}),
+        json!({"rules": [{
+            "action": "allow", "kinds": ["execute"],
+            "command": {"matches": vec!["x"; 65], "notMatches": vec!["y"; 64]}
+        }]}),
+    ];
+    for program in [
+        " git",
+        "git ",
+        "git\tstatus",
+        "git\nstatus",
+        "git\u{a0}status",
+        "git\u{2003}status",
+    ] {
+        invalid.push(json!({"rules": [{"action": "allow", "programs": [program]}]}));
+    }
+    invalid.push(json!({"rules": [
+        {"action": "allow", "kinds": ["execute"], "command": {"matches": vec!["x"; 64]}},
+        {"action": "reject", "kinds": ["execute"], "command": {"notMatches": vec!["y"; 65]}}
+    ]}));
+    for policy in invalid {
+        let endpoints = [
+            ("/v1/sessions/a1/policy", json!({"policy": policy})),
+            (
+                "/v1/sessions",
+                json!({"agent": "claude", "cwd": "/srv/x", "sid": "mine", "policy": policy}),
+            ),
+        ];
+        for (path, body) in endpoints {
+            let res = api
+                .req("POST", path, OWNER)
+                .body(body.to_string())
+                .send()
+                .await;
+            assert_eq!(
+                (res.status, res.json()),
+                (400, json!({"error": "bad body"})),
+                "{path}: {body}"
+            );
+        }
+    }
+    for body in [
+        json!({}),
+        json!({"policy": {"rules": []}, "epoch": EPOCH}),
+        json!({"policy": {"rules": []}, "extra": true}),
+    ] {
+        let res = api
+            .req("POST", "/v1/sessions/a1/policy", OWNER)
+            .body(body.to_string())
+            .send()
+            .await;
+        assert_eq!(
+            (res.status, res.json()),
+            (400, json!({"error": "bad body"}))
+        );
+    }
+    assert_eq!(
+        api.hub.requests().len(),
+        before,
+        "an invalid policy opened a hub connection"
+    );
+}
+
+#[tokio::test]
+async fn spawn_policy_bodies_accept_valid_conditions_and_boundary_values() {
+    let api = Api::start().await;
+    let policies = [
+        session_policy(),
+        json!({"rules": []}),
+        json!({"rules": [{"action": "allow", "command": {"matches": ["^safe"]}}]}),
+        json!({"rules": [{"action": "allow", "programs": []}]}),
+        json!({"rules": [{"action": "allow", "programs": ["x", "é".repeat(128)]}]}),
+        json!({"rules": [{
+            "action": "allow",
+            "programs": (0..64).map(|i| format!("program{i}")).collect::<Vec<_>>()
+        }]}),
+        json!({"rules": [{
+            "action": "allow", "kinds": ["read", "edit", "execute"],
+            "command": {"notMatches": ["danger"]}
+        }]}),
+        json!({"rules": vec![json!({"action": "ask"}); 64]}),
+        json!({"rules": [{
+            "action": "allow",
+            "roots": (0..64).map(|i| format!("/root{i}")).collect::<Vec<_>>(),
+            "kinds": (0..64).map(|i| format!("kind{i}")).collect::<Vec<_>>()
+        }]}),
+        json!({"rules": [{
+            "action": "allow", "kinds": ["execute"],
+            "command": {"matches": vec!["x"; 64], "notMatches": vec!["y"; 64]}
+        }]}),
+    ];
+    for policy in policies {
+        let req = api.req("POST", "/v1/sessions", OWNER).body(
+            json!({
+                "agent": "claude", "cwd": "/srv/x", "sid": "mine", "policy": policy
+            })
+            .to_string(),
+        );
+        let (hub_req, res) = api
+            .answered(req, |rid| {
+                HubMessage::ok(rid, &open_reply("mine", "testhost", true))
+            })
+            .await;
+        assert_eq!(res.status, 201);
+        let HubRequest::AcpOpen {
+            spawn: Some(spawn), ..
+        } = hub_req
+        else {
+            panic!("{hub_req:?}");
+        };
+        assert_eq!(serde_json::to_value(spawn.policy).unwrap(), policy);
+    }
+}
+
+#[tokio::test]
+async fn replacing_policy_uses_the_current_epoch_and_preserves_hub_errors() {
+    let hub = FakeHub::start();
+    let mut current = summary("a1", "testhost");
+    current.created_at = EPOCH + 100;
+    let pending = Pending {
+        req: 2,
+        kind: PendingKind::Permission,
+        title: "Already waiting".into(),
+        ts: EPOCH + 1,
+    };
+    current.acp.as_mut().unwrap().pending.push(pending.clone());
+    hub.set_sessions(vec![current]);
+    let api = Api::without_hub(hub).await;
+    api.web.wait_hub("up").await;
+
+    for policy in [session_policy(), json!({"rules": []})] {
+        let req = api
+            .req("POST", "/v1/sessions/a1/policy", OWNER)
+            .body(json!({"policy": policy}).to_string());
+        let (hub_req, res) = api.answered(req, ok).await;
+        assert_eq!(
+            hub_req,
+            HubRequest::AcpSetPolicy {
+                rid: 1,
+                sid: "a1".into(),
+                epoch: EPOCH + 100,
+                policy: serde_json::from_value::<Policy>(policy).unwrap(),
+            }
+        );
+        assert_eq!((res.status, res.json()), (200, json!({})));
+        let session = api
+            .req("GET", "/v1/sessions/a1", READER)
+            .send()
+            .await
+            .json();
+        assert_eq!(session["state"], "waiting_permission");
+        assert_eq!(session["acp"]["pending"], json!([pending]));
+    }
+    for (code, status) in [
+        (ErrorCode::Stale, 409),
+        (ErrorCode::KindMismatch, 409),
+        (ErrorCode::NotFound, 404),
+    ] {
+        let req = api
+            .req("POST", "/v1/sessions/a1/policy", OWNER)
+            .body(json!({"policy": session_policy()}).to_string());
+        let (_, res) = api.answered(req, refusal(code, "refused")).await;
+        assert_eq!(
+            (res.status, res.json()),
+            (status, json!({"error": "refused", "code": code}))
+        );
+    }
+    let before = api.hub.requests().len();
+    let res = api
+        .req("POST", "/v1/sessions/nope/policy", OWNER)
+        .body(r#"{"policy":{"rules":[]}}"#)
+        .send()
+        .await;
+    assert_eq!(
+        (res.status, res.json()),
+        (404, json!({"error": "no session nope"}))
+    );
+    assert_eq!(api.hub.requests().len(), before);
+}
+
+#[tokio::test]
+async fn readers_see_current_session_policy() {
+    let policy = session_policy();
+    let hub = FakeHub::start();
+    let mut current = summary("a1", "testhost");
+    current.acp.as_mut().unwrap().policy = Some(serde_json::from_value(policy.clone()).unwrap());
+    hub.set_sessions(vec![current]);
+    let api = Api::without_hub(hub).await;
+    api.web.wait_hub("up").await;
+    for (path, list) in [("/v1/sessions", true), ("/v1/sessions/a1", false)] {
+        let res = api.req("GET", path, READER).send().await;
+        assert_eq!(res.status, 200);
+        let body = res.json();
+        let session = if list { &body["sessions"][0] } else { &body };
+        assert_eq!(session["acp"]["policy"], policy);
+        assert_eq!(session["state"], "idle");
+    }
 }

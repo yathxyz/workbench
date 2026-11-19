@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::journal::JournalEvent;
+use crate::policy::Policy;
 
 /// Protocol version carried by both hellos.
 pub const PROTO: u32 = 1;
@@ -129,6 +130,23 @@ pub enum HubRequest {
         config_id: String,
         value: Value,
     },
+    /// Replace or clear the session's task reference. Reply: `{}` after journaling.
+    #[serde(rename = "acp.set_task")]
+    AcpSetTask {
+        rid: u64,
+        sid: String,
+        // The member is required; only an explicit null or empty string clears it.
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        task: Option<String>,
+    },
+    /// Replace the session permission policy; existing pending requests are unchanged.
+    #[serde(rename = "acp.set_policy")]
+    AcpSetPolicy {
+        rid: u64,
+        sid: String,
+        epoch: u64,
+        policy: Policy,
+    },
     /// The client has seen the events up to `seq`. Reply: `{}`.
     #[serde(rename = "acp.seen")]
     AcpSeen { rid: u64, sid: String, seq: u64 },
@@ -189,6 +207,9 @@ pub enum HubMessage {
         /// The hub has git configured for local ACP worktrees.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         acp_worktree: bool,
+        /// Whether the hub journals ACP task references. False from an older hub.
+        #[serde(default)]
+        acp_task: bool,
     },
     /// Success reply to the request with this `rid`; `result` holds the reply fields.
     #[serde(rename = "ok")]
@@ -394,6 +415,23 @@ pub struct ConfigError {
     pub error: String,
 }
 
+/// Validate a hub or harness task reference. An empty trimmed value clears it.
+pub fn normalize_task(raw: &str) -> Result<Option<&str>, &'static str> {
+    let task = raw.trim();
+    if task.len() > crate::limits::TASK_MAX {
+        return Err("task too long");
+    }
+    // Inspect the original input: trimming must not hide a trailing newline or separator.
+    if raw.chars().any(|c| {
+        c.is_control()
+            || matches!(c, '\u{2028}' | '\u{2029}' | '\u{061c}' | '\u{200e}' | '\u{200f}'
+                | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    }) {
+        return Err("control character or line separator in task");
+    }
+    Ok((!task.is_empty()).then_some(task))
+}
+
 /// How to start an ACP agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnAcp {
@@ -415,6 +453,16 @@ pub struct SpawnAcp {
         deserialize_with = "WorktreeRequest::deserialize_option"
     )]
     pub worktree: Option<WorktreeRequest>,
+    /// Optional task reference for the new session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Permission rules used only when creating a session, not when attaching.
+    #[serde(
+        default,
+        deserialize_with = "crate::policy::deserialize_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub policy: Option<Policy>,
 }
 
 /// A branch to check out and, for a new branch, the revision to start it at.
@@ -600,6 +648,15 @@ pub struct AcpFacts {
     pub config_options: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_worktree: Option<ManagedWorktree>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Current permission rules; an empty policy is represented by absence.
+    #[serde(
+        default,
+        deserialize_with = "crate::policy::deserialize_optional_policy",
+        skip_serializing_if = "crate::policy::optional_policy_is_empty"
+    )]
+    pub policy: Option<Policy>,
 }
 
 /// What is outstanding to the agent.

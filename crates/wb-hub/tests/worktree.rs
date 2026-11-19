@@ -1,4 +1,4 @@
-//! The hub must keep reading a session's mailbox while git holds an operation open.
+//! Managed checkout creation, persistence and rollback with real git and an isolated hub.
 
 mod common;
 #[path = "common/script.rs"]
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use common::acp::group_members;
+use common::acp::{group_members, stub};
 use common::{Client, Hub, PATIENCE, eventually};
 use serde_json::{Value, json};
 
@@ -32,6 +32,7 @@ fn git(hub: &Hub, args: &[&str]) -> String {
         .env_clear()
         .env("HOME", hub.home())
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CEILING_DIRECTORIES", &hub.dir)
         .args([
             "-c",
             "user.name=Test",
@@ -48,7 +49,7 @@ fn git(hub: &Hub, args: &[&str]) -> String {
 /// Sleep *after* real git registered an add, or *before* it removes anything. A
 /// descendant holds the pipes, so killing the wrapper alone cannot pass these tests.
 fn fixture(pause: &str) -> Hub {
-    fixture_with_git(&format!(
+    let intercept = format!(
         r#"
 case " $* " in
     *' worktree {pause} '*)
@@ -59,11 +60,13 @@ case " $* " in
         if [ '{pause}' = add ]; then exit 0; fi ;;
 esac
 "#
-    ))
+    );
+    fixture_with_git(&intercept, &[])
 }
 
-fn fixture_with_git(intercept: &str) -> Hub {
-    let hub = Hub::with_scenarios_and(&[], |cfg| {
+fn fixture_with_git(intercept: &str, env: &[(&str, &str)]) -> Hub {
+    let configure = |cfg: &mut Value| {
+        stub(cfg, "stub", &[]);
         let dir = Path::new(cfg["stateDir"].as_str().unwrap())
             .parent()
             .unwrap();
@@ -72,11 +75,18 @@ fn fixture_with_git(intercept: &str) -> Hub {
         executable::write(
             Path::new(cfg["shells"][0]["paths"][0].as_str().unwrap()),
             &shim,
-            &format!("set -e\nexport GIT_CONFIG_NOSYSTEM=1\n{intercept}\nexec \"$0.real\" \"$@\""),
+            &format!(
+                r#"set -e
+export GIT_CONFIG_NOSYSTEM=1 GIT_CEILING_DIRECTORIES="${{HOME%/*}}"
+case "$PWD" in "$GIT_CEILING_DIRECTORIES"/*) ;; *) exit 1 ;; esac
+{intercept}
+exec "$0.real" "$@""#
+            ),
         );
         cfg["agents"]["missing"] = json!({"label": "Missing", "argv": [dir.join("not-installed")]});
         cfg["git"] = json!(shim);
-    });
+    };
+    let hub = Hub::start_with_env(configure, env);
     git(&hub, &["init", "-b", "main"]);
     git(&hub, &["commit", "--allow-empty", "-m", "seed"]);
     hub
@@ -146,6 +156,118 @@ fn registered(hub: &Hub, path: &Path) -> bool {
         .any(|field| field == wanted)
 }
 
+fn assert_managed(hub: &Hub, summary: &Value) {
+    let path = hub.dir.join("home-wt/topic");
+    assert_eq!(summary["cwd"], path.to_str().unwrap());
+    assert_eq!(
+        summary["acp"]["managedWorktree"],
+        json!({"mainRoot":hub.home(), "branch":"topic", "path":path})
+    );
+    assert!(path.join(".git").is_file() && registered(hub, &path));
+}
+
+fn policy() -> Value {
+    json!({"rules":[{"action":"ask", "roots":["$cwd"]}]})
+}
+
+#[test]
+fn worktree_task_and_policy_survive_restart_together() {
+    let mut hub = fixture_with_git("", &[]);
+    let mut c = hub.connect();
+    let mut req = open(&hub, "stub");
+    req["spawn"]["policy"] = policy();
+    req["spawn"]["task"] = json!("  issue 44  ");
+    let check = |hub: &Hub, summary: &Value| {
+        assert_managed(hub, summary);
+        assert_eq!(summary["acp"]["task"], "issue 44");
+        assert_eq!(summary["acp"]["policy"], policy());
+    };
+    let opened = c.ok(req);
+    assert_eq!(opened["new"], true);
+    check(&hub, &opened["summary"]);
+    c.event("managed", "session");
+    assert_eq!(hub.kinds("managed"), ["task", "policy", "spawn", "session"]);
+    drop(c);
+
+    assert!(hub.terminate().success());
+    hub.restart();
+    let attached = hub.connect().acp_open("managed", 0);
+    assert_eq!(attached["new"], false);
+    check(&hub, &attached["summary"]);
+}
+
+// Pause just before real git removes the checkout, while its registration still exists.
+const HOLD_ROLLBACK: &str = r#"case " $* " in
+    *' worktree remove -- '*)
+        : > "$0.rolling-back"
+        while [ ! -e "$0.release" ]; do sleep 0.05; done ;;
+esac"#;
+
+#[cfg(debug_assertions)]
+#[test]
+fn initial_task_transaction_rolls_back_worktree_before_refusing_creation() {
+    // Fail the task alone, the task with a following policy, or that second policy write.
+    for (fail_at, with_policy) in [("1", false), ("1", true), ("2", true)] {
+        let hub = fixture_with_git(HOLD_ROLLBACK, &[("WB_HUB_TEST_FAIL_WRITE_AT", fail_at)]);
+        let path = hub.dir.join("home-wt/topic");
+        let mut c = hub.connect();
+        let mut req = open(&hub, "stub");
+        req["spawn"]["task"] = json!("issue 44");
+        if with_policy {
+            req["spawn"]["policy"] = policy();
+        }
+        c.send(&req);
+        eventually(GIT_READY, "rollback after journal failure", || {
+            hub.dir.join("git.rolling-back").exists()
+        });
+        assert!(path.join(".git").is_file() && registered(&hub, &path));
+        // Same connection: list must answer first, without exposing the failed create.
+        c.send(&json!({"t":"list", "rid":91}));
+        let first = c.next().unwrap();
+        assert_eq!(
+            first["rid"], 91,
+            "creation answered during rollback: {first}"
+        );
+        assert_eq!(first["sessions"], json!([]));
+        fs::write(hub.dir.join("git.release"), "").unwrap();
+
+        let refused = c.reply(90);
+        assert_eq!(refused["t"], "err", "{refused}");
+        assert_eq!(refused["code"], "faulted");
+        assert!(!path.exists() && !registered(&hub, &path));
+        assert!(fs::read_dir(hub.acp_file("")).unwrap().next().is_none());
+        assert!(hub.record("stub").is_empty());
+        assert_eq!(c.ok(json!({"t":"list"}))["sessions"], json!([]));
+        let retried = c.ok(req);
+        assert_eq!(retried["new"], true);
+        assert_managed(&hub, &retried["summary"]);
+        c.event("managed", "session");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn failed_initial_policy_without_task_keeps_faulted_session_and_owned_worktree() {
+    let hub = fixture_with_git("", &[("WB_HUB_TEST_FAIL_WRITE_AT", "1")]);
+    let mut c = hub.connect();
+    let mut req = open(&hub, "stub");
+    req["spawn"]["policy"] = policy();
+    let opened = c.ok(req);
+    assert_eq!(opened["new"], true);
+    let summary = c.summary("managed");
+    assert_eq!(summary["alive"], false);
+    assert_eq!(summary["fault"]["code"], "journal_write");
+    assert!(summary["acp"].get("policy").is_none());
+    assert_managed(&hub, &summary);
+    assert!(hub.journal("managed").is_empty());
+    assert!(hub.record("stub").is_empty());
+
+    // A stale ownership record cannot remove a registered checkout.
+    c.ok(json!({"t":"acp.remove_worktree", "sid":"managed"}));
+    let path = hub.dir.join("home-wt/topic");
+    assert!(!path.exists() && !registered(&hub, &path));
+}
+
 #[test]
 fn kill_and_forget_cancel_unpublished_worktree_add() {
     for forget in [false, true] {
@@ -186,18 +308,17 @@ fn kill_during_independent_create_failure_reports_only_a_leftover() {
     for dirty in [false, true] {
         // Make ownership marking fail even without a kill. Hold its rollback open
         // until the actor has processed the kill, then let real git decide removal.
-        let hub = fixture_with_git(
+        let intercept = format!(
             r#"case " $* " in
     *' worktree add -- '*)
         "$0.real" "$@"
         admin=$("$0.real" -C "$HOME-wt/topic" rev-parse --absolute-git-dir)
         : > "$admin/workbench-session"
         exit 0 ;;
-    *' worktree remove -- '*)
-        : > "$0.rolling-back"
-        while [ ! -e "$0.release" ]; do sleep 0.05; done ;;
-esac"#,
+esac
+{HOLD_ROLLBACK}"#
         );
+        let hub = fixture_with_git(&intercept, &[]);
         let mut c = hub.connect();
         c.send(&open(&hub, "stub"));
         eventually(GIT_READY, "rollback of failed marking", || {
