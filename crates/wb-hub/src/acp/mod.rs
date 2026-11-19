@@ -322,8 +322,8 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
         announce(&mut announced, ev);
         match &ev.body {
             // The fold already validated it; nonempty rules folding to none were invalid.
-            EventBody::Policy { policy } if !policy.rules.is_empty() && facts.policy.is_none() => {
-                policy_notice = true;
+            EventBody::Policy { policy } => {
+                policy_notice = !policy.rules.is_empty() && facts.policy.is_none();
             }
             EventBody::Notice {
                 level: NoticeLevel::Warn,

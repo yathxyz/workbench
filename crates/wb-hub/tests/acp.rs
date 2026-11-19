@@ -1465,6 +1465,25 @@ fn hub_policy_invalid_replacements_warn_once_and_do_not_accumulate_on_restart() 
     let mut c = hub.connect();
     assert!(c.summary("a1")["acp"]["policy"].is_null());
     assert_eq!(hub.journal("a1"), warned_again);
+    drop(c);
+    hub.terminate();
+
+    for policy in [permission_policy("allow"), json!({"rules":[]})] {
+        let replacements = [invalid[0].clone(), policy];
+        append(&hub, &replacements);
+        let before = hub.journal("a1");
+        hub.restart();
+        let mut c = hub.connect();
+        let expected = if replacements[1]["rules"] == json!([]) {
+            &Value::Null
+        } else {
+            &replacements[1]
+        };
+        assert_eq!(&c.summary("a1")["acp"]["policy"], expected);
+        assert_eq!(hub.journal("a1"), before);
+        drop(c);
+        hub.terminate();
+    }
 }
 
 #[test]
