@@ -450,6 +450,7 @@ class Harness:
     def info(self):
         return {
             "web": f"http://{WEB_ADDR[0]}:{WEB_ADDR[1]}",
+            "webPid": self.web.pid,
             "caddy": PUBLIC_ORIGIN,
             "caddySocket": self.caddy_sock,
             "hubSocket": self.hub_sock,
