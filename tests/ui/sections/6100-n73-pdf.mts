@@ -179,9 +179,45 @@ await section('N73', async () => {
       const dropped = await until(() => Object.values<BoardNode>(S.nodes).find(m => m.kind === 'pdf' && m.name === 'dropped') as PdfNode | undefined);
       await until(() => C.live[dropped!.id]?.pdf?.doc);
       out.dropped = dropped && { blob: dropped.blob, path: dropped.path, pages: dropped.pages, url: C.pdfUrl(dropped) };
+
+      // Exercise both UI entry points, not just the shared text finder.
+      out.search = [];
+      for (const action of ['Find', 'Jump']) for (const outcome of ['live failure', 'closed failure', 'closed success']) {
+        const card = C.pdfFromPath(file), L = C.live[card.id], P: PdfLive = L.pdf;
+        await P.load;
+        const gate = Promise.withResolvers<Awaited<ReturnType<PdfJsPage['getTextContent']>>>(), message = `N73 search: ${action} ${outcome}`;
+        let started = false;
+        P.pages[0].page!.getTextContent = () => { started = true; return gate.promise; };
+        if (action === 'Jump') C.jumpRef({ ...q, src: { ...q.src, node: card.id } });
+        else {
+          L.hdr.querySelector('button[title^="Find in the PDF"]').click();
+          document.querySelector<HTMLInputElement>('#ask-in')!.value = q.text;
+          document.querySelector<HTMLFormElement>('#ask-form')!.requestSubmit();
+        }
+        if (!await until(() => started)) throw new Error(`${message} did not request text`);
+        const closed = outcome.startsWith('closed');
+        if (closed) C.removeNode(card.id);
+        const toast = document.querySelector('#toast')!, before = toast.textContent;
+        if (outcome === 'closed success') gate.resolve({ items: [{ str: q.text }] }); else gate.reject(new Error(message));
+        await turn();
+        out.search.push({ message, ok: toast.textContent === before && (closed ? !P.err && P.texts[0] === null
+          : P.err.includes(message) && !L.note.hidden && L.note.textContent === P.err) });
+        if (!closed) C.removeNode(card.id);
+      }
       out.made = [n.id, q?.id, peek?.id, dropped?.id].filter(Boolean);
       // a card that goes takes its document with it
-      const P = L(); C.removeNode(n.id); out.closed = !C.live[n.id] && P.doc === null && P.pages.length === 0;
+      const P = L();
+      out.flights = [];
+      for (const target of [n, q]) {
+        let landed = false; C.jumpNode(target, 1, () => { landed = true; });
+        const pending = C.LOD.busy();
+        if (target === n) C.removeNode(n.id);
+        else { const b = JSON.parse(C.serialize()); delete b.nodes[q.id]; b.edges = b.edges.filter((e: Edge) => e.from !== q.id && e.to !== q.id); C.boardAdopt(b); }
+        const stopped = !C.LOD.busy();
+        await until(() => !C.LOD.busy());
+        out.flights.push({ kind: target.kind, pending, stopped, landed });
+      }
+      out.closed = !C.live[n.id] && P.doc === null && P.pages.length === 0;
       return out;
     }, file);
     check('N73: /api/raw serves a PDF on the host whole and one range (206, Content-Range), as an attachment under a sandbox CSP, and refuses a file that is not a PDF (400) and a range past the end (416); the blob store takes PDF bytes and serves them as an attachment',
@@ -207,6 +243,10 @@ await section('N73', async () => {
     check('N73: the selection quotes as a ref card holding the page and the text around it (TextQuoteSelector), linked to the PDF; the quote is found again (asked on page 2, found on page 1, lit up), a text that is not there is not',
       st.sel === 'quote target' && st.selOf === 'quote target' && st.quote?.text === 'quote target' && st.quote.src.page === 1 && /The $/.test(st.quote.src.prefix) && /^ sits/.test(st.quote.src.suffix) && st.quote.label === 'n68 paper › p. 1' && st.quote.edge
       && st.find === true && st.hit && st.miss === false, JSON.stringify({ sel: st.sel, quote: st.quote, find: st.find, hit: st.hit, miss: st.miss }));
+    check('N73: Find and quote Jump report a live extraction failure, but ignore both success and failure after close without a stale toast or rejection',
+      st.search.every((s: { ok: boolean }) => s.ok) && !pageErrors.length, JSON.stringify({ search: st.search, pageErrors }));
+    check('N73: removing a flight target locally or in an adopted board cancels its camera flight and completion',
+      st.flights.every((f: { pending: boolean; stopped: boolean; landed: boolean }) => f.pending && f.stopped && !f.landed), JSON.stringify(st.flights));
     check('N73: a link to page 2 opens a peek, an image card of that place in the blob store with ⤴ back; the reading position is saved in the card; on the pages j and q are the pdf keymap\'s, g and G go to the first and last page',
       st.peek?.page === 2 && st.peek.blob && st.peek.edge && st.peek.btn && st.pos?.page === 2 && st.pos.badge === 'p. 2 / 2' && st.keys.interior === 'pdf' && st.keys.j === 'pdf.down' && st.keys.q === 'pdf.quote' && st.keys.g === 1 && st.keys.G === 2,
       JSON.stringify({ peek: st.peek, pos: st.pos, keys: st.keys }));

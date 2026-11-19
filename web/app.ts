@@ -149,6 +149,7 @@ function camStop(finish = true) {
   if (WHEEL.raf) { cancelAnimationFrame(WHEEL.raf); WHEEL.raf = 0; }
   return flight;
 }
+function cancelCardFlight(id: string) { if (anim?.card === id) { camStop(false); lodSettle(); } }
 function pushHistory() { camBack.push({ ...cam() }); if (camBack.length > 60) camBack.shift(); camFwd.length = 0; }
 function leaveFocus() { if (FOCUS.cur) focusHide(); }
 function cameraHistory(from: Cam[], to: Cam[]) {
@@ -347,6 +348,7 @@ function boardAdopt(b: Board): void {
   hashRestore('board');
 }
 function unmountQuiet(id: string): void {   // the card went in another tab: drop it here without killing its session
+  cancelCardFlight(id);
   focusClose(id);
   const L = live[id]; if (!L) return;
   pdfClose(L); L.backend?.dispose?.(); L.ro?.disconnect(); L.term?.dispose(); if (L.frame?.contentWindow) HOSTS.delete(L.frame.contentWindow);
@@ -3351,6 +3353,7 @@ function cardGhost(e: HTMLElement) {
   nodesEl.append(g); setTimeout(() => g.remove(), MOTION.fast + 40);
 }
 function removeNode(id: string) {
+  cancelCardFlight(id);
   focusClose(id);
   PICKED.delete(id); pickChip();
   const gone = S.nodes[id], parent = gone?.in && S.nodes[gone.in] as FrameNode;
@@ -8525,12 +8528,12 @@ async function pdfLinks(n: PdfNode, P: PdfLive, p: PdfPageLive, page: PdfJsPage)
 }
 // a page's text, whitespace made single spaces: what quotes are anchored in and agents read
 async function pdfPageText(n: PdfNode, i: number): Promise<string> {
-  const L = live[n.id], P = L?.pdf; if (!P) return '';
+  const P = live[n.id]?.pdf; if (!P) return '';
   if (!P.doc) await P.load;
-  if (!P.doc || i < 0 || i >= P.pages.length) return '';
+  if (live[n.id]?.pdf !== P || !P.doc || i < 0 || i >= P.pages.length) return '';
   if (P.texts[i] == null) {
-    const page = await pdfPage(P, P.pages[i]); if (!page) return '';
-    const tc = await page.getTextContent();
+    const page = await pdfPage(P, P.pages[i]); if (!page || live[n.id]?.pdf !== P) return '';
+    const tc = await page.getTextContent(); if (live[n.id]?.pdf !== P) return '';
     P.texts[i] = tc.items.map(t => (t.str || '') + (t.hasEOL ? '\n' : '')).join(' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/[ \t]+/g, ' ').trim();
   }
   return P.texts[i]!;
@@ -8579,15 +8582,17 @@ async function pdfQuote(n: PdfNode) {
 async function pdfFind(n: PdfNode, text: string, i: number, prefix = '', suffix = ''): Promise<boolean> {
   const P = live[n.id]?.pdf; if (!P) return false;
   if (!P.doc) await P.load;
-  if (!P.doc) return false;
+  if (live[n.id]?.pdf !== P || !P.doc) return false;
   const want = flat(text), order = [i, ...P.pages.map(p => p.i).filter(j => j !== i)];
   for (const j of order) {
     if (j < 0 || j >= P.pages.length) continue;
-    const t = flat(await pdfPageText(n, j)); let k = t.indexOf(flat(prefix) + want + flat(suffix));
+    const t = flat(await pdfPageText(n, j)); if (live[n.id]?.pdf !== P) return false;
+    let k = t.indexOf(flat(prefix) + want + flat(suffix));
     k = k >= 0 ? k + flat(prefix).length : t.indexOf(want);
     if (k < 0) continue;
     pdfGo(n, j, 0, true);
-    const p = P.pages[j]; await pdfDraw(n, P, p); await p.textReady;
+    const p = P.pages[j]; await pdfDraw(n, P, p); if (live[n.id]?.pdf !== P) return false;
+    await p.textReady; if (live[n.id]?.pdf !== P) return false;
     const spans = [...(p.text?.querySelectorAll<HTMLElement>('span:not(.markedContent)') || [])];
     // the text layer's spans as one flat string, each character remembering its span
     let s = '', own: number[] = [];
@@ -8602,29 +8607,35 @@ async function pdfFind(n: PdfNode, text: string, i: number, prefix = '', suffix 
   return false;
 }
 function pdfJumpQuote(r: RefNode, n: PdfNode) {
+  const P = live[n.id]?.pdf; if (!P) return;
   jumpNode(n, 1, async () => {
-    if (!await pdfFind(n, r.text, (r.src.page || 1) - 1, r.src.prefix, r.src.suffix)) { pdfGo(n, (r.src.page || 1) - 1); toast('The quote is no longer in the PDF; here is the page it came from.'); }
-    live[n.id]?.pdf?.scroll.focus({ preventScroll: true });
+    if (live[n.id]?.pdf !== P) return;
+    const i = (r.src.page || 1) - 1;
+    const found = await pdfFind(n, r.text, i, r.src.prefix, r.src.suffix).catch(e => pdfError(n, P, e));
+    if (live[n.id]?.pdf !== P || found == null) return;
+    if (!found) { pdfGo(n, i); toast('The quote is no longer in the PDF; here is the page it came from.'); }
+    P.scroll.focus({ preventScroll: true });
   });
 }
 const PDF_FIND: { q: string; id: string; page: number } = { q: '', id: '', page: -1 };
 function pdfFindAsk(n: PdfNode) {
+  const P = live[n.id]?.pdf; if (!P) return;
   ask('Find in ' + n.name, PDF_FIND.id === n.id ? PDF_FIND.q : '', async q => {
-    q = flat(q); if (!q) return;
-    const P = live[n.id]?.pdf; if (!P?.doc) return;
+    q = flat(q); if (!q || live[n.id]?.pdf !== P || !P.doc) return;
     const again = PDF_FIND.id === n.id && PDF_FIND.q === q, start = again ? PDF_FIND.page + 1 : pdfWhere(n).page - 1;
     Object.assign(PDF_FIND, { q, id: n.id });
-    for (let s = 0; s < P.pages.length; s++) {
-      const j = (start + s) % P.pages.length;
-      if (flat(await pdfPageText(n, j)).toLowerCase().includes(q.toLowerCase())) {
+    try {
+      for (let s = 0; s < P.pages.length; s++) {
+        const j = (start + s) % P.pages.length, t = flat(await pdfPageText(n, j));
+        if (live[n.id]?.pdf !== P) return;
+        const k = t.toLowerCase().indexOf(q.toLowerCase()); if (k < 0) continue;
+        if (!await pdfFind(n, t.slice(k, k + q.length), j) || live[n.id]?.pdf !== P) return;
         PDF_FIND.page = j;
-        const t = flat(await pdfPageText(n, j)), k = t.toLowerCase().indexOf(q.toLowerCase());
-        await pdfFind(n, t.slice(k, k + q.length), j);
         P.scroll.focus({ preventScroll: true });
         return toast(`p. ${j + 1}: found. / and Enter again for the next one.`);
       }
-    }
-    toast(`"${q}" is not in ${n.name}.`);
+      toast(`"${q}" is not in ${n.name}.`);
+    } catch (e) { pdfError(n, P, e); }
   });
 }
 // A peek: the place a link points at, drawn into an image card beside the PDF (so it can be kept, moved, copied or sent on)
