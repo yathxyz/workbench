@@ -30,6 +30,12 @@ pub const ACP_CONFIG_MAX: usize = 16;
 pub const ACP_CONFIG_OPTIONS_MAX: usize = 64;
 /// Largest serialized agent configuration offering. Larger is malformed.
 pub const ACP_CONFIG_OPTIONS_BYTES: usize = 64 * KIB;
+/// Maximum byte length of a requested worktree branch or base.
+pub const GIT_NAME_MAX: usize = 255;
+/// Deadline for git queries and branch/lock updates.
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline to populate or delete a checkout (`git worktree add` or `remove`).
+pub const GIT_WORKTREE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Largest trimmed session task reference in UTF-8 bytes. Larger ACP requests are `bad_request`.
 pub const TASK_MAX: usize = 512;
 /// Largest serialized permission policy; excess is `bad_request`.

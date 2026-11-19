@@ -41,6 +41,10 @@ pub struct Config {
     /// Other hosts of the mesh whose agents the hub can start (DESIGN §3.8.5).
     #[serde(default)]
     pub hosts: BTreeMap<String, HostConfig>,
+    /// Absolute git executable for managed local ACP worktrees, if enabled.
+    pub git: Option<PathBuf>,
+    /// Mirror new managed worktrees here instead of beside the main checkout.
+    pub worktree_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +137,23 @@ impl Config {
         }
         if !self.state_dir.is_absolute() {
             bail!("stateDir must be an absolute path");
+        }
+        if self
+            .git
+            .as_deref()
+            .is_some_and(|p| !p.is_absolute() || p.as_os_str().as_encoded_bytes().contains(&0))
+        {
+            bail!("git must be an absolute executable path without NUL");
+        }
+        // Path::components() normalizes interior `.`; reject it as written.
+        if let Some(root) = &self.worktree_root
+            && !root.to_str().is_some_and(|s| {
+                absolute(s) && !s.split('/').any(|part| matches!(part, "." | ".." | ".git"))
+            })
+        {
+            bail!(
+                "worktreeRoot must be an absolute path without NUL or components named ., .. or .git"
+            );
         }
         let mut seen = BTreeSet::new();
         for shell in &self.shells {
@@ -291,6 +312,44 @@ mod tests {
         assert!(cfg.child.pass_env.is_empty() && cfg.child.set_env.is_empty());
         assert!(cfg.agents.is_empty());
         assert!(cfg.hosts.is_empty());
+    }
+
+    #[test]
+    fn git_must_be_an_absolute_path_when_configured() {
+        for path in ["git", "", "/bin/git\0"] {
+            assert!(with(|v| v["git"] = path.into()).is_err());
+        }
+        assert_eq!(
+            with(|v| v["git"] = "/bin/git".into())
+                .unwrap()
+                .git
+                .as_deref(),
+            Some(Path::new("/bin/git"))
+        );
+    }
+
+    #[test]
+    fn worktree_root_must_be_absolute_without_dot_components() {
+        for path in [
+            "relative",
+            "",
+            "/srv/./wt",
+            "/srv/.",
+            "/srv/../wt",
+            "/srv/..",
+            "/srv/.git",
+            "/srv/.git/worktrees",
+            "/wt\0",
+        ] {
+            assert!(
+                with(|v| v["worktreeRoot"] = path.into()).is_err(),
+                "{path:?}"
+            );
+        }
+        for path in ["/", "/srv/.worktrees", "/srv/.git-backup"] {
+            let cfg = with(|v| v["worktreeRoot"] = path.into()).unwrap();
+            assert_eq!(cfg.worktree_root.as_deref(), Some(Path::new(path)));
+        }
     }
 
     /// The example of DESIGN §3.8.5 under `hosts`.

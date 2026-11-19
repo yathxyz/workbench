@@ -166,6 +166,7 @@ in
           pkgs.python3
           pkgs.bashInteractive
           pkgs.coreutils
+          pkgs.git
           pkgs.caddy
           workbench
           workbench.fake
@@ -220,36 +221,37 @@ in
 
   vm = pkgs.testers.runNixOSTest (import ./vm.nix { inherit self; });
 
-  # The module's assertions refuse what wb-hub would refuse at its next start, so a bad name
-  # fails the evaluation instead of the first hub restart after a deploy.
+  # Fail a bad config at evaluation rather than the next hub restart, and check what the unit
+  # actually receives in /etc/workbench/hub.json.
   module =
     let
-      failing =
+      evaluate =
         extra:
-        let
-          sys = pkgs.nixos {
-            imports = [
-              self.nixosModules.workbench
-              extra
-            ];
-            system.stateVersion = lib.trivial.release;
-            users.users.alice.isNormalUser = true;
-            services.workbench = {
-              enable = true;
-              user = "alice";
-              listenAddress = "192.0.2.2";
-              trustedProxy = "192.0.2.1";
-              publicOrigin = "https://wb.example.org";
-              proxySecretFile = "/run/secrets/workbench-proxy-secret";
-              firewall.interface = "wg0";
-            };
+        pkgs.nixos {
+          imports = [
+            self.nixosModules.workbench
+            extra
+          ];
+          system.stateVersion = lib.trivial.release;
+          users.users.alice.isNormalUser = true;
+          services.workbench = {
+            enable = true;
+            user = "alice";
+            listenAddress = "192.0.2.2";
+            trustedProxy = "192.0.2.1";
+            publicOrigin = "https://wb.example.org";
+            proxySecretFile = "/run/secrets/workbench-proxy-secret";
+            firewall.interface = "wg0";
           };
-        in
-        map (a: a.message) (
-          lib.filter (a: !a.assertion && lib.hasPrefix "services.workbench" a.message) sys.config.assertions
-        );
+        };
+      badRoot = [ "services.workbench.worktreeRoot must be an absolute path" ];
       expect = {
         valid = [ ];
+        configuredRoot = [ ];
+        relativeRoot = badRoot;
+        dotRoot = badRoot;
+        parentRoot = badRoot;
+        gitDirRoot = badRoot;
         shellName = [ "services.workbench.shells: names" ];
         environmentName = [ "services.workbench.environment and agents" ];
         agentEnvName = [ "services.workbench.environment and agents" ];
@@ -261,8 +263,13 @@ in
         apiEventsHost = [ "services.workbench.api.clients.*: the events scope" ];
         apiListen = [ "services.workbench.api must not listen" ];
       };
-      got = lib.mapAttrs (_: failing) {
+      systems = lib.mapAttrs (_: evaluate) {
         valid = { };
+        configuredRoot.services.workbench.worktreeRoot = "/srv/.worktrees/";
+        relativeRoot.services.workbench.worktreeRoot = "worktrees";
+        dotRoot.services.workbench.worktreeRoot = "/srv/./wt";
+        parentRoot.services.workbench.worktreeRoot = "/srv/wt/..";
+        gitDirRoot.services.workbench.worktreeRoot = "/srv/repo/.git/worktrees";
         shellName.services.workbench.shells = {
           bash.paths = [ "/run/current-system/sw/bin/bash" ];
           my_sh.paths = [ "/run/current-system/sw/bin/sh" ];
@@ -308,15 +315,26 @@ in
           };
         };
       };
+      got = lib.mapAttrs (
+        _: sys:
+        map (a: a.message) (
+          lib.filter (a: !a.assertion && lib.hasPrefix "services.workbench" a.message) sys.config.assertions
+        )
+      ) systems;
+      hubJson = sys: sys.config.environment.etc."workbench/hub.json".source;
       matches = lib.mapAttrs (
         case: prefixes:
         lib.length got.${case} == lib.length prefixes
         && lib.all (p: lib.any (lib.hasPrefix p) got.${case}) prefixes
       ) expect;
     in
-    pkgs.runCommand "workbench-module" { } (
+    pkgs.runCommand "workbench-module" { nativeBuildInputs = [ pkgs.jq ]; } (
       if lib.all lib.id (lib.attrValues matches) then
-        "touch $out"
+        ''
+          jq -e 'has("worktreeRoot") | not' ${hubJson systems.valid}
+          jq -e '.worktreeRoot == "/srv/.worktrees/"' ${hubJson systems.configuredRoot}
+          touch $out
+        ''
       else
         ''
           echo ${lib.escapeShellArg (builtins.toJSON got)}

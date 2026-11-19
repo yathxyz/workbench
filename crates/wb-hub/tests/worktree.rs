@@ -1,0 +1,384 @@
+//! Managed checkout creation, persistence and rollback with real git and an isolated hub.
+
+mod common;
+#[path = "common/script.rs"]
+mod executable;
+
+use std::env;
+use std::fs;
+use std::os::unix::fs::symlink;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+use common::acp::{group_members, stub};
+use common::{Client, Hub, PATIENCE, eventually};
+use serde_json::{Value, json};
+
+// Allow for scheduling real git under load; still well below its 120 s worktree deadline.
+const GIT_READY: Duration = Duration::from_secs(30);
+
+fn program(name: &str) -> PathBuf {
+    env::split_paths(&env::var_os("PATH").unwrap())
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|file| file.is_file())
+        .unwrap_or_else(|| panic!("{name} missing from test PATH"))
+}
+
+fn git(hub: &Hub, args: &[&str]) -> String {
+    let output = Command::new(hub.dir.join("git.real"))
+        .current_dir(hub.home())
+        .env_clear()
+        .env("HOME", hub.home())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CEILING_DIRECTORIES", &hub.dir)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// Sleep *after* real git registered an add, or *before* it removes anything. A
+/// descendant holds the pipes, so killing the wrapper alone cannot pass these tests.
+fn fixture(pause: &str) -> Hub {
+    let intercept = format!(
+        r#"
+case " $* " in
+    *' worktree {pause} '*)
+        if [ '{pause}' = add ]; then "$0.real" "$@" || exit $?; fi
+        sleep 60 &
+        printf '%s %s\n' "$$" "$!" > "$0.started"
+        wait
+        if [ '{pause}' = add ]; then exit 0; fi ;;
+esac
+"#
+    );
+    fixture_with_git(&intercept, &[])
+}
+
+fn fixture_with_git(intercept: &str, env: &[(&str, &str)]) -> Hub {
+    let configure = |cfg: &mut Value| {
+        stub(cfg, "stub", &[]);
+        let dir = Path::new(cfg["stateDir"].as_str().unwrap())
+            .parent()
+            .unwrap();
+        let shim = dir.join("git");
+        symlink(program("git"), dir.join("git.real")).unwrap();
+        executable::write(
+            Path::new(cfg["shells"][0]["paths"][0].as_str().unwrap()),
+            &shim,
+            &format!(
+                r#"set -e
+export GIT_CONFIG_NOSYSTEM=1 GIT_CEILING_DIRECTORIES="${{HOME%/*}}"
+case "$PWD" in "$GIT_CEILING_DIRECTORIES"/*) ;; *) exit 1 ;; esac
+{intercept}
+exec "$0.real" "$@""#
+            ),
+        );
+        cfg["agents"]["missing"] = json!({"label": "Missing", "argv": [dir.join("not-installed")]});
+        cfg["git"] = json!(shim);
+    };
+    let hub = Hub::start_with_env(configure, env);
+    git(&hub, &["init", "-b", "main"]);
+    git(&hub, &["commit", "--allow-empty", "-m", "seed"]);
+    hub
+}
+
+fn open(hub: &Hub, agent: &str) -> Value {
+    json!({"t": "acp.open", "rid": 90, "sid": "managed", "since": 0,
+           "spawn": {"agent": agent, "cwd": hub.home(), "worktree": {"branch": "topic"}}})
+}
+
+fn sleeping_group(hub: &Hub) -> u32 {
+    let path = hub.dir.join("git.started");
+    eventually(GIT_READY, "git and its child started", || {
+        fs::read_to_string(&path).is_ok_and(|s| s.ends_with('\n'))
+    });
+    let pids = fs::read_to_string(path).unwrap();
+    let (group, child) = pids.trim().split_once(' ').unwrap();
+    let group = group.parse().unwrap();
+    assert!(group_members(group).contains(&child.parse().unwrap()));
+    group
+}
+
+/// More commands than both the 8-slot mailbox and the per-connection in-flight
+/// limit. If the actor waits on git, the pileup blocks even a different sid *on the
+/// same socket*. A second sender can fill the entire mailbox on its own.
+fn assert_responsive(hub: &Hub, c: &mut Client, published: bool) {
+    let mut filler = hub.connect();
+    for sender in [&mut filler, &mut *c] {
+        for rid in 100..116 {
+            let t = if rid % 2 == 0 {
+                "acp.revive"
+            } else {
+                "acp.remove_worktree"
+            };
+            sender.send(&json!({"t": t, "sid": "managed", "rid": rid}));
+        }
+    }
+    c.send(
+        &json!({"t": "acp.open", "rid": 200, "sid": "unrelated", "since": 0,
+                   "spawn": {"agent": "missing", "cwd": hub.home()}}),
+    );
+    let other = c.reply(200);
+    assert_eq!(other["new"], true, "{other}");
+    for sender in [&mut filler, &mut *c] {
+        for rid in 100..116 {
+            let busy = sender.reply(rid);
+            assert_eq!(busy["code"], "conflict", "{busy}");
+            assert_eq!(busy["message"], "worktree operation in progress");
+        }
+    }
+    let list = c.ok(json!({"t": "list"}));
+    assert_eq!(
+        list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["sid"] == "managed"),
+        published,
+        "{list}"
+    );
+}
+
+fn registered(hub: &Hub, path: &Path) -> bool {
+    let wanted = format!("worktree {}", path.display());
+    git(hub, &["worktree", "list", "--porcelain", "-z"])
+        .split('\0')
+        .any(|field| field == wanted)
+}
+
+fn assert_managed(hub: &Hub, summary: &Value) {
+    let path = hub.dir.join("home-wt/topic");
+    assert_eq!(summary["cwd"], path.to_str().unwrap());
+    assert_eq!(
+        summary["acp"]["managedWorktree"],
+        json!({"mainRoot":hub.home(), "branch":"topic", "path":path})
+    );
+    assert!(path.join(".git").is_file() && registered(hub, &path));
+}
+
+fn policy() -> Value {
+    json!({"rules":[{"action":"ask", "roots":["$cwd"]}]})
+}
+
+#[test]
+fn worktree_task_and_policy_survive_restart_together() {
+    let mut hub = fixture_with_git("", &[]);
+    let mut c = hub.connect();
+    let mut req = open(&hub, "stub");
+    req["spawn"]["policy"] = policy();
+    req["spawn"]["task"] = json!("  issue 44  ");
+    let check = |hub: &Hub, summary: &Value| {
+        assert_managed(hub, summary);
+        assert_eq!(summary["acp"]["task"], "issue 44");
+        assert_eq!(summary["acp"]["policy"], policy());
+    };
+    let opened = c.ok(req);
+    assert_eq!(opened["new"], true);
+    check(&hub, &opened["summary"]);
+    c.event("managed", "session");
+    assert_eq!(hub.kinds("managed"), ["task", "policy", "spawn", "session"]);
+    drop(c);
+
+    assert!(hub.terminate().success());
+    hub.restart();
+    let attached = hub.connect().acp_open("managed", 0);
+    assert_eq!(attached["new"], false);
+    check(&hub, &attached["summary"]);
+}
+
+// Pause just before real git removes the checkout, while its registration still exists.
+const HOLD_ROLLBACK: &str = r#"case " $* " in
+    *' worktree remove -- '*)
+        : > "$0.rolling-back"
+        while [ ! -e "$0.release" ]; do sleep 0.05; done ;;
+esac"#;
+
+#[cfg(debug_assertions)]
+#[test]
+fn initial_task_transaction_rolls_back_worktree_before_refusing_creation() {
+    // Fail the task alone, the task with a following policy, or that second policy write.
+    for (fail_at, with_policy) in [("1", false), ("1", true), ("2", true)] {
+        let hub = fixture_with_git(HOLD_ROLLBACK, &[("WB_HUB_TEST_FAIL_WRITE_AT", fail_at)]);
+        let path = hub.dir.join("home-wt/topic");
+        let mut c = hub.connect();
+        let mut req = open(&hub, "stub");
+        req["spawn"]["task"] = json!("issue 44");
+        if with_policy {
+            req["spawn"]["policy"] = policy();
+        }
+        c.send(&req);
+        eventually(GIT_READY, "rollback after journal failure", || {
+            hub.dir.join("git.rolling-back").exists()
+        });
+        assert!(path.join(".git").is_file() && registered(&hub, &path));
+        // Same connection: list must answer first, without exposing the failed create.
+        c.send(&json!({"t":"list", "rid":91}));
+        let first = c.next().unwrap();
+        assert_eq!(
+            first["rid"], 91,
+            "creation answered during rollback: {first}"
+        );
+        assert_eq!(first["sessions"], json!([]));
+        fs::write(hub.dir.join("git.release"), "").unwrap();
+
+        let refused = c.reply(90);
+        assert_eq!(refused["t"], "err", "{refused}");
+        assert_eq!(refused["code"], "faulted");
+        assert!(!path.exists() && !registered(&hub, &path));
+        assert!(fs::read_dir(hub.acp_file("")).unwrap().next().is_none());
+        assert!(hub.record("stub").is_empty());
+        assert_eq!(c.ok(json!({"t":"list"}))["sessions"], json!([]));
+        let retried = c.ok(req);
+        assert_eq!(retried["new"], true);
+        assert_managed(&hub, &retried["summary"]);
+        c.event("managed", "session");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn failed_initial_policy_without_task_keeps_faulted_session_and_owned_worktree() {
+    let hub = fixture_with_git("", &[("WB_HUB_TEST_FAIL_WRITE_AT", "1")]);
+    let mut c = hub.connect();
+    let mut req = open(&hub, "stub");
+    req["spawn"]["policy"] = policy();
+    let opened = c.ok(req);
+    assert_eq!(opened["new"], true);
+    let summary = c.summary("managed");
+    assert_eq!(summary["alive"], false);
+    assert_eq!(summary["fault"]["code"], "journal_write");
+    assert!(summary["acp"].get("policy").is_none());
+    assert_managed(&hub, &summary);
+    assert!(hub.journal("managed").is_empty());
+    assert!(hub.record("stub").is_empty());
+
+    // A stale ownership record cannot remove a registered checkout.
+    c.ok(json!({"t":"acp.remove_worktree", "sid":"managed"}));
+    let path = hub.dir.join("home-wt/topic");
+    assert!(!path.exists() && !registered(&hub, &path));
+}
+
+#[test]
+fn kill_and_forget_cancel_unpublished_worktree_add() {
+    for forget in [false, true] {
+        let hub = fixture("add");
+        let wt = hub.dir.join("home-wt/topic");
+        let mut c = hub.connect();
+        c.send(&open(&hub, "stub"));
+        let group = sleeping_group(&hub);
+        assert!(wt.join(".git").is_file() && registered(&hub, &wt));
+        assert_responsive(&hub, &mut c, false);
+
+        c.send(&json!({"t": "acp.kill", "rid": 300, "sid": "managed", "forget": forget}));
+        assert_eq!(c.reply(300), json!({"t":"ok", "rid":300}));
+        // Not just eventually: the cleanup is part of the kill reply.
+        assert!(!wt.exists() && !registered(&hub, &wt));
+        assert_eq!(
+            git(&hub, &["rev-parse", "topic"]),
+            git(&hub, &["rev-parse", "HEAD"])
+        );
+        assert!(fs::read_dir(hub.acp_file("")).unwrap().all(|f| {
+            !f.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("managed.")
+        }));
+        let interrupted = c.reply(90);
+        assert_eq!(interrupted["code"], "conflict", "{interrupted}");
+        assert_eq!(c.acp_open("managed", 0)["code"], "not_found");
+        assert!(hub.record("stub").is_empty());
+        eventually(PATIENCE, "cancelled git process group gone", || {
+            group_members(group).is_empty()
+        });
+    }
+}
+
+#[test]
+fn kill_during_independent_create_failure_reports_only_a_leftover() {
+    for dirty in [false, true] {
+        // Make ownership marking fail even without a kill. Hold its rollback open
+        // until the actor has processed the kill, then let real git decide removal.
+        let intercept = format!(
+            r#"case " $* " in
+    *' worktree add -- '*)
+        "$0.real" "$@"
+        admin=$("$0.real" -C "$HOME-wt/topic" rev-parse --absolute-git-dir)
+        : > "$admin/workbench-session"
+        exit 0 ;;
+esac
+{HOLD_ROLLBACK}"#
+        );
+        let hub = fixture_with_git(&intercept, &[]);
+        let mut c = hub.connect();
+        c.send(&open(&hub, "stub"));
+        eventually(GIT_READY, "rollback of failed marking", || {
+            hub.dir.join("git.rolling-back").exists()
+        });
+        let wt = hub.dir.join("home-wt/topic");
+        if dirty {
+            fs::write(wt.join("keep"), "mine").unwrap();
+        }
+        let kill = json!({"t":"acp.kill", "rid":300, "sid":"managed", "forget":dirty});
+        c.send(&kill);
+        // Only the second kill gets an immediate conflict; the first awaits cleanup.
+        assert_eq!(c.request(kill)["code"], "conflict");
+        fs::write(hub.dir.join("git.release"), "").unwrap();
+
+        let stopped = c.reply(300);
+        let refused = c.reply(90);
+        assert_eq!(refused["code"], "internal", "{refused}");
+        if dirty {
+            assert_eq!(stopped["code"], refused["code"]);
+            assert_eq!(stopped["message"], refused["message"]);
+            assert!(
+                stopped["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(wt.to_str().unwrap())
+            );
+            assert_eq!(fs::read_to_string(wt.join("keep")).unwrap(), "mine");
+        } else {
+            assert_eq!(stopped, json!({"t":"ok", "rid":300}));
+            assert!(!wt.exists());
+        }
+        assert_eq!(registered(&hub, &wt), dirty);
+        assert_eq!(c.acp_open("managed", 0)["code"], "not_found");
+        assert!(hub.record("stub").is_empty());
+    }
+}
+
+#[test]
+fn shutdown_aborts_worktree_add_remove_and_prepublication_rollback() {
+    for phase in ["add", "remove", "rollback"] {
+        let mut hub = fixture(if phase == "rollback" { "remove" } else { phase });
+        let mut c = hub.connect();
+        if phase == "rollback" {
+            // Refuse the new session after worktree add, as in the daemon conformance test.
+            fs::create_dir(hub.acp_file("managed.jsonl")).unwrap();
+        }
+        c.send(&open(&hub, "missing"));
+        let published = phase == "remove";
+        if published {
+            let made = c.reply(90);
+            assert_eq!(made["summary"]["alive"], false, "{made}");
+            c.send(&json!({"t": "acp.remove_worktree", "rid": 91, "sid": "managed"}));
+        }
+        let group = sleeping_group(&hub);
+        assert_responsive(&hub, &mut c, published);
+        assert!(hub.terminate().success());
+        eventually(PATIENCE, "git group gone on shutdown", || {
+            group_members(group).is_empty()
+        });
+        assert_eq!(hub.acp_file("managed.json").exists(), published);
+    }
+}

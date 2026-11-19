@@ -409,8 +409,9 @@ class Harness:
             raise RuntimeError("WB_HARNESS_TCP needs a network namespace with only lo (the nix sandbox, "
                                "unshare -rn): elsewhere other users could reach the secret-injecting proxy")
         # A stale listener would pass the readiness check and answer for the new wb-web.
-        if can_connect_tcp(WEB_ADDR):
-            raise RuntimeError(f"{WEB_ADDR[0]}:{WEB_ADDR[1]} is already in use")
+        for addr in ((WEB_ADDR, API_ADDR) if self.api_tokens else (WEB_ADDR,)):
+            if can_connect_tcp(addr):
+                raise RuntimeError(f"{addr[0]}:{addr[1]} is already in use")
         for name, step in (("hub", self.start_hub), ("edit", self.start_edit), ("web", self.start_web), ("caddy", self.start_caddy)):
             try:
                 step()

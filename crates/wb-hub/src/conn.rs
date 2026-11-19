@@ -178,6 +178,7 @@ fn hello(ctx: &Ctx) -> HubMessage {
         shells: ctx.cfg.available_shells(),
         default_shell: ctx.cfg.default_shell.clone(),
         acp_config: true,
+        acp_worktree: ctx.cfg.git.is_some(),
         acp_task: true,
         hosts: ctx
             .cfg
@@ -425,6 +426,9 @@ impl Conn {
             } => self.act(rid, sid, Act::Authenticate(method_id)).await,
             HubRequest::AcpKill { rid, sid, forget } => {
                 self.act(rid, sid, Act::Kill { forget }).await;
+            }
+            HubRequest::AcpRemoveWorktree { rid, sid } => {
+                self.act(rid, sid, Act::RemoveWorktree).await;
             }
             HubRequest::Unknown => {
                 self.error(

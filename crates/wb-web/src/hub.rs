@@ -84,6 +84,8 @@ pub struct HubInfo {
     pub hosts: Vec<Host>,
     /// Whether the hub applies ordered startup configuration.
     pub acp_config: bool,
+    /// Whether the hub can create and remove managed ACP worktrees.
+    pub acp_worktree: bool,
     /// Whether this connection's hub supports ACP session task references.
     pub acp_task: bool,
     /// The shells a spawn may name; DELTA-1 §B.
@@ -164,6 +166,7 @@ impl HubConn {
             default_shell,
             hosts,
             acp_config,
+            acp_worktree,
             acp_task,
             ..
         }) = hello
@@ -190,6 +193,7 @@ impl HubConn {
             agents,
             hosts,
             acp_config,
+            acp_worktree,
             acp_task,
             shells,
             default_shell,

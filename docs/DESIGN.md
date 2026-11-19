@@ -205,6 +205,7 @@ flake.nix flake.lock   (inputs: nixpkgs, edwin = github:yathxyz/edwin)
    - `build` comes from `option_env!("WB_HUB_BUILD")`. It is absent in local cargo builds.
    - `shells` lists the names of the configured shells that have an existing, executable path when the connection opens (the hub re-checks at each spawn). `defaultShell` is the configured default (§3.7.2).
    - `acpConfig:true` advertises ordered startup configuration and live configuration requests. Missing or false means unsupported; clients must not infer support from the version or build. Older hubs ignore an unknown `SpawnAcp.config`, so the web refuses a non-empty batch unless the connected hub advertises support.
+   - `acpWorktree:true` advertises local ACP worktree management and is sent only when `git` is configured (§3.7.2); absent or false means unsupported.
    - `acpTask:true` advertises support for both `SpawnAcp.task` and `acp.set_task`; absent or false means unsupported.
 2. The client answers within `HELLO_TIMEOUT` with `{"t":"hello","proto":1,"client":"wb-web/0.1.0"}`, or it is closed.
 3. A `proto` mismatch gives `err{code:"proto"}`, then close.
@@ -225,6 +226,7 @@ The error codes are a closed set:
 | `kind_mismatch` | sid exists with the other kind |
 | `not_alive` | needs a live process |
 | `busy` | an ACP turn or the session's initial configuration batch is outstanding |
+| `conflict` | the requested worktree path or branch is in use, or the worktree cannot be removed safely |
 | `already_resolved` | permission or elicitation already answered |
 | `bad_option` | `optionId`, `modeId`, `methodId` or `configId` not offered, or a config value not offered for that option |
 | `not_revivable` | revive impossible |
@@ -287,6 +289,8 @@ The error codes are a closed set:
   - `req` is the journal seq of the announcing event;
   - `title` is the permission's `toolCall.title` or the elicitation's `message`, cut to 200 characters for both kinds. It is `""` when the request has none.
 - **`AcpSessionInfo`:** `{protocolVersion, agentInfo, agentCapabilities, promptCapabilities, authMethods, modes, configOptions, availableCommands, plan, usage}`. It holds the latest materialised values; absent optional values are omitted. `Summary.acp.configOptions` is always present, with `null` when absent.
+- **`Summary.acp.managedWorktree`** is present only for a recorded worktree: `{path, branch, mainRoot}`, with both paths absolute.
+  This record is independent of the web's best-effort top-level git metadata (`repo`, `worktree`, `branch`).
 - **`Summary.acp.policy`:** the session's non-empty `Policy` (§3.4.5), omitted when none. It is a hub fact, not an agent config option. Optional rule `programs` is an ordinary policy field, preserved along with roots and command regexes through validation, installation, journaling and replay.
 - **Incarnation:** a sid can be forgotten and recreated, and `createdAt` distinguishes the incarnations.
   - It is persisted in `<kind>/<sid>.json` and survives hub restarts, revive and PTY respawn.
@@ -317,9 +321,10 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `acp.set_task` | `sid, task: string\|null` | `{}` after journaling | Replace the reference, or clear it with null or an empty trimmed string. This changes hub metadata, not the agent's configuration. |
 | `acp.set_policy` | `sid, epoch, policy: Policy` | `{}` after journaling | replace the whole permission policy; `{rules:[]}` removes it. Existing pending requests are unchanged. |
 | `acp.seen` | `sid, seq` | `{}` | `seenSeq = max(seenSeq, min(seq, headSeq))`, persisted |
-| `acp.revive` | `sid` | `{}` once started | only when `!alive && revivable && fault == null`, else `not_revivable`/`faulted`. §3.4.5. |
+| `acp.revive` | `sid` | `{}` once started | only when `!alive && revivable && fault == null`, else `not_revivable`/`faulted`; if the saved local `cwd` is no longer a directory, `not_revivable` before spawn. §3.4.5. |
 | `acp.authenticate` | `sid, methodId` | `{}` after the agent answers | only during a failed setup, agent-handled methods only (`type:"terminal"` → `bad_option`) |
 | `acp.kill` | `sid, forget` | `{}` | teardown stages in §3.4.5. **`forget:false`:** ok when the kill starts; the session stays revivable. **`forget:true`:** ok only after exit, deletion of `acp/<sid>.*` and registry removal. `gone` goes to attached connections and watchers. |
+| `acp.remove_worktree` | `sid` | `{}` | Verify `workbench-session` in the recorded checkout's private git directory, remove without force, then persist and publish the cleared record; an absent record is `not_found`, a running agent or dirty worktree is `conflict`. A missing checkout, missing marker or different sid clears the record without deletion and returns `not_found`: “session worktree already gone; record cleared; nothing deleted”. |
 
 **Check order.** While a non-empty initial configuration batch is active (including its preceding setup), `acp.prompt`, `acp.cancel`, `acp.set_mode`, `acp.set_config_option`, `acp.revive` and `acp.authenticate` fail with `busy` before their normal actor checks. They are rejected, never queued for a future turn. Permission and elicitation answers, `acp.seen` and `acp.kill` remain usable. Otherwise, when a request fails several checks, the first in this list applies:
 - `acp.prompt`: `faulted`, `not_alive`, `bad_request` (no ACP session yet), `busy`, then the content rules.
@@ -338,14 +343,39 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 - Cwd precedence: the cwd of a live `cwdFrom`, then `cwd`, then `$HOME`. A missing or non-directory cwd falls back to `$HOME`.
 - `env`: at most 32 entries. Keys match `^[A-Za-z_][A-Za-z0-9_]{0,63}$`, values are ≤ 4096 bytes, and keys the hub sets cannot be overridden.
 
-**`SpawnAcp`** = `{agent, cwd: absolute existing directory, config?: ConfigOption[], task?: string, policy?: Policy}`.
+**`SpawnAcp`** = `{agent, cwd: absolute existing directory, config?: ConfigOption[], task?: string, policy?: Policy, worktree?: {branch: string, base?: string}}` (remote `host` rules in §3.8.5).
 - **`ConfigValue`** is a JSON string or boolean, never a number, null, array or object. **`ConfigOption`** = `{id: string, value: ConfigValue}`. The optional `config` array is ordered: at most 16 entries, with distinct ids. The hub rejects an invalid batch with `bad_request` before spawning. Absent or empty `config` preserves the old asynchronous open behaviour; serializers omit the empty array.
 - **`ConfigError`** = `{id: string, value: ConfigValue, code: ErrorCode, error: string}`. `AcpOpenReply.configErrors` reports failed entries in input order, retaining their requested values and a required hub error code. It is omitted when empty and defaults to an empty array when absent. These errors belong only to the initiating open reply, not to the session facts or later attaches.
+- **Managed worktree (F-A52).** A request with `worktree` requires a local agent and an absolute `cwd` inside a non-bare git checkout, including a subdirectory of a linked worktree, but not a submodule.
+  The same rule applies to `branch` and `base`: 1–255 ASCII bytes in `[A-Za-z0-9._/-]`, not `HEAD`, no initial `-`, no `..`, and no empty slash-separated component or component starting with `.` or ending with `.lock`.
+  Invalid names are `bad_request` before git runs.
+  For git's resolved main worktree root `R` and branch `B` with each `/` replaced by `-`, the default destination is `R-wt/B`.
+  If `worktreeRoot` is set, the hub starts at that directory, appends the normal path components of `R` after its leading `/`, then appends `B`; main checkouts with the same basename but different full paths therefore do not collide.
+  Before creating any directories, the hub rejects a destination inside the repository's common git directory with 400 `bad_request`, resolving symlinks and accounting for separate git directories.
+  From a linked checkout with a separate main git directory, git must identify the main checkout (for example via `core.worktree`); if it reports only its metadata directory, the hub refuses rather than guessing a destination.
+  The hub creates missing parent directories and leaves them in place, even after rollback or removal; it atomically reserves the final directory and never adopts an existing destination, even if empty.
+  A local branch is checked out unchanged; otherwise the hub creates it from the commit id resolved from `base`, defaulting to the `HEAD` of the checkout containing `cwd`, without configuring an upstream or fetching.
+  An occupied destination, a destination still registered with git, or a branch listed as checked out elsewhere by `git worktree list --porcelain -z` is `conflict`.
+  Any other failure of `git worktree add`, including a checkout race after the list or a failed required filter, is `internal` with git's bounded first error line, control characters removed.
+  The agent's actual `cwd` is the new root, and its managed-worktree record survives restart and revive.
+  A change to `worktreeRoot`, including unsetting it, affects new creations only: removal uses the path in the record and verifies the ownership marker, never recomputing the path from today's configuration.
+  If creation is refused after checkout, the hub attempts a non-forced removal before abandoning the session, keeps the branch, and reports the path if rollback leaves the worktree.
+  An accepted dead session following an exec or setup failure (§3.2.7) is not an abandoned creation and keeps its record.
+  Git runs outside the actor, without blocking other sessions on the connection or delaying shutdown.
+  During unpublished worktree creation, including rollback, all `acp.open` requests (with or without `spawn`) and all ACP actions except the first `acp.kill` get `conflict` immediately; `acp.detach` is handled normally.
+  The first `acp.kill`, whether `forget` is true or false, requests cancellation and waits for cleanup; if creation fails independently, the opener receives its original error and the kill succeeds unless a leftover is reported.
+  During explicit removal, only `acp.open` with `spawn.worktree`, `acp.remove_worktree`, `acp.revive` and `acp.kill` (either `forget` value) get `conflict` because of the removal; everything else, including attach, detach, `acp.prompt` and `acp.seen`, follows the normal session rules.
+  Once a session is accepted, killing or forgetting it never removes the checkout.
+  Only a timed-out or cancelled `worktree add` permits forced cleanup: the hub verifies the reserved directory's device and inode before it unlocks and force-removes the incomplete checkout; no agent has run in it.
+  If the hub itself stops before creation completes, an incomplete, locked worktree can remain without a session record; inspect the path and recover it manually as described in F-A52.
+  A panic in the git creation task can likewise skip rollback and leave a marked checkout without a record; use the same manual recovery in F-A52.
 - **`task`** is a free-text reference (F-A51): reject Unicode control characters, line and paragraph separators (U+2028 and U+2029), and bidirectional controls (U+061C, U+200E, U+200F, U+202A–U+202E and U+2066–U+2069) anywhere in the input.
   Trim surrounding whitespace, then reject more than `TASK_MAX` UTF-8 bytes; an empty result means no task.
   Invalid input returns `bad_request`, never a truncated value.
   A spawn task applies only to a new session; failure to journal it leaves no session or files and the sid can be reused.
 - The hub validates the entire optional policy before registering or starting a session. Existing-sid opens validate but ignore spawn policy, as they ignore spawn config; an attach cannot replace either.
+  With a managed worktree, the hub compiles the policy against the new session `cwd`, not the original checkout.
+  A refusal while journaling initial events rolls the worktree back before releasing the sid; a policy-only write fault leaves an accepted, faulted session with its worktree record.
 
 **`pty.open` rules.** Principle: **a request without `spawn` never starts a process**.
 - **Alive:** attach, whether or not `spawn` is present. An alive session is never respawned.
@@ -394,6 +424,8 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `ACP_CONFIG_MAX` | 16 initial configuration entries, with distinct ids | hub `bad_request`; API 400 "bad body", before spawn |
 | `ACP_CONFIG_OPTIONS_MAX` | 64 options in an agent's full offering | a larger list is malformed |
 | `ACP_CONFIG_OPTIONS_BYTES` | 64 KiB of compact serialized UTF-8 JSON for the full offering | a larger list is malformed; oversized legacy journal offerings fold to none (§3.4.5) |
+| `GIT_NAME_MAX` | 255 bytes per requested branch or base | `bad_request` |
+| `GIT_TIMEOUT` / `GIT_WORKTREE_TIMEOUT` | 30 s for git queries and branch/lock updates; 120 s for `worktree add` and `worktree remove` | kill the process group and fail the request |
 | `TASK_MAX` | 512 UTF-8 bytes after trimming | ACP: hub `bad_request`, API 400; harness report: ignore the field, keep the stored task |
 | `POLICY_MAX` | 256 KiB serialized JSON per policy | hub `bad_request`; API 400 "bad body", before spawn; invalid journal replacements clear policy until a later valid event |
 | `POLICY_RULES_MAX` / `POLICY_PATTERNS_MAX` / `POLICY_PATTERN_MAX` | 64 rules / 128 command patterns across all rules / 4096 bytes per pattern | hub `bad_request`; API 400 "bad body", before spawn |
@@ -474,7 +506,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 hub.lock                                  flock, single instance
 pty/<sid>.json                            {sid, shell (name), argv (argv[0] = the resolved shell path), cwd, env (client-supplied only), createdAt, cols, rows, exit|null}
 pty/<sid>.snap                            last VT snapshot (on exit, on SIGTERM, every 30 s while dirty)
-acp/<sid>.json                            {sid, agent, cwd, createdAt, agentSessionId|null, init|null, seenSeq}
+acp/<sid>.json                            {sid, agent, cwd, createdAt, agentSessionId|null, init|null, seenSeq, managedWorktree?}
 acp/<sid>.jsonl                           journal (§3.4.4)
 acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one generation kept)
 <kind>/<sid>.quarantine-<ms>.<ext>        files of a session that failed to load (kept for inspection, never loaded)
@@ -1044,6 +1076,7 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
 - **Required keys:** `stateDir`, `host`, `shells`, `defaultShell` and `child`. `socket` defaults to the value shown, and `agents` to empty. Unknown keys are refused at every level (`deny_unknown_fields`).
 - **Validation** refuses to start the hub when:
   - `socket` is not absolute or is 108 bytes or longer, or `stateDir` is not absolute;
+  - `worktreeRoot`, when set, is not absolute, contains NUL, or has a component named `.`, `..` or `.git`;
   - a shell name does not match `^[a-z0-9-]{1,32}$` or is listed twice, a shell's `paths` is empty or holds a relative path, or its `args` contain NUL;
   - `defaultShell` is not in `shells`;
   - an environment variable name (in `passEnv`, `setEnv` or an agent's `env`) does not match `^[A-Za-z_][A-Za-z0-9_]{0,63}$`;
@@ -1052,6 +1085,18 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
 
   The hub also refuses to start without `HOME`, `USER` and `LOGNAME` in its environment.
 - **`hosts`** (optional; Nix writes `services.workbench.hosts`) names the other hosts the hub starts agents on: §3.8.5. Absent, `hub.json` is byte for byte what it was, so adding the option restarts no hub.
+- **`git`** (optional) is the absolute path to the executable used only for managed local ACP worktrees.
+  `services.workbench.gitPackage` defaults to `pkgs.git`; the module links its executable at `/etc/workbench/bin/git` and writes that stable path in `hub.json`.
+  Set the option to `null` to omit `git` and disable the capability.
+  The hub executes argv directly with no stdin, disables hooks with `-c core.hooksPath=/dev/null`, uses an end-of-options marker before request-derived operands, and bounds command output and runtime.
+  Its cleared git environment carries only the hub's own `HOME`, `XDG_CONFIG_HOME` and `PATH` if set, plus `GIT_TERMINAL_PROMPT=0` and `LC_ALL=C`.
+  This is not confinement: the agent retains its ordinary filesystem access, and git uses repository and user configuration, including filters that run on checkout.
+  A checkout filter must be resolvable on that `PATH` or named by absolute path; a required filter that cannot run fails the request.
+- **`worktreeRoot`** (optional) sets the directory under which the hub mirrors each main checkout's absolute path for new managed worktrees (§3.2.7).
+  `services.workbench.worktreeRoot` defaults to `null`, so the module omits the key and the hub keeps the sibling layout.
+  The hub user needs write access; a root inside a checkout is allowed, but the destination must be outside the repository's common git directory.
+  With `worktreeRoot` set to `/`, the worktree is placed directly in the main checkout at `<main-root>/<flattened-branch>`; an occupied name returns 409.
+  Use a root outside any checkout or ignore it in the containing checkout to keep it out of `git status`.
 - **Test configs:** take the shell path from `$BASH`, because the sandbox has no `/run/current-system`. The harness also configures `sh` as a second shell (§7, N-6).
 
 #### 3.7.3 Child environment (built from scratch)
@@ -1126,7 +1171,9 @@ Three parts follow from that, and each stands alone: the API listener (§3.8.1, 
 - Every response is JSON with `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`, except the event stream (`text/event-stream`). There are no CORS headers. A request body is at most `API_BODY_MAX`; a larger one is 413.
 - Errors are `{"error": message}`. An error the hub gave also carries the hub's `code`: `{"error": message, "code": "busy"}`.
 
-**Hub errors as statuses:** `bad_request`, `bad_option`, `unknown_agent` → 400; `not_found` → 404; `kind_mismatch`, `busy`, `not_alive`, `already_resolved`, `stale`, `not_revivable`, `faulted` → 409; `timeout` → 504; anything else → 502. The hub down or incompatible is 503; no reply within 10 s (40 s for `mode` and `config`, which wait for the agent) is 504. A create with non-empty config instead allows `40 s × (1 + number of options)` for its delayed hub open reply (§3.8.2).
+**Hub errors as statuses:** `bad_request`, `bad_option`, `unknown_agent` → 400; `not_found` → 404; `kind_mismatch`, `busy`, `conflict`, `not_alive`, `already_resolved`, `stale`, `not_revivable`, `faulted` → 409; `timeout` → 504; anything else → 502.
+The hub down or incompatible is 503; no reply within 10 s (40 s for `mode` and `config`, which wait for the agent) is 504.
+A create with non-empty config instead allows `40 s × (1 + number of options)` for its delayed hub open reply (§3.8.2); worktree creation and removal also allow for the applicable git deadlines.
 
 #### 3.8.2 `/v1` endpoints
 
@@ -1142,7 +1189,7 @@ A sid in a path that does not match `^[A-Za-z0-9_-]{1,64}$` is 400 "bad id". Req
 | `GET /v1/observed` | read | `{sessions:[ObservedSession]}` (§3.8.3), live first, then by `lastAt`, newest first. |
 | `GET /v1/observed/{id}` | read | One `ObservedSession` by its `id`; 404. |
 | `GET /v1/stream` | read | Server-sent events (§3.8.4). |
-| `POST /v1/sessions` | control | Starts an ACP agent. Body `{agent, cwd, host?, sid?, config?: {optionId: string\|boolean}, task?: string, policy?: Policy}`. `sid` defaults to `api_` and 16 random hex digits. `host` absent, or the hub's own, starts it on the hub's host; another name must be one of the hub's `hosts` as its hello lists them, else 400 "no host H" (so a hub that predates §3.8.5 is never asked). 201 `{sid, session: Summary+state, configErrors:[{id, value, code, error}]}`; configuration rules below. A sid that an agent session has is 409 "session exists", and one that a shell has is 409 with the hub's `kind_mismatch`; that session is left as it is. Policy validation, including all regex compilation and limits, precedes spawn; invalid policy is 400 "bad body". |
+| `POST /v1/sessions` | control | Starts an ACP agent. Body `{agent, cwd, host?, sid?, config?: {optionId: string\|boolean}, task?: string, policy?: Policy, worktree?: {branch, base?}}`. `sid` defaults to `api_` and 16 random hex digits. `host` absent, or the hub's own, starts it on the hub's host; another name must be one of the hub's `hosts` as its hello lists them, else 400 "no host H" (so a hub that predates §3.8.5 is never asked). 201 `{sid, session: Summary+state, configErrors:[{id, value, code, error}]}`; configuration and worktree rules below. A sid that an agent session has is 409 "session exists", and one that a shell has is 409 with the hub's `kind_mismatch`; that session is left as it is. Policy validation, including all regex compilation and limits, precedes spawn; invalid policy is 400 "bad body". |
 | `POST /v1/sessions/{sid}/prompt` | control | Body `{text}` or `{blocks:[ContentBlock]}`, exactly one of them; `text` becomes one text block. `acp.prompt`. 200 `{}`. |
 | `POST /v1/sessions/{sid}/cancel` | control | `acp.cancel`. 200 `{}`. |
 | `POST /v1/sessions/{sid}/permission` | control | Body `{req, epoch, outcome}`: `acp.permission`. 200 `{}`. |
@@ -1153,14 +1200,28 @@ A sid in a path that does not match `^[A-Za-z0-9_-]{1,64}$` is 400 "bad id". Req
 | `POST /v1/sessions/{sid}/policy` | control | Body `{policy: Policy}`: `acp.set_policy{sid, epoch: current Summary.createdAt, policy}`. No request-body epoch is accepted. 200 `{}` after journaling; `{policy:{rules:[]}}` removes it. Strict unknown-field/shape/limit/regex validation gives 400 "bad body". Read via session details' `acp.policy`; pending requests remain unchanged. |
 | `POST /v1/sessions/{sid}/revive` | control | `acp.revive`. 200 `{}`. |
 | `DELETE /v1/sessions/{sid}?forget=true\|false` | control | `acp.kill` or `pty.kill` by the session's kind, `forget` defaulting to `false`. 200 `{}`; 404 for a sid the hub does not know. |
+| `DELETE /v1/sessions/{sid}/worktree` | control | `acp.remove_worktree`; 200 `{}` after deletion, 409 while the agent runs, a worktree operation is in progress or git refuses non-forced removal, 404 for an unknown sid or absent record. A missing or replaced checkout gives a distinct 404 after clearing the record (§3.2.7). |
 | `POST /v1/events` | events | One session event (§3.8.3). 204. |
 
-A body that is not the JSON the endpoint takes, an unknown key included, is 400 "bad body". A sid the control connection has not heard of is 404 "no session S" for `GET /v1/sessions/{sid}`, `POST /v1/sessions/{sid}/config`, `POST /v1/sessions/{sid}/policy` and `DELETE`; the other endpoints ask the hub, and answer with its error. The API starts no PTY and sends no PTY input: a shell on the mesh is what ssh is for.
-
+A body that is not the JSON the endpoint takes, an unknown key included, is 400 "bad body".
+A sid the control connection has not heard of is 404 "no session S" for `GET /v1/sessions/{sid}`, `POST /v1/sessions/{sid}/config` and `POST /v1/sessions/{sid}/policy`; DELETE asks the hub because a sid may have a creation in progress before its first Summary.
+The other endpoints ask the hub and answer with its error.
+The API starts no PTY and sends no PTY input: a shell on the mesh is what ssh is for.
 
 **Configuration on create.** `config`, when present, is a JSON object with at most **16 distinct option ids**, each value a string or boolean. A non-object, another value type, duplicate id or a seventeenth option is 400 "bad body", before any spawn. The web retains the input object's member order and passes it as the hub's ordered `SpawnAcp.config` array `[{id, value}]`; it does not wait for setup events and issue its own configuration RPCs. With no config or `{}`, create keeps its immediate post-open behaviour and does not wait for ACP setup. With non-empty config, the hub delays the initiating `acp.open` reply until setup and the ordered batch end or terminate (§3.4.5), blocking prompts and the other listed live actions from every client in the meantime. The API waits up to `40 s × (1 + number of options)` for that reply, then returns its resulting session and opener `configErrors` verbatim. This outer HTTP wait is not a total setup timeout: the hub still uses `SETUP_IDLE_TIMEOUT`, which can be extended by agent messages or paused for pending requests. Individual configuration failures and setup failure do not turn accepted creation into a failed start: the response remains 201, with every unapplied option accounted for and `configErrors:[]` when all succeeded. Later option validation uses the latest authoritative full list. Create never sends a prompt, with or without configuration.
 
 Non-empty `config` requires `acpConfig:true` in the connected hub's hello. Otherwise creation is 400 "hub does not support session configuration", before any open or spawn is sent; a missing capability on an older hub is not success. Missing config or `{}` keeps the old behaviour.
+
+**Worktree on create.** `worktree` accepts only a required `branch` string and an optional `base` string (§3.2.7); there is no path argument.
+The hub chooses the destination at creation: for main checkout `/home/u/proj/app` and branch `feat/x`, the default is `/home/u/proj/app-wt/feat-x`; with `worktreeRoot` set to `/srv/wt` it is `/srv/wt/home/u/proj/app/feat-x`.
+A remote `host`, an invalid name, a `cwd` outside a checkout, in a bare repository or in a submodule, or a hub that does not advertise `acpWorktree:true` is 400.
+On success the returned session has the new `cwd` and `acp.managedWorktree`.
+Changing or unsetting the hub's root does not move existing worktrees or change which checkout a session's removal request can delete.
+Removal refuses modified files and non-ignored untracked files, but deletes **everything git ignores**, including local configuration such as `.env` and ignored nested repositories with their unpushed commits.
+A killed removal can leave tracked files partially deleted; the record stays, and retrying may refuse until the operator inspects and restores the checkout.
+The branch is never deleted.
+Killing or forgetting an accepted session never removes its worktree: forgetting discards the record and leaves the checkout on disk.
+Revive uses the recorded local `cwd`, even after removal; it now refuses with 409 `not_revivable` if that directory no longer exists, rather than attempting to start the agent there.
 
 **Task reference.** Both endpoints validate the reference as for `SpawnAcp.task` (§3.2.7). Creating with a non-empty normalized task, or setting or clearing a task later, requires `acpTask:true` on the connection that would send the request; otherwise the API returns 400 without forwarding it. The task, when present, is returned in `session.acp.task` on create and in `acp.task` in session summaries.
 

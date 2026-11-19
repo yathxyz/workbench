@@ -92,6 +92,12 @@ let
         argv = [ (agentArgv0 name a) ] ++ a.args;
       }) cfg.agents;
     }
+    // lib.optionalAttrs (cfg.gitPackage != null) {
+      git = "/etc/workbench/bin/git";
+    }
+    // lib.optionalAttrs (cfg.worktreeRoot != null) {
+      inherit (cfg) worktreeRoot;
+    }
     # Only when set, so that a hub without hosts keeps its config, and its sessions.
     // lib.optionalAttrs (cfg.hosts != { }) {
       hosts = lib.mapAttrs (_: h: {
@@ -212,6 +218,24 @@ in
       default = self.packages.${system}.workbench;
       defaultText = lib.literalExpression "workbench.packages.\${system}.workbench";
       description = "The package providing wb-hub, wb-web and wb.";
+    };
+
+    gitPackage = mkOption {
+      type = types.nullOr types.package;
+      default = pkgs.git;
+      defaultText = lib.literalExpression "pkgs.git";
+      description = "Git used by the hub to create and remove local ACP worktrees; null disables this capability.";
+    };
+
+    worktreeRoot = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/srv/wt";
+      description = ''
+        Absolute runtime directory under which the hub mirrors main checkout paths for new managed
+        local ACP worktrees. It must be writable by the service user. When null, the hub places
+        worktrees beside the main checkout instead.
+      '';
     };
 
     webPackage = mkOption {
@@ -600,6 +624,15 @@ in
         message = "services.workbench.releaseProfile pins the hub with this flake's release, so package and webPackage must keep their defaults.";
       }
       {
+        assertion =
+          cfg.worktreeRoot == null
+          || (
+            lib.hasPrefix "/" cfg.worktreeRoot
+            && lib.all (part: !(lib.elem part [ "." ".." ".git" ])) (lib.splitString "/" cfg.worktreeRoot)
+          );
+        message = "services.workbench.worktreeRoot must be an absolute path without components named ., .. or .git.";
+      }
+      {
         assertion = lib.all isName (lib.attrNames cfg.agents);
         message = "services.workbench.agents: names must match ^[a-z0-9-]{1,32}$.";
       }
@@ -690,6 +723,9 @@ in
     environment.etc = {
       "workbench/hub.json".source = hubJson;
       "workbench/web.json".source = webJson;
+    }
+    // lib.optionalAttrs (cfg.gitPackage != null) {
+      "workbench/bin/git".source = lib.getExe' cfg.gitPackage "git";
     }
     // lib.optionalAttrs (edit.socket != null) {
       "workbench/agents.md".source = agentsMd;
