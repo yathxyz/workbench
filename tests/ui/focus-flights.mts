@@ -50,5 +50,21 @@ export async function focusFlights(p: Page, shell: string) {
       const actual = await geometry();
       check(`N50: browser Back from focus restores canvas geometry before navigating to ${target}`, landed && !actual.focus && actual.world === expected.world && actual.w === expected.w && actual.h === expected.h, JSON.stringify({ expected, actual }));
     }
+
+    const saved = { x: 400, y: -600, z: 0.35 }, point = '@1024,2048', name = 'n50-saved';
+    const run = (q: string) => p.evaluate(q => window.__canvas.palSearch(q)[0].run(), q);
+    const camera = async () => { await until(() => p.evaluate(() => !window.__canvas.LOD.busy())); return p.evaluate(() => ({ ...window.__canvas.S.cam })); };
+    const focus = () => p.evaluate(id => { const C = window.__canvas; C.focusOpen(C.S.nodes[id]); (document.activeElement as HTMLElement)?.blur(); }, id);
+    await p.evaluate(({ name, saved }) => { window.__canvas.S.views[name] = saved; }, { name, saved });
+    try {
+      await run(name); await camera(); await run(point); const at = await camera();
+      for (const [command, dest] of [[name, saved], [point, at], ['Alt+ArrowLeft', saved], ['Alt+ArrowRight', at]] as const) {
+        await focus();
+        if (command.startsWith('Alt+')) await p.keyboard.press(command); else await run(command);
+        const cam = await camera();
+        check(`N50: ${command} leaves focus and lands at the canvas destination`,
+          await p.evaluate(() => !window.__canvas.FOCUS.cur) && cam.x === dest.x && cam.y === dest.y && cam.z === dest.z, JSON.stringify({ cam, dest }));
+      }
+    } finally { await p.evaluate(name => { delete window.__canvas.S.views[name]; }, name); }
   } finally { await p.evaluate(id => { const C = window.__canvas; C.focusClose(id); C.removeNode(id); }, id); }
 }

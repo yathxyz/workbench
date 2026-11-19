@@ -150,6 +150,11 @@ function camStop(finish = true) {
   return flight;
 }
 function pushHistory() { camBack.push({ ...cam() }); if (camBack.length > 60) camBack.shift(); camFwd.length = 0; }
+function leaveFocus() { if (FOCUS.cur) focusHide(); }
+function cameraHistory(from: Cam[], to: Cam[]) {
+  const target = from.pop(); if (!target) return;
+  leaveFocus(); to.push({ ...cam() }); animateTo(target);
+}
 function camArea(): { left: number; top: number; vw: number; vh: number } {   // the part of the viewport a fit aims at
   const left = document.body.classList.contains('tree-open') && VW() > 900 ? (S?.treeW || TREE_W) + 16 : 0;  // the folder tree floats over the left edge
   const top = 56, bottom = 34; return { left, top, vw: VW() - left, vh: VH() - top - bottom };
@@ -161,7 +166,7 @@ function camTarget(x: number, y: number, w: number, h: number, maxZ = 1): Cam {
   return { z, x: x + w / 2 - (left + vw / 2) / z, y: y + h / 2 - (top + vh / 2) / z };
 }
 function fitAll(animate = true) {
-  if (FOCUS.cur) focusHide();   // fit the board rectangles, not the temporary full-screen card
+  leaveFocus();   // fit the board rectangles, not the temporary full-screen card
   const items = Object.values(S.nodes).filter(n => !stashed(n));
   if (!items.length) return;
   const x0 = Math.min(...items.map(n => n.x)), y0 = Math.min(...items.map(n => n.y - (n.kind === 'frame' ? LABEL_H : 0)));
@@ -2980,7 +2985,7 @@ function pullCard(ev: PointerEvent, row: HTMLElement, deck: FrameNode, k: BoardN
 }
 function jumpFolder(f: FrameNode) {
   if (VIEW !== 'canvas') setView('canvas');
-  if (FOCUS.cur) focusHide();
+  leaveFocus();
   reveal(f); pushHistory(); activate(f.id);
   animateTo(camTarget(f.x, f.y - LABEL_H, f.w, f.h + LABEL_H, 1));
 }
@@ -3463,7 +3468,7 @@ function anchorAtCursor(n: PageNode) {
 // ------------------------------------------------------------------ jumping
 function jumpNode(n: BoardNode, maxZ = 1, done?: () => unknown) {
   if (VIEW !== 'canvas') setView('canvas');
-  if (FOCUS.cur) focusHide();
+  leaveFocus();
   reveal(n); pushHistory(); activate(n.id);
   animateTo(camTarget(n.x, n.y, n.w, n.h, maxZ), done, n.id);
 }
@@ -4060,7 +4065,7 @@ function palSearch(q: string): PaletteItem[] {
   let m = raw.match(/^(.+)\/([A-Za-z]{1,2})(\d{1,3})$/);
   if (m) { const f = findFolder(m[1]); if (f) { const cx = f.x + colIndex(m[2]) * GRID, cy = f.y + (+m[3] - 1) * GRID; out.push({ k: 'cell', l: `${f.name}/${m[2].toUpperCase()}${m[3]}`, s: 'folder cell', score: 1e6, run: onCanvas(() => { pushHistory(); animateTo(camTarget(cx, cy, GRID, GRID, 1.6)); }) }); } }
   m = raw.match(/^@\s*(-?\d+)\s*,\s*(-?\d+)$/);
-  if (m) out.push({ k: 'point', l: `@${m[1]},${m[2]}`, s: 'world coordinates', score: 1e6, run: onCanvas(() => { pushHistory(); animateTo(camTarget(+m[1] - 200, +m[2] - 150, 400, 300, cam().z)); }) });
+  if (m) out.push({ k: 'point', l: `@${m[1]},${m[2]}`, s: 'world coordinates', score: 1e6, run: onCanvas(() => { leaveFocus(); pushHistory(); animateTo(camTarget(+m[1] - 200, +m[2] - 150, 400, 300, cam().z)); }) });
   const cands: PaletteItem[] = [];
   for (const n of nodeList()) cands.push({ k: n.kind === 'term' ? 'shell' : n.kind === 'buffer' ? 'page' : n.kind, l: pathOf(n.id), s: (folderPath(n) ? folderPath(n) + '/' : '') + (deskOff(n) ? ' (not on this desk)' : stashed(n) ? ' (in a deck)' : ''), run: () => (n.kind === 'buffer' && VIEW === 'editor' ? edOpen(n) : jumpNode(n)) });
   for (const f of frameList()) cands.push({ k: 'folder', l: fullPath(f) + '/', s: `${f.mode || 'free'} · ${kidsOf(f.id).length} item(s)`, run: () => jumpFolder(f) });
@@ -4068,7 +4073,7 @@ function palSearch(q: string): PaletteItem[] {
     const pst = n.kind === 'buffer' && pageState(n); if (!pst) continue;
     for (const a of pageAnchors(n)) if (a.label) cands.push({ k: 'anchor', l: `${n.name}#${a.label}`, s: fmtAddr(bufferAddress(n, pst, a.pos)), run: () => jumpBuffer(n, a.pos) });
   }
-  for (const [name, v] of Object.entries(S.views)) cands.push({ k: 'view', l: name, s: `saved view · ${Math.round(v.z * 100)}%`, run: onCanvas(() => { pushHistory(); animateTo(v); }) });
+  for (const [name, v] of Object.entries(S.views)) cands.push({ k: 'view', l: name, s: `saved view · ${Math.round(v.z * 100)}%`, run: onCanvas(() => { leaveFocus(); pushHistory(); animateTo(v); }) });
   if (!ql) {
     const recent = (S.recentCmds || []).map(t => CMDS.find(c => c.l === t)).filter(c => c && (!c.when || c.when())) as PaletteItem[];
     return [...recent.map(c => ({ ...c, s: 'recent' })), ...cands.slice(0, 30)];
@@ -4208,7 +4213,7 @@ cmd('Folder: pull the walls in to fit', () => setMode(activeFolder()!, 'free'), 
 cmd('Folder: change shape', () => { const f = activeFolder()!; f.shape = FSHAPES[(FSHAPES.indexOf(f.shape || 'folder') + 1) % FSHAPES.length]; placeFrame(f); dirty(); }, '', () => !!activeFolder());
 cmd('Fit everything', onCanvas(() => fitAll()), '@fit');
 cmd('Save this view as…', () => setTimeout(() => openPalette('>save '), 0));
-cmd('Back to the previous view', onCanvas(() => { const t = camBack.pop(); if (t) { camFwd.push({ ...cam() }); animateTo(t); } }), '@camera.back');
+cmd('Back to the previous view', onCanvas(() => cameraHistory(camBack, camFwd)), '@camera.back');
 cmd('Export as JSON Canvas', async () => { syncBuffers(); ($('#ex-text') as HTMLTextAreaElement).value = await toJsonCanvas(); $('#export-box')!.hidden = false; });
 cmd('Theme: Modus Operandi (light)', () => setTheme('light'));
 cmd('Theme: Modus Vivendi (dark)', () => setTheme('dark'));
@@ -10387,8 +10392,8 @@ const KC: Record<string, KeyCmdFn> = {
   'zoom.in': () => zoomAt(VW() / 2, VH() / 2, 1.25), 'zoom.out': () => zoomAt(VW() / 2, VH() / 2, 0.8),
   'zoom.card': () => { const n = activeNode(); if (!n) return toast('Select a card first: h j k l, or f for hints.'); jumpNode(n, 1); },
   fit: () => fitAll(),
-  'camera.back': () => { const t = camBack.pop(); if (t) { camFwd.push({ ...cam() }); animateTo(t); } },
-  'camera.forward': () => { const t = camFwd.pop(); if (t) { camBack.push({ ...cam() }); animateTo(t); } },
+  'camera.back': () => cameraHistory(camBack, camFwd),
+  'camera.forward': () => cameraHistory(camFwd, camBack),
   compact: () => compact(PICKED.size ? 'selection' : 'all'),
   'optimise.board': () => optimise(null),
   'optimise.folder': () => { const f = activeFolderOf(); f ? optimise(f) : toast('Pick a folder or something inside one.'); },
