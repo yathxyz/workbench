@@ -243,7 +243,9 @@ await section('frames', async () => {
   const onDisk = (buf: string, text: string) => { const d = readNote(buf); return d != null && d.replace(/\n$/, '') === text.replace(/\n$/, ''); };
   const diskA = await until(() => (readNote(twoBuf) || '').includes(' while-down') ? readNote(twoBuf) : null, 15000);
   const textA = await pageText(A2, two), textB = await until(async () => { const t = await pageText(B2, two); return t === textA ? t : null; }, 5000);
-  st = { started, onA, onB, acked, disk: !!diskA, same: textB === textA, notice: await frOff(A2, two), sync: await frSync(A2, two), status: (await (await api('/api/status')).json()).edit };
+  // wb-web's status client reconnects independently of the tabs' replicas.
+  const status = await until(async () => { const { edit } = await (await api('/api/status')).json(); return edit?.up === true ? edit : null; }, 20000);
+  st = { started, onA, onB, acked, disk: !!diskA, same: textB === textA, notice: await frOff(A2, two), sync: await frSync(A2, two), status };
   check('frames: after edwind restarts both tabs reconnect (the mode line loses offline), the edit typed while it was down is acked, on disk and in the other tab, and the notice goes', st.started?.event === 'started' && st.onA && st.onB && st.acked && st.disk && st.same && /while-down$/.test(textA) && onDisk(twoBuf, textA) && st.notice && !st.notice.shown && st.sync === '' && st.status?.up === true, JSON.stringify({ ...st, disk: (diskA || '').slice(-30), textA: textA.slice(-30) }));
 
   // (c') a restart in the middle of typing: nothing typed is lost, in either tab or on disk
