@@ -1,16 +1,27 @@
 // N81: a warm Agents view, a newly mounted reader, and the shipped socket handler, reducer and Edwin display.
-// Run alone: WB_PLAYWRIGHT=... WB_HARNESS=tests/harness.py node tests/ui/transcript-stress.mts <web-root>
-// Use the ui check's binaries, Edwin root and browser; start inside `unshare -Urn` with lo up for a private network.
+// Run alone: bash tests/run-front-bench.sh ui/transcript-stress.mts
+// Outside Nix, use the same command with WB_WEB_ROOT, WB_EDWIN_WEB_ROOT and WB_PLAYWRIGHT (absolute index.mjs)
+// set, Node 24+, python3, caddy, wb-{hub,web,fake-acp}, edwind, bash, unshare and ip on PATH, and the matching
+// Playwright Chromium installed in PLAYWRIGHT_BROWSERS_PATH. The wrapper uses a temporary HOME and private loopback.
 import type { Page } from 'playwright-core';
 
 // Both the N81 check and the before/after benchmark use this fixture unchanged. The caller supplies a disposable,
 // idle Agents session. No stress event is sent to the hub. Reopening times the real viewer creation and attach;
 // deterministic batches enter its normal JSON socket handler after the small real journal has replayed.
-export async function measureTranscript(page: Page) {
-  const fixture = await page.evaluateHandle(async () => {
+export async function measureTranscript(page: Page, legacyEdwin = false) {
+  const base: number = await page.evaluate(() => window.__canvas.live.$agents.backend.seq);
+  const full = await measureReader(page, 640, base, legacyEdwin);
+  // Start from another freshly attached reader. The identical first 250 turns yield 500 closed items (one
+  // thought and one tool each), without injecting folds or changing the primary workload or its stream.
+  const append250 = await measureReader(page, 250, base, legacyEdwin);
+  return { ...full, append250 };
+}
+
+async function measureReader(page: Page, turns: number, base: number, legacyEdwin: boolean) {
+  const fixture = await page.evaluateHandle(async ({ turns, base, legacyEdwin }) => {
     const C = window.__canvas, old = C.live.$agents.backend;
     if (!old.transcript || !old.replayed) throw new Error('N81 measurement needs a mounted, replayed Edwin transcript');
-    const sid = old.n.id as string, base = old.seq as number, turns = 640, chunks = 96;
+    const sid = old.n.id as string, chunks = 96;
     let seq = base;
     type Body<T> = T extends JournalEvent ? Omit<T, 'seq' | 'ts'> : never;
     const event = (body: Body<JournalEvent>) => JSON.stringify({ t: 'ev', ev: { ...body, seq: ++seq, ts: 1700000000000 + seq } });
@@ -85,8 +96,23 @@ export async function measureTranscript(page: Page) {
           mc.port2.postMessage(0);
           await Promise.all([first, last]); await raf(); await raf();
         } finally { delete reader.render; mc.port1.close(); mc.port2.close(); }
-        return { events: frames.length, turns, longTools: turns / longEvery, longOutputBytes: long.length, replayWireBytes: frames.reduce((n, s) => n + s.length, 0),
+        return { events: frames.length, turns, longTools: Math.ceil(turns / longEvery), longOutputBytes: long.length, replayWireBytes: frames.reduce((n, s) => n + s.length, 0),
           projectionFrames, maxAddedChars, projectionMs: Number(projectionMs.toFixed(2)), maxProjectionMs: Number(maxProjectionMs.toFixed(2)) };
+      },
+      closedItems() {
+        // Inspect the actual display's closed ranges, not the projection's intended targets or preferences.
+        if (typeof window.Ed.getBufferFolds !== 'function') {
+          if (legacyEdwin && typeof window.Ed.setBufferFolds !== 'function') return null;
+          throw new Error('N81: Edwin omitted getBufferFolds; cannot measure a folded transcript');
+        }
+        if (legacyEdwin) throw new Error('N81: the legacy control unexpectedly has native folds');
+        const buf: EdwinBuffer = C.live.$agents.backend.transcript.buf, folds = window.Ed.getBufferFolds(buf);
+        if (folds.length !== 2 * turns) throw new Error(`N81: ${turns} turns, expected ${2 * turns} closed items, got ${folds.length}`);
+        for (const [i, { s }] of folds.entries()) {
+          const heading = i % 2 ? 'Tool: read [completed] N81: read ' + (i >> 1) : 'Thinking:';
+          if (buf.rope.slice(s - heading.length, s + 1) !== heading + '\n') throw new Error(`N81: fold ${i} is not at ${heading}`);
+        }
+        return folds.length;
       },
       async stream() {
         const b = C.live.$agents.backend, root = b.transcript.frame.root as HTMLElement, ws = b.ws as WebSocket;
@@ -100,7 +126,7 @@ export async function measureTranscript(page: Page) {
         return { chunks, enqueueMsPerChunk: enqueueMs / chunks };
       },
     };
-  });
+  }, { turns, base, legacyEdwin });
   const cdp = await page.context().newCDPSession(page);
   type TraceEvent = { pid: number; tid: number; name: string; ts: number; dur?: number; tdur?: number; ph: string };
   const trace: TraceEvent[] = [];
@@ -119,9 +145,11 @@ export async function measureTranscript(page: Page) {
     await cdp.send('Performance.enable', { timeDomain: 'threadTicks' });
     await cdp.send('Tracing.start', { categories: 'toplevel,devtools.timeline,disabled-by-default-devtools.timeline,blink.user_timing', transferMode: 'ReportEvents' });
     const workload = await fixture.evaluate(f => f.replay());
+    const closedBefore = await fixture.evaluate(f => f.closedItems());
     const cpuStart = await threadMs(), stream = await fixture.evaluate(f => f.stream()), cpu = await threadMs() - cpuStart;
     const completed = new Promise<void>(r => cdp.once('Tracing.tracingComplete', () => r()));
     await cdp.send('Tracing.end'); await completed;
+    const closedAfter = await fixture.evaluate(f => f.closedItems());
     const open = trace.find(e => e.name === 'n81:open');
     if (!open) throw new Error('Chromium did not trace the opening mark');
     const main = trace.filter(e => e.pid === open.pid && e.tid === open.tid).sort((a, b) => a.ts - b.ts);
@@ -145,7 +173,7 @@ export async function measureTranscript(page: Page) {
       return (p - at('chunk-' + i)) / 1000;
     }).sort((a, b) => a - b);
     const round = (n: number) => Number(n.toFixed(3));
-    return { ...workload, chunks: stream.chunks, firstPaintMs: round((paint('first-dom') - open.ts) / 1000), replayPaintMs: round((last - open.ts) / 1000),
+    return { ...workload, closedBefore, closedAfter, chunks: stream.chunks, firstPaintMs: round((paint('first-dom') - open.ts) / 1000), replayPaintMs: round((last - open.ts) / 1000),
       longestReplayTaskMs: round(worst.dur! / 1000), longestTaskThreadMs: worst.tdur === undefined ? null : round(worst.tdur / 1000),
       longestTaskDetails: nested.slice(0, 3).map(e => [e.name, round(e.dur! / 1000)]),
       replayTasksOver50Ms: tasks.filter(e => e.dur! >= 50000).length,
@@ -157,6 +185,9 @@ export async function measureTranscript(page: Page) {
 // The stand-alone run has no dependency on earlier UI check state and never opens an existing user's session.
 if (import.meta.main) {
   const { spawn } = await import('node:child_process'), fs = await import('node:fs');
+  // This entrypoint uses the UI suite's forwarder, not harness.py's WB_HARNESS_TCP guard.
+  const devices = fs.readFileSync('/proc/self/net/dev', 'utf8').trimEnd().split('\n').slice(2);
+  if (devices.length !== 1 || !/^\s*lo:/.test(devices[0])) throw new Error('Use tests/run-front-bench.sh (private loopback required)');
   const { HARNESS, ROOT, TMP, state } = await import('./shared.mts');
   const { startDaemon, dpage } = await import('./daemon.mts');
   if (!ROOT || !HARNESS) throw new Error('Set WB_HARNESS and pass a built web root');
@@ -172,9 +203,12 @@ if (import.meta.main) {
       Authorization: 'Bearer ' + fs.readFileSync(H.apiTokenFiles.near, 'utf8').trim() }, body: JSON.stringify({ sid, agent: 'stub', cwd: TMP }) });
     if (!response.ok) throw new Error('Private ACP session: ' + response.status + ' ' + await response.text());
     const page = await dpage();
-    await page.waitForFunction(id => window.__canvas?.FR.online && window.__canvas.SESS[id]?.acp?.agentSessionId, sid);
+    await page.waitForFunction(id => {
+      const acp = window.__canvas?.SESS[id]?.acp;
+      return window.__canvas?.FR.online && acp?.agentSessionId && acp.activity === 'none';
+    }, sid);
     await page.evaluate(id => window.__canvas.meshOpen(id), sid);
     await page.waitForFunction(() => window.__canvas.live.$agents?.backend.replayed && window.__canvas.live.$agents.backend.transcript);
-    console.log(JSON.stringify({ chromium: state.browser.version(), ...await measureTranscript(page) }));
+    console.log(JSON.stringify({ chromium: state.browser.version(), ...await measureTranscript(page, process.argv.includes('--legacy-edwin')) }));
   } finally { await state.browser.close(); fwd?.close(); child.stdin.end(); fs.rmSync(TMP, { recursive: true, force: true }); }
 }

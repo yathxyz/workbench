@@ -1594,7 +1594,8 @@ The Agents transcript projects semantic journal items as literal text: one headi
 Replay yields between batches, streamed text patches its own item, and a reader parked away from the tail keeps point, mark, viewport and focus.
 The transcript-local `C-c n`/`C-c p` jump between turns, `C-c ]`/`C-c [` between tools, `C-c TAB` toggles the section at point, `C-c a` toggles all folds, and `C-c f` resumes following the tail.
 Phone actions invoke the same commands without a keyboard.
-With owner-supplied Edwin folds, thoughts and tool details start collapsed and choices survive replay in the same journal incarnation (F-A53).
+With owner-supplied Edwin folds, thoughts and tool details start collapsed; transcript-local `za`/Tab toggle at point, `zc` closes, `zo`/`zO` open, and `zM`/`zR` close or open all.
+A tool jump opens its enclosing turn and lands on the tool header; fold choices survive appends, reset replay and reattaching to the same journal incarnation (F-A53).
 In the Agents list, `g` toggles grouping of root rows between repository (default) and task, keeping descendants with their parent and roots without a task in one last group in task mode (F-A51).
 In task groups, each root row shows its repository, and a nested row shows its repository when it differs from its parent's.
 Like the Details disclosure, grouping is local to this page and resets on reload.

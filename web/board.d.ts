@@ -839,9 +839,11 @@ interface EdwinApi {
   setLeaderKey(name: string): void;
   onFrameEvent(fn: (...args: any[]) => void): void; // any: frame events carry per-event payloads
   withFrame<R>(f: EdwinFrame, fn: () => R): R;
+  runCallback<R>(fn: () => R): R | undefined;
   applyOps(b: EdwinBuffer, ops: unknown[], origin: string): void;
   // Optional on a host serving an older Edwin. Workbench never mutates Edwin's fold cache.
   setBufferFolds?(b: EdwinBuffer, ranges: { s: number; e: number }[]): void;
+  getBufferFolds?(b: EdwinBuffer): { s: number; e: number }[];
   leaves(root: unknown): EdwinWindow[];
   selectFrame(f: EdwinFrame): void;
   selectWindow(w: EdwinWindow): void;
