@@ -538,6 +538,42 @@ mod tests {
         assert!(replay.events.iter().map(|e| e.seq).eq([since + 1]));
     }
 
+    /// A checkpoint followed by one requested, complete record.
+    fn journal_with_indexed_tail(name: &str) -> (PathBuf, u64) {
+        let path = fresh_dir(name).join("s.jsonl");
+        let mut journal = Journal::open(&path, drop).unwrap();
+        for seq in 1..=CHECKPOINT_STRIDE + 1 {
+            journal.append(prompt(), seq).unwrap();
+        }
+        (path, journal.replay_offset(CHECKPOINT_STRIDE))
+    }
+
+    #[test]
+    fn indexed_replay_rejects_junk_before_expected_json() {
+        let (path, offset) = journal_with_indexed_tail("seek-junk");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.insert(offset as usize, b'!');
+        fs::write(&path, bytes).unwrap();
+
+        let since = CHECKPOINT_STRIDE;
+        let scan = |at| super::super::replay::scan(&path, at, since, since + 1, &[], usize::MAX);
+        let from_zero = scan(0).unwrap_err();
+        let at_json = scan(offset + 1).unwrap_err();
+        assert_eq!(at_json.to_string(), from_zero.to_string());
+    }
+
+    #[test]
+    fn indexed_replay_ignores_expected_json_without_final_newline() {
+        let (path, offset) = journal_with_indexed_tail("seek-no-newline");
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+
+        let since = CHECKPOINT_STRIDE;
+        let replay =
+            super::super::replay::scan(&path, offset, since, since + 1, &[], usize::MAX).unwrap();
+        assert!(replay.events.is_empty());
+    }
+
     #[test]
     fn bytes_left_by_a_failed_truncation_heal() {
         let _torn = crate::lock(&TORN_WARN);

@@ -63,7 +63,8 @@ pub fn scan(
         let mut line = Vec::new();
         let mut first = None;
         if at != 0 {
-            first = seek_checkpoint(&mut reader, at, checkpoint_seq(since) + 1, &mut line);
+            first = seek_checkpoint(&mut reader, at, checkpoint_seq(since) + 1, &mut line)
+                .with_context(|| format!("cannot read {}", path.display()))?;
             if first.is_none() {
                 reader.rewind()?;
                 at = 0;
@@ -109,23 +110,30 @@ pub fn scan(
 }
 
 /// On success `line` holds the first complete record for the scan to consume.
-/// Any failed probe leaves the caller to rewind the same file and scan normally.
+/// A stale or incomplete checkpoint is a miss; I/O errors abort the scan.
 fn seek_checkpoint(
     reader: &mut BufReader<File>,
     offset: u64,
     expected_seq: u64,
     line: &mut Vec<u8>,
-) -> Option<u64> {
-    reader.seek(SeekFrom::Start(offset - 1)).ok()?;
-    if !reader.fill_buf().ok()?.starts_with(b"\n") {
-        return None;
+) -> io::Result<Option<u64>> {
+    reader.seek(SeekFrom::Start(offset - 1))?;
+    loop {
+        match reader.fill_buf() {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+            Ok(buf) if buf.starts_with(b"\n") => break,
+            Ok(_) => return Ok(None),
+        }
     }
     reader.consume(1);
-    reader.read_until(b'\n', line).ok()?;
-    let seq = serde_json::from_slice::<Seq>(line.strip_suffix(b"\n")?)
-        .ok()?
-        .seq;
-    (seq == expected_seq).then_some(seq)
+    reader.read_until(b'\n', line)?;
+    let Some(text) = line.strip_suffix(b"\n") else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_slice::<Seq>(text)
+        .is_ok_and(|s| s.seq == expected_seq)
+        .then_some(expected_seq))
 }
 
 /// The seq of a line, read without building the rest of the event.
