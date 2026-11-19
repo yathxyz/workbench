@@ -75,6 +75,7 @@ await section('N56', async () => {
     disk = boardFile()!;
     B = await devB();
     const b1 = await B.evaluate((m: DeskMarks) => { const C = window.__canvas; const d = C.deskAt(2); return { pinned: C.deskPinned(d), cur: C.DESK.cur, has: !!d && m.a in d.members }; }, m);
+    await B.evaluate(id => { const C = window.__canvas; C.deskSend(1, { items: [C.S.nodes[id]], follow: true }); }, m.a);
     const deskMessages = await B.evaluateHandle(() => {
       const C = window.__canvas, seen: number[] = [], ch = new BroadcastChannel(C.WIN.ch.name);
       ch.onmessage = e => { if (e.data.win === C.WIN.id && e.data.t === 'desk') seen.push(e.data.desk); };
@@ -94,6 +95,11 @@ await section('N56', async () => {
     check('N56: removing the focused desk card remotely persists the pruned tabs and only advertises the named desk',
       took && stored.device.desk === 2 && stored.win.desk === 2 && !stored.device.focusTabs.includes(made.n) && desks.join() === '2',
       JSON.stringify({ stored, desks }));
+    await B.evaluate(() => window.__canvas.ringOpen());
+    const previous = await B.locator('#ring .rg-item.sel').textContent();
+    check('N56: remote focus deletion keeps desk 1 as the previous place on desk 2, including in the saved ring',
+      previous?.endsWith('desk · 1') && stored.device.ring.filter((k: string) => k.startsWith('desk:')).slice(0, 2).join() === 'desk:2,desk:1',
+      JSON.stringify({ previous, ring: stored.device.ring }));
     await D.evaluate((made: { k: string; n: string }) => { const C = window.__canvas; C.deskGo(2, true); C.deskDelete(); for (const id of [made.k, made.n]) if (C.S.nodes[id]) C.removeNode(id); }, made);
     await settled(D);
   } finally { await B?.close(); await D?.close(); await ctx2.close(); }

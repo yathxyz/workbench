@@ -351,7 +351,7 @@ function boardAdopt(b: Board): void {
     SAVE.lastJson = serialize();
     if (edStale) { const e = edStale; setTimeout(() => { if (ED.node === e && ED.pre && VIEW === 'editor') frEdLoad(e); }); }   // the read-only Editor shows the newer text
   } finally { ADOPTING = false; }
-  if (viewSaveDeferred) { viewSaveDeferred = false; viewSave(); }
+  if (viewSaveDeferred) { viewSaveDeferred = false; ringRecord(); viewSave(); }
   hashRestore('board');
 }
 function unmountQuiet(id: string): void {   // the card went in another tab: drop it here without killing its session
@@ -9776,7 +9776,11 @@ function placeLabel(k: PlaceKey): string {
   if (k.startsWith('persp:')) return 'perspective · ' + v;
   return 'desk · ' + (+v === 9 ? '9 attention' : deskName(deskAt(+v)));
 }
-function ringNote() { if (!S || !BOOTED) return; const k = placeNow(); if (RING.list[0] === k) return; RING.list = [k, ...RING.list.filter(x => x !== k)].slice(0, RING_MAX); viewSave(); }
+function ringRecord(): boolean {
+  const k = placeNow(); if (RING.list[0] === k) return false;
+  RING.list = [k, ...RING.list.filter(x => x !== k)].slice(0, RING_MAX); return true;
+}
+function ringNote() { if (S && BOOTED && !ADOPTING && ringRecord()) viewSave(); }
 function ringGo(k: PlaceKey) {
   const v = k.slice(k.indexOf(':') + 1);
   if (k.startsWith('view:')) return setView(v as ViewName);
