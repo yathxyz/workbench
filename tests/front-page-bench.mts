@@ -1,10 +1,11 @@
-// bash tests/run-front-bench.sh front-page-bench.mts [desktop|phone] [load|input]
+// bash tests/run-front-bench.sh front-page-bench.mts [desktop|phone] [load|input|navigator]
 import { withBoard, metrics, stats } from './front-browser.mts';
 import { writeFileSync } from 'node:fs';
+import { strict as assert } from 'node:assert';
 import type { Page } from 'playwright-core';
 
 const [device = 'desktop', workload = 'load'] = process.argv.slice(2);
-if (!['desktop', 'phone'].includes(device) || !['load', 'input'].includes(workload)) throw Error('expected desktop|phone load|input');
+if (!['desktop', 'phone'].includes(device) || !['load', 'input', 'navigator'].includes(workload)) throw Error('expected desktop|phone load|input|navigator');
 const phone = device === 'phone', repeats = Number(process.env.WB_BENCH_REPEATS || 5);
 const viewport = phone ? { width: 390, height: 844 } : { width: 1280, height: 800 };
 interface Probe { frames: number[]; long: number[]; boot: number; heap: number; key: number; paints: number[] }
@@ -30,9 +31,24 @@ await withBoard(async (browser, info) => {
   // First visit writes the seed. All measured contexts then open the same persisted board.
   const seed = await browser.newPage({ viewport });
   await seed.goto(info.caddy);
-  await seed.waitForFunction(() => window.__canvas?.BOOTED && !window.__canvas.unsaved() && !window.__canvas.SAVE.busy);
-  await seed.waitForFunction(async () => (await (await fetch('/api/board')).json())?.v === 5);
+  await seed.waitForFunction(() => window.__canvas?.BOOTED && window.__canvas.SAVE.lastJson);
+  const board: Board = JSON.parse(await seed.evaluate(() => window.__canvas.SAVE.lastJson));
   await seed.close();
+  const r = await browser.newContext();
+  try {
+    const res = await r.request.get(`${info.caddy}/api/board`);
+    assert.ok(res.ok());
+    if (workload === 'navigator') {
+      // A populated navigator, in scrambled insertion order.
+      for (let i = 0; i < 180; ++i) {
+        const j = i * 97 % 180, id = `quote-${j}`;
+        board.nodes[id] = { kind: 'ref', id, name: `quote ${j}`, x: 12000 + 440 * (i % 12), y: Math.floor(i / 12) * 260,
+          w: 400, h: 220, text: `Excerpt ${j}`, srcLabel: 'notes', src: { node: 'notes' } };
+      }
+    }
+    const save = await r.request.put(`${info.caddy}/api/board`, { headers: { 'If-Match': res.headers().etag, Origin: info.caddy }, data: board });
+    assert.equal(save.status(), 204, await save.text());
+  } finally { await r.close(); }
   for (let i = 0; i < (workload === 'load' ? repeats : 1); i++) {
     const ctx = await browser.newContext({ viewport });
     try {
@@ -128,6 +144,24 @@ await withBoard(async (browser, info) => {
             return false;
           }), ids, { timeout: 60000 });
         });
+      }
+      if (workload === 'navigator') {
+        await page.evaluate(() => window.__canvas.setView('ranger'));
+        const rows = page.locator('#rg-cur .rg-row[data-key^="quote-"]');
+        assert.deepEqual(await rows.locator('.nm').allTextContents(), Array.from({ length: 180 }, (_, j) => `quote ${j}`));
+        await rows.first().click();
+        if (process.env.WB_BENCH_PROFILE) await cdp.send('Profiler.start');
+        const a = await metrics(cdp);
+        const times: number[] = [];
+        for (let k = 1; k <= 24; k++) {
+          await page.keyboard.press('j');
+          await page.waitForFunction(k => document.querySelector<HTMLElement>('#rg-cur .on')?.dataset.key === `quote-${k}`, k);
+          times.push(await page.evaluate(() => new Promise<number>(r => requestAnimationFrame(() => r(performance.now() - window.frontProbe.key)))));
+        }
+        const b = await metrics(cdp);
+        if (process.env.WB_BENCH_PROFILE) writeFileSync(`${process.env.WB_BENCH_PROFILE}-navigator.cpuprofile`, JSON.stringify((await cdp.send('Profiler.stop')).profile));
+        console.log(JSON.stringify({ device, name: 'navigator-key', keyMs: stats(times), threadMs: (b.TaskDuration - a.TaskDuration) * 1000,
+          layoutMs: (b.LayoutDuration - a.LayoutDuration) * 1000, styleMs: (b.RecalcStyleDuration - a.RecalcStyleDuration) * 1000 }));
       }
       if (process.env.WB_BENCH_TRACE && i === 0) await ctx.tracing.stop({ path: process.env.WB_BENCH_TRACE });
     } finally { await ctx.close(); }
