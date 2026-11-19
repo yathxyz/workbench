@@ -899,6 +899,7 @@ fn acp_open_requests() {
                 host: None,
                 config: Vec::new(),
                 task: Some("issue 44".into()),
+                policy: None,
             })
         }
     );
@@ -1248,4 +1249,73 @@ fn acp_ev_with_an_unknown_event_kind() {
         panic!("{msg:?}")
     };
     assert_eq!((ev.seq, ev.ts, ev.body), (5, 6, EventBody::Unknown));
+}
+
+#[test]
+fn acp_policy_wire_contract_and_legacy_defaults() {
+    let rules = json!({"rules":[{"action":"allow","kinds":["read"],"roots":["$cwd"]}]});
+    let spawn: SpawnAcp = round_trip(json!({
+        "agent":"claude", "cwd":"/work", "policy":rules
+    }));
+    assert_eq!(serde_json::to_value(spawn.policy.unwrap()).unwrap(), rules);
+    let legacy: SpawnAcp = round_trip(json!({"agent":"claude", "cwd":"/work"}));
+    assert_eq!(legacy.policy, None);
+    assert!(
+        serde_json::from_value::<SpawnAcp>(json!({
+            "agent":"claude", "cwd":"/work", "policy":null
+        }))
+        .is_err()
+    );
+    let empty: SpawnAcp = round_trip(json!({
+        "agent":"claude", "cwd":"/work", "policy":{"rules":[]}
+    }));
+    assert!(empty.policy.unwrap().rules.is_empty());
+
+    let req: HubRequest = round_trip(json!({
+        "t":"acp.set_policy", "rid":24, "sid":"n_agent1", "epoch":42,
+        "policy":rules
+    }));
+    assert!(matches!(
+        req,
+        HubRequest::AcpSetPolicy {
+            rid: 24,
+            epoch: 42,
+            ..
+        }
+    ));
+    let clear: HubRequest = round_trip(json!({
+        "t":"acp.set_policy", "rid":25, "sid":"n_agent1", "epoch":42,
+        "policy":{"rules":[]}
+    }));
+    let HubRequest::AcpSetPolicy { policy, .. } = clear else {
+        panic!("{clear:?}")
+    };
+    assert!(policy.rules.is_empty());
+    for malformed in [json!(null), json!({}), json!({"rules":[], "typo":true})] {
+        assert!(
+            serde_json::from_value::<HubRequest>(json!({
+                "t":"acp.set_policy", "rid":26, "sid":"n_agent1", "epoch":42,
+                "policy":malformed
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn acp_facts_policy_is_optional_and_empty_is_canonicalized() {
+    let legacy: Summary = round_trip(summary_acp());
+    assert_eq!(legacy.acp.unwrap().policy, None);
+    let mut wire = summary_acp();
+    wire["acp"]["policy"] = json!({"rules":[{"action":"reject"}]});
+    let summary: Summary = round_trip(wire);
+    assert_eq!(summary.acp.unwrap().policy.unwrap().rules.len(), 1);
+
+    for empty in [json!({"rules":[]}), Value::Null] {
+        let mut wire = summary_acp();
+        wire["acp"]["policy"] = empty;
+        let summary: Summary = serde_json::from_value(wire).unwrap();
+        assert_eq!(summary.acp.as_ref().unwrap().policy, None);
+        assert_eq!(serde_json::to_value(summary).unwrap(), summary_acp());
+    }
 }

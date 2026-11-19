@@ -16,6 +16,10 @@
 //! - `ask-permission`: a permission request; once an option is selected, `PONG`;
 //! - `perm`: a `tool_call`, then a permission request with `allow_once`, `allow_always`
 //!   and `reject_once`; the tool call completes or fails with the answer;
+//! - `omp-permission`: execute permission with empty locations and omp's rawInput;
+//! - `omp-after-cancel`: that permission, sent only after receiving session/cancel;
+//! - `omp-outside-turn`: sends that permission after its prompt response;
+//!   `omp-after-cancel outside` does so after a cancelled prompt response;
 //! - `form`: a form elicitation with a string enum (required), an integer (1..=10), a
 //!   boolean and a multi-select; the reply quotes the content it received;
 //! - `url`: a url elicitation for an https URL (`javascript:alert(1)` when the prompt
@@ -382,6 +386,13 @@ impl Fake {
                 }
                 let stop = self.prompt(params).await;
                 self.reply(id, json!({"stopReason": stop}));
+                let words = words(&prompt_text(&params["prompt"]));
+                if words.iter().any(|word| word == "omp-outside-turn")
+                    || (words.iter().any(|word| word == "omp-after-cancel")
+                        && words.iter().any(|word| word == "outside"))
+                {
+                    self.omp_permission_turn(false, "cargo test").await;
+                }
             }
             "session/set_mode" => self.set_mode(id, params),
             "session/set_config_option" => self.set_config_option(id, params),
@@ -720,7 +731,29 @@ impl Fake {
         }
         let words = words(text);
         let has = |k: &str| words.iter().any(|w| w == k);
-        if has("ask-permission") {
+        if has("omp-after-cancel") {
+            self.say("Waiting for cancel.");
+            while !self.cancelled {
+                let msg = self.recv().await;
+                self.background(msg);
+            }
+            if has("outside") {
+                "end_turn"
+            } else {
+                self.omp_permission_turn(false, "cargo test").await
+            }
+        } else if has("omp-outside-turn") {
+            "end_turn"
+        } else if has("omp-permission") {
+            let command = if has("cd") {
+                "cd src && cargo test"
+            } else if has("same-cwd") {
+                "cd . && cargo test"
+            } else {
+                "cargo test"
+            };
+            self.omp_permission_turn(has("cwd"), command).await
+        } else if has("ask-permission") {
             self.ask_permission_turn().await
         } else if has("perm") {
             self.permission_turn().await
@@ -770,7 +803,9 @@ impl Fake {
 
     async fn permission_turn(&mut self) -> &'static str {
         let call = self.turn_id("call");
-        let tool = json!({"toolCallId": call, "title": "Run `rm -rf build`", "kind": "execute", "status": "pending"});
+        let tool = json!({"toolCallId": call, "title": "Run `rm -rf build`", "kind": "execute",
+                          "status": "pending", "locations": [{"path": "build"}],
+                          "rawInput": {"command": "rm -rf build"}});
         let mut announce = tool.clone();
         announce["sessionUpdate"] = "tool_call".into();
         announce["rawInput"] = json!({"command": "rm -rf build"});
@@ -787,6 +822,19 @@ impl Fake {
         );
         self.say(text);
         stop
+    }
+
+    async fn omp_permission_turn(&mut self, cwd: bool, command: &str) -> &'static str {
+        let mut input = json!({"command":command, "timeout":300, "pty":false, "async":false});
+        if cwd {
+            input["cwd"] = json!("src");
+        }
+        let tool = json!({"toolCallId":self.turn_id("call"), "title":format!("Run {command}"),
+            "kind":"execute", "locations":[], "rawInput":input});
+        let params = self.permission_params(tool);
+        let answer = self.ask("session/request_permission", params).await;
+        self.say(&format!("Permission: {}", answer["result"]["outcome"]));
+        "end_turn"
     }
 
     async fn ask_permission_turn(&mut self) -> &'static str {

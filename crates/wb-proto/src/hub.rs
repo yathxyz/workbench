@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::journal::JournalEvent;
+use crate::policy::Policy;
 
 /// Protocol version carried by both hellos.
 pub const PROTO: u32 = 1;
@@ -137,6 +138,14 @@ pub enum HubRequest {
         // The member is required; only an explicit null or empty string clears it.
         #[serde(deserialize_with = "Deserialize::deserialize")]
         task: Option<String>,
+    },
+    /// Replace the session permission policy; existing pending requests are unchanged.
+    #[serde(rename = "acp.set_policy")]
+    AcpSetPolicy {
+        rid: u64,
+        sid: String,
+        epoch: u64,
+        policy: Policy,
     },
     /// The client has seen the events up to `seq`. Reply: `{}`.
     #[serde(rename = "acp.seen")]
@@ -432,6 +441,13 @@ pub struct SpawnAcp {
     /// Optional task reference for the new session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    /// Permission rules used only when creating a session, not when attaching.
+    #[serde(
+        default,
+        deserialize_with = "crate::policy::deserialize_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub policy: Option<Policy>,
 }
 
 /// Where a viewer's terminal stopped: honoured if `stream` matches and the ring still
@@ -555,6 +571,13 @@ pub struct AcpFacts {
     pub config_options: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    /// Current permission rules; an empty policy is represented by absence.
+    #[serde(
+        default,
+        deserialize_with = "crate::policy::deserialize_optional_policy",
+        skip_serializing_if = "crate::policy::optional_policy_is_empty"
+    )]
+    pub policy: Option<Policy>,
 }
 
 /// What is outstanding to the agent.

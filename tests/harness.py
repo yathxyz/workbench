@@ -180,6 +180,7 @@ class Harness:
             fake = self.bin("wb-fake-acp")
             self.agents = {
                 "stub": {"label": "Stub", "argv": [fake], "env": {}},
+                "omp": {"label": "OMP policy fixture", "argv": [fake], "env": {}},
                 "stuck": {"label": "Stuck", "argv": [fake, "--scenario", "kill-stubborn"], "env": {}},
                 "reconnect": {"label": "Reconnect", "argv": [fake, "--scenario", "permission-reconnect"], "env": {}},
                 "config": {"label": "Config", "argv": [fake, "--scenario", "config"], "env": {}},

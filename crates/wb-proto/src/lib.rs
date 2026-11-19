@@ -10,5 +10,6 @@ pub mod hub;
 pub mod journal;
 pub mod limits;
 pub mod line;
+pub mod policy;
 pub mod state;
 pub mod websock;

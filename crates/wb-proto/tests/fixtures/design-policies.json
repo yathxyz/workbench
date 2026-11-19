@@ -1,0 +1,16 @@
+[
+  {
+    "rules": [
+      {"action": "allow", "kinds": ["read", "edit"], "roots": ["$cwd", "/nix/store", "/tmp"]},
+      {
+        "action": "allow",
+        "kinds": ["execute"],
+        "roots": ["$cwd", "/nix/store", "/tmp"],
+        "programs": ["cargo", "nix", "git", "ls", "cat", "grep", "rg", "sed", "head", "tail", "wc", "node"],
+        "command": {
+          "notMatches": ["sudo", "git\\s+(push|tag|remote|config|reset|clean|checkout|switch|branch|rebase|merge|stash|worktree)", "gh ", "systemctl", "ssh", "scp", "curl", "wget", "nc", "kill", "pkill", "secrets", "sops", "~/", "\\$HOME"]
+        }
+      }
+    ]
+  }
+]

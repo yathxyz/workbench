@@ -53,6 +53,7 @@ fn summary(sid: &str, head_seq: u64) -> Summary {
             mode_id: Some("default".into()),
             config_options: None,
             task: None,
+            policy: None,
         }),
     }
 }
@@ -92,6 +93,7 @@ fn rid_of(r: &HubRequest) -> u64 {
         | HubRequest::AcpElicitation { rid, .. }
         | HubRequest::AcpSetMode { rid, .. }
         | HubRequest::AcpSetConfigOption { rid, .. }
+        | HubRequest::AcpSetPolicy { rid, .. }
         | HubRequest::AcpSeen { rid, .. }
         | HubRequest::AcpRevive { rid, .. }
         | HubRequest::AcpAuthenticate { rid, .. }
@@ -245,6 +247,7 @@ async fn spawn_fields_go_only_with_agent_and_cwd() {
                 host: None,
                 config: Vec::new(),
                 task: None,
+                policy: None,
             });
             // The id is sanitised to the sid alphabet; since and epoch pass through.
             (format!("a{i}x"), 5 + i as u64, Some(EPOCH), spawn)
@@ -934,4 +937,152 @@ async fn sigterm_closes_1012() {
     web.sigterm();
     assert_eq!(read_to_close(&mut ws).await.0, 1012);
     assert!(web.wait_exit().await.success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_reaches_a_spawn_but_never_turns_a_page_load_into_one() {
+    let (hub, web) = up().await;
+    let policy = json!({"rules": [{
+        "action": "allow",
+        "kinds": ["read", "edit", "execute"],
+        "roots": ["$cwd", "/nix/store", "/tmp"],
+        "programs": ["git", "/usr/bin/git", "./tools/git"],
+        "command": {"notMatches": ["danger"]}
+    }]});
+    let mut ws = web.ws("/acp").await;
+    send_json(
+        &mut ws,
+        json!({
+            "t": "open", "id": "policy-spawn", "since": 0,
+            "agent": "claude", "cwd": "/home/alice/src", "policy": policy
+        }),
+    )
+    .await;
+    let (conn, req) = hub
+        .wait_for(|r| matches!(r, HubRequest::AcpOpen { sid, .. } if sid == "policy-spawn"))
+        .await;
+    let HubRequest::AcpOpen {
+        spawn: Some(spawn), ..
+    } = &req
+    else {
+        panic!("{req:?}");
+    };
+    assert_eq!(serde_json::to_value(&spawn.policy).unwrap(), policy);
+    let mut opened = reply("policy-spawn");
+    opened.new = true;
+    hub.send(conn, HubMessage::ok(rid_of(&req), &opened));
+    let hello = next_json(&mut ws).await;
+    assert_eq!(hello["t"], "hello");
+    assert_eq!(hello["status"], "new");
+    ws.close(None).await.unwrap();
+
+    // Merely opening a card, reconnecting, or sending just one spawn field must
+    // not start anything, even if a valid policy is included.
+    for (i, fields) in [
+        json!({}),
+        json!({"agent": "claude"}),
+        json!({"cwd": "/home/alice/src"}),
+        json!({"agent": "", "cwd": "/home/alice/src"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("policy-page-{i}");
+        let mut msg = json!({
+            "t": "open", "id": id, "since": 4, "epoch": EPOCH, "policy": policy
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            msg[key] = value.clone();
+        }
+        let mut page = web.ws("/acp").await;
+        send_json(&mut page, msg).await;
+        let (page_conn, open) = hub
+            .wait_for(|r| matches!(r, HubRequest::AcpOpen { sid, .. } if sid == &id))
+            .await;
+        assert!(
+            matches!(open, HubRequest::AcpOpen { spawn: None, .. }),
+            "{open:?}"
+        );
+        hub.send(page_conn, HubMessage::ok(rid_of(&open), &reply(&id)));
+        let hello = next_json(&mut page).await;
+        assert_eq!(hello["status"], "attached");
+        page.close(None).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_spawn_and_attach_policies_are_rejected_before_open() {
+    let (hub, web) = up().await;
+    let invalid = [
+        Value::Null,
+        json!({}),
+        json!([]),
+        json!({"rules": [{"action": "allow", "roots": null}]}),
+        json!({"rules": [{"action": "allow", "kinds": null}]}),
+        json!({"rules": [{"action": "allow", "command": null}]}),
+        json!({"rules": [{"action": "allow", "programs": null}]}),
+        json!({"rules": [{"action": "allow", "programs": "git"}]}),
+        json!({"rules": [{"action": "allow", "programs": [1]}]}),
+        json!({"rules": [{"action": "allow", "programs": [""]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["git status"]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["git\tstatus"]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["git\nstatus"]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["git\u{a0}status"]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["git\u{2003}status"]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["a\u{0}b"]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["x".repeat(257)]}]}),
+        json!({"rules": [{"action": "allow", "programs": ["é".repeat(129)]}]}),
+        json!({"rules": [{"action": "allow", "programs": vec!["git"; 65]}]}),
+        json!({"rules": [], "extra": true}),
+        json!({"rules": [{"action": "allow", "extra": true}]}),
+        json!({"rules": [{"action": "deny"}]}),
+        json!({"rules": [{"action": "allow", "roots": ["relative"]}]}),
+        json!({"rules": [{"action": "allow", "roots": ["$cwd/child"]}]}),
+        json!({"rules": [{"action": "allow", "roots": [""]}]}),
+        json!({"rules": [{"action": "allow", "kinds": ["x".repeat(65)]}]}),
+        json!({"rules": vec![json!({"action": "ask"}); 65]}),
+        json!({"rules": [{
+            "action": "allow", "command": {"matches": ["["]}
+        }]}),
+        json!({"rules": [{
+            "action": "allow", "command": {"notMatches": ["("]}
+        }]}),
+        json!({"rules": [{
+            "action": "allow", "command": {"matches": ["x".repeat(4097)]}
+        }]}),
+        json!({"rules": [{"action":"allow", "roots":[format!("/{}", "r".repeat(4096))]}]}),
+        json!({"rules": [{"action":"allow", "roots":vec![format!("/{}", "r".repeat(4095));64]}]}),
+        json!({"rules": [{"action":"allow", "command":{"notMatches":["a[a-z]{3637}0"]}}]}),
+        json!({"rules": [{"action":"allow", "command":{"notMatches":["[ab]*a[ab]{3635}c"]}}]}),
+        json!({"rules": [{
+            "action": "allow", "command": {"matches": vec!["x"; 129]}
+        }]}),
+        json!({"rules": [{
+            "action": "allow", "command": {"not_matches": ["danger"]}
+        }]}),
+    ];
+    for policy in invalid {
+        for spawning in [false, true] {
+            let mut open = json!({
+                "t": "open", "id": "invalid-policy", "since": 0,
+                "policy": policy, "rid": "bad-policy"
+            });
+            if spawning {
+                open["agent"] = json!("claude");
+                open["cwd"] = json!("/home/alice/src");
+            }
+            let mut ws = web.ws("/acp").await;
+            send_json(&mut ws, open).await;
+            let (code, texts) = read_to_close(&mut ws).await;
+            assert_eq!(code, 1008);
+            assert_eq!(
+                texts,
+                [json!({
+                    "t": "error", "error": "malformed message",
+                    "code": "bad_request", "rid": "bad-policy"
+                })]
+            );
+        }
+    }
+    assert!(!hub.requests().iter().any(|(_, r)| is_acp(r)));
 }
