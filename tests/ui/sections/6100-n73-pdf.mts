@@ -43,6 +43,21 @@ await section('N73', async () => {
       await until(() => L()?.doc && L().pages.length === 2);
       const p0 = await until(() => L().pages[0].canvas && L().pages[0].text?.querySelector('span') && L().pages[0].el.querySelector('.pdf-link') ? L().pages[0] : null);
       out.open = { name: n.name, pages: n.pages, drawn: !!p0?.canvas?.width, text: !!p0?.text, link: !!p0?.el.querySelector('.pdf-link'), badge: C.badgeOf(n), ident: C.fsIdent(n)?.path === file };
+      // Hold the link request for a narrower layout until the real link has been drawn at the restored width.
+      const linkPage: PdfJsPage = p0.page, annotations = linkPage.getAnnotations.bind(linkPage);
+      const oldLinks = Promise.withResolvers<Awaited<ReturnType<typeof annotations>>>(), width = n.w;
+      let requested = false;
+      linkPage.getAnnotations = () => { if (requested) return annotations(); requested = true; return oldLinks.promise; };
+      try {
+        n.w = width - 140; C.nodeResized(n);
+        if (!await until(() => requested)) throw new Error('narrower PDF did not request annotations');
+        n.w = width; C.nodeResized(n);
+        const current = await until(() => p0.el.querySelector('.pdf-link'));
+        oldLinks.resolve(await annotations()); await oldLinks.promise;
+        out.resizedLinks = { kept: !!current && p0.el.querySelector('.pdf-link') === current,
+          layers: p0.el.querySelectorAll('.pdf-links').length, links: p0.el.querySelectorAll('.pdf-link').length };
+        await p0.textReady;
+      } finally { linkPage.getAnnotations = annotations; }
       out.text = await C.pdfText(n, 1, 2);
       // select "quote target" on page 1 and quote it
       const span = [...(p0?.text?.querySelectorAll('span') || [])].find((x: Element) => /quote target/.test(x.textContent!)) as HTMLElement | undefined;
@@ -194,6 +209,8 @@ await section('N73', async () => {
       JSON.stringify({ peek: st.peek, pos: st.pos, keys: st.keys }));
     check('N73: a PDF dropped on the canvas is a pdf card on its sha256 in the blob store, and it opens; a removed card lets go of its document',
       /^[0-9a-f]{64}$/.test(st.dropped?.blob || '') && !st.dropped.path && st.dropped.pages === 2 && st.dropped.url === '/blob/' + st.dropped.blob && st.closed, JSON.stringify({ dropped: st.dropped, closed: st.closed }));
+    check('N73: an earlier annotation request finishing after resize cannot append an old-scale overlay',
+      st.resizedLinks.kept && st.resizedLinks.layers === 1 && st.resizedLinks.links === 1, JSON.stringify(st.resizedLinks));
     await D.evaluate((ids: string[]) => { for (const id of ids) if (window.__canvas.S.nodes[id]) window.__canvas.removeNode(id); window.__canvas.pickClear(); }, st.made);
     await settled(D);
   } finally { await D?.close(); }

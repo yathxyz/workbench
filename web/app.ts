@@ -8370,7 +8370,7 @@ async function pdfOpen(n: PdfNode, L: LiveEntry): Promise<PdfJsDocument | null> 
     const box = el('div', 'pdf-page'); box.dataset.page = String(i + 1);
     box.append(el('span', 'pdf-ph', 'p. ' + (i + 1)));
     P.scroll.append(box);
-    return { i, page: i ? null : first, el: box, pw: vp.width, ph: vp.height, canvas: null, r: 0, task: null, text: null, links: false, used: 0 };
+    return { i, page: i ? null : first, el: box, pw: vp.width, ph: vp.height, canvas: null, r: 0, task: null, text: null, links: null, used: 0 };
   });
   if (n.pages !== doc.numPages) { n.pages = doc.numPages; dirty(); }
   L.note!.hidden = true; P.w = 0; pdfLayout(n);
@@ -8394,7 +8394,7 @@ function pdfLayout(n: PdfNode): boolean {
     const k = w / p.pw;
     Object.assign(p.el.style, { width: w + 'px', height: Math.round(p.ph * k) + 'px' });
     p.el.style.setProperty('--total-scale-factor', String(k));
-    p.text?.remove(); p.text = null; p.el.querySelector('.pdf-links')?.remove(); p.links = false;
+    p.text?.remove(); p.text = null; p.links?.remove(); p.links = null;
   }
   if (at) pdfGo(n, at.page - 1, at.y, true);
   return true;
@@ -8495,10 +8495,10 @@ function pdfTextLayer(P: PdfLive, p: PdfPageLive, page: PdfJsPage) {
   p.textReady = pdfLib().then(lib => new lib.TextLayer({ textContentSource: page.streamTextContent(), container: div, viewport: page.getViewport({ scale: P.w / p.pw }) }).render()).catch(() => {});
 }
 async function pdfLinks(n: PdfNode, P: PdfLive, p: PdfPageLive, page: PdfJsPage) {
-  p.links = true;
-  const box = el('div', 'pdf-links'), vp = page.getViewport({ scale: P.w / p.pw });
+  const doc = P.doc, box = p.links = el('div', 'pdf-links'), vp = page.getViewport({ scale: P.w / p.pw });
   let anns: Awaited<ReturnType<PdfJsPage['getAnnotations']>> = [];
   try { anns = await page.getAnnotations(); } catch {}
+  if (P.doc !== doc || p.links !== box) return;   // closed document or a newer layout's overlay
   for (const a of anns) {
     if (a.subtype !== 'Link' || !(a.dest || (a.url && /^https?:\/\//i.test(a.url)))) continue;
     const [x1, y1] = vp.convertToViewportPoint(a.rect[0], a.rect[1]), [x2, y2] = vp.convertToViewportPoint(a.rect[2], a.rect[3]), l = el('a', 'pdf-link');
@@ -8507,7 +8507,7 @@ async function pdfLinks(n: PdfNode, P: PdfLive, p: PdfPageLive, page: PdfJsPage)
     else { l.title = a.url!; l.onclick = e => { e.preventDefault(); window.open(a.url!, '_blank', 'noopener'); }; }
     box.append(l);
   }
-  if (p.text?.isConnected || p.el.isConnected) p.el.append(box);
+  p.el.append(box);
 }
 // a page's text, whitespace made single spaces: what quotes are anchored in and agents read
 async function pdfPageText(n: PdfNode, i: number): Promise<string> {

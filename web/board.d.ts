@@ -370,7 +370,7 @@ interface PdfPageLive {
   canvas: HTMLCanvasElement | null; r: number;   // the drawn bitmap and its pixels per PDF unit
   task: PdfJsRenderTask | null; taskR?: number;  // the bitmap being drawn and its pixels per PDF unit
   textReady?: Promise<void>;           // the text layer, once its spans are in
-  text: HTMLElement | null; links: boolean; used: number;
+  text: HTMLElement | null; links: HTMLElement | null; used: number;
 }
 /* A media card's controls. */
 interface OpLive { prompt: HTMLTextAreaElement; out: HTMLElement; ins: HTMLElement; run: HTMLButtonElement; busy: boolean }
