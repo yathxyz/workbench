@@ -3,10 +3,11 @@
 
   python3 -I tests/test_daemon.py --web-root DIR [--bin-dir DIR]
 
-Sections so far: board (through Caddy, so ETags round-trip through the proxy) and fs (direct,
-with the proxy secret). Each section is a function of (suite, harness) listed in SECTIONS; later
-work packages add theirs. In test mode the harness gives wb-web a temporary HOME, so `~` and the
-mv denylist act on throwaway directories. Prints one line per check and exits 1 if any failed.
+Sections: board (through Caddy, so ETags round-trip through the proxy), fs (direct, with the proxy
+secret), and session configuration (through /acp, the hub and the fake ACP agent). Each section is a
+function of (suite, harness) listed in SECTIONS. In test mode the harness gives wb-web a temporary
+HOME, so `~` and the mv denylist act on throwaway directories. Prints one line per check and exits
+1 if any failed.
 """
 
 import argparse
@@ -274,7 +275,168 @@ def fs(t, h):
             and src.exists() and not (root / "out.txt").exists(), repr((st, body)))
 
 
-SECTIONS = [board, fs]
+def session_config(t, h):
+    ep = wbctl.Endpoint(ORIGIN, unix=h.caddy_sock)
+    sid = "conformance_config"
+    card = wbctl.AcpCard(ep, sid)
+
+    def options():
+        return (card.result["info"] or {}).get("acp", {}).get("configOptions")
+
+    def values():
+        return {o["id"]: o["currentValue"] for o in options() or []}
+
+    def refused(config_id, value, code, epoch=None):
+        mark = card.cursor()
+        rid = card.send("set_config_option", configId=config_id, value=value,
+                        epoch=card.epoch() if epoch is None else epoch)
+        arrived = card.wait(lambda: card.error_for(rid) is not None)
+        error = card.error_for(rid) or {}
+        return arrived and error.get("code") == code and not card.since(mark, ("config",))
+
+    try:
+        opened = card.open(agent="config", cwd=str(h.home.resolve()))
+        ready = opened and card.wait(
+            lambda: card.since(0, wbctl.SETUP_END) and options() is not None)
+        if not t.check("config: /acp offers the agent's initial full options in Summary and session info",
+                       ready and values() == {"model": "small", "effort": "low", "thinking": False}
+                       and (card.result["info"] or {}).get("session", {}).get("configOptions") == options(),
+                       repr(card.result)):
+            return
+
+        t.check("config: stale epoch wins over an unoffered id",
+                refused("missing", "bad", "stale", epoch=card.epoch() + 1), repr(card.result["errors"]))
+        t.check("config: an unoffered select value is rejected",
+                refused("effort", "max", "bad_option"), repr(card.result["errors"]))
+        t.check("config: a boolean option rejects a string",
+                refused("thinking", "true", "bad_option"), repr(card.result["errors"]))
+
+        applied = card.set_config("model", "large")
+        applied = applied and card.set_config("effort", "max")
+        applied = applied and card.set_config("thinking", True)
+        t.check("config: grouped select, dependent choices and booleans round-trip through the agent",
+                applied and values() == {"model": "large", "effort": "max", "thinking": True},
+                repr(card.result))
+        canonicalized = card.set_config("effort", "high") if applied else False
+        t.check("config: the agent's whole result, not the requested value, replaces the offering",
+                canonicalized and values() == {"model": "large", "effort": "low", "thinking": True},
+                repr(card.result))
+
+        live = [e for e in card.result["events"] if e.get("e") == "config"]
+        summaries = wbctl.hub_sessions(h.hub_sock)
+        summary = next((s for s in summaries if s.get("sid") == sid), {})
+        t.check("config: hub list exposes the same materialised full option list",
+                bool(live) and summary.get("acp", {}).get("configOptions") == options(), repr(summary))
+
+        replay = wbctl.AcpCard(ep, sid)
+        try:
+            replayed = replay.open()
+            events = [e for e in replay.result["events"] if e.get("e") == "config"]
+            t.check("config: journal replay retains every successful full-list result without a prompt",
+                    replayed and len(events) == 4 and events == live
+                    and (replay.result["info"] or {}).get("acp", {}).get("configOptions") == options()
+                    and not any(e.get("e") == "prompt" for e in replay.result["events"]),
+                    repr(replay.result))
+        finally:
+            replay.close()
+    finally:
+        card.close()
+        wbctl.acp_session(ep, sid, kill=True)
+
+
+def configured_open(t, h):
+    ep = wbctl.Endpoint(ORIGIN, unix=h.caddy_sock)
+
+    def values(options):
+        return {o["id"]: o["currentValue"] for o in options or []}
+
+    cases = (
+        ("ready", [
+            {"id": "model", "value": "large"},
+            {"id": "effort", "value": "max"},
+            {"id": "thinking", "value": True},
+        ], [], [
+            {"model": "large", "effort": "low", "thinking": False},
+            {"model": "large", "effort": "max", "thinking": False},
+            {"model": "large", "effort": "max", "thinking": True},
+        ]),
+        ("errors", [
+            {"id": "missing", "value": True},
+            {"id": "effort", "value": "max"},
+            {"id": "model", "value": "large"},
+            {"id": "thinking", "value": True},
+        ], [("missing", True, "bad_option"), ("effort", "max", "bad_option")], [
+            {"model": "large", "effort": "low", "thinking": False},
+            {"model": "large", "effort": "low", "thinking": True},
+        ]),
+    )
+    for name, config, expected_errors, expected_results in cases:
+        sid = "conformance_config_open_" + name
+        card = wbctl.AcpCard(ep, sid)
+        try:
+            opened = card.open(agent="config", cwd=str(h.home.resolve()), config=config)
+            hello = card.result["hello"] or {}
+            info = hello.get("info") or {}
+            acp = info.get("acp") or {}
+            options = acp.get("configOptions")
+            events = card.result["events"]
+            applied = [e for e in events if e.get("e") == "config"]
+            session_events = [e for e in events if e.get("e") == "session"]
+            t.check(f"configured open ({name}): hello already carries the ready configured full list",
+                    opened and hello.get("status") == "new" and info.get("alive") is True
+                    and acp.get("activity") == "none" and bool(acp.get("agentSessionId"))
+                    and values(options) == expected_results[-1]
+                    and (info.get("session") or {}).get("configOptions") == options,
+                    repr(card.result))
+
+            errors = hello.get("configErrors") or []
+            actual_errors = [(e.get("id"), e.get("value"), e.get("code")) for e in errors]
+            t.check(f"configured open ({name}): ordered opener errors retain values and required codes",
+                    actual_errors == expected_errors
+                    and all(isinstance(e.get("error"), str) and e["error"] for e in errors)
+                    and bool("configErrors" in hello) == bool(expected_errors)
+                    and "configErrors" not in info and not card.result["errors"],
+                    repr(hello))
+            notices = [e for e in events if e.get("e") == "notice"]
+            t.check(f"configured open ({name}): each failure is journaled before later successful options",
+                    opened and bool(applied) and len(notices) == len(expected_errors)
+                    and all(e.get("level") == "warn" and error[0] in e.get("text", "")
+                            for e, error in zip(notices, expected_errors))
+                    and all(e["seq"] < applied[0]["seq"] for e in notices),
+                    repr(events))
+            t.check(f"configured open ({name}): dependent options run in input order and journal full results",
+                    opened and [values(e.get("configOptions")) for e in applied] == expected_results
+                    and all(len(e.get("configOptions") or []) == 3 for e in applied)
+                    and len(session_events) == 1 and bool(applied)
+                    and session_events[0]["seq"] < applied[0]["seq"],
+                    repr(events))
+            t.check(f"configured open ({name}): creation sends no implicit prompt",
+                    opened and not any(e.get("e") == "prompt" for e in events), repr(events))
+
+            summary = next((s for s in wbctl.hub_sessions(h.hub_sock) if s.get("sid") == sid), {})
+            t.check(f"configured open ({name}): hub list agrees with the initial hello",
+                    opened and summary.get("acp", {}).get("configOptions") == options,
+                    repr(summary))
+
+            replay = wbctl.AcpCard(ep, sid)
+            try:
+                attached = replay.open()
+                replay_hello = replay.result["hello"] or {}
+                t.check(f"configured open ({name}): attach replays results but not opener-only errors",
+                        attached and replay_hello.get("status") == "attached"
+                        and "configErrors" not in replay_hello
+                        and [e for e in replay.result["events"] if e.get("e") == "config"] == applied
+                        and (replay_hello.get("info") or {}).get("acp", {}).get("configOptions") == options
+                        and not any(e.get("e") == "prompt" for e in replay.result["events"]),
+                        repr(replay.result))
+            finally:
+                replay.close()
+        finally:
+            card.close()
+            wbctl.acp_session(ep, sid, kill=True)
+
+
+SECTIONS = [board, fs, session_config, configured_open]
 
 
 def main():

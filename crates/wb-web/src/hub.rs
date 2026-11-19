@@ -40,6 +40,15 @@ pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Captures waiting for the control task.
 const CALLS: usize = 64;
 
+/// Configured opens wait for setup and each agent config deadline, with reply margin.
+pub fn acp_open_timeout(config_count: usize) -> Duration {
+    if config_count == 0 {
+        REPLY_TIMEOUT
+    } else {
+        Duration::from_secs(40) * (config_count as u32 + 1)
+    }
+}
+
 /// What the web knows about the hub, from the control connection.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HubStatus {
@@ -73,6 +82,8 @@ pub struct HubInfo {
     pub agents: Vec<Agent>,
     /// The other hosts the hub starts agents on (§3.8.5); empty from an older hub.
     pub hosts: Vec<Host>,
+    /// Whether the hub applies ordered startup configuration.
+    pub acp_config: bool,
     /// The shells a spawn may name; DELTA-1 §B.
     pub shells: Vec<String>,
     /// Empty from a hub that predates shell choice.
@@ -150,6 +161,7 @@ impl HubConn {
             shells,
             default_shell,
             hosts,
+            acp_config,
             ..
         }) = hello
         else {
@@ -174,6 +186,7 @@ impl HubConn {
             host,
             agents,
             hosts,
+            acp_config,
             shells,
             default_shell,
         };

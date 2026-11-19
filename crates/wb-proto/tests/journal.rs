@@ -75,7 +75,8 @@ fn session() {
             "via": "new", "sessionId": "c0ffee",
             "modes": {"currentModeId": "default",
                       "availableModes": [{"id": "default", "name": "Default", "description": null}]},
-            "configOptions": [{"id": "model", "currentValue": "opus"}]
+            "configOptions": [{"id": "model", "name": "Model", "type": "select",
+                               "currentValue": "opus", "options": [{"value": "opus", "name": "Opus"}]}]
         }),
     ));
     let EventBody::Session {
@@ -349,6 +350,19 @@ fn mode() {
         e.body,
         EventBody::Mode {
             mode_id: "plan".into()
+        }
+    );
+}
+
+#[test]
+fn config() {
+    let options =
+        json!([{"id": "thinking", "name": "Thinking", "type": "boolean", "currentValue": true}]);
+    let event = round_trip(ev(21, "config", json!({"configOptions": options})));
+    assert_eq!(
+        event.body,
+        EventBody::Config {
+            config_options: options
         }
     );
 }

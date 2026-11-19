@@ -75,6 +75,16 @@ enum Scenario {
     Version,
     Hang,
     SetMode,
+    Config,
+    ConfigResult,
+    ConfigBatch,
+    ConfigError,
+    ConfigMalformed,
+    ConfigMalformedList,
+    ConfigNewMalformed,
+    ConfigReviveMalformed,
+    ConfigHang,
+    ConfigExit,
     KillStubborn,
     ReplayLarge,
     CrashLeaveChild,
@@ -107,6 +117,14 @@ enum Scenario {
 /// - `version`: `initialize` answers `protocolVersion: 2`;
 /// - `hang`: `initialize` is never answered;
 /// - `set-mode`: `session/set_mode` sends no `current_mode_update`;
+/// - `config`: initial select/grouped/boolean options; config changes send an update;
+/// - `config-result`: config changes return the complete list without a notification;
+/// - `config-batch`: creation/config replies wait for numbered steps in `<record>.step`;
+/// - `config-malformed-list`: returns malformed lists/updates, or clears on thinking=false;
+/// - `config-new-malformed`: malformed lists from new and resume;
+/// - `config-revive-malformed`: resume fails, then load returns malformed options;
+/// - `config-error`, `config-malformed`, `config-hang`, `config-exit`: refuse a config
+///   request, return a malformed result, defer the answer until a prompt, or exit;
 /// - `kill-stubborn`: SIGTERM and the end of stdin are ignored, and a prompt never ends;
 /// - `replay-large`: a prompt streams 200 messages of 20 chunks of 5 KiB (about
 ///   20 MiB), asking a permission after the tenth message; then, until it is answered,
@@ -115,7 +133,7 @@ enum Scenario {
 ///   with the agent's stdout and stderr, and exits 1;
 /// - `setsid-child`: a prompt starts `sleep 1000` in a process group of its own, with
 ///   no stdio, and exits 1.
-const SCENARIOS: [(&str, Scenario); 21] = [
+const SCENARIOS: [(&str, Scenario); 31] = [
     ("basic", Scenario::Basic),
     ("noise", Scenario::Noise),
     ("permission", Scenario::Permission),
@@ -133,6 +151,16 @@ const SCENARIOS: [(&str, Scenario); 21] = [
     ("version", Scenario::Version),
     ("hang", Scenario::Hang),
     ("set-mode", Scenario::SetMode),
+    ("config", Scenario::Config),
+    ("config-result", Scenario::ConfigResult),
+    ("config-batch", Scenario::ConfigBatch),
+    ("config-error", Scenario::ConfigError),
+    ("config-malformed", Scenario::ConfigMalformed),
+    ("config-malformed-list", Scenario::ConfigMalformedList),
+    ("config-new-malformed", Scenario::ConfigNewMalformed),
+    ("config-revive-malformed", Scenario::ConfigReviveMalformed),
+    ("config-hang", Scenario::ConfigHang),
+    ("config-exit", Scenario::ConfigExit),
     ("kill-stubborn", Scenario::KillStubborn),
     ("replay-large", Scenario::ReplayLarge),
     ("crash-leave-child", Scenario::CrashLeaveChild),
@@ -262,6 +290,11 @@ async fn main() -> ExitCode {
         session: String::new(),
         cwd: "/".to_owned(),
         mode: MODES[0].0.to_owned(),
+        model: "small".into(),
+        effort: "low".into(),
+        thinking: false,
+        delayed_config: None,
+        config_step: 0,
         authenticated: false,
         titled: false,
         cancelled: false,
@@ -285,6 +318,11 @@ struct Fake {
     session: String,
     cwd: String,
     mode: String,
+    model: String,
+    effort: String,
+    thinking: bool,
+    delayed_config: Option<Value>,
+    config_step: u64,
     authenticated: bool,
     /// The keyword mode titles the session on its first prompt.
     titled: bool,
@@ -312,16 +350,41 @@ impl Fake {
             return;
         };
         let params = &msg["params"];
+        if self.scenario == Scenario::ConfigBatch
+            && matches!(method, "session/new" | "session/set_config_option")
+        {
+            self.config_step += 1;
+            if let Some(record) = &self.rec.0 {
+                let gate = record.with_extension("step");
+                loop {
+                    let released = std::fs::read_to_string(&gate)
+                        .ok()
+                        .and_then(|step| step.parse::<u64>().ok())
+                        .is_some_and(|step| step >= self.config_step);
+                    if released {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
         match method {
             "initialize" => self.initialize(id),
             "session/new" => self.new_session(id, params),
             "session/load" => self.load(id, params),
             "session/resume" => self.resume(id, params),
             "session/prompt" => {
+                if let Some(config_id) = self.delayed_config.take() {
+                    self.reply(
+                        config_id,
+                        json!({"configOptions": self.session_config_options()}),
+                    );
+                }
                 let stop = self.prompt(params).await;
                 self.reply(id, json!({"stopReason": stop}));
             }
             "session/set_mode" => self.set_mode(id, params),
+            "session/set_config_option" => self.set_config_option(id, params),
             "authenticate" => self.authenticate(id, params).await,
             _ => self.error(id, -32601, "Method not found"),
         }
@@ -332,6 +395,9 @@ impl Fake {
         match (msg["method"].as_str(), msg.get("id").cloned()) {
             (Some("session/cancel"), None) => self.cancelled = true,
             (Some("session/set_mode"), Some(id)) => self.set_mode(id, &msg["params"]),
+            (Some("session/set_config_option"), Some(id)) => {
+                self.set_config_option(id, &msg["params"])
+            }
             (Some(method), Some(id)) => {
                 self.error(id, -32603, &format!("{method} while busy"));
             }
@@ -404,11 +470,14 @@ impl Fake {
             return self.error(id, -32000, "Authentication required");
         }
         self.session = format!("fake-session-{}", std::process::id());
-        let result = json!({
+        let mut result = json!({
             "sessionId": self.session,
             "modes": self.modes(),
-            "configOptions": Self::config_options(),
+            "configOptions": self.session_config_options(),
         });
+        if self.scenario == Scenario::ConfigNewMalformed {
+            result["configOptions"] = json!([null]);
+        }
         self.reply(id, result);
     }
 
@@ -436,16 +505,27 @@ impl Fake {
                 {"name": "test", "description": "Run the tests", "input": {"hint": "a test filter"}},
             ],
         }));
-        let result = json!({"modes": self.modes(), "configOptions": Self::config_options()});
+        let mut result =
+            json!({"modes": self.modes(), "configOptions": self.session_config_options()});
+        if self.scenario == Scenario::ConfigReviveMalformed {
+            result["configOptions"] = json!([null]);
+        }
         self.reply(id, result);
     }
 
     fn resume(&mut self, id: Value, params: &Value) {
-        if self.scenario == Scenario::ReviveFail {
+        if matches!(
+            self.scenario,
+            Scenario::ReviveFail | Scenario::ConfigReviveMalformed
+        ) {
             return self.error(id, -32002, "Session not found");
         }
         self.adopt(params);
-        let result = json!({"modes": self.modes(), "configOptions": Self::config_options()});
+        let mut result =
+            json!({"modes": self.modes(), "configOptions": self.session_config_options()});
+        if self.scenario == Scenario::ConfigNewMalformed {
+            result["configOptions"] = json!([null]);
+        }
         self.reply(id, result);
     }
 
@@ -471,6 +551,101 @@ impl Fake {
             let mode = self.mode.clone();
             self.update(json!({"sessionUpdate": "current_mode_update", "currentModeId": mode}));
         }
+    }
+
+    fn has_config(&self) -> bool {
+        matches!(
+            self.scenario,
+            Scenario::Config
+                | Scenario::ConfigResult
+                | Scenario::ConfigBatch
+                | Scenario::ConfigError
+                | Scenario::ConfigMalformed
+                | Scenario::ConfigMalformedList
+                | Scenario::ConfigNewMalformed
+                | Scenario::ConfigHang
+                | Scenario::ConfigExit
+        )
+    }
+
+    fn session_config_options(&self) -> Value {
+        if !self.has_config() {
+            return Self::config_options();
+        }
+        let mut efforts = vec![
+            json!({"value": "low", "name": "Low"}),
+            json!({"value": "high", "name": "High"}),
+        ];
+        if self.model == "large" {
+            efforts.push(json!({"value": "max", "name": "Maximum"}));
+        }
+        json!([
+            {"id": "model", "name": "Model", "category": "model", "type": "select",
+             "currentValue": self.model, "options": [
+                 {"group": "local", "name": "Local", "options": [{"value": "small", "name": "Small"}]},
+                 {"group": "cloud", "name": "Cloud", "options": [{"value": "large", "name": "Large"}]}
+             ]},
+            {"id": "effort", "name": "Effort", "type": "select", "currentValue": self.effort, "options": efforts},
+            {"id": "thinking", "name": "Thinking", "type": "boolean", "currentValue": self.thinking}
+        ])
+    }
+
+    fn set_config_option(&mut self, id: Value, params: &Value) {
+        match self.scenario {
+            Scenario::ConfigError => return self.error(id, -32602, "Configuration refused"),
+            Scenario::ConfigMalformed => return self.reply(id, json!({})),
+            Scenario::ConfigExit => std::process::exit(1),
+            _ => {}
+        }
+        if self.scenario == Scenario::ConfigMalformedList {
+            let options = match params["configId"].as_str() {
+                Some("model") => json!([null]),
+                Some("effort") => json!([{
+                    "id": "effort", "name": "Effort", "type": "select", "currentValue": "high",
+                    "options": [{"group": "bad", "name": "Bad", "options": [{"value": 1, "name": "One"}]}]
+                }]),
+                _ if params["value"] == false => json!([]),
+                _ => json!([{
+                    "id": "thinking", "name": "Thinking", "type": "boolean", "currentValue": "true"
+                }]),
+            };
+            self.update(json!({"sessionUpdate": "config_option_update", "configOptions": options}));
+            return self.reply(id, json!({"configOptions": options}));
+        }
+        if !self.has_config() {
+            return self.error(id, -32602, "No configuration offered");
+        }
+        match (params["configId"].as_str(), &params["value"]) {
+            (Some("model"), Value::String(model)) if model == "small" || model == "large" => {
+                self.model = model.clone();
+                self.effort = "low".into();
+            }
+            (Some("effort"), Value::String(effort))
+                if effort == "low"
+                    || effort == "high"
+                    || (effort == "max" && self.model == "large") =>
+            {
+                // Deliberately canonicalize high: clients must use the agent's result.
+                self.effort = if effort == "high" {
+                    "low".into()
+                } else {
+                    effort.clone()
+                };
+            }
+            (Some("thinking"), Value::Bool(thinking)) if params["type"] == "boolean" => {
+                self.thinking = *thinking;
+            }
+            _ => return self.error(id, -32602, "Unknown configuration or value"),
+        }
+        if self.scenario == Scenario::ConfigHang {
+            self.delayed_config = Some(id);
+            return;
+        }
+        let options = self.session_config_options();
+        if self.scenario == Scenario::Config {
+            self.update(json!({"sessionUpdate": "config_option_update", "configOptions": options}));
+        }
+        self.reply(id, json!({"configOptions": options}));
     }
 
     async fn authenticate(&mut self, id: Value, params: &Value) {
@@ -516,7 +691,9 @@ impl Fake {
         }
         let text = prompt_text(&params["prompt"]);
         let stop = match self.scenario {
-            Scenario::Keywords | Scenario::Elicitation => self.keyword_turn(&text).await,
+            Scenario::Keywords | Scenario::Elicitation | Scenario::Config => {
+                self.keyword_turn(&text).await
+            }
             Scenario::Permission | Scenario::Cancel => self.permission_turn().await,
             Scenario::PermissionReconnect => self.reconnect_turn().await,
             Scenario::AgentCancels => self.agent_cancels_turn().await,
@@ -526,6 +703,10 @@ impl Fake {
             Scenario::ReplayLarge => self.large_turn().await,
             Scenario::CrashLeaveChild => self.leave_child(false),
             Scenario::SetsidChild => self.leave_child(true),
+            Scenario::ConfigBatch => {
+                self.say(&format!("model={} effort={}", self.model, self.effort));
+                "end_turn"
+            }
             _ => self.stream_turn(),
         };
         if self.cancelled { "cancelled" } else { stop }

@@ -155,6 +155,7 @@ mod tests {
             seen_seq: 10,
             title: None,
             mode_id: None,
+            config_options: None,
         };
         edit(&mut facts);
         Summary {

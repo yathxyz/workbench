@@ -8,7 +8,7 @@ connects to a unix socket, such as the harness's Caddy, instead of the host and 
   wbctl.py [...] pty-open SID [--spawn] [--cmd CMD] [--shell NAME] [--send TEXT] [--expect REGEX] [--wait-exit]
   wbctl.py [...] pty-attach SID [--resume STREAM,OUT] [--send TEXT] [--expect REGEX] [--wait-exit]
   wbctl.py [...] pty-kill SID             kills and forgets the session; waits for the close
-  wbctl.py [...] acp-new SID --agent NAME --cwd DIR [ACTION...]
+  wbctl.py [...] acp-new SID --agent NAME --cwd DIR [--config JSON] [ACTION...]
   wbctl.py [...] acp-attach SID [--since N] [ACTION...]
   wbctl.py [...] acp-revive SID [ACTION...]
   wbctl.py [...] acp-kill SID [--forget]  without --forget waits for the exit, with it for the close
@@ -22,8 +22,10 @@ Hub commands speak NDJSON on hub.sock directly (run them as the hub's user or ro
   wbctl.py [--hub PATH] raw JSON          prints the hub's hello, then every line up to the reply
 
 The acp commands speak /acp: acp-new opens with the spawn fields (agent and cwd, a directory on
-the hub's host) and waits for the setup to succeed, acp-revive revives a dead session and waits
-for its new `session` event, acp-attach only attaches. ACTION is any of --prompt TEXT (sent as one
+the hub's host) and optional --config '[{"id":"model","value":"large"}]' in application order.
+It waits for setup and the hub-owned initial configuration batch; opener failures remain in
+hello.configErrors, not the socket's errors. acp-revive revives a dead session and waits for its
+new `session` event, acp-attach only attaches. ACTION is any of --prompt TEXT (sent as one
 text block), --permission OPTION (answer the pending permission, or the one the prompt raises,
 with that optionId or option kind), --until-permission (stop at a pending permission instead of
 the turn's end) and --expect REGEX (matched against the agent text that arrives live). They wait
@@ -401,12 +403,12 @@ class AcpCard:
             self.closed, r["close"] = True, type(e).__name__
         return bool(done())
 
-    def open(self, since=0, epoch=None, agent=None, cwd=None):
-        """Send `open` and read the hello and the replay; True once `replayed` arrived."""
+    def open(self, since=0, epoch=None, agent=None, cwd=None, config=None):
+        """Read the hello and replay; a nonempty config array delays hello until the hub batch ends."""
         if self.ws is None:
             return False
         fields = {"id": self.sid, "since": since}
-        for k, v in (("epoch", epoch), ("agent", agent), ("cwd", cwd)):
+        for k, v in (("epoch", epoch), ("agent", agent), ("cwd", cwd), ("config", config)):
             if v is not None:
                 fields[k] = v
         self.send("open", **fields)
@@ -449,17 +451,37 @@ class AcpCard:
         return self.send("permission", req=perm["seq"], epoch=self.epoch() if epoch is None else epoch,
                          outcome={"outcome": "selected", "optionId": option["optionId"]})
 
+    def set_config(self, config_id, value, epoch=None):
+        """Set one option, waiting for the journaled full result and matching materialised info.
+
+        The agent may return a different value, so success never compares with the requested one.
+        """
+        mark = self.cursor()
+        self.send("set_config_option", configId=config_id, value=value,
+                  epoch=self.epoch() if epoch is None else epoch)
+
+        def applied():
+            events = self.since(mark, ("config",))
+            info = self.result["info"] or {}
+            if not events:
+                return False
+            options = events[-1].get("configOptions")
+            return (options is not None and (info.get("acp") or {}).get("configOptions") == options
+                    and (info.get("session") or {}).get("configOptions") == options)
+
+        return self.wait(applied)
+
     def close(self):
         if self.ws is not None:
             self.ws.close()
 
 
 def acp_session(ep, sid, agent=None, cwd=None, since=0, revive=False, prompt=None, permission=None,
-                until_permission=False, expect=None, kill=None, timeout=20.0):
+                until_permission=False, expect=None, kill=None, timeout=20.0, config=None):
     """Open /acp for `sid` (with spawn fields when `agent` is given) and run these steps in order,
     each only when asked for and only while the previous ones succeeded:
 
-    1. with `agent`: wait for the setup's outcome, which must be a `session` event;
+    1. with `agent`: wait for setup and any ordered initial `config` batch;
     2. `revive`: send revive and wait for a `session` event after it;
     3. `prompt`: send it as one text block;
     4. `permission`: wait for a pending permission (from before, or raised by the prompt) and
@@ -480,7 +502,7 @@ def acp_session(ep, sid, agent=None, cwd=None, since=0, revive=False, prompt=Non
         return r
     mark = 0
     try:
-        ok = card.open(since, agent=agent, cwd=cwd if agent is not None else None)
+        ok = card.open(since, agent=agent, cwd=cwd if agent is not None else None, config=config)
         mark = card.cursor()
         if ok and agent is not None:
             ok = card.wait(lambda: card.since(0, SETUP_END)) and card.since(0, SETUP_END)[-1]["e"] == "session"
@@ -767,6 +789,8 @@ def main():
         if name == "acp-new":
             s.add_argument("--agent", required=True)
             s.add_argument("--cwd", required=True, help="absolute directory on the hub's host")
+            s.add_argument("--config", type=json.loads, metavar="JSON",
+                           help='ordered spawn options, e.g. \'[{"id":"model","value":"large"}]\'')
         if name == "acp-attach":
             s.add_argument("--since", type=int, default=0)
         s.add_argument("--prompt", help="send this text as a prompt")
@@ -812,7 +836,7 @@ def main():
             res = acp_session(ep, a.sid, agent=getattr(a, "agent", None), cwd=getattr(a, "cwd", None),
                               since=getattr(a, "since", 0), revive=a.command == "acp-revive", prompt=a.prompt,
                               permission=a.permission, until_permission=a.until_permission, expect=a.expect,
-                              timeout=a.timeout)
+                              timeout=a.timeout, config=getattr(a, "config", None))
         print(json.dumps(res))
         return 0 if res["ok"] else 1
     if a.command == "pty-kill":

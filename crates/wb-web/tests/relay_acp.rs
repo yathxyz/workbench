@@ -51,6 +51,7 @@ fn summary(sid: &str, head_seq: u64) -> Summary {
             seen_seq: 0,
             title: None,
             mode_id: Some("default".into()),
+            config_options: None,
         }),
     }
 }
@@ -71,6 +72,7 @@ fn reply(sid: &str) -> AcpOpenReply {
         head: 3,
         from: 1,
         reset: false,
+        config_errors: Vec::new(),
     }
 }
 
@@ -88,6 +90,7 @@ fn rid_of(r: &HubRequest) -> u64 {
         | HubRequest::AcpPermission { rid, .. }
         | HubRequest::AcpElicitation { rid, .. }
         | HubRequest::AcpSetMode { rid, .. }
+        | HubRequest::AcpSetConfigOption { rid, .. }
         | HubRequest::AcpSeen { rid, .. }
         | HubRequest::AcpRevive { rid, .. }
         | HubRequest::AcpAuthenticate { rid, .. }
@@ -147,6 +150,53 @@ async fn quiet(ws: &mut Ws) {
     }
 }
 
+#[tokio::test]
+async fn startup_configuration_is_not_forwarded_to_an_older_hub() {
+    let hub = FakeHub::start_with(common::Hello {
+        acp_config: None,
+        ..common::Hello::default()
+    });
+    let web = Web::start(&hub.path);
+    web.wait_hub("up").await;
+    let mut ws = web.ws("/acp").await;
+    send_json(
+        &mut ws,
+        json!({
+            "t": "open", "id": "old", "since": 0, "agent": "claude", "cwd": "/x",
+            "rid": 17, "config": [{"id": "model", "value": "large"}]
+        }),
+    )
+    .await;
+    let (closed, messages) = read_to_close(&mut ws).await;
+    assert_eq!(
+        messages,
+        [json!({
+            "t": "error", "code": "bad_request", "rid": 17,
+            "error": "hub does not support session configuration"
+        })]
+    );
+    assert_eq!(closed, 1008);
+    assert!(!hub.requests().iter().any(|(_, r)| is_acp(r)));
+
+    let mut ws = web.ws("/acp").await;
+    send_json(
+        &mut ws,
+        json!({
+            "t": "open", "id": "empty", "since": 0, "agent": "claude", "cwd": "/x",
+            "config": []
+        }),
+    )
+    .await;
+    let (conn, req) = hub
+        .wait_for(|r| {
+            matches!(r,
+        HubRequest::AcpOpen { sid, .. } if sid == "empty")
+        })
+        .await;
+    hub.send(conn, HubMessage::ok(rid_of(&req), &reply("empty")));
+    assert_eq!(next_json(&mut ws).await["t"], "hello");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_fields_go_only_with_agent_and_cwd() {
     let (hub, web) = up().await;
@@ -192,6 +242,7 @@ async fn spawn_fields_go_only_with_agent_and_cwd() {
                 agent: "claude".into(),
                 cwd: "/home/alice".into(),
                 host: None,
+                config: Vec::new(),
             });
             // The id is sanitised to the sid alphabet; since and epoch pass through.
             (format!("a{i}x"), 5 + i as u64, Some(EPOCH), spawn)
@@ -258,6 +309,7 @@ async fn hello_carries_state_and_session_and_info_omits_an_unchanged_session() {
         "protocolVersion": 1, "agentInfo": {"name": "stub", "version": "1"},
         "agentCapabilities": null, "promptCapabilities": null, "authMethods": null,
         "modes": null, "availableCommands": null, "plan": null, "usage": null,
+        "configOptions": null,
     });
     let info = |activity: &str, head: u64, state: &str| {
         json!({
@@ -268,6 +320,7 @@ async fn hello_carries_state_and_session_and_info_omits_an_unchanged_session() {
                 "agent": "claude", "agentSessionId": "s-1", "revivable": true,
                 "activity": activity, "pending": [], "last": null, "headSeq": head,
                 "seenSeq": 0, "title": null, "modeId": "default",
+                "configOptions": null,
             },
             "state": state,
             "repoRoot": null, "repo": null, "worktree": null, "branch": null,
@@ -541,6 +594,57 @@ async fn commands_map_onto_acp_requests_and_errors_echo_the_rid() {
     let reqs = wait_on_conn(&hub, conn, 13).await;
     assert_eq!(reqs.len(), 13, "{reqs:?}");
     assert!(matches!(reqs[12], HubRequest::AcpSeen { seq: 10, .. }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_errors_keep_the_browser_correlation_and_socket_usable() {
+    let (hub, web) = up().await;
+    let (mut ws, _, conn) = attached(&hub, &web, "config1").await;
+    send_json(
+        &mut ws,
+        json!({
+            "t":"set_config_option","epoch":EPOCH - 1,"configId":"model","value":"other","rid":"old"
+        }),
+    )
+    .await;
+    let reqs = wait_on_conn(&hub, conn, 2).await;
+    hub.send(
+        conn,
+        HubMessage::Err {
+            rid: Some(rid_of(&reqs[1])),
+            sid: None,
+            code: ErrorCode::Stale,
+            message: "session changed".into(),
+        },
+    );
+    assert_eq!(
+        next_json(&mut ws).await,
+        json!({
+            "t":"error","code":"stale","error":"session changed","rid":"old"
+        })
+    );
+    send_json(
+        &mut ws,
+        json!({"t":"set_config_option","configId":"model","value":"other","rid":"no-epoch"}),
+    )
+    .await;
+    assert_eq!(
+        next_json(&mut ws).await,
+        json!({
+            "t":"error","code":"bad_request","error":"malformed message","rid":"no-epoch"
+        })
+    );
+    send_json(
+        &mut ws,
+        json!({
+            "t":"set_config_option","epoch":EPOCH,"configId":"enabled","value":true
+        }),
+    )
+    .await;
+    let reqs = wait_on_conn(&hub, conn, 3).await;
+    hub.send(conn, HubMessage::ok(rid_of(&reqs[2]), &json!({})));
+    quiet(&mut ws).await;
+    ws.close(None).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

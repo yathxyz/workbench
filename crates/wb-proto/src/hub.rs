@@ -119,6 +119,16 @@ pub enum HubRequest {
         sid: String,
         mode_id: String,
     },
+    /// Change an offered session configuration option. Reply: `{}` after journaling
+    /// the agent's complete resulting configuration.
+    #[serde(rename = "acp.set_config_option")]
+    AcpSetConfigOption {
+        rid: u64,
+        sid: String,
+        epoch: u64,
+        config_id: String,
+        value: Value,
+    },
     /// The client has seen the events up to `seq`. Reply: `{}`.
     #[serde(rename = "acp.seen")]
     AcpSeen { rid: u64, sid: String, seq: u64 },
@@ -169,6 +179,10 @@ pub enum HubMessage {
         /// hub.
         #[serde(default)]
         hosts: Vec<Host>,
+        /// Whether ordered startup configuration and live config requests are supported.
+        /// False from an older hub.
+        #[serde(default)]
+        acp_config: bool,
     },
     /// Success reply to the request with this `rid`; `result` holds the reply fields.
     #[serde(rename = "ok")]
@@ -339,6 +353,39 @@ pub struct SpawnPty {
     pub env: Option<BTreeMap<String, String>>,
 }
 
+/// A typed value for a session configuration option.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ConfigValue {
+    String(String),
+    Boolean(bool),
+}
+
+impl From<ConfigValue> for Value {
+    fn from(value: ConfigValue) -> Self {
+        match value {
+            ConfigValue::String(value) => Self::String(value),
+            ConfigValue::Boolean(value) => Self::Bool(value),
+        }
+    }
+}
+
+/// One session configuration option to apply at startup.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigOption {
+    pub id: String,
+    pub value: ConfigValue,
+}
+
+/// A startup configuration option that could not be applied.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigError {
+    pub id: String,
+    pub value: ConfigValue,
+    pub code: ErrorCode,
+    pub error: String,
+}
+
 /// How to start an ACP agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnAcp {
@@ -350,6 +397,9 @@ pub struct SpawnAcp {
     /// A name from the hello's `hosts`. Absent, or the hub's own `host`, means local.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Startup options, applied sequentially in the supplied order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config: Vec<ConfigOption>,
 }
 
 /// Where a viewer's terminal stopped: honoured if `stream` matches and the ring still
@@ -470,6 +520,7 @@ pub struct AcpFacts {
     pub seen_seq: u64,
     pub title: Option<String>,
     pub mode_id: Option<String>,
+    pub config_options: Option<Value>,
 }
 
 /// What is outstanding to the agent.
@@ -564,6 +615,8 @@ pub struct AcpSessionInfo {
     pub auth_methods: Option<Value>,
     /// The session's modes, with the current mode id.
     pub modes: Option<Value>,
+    /// The full current session configuration options, verbatim.
+    pub config_options: Option<Value>,
     /// The last `available_commands_update`.
     pub available_commands: Option<Value>,
     /// The last `plan` update.
@@ -574,6 +627,7 @@ pub struct AcpSessionInfo {
 
 /// `ok` reply fields of `acp.open`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AcpOpenReply {
     /// The session was created by this request.
     pub new: bool,
@@ -585,6 +639,9 @@ pub struct AcpOpenReply {
     pub from: u64,
     /// The replay starts from seq 1 and the client must drop what it holds.
     pub reset: bool,
+    /// Failed startup options, in the order they were attempted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_errors: Vec<ConfigError>,
 }
 
 /// `ok` reply fields of `pty.capture`.

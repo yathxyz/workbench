@@ -10,24 +10,29 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, MapAccess, Visitor};
 use serde_json::{Value, json};
 use tokio::time::timeout;
-use wb_proto::hub::{AcpOpenReply, ErrorCode, HubMessage, HubRequest, Kind, SpawnAcp, Summary};
+use wb_proto::hub::{
+    AcpOpenReply, ConfigOption, ConfigValue, ErrorCode, HubMessage, HubRequest, Kind, SpawnAcp,
+    Summary,
+};
 use wb_proto::journal::{EventBody, JournalEvent};
-use wb_proto::limits::CAPTURE_MAX;
+use wb_proto::limits::{ACP_CONFIG_MAX, CAPTURE_MAX};
 
 use super::{ApiState, Control, Read};
 use crate::AppState;
 use crate::http::{ApiError, ApiQuery, Body, Param};
-use crate::hub::{CallError, ConnectError, HubConn, HubInfo, HubStatus, REPLY_TIMEOUT};
+use crate::hub::{
+    CallError, ConnectError, HubConn, HubInfo, HubStatus, REPLY_TIMEOUT, acp_open_timeout,
+};
 use crate::info::hub_up;
 use crate::util::valid_sid;
 
 /// The rid of the one request a connection carries.
 const RID: u64 = 1;
-/// How long `mode` waits: the hub waits for the agent first.
-const MODE_TIMEOUT: Duration = Duration::from_secs(40);
+/// Mode and config changes wait for the hub's 30 s agent deadline.
+const CONFIG_TIMEOUT: Duration = Duration::from_secs(40);
 /// Lines a capture returns when the request does not say.
 const CAPTURE_DEFAULT: usize = 200;
 
@@ -43,6 +48,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/sessions/{sid}/permission", post(permission))
         .route("/sessions/{sid}/elicitation", post(elicitation))
         .route("/sessions/{sid}/mode", post(mode))
+        .route("/sessions/{sid}/config", post(config))
         .route("/sessions/{sid}/revive", post(revive))
 }
 
@@ -283,6 +289,39 @@ struct Create {
     cwd: String,
     host: Option<String>,
     sid: Option<String>,
+    #[serde(default)]
+    config: StartConfig,
+}
+
+/// JSON member order matters: changing a model may change the remaining options.
+#[derive(Default)]
+struct StartConfig(Vec<ConfigOption>);
+
+impl<'de> Deserialize<'de> for StartConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Ordered;
+        impl<'de> Visitor<'de> for Ordered {
+            type Value = StartConfig;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an object of config option ids to values")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<StartConfig, M::Error> {
+                let mut options = Vec::new();
+                while let Some((id, value)) = map.next_entry::<String, ConfigValue>()? {
+                    if options.len() == ACP_CONFIG_MAX
+                        || options.iter().any(|option: &ConfigOption| option.id == id)
+                    {
+                        return Err(serde::de::Error::custom("at most 16 distinct config ids"));
+                    }
+                    options.push(ConfigOption { id, value });
+                }
+                Ok(StartConfig(options))
+            }
+        }
+        deserializer.deserialize_map(Ordered)
+    }
 }
 
 /// `api_` and 16 random hex digits.
@@ -323,8 +362,16 @@ async fn create(
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "cannot make a sid")
         })?,
     };
+    let config = body.config.0;
+    let wait = acp_open_timeout(config.len());
     let open = async {
         let (mut conn, info) = connect(&api.app).await?;
+        if !config.is_empty() && !info.acp_config {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "hub does not support session configuration",
+            ));
+        }
         let req = HubRequest::AcpOpen {
             rid: RID,
             sid: sid.clone(),
@@ -334,11 +381,13 @@ async fn create(
                 agent: body.agent,
                 cwd: body.cwd,
                 host: spawn_host(&info, body.host)?,
+                config,
             }),
         };
-        conn.request(&req, RID).await.map_err(call_error)
+        let reply = conn.request(&req, RID).await.map_err(call_error)?;
+        Ok::<_, ApiError>(reply)
     };
-    let reply = timeout(REPLY_TIMEOUT, open)
+    let reply = timeout(wait, open)
         .await
         .unwrap_or_else(|_| Err(silent()))?;
     let reply: AcpOpenReply =
@@ -346,7 +395,11 @@ async fn create(
     if !reply.new {
         return Err(ApiError::new(StatusCode::CONFLICT, "session exists"));
     }
-    let created = json!({"sid": sid, "session": api.app.session_summary(&reply.summary)});
+    let created = json!({
+        "sid": sid,
+        "session": api.app.session_summary(&reply.summary),
+        "configErrors": reply.config_errors,
+    });
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -468,7 +521,33 @@ async fn mode(
         sid,
         mode_id: body.mode_id,
     };
-    act(&api.app, req, MODE_TIMEOUT).await
+    act(&api.app, req, CONFIG_TIMEOUT).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    id: String,
+    value: ConfigValue,
+}
+
+async fn config(
+    _: Control,
+    State(api): State<ApiState>,
+    Param(id): Param<String>,
+    Body(body): Body,
+) -> Result<Json<Value>, ApiError> {
+    let sid = sid_of(id)?;
+    let body: Config = parse(&body)?;
+    let epoch = summary(&api.app, &sid)?.created_at;
+    let req = HubRequest::AcpSetConfigOption {
+        rid: RID,
+        sid,
+        epoch,
+        config_id: body.id,
+        value: body.value.into(),
+    };
+    act(&api.app, req, CONFIG_TIMEOUT).await
 }
 
 async fn revive(
@@ -563,6 +642,7 @@ mod tests {
             started_at: 0,
             host: "hubhost".into(),
             agents: Vec::new(),
+            acp_config: true,
             hosts: hosts
                 .iter()
                 .map(|name| Host {

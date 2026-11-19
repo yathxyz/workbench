@@ -105,6 +105,9 @@ pub enum EventBody {
     /// `session/set_mode` succeeded.
     #[serde(rename = "mode")]
     Mode { mode_id: String },
+    /// `session/set_config_option` succeeded; the full agent-provided list.
+    #[serde(rename = "config")]
+    Config { config_options: Value },
     /// A note from the hub, such as the revive method or the agent's last stderr line.
     #[serde(rename = "notice")]
     Notice { level: NoticeLevel, text: String },

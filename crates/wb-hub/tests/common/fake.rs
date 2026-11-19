@@ -22,7 +22,8 @@ pub fn initialize_params() -> Value {
         "protocolVersion": 1,
         "clientInfo": {"name": "workbench", "version": "0.1.0"},
         "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false},
-                               "terminal": false, "elicitation": {"form": {}, "url": {}}},
+                               "terminal": false, "elicitation": {"form": {}, "url": {}},
+                               "session": {"configOptions": {"boolean": {}}}},
     })
 }
 

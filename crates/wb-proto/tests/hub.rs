@@ -59,7 +59,7 @@ fn summary_acp() -> Value {
             "last": {"seq": 790, "ts": 1791460100000u64, "outcome": "end_turn", "error": null},
             "headSeq": 815, "seenSeq": 790,
             "title": "Fix flaky test",
-            "modeId": "default"
+            "modeId": "default", "configOptions": []
         }
     })
 }
@@ -80,7 +80,7 @@ fn summary_acp_fresh_faulted() -> Value {
                      "error": {"code": "agent_exited", "message": "agent exited"}},
             "headSeq": 5, "seenSeq": 0,
             "title": null,
-            "modeId": null
+            "modeId": null, "configOptions": null
         }
     })
 }
@@ -92,7 +92,8 @@ fn server_hello() {
         "build": "0123abcd", "host": "example", "pid": 1234, "startedAt": 1791460000000u64,
         "agents": [{"name": "claude", "label": "Claude"}, {"name": "codex", "label": "Codex"}],
         "shells": ["bash", "nu", "zsh"], "defaultShell": "bash",
-        "hosts": [{"name": "laptop", "agents": [{"name": "pi", "label": "pi"}]}]
+        "hosts": [{"name": "laptop", "agents": [{"name": "pi", "label": "pi"}]}],
+        "acpConfig": true
     }));
     let HubMessage::Hello {
         proto,
@@ -102,6 +103,7 @@ fn server_hello() {
         shells,
         default_shell,
         hosts,
+        acp_config,
         ..
     } = msg
     else {
@@ -113,6 +115,7 @@ fn server_hello() {
     assert_eq!(agents[1].label, "Codex");
     assert_eq!(shells, ["bash", "nu", "zsh"]);
     assert_eq!(default_shell, "bash");
+    assert!(acp_config);
     assert_eq!(
         hosts,
         [Host {
@@ -130,7 +133,7 @@ fn server_hello_without_build() {
     let msg: HubMessage = round_trip(json!({
         "t": "hello", "proto": 1, "server": "wb-hub", "version": "0.1.0",
         "host": "example", "pid": 1234, "startedAt": 1791460000000u64, "agents": [],
-        "shells": [], "defaultShell": "bash", "hosts": []
+        "shells": [], "defaultShell": "bash", "hosts": [], "acpConfig": true
     }));
     assert!(matches!(msg, HubMessage::Hello { build: None, .. }));
 }
@@ -146,6 +149,7 @@ fn server_hello_from_an_older_hub_without_shells_or_hosts() {
         shells,
         default_shell,
         hosts,
+        acp_config,
         ..
     } = &msg
     else {
@@ -154,6 +158,7 @@ fn server_hello_from_an_older_hub_without_shells_or_hosts() {
     assert!(shells.is_empty());
     assert_eq!(default_shell, "");
     assert!(hosts.is_empty());
+    assert!(!acp_config);
     // A newer hub always sends these fields.
     let back: Value = serde_json::from_slice(&line::encode(&msg)).unwrap();
     assert_eq!(back["shells"], json!([]));
@@ -693,6 +698,8 @@ fn session_info_full() -> Value {
         "modes": {"currentModeId": "default",
                   "availableModes": [{"id": "default", "name": "Default"},
                                      {"id": "plan", "name": "Plan", "description": "Read only"}]},
+        "configOptions": [{"id": "model", "name": "Model", "type": "select", "currentValue": "small",
+                           "options": [{"value": "small", "name": "Small"}]}],
         "availableCommands": [{"name": "review", "description": "Review the diff", "input": null}],
         "plan": {"entries": [{"content": "Fix it", "priority": "high", "status": "in_progress"}]},
         "usage": {"used": 1200, "size": 200000, "cost": null}
@@ -702,7 +709,7 @@ fn session_info_full() -> Value {
 fn session_info_empty() -> Value {
     json!({
         "protocolVersion": null, "agentInfo": null, "agentCapabilities": null,
-        "promptCapabilities": null, "authMethods": null, "modes": null,
+        "promptCapabilities": null, "authMethods": null, "modes": null, "configOptions": null,
         "availableCommands": null, "plan": null, "usage": null
     })
 }
@@ -728,8 +735,116 @@ fn acp_session_info() {
         info,
         AcpSessionInfo {
             protocol_version: Some(1),
+            config_options: Some(json!([])),
             ..AcpSessionInfo::default()
         }
+    );
+}
+
+#[test]
+fn config_values_are_typed() {
+    for (wire, expected) in [
+        (json!("small"), ConfigValue::String("small".into())),
+        (json!("true"), ConfigValue::String("true".into())),
+        (json!(""), ConfigValue::String(String::new())),
+        (json!(true), ConfigValue::Boolean(true)),
+        (json!(false), ConfigValue::Boolean(false)),
+    ] {
+        let value: ConfigValue = round_trip(wire.clone());
+        assert_eq!(value, expected);
+        assert_eq!(Value::from(value), wire);
+    }
+}
+
+#[test]
+fn config_values_reject_other_json_shapes() {
+    for value in [
+        json!(null),
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!([]),
+        json!(["small"]),
+        json!({}),
+        json!({"value": "small"}),
+    ] {
+        assert!(serde_json::from_value::<ConfigValue>(value.clone()).is_err());
+        let option = json!({"id": "model", "value": value});
+        assert!(serde_json::from_value::<ConfigOption>(option.clone()).is_err());
+        assert!(
+            serde_json::from_value::<HubRequest>(json!({
+                "t": "acp.open", "rid": 8, "sid": "n_agent1", "since": 0,
+                "spawn": {"agent": "claude", "cwd": "/home/alice/proj/x", "config": [option]}
+            }))
+            .is_err()
+        );
+        let error = json!({
+            "id": "model", "value": value, "code": "bad_option", "error": "Not offered"
+        });
+        assert!(serde_json::from_value::<ConfigError>(error.clone()).is_err());
+        assert!(
+            serde_json::from_value::<AcpOpenReply>(json!({
+                "new": true, "summary": summary_acp(), "session": session_info_empty(),
+                "head": 1, "from": 1, "reset": true, "configErrors": [error]
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn acp_spawn_config_defaults_and_omits_empty() {
+    let wire = json!({"agent": "claude", "cwd": "/home/alice/proj/x"});
+    let absent: SpawnAcp = round_trip(wire.clone());
+    assert!(absent.config.is_empty());
+    let empty: SpawnAcp = serde_json::from_value(json!({
+        "agent": "claude", "cwd": "/home/alice/proj/x", "config": []
+    }))
+    .unwrap();
+    assert_eq!(empty, absent);
+    assert_eq!(serde_json::to_value(empty).unwrap(), wire);
+}
+
+#[test]
+fn acp_spawn_config_preserves_order_and_duplicates() {
+    let req: HubRequest = round_trip(json!({
+        "t": "acp.open", "rid": 8, "sid": "n_agent1", "since": 0,
+        "spawn": {
+            "agent": "claude", "cwd": "/home/alice/proj/x",
+            "config": [
+                {"id": "model", "value": "small"},
+                {"id": "thinking", "value": true},
+                {"id": "model", "value": "large"},
+                {"id": "thinking", "value": false}
+            ]
+        }
+    }));
+    let HubRequest::AcpOpen {
+        spawn: Some(spawn), ..
+    } = req
+    else {
+        panic!("{req:?}")
+    };
+    assert_eq!(
+        spawn.config,
+        vec![
+            ConfigOption {
+                id: "model".into(),
+                value: ConfigValue::String("small".into()),
+            },
+            ConfigOption {
+                id: "thinking".into(),
+                value: ConfigValue::Boolean(true),
+            },
+            ConfigOption {
+                id: "model".into(),
+                value: ConfigValue::String("large".into()),
+            },
+            ConfigOption {
+                id: "thinking".into(),
+                value: ConfigValue::Boolean(false),
+            },
+        ]
     );
 }
 
@@ -749,7 +864,8 @@ fn acp_open_requests() {
             spawn: Some(SpawnAcp {
                 agent: "claude".into(),
                 cwd: "/home/alice/proj/x".into(),
-                host: None
+                host: None,
+                config: Vec::new(),
             })
         }
     );
@@ -802,6 +918,7 @@ fn acp_open_replies() {
         head: 815,
         from: 120,
         reset: false,
+        config_errors: Vec::new(),
     };
     let json = json!({
         "t": "ok", "rid": 9, "new": false, "summary": summary_acp(),
@@ -824,6 +941,66 @@ fn acp_open_replies() {
     }));
     assert!(fresh.new && fresh.reset);
     assert_eq!(fresh.session, AcpSessionInfo::default());
+    assert!(fresh.config_errors.is_empty());
+}
+
+#[test]
+fn acp_open_config_errors_default_and_omit_empty() {
+    let wire = json!({
+        "new": true, "summary": summary_acp(), "session": session_info_empty(),
+        "head": 1, "from": 1, "reset": true
+    });
+    let absent: AcpOpenReply = round_trip(wire.clone());
+    assert!(absent.config_errors.is_empty());
+    let mut with_empty = wire.clone();
+    with_empty["configErrors"] = json!([]);
+    let empty: AcpOpenReply = serde_json::from_value(with_empty).unwrap();
+    assert_eq!(empty, absent);
+    assert_eq!(serde_json::to_value(empty).unwrap(), wire);
+}
+
+#[test]
+fn acp_open_config_errors_preserve_order_and_duplicates() {
+    let wire = json!({
+        "new": true, "summary": summary_acp(), "session": session_info_empty(),
+        "head": 1, "from": 1, "reset": true,
+        "configErrors": [
+            {"id": "model", "value": "missing", "code": "bad_option", "error": "Not offered"},
+            {"id": "thinking", "value": true, "code": "agent_error", "error": "Rejected"},
+            {"id": "model", "value": "large", "code": "timeout", "error": "No response"}
+        ]
+    });
+    let reply: AcpOpenReply = round_trip(wire.clone());
+    assert_eq!(
+        reply.config_errors,
+        vec![
+            ConfigError {
+                id: "model".into(),
+                value: ConfigValue::String("missing".into()),
+                code: ErrorCode::BadOption,
+                error: "Not offered".into(),
+            },
+            ConfigError {
+                id: "thinking".into(),
+                value: ConfigValue::Boolean(true),
+                code: ErrorCode::AgentError,
+                error: "Rejected".into(),
+            },
+            ConfigError {
+                id: "model".into(),
+                value: ConfigValue::String("large".into()),
+                code: ErrorCode::Timeout,
+                error: "No response".into(),
+            },
+        ]
+    );
+    let mut expected = wire;
+    expected["t"] = json!("ok");
+    expected["rid"] = json!(8);
+    assert_eq!(
+        serde_json::to_value(HubMessage::ok(8, &reply)).unwrap(),
+        expected
+    );
 }
 
 #[test]
@@ -901,6 +1078,17 @@ fn acp_requests() {
             },
         ),
         (
+            json!({"t": "acp.set_config_option", "rid": 22, "sid": "n_agent1",
+                   "epoch": 42, "configId": "thinking", "value": true}),
+            HubRequest::AcpSetConfigOption {
+                rid: 22,
+                sid: sid(),
+                epoch: 42,
+                config_id: "thinking".into(),
+                value: json!(true),
+            },
+        ),
+        (
             json!({"t": "acp.seen", "rid": 18, "sid": "n_agent1", "seq": 815}),
             HubRequest::AcpSeen {
                 rid: 18,
@@ -954,6 +1142,9 @@ fn acp_requests_need_their_fields() {
         r#"{"t":"acp.permission","rid":1,"sid":"n_1","req":2,"outcome":{"outcome":"cancelled"}}"#,
         r#"{"t":"acp.elicitation","rid":1,"sid":"n_1","epoch":3,"response":{"action":"cancel"}}"#,
         r#"{"t":"acp.set_mode","rid":1,"sid":"n_1"}"#,
+        r#"{"t":"acp.set_config_option","rid":1,"sid":"n_1","configId":"model","value":"small"}"#,
+        r#"{"t":"acp.set_config_option","rid":1,"sid":"n_1","epoch":3,"value":"small"}"#,
+        r#"{"t":"acp.set_config_option","rid":1,"sid":"n_1","epoch":3,"configId":"model"}"#,
         r#"{"t":"acp.seen","rid":1,"sid":"n_1"}"#,
         r#"{"t":"acp.kill","rid":1,"sid":"n_1"}"#,
     ] {

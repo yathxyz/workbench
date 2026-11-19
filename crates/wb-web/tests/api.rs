@@ -139,6 +139,7 @@ fn rid_of(r: &HubRequest) -> u64 {
         | HubRequest::AcpPermission { rid, .. }
         | HubRequest::AcpElicitation { rid, .. }
         | HubRequest::AcpSetMode { rid, .. }
+        | HubRequest::AcpSetConfigOption { rid, .. }
         | HubRequest::AcpRevive { rid, .. }
         | HubRequest::AcpKill { rid, .. }
         | HubRequest::PtyKill { rid, .. } => *rid,
@@ -170,6 +171,7 @@ fn summary(sid: &str, host: &str) -> Summary {
             seen_seq: 0,
             title: None,
             mode_id: Some("default".into()),
+            config_options: None,
         }),
     }
 }
@@ -182,6 +184,7 @@ fn open_reply(sid: &str, host: &str, new: bool) -> AcpOpenReply {
         head: 3,
         from: 1,
         reset: false,
+        config_errors: Vec::new(),
     }
 }
 
@@ -249,6 +252,13 @@ async fn scopes_paths_and_methods_are_checked_after_the_token() {
         (
             "POST",
             "/v1/sessions/a/prompt",
+            READER,
+            403,
+            json!("forbidden"),
+        ),
+        (
+            "POST",
+            "/v1/sessions/a/config",
             READER,
             403,
             json!("forbidden"),
@@ -473,6 +483,7 @@ async fn a_post_starts_an_agent() {
             agent: "claude".into(),
             cwd: "/home/alice/src".into(),
             host: None,
+            config: Vec::new(),
         })
     );
     assert_eq!(res.status, 201);
@@ -542,6 +553,10 @@ async fn a_post_starts_an_agent() {
             "bad body",
         ),
         (json!([]), "bad body"),
+        (
+            json!({"agent": "claude", "cwd": "/x", "config": []}),
+            "bad body",
+        ),
     ];
     for (body, error) in bad {
         let res = post(body.clone()).send().await;
@@ -563,6 +578,57 @@ async fn a_post_starts_an_agent() {
             .all(|(_, r)| matches!(r, HubRequest::Hello { .. })),
         "a refused request reached the hub"
     );
+}
+
+#[tokio::test]
+async fn startup_configuration_requires_the_hubs_advertised_support() {
+    let api = Api::start_with(Hello {
+        acp_config: None,
+        ..Hello::default()
+    })
+    .await;
+    let before = api.hub.requests().len();
+    let res = api
+        .req("POST", "/v1/sessions", OWNER)
+        .body(
+            json!({"agent": "claude", "cwd": "/x", "sid": "old",
+                     "config": {"model": "large"}})
+            .to_string(),
+        )
+        .send()
+        .await;
+    assert_eq!(
+        (res.status, res.json()),
+        (
+            400,
+            json!({
+                "error": "hub does not support session configuration"
+            })
+        )
+    );
+    assert!(
+        api.hub
+            .requests()
+            .into_iter()
+            .skip(before)
+            .all(|(_, r)| matches!(r, HubRequest::Hello { .. }))
+    );
+
+    for config in [None, Some(json!({}))] {
+        let mut body = json!({"agent": "claude", "cwd": "/x", "sid": "old"});
+        if let Some(config) = config {
+            body["config"] = config;
+        }
+        let (_, res) = api
+            .answered(
+                api.req("POST", "/v1/sessions", OWNER)
+                    .body(body.to_string()),
+                |rid| HubMessage::ok(rid, &open_reply("old", "testhost", true)),
+            )
+            .await;
+        assert_eq!(res.status, 201);
+        assert_eq!(res.json()["configErrors"], json!([]));
+    }
 }
 
 #[tokio::test]
@@ -748,6 +814,11 @@ async fn actions_are_the_hubs_requests() {
         ),
         ("/v1/sessions/a1/elicitation", json!({"req": 8, "epoch": 1})),
         ("/v1/sessions/a1/mode", json!({"mode_id": "plan"})),
+        ("/v1/sessions/a1/config", json!({"value": "other"})),
+        (
+            "/v1/sessions/a1/config",
+            json!({"id": "model", "value": "other", "extra": 1}),
+        ),
         ("/v1/sessions/a%2Fb/cancel", json!({})),
     ];
     for (path, body) in bad {
@@ -774,6 +845,117 @@ async fn actions_are_the_hubs_requests() {
             .all(|(_, r)| matches!(r, HubRequest::Hello { .. })),
         "a refused request reached the hub"
     );
+}
+
+#[tokio::test]
+async fn start_config_refuses_duplicate_ids_and_more_than_sixteen_members() {
+    let api = Api::start().await;
+    let before = api.hub.requests().len();
+    let too_many = (0..17)
+        .map(|i| format!(r#""option{i}":"value""#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let bad_configs = [
+        format!("{{{too_many}}}"),
+        r#"{"model":"small","model":"large"}"#.into(),
+        r#"{"model":"small","effort":"low","model":"large"}"#.into(),
+        "null".into(),
+        "[]".into(),
+    ];
+    for config in bad_configs {
+        let res = api
+            .req("POST", "/v1/sessions", OWNER)
+            .body(format!(
+                r#"{{"agent":"claude","cwd":"/x","sid":"mine","config":{config}}}"#
+            ))
+            .send()
+            .await;
+        assert_eq!((res.status, res.json()), (400, json!({"error":"bad body"})));
+    }
+    assert!(
+        api.hub
+            .requests()
+            .into_iter()
+            .skip(before)
+            .all(|(_, request)| matches!(request, HubRequest::Hello { .. })),
+        "an invalid config reached the hub"
+    );
+
+    let sixteen = (0..16)
+        .map(|i| format!(r#""option{i}":true"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let req = api.req("POST", "/v1/sessions", OWNER).body(format!(
+        r#"{{"agent":"claude","cwd":"/x","sid":"mine","config":{{{sixteen}}}}}"#
+    ));
+    let (_, res) = api
+        .answered(req, |rid| {
+            HubMessage::ok(rid, &open_reply("mine", "testhost", true))
+        })
+        .await;
+    assert_eq!(res.status, 201);
+}
+
+#[tokio::test]
+async fn config_values_must_be_strings_or_booleans_before_reaching_the_hub() {
+    let api = Api::start().await;
+    let before = api.hub.requests().len();
+    for value in ["123", "1.5", "null", "[]", r#"{"nested":"value"}"#] {
+        for (path, body) in [
+            (
+                "/v1/sessions",
+                format!(
+                    r#"{{"agent":"claude","cwd":"/x","sid":"mine","config":{{"model":{value}}}}}"#
+                ),
+            ),
+            (
+                "/v1/sessions/a1/config",
+                format!(r#"{{"id":"model","value":{value}}}"#),
+            ),
+        ] {
+            let res = api.req("POST", path, OWNER).body(body).send().await;
+            assert_eq!((res.status, res.json()), (400, json!({"error":"bad body"})));
+        }
+    }
+    assert!(
+        api.hub
+            .requests()
+            .into_iter()
+            .skip(before)
+            .all(|(_, request)| matches!(request, HubRequest::Hello { .. })),
+        "an invalid value reached the hub"
+    );
+}
+
+#[tokio::test]
+async fn live_config_preserves_agent_errors_and_exposes_current_options() {
+    let hub = FakeHub::start();
+    let mut current = summary("a1", "testhost");
+    current.acp.as_mut().unwrap().config_options = Some(json!([
+        {"id":"model","currentValue":"default"}
+    ]));
+    hub.set_sessions(vec![current]);
+    let api = Api::without_hub(hub).await;
+    api.web.wait_hub("up").await;
+    assert_eq!(
+        api.get("/v1/sessions/a1").await.json()["acp"]["configOptions"],
+        json!([
+            {"id":"model","currentValue":"default"}
+        ])
+    );
+    for (code, status) in [
+        (ErrorCode::BadOption, 400),
+        (ErrorCode::AgentError, 502),
+        (ErrorCode::Stale, 409),
+        (ErrorCode::Timeout, 504),
+    ] {
+        let req = api
+            .req("POST", "/v1/sessions/a1/config", OWNER)
+            .body(json!({"id":"model","value":"other"}).to_string());
+        let (_, res) = api.answered(req, refusal(code, "refused")).await;
+        assert_eq!(res.status, status);
+        assert_eq!(res.json(), json!({"error":"refused","code":code}));
+    }
 }
 
 #[tokio::test]
