@@ -190,8 +190,10 @@ function dirtyCam() { clearTimeout(camT); camT = setTimeout(() => DAEMON ? store
 const VIEW_KEYS = ['ws', 'focusTabs', 'persp', 'manual'];
 const viewKey = () => 'wb-view-' + (INFO?.host || location.host);
 function viewLoad(): Partial<BoardViewState> | null { try { const v: unknown = JSON.parse(store.get(viewKey())!); if (v && typeof v === 'object') return v as Partial<BoardViewState>; } catch {} return null; }
+let viewSaveDeferred = false;
 function viewSave() {
   if (!S || !BOOTED) return;
+  if (ADOPTING) { viewSaveDeferred = true; return; }
   store.set(viewKey(), JSON.stringify({ ws: S.ws || null, focusTabs: S.focusTabs || [], persp: perspCur(), desk: DESK.cur, prevDesk: DESK.prev, scratch: DESK.scratch, deskCams: DESK.cams, ring: RING.list, overlay: OVL.ids }));
   winSave();
 }
@@ -345,6 +347,7 @@ function boardAdopt(b: Board): void {
     SAVE.lastJson = serialize();
     if (edStale) { const e = edStale; setTimeout(() => { if (ED.node === e && ED.pre && VIEW === 'editor') frEdLoad(e); }); }   // the read-only Editor shows the newer text
   } finally { ADOPTING = false; }
+  if (viewSaveDeferred) { viewSaveDeferred = false; viewSave(); }
   hashRestore('board');
 }
 function unmountQuiet(id: string): void {   // the card went in another tab: drop it here without killing its session

@@ -75,14 +75,25 @@ await section('N56', async () => {
     disk = boardFile()!;
     B = await devB();
     const b1 = await B.evaluate((m: DeskMarks) => { const C = window.__canvas; const d = C.deskAt(2); return { pinned: C.deskPinned(d), cur: C.DESK.cur, has: !!d && m.a in d.members }; }, m);
-    await B.evaluate(() => window.__canvas.deskGo(2, true));
+    const deskMessages = await B.evaluateHandle(() => {
+      const C = window.__canvas, seen: number[] = [], ch = new BroadcastChannel(C.WIN.ch.name);
+      ch.onmessage = e => { if (e.data.win === C.WIN.id && e.data.t === 'desk') seen.push(e.data.desk); };
+      C.deskGo(2, true); return seen;
+    });
+    await B.evaluate(id => { const C = window.__canvas; C.focusOpen(C.S.nodes[id]); }, made.n);
     await sleep(700); await settled(B);
+    await D.evaluate(id => window.__canvas.removeNode(id), made.n);
     const mv = await D.evaluate((m: DeskMarks) => { const C = window.__canvas, S = C.S; C.deskGo(0, true); const n = S.nodes[m.other!] || Object.values<BoardNode>(S.nodes).find(n => n.kind !== 'frame' && !n.in && !(n.id in C.deskAt(2).members)); C.moveTree(n, 90, 0); C.dirty(); return { id: n.id, x: n.x }; }, m);
     await settled(D);
     const took = await until(() => B!.evaluate((mv: { id: string; x: number }) => { const C = window.__canvas; return C.DESK.cur === 2 && JSON.parse(C.serialize()).nodes[mv.id]?.x === mv.x; }, mv), 6000);
     const b2 = await B.evaluate((m: DeskMarks) => { const C = window.__canvas, a = C.S.nodes[m.a]; return { cur: C.DESK.cur, a: [a.x, a.y], hidden: C.stashed(C.S.nodes[m.ain!]) }; }, m), bar = await barOf(B);
     check('N56: a pinned desk is in the board file and on the other device; a device on a desk takes another device\'s move and stays on its desk',
       (disk.desks || []).some((d: Desk) => d.slot === 2 && m.a in d.members) && b1.pinned && b1.has && b1.cur === 0 && !!took && b2.cur === 2 && b2.a[0] === on.a[0] && b2.hidden && bar.hidden, JSON.stringify({ b1, b2, took, bar, desks: disk.desks?.length }));
+    const stored = await B.evaluate(() => { const C = window.__canvas; return { device: JSON.parse(localStorage.getItem(C.viewKey())!), win: JSON.parse(sessionStorage.getItem('wb-desk-' + C.INFO.host)!) }; });
+    const desks = await deskMessages.jsonValue();
+    check('N56: removing the focused desk card remotely persists the pruned tabs and only advertises the named desk',
+      took && stored.device.desk === 2 && stored.win.desk === 2 && !stored.device.focusTabs.includes(made.n) && desks.join() === '2',
+      JSON.stringify({ stored, desks }));
     await D.evaluate((made: { k: string; n: string }) => { const C = window.__canvas; C.deskGo(2, true); C.deskDelete(); for (const id of [made.k, made.n]) if (C.S.nodes[id]) C.removeNode(id); }, made);
     await settled(D);
   } finally { await B?.close(); await D?.close(); await ctx2.close(); }
