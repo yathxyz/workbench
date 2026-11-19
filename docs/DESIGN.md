@@ -1597,6 +1597,7 @@ Phone actions invoke the same commands without a keyboard.
 With owner-supplied Edwin folds, thoughts and tool details start collapsed; transcript-local `za`/Tab toggle at point, `zc` closes, `zo`/`zO` open, and `zM`/`zR` close or open all.
 A tool jump opens its enclosing turn and lands on the tool header; fold-all and unfold-all apply to all items received so far, including those still queued for paint.
 Fold choices survive appends, reset replay and reattaching to the same journal incarnation, but a different prompt at a reused sequence does not inherit a choice (F-A53).
+A replay starting inside a thought resets that thought's fold because its first journal record is missing.
 In the Agents list, `g` toggles grouping of root rows between repository (default) and task, keeping descendants with their parent and roots without a task in one last group in task mode (F-A51).
 In task groups, each root row shows its repository, and a nested row shows its repository when it differs from its parent's.
 Like the Details disclosure, grouping is local to this page and resets on reload.

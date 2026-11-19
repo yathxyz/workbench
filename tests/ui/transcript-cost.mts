@@ -1,4 +1,4 @@
-// N81 cost probes: bash tests/run-front-bench.sh ui/transcript-cost.mts [--folds-only | --large-only]
+// N81 cost probes: bash tests/run-front-bench.sh ui/transcript-cost.mts [--folds-only | --large-only | --bulk-only]
 // The timed inputs enter the real reader socket; no fixture journal or benchmark traffic goes to the hub.
 import fs from 'node:fs';
 import os from 'node:os';
@@ -33,10 +33,21 @@ async function foldCosts(page: Page) {
       return closed;
     }
     return {
-      async grow(toPairs: number) {
+      async grow(toPairs: number, turns = true) {
         // Prompt/tool pairs really have half their sections closed. No invented ranges or preferences.
-        for (; i < toPairs;) { prompt(); tool('short'); if (!(i % 128)) await raf(); }
+        for (; i < toPairs;) { if (turns) prompt(); tool('short'); if (!(i % 128)) await raf(); }
         await drain(); r.frame.setPoint(0); await raf();
+      },
+      bulkUnfold() {
+        const samples: number[] = [];
+        for (let n = 0; n < 26; n++) {
+          r.navigate('fold-all', true);
+          if (folds().length !== 6400) throw Error('Bulk fixture needs 6,400 closed tools');
+          const start = performance.now(); r.navigate('fold-all', false); const elapsed = performance.now() - start;
+          if (folds().length) throw Error('Unfold all left a tool closed');
+          if (n >= 5) samples.push(elapsed);
+        }
+        return samples;
       },
       async costs(sections: number) {
         const closed = counts(sections), pub = r.publishFolds, publish: number[] = [], read: number[] = [];
@@ -104,6 +115,10 @@ async function foldCosts(page: Page) {
     };
   });
   try {
+    if (process.argv.includes('--bulk-only')) {
+      await fixture.evaluate(f => f.grow(6400, false));
+      return { unfold6400Ms: stats(await fixture.evaluate(f => f.bulkUnfold())) };
+    }
     const measure = async (n: number) => {
       const { sections, closed, publish, read } = await fixture.evaluate((f, n) => f.costs(n), n);
       return { sections, closed, publishMs: stats(publish), readMs: stats(read) };
@@ -239,6 +254,6 @@ if (import.meta.main) {
     await page.evaluate(id => window.__canvas.meshOpen(id), sid);
     await page.waitForFunction(() => window.__canvas.live.$agents?.backend.replayed && window.__canvas.live.$agents.backend.transcript);
     if (!process.argv.includes('--large-only')) console.log(JSON.stringify({ chromium: browser.version(), folds: await foldCosts(page) }));
-    if (!process.argv.includes('--folds-only')) console.log(JSON.stringify({ chromium: browser.version(), body: await largeReplacement(page, true) }));
+    if (!process.argv.includes('--folds-only') && !process.argv.includes('--bulk-only')) console.log(JSON.stringify({ chromium: browser.version(), body: await largeReplacement(page, true) }));
   }, ['--api']);
 }

@@ -437,7 +437,11 @@ const RPC_EVENTS: RpcEventHandlers = {
   sessions: m => {
     const was: Record<string, SessionState> = {}; for (const k in SESS) { was[k] = SESS[k].state; delete SESS[k]; }
     (m.sessions || []).forEach(x => sessPut(x, was[x.sid]));
-    for (const sid of ACP_FOLD_CHOICES.keys()) if (!SESS[sid]) ACP_FOLD_CHOICES.delete(sid);
+    for (const sid of ACP_FOLD_CHOICES.keys()) if (!SESS[sid]) {
+      ACP_FOLD_CHOICES.delete(sid);
+      const b = live.$agents?.backend;
+      if (b instanceof AcpBackend && b.n.id === sid) b.transcript?.forgetChoices();
+    }
     statusRender();
   },
   session: m => sessPut(m.session),
@@ -914,7 +918,8 @@ class PtyBackend implements CardBackend, Wakeable {
 // textContent (el()), never innerHTML. URLs stay text; only an https: one opens, and only on an explicit click (F-A19).
 /* Items keep the sequence of their first journal event, including across updates to their text. */
 interface AcpItemBase { seq: number; el?: HTMLElement }
-interface AcpFirstChunk { through: number; ts: number; text: string }
+interface AcpChunkStamp { through: number; ts: number; text: string }
+interface AcpFirstChunk extends AcpChunkStamp { sessionId?: string; joined?: AcpChunkStamp }
 interface AcpChunkItem extends AcpItemBase { k: 'user' | 'asst' | 'thought'; text: string; mid?: string | null; closed?: boolean; journalKey?: string; first?: AcpFirstChunk }
 interface AcpNoteItem extends AcpItemBase { k: 'note'; text: string; cls?: string; host?: string; request?: 'Permission' | 'Elicitation' }
 interface AcpSepItem extends AcpItemBase { k: 'sep' }
@@ -972,9 +977,11 @@ function acpItemKey(item: AcpItem) {
 }
 // Preserve the wire content, not the projection (which renders every image as "[image]").
 // For text, keep metadata before the text so that two differently coalesced runs can be compared.
+function acpTextBlock(block: JsonValue): block is JsonObject & { type: 'text'; text: string } {
+  return !!block && typeof block === 'object' && !Array.isArray(block) && block.type === 'text' && typeof block.text === 'string';
+}
 function acpJournalBlock(block: JsonValue): string {
-  if (!block || typeof block !== 'object' || Array.isArray(block) || block.type !== 'text' || typeof block.text !== 'string')
-    return 'j' + JSON.stringify(block);
+  if (!acpTextBlock(block)) return 'j' + JSON.stringify(block);
   if (Object.keys(block).length === 2) return 't' + block.text;
   const { text, ...metadata } = block;
   return 'm' + JSON.stringify(metadata) + '\n' + text;
@@ -983,10 +990,10 @@ function acpSameChoice(choice: true | AcpFirstChunk | undefined, item: AcpItem) 
   if (choice === true) return true;
   if (!choice || item.k !== 'thought' || !item.first) return false;
   const now = item.first;
-  // A live first chunk and its coalesced replay cover the same start, but the latter ends at
-  // a later journal event. Equal coverage must match exactly, not merely share some text.
-  return choice.through === now.through ? choice.ts === now.ts && choice.text === now.text
-    : choice.through < now.through ? now.text.startsWith(choice.text) : choice.text.startsWith(now.text);
+  // A coalesced event exposes only its terminal timestamp. Match its entire covered
+  // payload and timestamp against a run we actually received, never just a common prefix.
+  const known = choice.through === now.through ? choice : choice.joined;
+  return choice.sessionId === now.sessionId && !!known && known.through === now.through && known.ts === now.ts && known.text === now.text;
 }
 const ACP_PAINT_BATCH = 128, ACP_PAINT_CHARS = 64 * 1024, ACP_PAINT_MS = 5;
 function acpReaderField(text: string): string {
@@ -1072,6 +1079,15 @@ class AcpTranscript {
     // point (and therefore Edwin's viewport) through all the new rows.
     return this.scrollPaused ? Math.min(pt, Math.max(0, this.buf.rope.length - 2)) : pt;
   }
+  afterCommand(cmd: unknown, failed: boolean) {
+    // A short scroll can leave G targeting the very same point. Counted G into history
+    // and unrelated commands at the sentinel are not requests to follow.
+    if (!failed && this.scrollPaused && this.frame.buffer === this.buf && this.buf.rope.length - this.frame.point() <= 1) {
+      const name = FR.L!.cmdName(cmd);
+      if (name === 'evil-goto-line' || name === 'end-of-buffer') this.scrollPaused = false;
+    }
+    this.readFolds();
+  }
   get canFold() { return !!(FR.Ed!.setBufferFolds && FR.Ed!.getBufferFolds); }
   get painting() { return !!(this.remainder || this.replacement); }
   private start(index: number) {
@@ -1107,25 +1123,35 @@ class AcpTranscript {
     return acpSameChoice(this.preferences.get(this.ranges.get(item)?.key ?? acpItemKey(item)), item) ? !closed : closed;
   }
   private choose(item: AcpItem, closed: boolean) {
+    this.storeChoice(item, closed);
+    this.indexChoice(item, closed);
+  }
+  private storeChoice(item: AcpItem, closed: boolean) {
     const key = this.ranges.get(item)?.key ?? acpItemKey(item);
     if (closed === !this.isTurn(item)) {
       if (this.preferences?.delete(key)) this.dropEmptyChoices();
     } else {
       if (!this.preferences) {
         this.preferences = new Map();
-        if (this.epoch !== null && SESS[this.sid]?.createdAt === this.epoch && !ACP_READERS.get(this.buf)?.gone) {
+        const s = SESS[this.sid];
+        if (this.epoch !== null && (!s || s.createdAt === this.epoch) && !ACP_READERS.get(this.buf)?.gone && !TOMBS.has(this.sid + ' ' + this.epoch)) {
           ACP_FOLD_CHOICES.set(this.sid, { epoch: this.epoch, items: this.preferences });
           if (ACP_FOLD_CHOICES.size > ACP_FOLD_LIMIT) ACP_FOLD_CHOICES.delete(ACP_FOLD_CHOICES.keys().next().value!);
         }
       }
       this.preferences.set(key, item.k === 'thought' && item.first || true);
     }
-    this.indexChoice(item, closed);
   }
   private dropEmptyChoices() {
     if (!this.preferences || this.preferences.size) return;
     if (ACP_FOLD_CHOICES.get(this.sid)?.items === this.preferences) ACP_FOLD_CHOICES.delete(this.sid);
     this.preferences = undefined;
+  }
+  forgetChoices() {
+    this.preferences = undefined;
+    this.candidates = this.sections.filter(r => !this.isTurn(r.item));
+    this.foldFrom = 0;
+    this.publishFolds();
   }
   finishReplay() {
     if (!this.preferences?.size) return;
@@ -1199,18 +1225,31 @@ class AcpTranscript {
   }
   navigate(action: AcpNavigationAction, desired?: boolean, nativeOpen?: string) {
     this.place = undefined;
-    const frame = this.frame, pt = frame.point();
+    const frame = this.frame, backend = ACP_READERS.get(this.buf)!;
     if (action === 'follow') { this.scrollPaused = false; frame.setPoint(Math.max(0, this.buf.rope.length - 1)); return; }
+    const tools = action.endsWith('tool');
+    if (action === 'fold' || action === 'fold-all' || tools) {
+      // Before the scheduled first/reset paint, point and preferences can still belong to
+      // the old generation. Use the normal render transition before acting on the new one.
+      if (this.epoch !== backend.epoch || backend.cleared) {
+        backend.render();
+        if (backend.transcript !== this) return;
+      }
+      this.readFolds(); // an unfinished native command may have opened another item
+    }
+    const pt = frame.point();
     if (action === 'fold' || action === 'fold-all') {
       if (!this.canFold) return;
       const r = this.sections[this.bound(this.sections, pt, true) - 1];
       const turn = this.turns[this.bound(this.turns, pt, true) - 1];
       const target = r && pt < this.start(r.index + 1) ? r : turn;
       if (action === 'fold-all') {
-        const items = ACP_READERS.get(this.buf)!.items; // includes journal records queued for a later paint
+        const items = backend.items; // includes journal records queued for a later paint
         const section = (it: AcpItem) => this.isTurn(it) || it.k === 'tool' || it.k === 'thought';
         const fold = desired ?? items.some(it => section(it) && !this.folded(it));
-        for (const it of items) if (section(it)) this.choose(it, fold);
+        for (const it of items) if (section(it)) this.storeChoice(it, fold);
+        this.candidates = fold ? this.sections.slice() : [];
+        this.foldFrom = 0;
         if (fold && (turn || target)) frame.setPoint(this.start((turn || target).index));
       } else if (target) {
         const fold = desired ?? !this.folded(target.item);
@@ -1228,7 +1267,7 @@ class AcpTranscript {
       }
       this.publishFolds(); return;
     }
-    const tools = action.endsWith('tool'), rows = tools ? this.tools : this.turns;
+    const rows = tools ? this.tools : this.turns;
     const next = action.startsWith('next'), r = rows[this.bound(rows, pt, next) - (next ? 0 : 1)];
     if (!r) return;
     const pos = this.start(r.index);
@@ -1808,7 +1847,7 @@ class AcpBackend implements CardBackend {
         if (this.draft != null && text === this.draft) this.echoed();
         break;
       }
-      case 'update': this.update(ev.update || {}, from, ev.ts); break;
+      case 'update': this.update(ev.update || {}, from, ev.ts, ev.sessionId); break;
       case 'turn_end': this.add(ev.stopReason === 'end_turn' ? { k: 'sep' } : { k: 'note', text: 'stopped: ' + vtext(ev.stopReason) }); break;
       case 'turn_error': this.add({ k: 'note', cls: 'err', text: 'turn failed: ' + vtext(ev.message) }); break;
       case 'setup_error':
@@ -1868,7 +1907,7 @@ class AcpBackend implements CardBackend {
       case 'exit': this.add({ k: 'note', text: 'agent exited' + (ev.reason ? ' (' + vtext(ev.reason) + ')' : '') }); break;
     }
   }
-  update(u: JsonObject, from: number, ts: number) {
+  update(u: JsonObject, from: number, ts: number, sessionId?: string) {
     const tag = u.sessionUpdate, k = typeof tag === 'string' && Object.hasOwn(CHUNK_KIND, tag) ? CHUNK_KIND[tag] : undefined;
     if (k) {   // a chunk joins the open item of its kind and messageId, else the last item when neither has one
       const mid = u.messageId == null ? null : vtext(u.messageId), key = k + '\n' + mid, last = this.items[this.items.length - 1];
@@ -1878,9 +1917,15 @@ class AcpBackend implements CardBackend {
         it = this.add({ k, text: '', mid });
         if (this.agents) {
           it.journalKey = k + ':' + from + (mid == null ? '' : ':msg:' + mid);
-          if (k === 'thought') it.first = { through: this.seq, ts, text: acpJournalBlock(u.content) };
+          if (k === 'thought') it.first = { through: this.seq, ts, sessionId, text: acpJournalBlock(u.content) };
         }
         if (mid != null) this.byMsg.set(key, it);
+      } else if (it.first && it.first.sessionId === sessionId && it.first.text[0] !== 'j'
+          && from === (it.first.joined ?? it.first).through + 1 && acpTextBlock(u.content)) {
+        // Only adjacent text chunks can be one hub replay event. A messageId can also
+        // join chunks across intervening records on screen; those are not a replay run.
+        const run = it.first.joined ??= { through: this.seq, ts, text: it.first.text };
+        run.through = this.seq; run.ts = ts; run.text += text;
       }
       it.text += text; this.changed.add(it);
       return;
@@ -2091,8 +2136,8 @@ function acpToolStatus(it: AcpToolItem) {
   const status = vtext(it.status);
   return Object.hasOwn(TOOL_GLYPH, status) ? status : 'pending';
 }
-function acpToolLocations(it: AcpToolItem) {
-  const locs = Array.isArray(it.locations) ? it.locations as (AcpToolLocation | null)[] : [];
+function acpToolLocations(locations: AcpToolItem['locations']) {
+  const locs = Array.isArray(locations) ? locations as (AcpToolLocation | null)[] : [];
   return locs.length ? locs.map(l => vtext(l?.path) + (l?.line != null ? ':' + vtext(l.line) : '')).join('  ') : null;
 }
 function acpToolText(item: JsonValue) {
@@ -2110,11 +2155,13 @@ function acpReaderText(it: Exclude<AcpItem, AcpToolItem>): string {
 function acpToolHeader(it: AcpToolItem): string {
   return 'Tool: ' + acpIndent(vtext(it.kind) || 'tool') + ' [' + acpIndent(vtext(it.status) || 'pending') + '] ' + acpIndent(vtext(it.title)) + '\n';
 }
-function* acpToolFields(it: AcpToolItem): Generator<[string, string]> {
-  const locs = acpToolLocations(it);
+// The reducer replaces fields on the same item between paints. Capture the header's body
+// revision by reference before yielding; formatting can still proceed one field at a time.
+function* acpToolFields({ locations, rawInput, content, rawOutput }: AcpToolItem): Generator<[string, string]> {
+  const locs = acpToolLocations(locations);
   if (locs != null) yield ['  Location: ', locs];
-  if (it.rawInput != null) yield ['  Input:\n  ', vtext(it.rawInput)];
-  for (const c of Array.isArray(it.content) ? it.content : []) {
+  if (rawInput != null) yield ['  Input:\n  ', vtext(rawInput)];
+  for (const c of Array.isArray(content) ? content : []) {
     if ((c as AcpDiffContent | null)?.type === 'diff') {
       const { title, lines, large } = acpDiff(c as AcpDiffContent, acpReaderField);
       if (large == null) yield ['  Diff: ', title];
@@ -2124,7 +2171,7 @@ function* acpToolFields(it: AcpToolItem): Generator<[string, string]> {
       if (output) yield ['  Output:\n  ', output];
     }
   }
-  if (it.rawOutput != null) yield ['  Output:\n  ', vtext(it.rawOutput)];
+  if (rawOutput != null) yield ['  Output:\n  ', vtext(rawOutput)];
 }
 // Format long fields as the paint cursor consumes them; never flatten a multi-MiB
 // indented string before yielding the first piece.
@@ -2153,7 +2200,7 @@ function acpFill(it: AcpItem) {
   }
   else if (it.k === 'status') e.hidden = true;   // the DOM fallback has its own plan and settings
   else if (it.k === 'tool') {
-    const st = acpToolStatus(it), h = el('div', 'th'), locs = acpToolLocations(it);
+    const st = acpToolStatus(it), h = el('div', 'th'), locs = acpToolLocations(it.locations);
     h.append(el('span', 'tg ' + st, TOOL_GLYPH[st]), el('b', '', vtext(it.kind) || 'tool'), el('span', 'tt', vtext(it.title)));
     const parts: HTMLElement[] = [h];
     if (locs != null) parts.push(el('div', 'tl', locs));
@@ -7068,7 +7115,7 @@ function frTranscriptKeymap(canFold: boolean) {
     const reader = ACP_READERS.get(b);
     if (reader) {
       b.undo.length = b.redo.length = 0; b.pendingUndo = null;
-      reader.transcript?.readFolds();
+      reader.transcript?.afterCommand(cmd, failed);
       if (reader.transcript?.frame.buffer !== b) reader.schedule();
     }
   };

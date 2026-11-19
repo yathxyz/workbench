@@ -38,7 +38,7 @@ export async function checkTranscriptScroll(page: Page, prompt: (s: string) => v
   try {
     if (!savedDraft) await composer.fill(draft);
     prompt('N81 viewport gestures');
-    for (const kind of ['wheel-step', 'wheel-page', 'touch'] as const) {
+    for (const kind of ['wheel-step', 'wheel-G', 'wheel-page', 'touch'] as const) {
       const mobile = kind === 'touch';
       if (mobile) {
         await page.setViewportSize(phone);
@@ -64,8 +64,16 @@ export async function checkTranscriptScroll(page: Page, prompt: (s: string) => v
       await gesture(kind === 'wheel-page' ? -initial.rows.length * 2 : -3, initial.lh!);
       const away = await picture(), moved = !!away.first && away.firstOffset < initial.firstOffset;
       check(`N81: ${kind} really scrolls up inside the transcript`, moved, { initial, away });
-      if (!mobile) check(`N81: ${kind} ${kind === 'wheel-step' ? 'leaves point at EOF' : 'moves point into history'}`,
-        kind === 'wheel-step' ? away.point === initial.point : !away.atTail, { initial, away });
+      if (!mobile) check(`N81: ${kind} ${kind === 'wheel-page' ? 'moves point into history' : 'leaves point at EOF'}`,
+        kind === 'wheel-page' ? !away.atTail : away.atTail && away.point === initial.point, { initial, away });
+      if (kind === 'wheel-G') {
+        await keys('Shift+G'); // explicit end motion, before any new text has moved the sentinel
+        const atG = await picture(), end = await send(kind, kind + ' live', 64), resumed = await picture();
+        check('N81: G at the unchanged tail resumes visible streaming after a short wheel scroll',
+          moved && atG.atTail && atG.point === away.point && resumed.atTail && resumed.rows.includes(end)
+          && await composer.inputValue() === draft, { away, atG, resumed });
+        continue;
+      }
       const incoming = await send(kind, kind + ' paused', 64), kept = await picture();
       check(`N81: ${kind} holds the visible text and composer across a streamed chunk`, moved && kept.first === away.first
         && !kept.rows.includes(incoming) && kept.composer && await composer.inputValue() === draft, { away, kept });

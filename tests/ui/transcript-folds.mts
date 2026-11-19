@@ -47,6 +47,12 @@ export async function foldRegressions(page: Page) {
     const extra = await test([...earlier, foreign, a, z]), substitute = await test([...earlier, foreign, z]);
     const short = { s: a.s, e: t.indexOf('\n', a.s + 1) };
     const changedEnd = await test([...earlier, short, z]), pending = await test([...earlier, z], true);
+    reset(); set([...earlier, z]); // native A is open; the command's post-hook has not run yet
+    const native = Promise.resolve().then(afterCommand);
+    r.frame.setPoint(z.s);
+    b.L.body.querySelector('button[aria-label="Toggle fold at point"]').click();
+    await native;
+    const pendingPhone = !get().some(f => f.s === a.s || f.s === z.s);
     reset();
     const setter = ed.setBufferFolds!, warn = console.warn; let warnings = 0;
     try {
@@ -58,7 +64,7 @@ export async function foldRegressions(page: Page) {
     msg('next paint'); b.render();
     return { close: queued && closed.filter(s => s.startsWith('Prompt: bulk-close-')).length === 150 && !closed.includes('Prompt: later-open') && closed.some(s => s.endsWith('later-tool')),
       open: queuedOpen && !opened.some(s => s.includes('bulk-open-') || s === 'Thinking:') && opened.some(s => s.endsWith('later-default')),
-      extra, substitute, changedEnd, pending, recovered: survived && warnings === 1 && b.transcript === r && headers().some(s => s.endsWith('exact-A')) };
+      extra, substitute, changedEnd, pending, pendingPhone, recovered: survived && warnings === 1 && b.transcript === r && headers().some(s => s.endsWith('exact-A')) };
   });
   check('N81: close all includes received but unpainted turns and excludes future turns', results.close);
   check('N81: open all includes received but unpainted tools and thoughts and excludes future tools', results.open);
@@ -66,5 +72,24 @@ export async function foldRegressions(page: Page) {
   check('N81: an equal-count substitution opens only the missing journal fold', results.substitute === 'B', results.substitute);
   check('N81: a range with the right header but a different end is not the journal fold', results.changedEnd === 'B', results.changedEnd);
   check('N81: a native open before an async command completes survives an intervening paint', results.pending === 'B', results.pending);
+  check('N81: a phone fold on B preserves a pending native open on A', results.pendingPhone);
   check('N81: rejected fold publications warn once, preserve the reader and retry on the next paint', results.recovered);
+  // Deliver hello, the first items, the command and the first paint in one browser task.
+  // A remount gives each arm a real new frame; a later socket task cannot race the assertion.
+  for (const close of [true, false]) {
+    const early = await page.evaluate(close => {
+      const c = window.__canvas, sid = c.live.$agents.backend.n.id;
+      c.setView('canvas'); c.meshOpen(sid);
+      const b = c.live.$agents.backend, r = b.transcript, buf: EdwinBuffer = r.buf;
+      const receive = (m: AcpServerMsg) => b.ws.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(m) }));
+      receive({ t: 'hello', info: c.SESS[sid], status: 'attached', reset: false, head: 2, from: 1 });
+      receive({ t: 'ev', ev: { e: 'prompt', seq: 1, ts: 1000, prompt: [{ type: 'text', text: 'early turn' }] } });
+      receive({ t: 'ev', ev: { e: 'update', seq: 2, ts: 1001, update: { sessionUpdate: 'tool_call', toolCallId: 'early', rawOutput: 'early body' } } });
+      const empty = !buf.text.includes('early turn');
+      r.navigate('fold-all', close); b.render();
+      return { empty, text: buf.text, folds: window.Ed.getBufferFolds!(buf).map(f => buf.text.slice(0, f.s)) };
+    }, close);
+    check(`N81: ${close ? 'fold' : 'unfold'} all between hello and first paint uses the attached journal`,
+      early.empty && early.text.includes('early body') && (close ? early.folds.length === 1 && early.folds[0] === 'Prompt: early turn' : !early.folds.length), early);
+  }
 }

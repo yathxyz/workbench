@@ -5,6 +5,7 @@ import { H } from '../daemon.mts';
 import { acpIdle, gatedPage } from '../acp.mts';
 import { measureTranscript } from '../transcript-stress.mts';
 import { largeReplacement } from '../transcript-cost.mts';
+import { transcriptToolVersions } from '../transcript-tool-version.mts';
 import { foldRegressions } from '../transcript-folds.mts';
 import { transcriptIdentities } from '../transcript-identities.mts';
 import { checkTranscriptScroll } from '../transcript-scroll.mts';
@@ -344,6 +345,7 @@ await section('N81', async () => {
     await foldRegressions(P);
     const body = await largeReplacement(P);
     check('N81: a 4 MiB tool event and a same-length replacement both reach the Edwin buffer intact', body.onset.projected === body.update.projected && body.update.edits > 0);
+    await transcriptToolVersions(P);
     await transcriptIdentities(P);
   } finally {
     await P.close();
