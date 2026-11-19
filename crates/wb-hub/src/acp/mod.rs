@@ -57,6 +57,8 @@ use crate::{Ctx, lock, now_ms};
 /// Longest `cwd` of a spawn on another host, in bytes.
 const REMOTE_CWD_MAX: usize = 4096;
 
+const INVALID_POLICY_NOTICE: &str = "stored permission policy is no longer valid and was cleared during replay; requests ask unless a later valid policy is set";
+
 /// How long `session/set_mode` may take.
 const SET_MODE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long `session/set_config_option` may take.
@@ -314,9 +316,21 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
     let (mut journal, events) = Journal::open(&dir.join(format!("{sid}.jsonl")))?;
     let mut facts = Facts::default();
     let mut announced = BTreeMap::new();
+    let mut policy_notice = false;
     for ev in &events {
         facts.apply(ev);
         announce(&mut announced, ev);
+        match &ev.body {
+            // The fold already validated it; nonempty rules folding to none were invalid.
+            EventBody::Policy { policy } if !policy.rules.is_empty() && facts.policy.is_none() => {
+                policy_notice = true;
+            }
+            EventBody::Notice {
+                level: NoticeLevel::Warn,
+                text,
+            } if text == INVALID_POLICY_NOTICE => policy_notice = false,
+            _ => {}
+        }
     }
     let policy = facts
         .policy
@@ -324,13 +338,29 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
         .map(|policy| CompiledPolicy::new(policy, &meta.cwd, meta.agent == "omp"))
         .transpose()
         .map_err(anyhow::Error::msg)?;
-    let (appended, fault) = match journal.normalise(&mut facts, now_ms()) {
+    let (mut appended, mut fault) = match journal.normalise(&mut facts, now_ms()) {
         Ok(written) => (!written.is_empty(), None),
         Err(f) => {
             error!(%sid, "completing the journal: {}", f.error);
             (false, Some(fault_message(&f)))
         }
     };
+    if policy_notice && fault.is_none() {
+        let notice = EventBody::Notice {
+            level: NoticeLevel::Warn,
+            text: INVALID_POLICY_NOTICE.into(),
+        };
+        match journal.append(&notice, now_ms()) {
+            Ok(ev) => {
+                facts.apply(&ev);
+                appended = true;
+            }
+            Err(f) => {
+                error!(%sid, "recording the cleared policy notice: {}", f.error);
+                fault = Some(fault_message(&f));
+            }
+        }
+    }
     let loaded = Loaded {
         meta,
         journal,
@@ -2312,20 +2342,6 @@ impl Acp {
             }
             Err(e) => return self.revive_step(Some((via, e))),
         };
-        if result
-            .get("configOptions")
-            .is_some_and(|options| !options.is_null() && !config::valid_options(options))
-        {
-            self.record(EventBody::SetupError {
-                code: SetupErrorCode::AgentError,
-                message: format!(
-                    "the session/{} result has invalid configOptions",
-                    via_name(via)
-                ),
-                rpc: None,
-            });
-            return self.stop_failed_setup();
-        }
         // Only `session/new` names the session; resume and load keep the known one.
         let session_id = match via {
             SessionVia::New => result

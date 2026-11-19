@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-#[cfg(debug_assertions)]
 use common::acp::stub;
 use common::acp::{fold_equals_live, group_members};
 use common::fake::{Agent, text_of, updates};
@@ -1373,6 +1372,99 @@ fn hub_policy_answers_once_without_publishing_pending_and_replays() {
         "ok"
     );
     c.event("unlisted", "turn_end");
+}
+
+#[test]
+fn hub_policy_invalid_replacements_warn_once_and_do_not_accumulate_on_restart() {
+    let mut hub = policy_hub();
+    let mut c = hub.connect();
+    let open = policy_ready(&mut c, &hub, "a1", permission_policy("reject"));
+    drop(c);
+    hub.terminate();
+
+    let append = |hub: &Hub, policies: &[Value]| {
+        let mut seq = hub.journal("a1").len() as u64;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(hub.acp_file("a1.jsonl"))
+            .unwrap();
+        for policy in policies {
+            seq += 1;
+            serde_json::to_writer(
+                &mut file,
+                &json!({"seq":seq, "ts":1, "e":"policy", "policy":policy}),
+            )
+            .unwrap();
+            std::io::Write::write_all(&mut file, b"\n").unwrap();
+        }
+    };
+    let invalid = [
+        json!({"rules":[{"action":"allow", "roots":["relative"]}]}),
+        json!({"rules":[{"action":"allow", "command":{"matches":["("]}}]}),
+    ];
+    append(&hub, &invalid);
+    let before = hub.journal("a1");
+
+    hub.restart();
+    let mut c = hub.connect();
+    let attached = c.ok(json!({"t":"acp.open", "sid":"a1", "since":0}));
+    assert!(attached["summary"]["acp"]["policy"].is_null());
+    let (events, _) = c.replay("a1");
+    let warnings: Vec<_> = events
+        .iter()
+        .filter(|e| e["e"] == "notice" && e["level"] == "warn")
+        .collect();
+    assert_eq!(warnings.len(), 1, "{events:?}");
+    assert_eq!(warnings[0]["seq"], before.len() as u64 + 1);
+    let warned = hub.journal("a1");
+    assert_eq!(&warned[..before.len()], before.as_slice());
+    assert_eq!(warned.last(), Some(warnings[0]));
+    drop(c);
+    hub.terminate();
+    hub.restart();
+    let mut c = hub.connect();
+    c.ok(json!({"t":"acp.open", "sid":"a1", "since":0}));
+    c.replay("a1");
+    assert!(c.summary("a1")["acp"]["policy"].is_null());
+    assert_eq!(hub.journal("a1"), warned);
+    c.ok(json!({"t":"acp.revive", "sid":"a1"}));
+    c.event("a1", "session");
+    assert_eq!(c.acp_prompt("a1", "perm")["t"], "ok");
+    let req = c.event("a1", "permission")["seq"].clone();
+    assert_eq!(
+        permit(&mut c, "a1", &req, epoch(&open), "reject-once")["t"],
+        "ok"
+    );
+    c.event("a1", "turn_end");
+    c.ok(
+        json!({"t":"acp.set_policy", "sid":"a1", "epoch":epoch(&open),
+        "policy":permission_policy("allow")}),
+    );
+    assert_eq!(c.acp_prompt("a1", "perm")["t"], "ok");
+    c.event("a1", "permission_auto");
+    c.event("a1", "turn_end");
+    drop(c);
+    hub.terminate();
+
+    // A newly invalid event needs a new warning, even after an older warning and valid policy.
+    append(&hub, &invalid[..1]);
+    hub.restart();
+    let mut c = hub.connect();
+    assert!(c.summary("a1")["acp"]["policy"].is_null());
+    let warned_again = hub.journal("a1");
+    assert_eq!(
+        warned_again
+            .iter()
+            .filter(|e| e["e"] == "notice" && e["level"] == "warn")
+            .count(),
+        2
+    );
+    drop(c);
+    hub.terminate();
+    hub.restart();
+    let mut c = hub.connect();
+    assert!(c.summary("a1")["acp"]["policy"].is_null());
+    assert_eq!(hub.journal("a1"), warned_again);
 }
 
 #[test]

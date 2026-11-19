@@ -18,5 +18,5 @@
     "noFallthroughCasesInSwitch": true,
     "useUnknownInCatchVariables": false
   },
-  "files": ["../web/globals.d.ts", "../web/board.d.ts", "ui.mts", "perf.mts", "keys.test.mts", "address.test.mts", "../tools/strip.mts"]
+  "files": ["../web/globals.d.ts", "../web/board.d.ts", "ui.mts", "perf.mts", "keys.test.mts", "address.test.mts", "design-policies.test.mts", "../tools/strip.mts"]
 }

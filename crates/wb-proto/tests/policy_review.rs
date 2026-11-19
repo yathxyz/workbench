@@ -36,15 +36,9 @@ fn action(policy: &CompiledPolicy, input: Value) -> Option<Action> {
 }
 
 fn design_policies() -> impl Iterator<Item = Policy> {
-    include_str!("../../../docs/DESIGN.md")
-        .split("```json\n")
-        .skip(1)
-        .filter_map(|block| {
-            let (example, _) = block.split_once("```")?;
-            example.contains("\"rules\"").then(|| {
-                serde_json::from_str(example).expect("DESIGN policy example must deserialize")
-            })
-        })
+    serde_json::from_str::<Vec<Policy>>(include_str!("fixtures/design-policies.json"))
+        .expect("DESIGN policy fixture must deserialize")
+        .into_iter()
 }
 
 fn design_example() -> CompiledPolicy {
