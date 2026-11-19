@@ -4482,34 +4482,45 @@ function meshRowEl(r: MeshRow): HTMLElement {
   row.onclick = () => meshSelect(r.id, true);
   return row;
 }
-// A row's texts, set in place: a row under the pointer is not replaced while its session works.
+// Setting a reflected attribute to its existing value still mutates the DOM. An ordinary report
+// should update its row, not dirty every row's classes, disclosure and tooltips.
+function meshAttr(e: HTMLElement, name: string, value: string): void {
+  if (e.getAttribute(name) !== value) e.setAttribute(name, value);
+}
+function meshRowText(e: HTMLElement, text: string): void {
+  if (e.textContent !== text) e.textContent = text;
+}
 function meshFill(row: HTMLElement, r: MeshRow, depth: number, showRepo: boolean, visible: Set<string>): void {
-  row.className = 'mesh-row' + (r.live ? '' : ' ended') + (meshBad(r) ? ' bad' : '') + (r.id === MESH.open ? ' on' : '');
-  row.style.setProperty('--d', String(depth)); row.dataset.depth = String(depth); row.dataset.card = r.card?.id || '';
-  row.setAttribute('aria-current', r.id === MESH.open ? 'true' : 'false');
-  $('.dot', row)!.className = 'dot st-' + (r.live ? r.state : 'exited');
-  const set = (sel: string, text: string) => { const e = $(sel, row)!; if (e.textContent !== text) e.textContent = text; return e; };
-  set('b', r.title).title = r.title; set('.mesh-at', agoShort(r.at));
-  set('.mesh-task', r.task || '').title = r.task || '';
+  meshAttr(row, 'class', 'mesh-row' + (r.live ? '' : ' ended') + (meshBad(r) ? ' bad' : '') + (r.id === MESH.open ? ' on' : ''));
+  const d = String(depth);
+  if (row.dataset.depth !== d) { row.dataset.depth = d; row.style.setProperty('--d', d); }
+  meshAttr(row, 'data-card', r.card?.id || '');
+  meshAttr(row, 'aria-current', String(r.id === MESH.open));
+  meshAttr($('.dot', row)!, 'class', 'dot st-' + (r.live ? r.state : 'exited'));
+  const set = (sel: string, text: string, title?: string) => {
+    const e = $(sel, row)!; meshRowText(e, text); if (title !== undefined) meshAttr(e, 'title', title);
+  };
+  set('b', r.title, r.title); set('.mesh-at', agoShort(r.at));
+  set('.mesh-task', r.task || '', r.task || '');
   const model = meshConfig(r, 'model') || r.obs?.model || '', harness = depth && r.obs?.agentType ? r.harness + '/' + r.obs.agentType : r.harness;
-  set('.mesh-harness', meshShort(harness)).title = harness; set('.mesh-model', model ? meshShort(model) + ' · ' : '').title = model;
+  set('.mesh-harness', meshShort(harness), harness); set('.mesh-model', model ? meshShort(model) + ' · ' : '', model);
   set('.mesh-doing', [...(depth ? [] : ['@' + r.host]), meshDoing(r)].join(' · '));
   const worktree = r.worktree?.replace(/\/+$/, '').split('/').pop() || '', branch = r.branch && r.branch !== r.worktree ? r.branch : '';
-  set('.mesh-repo', showRepo ? meshShort(r.repo) + ' · ' : '').title = r.repo;
-  set('.mesh-worktree', worktree ? meshShort(worktree) + ' · ' : '').title = r.worktree || '';
-  set('.mesh-branch', branch ? meshShort(branch) + ' · ' : '').title = r.branch || '';
+  set('.mesh-repo', showRepo ? meshShort(r.repo) + ' · ' : '', r.repo);
+  set('.mesh-worktree', worktree ? meshShort(worktree) + ' · ' : '', r.worktree || '');
+  set('.mesh-branch', branch ? meshShort(branch) + ' · ' : '', r.branch || '');
   const toggle = $('.mesh-collapse', row) as HTMLButtonElement, collapsed = MESH.collapsed.has(r.id), descendants = meshFlat(r.kids).filter(k => MESH.ended || k.live || k.id === MESH.open);
-  toggle.hidden = !descendants.length; toggle.textContent = collapsed ? '▸' : '▾';
-  toggle.title = (collapsed ? 'Expand' : 'Collapse') + ' descendants'; toggle.setAttribute('aria-label', toggle.title);
-  toggle.setAttribute('aria-expanded', String(!collapsed));
-  const summary = $('.mesh-collapsed', row)!; summary.hidden = !collapsed || !descendants.length;
+  const label = (collapsed ? 'Expand' : 'Collapse') + ' descendants';
+  toggle.toggleAttribute('hidden', !descendants.length); meshRowText(toggle, collapsed ? '▸' : '▾');
+  meshAttr(toggle, 'title', label); meshAttr(toggle, 'aria-label', label); meshAttr(toggle, 'aria-expanded', String(!collapsed));
+  const summary = $('.mesh-collapsed', row)!; summary.toggleAttribute('hidden', !collapsed || !descendants.length);
   if (!summary.hidden) {
     const worst = descendants.reduce((a, b) => meshSeverity(b) < meshSeverity(a) ? b : a);
-    summary.dataset.count = String(descendants.length); summary.dataset.hidden = String(descendants.filter(x => !visible.has(x.id)).length);
-    summary.dataset.state = worst.live ? worst.state : 'exited';
-    set('.mesh-collapsed', `${descendants.length} descendant${descendants.length === 1 ? '' : 's'} · ${meshBad(worst) ? meshWants(worst.state) : worst.live ? worst.state.replace(/_/g, ' ') : 'ended'}`);
+    meshAttr(summary, 'data-count', String(descendants.length)); meshAttr(summary, 'data-hidden', String(descendants.filter(x => !visible.has(x.id)).length));
+    meshAttr(summary, 'data-state', worst.live ? worst.state : 'exited');
+    meshRowText(summary, `${descendants.length} descendant${descendants.length === 1 ? '' : 's'} · ${meshBad(worst) ? meshWants(worst.state) : worst.live ? worst.state.replace(/_/g, ' ') : 'ended'}`);
   }
-  ($('.mesh-canvas', row) as HTMLButtonElement).hidden = !r.card;
+  $('.mesh-canvas', row)!.toggleAttribute('hidden', !r.card);
 }
 const meshSeverity = (r: MeshRow): number => !r.live ? 7 : r.state === 'error' ? 0 : r.state === 'waiting_permission' ? 1 : r.state === 'waiting_input' ? 2 : r.state === 'running' ? 3 : r.state === 'done' ? 5 : 4;
 const meshShort = (s: string): string => s.length > 32 ? s.slice(0, 15) + '…' + s.slice(-16) : s;
