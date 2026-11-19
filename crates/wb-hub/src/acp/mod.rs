@@ -116,6 +116,7 @@ pub enum Cmd {
         reply: Option<Reply>,
     },
     Act {
+        epoch: Option<u64>,
         act: Act,
         reply: Reply,
     },
@@ -169,7 +170,7 @@ pub enum Act {
 
 impl Cmd {
     /// Answers a command that the session can no longer carry out.
-    pub fn refuse(self, code: ErrorCode, message: &str) {
+    pub fn refuse(self, code: ErrorCode, message: impl Into<String>) {
         match self {
             Cmd::Open(Open { reply, .. })
             | Cmd::Act { reply, .. }
@@ -526,20 +527,11 @@ fn tell_reloaded(sid: &str, viewers: Vec<Viewer>) {
     }
 }
 
-/// Delivers a command that reached a forgotten actor to whatever now holds `sid`: an
-/// open is routed as a new request, anything else goes to the current session, if any.
+/// Route an open as a new request; other commands keep their original epoch guard.
 async fn redeliver(ctx: &Arc<Ctx>, sid: &str, cmd: Cmd) {
-    const FORGOTTEN: &str = "the session was forgotten";
     match cmd {
         Cmd::Open(o) => open(ctx.clone(), sid.to_owned(), o).await,
-        cmd => match ctx.registry.sender::<Cmd>(sid) {
-            Some(tx) => {
-                if let Err(unsent) = tx.send(cmd).await {
-                    unsent.0.refuse(ErrorCode::NotFound, FORGOTTEN);
-                }
-            }
-            None => cmd.refuse(ErrorCode::NotFound, FORGOTTEN),
-        },
+        cmd => ctx.registry.redeliver(sid, cmd).await,
     }
 }
 
@@ -968,6 +960,7 @@ impl Acp {
                 Cmd::Act {
                     act: Act::Kill { .. },
                     reply,
+                    ..
                 } if self.journal.is_none() => {
                     if self.create_kill.is_some() {
                         return reply.err(ErrorCode::Conflict, WORKTREE_BUSY);
@@ -986,7 +979,7 @@ impl Acp {
                 {
                     return o.reply.err(ErrorCode::Conflict, WORKTREE_BUSY);
                 }
-                Cmd::Act { act, reply }
+                Cmd::Act { act, reply, .. }
                     if self.journal.is_none()
                         || matches!(act, Act::Revive | Act::Kill { .. } | Act::RemoveWorktree) =>
                 {
@@ -1003,7 +996,7 @@ impl Acp {
                     reply.done();
                 }
             }
-            Cmd::Act { act, reply } => self.act(act, reply),
+            Cmd::Act { act, reply, .. } => self.act(act, reply),
             Cmd::Shutdown { done } => self.shutdown(done).await,
         }
     }

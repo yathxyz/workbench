@@ -512,6 +512,7 @@ pub struct Hello {
     pub acp_config: Option<bool>,
     pub acp_worktree: Option<bool>,
     pub acp_task: Option<bool>,
+    pub session_action_epoch: Option<bool>,
 }
 
 impl Default for Hello {
@@ -527,6 +528,7 @@ impl Default for Hello {
             acp_config: Some(true),
             acp_worktree: Some(true),
             acp_task: Some(true),
+            session_action_epoch: Some(true),
         }
     }
 }
@@ -769,6 +771,7 @@ async fn serve(
     let acp_config = hello.acp_config;
     let acp_worktree = hello.acp_worktree;
     let acp_task = hello.acp_task;
+    let session_action_epoch = hello.session_action_epoch;
     let hello = HubMessage::Hello {
         proto: hello.proto,
         server: "wb-hub".into(),
@@ -784,6 +787,7 @@ async fn serve(
         acp_config: acp_config.unwrap_or(false),
         acp_worktree: acp_worktree.unwrap_or(false),
         acp_task: acp_task.unwrap_or(false),
+        session_action_epoch: session_action_epoch.unwrap_or(false),
     };
     let mut hello = serde_json::to_value(hello).unwrap();
     if acp_config.is_none() {
@@ -797,6 +801,11 @@ async fn serve(
     }
     if acp_task.is_none() {
         hello.as_object_mut().unwrap().remove("acpTask");
+    }
+    if let Some(capable) = session_action_epoch {
+        hello["sessionActionEpoch"] = json!(capable);
+    } else {
+        hello.as_object_mut().unwrap().remove("sessionActionEpoch");
     }
     if tx.write_all(&line::encode(&hello)).await.is_err() {
         return;

@@ -120,6 +120,22 @@ async fn act(app: &AppState, req: HubRequest, wait: Duration) -> Result<Json<Val
         match req {
             HubRequest::AcpRemoveWorktree { .. } => require_worktree(&info)?,
             HubRequest::AcpSetTask { .. } => require_task(&info)?,
+            HubRequest::AcpPrompt { epoch: Some(_), .. }
+            | HubRequest::AcpCancel { epoch: Some(_), .. }
+            | HubRequest::AcpSetMode { epoch: Some(_), .. }
+            | HubRequest::AcpSetConfigOption {
+                check_epoch_first: true,
+                ..
+            }
+            | HubRequest::AcpKill { epoch: Some(_), .. }
+            | HubRequest::PtyKill { epoch: Some(_), .. }
+                if !info.session_action_epoch =>
+            {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "hub does not support session action epochs",
+                ));
+            }
             _ => {}
         }
         conn.request(&req, RID).await.map_err(call_error)
@@ -505,6 +521,8 @@ async fn create(
 struct Prompt {
     text: Option<String>,
     blocks: Option<Vec<Value>>,
+    #[serde(default, deserialize_with = "wb_proto::policy::deserialize_optional")]
+    epoch: Option<u64>,
 }
 
 async fn prompt(
@@ -528,20 +546,31 @@ async fn prompt(
     let req = HubRequest::AcpPrompt {
         rid: RID,
         sid,
+        epoch: body.epoch,
         prompt,
     };
     act(&api.app, req, REPLY_TIMEOUT).await
+}
+
+#[derive(Deserialize)]
+struct CancelQuery {
+    epoch: Option<u64>,
 }
 
 async fn cancel(
     _: Control,
     State(api): State<ApiState>,
     Param(id): Param<String>,
+    ApiQuery(query): ApiQuery<CancelQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let sid = sid_of(id)?;
     act(
         &api.app,
-        HubRequest::AcpCancel { rid: RID, sid },
+        HubRequest::AcpCancel {
+            rid: RID,
+            sid,
+            epoch: query.epoch,
+        },
         REPLY_TIMEOUT,
     )
     .await
@@ -603,6 +632,8 @@ async fn elicitation(
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Mode {
     mode_id: String,
+    #[serde(default, deserialize_with = "wb_proto::policy::deserialize_optional")]
+    epoch: Option<u64>,
 }
 
 async fn mode(
@@ -616,6 +647,7 @@ async fn mode(
     let req = HubRequest::AcpSetMode {
         rid: RID,
         sid,
+        epoch: body.epoch,
         mode_id: body.mode_id,
     };
     act(&api.app, req, CONFIG_TIMEOUT).await
@@ -626,6 +658,8 @@ async fn mode(
 struct Config {
     id: String,
     value: ConfigValue,
+    #[serde(default, deserialize_with = "wb_proto::policy::deserialize_optional")]
+    epoch: Option<u64>,
 }
 
 async fn config(
@@ -636,11 +670,15 @@ async fn config(
 ) -> Result<Json<Value>, ApiError> {
     let sid = sid_of(id)?;
     let body: Config = parse(&body)?;
-    let epoch = summary(&api.app, &sid)?.created_at;
+    let epoch = match body.epoch {
+        Some(epoch) => epoch,
+        None => summary(&api.app, &sid)?.created_at,
+    };
     let req = HubRequest::AcpSetConfigOption {
         rid: RID,
         sid,
         epoch,
+        check_epoch_first: body.epoch.is_some(),
         config_id: body.id,
         value: body.value.into(),
     };
@@ -732,6 +770,7 @@ async fn remove_worktree(
 #[derive(Deserialize)]
 struct KillQuery {
     forget: Option<bool>,
+    epoch: Option<u64>,
 }
 
 /// An unpublished sid can already have an ACP actor preparing its worktree.
@@ -755,11 +794,13 @@ async fn kill(
         Some(Kind::Acp) | None => HubRequest::AcpKill {
             rid: RID,
             sid,
+            epoch: query.epoch,
             forget,
         },
         Some(Kind::Pty) => HubRequest::PtyKill {
             rid: RID,
             sid,
+            epoch: query.epoch,
             forget,
         },
         Some(Kind::Unknown) => {
@@ -825,6 +866,7 @@ mod tests {
             acp_config: true,
             acp_worktree: true,
             acp_task: true,
+            session_action_epoch: true,
             hosts: hosts
                 .iter()
                 .map(|name| Host {

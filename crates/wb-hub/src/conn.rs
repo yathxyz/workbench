@@ -179,6 +179,7 @@ fn hello(ctx: &Ctx) -> HubMessage {
         acp_config: true,
         acp_worktree: ctx.cfg.git.is_some(),
         acp_task: true,
+        session_action_epoch: true,
         hosts: ctx
             .cfg
             .hosts
@@ -324,9 +325,18 @@ impl Conn {
                     let _ = tx.send(Cmd::Resize { cols, rows }).await;
                 }
             }
-            HubRequest::PtyKill { rid, sid, forget } => {
-                self.to_session(rid, sid, |reply| Cmd::Kill { forget, reply })
-                    .await;
+            HubRequest::PtyKill {
+                rid,
+                sid,
+                forget,
+                epoch,
+            } => {
+                self.to_session(rid, sid, |reply| Cmd::Kill {
+                    epoch,
+                    forget,
+                    reply,
+                })
+                .await;
             }
             HubRequest::PtyCapture { rid, sid, lines } => {
                 let lines = lines.unwrap_or(CAPTURE_DEFAULT).min(CAPTURE_MAX as u32) as usize;
@@ -348,10 +358,15 @@ impl Conn {
                 })
                 .await;
             }
-            HubRequest::AcpPrompt { rid, sid, prompt } => {
-                self.act(rid, sid, Act::Prompt(prompt)).await;
+            HubRequest::AcpPrompt {
+                rid,
+                sid,
+                prompt,
+                epoch,
+            } => self.act(rid, sid, epoch, Act::Prompt(prompt)).await,
+            HubRequest::AcpCancel { rid, sid, epoch } => {
+                self.act(rid, sid, epoch, Act::Cancel).await
             }
-            HubRequest::AcpCancel { rid, sid } => self.act(rid, sid, Act::Cancel).await,
             HubRequest::AcpPermission {
                 rid,
                 sid,
@@ -364,7 +379,7 @@ impl Conn {
                     epoch,
                     outcome,
                 };
-                self.act(rid, sid, act).await;
+                self.act(rid, sid, None, act).await;
             }
             HubRequest::AcpElicitation {
                 rid,
@@ -378,21 +393,26 @@ impl Conn {
                     epoch,
                     response,
                 };
-                self.act(rid, sid, act).await;
+                self.act(rid, sid, None, act).await;
             }
-            HubRequest::AcpSetMode { rid, sid, mode_id } => {
-                self.act(rid, sid, Act::SetMode(mode_id)).await;
-            }
+            HubRequest::AcpSetMode {
+                rid,
+                sid,
+                mode_id,
+                epoch,
+            } => self.act(rid, sid, epoch, Act::SetMode(mode_id)).await,
             HubRequest::AcpSetConfigOption {
                 rid,
                 sid,
                 epoch,
+                check_epoch_first,
                 config_id,
                 value,
             } => {
                 self.act(
                     rid,
                     sid,
+                    check_epoch_first.then_some(epoch),
                     Act::SetConfigOption {
                         epoch,
                         config_id,
@@ -402,7 +422,7 @@ impl Conn {
                 .await;
             }
             HubRequest::AcpSetTask { rid, sid, task } => {
-                self.act(rid, sid, Act::SetTask(task)).await;
+                self.act(rid, sid, None, Act::SetTask(task)).await;
             }
             HubRequest::AcpSetPolicy {
                 rid,
@@ -410,20 +430,24 @@ impl Conn {
                 epoch,
                 policy,
             } => {
-                self.act(rid, sid, Act::SetPolicy { epoch, policy }).await;
+                self.act(rid, sid, None, Act::SetPolicy { epoch, policy })
+                    .await;
             }
-            HubRequest::AcpSeen { rid, sid, seq } => self.act(rid, sid, Act::Seen(seq)).await,
-            HubRequest::AcpRevive { rid, sid } => self.act(rid, sid, Act::Revive).await,
+            HubRequest::AcpSeen { rid, sid, seq } => self.act(rid, sid, None, Act::Seen(seq)).await,
+            HubRequest::AcpRevive { rid, sid } => self.act(rid, sid, None, Act::Revive).await,
             HubRequest::AcpAuthenticate {
                 rid,
                 sid,
                 method_id,
-            } => self.act(rid, sid, Act::Authenticate(method_id)).await,
-            HubRequest::AcpKill { rid, sid, forget } => {
-                self.act(rid, sid, Act::Kill { forget }).await;
-            }
+            } => self.act(rid, sid, None, Act::Authenticate(method_id)).await,
+            HubRequest::AcpKill {
+                rid,
+                sid,
+                forget,
+                epoch,
+            } => self.act(rid, sid, epoch, Act::Kill { forget }).await,
             HubRequest::AcpRemoveWorktree { rid, sid } => {
-                self.act(rid, sid, Act::RemoveWorktree).await;
+                self.act(rid, sid, None, Act::RemoveWorktree).await;
             }
             HubRequest::Unknown => {
                 self.error(
@@ -491,8 +515,8 @@ impl Conn {
         acp::open(self.ctx.clone(), sid, open).await;
     }
 
-    async fn act(&self, rid: u64, sid: String, act: Act) {
-        self.to_session(rid, sid, |reply| acp::Cmd::Act { act, reply })
+    async fn act(&self, rid: u64, sid: String, epoch: Option<u64>, act: Act) {
+        self.to_session(rid, sid, |reply| acp::Cmd::Act { epoch, act, reply })
             .await;
     }
 
@@ -511,20 +535,8 @@ impl Conn {
         if !valid_sid(&sid) {
             return self.error(Some(rid), None, ErrorCode::BadRequest, "invalid sid".into());
         }
-        if let Some(Err(msg)) = self.kind_check::<C>(&sid) {
-            return self.error(Some(rid), None, ErrorCode::KindMismatch, msg);
-        }
-        let reply = self.reply(rid).await;
-        match self.ctx.registry.sender::<C>(&sid) {
-            Some(tx) => {
-                if let Err(unsent) = tx.send(cmd(reply)).await {
-                    unsent
-                        .0
-                        .refuse(ErrorCode::NotFound, &format!("no session {sid}"));
-                }
-            }
-            None => reply.err(ErrorCode::NotFound, format!("no session {sid}")),
-        }
+        let cmd = cmd(self.reply(rid).await);
+        self.ctx.registry.deliver(&sid, cmd).await;
     }
 
     async fn input(&self, sid: String, d: String) {

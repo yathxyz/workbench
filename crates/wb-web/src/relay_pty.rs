@@ -194,7 +194,13 @@ impl Relay {
                     return Ok(());
                 };
                 let rid = self.rid();
-                self.send(&HubRequest::PtyKill { rid, sid, forget }).await
+                self.send(&HubRequest::PtyKill {
+                    rid,
+                    sid,
+                    epoch: None,
+                    forget,
+                })
+                .await
             }
             _ => Ok(()),
         }
@@ -397,6 +403,7 @@ impl Relay {
                 self.send(&HubRequest::PtyKill {
                     rid,
                     sid: open.sid.clone(),
+                    epoch: None,
                     forget,
                 })
                 .await?;
@@ -413,6 +420,7 @@ impl Relay {
                     Some(forget) => HubRequest::PtyKill {
                         rid,
                         sid: open.sid,
+                        epoch: None,
                         forget,
                     },
                     None => HubRequest::PtyDetach { rid, sid: open.sid },

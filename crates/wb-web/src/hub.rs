@@ -88,6 +88,8 @@ pub struct HubInfo {
     pub acp_worktree: bool,
     /// Whether this connection's hub supports ACP session task references.
     pub acp_task: bool,
+    /// Whether the hub enforces caller-supplied session action preconditions.
+    pub session_action_epoch: bool,
     /// The shells a spawn may name; DELTA-1 §B.
     pub shells: Vec<String>,
     /// Empty from a hub that predates shell choice.
@@ -168,6 +170,7 @@ impl HubConn {
             acp_config,
             acp_worktree,
             acp_task,
+            session_action_epoch,
             ..
         }) = hello
         else {
@@ -195,6 +198,7 @@ impl HubConn {
             acp_config,
             acp_worktree,
             acp_task,
+            session_action_epoch,
             shells,
             default_shell,
         };

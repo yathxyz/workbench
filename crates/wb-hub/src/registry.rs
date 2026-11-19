@@ -75,8 +75,10 @@ pub trait SessionCmd: Sized {
     fn wrap(tx: mpsc::Sender<Self>) -> Tx;
     /// The sender in `tx` if it is of this kind.
     fn unwrap(tx: &Tx) -> Option<mpsc::Sender<Self>>;
+    /// The caller's routing guard, retained on the command in case it is redelivered.
+    fn expected_epoch(&self) -> Option<u64>;
     /// Answers a command that the session can no longer carry out.
-    fn refuse(self, code: ErrorCode, message: &str);
+    fn refuse(self, code: ErrorCode, message: impl Into<String>);
 }
 
 impl SessionCmd for pty::Cmd {
@@ -90,7 +92,13 @@ impl SessionCmd for pty::Cmd {
             Tx::Acp(_) => None,
         }
     }
-    fn refuse(self, code: ErrorCode, message: &str) {
+    fn expected_epoch(&self) -> Option<u64> {
+        match self {
+            pty::Cmd::Kill { epoch, .. } => *epoch,
+            _ => None,
+        }
+    }
+    fn refuse(self, code: ErrorCode, message: impl Into<String>) {
         pty::Cmd::refuse(self, code, message);
     }
 }
@@ -106,7 +114,13 @@ impl SessionCmd for acp::Cmd {
             Tx::Pty(_) => None,
         }
     }
-    fn refuse(self, code: ErrorCode, message: &str) {
+    fn expected_epoch(&self) -> Option<u64> {
+        match self {
+            acp::Cmd::Act { epoch, .. } => *epoch,
+            _ => None,
+        }
+    }
+    fn refuse(self, code: ErrorCode, message: impl Into<String>) {
         acp::Cmd::refuse(self, code, message);
     }
 }
@@ -190,6 +204,64 @@ impl Registry {
             .sessions
             .get(sid)
             .and_then(|e| C::unwrap(&e.tx))
+    }
+
+    /// Compare `epoch` and take the matching actor's sender in one critical section,
+    /// even for a registered session whose first Summary hasn't been published yet.
+    fn action_sender<C: SessionCmd>(
+        &self,
+        sid: &str,
+        epoch: Option<u64>,
+    ) -> Result<mpsc::Sender<C>, (ErrorCode, String)> {
+        let inner = lock(&self.inner);
+        let entry = inner
+            .sessions
+            .get(sid)
+            .ok_or_else(|| (ErrorCode::NotFound, format!("no session {sid}")))?;
+        if epoch.is_some_and(|epoch| epoch != entry.created_at) {
+            return Err((ErrorCode::Stale, "the session was created again".into()));
+        }
+        C::unwrap(&entry.tx).ok_or_else(|| {
+            let kind = if entry.tx.kind() == Kind::Pty {
+                "pty"
+            } else {
+                "acp"
+            };
+            (
+                ErrorCode::KindMismatch,
+                format!("{sid} is a {kind} session"),
+            )
+        })
+    }
+
+    pub async fn deliver<C: SessionCmd>(&self, sid: &str, cmd: C) {
+        match self.action_sender::<C>(sid, cmd.expected_epoch()) {
+            Ok(tx) => {
+                if let Err(unsent) = tx.send(cmd).await {
+                    unsent
+                        .0
+                        .refuse(ErrorCode::NotFound, format!("no session {sid}"));
+                }
+            }
+            Err((code, msg)) => cmd.refuse(code, msg),
+        }
+    }
+
+    /// A queued open may just have recreated `sid`. Never redeliver guarded actions
+    /// based on `sid` alone. Legacy unguarded commands still follow it if possible.
+    pub async fn redeliver<C: SessionCmd>(&self, sid: &str, cmd: C) {
+        if cmd.expected_epoch().is_some() {
+            return self.deliver(sid, cmd).await;
+        }
+        const FORGOTTEN: &str = "the session was forgotten";
+        match self.sender(sid) {
+            Some(tx) => {
+                if let Err(unsent) = tx.send(cmd).await {
+                    unsent.0.refuse(ErrorCode::NotFound, FORGOTTEN);
+                }
+            }
+            None => cmd.refuse(ErrorCode::NotFound, FORGOTTEN),
+        }
     }
 
     /// Finds the session for `sid`, registering a new one of kind `C` when there is none

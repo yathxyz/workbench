@@ -93,7 +93,7 @@ fn server_hello() {
         "agents": [{"name": "claude", "label": "Claude"}, {"name": "codex", "label": "Codex"}],
         "shells": ["bash", "nu", "zsh"], "defaultShell": "bash",
         "hosts": [{"name": "laptop", "agents": [{"name": "pi", "label": "pi"}]}],
-        "acpConfig": true, "acpWorktree": true, "acpTask": true
+        "acpConfig": true, "acpWorktree": true, "acpTask": true, "sessionActionEpoch": true
     }));
     let HubMessage::Hello {
         proto,
@@ -536,6 +536,7 @@ fn pty_requests_without_reply_and_kill_detach_capture() {
         HubRequest::PtyKill {
             rid: 10,
             sid: "n_1".into(),
+            epoch: None,
             forget: true
         }
     );
@@ -1165,6 +1166,7 @@ fn acp_requests() {
             HubRequest::AcpCancel {
                 rid: 16,
                 sid: sid(),
+                epoch: None,
             },
         ),
         (
@@ -1172,6 +1174,7 @@ fn acp_requests() {
             HubRequest::AcpSetMode {
                 rid: 17,
                 sid: sid(),
+                epoch: None,
                 mode_id: "plan".into(),
             },
         ),
@@ -1182,6 +1185,7 @@ fn acp_requests() {
                 rid: 22,
                 sid: sid(),
                 epoch: 42,
+                check_epoch_first: false,
                 config_id: "thinking".into(),
                 value: json!(true),
             },
@@ -1222,6 +1226,7 @@ fn acp_requests() {
             HubRequest::AcpKill {
                 rid: 21,
                 sid: sid(),
+                epoch: None,
                 forget: true,
             },
         ),
@@ -1230,6 +1235,7 @@ fn acp_requests() {
             HubRequest::AcpKill {
                 rid: 22,
                 sid: sid(),
+                epoch: None,
                 forget: false,
             },
         ),
