@@ -6,14 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::ws::{Message, WebSocket};
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use axum::extract::ws::Message;
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{Map, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{sleep, timeout};
+use tokio_util::bytes::Buf;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use wb_proto::hub::{
     Agent, CaptureReply, ErrorCode, Host, HubMessage, HubRequest, PROTO, SessionsReply, Summary,
@@ -138,9 +139,20 @@ pub async fn connect_relay(app: &AppState) -> Result<(HubConn, HubInfo), &'stati
 pub struct HubConn {
     rx: FramedRead<OwnedReadHalf, LinesCodec>,
     tx: OwnedWriteHalf,
+    /// Non-data lookahead belongs to the relay even if the browser flush fails.
+    pending: Option<HubMessage>,
 }
 
 impl HubConn {
+    pub(super) fn from_stream(stream: UnixStream) -> Self {
+        let (rx, tx) = stream.into_split();
+        Self {
+            rx: FramedRead::new(rx, LinesCodec::new_with_max_length(MAX_LINE)),
+            tx,
+            pending: None,
+        }
+    }
+
     /// Connects and does the handshake (§3.2.3). Returns what the hub's hello says.
     pub async fn connect(path: &Path) -> Result<(Self, HubInfo), ConnectError> {
         let unavailable = |why: String| ConnectError::Unavailable(why);
@@ -148,11 +160,7 @@ impl HubConn {
             .await
             .map_err(|_| unavailable("connect timed out".into()))?
             .map_err(|e| unavailable(e.to_string()))?;
-        let (rx, tx) = stream.into_split();
-        let mut conn = HubConn {
-            rx: FramedRead::new(rx, LinesCodec::new_with_max_length(MAX_LINE)),
-            tx,
-        };
+        let mut conn = Self::from_stream(stream);
         let hello = timeout(HELLO_TIMEOUT, conn.recv())
             .await
             .map_err(|_| unavailable("no hello".into()))?;
@@ -238,6 +246,9 @@ impl HubConn {
     /// The next message, or `None` once the connection has ended. Lines that do not
     /// decode are skipped. Cancel safe.
     pub async fn recv(&mut self) -> Option<HubMessage> {
+        if let Some(msg) = self.pending.take() {
+            return Some(msg);
+        }
         loop {
             match self.rx.next().await? {
                 Ok(line) => match serde_json::from_str(&line) {
@@ -256,50 +267,62 @@ impl HubConn {
         self.rx.read_buffer().contains(&b'\n')
     }
 
-    /// Send consecutive data frames already in the decoder, then give the
-    /// relay its first non-data message back. Never await the next hub line.
+    /// Take at most one complete buffered line. A malformed or oversize line
+    /// stays in the codec for normal receive after the preceding frames flush.
+    fn buffered_frame(
+        &mut self,
+        room: usize,
+        frame: &impl Fn(&HubMessage) -> Option<Value>,
+    ) -> Option<String> {
+        let buf = self.rx.read_buffer();
+        let end = buf[..room.min(buf.len())]
+            .iter()
+            .position(|&b| b == b'\n')?;
+        let msg = serde_json::from_str(std::str::from_utf8(&buf[..end]).ok()?).ok()?;
+        let text = match frame(&msg) {
+            Some(data) => {
+                let text = data.to_string();
+                // The relay strips the hub envelope. Still enforce the wire cap
+                // if re-encoding a noncanonical hub line increases its size.
+                if text.len() > room {
+                    return None;
+                }
+                Some(text)
+            }
+            None => {
+                self.pending = Some(msg);
+                None
+            }
+        };
+        self.rx.read_buffer_mut().advance(end + 1);
+        text
+    }
+
+    /// Flush consecutive data frames already in the decoder; never read the socket.
     pub async fn send_ready(
         &mut self,
-        ws: &mut WebSocket,
-        mut out: Value,
+        ws: &mut (impl Sink<Message> + Unpin),
+        out: Value,
         frame: impl Fn(&HubMessage) -> Option<Value>,
-    ) -> Result<Option<HubMessage>, End> {
-        const MAX_BYTES: usize = 64 * 1024;
-        let mut bytes = 0;
-        let mut count = 0;
-        loop {
-            count += 1;
-            let text = out.to_string();
-            let size = text.len() + 10; // largest unmasked WebSocket header
-            if bytes != 0 && bytes + size > MAX_BYTES {
-                ws.flush().await.map_err(|_| End::Gone)?;
-                bytes = 0;
+    ) -> Result<(), End> {
+        const HEADER: usize = 10; // largest unmasked WebSocket header
+        let mut remaining: usize = 64 * 1024;
+        let mut text = out.to_string();
+        drop(out);
+        for count in 1..=64 {
+            remaining = remaining.saturating_sub(text.len() + HEADER);
+            ws.feed(Message::Text(text.into()))
+                .await
+                .map_err(|_| End::Gone)?;
+            if count == 64 {
+                break;
             }
-            bytes += size;
-            let data = Message::Text(text.into());
-            if bytes >= MAX_BYTES || count == 64 || (count > 1 && !self.has_buffered_line()) {
-                ws.send(data).await.map_err(|_| End::Gone)?;
-                return Ok(None);
-            }
-            ws.feed(data).await.map_err(|_| End::Gone)?;
-            match self.recv().now_or_never() {
-                Some(Some(next)) => match frame(&next) {
-                    Some(data) => out = data,
-                    None => {
-                        ws.flush().await.map_err(|_| End::Gone)?;
-                        return Ok(Some(next));
-                    }
-                },
-                ended => {
-                    ws.flush().await.map_err(|_| End::Gone)?;
-                    return if ended.is_some() {
-                        Err(HUB_LOST)
-                    } else {
-                        Ok(None)
-                    };
-                }
-            }
+            let Some(next) = self.buffered_frame(remaining.saturating_sub(HEADER), &frame) else {
+                break;
+            };
+            text = next;
         }
+        ws.flush().await.map_err(|_| End::Gone)
     }
 }
 
@@ -547,3 +570,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod ready_tests;

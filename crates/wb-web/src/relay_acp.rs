@@ -391,7 +391,7 @@ impl Relay {
         self.sid.as_deref() == Some(sid)
     }
 
-    async fn hub_msg(&mut self, ws: &mut WebSocket, mut msg: HubMessage) -> Result<(), End> {
+    async fn hub_msg(&mut self, ws: &mut WebSocket, msg: HubMessage) -> Result<(), End> {
         let sid = self.sid.as_deref();
         let frame = |msg: &HubMessage| match msg {
             HubMessage::AcpEv { sid: s, ev }
@@ -402,13 +402,11 @@ impl Relay {
             _ => None,
         };
         if let Some(out) = frame(&msg) {
+            drop(msg);
             if !self.hub.has_buffered_line() {
                 return send_json(ws, &out).await.map_err(|_| End::Gone);
             }
-            let Some(next) = self.hub.send_ready(ws, out, frame).await? else {
-                return Ok(());
-            };
-            msg = next;
+            return self.hub.send_ready(ws, out, frame).await;
         }
         let out = match msg {
             HubMessage::Ok { rid, result } => match self.replies.remove(&rid) {

@@ -232,14 +232,15 @@ async fn read_line(r: &mut Lines) -> std::io::Result<Option<String>> {
 }
 
 async fn write_loop(mut wr: OwnedWriteHalf, q: Arc<OutQ>) {
-    while let Ok(Some((line, offset))) = q.pop_write(|iov| wr.try_write_vectored(iov)).await {
-        if offset == line.len() {
-            tokio::task::consume_budget().await;
-            continue;
+    while let Ok(Some(w)) = q.pop_write(|iov| wr.try_write_vectored(iov)).await {
+        if w.offset < w.line.len() {
+            tokio::select! {
+                r = wr.write_all(&w.line[w.offset..]) => if r.is_err() { break },
+                () = q.closed() => break,
+            }
         }
-        tokio::select! {
-            r = wr.write_all(&line[offset..]) => if r.is_err() { break },
-            () = q.closed() => break,
+        for _ in 0..w.completed {
+            tokio::task::consume_budget().await;
         }
     }
     q.close();
@@ -654,6 +655,32 @@ mod tests {
             .await
             .expect("writer hung after peer closed");
         assert!(q.room().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_ready_replay_yields_before_draining_every_line() {
+        let (sender, mut reader) = UnixStream::pair().unwrap();
+        sender.writable().await.unwrap();
+        let (_, wr) = sender.into_split();
+        let q = Arc::new(OutQ::default());
+        let line = Arc::<[u8]>::from(&b"x\n"[..]);
+        for _ in 0..512 {
+            q.push_reply(line.clone());
+        }
+        q.finish();
+
+        let mut writer = std::pin::pin!(write_loop(wr, q));
+        tokio::select! {
+            biased;
+            () = &mut writer => panic!("ready replay monopolized the worker"),
+            () = std::future::ready(()) => {}
+        }
+        let mut buf = [0; 1024];
+        let sent = reader.read(&mut buf).await.unwrap();
+        assert!((1..buf.len()).contains(&sent));
+        writer.await;
+        reader.read_exact(&mut buf[sent..]).await.unwrap();
+        assert!(buf.as_chunks::<2>().0.iter().all(|line| line == b"x\n"));
     }
 
     #[test]

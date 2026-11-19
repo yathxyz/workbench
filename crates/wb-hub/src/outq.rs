@@ -22,6 +22,13 @@ use crate::lock;
 #[derive(Debug, PartialEq, Eq)]
 pub struct Closed;
 
+pub struct WriteProgress {
+    pub line: Arc<[u8]>,
+    pub offset: usize,
+    /// Lines completed by the nonblocking write, without an async I/O budget charge.
+    pub completed: usize,
+}
+
 #[derive(Default)]
 pub struct OutQ {
     st: Mutex<State>,
@@ -84,7 +91,7 @@ impl OutQ {
     pub async fn pop_write(
         &self,
         mut try_write: impl FnMut(&[IoSlice<'_>]) -> io::Result<usize>,
-    ) -> io::Result<Option<(Arc<[u8]>, usize)>> {
+    ) -> io::Result<Option<WriteProgress>> {
         let line = self
             .wait(|st| {
                 if st.q.is_empty() {
@@ -99,13 +106,20 @@ impl OutQ {
                         Err(e) => return Some(Err(e)),
                     }
                 };
+                let mut completed = 0;
                 loop {
                     let line = st.q.pop_front().expect("write cannot exceed queued bytes");
                     st.bytes -= line.len();
                     if written <= line.len() {
-                        return Some(Ok(Some((line, written))));
+                        completed += usize::from(written == line.len());
+                        return Some(Ok(Some(WriteProgress {
+                            line,
+                            offset: written,
+                            completed,
+                        })));
                     }
                     written -= line.len();
+                    completed += 1;
                 }
             })
             .await?;
@@ -227,7 +241,7 @@ mod tests {
             self.pop_write(|_| Err(io::ErrorKind::WouldBlock.into()))
                 .await
                 .unwrap()
-                .map(|(line, _)| line)
+                .map(|w| w.line)
         }
     }
 
@@ -241,7 +255,7 @@ mod tests {
         for s in ["one\n", "two\n", "three\n"] {
             q.push_reply(Arc::from(s.as_bytes()));
         }
-        let (partial, offset) = q
+        let partial = q
             .pop_write(|iov| {
                 assert_eq!(iov.len(), 3);
                 Ok(6) // "one\ntw" made it to the peer
@@ -249,7 +263,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(&partial[offset..], b"o\n");
+        assert_eq!(partial.completed, 1);
+        assert_eq!(&partial.line[partial.offset..], b"o\n");
         assert_eq!(lock(&q.st).bytes, b"three\n".len());
         assert_eq!(q.push_event(line(CONN_QUEUE)), Err(Closed));
     }
@@ -260,7 +275,7 @@ mod tests {
         for _ in 0..100 {
             q.push_reply(line(2048));
         }
-        let (first, offset) = q
+        let first = q
             .pop_write(|iov| {
                 assert!(iov.len() > 1 && iov.len() <= 64);
                 assert!(iov.iter().map(|s| s.len()).sum::<usize>() <= 64 * 1024);
@@ -269,7 +284,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!((first.len(), offset), (2048, 0));
+        assert_eq!(
+            (first.line.len(), first.offset, first.completed),
+            (2048, 0, 0)
+        );
         assert_eq!(lock(&q.st).bytes, 99 * 2048);
 
         let q = OutQ::default();
@@ -277,12 +295,15 @@ mod tests {
             q.push_reply(line(n));
         }
         for n in [1, 65_537, 1] {
-            let (single, offset) = q
+            let single = q
                 .pop_write(|_| panic!("oversize line batched with a neighbour"))
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!((single.len(), offset), (n, 0));
+            assert_eq!(
+                (single.line.len(), single.offset, single.completed),
+                (n, 0, 0)
+            );
         }
     }
 
