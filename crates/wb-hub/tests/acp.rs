@@ -1081,7 +1081,8 @@ fn hub_policy_answers_omp_empty_locations_with_and_without_cwd() {
         assert_eq!(auto["outcome"]["optionId"], "allow-once");
         assert!(!events.iter().any(|e| e["e"] == "permission"));
         assert!(hub.journal("omp").contains(auto));
-        assert_eq!(c.summary("omp")["acp"]["pending"], json!([]));
+        let summary = c.summary_through("omp", events.last().unwrap());
+        assert_eq!(summary["acp"]["pending"], json!([]));
     }
 }
 
@@ -1096,7 +1097,7 @@ fn hub_policy_leaves_post_cancel_requests_pending_only_for_that_turn() {
     let pending = c.event("cancelled", "permission");
     assert_eq!(pending["toolCall"]["rawInput"]["command"], "cargo test");
     assert_eq!(
-        c.summary("cancelled")["acp"]["pending"][0]["req"],
+        c.summary_through("cancelled", &pending)["acp"]["pending"][0]["req"],
         pending["seq"]
     );
     assert!(
@@ -1128,7 +1129,8 @@ fn hub_policy_leaves_post_cancel_requests_pending_only_for_that_turn() {
     let auto = events.iter().find(|e| e["e"] == "permission_auto").unwrap();
     assert_eq!(auto["outcome"]["optionId"], "allow-once");
     assert!(!events.iter().any(|e| e["e"] == "permission"));
-    assert_eq!(c.summary("cancelled")["acp"]["pending"], json!([]));
+    let summary = c.summary_through("cancelled", events.last().unwrap());
+    assert_eq!(summary["acp"]["pending"], json!([]));
 }
 
 #[test]
@@ -1159,7 +1161,7 @@ fn hub_policy_leaves_permissions_outside_every_turn_pending() {
             );
             assert!(!events.iter().any(|ev| ev["e"] == "permission_auto"));
             let pending = events.last().unwrap();
-            let summary = c.summary(&sid);
+            let summary = c.summary_through(&sid, pending);
             assert_eq!(summary["acp"]["activity"], "none");
             assert_eq!(summary["acp"]["pending"][0]["req"], pending["seq"]);
             assert_eq!(
@@ -1174,7 +1176,8 @@ fn hub_policy_leaves_permissions_outside_every_turn_pending() {
                 .find(|ev| ev["e"] == "permission_auto")
                 .unwrap();
             assert_eq!(auto["policy"]["action"], action);
-            assert_eq!(c.summary(&sid)["acp"]["pending"], json!([]));
+            let summary = c.summary_through(&sid, events.last().unwrap());
+            assert_eq!(summary["acp"]["pending"], json!([]));
         }
     }
 }
@@ -1211,14 +1214,15 @@ fn hub_policy_only_answers_execute_for_the_configured_omp_agent() {
                 } else {
                     let pending = c.event(sid, "permission");
                     assert_eq!(pending["toolCall"]["rawInput"]["command"], command);
-                    assert_eq!(c.summary(sid)["acp"]["pending"][0]["req"], pending["seq"]);
+                    let summary = c.summary_through(sid, &pending);
+                    assert_eq!(summary["acp"]["pending"][0]["req"], pending["seq"]);
                     assert_eq!(
                         permit(&mut c, sid, &pending["seq"], epoch(&opened), "allow-once")["t"],
                         "ok"
                     );
                 }
-                c.event(sid, "turn_end");
-                assert_eq!(c.summary(sid)["acp"]["pending"], json!([]));
+                let end = c.event(sid, "turn_end");
+                assert_eq!(c.summary_through(sid, &end)["acp"]["pending"], json!([]));
             }
         }
         if agent != "omp" {
@@ -1250,7 +1254,8 @@ fn hub_policy_answers_once_without_publishing_pending_and_replays() {
         );
         assert!(evs.iter().any(|e| e["update"]["status"] == status));
         assert!(!evs.iter().any(|e| e["e"] == "permission"));
-        assert_eq!(c.summary(sid)["acp"]["pending"], json!([]));
+        let summary = c.summary_through(sid, evs.last().unwrap());
+        assert_eq!(summary["acp"]["pending"], json!([]));
         assert_eq!(
             permit(&mut c, sid, &auto["seq"], epoch(&open), option)["code"],
             "already_resolved"
@@ -1293,7 +1298,7 @@ fn hub_policy_answers_once_without_publishing_pending_and_replays() {
     );
     assert!(permission.get("policy").is_none());
     assert_eq!(
-        c.summary("unlisted")["acp"]["pending"][0]["req"],
+        c.summary_through("unlisted", &permission)["acp"]["pending"][0]["req"],
         permission["seq"]
     );
     assert_eq!(
@@ -1509,7 +1514,9 @@ fn hub_policy_replace_remove_leave_pending_and_never_answer_elicitations() {
         "policy":{"rules":[{"action":"allow"}]}}));
     assert_eq!(c.acp_prompt("a1", "form")["t"], "ok");
     let elicitation = c.event("a1", "elicitation");
-    assert_eq!(c.summary("a1")["acp"]["pending"][0]["kind"], "elicitation");
+    let summary = c.summary_through("a1", &elicitation);
+    assert_eq!(summary["acp"]["pending"][0]["kind"], "elicitation");
+    assert_eq!(summary["acp"]["pending"][0]["req"], elicitation["seq"]);
     c.ok(json!({"t":"acp.elicitation","sid":"a1","epoch":epoch,
         "req":elicitation["seq"],"response":{"action":"decline"}}));
     c.event("a1", "turn_end");

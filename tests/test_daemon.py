@@ -488,6 +488,14 @@ def session_policy(t, h):
                 self.snapshots.append(message.get("info") or {})
             super().handle(message)
 
+        def wait_for_published(self, mark, kinds):
+            def published():
+                events = self.since(mark, kinds)
+                head = (self.result["info"] or {}).get("acp", {}).get("headSeq", 0)
+                return events and head >= events[-1]["seq"]
+
+            return self.wait(published)
+
     def request(kind, **fields):
         hub = wbctl.HubClient(h.hub_sock)
         try:
@@ -509,7 +517,7 @@ def session_policy(t, h):
 
     def auto_turn(card, action):
         mark = start_turn(card)
-        ended = card.wait(lambda: card.since(mark, wbctl.TURN_END))
+        ended = card.wait_for_published(mark, wbctl.TURN_END)
         automatic = card.since(mark, ("permission_auto",))
         expected = {"rule": 0, "action": action}
         kind = "allow_once" if action == "allow" else "reject_once"
@@ -541,7 +549,7 @@ def session_policy(t, h):
 
     def pending_turn(card):
         mark = start_turn(card)
-        waiting = card.wait(lambda: card.since(mark, ("permission",)))
+        waiting = card.wait_for_published(mark, ("permission",))
         permissions = card.since(mark, ("permission",))
         permission = permissions[0] if permissions else None
         current = summary(card.sid)
