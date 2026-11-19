@@ -340,6 +340,7 @@ function boardAdopt(b: Board): void {
   } finally { ADOPTING = false; }
 }
 function unmountQuiet(id: string): void {   // the card went in another tab: drop it here without killing its session
+  focusClose(id);
   const L = live[id]; if (!L) return;
   pdfClose(L); L.backend?.dispose?.(); L.ro?.disconnect(); L.term?.dispose(); if (L.frame?.contentWindow) HOSTS.delete(L.frame.contentWindow);
   if (FR.on) frUnmount(id);
@@ -3342,6 +3343,7 @@ function cardGhost(e: HTMLElement) {
   nodesEl.append(g); setTimeout(() => g.remove(), MOTION.fast + 40);
 }
 function removeNode(id: string) {
+  focusClose(id);
   PICKED.delete(id); pickChip();
   const gone = S.nodes[id], parent = gone?.in && S.nodes[gone.in] as FrameNode;
   if (gone?.kind === 'frame') {
@@ -9136,6 +9138,7 @@ function focusHide() {
   focusStrip(); renderLinks(); dirty(); ringNote();
 }
 function focusClose(id: string | null) {
+  if (!id || (FOCUS.cur !== id && !FOCUS.tabs.includes(id))) return;
   const wasCur = FOCUS.cur === id;
   FOCUS.tabs = FOCUS.tabs.filter(x => x !== id);
   if (wasCur) focusHide(); else focusStrip();
