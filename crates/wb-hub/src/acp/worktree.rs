@@ -657,8 +657,9 @@ async fn check_destination_parent(git: &Path, cwd: &Path, parent: &Path) -> Resu
         GIT_TIMEOUT,
     )
     .await?;
-    let bytes = checked(out, ErrorCode::BadRequest)?;
-    let common = absolute_path(bytes.strip_suffix(b"\n").unwrap_or_default())?;
+    let bytes = checked(out, ErrorCode::Internal)?;
+    let common = absolute_path(bytes.strip_suffix(b"\n").unwrap_or_default())
+        .map_err(|(_, message)| (ErrorCode::Internal, message))?;
     let common = fs::canonicalize(common).await.map_err(internal)?;
 
     // The parent may not exist yet. Its canonical path is the resolved existing
@@ -671,11 +672,17 @@ async fn check_destination_parent(git: &Path, cwd: &Path, parent: &Path) -> Resu
         }
         existing = existing.parent().ok_or_else(|| internal(e))?;
     }
-    if fs::canonicalize(existing)
-        .await
-        .map_err(internal)?
-        .starts_with(common)
-    {
+    let resolved = fs::canonicalize(existing).await.map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            (
+                ErrorCode::BadRequest,
+                format!("dangling worktree destination path: {}", existing.display()),
+            )
+        } else {
+            internal(e)
+        }
+    })?;
+    if resolved.starts_with(common) {
         return Err((
             ErrorCode::BadRequest,
             "worktree destination is inside the repository's git directory".into(),

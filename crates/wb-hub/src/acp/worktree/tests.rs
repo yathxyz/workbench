@@ -633,6 +633,34 @@ async fn refuses_a_destination_in_the_common_git_dir_before_creating_parents() {
 }
 
 #[tokio::test]
+async fn destination_parent_reports_dangling_path_or_unexpected_git_failure() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let link = f.temp.join("dangling");
+    symlink("missing", &link).unwrap();
+    let error = create_at(
+        &f.git,
+        &repo,
+        Some(&link.join("child")),
+        &request("topic", None),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.0, ErrorCode::BadRequest);
+    assert!(error.1.contains(link.to_str().unwrap()), "{error:?}");
+
+    let git = f.temp.join("broken-git");
+    script(&git, "echo 'common directory unavailable' >&2; exit 1");
+    let error = check_destination_parent(&git, &repo, &f.temp)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        (ErrorCode::Internal, "common directory unavailable".into())
+    );
+}
+
+#[tokio::test]
 async fn linked_checkout_refuses_a_mirrored_parent_symlinked_into_the_common_git_dir() {
     let f = Fixture::new();
     let repo = f.repo();
