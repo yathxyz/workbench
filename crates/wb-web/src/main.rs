@@ -56,7 +56,7 @@ use crate::static_files::Assets;
 pub enum FeedMsg {
     Hub(HubStatus),
     /// A session's Summary changed.
-    Session(Box<Summary>),
+    Session(Arc<Summary>),
     /// The hub forgot incarnation `epoch` of `sid`.
     Gone {
         sid: String,

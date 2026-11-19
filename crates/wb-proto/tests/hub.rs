@@ -342,9 +342,21 @@ fn exit_reasons() {
 #[test]
 fn list_and_watch() {
     let req: HubRequest = round_trip(json!({"t": "list", "rid": 1}));
-    assert_eq!(req, HubRequest::List { rid: 1 });
+    assert_eq!(
+        req,
+        HubRequest::List {
+            rid: 1,
+            stream: false
+        }
+    );
     let req: HubRequest = round_trip(json!({"t": "watch", "rid": 2}));
-    assert_eq!(req, HubRequest::Watch { rid: 2 });
+    assert_eq!(
+        req,
+        HubRequest::Watch {
+            rid: 2,
+            stream: false
+        }
+    );
 
     let msg: HubMessage = round_trip(json!({
         "t": "ok", "rid": 2,

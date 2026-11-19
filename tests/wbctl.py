@@ -581,12 +581,13 @@ class HubClient:
 def hub_sessions(path):
     hub = HubClient(path)
     try:
-        reply, _ = hub.request({"t": "list", "rid": 1})
+        reply, pages = hub.request({"t": "list", "rid": 1, "stream": True})
     finally:
         hub.close()
     if reply.get("t") != "ok":
         raise RuntimeError(f"list failed: {reply}")
-    return reply["sessions"]
+    return [session for page in pages if page.get("t") == "sessions.page" and page.get("rid") == 1
+            for session in page["sessions"]] + reply["sessions"]
 
 
 def parse_resume(s):

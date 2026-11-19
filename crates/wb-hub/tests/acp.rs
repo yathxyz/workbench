@@ -3657,6 +3657,99 @@ fn hub_quarantines_a_garbage_journal() {
 }
 
 #[test]
+fn restored_summaries_only_use_wire_bounds_on_overflow() {
+    use std::io::{BufWriter, Write};
+    use wb_proto::hub::{HubMessage, Summary};
+    use wb_proto::limits::MAX_LINE;
+
+    const RID: u64 = u64::MAX;
+    const PENDING: u64 = 4097;
+    let mut hub = Hub::start();
+    assert!(hub.terminate().success());
+    let agent_id = "s".repeat(32 * 1024 + 1);
+    let pending: Vec<_> = (3..3 + PENDING)
+        .map(|req| json!({"req": req, "kind": "permission", "title": "", "ts": 1}))
+        .collect();
+    let mut original: Summary = serde_json::from_value(json!({
+        "sid": "a-fit", "kind": "acp", "host": "example", "createdAt": 1,
+        "updatedAt": 9_999_999_999_999_999_999u64, "alive": false, "viewers": 0,
+        "cwd": CWD, "fault": null, "acp": {
+            "agent": "basic", "agentSessionId": agent_id, "revivable": false, "activity": "none",
+            "pending": pending, "last": null, "headSeq": PENDING + 2, "seenSeq": 0,
+            "title": "", "modeId": null, "configOptions": null
+        }
+    }))
+    .unwrap();
+    let baseline = serde_json::to_vec(&HubMessage::SessionsPage {
+        rid: RID,
+        sessions: vec![original.clone()],
+    })
+    .unwrap()
+    .len();
+    // Leave room for the actual timestamp. Both titles separately fit as journal lines.
+    let title_len = MAX_LINE - baseline - 1;
+    original.acp.as_mut().unwrap().title = Some("x".repeat(title_len));
+    for (sid, len) in [("a-fit", title_len), ("b-big", title_len + 128)] {
+        let mut journal =
+            BufWriter::new(fs::File::create(hub.acp_file(&format!("{sid}.jsonl"))).unwrap());
+        fs::write(
+            hub.acp_file(&format!("{sid}.json")),
+            json!({"sid": sid, "agent": "basic", "cwd": CWD, "createdAt": 1, "seenSeq": 0})
+                .to_string(),
+        )
+        .unwrap();
+        writeln!(
+            journal,
+            "{}",
+            json!({
+                "seq": 1, "ts": 1, "e": "session", "via": "new", "sessionId": agent_id
+            })
+        )
+        .unwrap();
+        writeln!(
+            journal,
+            "{}",
+            json!({
+                "seq": 2, "ts": 1, "e": "update",
+                "update": {"sessionUpdate": "session_info_update", "title": "x".repeat(len)}
+            })
+        )
+        .unwrap();
+        for seq in 3..3 + PENDING {
+            writeln!(
+                journal,
+                "{}",
+                json!({
+                    "seq": seq, "ts": 1, "e": "permission", "toolCall": {}, "options": []
+                })
+            )
+            .unwrap();
+        }
+        journal.flush().unwrap();
+    }
+    hub.restart();
+    let mut watcher = hub.connect();
+    watcher.send(&json!({"t": "watch", "rid": RID, "stream": true}));
+    let mut first = watcher.next().unwrap();
+    assert_eq!(first["t"], "sessions.page");
+    assert_eq!(first["rid"], RID);
+    let [actual]: [Summary; 1] = serde_json::from_value(first["sessions"].take()).unwrap();
+    original.updated_at = actual.updated_at;
+    assert_eq!(actual.acp.as_ref().unwrap().pending.len(), PENDING as usize);
+    assert!(actual == original, "a fitting summary was changed");
+
+    let last = watcher.next().unwrap();
+    assert_eq!(last["t"], "ok");
+    let [bounded] = last["sessions"].as_array().unwrap().as_slice() else {
+        panic!("expected one final summary");
+    };
+    assert_eq!(bounded["sid"], "b-big");
+    assert_eq!(bounded["acp"]["pending"].as_array().unwrap().len(), 4096);
+    assert_eq!(bounded["acp"]["agentSessionId"], Value::Null);
+    assert_eq!(bounded["acp"]["title"].as_str().unwrap().len(), 32 * 1024);
+}
+
+#[test]
 fn hub_exec_failure_writes_only_setup_error() {
     let mut hub = Hub::start_with(|config| {
         config["agents"]["missing"] =
