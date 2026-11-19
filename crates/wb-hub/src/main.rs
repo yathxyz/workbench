@@ -196,6 +196,6 @@ async fn load_sessions(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
         }
         acp::load(ctx, sid).await;
     }
-    info!(sessions = ctx.registry.list().len(), "loaded");
+    info!(sessions = ctx.registry.published_count(), "loaded");
     Ok(())
 }

@@ -25,6 +25,20 @@ use super::facts::Facts;
 /// The message of the `turn_error`/`setup_error` that startup normalisation writes.
 const HUB_RESTART: &str = "interrupted by a hub restart";
 
+/// One byte offset per 128 committed lines, rebuilt by the validation pass at open.
+const CHECKPOINT_STRIDE: u64 = 128;
+
+/// Last indexed sequence at or before `since` (zero before the first checkpoint).
+pub(super) fn checkpoint_seq(since: u64) -> u64 {
+    since - since % CHECKPOINT_STRIDE
+}
+
+fn checkpoint(offsets: &mut Vec<u64>, seq: u64, end: u64) {
+    if seq.is_multiple_of(CHECKPOINT_STRIDE) {
+        offsets.push(end);
+    }
+}
+
 /// The append handle of one session's journal.
 pub struct Journal {
     file: File,
@@ -32,6 +46,7 @@ pub struct Journal {
     end: u64,
     /// Seq of the last line written; 0 for an empty journal.
     head: u64,
+    offsets: Vec<u64>,
     /// The append of this seq fails once after writing half its line (fault injection).
     #[cfg(any(test, debug_assertions))]
     fail_at: Option<u64>,
@@ -45,12 +60,12 @@ pub struct WriteFault {
 }
 
 impl Journal {
-    /// Opens the journal at `path`, creating it with mode 0600 if missing, and returns
-    /// its events in file order. Bytes after the last `\n` are a torn tail: they are
+    /// Opens the journal at `path`, creating it with mode 0600 if missing, visiting
+    /// validated events in file order. Bytes after the last `\n` are a torn tail: they are
     /// truncated away and logged. Any complete line that is not a journal event, or
     /// whose seq is not the previous one plus 1 (starting at 1), is an error, so the
     /// caller quarantines the session (DESIGN §3.4.4).
-    pub fn open(path: &Path) -> Result<(Journal, Vec<JournalEvent>)> {
+    pub fn open(path: &Path, mut visit: impl FnMut(JournalEvent)) -> Result<Journal> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -60,8 +75,9 @@ impl Journal {
             .open(path)
             .with_context(|| format!("cannot open {}", path.display()))?;
         let mut reader = BufReader::new(&file);
-        let mut events: Vec<JournalEvent> = Vec::new();
+        let mut head = 0;
         let mut end = 0u64;
+        let mut offsets = Vec::new();
         let mut line = Vec::new();
         loop {
             line.clear();
@@ -83,7 +99,7 @@ impl Journal {
                     path.display()
                 )
             })?;
-            let due = events.len() as u64 + 1;
+            let due = head + 1;
             if ev.seq != due {
                 bail!(
                     "{}: the line at byte {end} has seq {} where {due} is due",
@@ -92,26 +108,28 @@ impl Journal {
                 );
             }
             end += n as u64;
-            events.push(ev);
+            head = ev.seq;
+            checkpoint(&mut offsets, head, end);
+            visit(ev);
         }
-        let journal = Journal {
+        Ok(Journal {
             file,
             end,
-            head: events.len() as u64,
+            head,
+            offsets,
             #[cfg(any(test, debug_assertions))]
             fail_at: fail_at_from_env(),
-        };
-        Ok((journal, events))
+        })
     }
 
     /// Writes `body` as the next event with one `write(2)`. Only a complete write
     /// advances the head; on any failure the file is truncated back and the fault
     /// returned.
-    pub fn append(&mut self, body: &EventBody, ts: u64) -> Result<JournalEvent, WriteFault> {
+    pub fn append(&mut self, body: EventBody, ts: u64) -> Result<JournalEvent, WriteFault> {
         let ev = JournalEvent {
             seq: self.head + 1,
             ts,
-            body: body.clone(),
+            body,
         };
         let bytes = line::encode(&ev);
         if let Err(error) = self.write(&bytes) {
@@ -122,6 +140,7 @@ impl Journal {
         }
         self.end += bytes.len() as u64;
         self.head = ev.seq;
+        checkpoint(&mut self.offsets, self.head, self.end);
         Ok(ev)
     }
 
@@ -152,7 +171,7 @@ impl Journal {
             reason: ExitReason::HubRestart,
         });
         let mut written = Vec::with_capacity(lines.len());
-        for body in &lines {
+        for body in lines {
             let ev = self.append(body, ts)?;
             facts.apply(&ev);
             written.push(ev);
@@ -170,6 +189,16 @@ impl Journal {
     /// The head seq: the seq of the last event written, 0 for an empty journal.
     pub fn len(&self) -> u64 {
         self.head
+    }
+
+    /// An offset hint after `checkpoint_seq(since)`, or zero if not indexed.
+    pub fn replay_offset(&self, since: u64) -> u64 {
+        let block = checkpoint_seq(since) / CHECKPOINT_STRIDE;
+        block
+            .checked_sub(1)
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| self.offsets.get(i).copied())
+            .unwrap_or(0)
     }
 
     /// One `pwrite(2)` of `bytes` at the end of the last complete line; a short write
@@ -261,10 +290,16 @@ mod tests {
     fn write_all(j: &mut Journal, bodies: &[EventBody]) -> Facts {
         let mut facts = Facts::default();
         for b in bodies {
-            let ev = j.append(b, j.len() + 1).unwrap();
+            let ev = j.append(b.clone(), j.len() + 1).unwrap();
             facts.apply(&ev);
         }
         facts
+    }
+
+    fn open_events(path: &Path) -> Result<(Journal, Vec<JournalEvent>)> {
+        let mut events = Vec::new();
+        let journal = Journal::open(path, |ev| events.push(ev))?;
+        Ok((journal, events))
     }
 
     fn fold(events: &[JournalEvent]) -> Facts {
@@ -278,7 +313,7 @@ mod tests {
     #[test]
     fn append_and_reload_round_trip() {
         let path = fresh_dir("round").join("s.jsonl");
-        let (mut j, events) = Journal::open(&path).unwrap();
+        let (mut j, events) = open_events(&path).unwrap();
         assert!(events.is_empty());
         assert_eq!(j.len(), 0);
         let notice = EventBody::Notice {
@@ -288,7 +323,7 @@ mod tests {
         let bodies = [spawn(), session(), prompt(), chunk("héllo\n"), notice];
         let mut written = Vec::new();
         for (i, b) in bodies.iter().enumerate() {
-            let ev = j.append(b, 100 + i as u64).unwrap();
+            let ev = j.append(b.clone(), 100 + i as u64).unwrap();
             assert_eq!((ev.seq, ev.ts, &ev.body), (i as u64 + 1, 100 + i as u64, b));
             written.push(ev);
         }
@@ -300,7 +335,7 @@ mod tests {
         let expected: Vec<u8> = written.iter().flat_map(line::encode).collect();
         assert_eq!(fs::read(&path).unwrap(), expected);
 
-        let (j, events) = Journal::open(&path).unwrap();
+        let (j, events) = open_events(&path).unwrap();
         assert_eq!(events, written);
         assert_eq!(j.len(), 5);
     }
@@ -328,7 +363,7 @@ mod tests {
     fn a_torn_final_line_is_truncated_and_logged() {
         let _torn = crate::lock(&TORN_WARN);
         let path = fresh_dir("torn").join("s.jsonl");
-        let (mut j, _) = Journal::open(&path).unwrap();
+        let mut j = Journal::open(&path, drop).unwrap();
         write_all(&mut j, &[spawn(), session()]);
         drop(j);
         let good = fs::read(&path).unwrap();
@@ -345,16 +380,16 @@ mod tests {
             })
             .finish();
         let (mut j, events) =
-            tracing::subscriber::with_default(subscriber, || Journal::open(&path)).unwrap();
+            tracing::subscriber::with_default(subscriber, || open_events(&path)).unwrap();
         let logged = String::from_utf8(crate::lock(&logs.0).clone()).unwrap();
         assert!(logged.contains("torn journal tail"), "{logged}");
         assert_eq!(events.len(), 2);
         assert_eq!(j.len(), 2);
         assert_eq!(fs::read(&path).unwrap(), good);
 
-        let ev = j.append(&prompt(), 3).unwrap();
+        let ev = j.append(prompt(), 3).unwrap();
         assert_eq!(ev.seq, 3);
-        let (_, events) = Journal::open(&path).unwrap();
+        let (_, events) = open_events(&path).unwrap();
         assert_eq!(events.last(), Some(&ev));
     }
 
@@ -376,7 +411,7 @@ mod tests {
         for (name, content) in cases {
             let path = dir.join(format!("{name}.jsonl"));
             fs::write(&path, &content).unwrap();
-            assert!(Journal::open(&path).is_err(), "{name} loaded");
+            assert!(Journal::open(&path, drop).is_err(), "{name} loaded");
             assert_eq!(
                 fs::read_to_string(&path).unwrap(),
                 content,
@@ -388,12 +423,12 @@ mod tests {
     #[test]
     fn a_write_fault_truncates_and_reuses_no_seq() {
         let path = fresh_dir("fault").join("s.jsonl");
-        let (mut j, _) = Journal::open(&path).unwrap();
+        let mut j = Journal::open(&path, drop).unwrap();
         let mut live = write_all(&mut j, &[spawn(), session()]);
         let before = fs::read(&path).unwrap();
 
         j.fail_at = Some(3);
-        let fault = j.append(&chunk(&"x".repeat(1000)), 3).unwrap_err();
+        let fault = j.append(chunk(&"x".repeat(1000)), 3).unwrap_err();
         assert_eq!(fault.error.to_string(), "injected journal write fault");
         assert_eq!(
             fs::read(&path).unwrap(),
@@ -404,13 +439,13 @@ mod tests {
 
         let mut seqs = vec![1, 2];
         for b in [prompt(), chunk("after")] {
-            let ev = j.append(&b, 9).unwrap();
+            let ev = j.append(b, 9).unwrap();
             live.apply(&ev);
             seqs.push(ev.seq);
         }
         assert_eq!(seqs, [1, 2, 3, 4]);
 
-        let (j, events) = Journal::open(&path).unwrap();
+        let (j, events) = open_events(&path).unwrap();
         assert_eq!(j.len(), 4);
         assert_eq!(events[2].body, prompt());
         assert_eq!(
@@ -421,10 +456,129 @@ mod tests {
     }
 
     #[test]
+    fn replay_crosses_checkpoints_after_a_write_fault_and_reload() {
+        let path = fresh_dir("seek").join("s.jsonl");
+        let mut j = Journal::open(&path, drop).unwrap();
+        for seq in 1..=2 * CHECKPOINT_STRIDE + 2 {
+            if seq == CHECKPOINT_STRIDE {
+                j.fail_at = Some(seq);
+                assert!(j.append(chunk(&"x".repeat(5000)), seq).is_err());
+            }
+            j.append(prompt(), seq).unwrap();
+        }
+        let check = |j: &Journal| {
+            for since in [0, CHECKPOINT_STRIDE - 1, CHECKPOINT_STRIDE, j.len() - 1] {
+                let replay = super::super::replay::scan(
+                    &path,
+                    j.replay_offset(since),
+                    since,
+                    j.len(),
+                    &[],
+                    usize::MAX,
+                )
+                .unwrap();
+                assert!(replay.events.iter().map(|e| e.seq).eq(since + 1..=j.len()));
+            }
+        };
+        check(&j);
+        drop(j);
+        check(&Journal::open(&path, drop).unwrap());
+    }
+
+    #[test]
+    fn stale_replay_checkpoint_cannot_skip_requested_records() {
+        use super::super::replay::scan;
+
+        let path = fresh_dir("seek-shift").join("s.jsonl");
+        let since = CHECKPOINT_STRIDE;
+        let head = since + 2;
+        let mut journal = Journal::open(&path, drop).unwrap();
+        for seq in 1..=head {
+            journal.append(prompt(), seq).unwrap();
+        }
+        let boundary = journal.replay_offset(since) as usize;
+        drop(journal);
+        let compact = fs::read(&path).unwrap();
+        let tail = &compact[boundary..];
+        let next_len = tail.iter().position(|&b| b == b'\n').unwrap() + 1;
+        let full = scan(&path, 0, since, head, &[], usize::MAX).unwrap();
+        assert!(full.events.iter().map(|e| e.seq).eq(since + 1..=head));
+
+        // Index a longer first record, then shorten it without changing any seq.
+        // The stale offset lands inside record 129, on record 130, or at EOF.
+        for shift in [1, next_len, tail.len()] {
+            let mut padded = vec![b' '; shift];
+            padded.extend_from_slice(&compact);
+            fs::write(&path, padded).unwrap();
+            let journal = Journal::open(&path, drop).unwrap();
+            let offset = journal.replay_offset(since);
+            assert_eq!(offset as usize, boundary + shift);
+            fs::write(&path, &compact).unwrap();
+            assert_eq!(
+                scan(&path, offset, since, head, &[], usize::MAX).unwrap(),
+                full
+            );
+        }
+    }
+
+    #[test]
+    fn missing_replay_checkpoint_scans_from_zero() {
+        let path = fresh_dir("seek-missing").join("s.jsonl");
+        let mut journal = Journal::open(&path, drop).unwrap();
+        let since = CHECKPOINT_STRIDE;
+        for seq in 1..=since + 1 {
+            journal.append(prompt(), seq).unwrap();
+        }
+        journal.offsets.clear();
+        let offset = journal.replay_offset(since);
+        assert_eq!(offset, 0);
+        let replay =
+            super::super::replay::scan(&path, offset, since, journal.len(), &[], usize::MAX)
+                .unwrap();
+        assert!(replay.events.iter().map(|e| e.seq).eq([since + 1]));
+    }
+
+    /// A checkpoint followed by one requested, complete record.
+    fn journal_with_indexed_tail(name: &str) -> (PathBuf, u64) {
+        let path = fresh_dir(name).join("s.jsonl");
+        let mut journal = Journal::open(&path, drop).unwrap();
+        for seq in 1..=CHECKPOINT_STRIDE + 1 {
+            journal.append(prompt(), seq).unwrap();
+        }
+        (path, journal.replay_offset(CHECKPOINT_STRIDE))
+    }
+
+    #[test]
+    fn indexed_replay_rejects_junk_before_expected_json() {
+        let (path, offset) = journal_with_indexed_tail("seek-junk");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.insert(offset as usize, b'!');
+        fs::write(&path, bytes).unwrap();
+
+        let since = CHECKPOINT_STRIDE;
+        let scan = |at| super::super::replay::scan(&path, at, since, since + 1, &[], usize::MAX);
+        let from_zero = scan(0).unwrap_err();
+        let at_json = scan(offset + 1).unwrap_err();
+        assert_eq!(at_json.to_string(), from_zero.to_string());
+    }
+
+    #[test]
+    fn indexed_replay_ignores_expected_json_without_final_newline() {
+        let (path, offset) = journal_with_indexed_tail("seek-no-newline");
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+
+        let since = CHECKPOINT_STRIDE;
+        let replay =
+            super::super::replay::scan(&path, offset, since, since + 1, &[], usize::MAX).unwrap();
+        assert!(replay.events.is_empty());
+    }
+
+    #[test]
     fn bytes_left_by_a_failed_truncation_heal() {
         let _torn = crate::lock(&TORN_WARN);
         let path = fresh_dir("heal").join("s.jsonl");
-        let (mut j, _) = Journal::open(&path).unwrap();
+        let mut j = Journal::open(&path, drop).unwrap();
         write_all(&mut j, &[spawn()]);
         let end = fs::metadata(&path).unwrap().len();
         let junk = br#"{"seq":2,"ts":2,"e":"update","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"#;
@@ -435,13 +589,13 @@ mod tests {
             .write_at(junk, end)
             .unwrap();
 
-        let ev2 = j.append(&session(), 2).unwrap();
+        let ev2 = j.append(session(), 2).unwrap();
         assert!(
             fs::metadata(&path).unwrap().len() > j.end,
             "junk is left after the line"
         );
         drop(j);
-        let (j, events) = Journal::open(&path).unwrap();
+        let (j, events) = open_events(&path).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1], ev2);
         assert_eq!(fs::metadata(&path).unwrap().len(), j.end);
@@ -477,7 +631,7 @@ mod tests {
 
     /// Opens the journal at `path`, folds it and normalises it at ts 99.
     fn load(path: &Path) -> (Journal, Facts, Result<Vec<JournalEvent>, WriteFault>) {
-        let (mut j, events) = Journal::open(path).unwrap();
+        let (mut j, events) = open_events(path).unwrap();
         let mut facts = fold(&events);
         let res = j.normalise(&mut facts, 99);
         (j, facts, res)
@@ -486,7 +640,7 @@ mod tests {
     #[test]
     fn normalisation_appends_exactly_the_death_invariant() {
         let path = fresh_dir("norm").join("s.jsonl");
-        let (mut j, _) = Journal::open(&path).unwrap();
+        let mut j = Journal::open(&path, drop).unwrap();
         write_all(&mut j, &mid_turn());
         drop(j);
         let before = fs::read(&path).unwrap();
@@ -526,7 +680,7 @@ mod tests {
     #[test]
     fn normalisation_ends_a_setup() {
         let path = fresh_dir("norm-setup").join("s.jsonl");
-        let (mut j, _) = Journal::open(&path).unwrap();
+        let mut j = Journal::open(&path, drop).unwrap();
         write_all(&mut j, &[spawn()]);
         drop(j);
         let (_, facts, res) = load(&path);
@@ -561,7 +715,7 @@ mod tests {
             ("auth", vec![spawn(), auth_wait]),
         ] {
             let path = fresh_dir(&format!("norm-{name}")).join("s.jsonl");
-            let (mut j, _) = Journal::open(&path).unwrap();
+            let mut j = Journal::open(&path, drop).unwrap();
             write_all(&mut j, &bodies);
             drop(j);
             let (_, _, res) = load(&path);
@@ -595,7 +749,7 @@ mod tests {
             ("ended", vec![spawn(), session(), exited]),
         ] {
             let path = fresh_dir(&format!("alone-{name}")).join("s.jsonl");
-            let (mut j, _) = Journal::open(&path).unwrap();
+            let mut j = Journal::open(&path, drop).unwrap();
             write_all(&mut j, &bodies);
             drop(j);
             let before = fs::read(&path).unwrap();
@@ -608,19 +762,19 @@ mod tests {
     #[test]
     fn a_fault_during_normalisation_folds_what_was_written_and_a_retry_completes() {
         let path = fresh_dir("norm-fault").join("s.jsonl");
-        let (mut j, _) = Journal::open(&path).unwrap();
+        let mut j = Journal::open(&path, drop).unwrap();
         write_all(&mut j, &mid_turn());
         drop(j);
         let before = fs::read(&path).unwrap();
 
-        let (mut j, events) = Journal::open(&path).unwrap();
+        let (mut j, events) = open_events(&path).unwrap();
         let mut facts = fold(&events);
         j.fail_at = Some(7);
         assert!(j.normalise(&mut facts, 99).is_err());
         assert_eq!(facts.head_seq, 6);
         assert_eq!(facts.pending.iter().map(|p| p.req).collect::<Vec<_>>(), [5]);
         assert!(facts.running);
-        let (_, on_disk) = Journal::open(&path).unwrap();
+        let (_, on_disk) = open_events(&path).unwrap();
         assert_eq!(fold(&on_disk), facts, "the facts are the fold of the disk");
 
         let retried = j.normalise(&mut facts, 99).unwrap();
@@ -636,7 +790,7 @@ mod tests {
     #[tokio::test]
     async fn sync_reaches_the_disk_off_the_caller() {
         let path = fresh_dir("sync").join("s.jsonl");
-        let (mut j, _) = Journal::open(&path).unwrap();
+        let mut j = Journal::open(&path, drop).unwrap();
         write_all(&mut j, &[spawn()]);
         j.sync().await.unwrap().unwrap();
     }
