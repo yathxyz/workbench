@@ -972,7 +972,15 @@ impl Acp {
             self.git.spawn(async move {
                 let git = ctx.cfg.git.as_deref().expect("validated worktree request");
                 WorktreeResult::Created(
-                    worktree::create(git, Path::new(&cwd), &request, &sid, cancelled).await,
+                    worktree::create(
+                        git,
+                        Path::new(&cwd),
+                        ctx.cfg.worktree_root.as_deref(),
+                        &request,
+                        &sid,
+                        cancelled,
+                    )
+                    .await,
                 )
             });
         } else {

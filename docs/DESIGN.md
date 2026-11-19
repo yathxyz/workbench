@@ -343,13 +343,15 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 - **Managed worktree (F-A52).** A request with `worktree` requires a local agent and an absolute `cwd` inside a non-bare git checkout, including a subdirectory of a linked worktree, but not a submodule.
   The same rule applies to `branch` and `base`: 1–255 ASCII bytes in `[A-Za-z0-9._/-]`, not `HEAD`, no initial `-`, no `..`, and no empty slash-separated component or component starting with `.` or ending with `.lock`.
   Invalid names are `bad_request` before git runs.
-  For main worktree root `R`, the hub creates the checkout at `R-wt/B`, where `B` is `branch` with every `/` replaced by `-`.
+  For git's resolved main worktree root `R` and branch `B` with each `/` replaced by `-`, the default destination is `R-wt/B`.
+  If `worktreeRoot` is set, the hub starts at that directory, appends the normal path components of `R` after its leading `/`, then appends `B`; main checkouts with the same basename but different full paths therefore do not collide.
   From a linked checkout with a separate main git directory, git must identify the main checkout (for example via `core.worktree`); if it reports only its metadata directory, the hub refuses rather than guessing a destination.
-  The hub creates `R-wt` if needed but never adopts an existing destination, even if empty.
+  The hub creates missing parent directories and leaves them in place, even after rollback or removal; it atomically reserves the final directory and never adopts an existing destination, even if empty.
   A local branch is checked out unchanged; otherwise the hub creates it from the commit id resolved from `base`, defaulting to the `HEAD` of the checkout containing `cwd`, without configuring an upstream or fetching.
   An occupied destination, a destination still registered with git, or a branch listed as checked out elsewhere by `git worktree list --porcelain -z` is `conflict`.
   Any other failure of `git worktree add`, including a checkout race after the list or a failed required filter, is `internal` with git's bounded first error line, control characters removed.
   The agent's actual `cwd` is the new root, and its managed-worktree record survives restart and revive.
+  A change to `worktreeRoot`, including unsetting it, affects new creations only: removal uses the path in the record and verifies the ownership marker, never recomputing the path from today's configuration.
   If creation is refused after checkout, the hub attempts a non-forced removal before abandoning the session, keeps the branch, and reports the path if rollback leaves the worktree.
   An accepted dead session following an exec or setup failure (§3.2.7) is not an abandoned creation and keeps its record.
   Git runs outside the actor, without blocking other sessions on the connection or delaying shutdown.
@@ -1012,6 +1014,7 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
 - **Required keys:** `stateDir`, `host`, `shells`, `defaultShell` and `child`. `socket` defaults to the value shown, and `agents` to empty. Unknown keys are refused at every level (`deny_unknown_fields`).
 - **Validation** refuses to start the hub when:
   - `socket` is not absolute or is 108 bytes or longer, or `stateDir` is not absolute;
+  - `worktreeRoot`, when set, is not absolute, contains NUL, or has a `.` or `..` component;
   - a shell name does not match `^[a-z0-9-]{1,32}$` or is listed twice, a shell's `paths` is empty or holds a relative path, or its `args` contain NUL;
   - `defaultShell` is not in `shells`;
   - an environment variable name (in `passEnv`, `setEnv` or an agent's `env`) does not match `^[A-Za-z_][A-Za-z0-9_]{0,63}$`;
@@ -1027,6 +1030,9 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
   Its cleared git environment carries only the hub's own `HOME`, `XDG_CONFIG_HOME` and `PATH` if set, plus `GIT_TERMINAL_PROMPT=0` and `LC_ALL=C`.
   This is not confinement: the agent retains its ordinary filesystem access, and git uses repository and user configuration, including filters that run on checkout.
   A checkout filter must be resolvable on that `PATH` or named by absolute path; a required filter that cannot run fails the request.
+- **`worktreeRoot`** (optional) sets the directory under which the hub mirrors each main checkout's absolute path for new managed worktrees (§3.2.7).
+  `services.workbench.worktreeRoot` defaults to `null`, so the module omits the key and the hub keeps the sibling layout.
+  The hub user needs write access; a root inside a checkout is allowed, but use a location outside any checkout or ignore the root in the containing checkout to keep it out of `git status`.
 - **Test configs:** take the shell path from `$BASH`, because the sandbox has no `/run/current-system`. The harness also configures `sh` as a second shell (§7, N-6).
 
 #### 3.7.3 Child environment (built from scratch)
@@ -1141,8 +1147,10 @@ The API starts no PTY and sends no PTY input: a shell on the mesh is what ssh is
 Non-empty `config` requires `acpConfig:true` in the connected hub's hello. Otherwise creation is 400 "hub does not support session configuration", before any open or spawn is sent; a missing capability on an older hub is not success. Missing config or `{}` keeps the old behaviour.
 
 **Worktree on create.** `worktree` accepts only a required `branch` string and an optional `base` string (§3.2.7); there is no path argument.
+The hub chooses the destination at creation: for main checkout `/home/u/proj/app` and branch `feat/x`, the default is `/home/u/proj/app-wt/feat-x`; with `worktreeRoot` set to `/srv/wt` it is `/srv/wt/home/u/proj/app/feat-x`.
 A remote `host`, an invalid name, a `cwd` outside a checkout, in a bare repository or in a submodule, or a hub that does not advertise `acpWorktree:true` is 400.
 On success the returned session has the new `cwd` and `acp.managedWorktree`.
+Changing or unsetting the hub's root does not move existing worktrees or change which checkout a session's removal request can delete.
 Removal refuses modified files and non-ignored untracked files, but deletes **everything git ignores**, including local configuration such as `.env` and ignored nested repositories with their unpushed commits.
 A killed removal can leave tracked files partially deleted; the record stays, and retrying may refuse until the operator inspects and restores the checkout.
 The branch is never deleted.

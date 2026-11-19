@@ -105,8 +105,17 @@ async fn create(
     cwd: &Path,
     request: &WorktreeRequest,
 ) -> Result<ManagedWorktree, Error> {
+    create_at(git, cwd, None, request).await
+}
+
+async fn create_at(
+    git: &Path,
+    cwd: &Path,
+    root: Option<&Path>,
+    request: &WorktreeRequest,
+) -> Result<ManagedWorktree, Error> {
     let (_tx, rx) = oneshot::channel();
-    super::create(git, cwd, request, SID, rx)
+    super::create(git, cwd, root, request, SID, rx)
         .await
         .map_err(|failure| match failure {
             CreateFailure::Clean(err) => err,
@@ -307,7 +316,7 @@ async fn stale_records_leave_no_worktree_and_replacements_alone() {
     fs::remove_dir(wt).unwrap();
 
     let (_tx, rx) = oneshot::channel();
-    let other = super::create(&f.git, &repo, &req, "other", rx)
+    let other = super::create(&f.git, &repo, None, &req, "other", rx)
         .await
         .unwrap();
     assert!(!remove(&f.git, &original, SID).await.unwrap());
@@ -370,9 +379,8 @@ async fn expire_when_ready<F: Future, R: Future>(command: F, ready: R) -> (F::Ou
 
 // Run every normal git command unchanged; intercept precisely the add. The
 // real git has registered and populated the worktree before the fake sleeps.
-fn slow_add(f: &Fixture, branch: &str, body: &str) -> PathBuf {
+fn slow_add(f: &Fixture, wt: &Path, body: &str) -> PathBuf {
     let fake = f.temp.join("slow-add");
-    let wt = f.temp.join("main repo-wt").join(branch);
     script(
         &fake,
         &format!(
@@ -389,15 +397,18 @@ fn slow_add(f: &Fixture, branch: &str, body: &str) -> PathBuf {
 async fn timed_out_add_unlocks_and_force_removes_only_the_reserved_checkout() {
     let f = Fixture::new();
     let repo = f.repo();
+    let root = f.temp.join("central");
+    let parent = root.join(repo.strip_prefix("/").unwrap());
+    let wt = parent.join("timed");
     let fake = slow_add(
         &f,
-        "timed",
+        &wt,
         "\"$git\" \"$@\"\n\"$git\" worktree lock -- \"$wt\"\n: > \"$wt/untracked\"",
     );
     let req = request("timed", None);
     let ready = repo.join("ready");
     let (result, ()) = expire_when_ready(
-        create(&fake, &repo, &req),
+        create_at(&fake, &repo, Some(&root), &req),
         wait_for("registered, locked checkout", || ready.is_file()),
     )
     .await;
@@ -405,7 +416,8 @@ async fn timed_out_add_unlocks_and_force_removes_only_the_reserved_checkout() {
         result.unwrap_err(),
         (ErrorCode::Timeout, "git worktree add timed out".into())
     );
-    assert!(!f.temp.join("main repo-wt/timed").exists());
+    assert!(!wt.exists());
+    assert!(parent.is_dir());
     assert!(
         !f.git(&repo, &["worktree", "list", "--porcelain"])
             .contains("refs/heads/timed")
@@ -414,7 +426,7 @@ async fn timed_out_add_unlocks_and_force_removes_only_the_reserved_checkout() {
         f.git(&repo, &["show-ref", "--verify", "refs/heads/timed"])
             .contains("refs/heads/timed")
     );
-    create(&f.git, &repo, &req).await.unwrap();
+    create_at(&f.git, &repo, Some(&root), &req).await.unwrap();
 }
 
 #[tokio::test]
@@ -429,10 +441,11 @@ async fn cancel_unregistered_unlocked_and_replaced_add() {
     ] {
         let f = Fixture::new();
         let repo = f.repo();
-        let fake = slow_add(&f, branch, body);
+        let wt = f.temp.join("main repo-wt").join(branch);
+        let fake = slow_add(&f, &wt, body);
         let req = request(branch, None);
         let (tx, rx) = oneshot::channel();
-        let creation = super::create(&fake, &repo, &req, SID, rx);
+        let creation = super::create(&fake, &repo, None, &req, SID, rx);
         let ready = repo.join("ready");
         let interrupt = async {
             wait_for("interrupted add fixture", || ready.is_file()).await;
@@ -440,7 +453,6 @@ async fn cancel_unregistered_unlocked_and_replaced_add() {
         };
         let (result, ()) = tokio::join!(creation, interrupt);
         let err = result.unwrap_err();
-        let wt = f.temp.join("main repo-wt").join(branch);
         if branch == "replaced" {
             let CreateFailure::PossibleLeftover((code, message)) = err else {
                 panic!("replacement must report a leftover: {err:?}");
@@ -545,6 +557,78 @@ async fn linked_subdirectory_uses_linked_head_but_main_checkout_sibling() {
     assert_eq!(f.git(Path::new(&record.path), &["rev-parse", "HEAD"]), old);
 }
 
+#[test]
+fn destination_rejects_unexpected_main_checkout_components() {
+    for main in ["relative", "/./repo", "/repo/.", "/nested/../repo", "/a\0b"] {
+        for root in [None, Some(Path::new("/central"))] {
+            assert_eq!(
+                worktree_parent(main, root).unwrap_err().0,
+                ErrorCode::BadRequest,
+                "{main:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn configured_root_mirrors_main_checkout_from_main_linked_and_subdirectory() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let root = repo.join(".worktrees"); // Inside the checkout is allowed.
+    let linked = f.temp.join("linked");
+    f.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "--",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let subdir = repo.join("src");
+    fs::create_dir(&subdir).unwrap();
+    let parent = root.join(repo.strip_prefix("/").unwrap());
+    for cwd in [&repo, &linked, &subdir] {
+        let record = create_at(&f.git, cwd, Some(&root), &request("feat/x", None))
+            .await
+            .unwrap();
+        assert_eq!(Path::new(&record.main_root), repo);
+        let path = Path::new(&record.path);
+        assert_eq!(path, parent.join("feat-x"));
+        assert_eq!(f.git(path, &["symbolic-ref", "--short", "HEAD"]), "feat/x");
+        assert!(remove(&f.git, &record, SID).await.unwrap());
+        assert!(!path.exists());
+        assert!(parent.is_dir());
+    }
+}
+
+#[tokio::test]
+async fn configured_root_separates_same_named_repositories() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let other = f.temp.join(".worktrees/main repo");
+    fs::create_dir(other.parent().unwrap()).unwrap();
+    f.git(
+        &f.temp,
+        &[
+            "clone",
+            "--",
+            repo.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    let root = f.temp.join("central");
+    for main in [&repo, &other] {
+        let record = create_at(&f.git, main, Some(&root), &request("same", None))
+            .await
+            .unwrap();
+        let expected = root.join(main.strip_prefix("/").unwrap()).join("same");
+        assert_eq!(Path::new(&record.path), expected);
+        assert!(expected.join("tracked").is_file());
+    }
+}
+
 #[tokio::test]
 async fn existing_local_branch_is_attached_not_reset_or_detached_at_same_named_tag() {
     let f = Fixture::new();
@@ -580,13 +664,14 @@ async fn existing_local_branch_is_attached_not_reset_or_detached_at_same_named_t
 async fn reserves_path_without_touching_any_existing_entry() {
     let f = Fixture::new();
     let repo = f.repo();
-    let parent = f.temp.join("main repo-wt");
-    fs::create_dir(&parent).unwrap();
+    let root = f.temp.join("central");
+    let parent = root.join(repo.strip_prefix("/").unwrap());
+    fs::create_dir_all(&parent).unwrap();
     fs::create_dir(parent.join("empty")).unwrap();
     fs::write(parent.join("file"), b"keep").unwrap();
     symlink("missing", parent.join("dangling")).unwrap();
     for name in ["empty", "file", "dangling"] {
-        let err = create(&f.git, &repo, &request(name, None))
+        let err = create_at(&f.git, &repo, Some(&root), &request(name, None))
             .await
             .unwrap_err();
         assert_eq!(err.0, ErrorCode::Conflict);
@@ -601,7 +686,10 @@ async fn reserves_path_without_touching_any_existing_entry() {
 
     let a = request("a/b", None);
     let b = request("a-b", None);
-    let (one, two) = tokio::join!(create(&f.git, &repo, &a), create(&f.git, &repo, &b));
+    let (one, two) = tokio::join!(
+        create_at(&f.git, &repo, Some(&root), &a),
+        create_at(&f.git, &repo, Some(&root), &b)
+    );
     match (one, two) {
         (Ok(rec), Err(err)) | (Err(err), Ok(rec)) => {
             assert_eq!(err.0, ErrorCode::Conflict);

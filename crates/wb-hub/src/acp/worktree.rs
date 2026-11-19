@@ -627,9 +627,32 @@ async fn rollback(
     Ok(())
 }
 
+fn worktree_parent(main_root: &str, worktree_root: Option<&Path>) -> Result<PathBuf, Error> {
+    let invalid = || {
+        (
+            ErrorCode::BadRequest,
+            "invalid git main checkout path".into(),
+        )
+    };
+    let relative = main_root.strip_prefix('/').ok_or_else(invalid)?;
+    let mut parent = worktree_root.unwrap_or(Path::new("/")).to_owned();
+    // Inspect each Unix component before Path::components can normalize away `.`.
+    for name in relative.split_terminator('/') {
+        if matches!(name, "" | "." | "..") || name.contains('\0') {
+            return Err(invalid());
+        }
+        parent.push(name);
+    }
+    if worktree_root.is_none() {
+        parent.as_mut_os_string().push("-wt");
+    }
+    Ok(parent)
+}
+
 pub(super) async fn create(
     git: &Path,
     cwd: &Path,
+    worktree_root: Option<&Path>,
     request: &WorktreeRequest,
     sid: &str,
     mut cancel: oneshot::Receiver<()>,
@@ -647,11 +670,15 @@ pub(super) async fn create(
         _ = &mut cancel => return Err(Clean(cancelled())),
         root = main_checkout(git, cwd) => root.map_err(Clean)?,
     };
-    let parent = format!("{main_root}-wt");
-    let path = format!("{parent}/{}", request.branch.replace('/', "-"));
-    fs::create_dir_all(&parent)
+    let mut destination = worktree_parent(&main_root, worktree_root).map_err(Clean)?;
+    fs::create_dir_all(&destination)
         .await
         .map_err(|e| Clean(internal(e)))?;
+    destination.push(request.branch.replace('/', "-"));
+    let path = destination
+        .into_os_string()
+        .into_string()
+        .map_err(|_| Clean((ErrorCode::BadRequest, "worktree path is not UTF-8".into())))?;
     // A check followed by `git worktree add` is racy: git accepts existing empty
     // directories. Atomically reserve this name, including against dangling links.
     fs::create_dir(&path).await.map_err(|e| {

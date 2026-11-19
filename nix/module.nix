@@ -95,6 +95,9 @@ let
     // lib.optionalAttrs (cfg.gitPackage != null) {
       git = "/etc/workbench/bin/git";
     }
+    // lib.optionalAttrs (cfg.worktreeRoot != null) {
+      inherit (cfg) worktreeRoot;
+    }
     # Only when set, so that a hub without hosts keeps its config, and its sessions.
     // lib.optionalAttrs (cfg.hosts != { }) {
       hosts = lib.mapAttrs (_: h: {
@@ -222,6 +225,17 @@ in
       default = pkgs.git;
       defaultText = lib.literalExpression "pkgs.git";
       description = "Git used by the hub to create and remove local ACP worktrees; null disables this capability.";
+    };
+
+    worktreeRoot = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/srv/wt";
+      description = ''
+        Absolute runtime directory under which the hub mirrors main checkout paths for new managed
+        local ACP worktrees. It must be writable by the service user. When null, the hub places
+        worktrees beside the main checkout instead.
+      '';
     };
 
     webPackage = mkOption {
@@ -608,6 +622,15 @@ in
             && cfg.webPackage == self.packages.${system}.workbench-web
           );
         message = "services.workbench.releaseProfile pins the hub with this flake's release, so package and webPackage must keep their defaults.";
+      }
+      {
+        assertion =
+          cfg.worktreeRoot == null
+          || (
+            lib.hasPrefix "/" cfg.worktreeRoot
+            && lib.all (part: part != "." && part != "..") (lib.splitString "/" cfg.worktreeRoot)
+          );
+        message = "services.workbench.worktreeRoot must be an absolute path without . or .. components.";
       }
       {
         assertion = lib.all isName (lib.attrNames cfg.agents);

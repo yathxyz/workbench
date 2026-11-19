@@ -43,6 +43,8 @@ pub struct Config {
     pub hosts: BTreeMap<String, HostConfig>,
     /// Absolute git executable for managed local ACP worktrees, if enabled.
     pub git: Option<PathBuf>,
+    /// Mirror new managed worktrees here instead of beside the main checkout.
+    pub worktree_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +144,14 @@ impl Config {
             .is_some_and(|p| !p.is_absolute() || p.as_os_str().as_encoded_bytes().contains(&0))
         {
             bail!("git must be an absolute executable path without NUL");
+        }
+        // Path::components() normalizes interior `.`; reject it as written.
+        if let Some(root) = &self.worktree_root
+            && !root.to_str().is_some_and(|s| {
+                absolute(s) && !s.split('/').any(|part| matches!(part, "." | ".."))
+            })
+        {
+            bail!("worktreeRoot must be an absolute path without NUL, . or .. components");
         }
         let mut seen = BTreeSet::new();
         for shell in &self.shells {
@@ -314,6 +324,28 @@ mod tests {
                 .as_deref(),
             Some(Path::new("/bin/git"))
         );
+    }
+
+    #[test]
+    fn worktree_root_must_be_absolute_without_dot_components() {
+        for path in [
+            "relative",
+            "",
+            "/srv/./wt",
+            "/srv/.",
+            "/srv/../wt",
+            "/srv/..",
+            "/wt\0",
+        ] {
+            assert!(
+                with(|v| v["worktreeRoot"] = path.into()).is_err(),
+                "{path:?}"
+            );
+        }
+        for path in ["/", "/srv/.worktrees"] {
+            let cfg = with(|v| v["worktreeRoot"] = path.into()).unwrap();
+            assert_eq!(cfg.worktree_root.as_deref(), Some(Path::new(path)));
+        }
     }
 
     /// The example of DESIGN §3.8.5 under `hosts`.

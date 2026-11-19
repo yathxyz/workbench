@@ -489,6 +489,14 @@ def worktrees(t, h):
                            "web watch of restarted hub", h.web)
         return hello
 
+    def restart_with_root(root):
+        if root is None:
+            del h.hub_config["worktreeRoot"]
+        else:
+            h.hub_config["worktreeRoot"] = str(root)
+        h.write_json("hub.json", h.hub_config)
+        restart_hub()
+
     def refused(sid, **extra):
         spawn = dict(agent="stub", cwd=str(repo), worktree={"branch": sid}, **extra)
         api("POST", "sessions", 400, dict(sid=sid, **spawn))
@@ -589,7 +597,10 @@ def worktrees(t, h):
 
     sid, branch = "wt_managed", "feat/session"
     session = "sessions/" + sid
-    wt = sibling / "feat-session"
+    root_a, root_b = repo.parent / "managed A", repo.parent / "managed B"
+    mirror = repo.relative_to("/")
+    restart_with_root(root_a)
+    wt = root_a / mirror / "feat-session"
     managed = {"mainRoot": str(repo), "branch": branch, "path": str(wt)}
 
     def wait_summary(path, condition, why):
@@ -621,9 +632,9 @@ def worktrees(t, h):
     api("DELETE", session + "/worktree", 409)
     t.check("worktree: removal while running leaves the registration", registered(wt) and wt.is_dir())
 
-    restart_hub()
+    restart_with_root(root_b)
     recovered = api("GET", session, 200)
-    t.check("worktree: restart keeps the dead, revivable session's cwd and record",
+    t.check("worktree: changing the root keeps the saved cwd and managed record",
             recovered["alive"] is False and recovered["acp"]["revivable"]
             and recovered["cwd"] == str(wt) and recovered["acp"].get("managedWorktree") == managed,
             repr(recovered))
@@ -652,12 +663,28 @@ def worktrees(t, h):
     t.check("worktree: clean removal replies with an empty object", api("DELETE", session + "/worktree", 200) == {})
     wait_summary(session, lambda s: not s["alive"] and s["acp"].get("managedWorktree") is None,
                  "cleared managed worktree record")
-    restart_hub()
+    # Now make a worktree under the new root, then remove it with neither root configured.
+    second = "wt_root_b"
+    second_path = root_b / mirror / second
+    second_session = "sessions/" + second
+    made = api("POST", "sessions", 201, {"sid": second, "agent": "missing", "cwd": str(repo),
+                                         "worktree": {"branch": second}})["session"]
+    second_record = {"mainRoot": str(repo), "branch": second, "path": str(second_path)}
+    t.check("worktree: a new create uses the changed root",
+            made["acp"].get("managedWorktree") == second_record and registered(second_path), repr(made))
+    restart_with_root(None)
+    t.check("worktree: unsetting the root keeps the previously recorded checkout",
+            api("GET", second_session, 200)["acp"].get("managedWorktree") == second_record)
+    api("DELETE", second_session + "/worktree", 200)
+    t.check("worktree: removal after unsetting the root uses the recorded path and leaves parents",
+            not second_path.exists() and not registered(second_path) and second_path.parent.is_dir()
+            and git("rev-parse", second) == head)
     t.check("worktree: cleared record stays cleared on restart",
             api("GET", session, 200)["acp"].get("managedWorktree") is None)
     api("DELETE", session + "/worktree", 404)
-    t.check("worktree: clean removal clears record and registration but retains branch",
-            not wt.exists() and not registered(wt) and git("rev-parse", "refs/heads/" + branch) == head)
+    t.check("worktree: removal after changing the root clears checkout and registration but retains branch and parents",
+            not wt.exists() and not registered(wt) and wt.parent.is_dir()
+            and git("rev-parse", "refs/heads/" + branch) == head)
     error = api("POST", session + "/revive", 409)
     t.check("worktree: reviving after removal explains the missing working directory",
             error.get("code") == "not_revivable" and error["error"] == f"session working directory no longer exists: {wt}",
