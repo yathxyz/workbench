@@ -574,7 +574,7 @@ fn destination_rejects_unexpected_main_checkout_components() {
 async fn configured_root_mirrors_main_checkout_from_main_linked_and_subdirectory() {
     let f = Fixture::new();
     let repo = f.repo();
-    let root = repo.join(".worktrees"); // Inside the checkout is allowed.
+    let root = repo.join(".git-backup"); // A shared string prefix is not a .git component.
     let linked = f.temp.join("linked");
     f.git(
         &repo,
@@ -601,6 +601,66 @@ async fn configured_root_mirrors_main_checkout_from_main_linked_and_subdirectory
         assert!(!path.exists());
         assert!(parent.is_dir());
     }
+}
+
+#[tokio::test]
+async fn refuses_a_destination_in_the_common_git_dir_before_creating_parents() {
+    for separate in [false, true] {
+        let f = Fixture::new();
+        let repo = f.repo();
+        let common = if separate {
+            let metadata = f.temp.join("metadata");
+            f.git(
+                &repo,
+                &["init", "--separate-git-dir", metadata.to_str().unwrap()],
+            );
+            metadata
+        } else {
+            repo.join(".git")
+        };
+        let root = common.join("worktrees");
+        let error = create_at(&f.git, &repo, Some(&root), &request("topic", None))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, ErrorCode::BadRequest, "{error:?}");
+        assert!(
+            !root.exists(),
+            "created a directory under {}",
+            common.display()
+        );
+        assert!(f.git(&repo, &["branch", "--list", "topic"]).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn linked_checkout_refuses_a_mirrored_parent_symlinked_into_the_common_git_dir() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let linked = f.temp.join("linked");
+    f.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "--",
+            linked.to_str().unwrap(),
+        ],
+    );
+
+    // The configured root is outside the checkout; only the mirrored path enters refs.
+    let root = f.temp.join("mirror");
+    let mirror = root.join(repo.strip_prefix("/").unwrap());
+    let alias = mirror.parent().unwrap();
+    fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    let refs = repo.join(".git/refs");
+    symlink(&refs, alias).unwrap();
+    let error = create_at(&f.git, &linked, Some(&root), &request("topic", None))
+        .await
+        .unwrap_err();
+    assert_eq!(error.0, ErrorCode::BadRequest, "{error:?}");
+    assert!(!refs.join(repo.file_name().unwrap()).exists());
+    assert!(f.git(&repo, &["branch", "--list", "topic"]).is_empty());
 }
 
 #[tokio::test]

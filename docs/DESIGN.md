@@ -345,6 +345,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
   Invalid names are `bad_request` before git runs.
   For git's resolved main worktree root `R` and branch `B` with each `/` replaced by `-`, the default destination is `R-wt/B`.
   If `worktreeRoot` is set, the hub starts at that directory, appends the normal path components of `R` after its leading `/`, then appends `B`; main checkouts with the same basename but different full paths therefore do not collide.
+  Before creating any directories, the hub rejects a destination inside the repository's common git directory with 400 `bad_request`, resolving symlinks and accounting for separate git directories.
   From a linked checkout with a separate main git directory, git must identify the main checkout (for example via `core.worktree`); if it reports only its metadata directory, the hub refuses rather than guessing a destination.
   The hub creates missing parent directories and leaves them in place, even after rollback or removal; it atomically reserves the final directory and never adopts an existing destination, even if empty.
   A local branch is checked out unchanged; otherwise the hub creates it from the commit id resolved from `base`, defaulting to the `HEAD` of the checkout containing `cwd`, without configuring an upstream or fetching.
@@ -1014,7 +1015,7 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
 - **Required keys:** `stateDir`, `host`, `shells`, `defaultShell` and `child`. `socket` defaults to the value shown, and `agents` to empty. Unknown keys are refused at every level (`deny_unknown_fields`).
 - **Validation** refuses to start the hub when:
   - `socket` is not absolute or is 108 bytes or longer, or `stateDir` is not absolute;
-  - `worktreeRoot`, when set, is not absolute, contains NUL, or has a `.` or `..` component;
+  - `worktreeRoot`, when set, is not absolute, contains NUL, or has a component named `.`, `..` or `.git`;
   - a shell name does not match `^[a-z0-9-]{1,32}$` or is listed twice, a shell's `paths` is empty or holds a relative path, or its `args` contain NUL;
   - `defaultShell` is not in `shells`;
   - an environment variable name (in `passEnv`, `setEnv` or an agent's `env`) does not match `^[A-Za-z_][A-Za-z0-9_]{0,63}$`;
@@ -1032,7 +1033,9 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
   A checkout filter must be resolvable on that `PATH` or named by absolute path; a required filter that cannot run fails the request.
 - **`worktreeRoot`** (optional) sets the directory under which the hub mirrors each main checkout's absolute path for new managed worktrees (§3.2.7).
   `services.workbench.worktreeRoot` defaults to `null`, so the module omits the key and the hub keeps the sibling layout.
-  The hub user needs write access; a root inside a checkout is allowed, but use a location outside any checkout or ignore the root in the containing checkout to keep it out of `git status`.
+  The hub user needs write access; a root inside a checkout is allowed, but the destination must be outside the repository's common git directory.
+  With `worktreeRoot` set to `/`, the worktree is placed directly in the main checkout at `<main-root>/<flattened-branch>`; an occupied name returns 409.
+  Use a root outside any checkout or ignore it in the containing checkout to keep it out of `git status`.
 - **Test configs:** take the shell path from `$BASH`, because the sandbox has no `/run/current-system`. The harness also configures `sh` as a second shell (§7, N-6).
 
 #### 3.7.3 Child environment (built from scratch)

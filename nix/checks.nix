@@ -247,6 +247,7 @@ in
         relativeRoot = badRoot;
         dotRoot = badRoot;
         parentRoot = badRoot;
+        gitDirRoot = badRoot;
         shellName = [ "services.workbench.shells: names" ];
         environmentName = [ "services.workbench.environment and agents" ];
         agentEnvName = [ "services.workbench.environment and agents" ];
@@ -264,6 +265,7 @@ in
         relativeRoot.services.workbench.worktreeRoot = "worktrees";
         dotRoot.services.workbench.worktreeRoot = "/srv/./wt";
         parentRoot.services.workbench.worktreeRoot = "/srv/wt/..";
+        gitDirRoot.services.workbench.worktreeRoot = "/srv/repo/.git/worktrees";
         shellName.services.workbench.shells = {
           bash.paths = [ "/run/current-system/sw/bin/bash" ];
           my_sh.paths = [ "/run/current-system/sw/bin/sh" ];

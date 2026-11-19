@@ -628,9 +628,9 @@ in
           cfg.worktreeRoot == null
           || (
             lib.hasPrefix "/" cfg.worktreeRoot
-            && lib.all (part: part != "." && part != "..") (lib.splitString "/" cfg.worktreeRoot)
+            && lib.all (part: !(lib.elem part [ "." ".." ".git" ])) (lib.splitString "/" cfg.worktreeRoot)
           );
-        message = "services.workbench.worktreeRoot must be an absolute path without . or .. components.";
+        message = "services.workbench.worktreeRoot must be an absolute path without components named ., .. or .git.";
       }
       {
         assertion = lib.all isName (lib.attrNames cfg.agents);

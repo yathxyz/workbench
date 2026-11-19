@@ -649,6 +649,41 @@ fn worktree_parent(main_root: &str, worktree_root: Option<&Path>) -> Result<Path
     Ok(parent)
 }
 
+async fn check_destination_parent(git: &Path, cwd: &Path, parent: &Path) -> Result<(), Error> {
+    let out = run(
+        git,
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        GIT_TIMEOUT,
+    )
+    .await?;
+    let bytes = checked(out, ErrorCode::BadRequest)?;
+    let common = absolute_path(bytes.strip_suffix(b"\n").unwrap_or_default())?;
+    let common = fs::canonicalize(common).await.map_err(internal)?;
+
+    // The parent may not exist yet. Its canonical path is the resolved existing
+    // ancestor plus a missing suffix of normal components. Since `common` exists,
+    // the suffix cannot enter it. A dangling symlink is not a missing component.
+    let mut existing = parent;
+    while let Err(e) = fs::symlink_metadata(existing).await {
+        if e.kind() != io::ErrorKind::NotFound {
+            return Err(internal(e));
+        }
+        existing = existing.parent().ok_or_else(|| internal(e))?;
+    }
+    if fs::canonicalize(existing)
+        .await
+        .map_err(internal)?
+        .starts_with(common)
+    {
+        return Err((
+            ErrorCode::BadRequest,
+            "worktree destination is inside the repository's git directory".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn create(
     git: &Path,
     cwd: &Path,
@@ -665,12 +700,16 @@ pub(super) async fn create(
             "invalid worktree branch or base".into(),
         )));
     }
-    let main_root = tokio::select! {
+    let (main_root, mut destination) = tokio::select! {
         biased;
         _ = &mut cancel => return Err(Clean(cancelled())),
-        root = main_checkout(git, cwd) => root.map_err(Clean)?,
+        result = async {
+            let main_root = main_checkout(git, cwd).await?;
+            let parent = worktree_parent(&main_root, worktree_root)?;
+            check_destination_parent(git, cwd, &parent).await?;
+            Ok((main_root, parent))
+        } => result.map_err(Clean)?,
     };
-    let mut destination = worktree_parent(&main_root, worktree_root).map_err(Clean)?;
     fs::create_dir_all(&destination)
         .await
         .map_err(|e| Clean(internal(e)))?;

@@ -148,10 +148,12 @@ impl Config {
         // Path::components() normalizes interior `.`; reject it as written.
         if let Some(root) = &self.worktree_root
             && !root.to_str().is_some_and(|s| {
-                absolute(s) && !s.split('/').any(|part| matches!(part, "." | ".."))
+                absolute(s) && !s.split('/').any(|part| matches!(part, "." | ".." | ".git"))
             })
         {
-            bail!("worktreeRoot must be an absolute path without NUL, . or .. components");
+            bail!(
+                "worktreeRoot must be an absolute path without NUL or components named ., .. or .git"
+            );
         }
         let mut seen = BTreeSet::new();
         for shell in &self.shells {
@@ -335,6 +337,8 @@ mod tests {
             "/srv/.",
             "/srv/../wt",
             "/srv/..",
+            "/srv/.git",
+            "/srv/.git/worktrees",
             "/wt\0",
         ] {
             assert!(
@@ -342,7 +346,7 @@ mod tests {
                 "{path:?}"
             );
         }
-        for path in ["/", "/srv/.worktrees"] {
+        for path in ["/", "/srv/.worktrees", "/srv/.git-backup"] {
             let cfg = with(|v| v["worktreeRoot"] = path.into()).unwrap();
             assert_eq!(cfg.worktree_root.as_deref(), Some(Path::new(path)));
         }
