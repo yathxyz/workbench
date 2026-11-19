@@ -7687,19 +7687,23 @@ function mountPdf(n: PdfNode, L: LiveEntry) {
 function pdfFail(L: LiveEntry, msg: string) { if (L.pdf) L.pdf.err = msg; if (L.note) { L.note.hidden = false; L.note.textContent = msg; } }
 async function pdfOpen(n: PdfNode, L: LiveEntry): Promise<PdfJsDocument | null> {
   const url = pdfUrl(n); if (!url) { pdfFail(L, 'This card names no PDF.'); return null; }
-  let doc: PdfJsDocument;
+  let doc: PdfJsDocument, first: PdfJsPage;
   try {
     const lib = await pdfLib().catch(() => { throw new Error('pdf.js is not in this build of Workbench'); });
+    if (live[n.id] !== L) return null;
     const src = url.startsWith('data:') ? { data: Uint8Array.from(atob(url.slice(url.indexOf(',') + 1)), c => c.charCodeAt(0)) } : { url };
     const task = L.pdf!.task = lib.getDocument({ ...src, enableXfa: false, cMapUrl: new URL('vendor/pdfjs/cmaps/', location.href).href, cMapPacked: true });
     doc = await task.promise;
+    if (live[n.id] !== L) return null;
+    first = await doc.getPage(1);
   } catch (e) {
+    if (live[n.id] !== L) return null;   // pdfClose destroyed the task while it was loading
     const m = String(e?.message || e);
     pdfFail(L, /Missing PDF|Unexpected server response \((400|404)\)/.test(m) ? `Cannot open ${n.path || 'the PDF'}: the file is missing or not a PDF.` : 'Cannot open the PDF: ' + m);
     return null;
   }
-  if (live[n.id] !== L) return null;   // the card went while the file loaded (pdfClose destroyed the task)
-  const P = L.pdf!, first = await doc.getPage(1), vp = first.getViewport({ scale: 1 });
+  if (live[n.id] !== L) return null;
+  const P = L.pdf!, vp = first.getViewport({ scale: 1 });
   P.doc = doc; P.texts = new Array(doc.numPages).fill(null);
   P.pages = Array.from({ length: doc.numPages }, (_, i) => {
     const box = el('div', 'pdf-page'); box.dataset.page = String(i + 1);

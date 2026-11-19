@@ -72,8 +72,23 @@ await section('N73', async () => {
       const tool = (name: string) => C.AGENT_TOOLS.find((t: AgentTool) => t.name === name);
       out.read = await tool('read_pdf').run({ path: n.name, from: 2, to: 2 });
       out.readNode = await tool('read_node').run({ path: n.name });
-      const p2 = C.findNode(await tool('open_pdf').run({ file }));
-      out.opened = p2 && { kind: p2.kind, path: p2.path, other: p2.id !== n.id };
+      // Hold the second card in getPage(1) until removal has destroyed its loading task.
+      const proto: PdfJsDocument = Object.getPrototypeOf(L().doc), getPage = proto.getPage;
+      const first = Promise.withResolvers<PdfJsPage>();
+      let waiting = false;
+      proto.getPage = function (page) {
+        if (this === L().doc || page !== 1) return getPage.call(this, page);
+        waiting = true; return first.promise;
+      };
+      try {
+        const p2 = C.findNode(await tool('open_pdf').run({ file }));
+        out.opened = p2 && { kind: p2.kind, path: p2.path, other: p2.id !== n.id };
+        const P: PdfLive = C.live[p2.id].pdf;
+        if (!await until(() => waiting)) throw new Error('second PDF never requested page 1');
+        C.removeNode(p2.id);
+        first.reject(new Error('Transport destroyed'));
+        out.closedLoading = await P.load === null && !P.err && !C.live[p2.id];
+      } finally { proto.getPage = getPage; }
       // a dropped PDF is a card on its bytes in the blob store
       const dt = new DataTransfer(); dt.items.add(new File([await (await fetch('/api/raw?path=' + encodeURIComponent(file))).blob()], 'dropped.pdf', { type: 'application/pdf' }));
       const vp = document.querySelector('#viewport')!.getBoundingClientRect();
@@ -81,7 +96,7 @@ await section('N73', async () => {
       const dropped = await until(() => Object.values<BoardNode>(S.nodes).find(m => m.kind === 'pdf' && m.name === 'dropped') as PdfNode | undefined);
       await until(() => C.live[dropped!.id]?.pdf?.doc);
       out.dropped = dropped && { blob: dropped.blob, path: dropped.path, pages: dropped.pages, url: C.pdfUrl(dropped) };
-      out.made = [n.id, q?.id, peek?.id, p2?.id, dropped?.id].filter(Boolean);
+      out.made = [n.id, q?.id, peek?.id, dropped?.id].filter(Boolean);
       // a card that goes takes its document with it
       const P = L(); C.removeNode(n.id); out.closed = !C.live[n.id] && P.doc === null && P.pages.length === 0;
       return out;
@@ -92,6 +107,7 @@ await section('N73', async () => {
     check('N73: a PDF on the host opens as a pdf card: two pages, the one in view drawn with a text layer and its link, "p. 1 / 2" on the badge; pdfText reads pages with markers; agents read it (read_pdf; read_node from the reading page, by then page 2) and open another (open_pdf)',
       st.open.pages === 2 && st.open.drawn && st.open.text && st.open.link && st.open.badge === 'p. 1 / 2' && st.open.ident && /--- n68 paper p\. 1 ---[\s\S]*quote target[\s\S]*--- n68 paper p\. 2 ---[\s\S]*Second page text/.test(st.text)
       && /p\. 2 ---[\s\S]*Beta section/.test(st.read) && !/Alpha/.test(st.read) && /p\. 2 ---[\s\S]*Beta section/.test(st.readNode) && st.opened?.kind === 'pdf' && st.opened.path === file && st.opened.other, JSON.stringify(st.open) + st.text.slice(0, 300));
+    check('N73: closing a PDF while page 1 is loading cancels the load without an error', st.closedLoading);
     check('N73: the selection quotes as a ref card holding the page and the text around it (TextQuoteSelector), linked to the PDF; the quote is found again (asked on page 2, found on page 1, lit up), a text that is not there is not',
       st.sel === 'quote target' && st.selOf === 'quote target' && st.quote?.text === 'quote target' && st.quote.src.page === 1 && /The $/.test(st.quote.src.prefix) && /^ sits/.test(st.quote.src.suffix) && st.quote.label === 'n68 paper › p. 1' && st.quote.edge
       && st.find === true && st.hit && st.miss === false, JSON.stringify({ sel: st.sel, quote: st.quote, find: st.find, hit: st.hit, miss: st.miss }));
