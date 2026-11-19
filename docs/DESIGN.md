@@ -290,14 +290,8 @@ The error codes are a closed set:
   - `req` is the journal seq of the announcing event;
   - `title` is the permission's `toolCall.title` or the elicitation's `message`, cut to 200 characters for both kinds. It is `""` when the request has none.
 - **`AcpSessionInfo`:** `{protocolVersion, agentInfo, agentCapabilities, promptCapabilities, authMethods, modes, configOptions, availableCommands, plan, usage}`. It holds the latest materialised values; absent optional values are omitted. `Summary.acp.configOptions` is always present, with `null` when absent.
-- Snapshots and watch events carry complete summaries, including the full option list.
-  This preserves the session summary returned by the browser and mesh HTTP APIs.
-- Live and restored summaries use the same bounds.
-  Display strings (`fault.message`, `pty.fg.comm`, ACP `title`, `last.outcome` and `last.error.message`) are cut at a UTF-8 boundary to 32 KiB each.
-  Longer `host`, `cwd` or `acp.agent` values are represented by empty strings; longer agent-session IDs, mode IDs or managed worktrees with any longer field are absent.
-  `pty.argv` contains the longest prefix of at most 256 arguments and 256 KiB of UTF-8.
-  `acp.pending` contains the oldest 4096 unresolved requests at most; this does not change which requests the hub handles or records in the journal.
-  Session records keep their operational paths and identifiers; these limits apply when making a summary, not when executing a command or resuming an agent.
+- Snapshots and watch events publish live and restored summaries unchanged, including the full option list, whenever they fit in a single-summary page with the longest request ID.
+  Only on overflow does the hub shorten the wire summary; it leaves the journal and session records unchanged.
 - **`Summary.acp.managedWorktree`** is present only for a recorded worktree: `{path, branch, mainRoot}`, with both paths absolute.
   This record is independent of the web's best-effort top-level git metadata (`repo`, `worktree`, `branch`).
 - **`Summary.acp.policy`:** the session's non-empty `Policy` (§3.4.5), omitted when none. It is a hub fact, not an agent config option. Optional rule `programs` is an ordinary policy field, preserved along with roots and command regexes through validation, installation, journaling and replay.

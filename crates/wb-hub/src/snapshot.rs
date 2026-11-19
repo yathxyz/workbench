@@ -12,11 +12,14 @@ use wb_proto::line::encode;
 const LINE_BYTES: usize = MAX_LINE + 1; // includes the newline
 const OK: &[u8] = b"],\"t\":\"ok\"}\n";
 const PAGE: &[u8] = b"],\"t\":\"sessions.page\"}\n";
+// A singleton page with the longest rid takes more space than an `ok` or `session`.
+const SINGLE_SUMMARY_BYTES: usize =
+    LINE_BYTES - b"{\"rid\":18446744073709551615,\"sessions\":[".len() - PAGE.len();
 
 pub const ARGV_MAX: usize = 256;
 pub const ARGV_BYTES_MAX: usize = 256 << 10;
 pub const PENDING_TITLE_CHARS: usize = 200;
-pub const SUMMARY_PENDING_MAX: usize = 4096;
+const SUMMARY_PENDING_MAX: usize = 4096;
 const SUMMARY_TEXT_BYTES: usize = 32 << 10;
 
 // Budget both kinds together, although only one is present. serde_json writes a
@@ -32,25 +35,95 @@ const _: () = assert!(
         < MAX_LINE
 );
 
-/// Preserve identifiers and paths verbatim, or leave them unavailable.
-pub fn summary_id(value: &str) -> Option<&str> {
-    (value.len() <= SUMMARY_TEXT_BYTES).then_some(value)
-}
+/// Preserve a summary as-is if it fits every singleton watch/list envelope.
+pub fn fit_summary(summary: &mut Summary) {
+    struct Budget(usize);
 
-/// Display text can be clipped without altering the session's stored facts.
-pub fn summary_text(value: &str) -> String {
-    value[..value.floor_char_boundary(SUMMARY_TEXT_BYTES)].to_owned()
-}
+    impl Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or(io::ErrorKind::FileTooLarge)?;
+            Ok(bytes.len())
+        }
 
-pub fn summary_argv(argv: &[String]) -> Vec<String> {
-    let mut left = ARGV_BYTES_MAX;
-    argv.iter()
-        .take(ARGV_MAX)
-        .map_while(|arg| {
-            left = left.checked_sub(arg.len())?;
-            Some(arg.clone())
-        })
-        .collect()
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    if serde_json::to_writer(Budget(SINGLE_SUMMARY_BYTES), summary).is_ok() {
+        return;
+    }
+
+    fn clip(text: &mut String) {
+        if too_long(text) {
+            *text = text[..text.floor_char_boundary(SUMMARY_TEXT_BYTES)].to_owned();
+        }
+    }
+
+    fn clear_long(text: &mut String) {
+        if too_long(text) {
+            *text = String::new();
+        }
+    }
+
+    fn too_long(text: &str) -> bool {
+        text.len() > SUMMARY_TEXT_BYTES
+    }
+
+    // Clip display text, but never publish a partial path or identifier.
+    clear_long(&mut summary.host);
+    clear_long(&mut summary.cwd);
+    if let Some(fault) = &mut summary.fault {
+        clip(&mut fault.message);
+    }
+    if let Some(pty) = &mut summary.pty {
+        let mut left = ARGV_BYTES_MAX;
+        let keep = pty
+            .argv
+            .iter()
+            .take(ARGV_MAX)
+            .map_while(|arg| {
+                left = left.checked_sub(arg.len())?;
+                Some(())
+            })
+            .count();
+        pty.argv.truncate(keep);
+        if let Some(fg) = &mut pty.fg {
+            clip(&mut fg.comm);
+        }
+    }
+    if let Some(acp) = &mut summary.acp {
+        clear_long(&mut acp.agent);
+        if acp.agent_session_id.as_deref().is_some_and(too_long) {
+            acp.agent_session_id = None;
+        }
+        if acp.mode_id.as_deref().is_some_and(too_long) {
+            acp.mode_id = None;
+        }
+        if acp.managed_worktree.as_ref().is_some_and(|wt| {
+            [wt.path.as_str(), wt.branch.as_str(), wt.main_root.as_str()]
+                .into_iter()
+                .any(too_long)
+        }) {
+            acp.managed_worktree = None;
+        }
+        if acp.task.as_ref().is_some_and(|task| task.len() > TASK_MAX) {
+            acp.task = None;
+        }
+        acp.pending.truncate(SUMMARY_PENDING_MAX);
+        if let Some(title) = &mut acp.title {
+            clip(title);
+        }
+        if let Some(last) = &mut acp.last {
+            clip(&mut last.outcome);
+            if let Some(error) = &mut last.error {
+                clip(&mut error.message);
+            }
+        }
+    }
 }
 
 pub enum SnapshotMode {

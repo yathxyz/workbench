@@ -2,7 +2,7 @@
 //! at startup, so the folded journal and the live facts agree by construction.
 
 use serde_json::{Value, json};
-use wb_proto::hub::{Activity, Last, LastError, Pending, PendingKind, normalize_task};
+use wb_proto::hub::{Activity, Last, LastError, Pending, PendingKind};
 use wb_proto::journal::{EventBody, JournalEvent, ResolvedBy, SetupErrorCode, TurnErrorCode};
 use wb_proto::policy::Policy;
 
@@ -132,12 +132,7 @@ impl Facts {
             }
             EventBody::Mode { mode_id } => self.set_mode(mode_id),
             EventBody::Config { config_options } => self.set_config_options(config_options),
-            EventBody::Task { task } => {
-                self.task = task
-                    .as_deref()
-                    .and_then(|task| normalize_task(task).ok().flatten())
-                    .map(str::to_owned);
-            }
+            EventBody::Task { task } => self.task.clone_from(task),
             EventBody::Policy { policy } => {
                 self.policy =
                     (policy.validate().is_ok() && !policy.rules.is_empty()).then(|| policy.clone());
@@ -474,7 +469,7 @@ mod tests {
     fn task_events_only_change_the_reference_and_head() {
         let before = fold(vec![spawn(), session("s", None), prompt()]);
         let mut f = before.clone();
-        for (seq, value) in [(4, Some("issue 44")), (5, Some("other work")), (6, None)] {
+        for (seq, value) in [(4, Some("issue 44")), (5, Some(" task ")), (6, None)] {
             let task = value.map(str::to_owned);
             f.apply(&ev(seq, EventBody::Task { task: task.clone() }));
             assert_eq!(

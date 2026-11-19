@@ -34,8 +34,8 @@ use tokio::time::Instant;
 use tracing::{Instrument, error, info, info_span, warn};
 use wb_proto::hub::{
     AcpFacts, AcpOpenReply, AcpSessionInfo, Activity, ConfigError, ConfigOption, ErrorCode,
-    ExitReason, Fault, FaultCode, HubMessage, Kind, Last, LastError, ManagedWorktree, PendingKind,
-    SpawnAcp, Summary,
+    ExitReason, Fault, FaultCode, HubMessage, Kind, ManagedWorktree, PendingKind, SpawnAcp,
+    Summary,
 };
 use wb_proto::journal::{
     EventBody, JournalEvent, NoticeLevel, ResolvedBy, SessionVia, SetupErrorCode, SpawnVia,
@@ -55,7 +55,7 @@ use self::worktree::CreateFailure::{self, Clean, PossibleLeftover};
 use crate::conn::{ConnId, Reply, Viewer, line};
 use crate::outq::OutQ;
 use crate::registry::Route;
-use crate::snapshot::{SUMMARY_PENDING_MAX, summary_id, summary_text};
+use crate::snapshot::fit_summary;
 use crate::store::write_atomic;
 use crate::{Ctx, lock, now_ms};
 
@@ -1463,78 +1463,48 @@ impl Acp {
         self.publish();
     }
 
-    /// The Summary and session info as they are now, with the last `updatedAt`.
-    /// Applies the same wire bounds to live facts and to facts restored from disk.
-    fn snapshot(&self) -> (Summary, AcpSessionInfo) {
+    /// The wire Summary and session info as they are now.
+    fn snapshot(&self, updated_at: u64) -> (Summary, AcpSessionInfo) {
         let viewers = lock(&self.shared.viewers).len();
         let facts = &self.facts;
-        let summary = Summary {
+        let mut summary = Summary {
             sid: self.sid.clone(),
             kind: Kind::Acp,
-            host: summary_id(self.meta.host.as_deref().unwrap_or(&self.ctx.cfg.host))
-                .unwrap_or_default()
-                .to_owned(),
+            host: self
+                .meta
+                .host
+                .as_ref()
+                .unwrap_or(&self.ctx.cfg.host)
+                .clone(),
             created_at: self.created_at,
-            updated_at: self.updated_at,
+            updated_at,
             alive: self.proc.is_some(),
             viewers: u32::try_from(viewers).unwrap_or(u32::MAX),
-            cwd: summary_id(&self.meta.cwd).unwrap_or_default().to_owned(),
-            fault: self.fault.as_ref().map(|fault| Fault {
-                code: fault.code,
-                message: summary_text(&fault.message),
-            }),
+            cwd: self.meta.cwd.clone(),
+            fault: self.fault.clone(),
             pty: None,
             acp: Some(AcpFacts {
-                agent: summary_id(&self.meta.agent).unwrap_or_default().to_owned(),
-                agent_session_id: facts
-                    .agent_session_id
-                    .as_deref()
-                    .and_then(summary_id)
-                    .map(str::to_owned),
+                agent: self.meta.agent.clone(),
+                agent_session_id: facts.agent_session_id.clone(),
                 revivable: facts.revivable(self.meta.init.as_ref()),
                 activity: if self.startup_config.is_some() {
                     Activity::Setup
                 } else {
                     facts.activity
                 },
-                pending: facts
-                    .pending
-                    .iter()
-                    .take(SUMMARY_PENDING_MAX)
-                    .cloned()
-                    .collect(),
-                last: facts.last.as_ref().map(|last| Last {
-                    seq: last.seq,
-                    ts: last.ts,
-                    outcome: summary_text(&last.outcome),
-                    error: last.error.as_ref().map(|error| LastError {
-                        code: error.code.clone(),
-                        message: summary_text(&error.message),
-                    }),
-                }),
+                pending: facts.pending.clone(),
+                last: facts.last.clone(),
                 head_seq: facts.head_seq,
                 seen_seq: self.meta.seen_seq,
-                title: facts.title.as_deref().map(summary_text),
-                mode_id: facts
-                    .mode_id
-                    .as_deref()
-                    .and_then(summary_id)
-                    .map(str::to_owned),
+                title: facts.title.clone(),
+                mode_id: facts.mode_id.clone(),
                 policy: facts.policy.clone(),
                 config_options: facts.config_options.clone(),
-                managed_worktree: self
-                    .meta
-                    .managed_worktree
-                    .as_ref()
-                    .filter(|wt| {
-                        [&wt.path, &wt.branch, &wt.main_root]
-                            .into_iter()
-                            .all(|field| summary_id(field).is_some())
-                    })
-                    .cloned(),
+                managed_worktree: self.meta.managed_worktree.clone(),
                 task: facts.task.clone(),
             }),
         };
+        fit_summary(&mut summary);
         let init = self.meta.init.as_ref();
         let field = |key: &str| init.and_then(|i| i.get(key)).cloned();
         let session = AcpSessionInfo {
@@ -1562,12 +1532,14 @@ impl Acp {
         if self.quiet {
             return;
         }
-        let (mut summary, session) = self.snapshot();
+        let updated_at = now_ms().max(self.updated_at);
+        let (mut summary, session) = self.snapshot(updated_at);
         if let Some((last, last_session)) = &self.published
             && let (Some(now), Some(then)) = (&mut summary.acp, &last.acp)
         {
-            // Compare at the published head without copying the rest of the Summary.
+            // Compare at the published head and time without copying the Summary.
             now.head_seq = then.head_seq;
+            summary.updated_at = last.updated_at;
             if summary == *last
                 && session == *last_session
                 && (self.facts.head_seq == then.head_seq || self.defer_head())
@@ -1575,6 +1547,7 @@ impl Acp {
                 return;
             }
             summary.acp.as_mut().unwrap().head_seq = self.facts.head_seq;
+            summary.updated_at = updated_at;
         }
         self.send_info(summary, session);
     }
@@ -1591,14 +1564,13 @@ impl Acp {
     }
 
     fn flush_info(&mut self) {
-        let (summary, session) = self.snapshot();
+        let (summary, session) = self.snapshot(now_ms().max(self.updated_at));
         self.send_info(summary, session);
     }
 
-    fn send_info(&mut self, mut summary: Summary, session: AcpSessionInfo) {
+    fn send_info(&mut self, summary: Summary, session: AcpSessionInfo) {
         self.info_at = None;
-        self.updated_at = now_ms().max(self.updated_at);
-        summary.updated_at = self.updated_at;
+        self.updated_at = summary.updated_at;
         self.ctx.registry.publish(Arc::new(summary.clone()));
         let msg = line(&HubMessage::AcpInfo {
             sid: self.sid.clone(),
@@ -1669,7 +1641,7 @@ impl Acp {
             });
         }
         self.publish();
-        let (summary, session) = self.snapshot();
+        let (summary, session) = self.snapshot(self.updated_at);
         let ok = AcpOpenReply {
             new,
             summary,
