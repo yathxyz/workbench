@@ -60,6 +60,7 @@ function s2w(sx: number, sy: number): BoardPoint { return { x: sx / cam().z + ca
 function w2s(wx: number, wy: number): BoardPoint { return { x: (wx - cam().x) * cam().z, y: (wy - cam().y) * cam().z }; }
 let lastLod: boolean | null = null, lodTimer: number | null = null;
 function applyCam() {
+  hashCancelRestore();
   const c = cam();
   world.style.transform = `translate(${-c.x * c.z}px, ${-c.y * c.z}px) scale(${c.z})`;
   world.style.setProperty('--iz', String(1 / c.z)); // folder tabs keep their screen size at every zoom
@@ -338,6 +339,7 @@ function boardAdopt(b: Board): void {
     SAVE.lastJson = serialize();
     if (edStale) { const e = edStale; setTimeout(() => { if (ED.node === e && ED.pre && VIEW === 'editor') frEdLoad(e); }); }   // the read-only Editor shows the newer text
   } finally { ADOPTING = false; }
+  hashRestore('board');
 }
 function unmountQuiet(id: string): void {   // the card went in another tab: drop it here without killing its session
   focusClose(id);
@@ -3256,6 +3258,7 @@ document.addEventListener('pointerdown', () => { PDOWN.on = true; PDOWN.then = n
 for (const t of ['pointerup', 'pointercancel']) document.addEventListener(t, () => { PDOWN.on = false; const f = PDOWN.then; PDOWN.then = null; if (f) setTimeout(f, 0); }, true);
 function activate(id: string) {
   if (activeId && live[activeId]) live[activeId].el!.classList.remove('active');
+  hashCancelRestore();
   activeId = id;
   const L = live[id]; if (!L) return;
   L.el!.classList.add('active');
@@ -4892,6 +4895,7 @@ function renderRanger() {
   $('#rg-info')!.textContent = info.join('   ');
 }
 function rgGo(key: string, selKey?: string) {
+  hashCancelRestore();
   RG.dir = key; RG.filter = ''; RG.filtering = false;
   if (selKey) { const j = rgEntries(key).findIndex(x => x.key === selKey); if (j >= 0) RG.sel[key] = j; }
   renderRanger();
@@ -5439,6 +5443,7 @@ const isJournal = (n: BoardNode): boolean => /^\d{4}-\d\d-\d\d$/.test(n.name);
 function sortPages(list: PageNode[]): PageNode[] { return list.sort((a, b) => (isJournal(b) as unknown as number - (isJournal(a) as unknown as number)) || (isJournal(a) ? b.name.localeCompare(a.name) : a.name.localeCompare(b.name))); }
 function setView(v: string) {
   if (!VIEWS.includes(v as ViewName)) return;
+  if (v !== VIEW) hashCancelRestore();
   ringNote();   // the place being left, so the first switch away from it can come back
   const prev = VIEW; VIEW = v as ViewName;
   if (S && S.view !== v) { S.view = v as ViewName; dirty(); }
@@ -10985,6 +10990,8 @@ function notesDemoRows(): NoteRow[] {
     lines.forEach((ln, i) => { const m = ln.match(/^(#{1,6}) (.*)$/); if (m) rows.push({ id: p.id + '#' + (i + 1), path: p.name + '.md', title: m[2].replace(/\s*\^[\w-]+$/, ''), kind: 'heading', level: m[1].length, tags: [], body: lines.slice(i + 1, i + 6).join('\n'), line: i + 1, board: p }); }); }
   return rows;
 }
+let coldNotes: Promise<NoteRow[]> | null = null;
+function notesReady(): Promise<NoteRow[]> { return coldNotes ??= notesLoad().finally(() => { coldNotes = null; }); }
 async function notesLoad(force?: boolean): Promise<NoteRow[]> {
   if (!force && Date.now() - NOTES.at < 30000) return NOTES.rows;
   if (!DAEMON) NOTES.rows = notesDemoRows();
@@ -11058,7 +11065,7 @@ const noteKids = (r: NoteRow): NoteRow[] => (noteTree(r.path).kids[r.id] || []);
 const noteParent = (r: NoteRow): NoteRow | null => { const p = noteTree(r.path).parent[r.id]; return p ? noteById(p) : null; };
 function noteEntry(r: NoteRow): RgEntry { const kids = noteKids(r), bl = r.kind === 'file' ? backlinkCount(r) : 0; return { key: 'note:' + r.id, name: r.title, kind: r.kind === 'file' ? 'inote' : 'iblock', dir: kids.length > 0, note: r, meta: [r.kind === 'file' ? (kids.length ? String(kids.length) : '') : (r.kind === 'item' ? 'item' : 'h' + r.level), bl ? '← ' + bl : ''].filter(Boolean).join(' · ') }; }
 function rgPerspRoots(): RgEntry[] {
-  if (!NOTES.at) notesLoad();
+  if (!NOTES.at) notesReady();
   const out: RgEntry[] = [{ key: 'tag:', name: '# tags', kind: 'persp', dir: true, meta: 'tag:' }, { key: 'note:', name: '¶ notes', kind: 'persp', dir: true, meta: 'note:' }, { key: 'journal:', name: '▦ journal', kind: 'persp', dir: true, meta: 'journal:' }, { key: 'link:', name: '⇄ links', kind: 'persp', dir: true, meta: 'link:' }];
   out.push({ key: 'proc:', name: '⚙ processes', kind: 'persp', dir: true, meta: 'proc:' }, { key: 'unit:', name: '⊙ units', kind: 'persp', dir: true, meta: 'unit:' }, { key: 'attn:', name: '! attention', kind: 'persp', dir: true, meta: attnCount() ? String(attnCount()) : '' });
   return out;
@@ -11166,6 +11173,7 @@ function noteOpen(r: { path: string; line: number; board?: PageNode }) {
 }
 // go to an address: board nodes on the canvas, everything else in the navigator
 function goAddr(addr: string, push = true): boolean {
+  hashCancelRestore();
   const r = resolveAddr(addr); if (r.error) { toast(r.error); return false; }
   if (r.n && !isFs(r.key)) { r.n.kind === 'frame' ? (VIEW === 'ranger' ? rgGo(r.key) : jumpFolder(r.n)) : (VIEW === 'ranger' ? rgGo(rgParent(r.key) || 'root', r.key) : jumpNode(r.n)); }
   else if (r.key === 'root') { if (VIEW === 'ranger') rgGo('root'); else fitAll(); }
@@ -11173,7 +11181,13 @@ function goAddr(addr: string, push = true): boolean {
   if (push) hashSync(r.addr, true);
   return true;
 }
-const HASH = { busy: false, last: '' };
+const HASH = { busy: false, last: '', pending: '' };
+function hashCancelRestore(): void { if (!ADOPTING) HASH.pending = ''; }
+function hashRestore(kind: 'note' | 'board'): void {
+  const addr = HASH.pending; if (!addr.startsWith(kind + ':')) return;
+  HASH.pending = '';
+  if (decodeURIComponent(location.hash.slice(1)) === addr && (kind !== 'board' || addrToKey(addr))) goAddr(addr, false);
+}
 function currentAddr(): string { if (VIEW === 'ranger') return keyToAddr(RG.dir); const n = activeId && S.nodes[activeId]; return n ? addrOf(n) : (WS.cur && S.nodes[WS.cur] ? addrOf(S.nodes[WS.cur]) : 'board:/'); }
 function hashSync(addr?: string | null, push?: boolean): void {
   addr = addr || currentAddr(); if (!addr || addr === HASH.last) return;
@@ -11182,10 +11196,12 @@ function hashSync(addr?: string | null, push?: boolean): void {
   setTimeout(() => { HASH.busy = false; }, 0);
 }
 function hashInit(): void {
-  const start = decodeURIComponent(location.hash.slice(1));
-  if (start && parseAddr(start)) goAddr(start, false);
-  addEventListener('hashchange', () => { if (HASH.busy) return; const a = decodeURIComponent(location.hash.slice(1)); if (a && parseAddr(a) && a !== HASH.last) { HASH.last = a; goAddr(a, false); } });
-  setInterval(() => { if (!HASH.busy && !document.hidden) hashSync(); }, 1500);
+  const start = decodeURIComponent(location.hash.slice(1)), a = parseAddr(start);
+  if (a?.kind === 'note' && a.path && !NOTES.at) {
+    HASH.pending = start; notesReady().then(() => hashRestore('note'));
+  } else if (a && !goAddr(start, false) && a.kind === 'board' && DAEMON) HASH.pending = start;
+  addEventListener('hashchange', () => { hashCancelRestore(); if (HASH.busy) return; const a = decodeURIComponent(location.hash.slice(1)); if (a && parseAddr(a) && a !== HASH.last) { HASH.last = a; goAddr(a, false); } });
+  setInterval(() => { if (!HASH.pending && !HASH.busy && !document.hidden) hashSync(); }, 1500);
 }
 cmd('Go to address…', () => askName('Address (board:/path · fs:@host/dir · note:Title#Heading · tag:x · journal:2026/10/10 · link:Page · proc:@host/PID · unit:@host/NAME)', currentAddr(), v => goAddr(v)), 'Ctrl-Space a · ga in the navigator');
 cmd('Copy the address of the active node', () => { const n = activeId && S.nodes[activeId]; if (n) { copyText(addrOf(n)); toast(addrOf(n)); } else toast('Pick a node first.'); });

@@ -235,6 +235,24 @@ check('clicking the tab re-opens the focus', v10b.body && !!v10b.cur, JSON.strin
 await p.evaluate(() => window.__canvas.focusClose(window.__canvas.FOCUS.cur)); await sleep(300);
 v10b = await p.evaluate(() => ({ body: document.body.classList.contains('focus'), hidden: document.querySelector<HTMLElement>('#focus-tabs')!.hidden, tabs: window.__canvas.FOCUS.tabs.length }));
 check('closing the last tab hides the strip', !v10b.body && v10b.hidden && v10b.tabs === 0, JSON.stringify(v10b));
+// Reload an actual address. Keep browser time still until focus opens, then advance past both the old boot delay and the flight.
+{
+  const tab = await browser.newPage({ viewport: { width: 1500, height: 950 } }); watchErrors(tab);
+  try {
+    await tab.goto('file://' + wrapped);
+    await tab.evaluate(() => history.replaceState(null, '', '#board:/canvas-workbench/machines/build'));
+    const now = new Date(); await tab.clock.install({ time: now }); await tab.clock.pauseAt(new Date(+now + 1000));
+    await tab.reload(); await until(() => tab.evaluate(() => window.__canvas?.BOOTED));
+    const id = await tab.evaluate(() => { const C = window.__canvas, n = C.S.nodes.plans; C.focusOpen(n); return n.id; });
+    await tab.clock.runFor(1600);
+    const pos = await tab.evaluate(id => {
+      const card = document.querySelector(`.node[data-id="${id}"]`)!.getBoundingClientRect(), vp = document.querySelector('#viewport')!.getBoundingClientRect();
+      return { id: window.__canvas.FOCUS.cur, left: card.left - vp.left, top: card.top - vp.top };
+    }, id);
+    check('reloading a board address cannot move a subsequently focused tab off screen',
+      pos.id === id && Math.abs(pos.left) <= 2 && Math.abs(pos.top - 90) <= 2, JSON.stringify(pos));
+  } finally { await tab.close(); }
+}
 // optimiser: no overlapping top-level items afterwards, snapped to the grid, undoable
 v10 = await p.evaluate(() => {
   const C = window.__canvas, S = C.S;
