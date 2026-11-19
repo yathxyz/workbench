@@ -397,7 +397,7 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
             level: NoticeLevel::Warn,
             text: INVALID_POLICY_NOTICE.into(),
         };
-        match journal.append(&notice, now_ms()) {
+        match journal.append(notice, now_ms()) {
             Ok(ev) => {
                 facts.apply(&ev);
                 appended = true;
@@ -1323,7 +1323,7 @@ impl Acp {
         let Some(journal) = &mut self.journal else {
             return false;
         };
-        match journal.append(&body, now_ms()) {
+        match journal.append(body, now_ms()) {
             Ok(ev) => {
                 self.applied(ev);
                 true
@@ -1446,7 +1446,7 @@ impl Acp {
             let Some(journal) = &mut self.journal else {
                 return;
             };
-            match journal.append(&body, now_ms()) {
+            match journal.append(body, now_ms()) {
                 Ok(ev) => self.applied(ev),
                 Err(f) => {
                     warn!("the journal still fails: {}", f.error);
@@ -2819,7 +2819,7 @@ impl Acp {
                     let written = if self.fault.is_none() {
                         self.journal
                             .as_mut()
-                            .map(|journal| journal.append(&body, now_ms()))
+                            .map(|journal| journal.append(body, now_ms()))
                     } else {
                         None
                     };

@@ -120,11 +120,11 @@ impl Journal {
     /// Writes `body` as the next event with one `write(2)`. Only a complete write
     /// advances the head; on any failure the file is truncated back and the fault
     /// returned.
-    pub fn append(&mut self, body: &EventBody, ts: u64) -> Result<JournalEvent, WriteFault> {
+    pub fn append(&mut self, body: EventBody, ts: u64) -> Result<JournalEvent, WriteFault> {
         let ev = JournalEvent {
             seq: self.head + 1,
             ts,
-            body: body.clone(),
+            body,
         };
         let bytes = line::encode(&ev);
         if let Err(error) = self.write(&bytes) {
@@ -166,7 +166,7 @@ impl Journal {
             reason: ExitReason::HubRestart,
         });
         let mut written = Vec::with_capacity(lines.len());
-        for body in &lines {
+        for body in lines {
             let ev = self.append(body, ts)?;
             facts.apply(&ev);
             written.push(ev);
@@ -284,7 +284,7 @@ mod tests {
     fn write_all(j: &mut Journal, bodies: &[EventBody]) -> Facts {
         let mut facts = Facts::default();
         for b in bodies {
-            let ev = j.append(b, j.len() + 1).unwrap();
+            let ev = j.append(b.clone(), j.len() + 1).unwrap();
             facts.apply(&ev);
         }
         facts
@@ -317,7 +317,7 @@ mod tests {
         let bodies = [spawn(), session(), prompt(), chunk("héllo\n"), notice];
         let mut written = Vec::new();
         for (i, b) in bodies.iter().enumerate() {
-            let ev = j.append(b, 100 + i as u64).unwrap();
+            let ev = j.append(b.clone(), 100 + i as u64).unwrap();
             assert_eq!((ev.seq, ev.ts, &ev.body), (i as u64 + 1, 100 + i as u64, b));
             written.push(ev);
         }
@@ -381,7 +381,7 @@ mod tests {
         assert_eq!(j.len(), 2);
         assert_eq!(fs::read(&path).unwrap(), good);
 
-        let ev = j.append(&prompt(), 3).unwrap();
+        let ev = j.append(prompt(), 3).unwrap();
         assert_eq!(ev.seq, 3);
         let (_, events) = open_events(&path).unwrap();
         assert_eq!(events.last(), Some(&ev));
@@ -422,7 +422,7 @@ mod tests {
         let before = fs::read(&path).unwrap();
 
         j.fail_at = Some(3);
-        let fault = j.append(&chunk(&"x".repeat(1000)), 3).unwrap_err();
+        let fault = j.append(chunk(&"x".repeat(1000)), 3).unwrap_err();
         assert_eq!(fault.error.to_string(), "injected journal write fault");
         assert_eq!(
             fs::read(&path).unwrap(),
@@ -433,7 +433,7 @@ mod tests {
 
         let mut seqs = vec![1, 2];
         for b in [prompt(), chunk("after")] {
-            let ev = j.append(&b, 9).unwrap();
+            let ev = j.append(b, 9).unwrap();
             live.apply(&ev);
             seqs.push(ev.seq);
         }
@@ -456,9 +456,9 @@ mod tests {
         for seq in 1..=2 * CHECKPOINT_STRIDE + 2 {
             if seq == CHECKPOINT_STRIDE {
                 j.fail_at = Some(seq);
-                assert!(j.append(&chunk(&"x".repeat(5000)), seq).is_err());
+                assert!(j.append(chunk(&"x".repeat(5000)), seq).is_err());
             }
-            j.append(&prompt(), seq).unwrap();
+            j.append(prompt(), seq).unwrap();
         }
         let check = |j: &Journal| {
             for since in [0, CHECKPOINT_STRIDE - 1, CHECKPOINT_STRIDE, j.len() - 1] {
@@ -494,7 +494,7 @@ mod tests {
             .write_at(junk, end)
             .unwrap();
 
-        let ev2 = j.append(&session(), 2).unwrap();
+        let ev2 = j.append(session(), 2).unwrap();
         assert!(
             fs::metadata(&path).unwrap().len() > j.end,
             "junk is left after the line"
