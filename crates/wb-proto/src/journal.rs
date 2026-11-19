@@ -117,6 +117,12 @@ pub enum EventBody {
     /// `session/set_config_option` succeeded; the full agent-provided list.
     #[serde(rename = "config")]
     Config { config_options: Value },
+    /// The task reference was set (at creation or later) or explicitly cleared.
+    #[serde(rename = "task")]
+    Task {
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        task: Option<String>,
+    },
     /// The complete replacement permission policy; an empty list clears it.
     #[serde(rename = "policy")]
     Policy { policy: Policy },

@@ -122,6 +122,7 @@ fn spawn(
             cwd,
             host: None,
             config,
+            task: None,
             policy,
         }),
         _ => None,
@@ -521,6 +522,7 @@ mod tests {
                 cwd: "/home/alice".into(),
                 host: None,
                 config: Vec::new(),
+                task: None,
                 policy: None,
             })
         );
@@ -601,6 +603,7 @@ mod tests {
                 title: None,
                 mode_id: None,
                 config_options: None,
+                task: None,
                 policy: None,
             }),
         }

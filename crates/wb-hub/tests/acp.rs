@@ -1081,7 +1081,8 @@ fn hub_policy_answers_omp_empty_locations_with_and_without_cwd() {
         assert_eq!(auto["outcome"]["optionId"], "allow-once");
         assert!(!events.iter().any(|e| e["e"] == "permission"));
         assert!(hub.journal("omp").contains(auto));
-        assert_eq!(c.summary("omp")["acp"]["pending"], json!([]));
+        let summary = c.summary_through("omp", events.last().unwrap());
+        assert_eq!(summary["acp"]["pending"], json!([]));
     }
 }
 
@@ -1096,7 +1097,7 @@ fn hub_policy_leaves_post_cancel_requests_pending_only_for_that_turn() {
     let pending = c.event("cancelled", "permission");
     assert_eq!(pending["toolCall"]["rawInput"]["command"], "cargo test");
     assert_eq!(
-        c.summary("cancelled")["acp"]["pending"][0]["req"],
+        c.summary_through("cancelled", &pending)["acp"]["pending"][0]["req"],
         pending["seq"]
     );
     assert!(
@@ -1128,7 +1129,8 @@ fn hub_policy_leaves_post_cancel_requests_pending_only_for_that_turn() {
     let auto = events.iter().find(|e| e["e"] == "permission_auto").unwrap();
     assert_eq!(auto["outcome"]["optionId"], "allow-once");
     assert!(!events.iter().any(|e| e["e"] == "permission"));
-    assert_eq!(c.summary("cancelled")["acp"]["pending"], json!([]));
+    let summary = c.summary_through("cancelled", events.last().unwrap());
+    assert_eq!(summary["acp"]["pending"], json!([]));
 }
 
 #[test]
@@ -1159,7 +1161,7 @@ fn hub_policy_leaves_permissions_outside_every_turn_pending() {
             );
             assert!(!events.iter().any(|ev| ev["e"] == "permission_auto"));
             let pending = events.last().unwrap();
-            let summary = c.summary(&sid);
+            let summary = c.summary_through(&sid, pending);
             assert_eq!(summary["acp"]["activity"], "none");
             assert_eq!(summary["acp"]["pending"][0]["req"], pending["seq"]);
             assert_eq!(
@@ -1174,7 +1176,8 @@ fn hub_policy_leaves_permissions_outside_every_turn_pending() {
                 .find(|ev| ev["e"] == "permission_auto")
                 .unwrap();
             assert_eq!(auto["policy"]["action"], action);
-            assert_eq!(c.summary(&sid)["acp"]["pending"], json!([]));
+            let summary = c.summary_through(&sid, events.last().unwrap());
+            assert_eq!(summary["acp"]["pending"], json!([]));
         }
     }
 }
@@ -1211,14 +1214,15 @@ fn hub_policy_only_answers_execute_for_the_configured_omp_agent() {
                 } else {
                     let pending = c.event(sid, "permission");
                     assert_eq!(pending["toolCall"]["rawInput"]["command"], command);
-                    assert_eq!(c.summary(sid)["acp"]["pending"][0]["req"], pending["seq"]);
+                    let summary = c.summary_through(sid, &pending);
+                    assert_eq!(summary["acp"]["pending"][0]["req"], pending["seq"]);
                     assert_eq!(
                         permit(&mut c, sid, &pending["seq"], epoch(&opened), "allow-once")["t"],
                         "ok"
                     );
                 }
-                c.event(sid, "turn_end");
-                assert_eq!(c.summary(sid)["acp"]["pending"], json!([]));
+                let end = c.event(sid, "turn_end");
+                assert_eq!(c.summary_through(sid, &end)["acp"]["pending"], json!([]));
             }
         }
         if agent != "omp" {
@@ -1250,7 +1254,8 @@ fn hub_policy_answers_once_without_publishing_pending_and_replays() {
         );
         assert!(evs.iter().any(|e| e["update"]["status"] == status));
         assert!(!evs.iter().any(|e| e["e"] == "permission"));
-        assert_eq!(c.summary(sid)["acp"]["pending"], json!([]));
+        let summary = c.summary_through(sid, evs.last().unwrap());
+        assert_eq!(summary["acp"]["pending"], json!([]));
         assert_eq!(
             permit(&mut c, sid, &auto["seq"], epoch(&open), option)["code"],
             "already_resolved"
@@ -1293,7 +1298,7 @@ fn hub_policy_answers_once_without_publishing_pending_and_replays() {
     );
     assert!(permission.get("policy").is_none());
     assert_eq!(
-        c.summary("unlisted")["acp"]["pending"][0]["req"],
+        c.summary_through("unlisted", &permission)["acp"]["pending"][0]["req"],
         permission["seq"]
     );
     assert_eq!(
@@ -1509,7 +1514,9 @@ fn hub_policy_replace_remove_leave_pending_and_never_answer_elicitations() {
         "policy":{"rules":[{"action":"allow"}]}}));
     assert_eq!(c.acp_prompt("a1", "form")["t"], "ok");
     let elicitation = c.event("a1", "elicitation");
-    assert_eq!(c.summary("a1")["acp"]["pending"][0]["kind"], "elicitation");
+    let summary = c.summary_through("a1", &elicitation);
+    assert_eq!(summary["acp"]["pending"][0]["kind"], "elicitation");
+    assert_eq!(summary["acp"]["pending"][0]["req"], elicitation["seq"]);
     c.ok(json!({"t":"acp.elicitation","sid":"a1","epoch":epoch,
         "req":elicitation["seq"],"response":{"action":"decline"}}));
     c.event("a1", "turn_end");
@@ -2875,6 +2882,196 @@ fn hub_config_journal_failure_is_not_acknowledged_or_folded() {
     c.ok(json!({"t": "acp.kill", "sid": "a1", "forget": false}));
     drop(c);
     fold_equals_live(&mut hub);
+}
+
+fn set_task(c: &mut Client, sid: &str, task: Value) -> Value {
+    c.request(json!({"t": "acp.set_task", "sid": sid, "task": task}))
+}
+
+#[test]
+fn hub_set_task_refuses_an_absent_sid() {
+    let hub = Hub::start();
+    let mut c = hub.connect();
+    let reply = set_task(&mut c, "missing", json!("work"));
+    assert_eq!(reply["code"], "not_found");
+}
+
+#[test]
+fn hub_set_task_refuses_a_pty_session() {
+    let hub = Hub::start();
+    let mut c = hub.connect();
+    c.spawn("p1", &["sleep", "1000"]);
+    let reply = set_task(&mut c, "p1", json!("work"));
+    assert_eq!(reply["code"], "kind_mismatch");
+}
+
+#[test]
+fn hub_validates_task_before_creation_or_mutation() {
+    let hub = Hub::with_scenarios(&["basic"]);
+    let mut c = hub.connect();
+    let max = "é".repeat(wb_proto::limits::TASK_MAX / 2);
+    let invalid = [
+        json!(format!("{max}x")),
+        json!("\nissue 44"),
+        json!("issue\u{7f}44"),
+        json!(false),
+    ];
+    let spawn = |task: &Value| {
+        json!({"t": "acp.open", "sid": "a1", "since": 0,
+               "spawn": {"agent": "basic", "cwd": hub.home(), "task": task}})
+    };
+    for value in &invalid {
+        assert_eq!(c.request(spawn(value))["code"], "bad_request");
+    }
+    assert_eq!(c.ok(json!({"t": "list"}))["sessions"], json!([]));
+    assert!(!hub.acp_file("a1.jsonl").exists());
+    let opened = c.ok(spawn(&json!(format!("  {max}  "))));
+    assert_eq!(opened["summary"]["acp"]["task"], max);
+    c.event("a1", "session");
+    for value in invalid {
+        assert_eq!(set_task(&mut c, "a1", value)["code"], "bad_request");
+    }
+    assert_eq!(
+        c.request(json!({"t": "acp.set_task", "sid": "a1"}))["code"],
+        "bad_request"
+    );
+    let reopened = c.ok(spawn(&json!("not a mutation")));
+    assert_eq!(reopened["new"], false);
+    assert_eq!(reopened["summary"]["acp"]["task"], max);
+    assert_eq!(hub.kinds("a1"), ["task", "spawn", "session"]);
+}
+
+#[test]
+fn hub_task_and_clear_survive_restart_and_revive_independently_of_config() {
+    let mut hub = Hub::with_scenarios(&["config-result", "basic"]);
+    let mut c = hub.connect();
+    assert_eq!(c.hello["acpTask"], true);
+    let opened = c.ok(json!({
+        "t": "acp.open", "sid": "a1", "since": 0,
+        "spawn": {"agent": "config-result", "cwd": hub.home(), "task": "  issue 44  ",
+                  "config": [{"id": "model", "value": "large"}]}
+    }));
+    let options = &opened["summary"]["acp"]["configOptions"];
+    assert_eq!(options[0]["currentValue"], "large");
+    assert_eq!(opened["summary"]["acp"]["task"], "issue 44");
+    let (replay, _) = c.replay("a1");
+    assert_eq!(replay[0]["e"], "task");
+    assert_eq!(replay[0]["task"], "issue 44");
+    assert_eq!(set_task(&mut c, "a1", json!("  issue 45  "))["t"], "ok");
+    assert_eq!(c.event("a1", "task")["task"], "issue 45");
+    assert_eq!(&c.summary("a1")["acp"]["configOptions"], options);
+
+    let cleared = c.ok(json!({"t": "acp.open", "sid": "cleared", "since": 0,
+        "spawn": {"agent": "basic", "cwd": hub.home(), "task": "   "}}));
+    assert!(cleared["summary"]["acp"].get("task").is_none());
+    c.event("cleared", "session");
+    assert_eq!(hub.kinds("cleared"), ["spawn", "session"]);
+    for clear in [json!("  "), Value::Null] {
+        assert_eq!(set_task(&mut c, "cleared", json!("work"))["t"], "ok");
+        assert_eq!(c.event("cleared", "task")["task"], "work");
+        assert_eq!(set_task(&mut c, "cleared", clear)["t"], "ok");
+        assert_eq!(c.event("cleared", "task").get("task"), Some(&Value::Null));
+        assert!(c.summary("cleared")["acp"].get("task").is_none());
+    }
+    drop(c);
+    fold_equals_live(&mut hub);
+
+    let mut c = hub.connect();
+    let reopened = c.ok(json!({"t": "acp.open", "sid": "a1", "since": 0}));
+    assert_eq!(reopened["summary"]["acp"]["task"], "issue 45");
+    assert_eq!(&reopened["summary"]["acp"]["configOptions"], options);
+    c.replay("a1");
+    revive(&mut c, "a1");
+    assert_eq!(c.summary("a1")["acp"]["task"], "issue 45");
+    let reopened = c.ok(json!({"t": "acp.open", "sid": "cleared", "since": 0}));
+    assert!(reopened["summary"]["acp"].get("task").is_none());
+    c.replay("cleared");
+    revive(&mut c, "cleared");
+    assert!(c.summary("cleared")["acp"].get("task").is_none());
+}
+
+#[test]
+fn hub_initial_task_and_policy_survive_restart_and_revive() {
+    let mut hub = policy_hub();
+    let mut c = hub.connect();
+    let policy = permission_policy("allow");
+    let check = |summary: &Value| {
+        assert_eq!(summary["acp"]["task"], "issue 44");
+        assert_eq!(summary["acp"]["policy"], policy);
+    };
+    let opened = c.ok(json!({"t": "acp.open", "sid": "a1", "since": 0,
+        "spawn": {"agent": "omp", "cwd": hub.home(), "task": "  issue 44  ", "policy": policy}}));
+    check(&opened["summary"]);
+    c.event("a1", "session");
+    assert_eq!(hub.kinds("a1"), ["task", "policy", "spawn", "session"]);
+    drop(c);
+    fold_equals_live(&mut hub);
+
+    let mut c = hub.connect();
+    let attached = c.acp_open("a1", 0);
+    check(&attached["summary"]);
+    c.replay("a1");
+    let events = revive(&mut c, "a1");
+    let session = events.iter().find(|e| e["e"] == "session").unwrap();
+    assert_eq!(session["via"], "resume");
+    check(&c.summary("a1"));
+    assert_eq!(c.acp_prompt("a1", "perm")["t"], "ok");
+    assert_eq!(
+        c.event("a1", "permission_auto")["outcome"]["optionId"],
+        "allow-once"
+    );
+    c.event("a1", "turn_end");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hub_initial_task_write_fault_refuses_creation_before_starting_the_agent() {
+    let policy = permission_policy("allow");
+    // Task alone, then both fields with the fault on the task or the following policy.
+    for (fail_at, initial_policy) in [("1", None), ("1", Some(&policy)), ("2", Some(&policy))] {
+        let hub = Hub::start_with_env(
+            |cfg| stub(cfg, "basic", &["--scenario", "basic"]),
+            &[("WB_HUB_TEST_FAIL_WRITE_AT", fail_at)],
+        );
+        let mut c = hub.connect();
+        let mut open = json!({"t": "acp.open", "sid": "a1", "since": 0,
+            "spawn": {"agent": "basic", "cwd": hub.home(), "task": "work",
+                      "config": [{"id": "model", "value": "large"}]}});
+        if let Some(policy) = initial_policy {
+            open["spawn"]["policy"] = policy.clone();
+        }
+        let reply = c.request(open.clone());
+        assert_eq!(reply["t"], "err");
+        assert_eq!(reply["code"], "faulted");
+        assert!(fs::read_dir(hub.acp_file("")).unwrap().next().is_none());
+        assert!(hub.record("basic").is_empty());
+        assert_eq!(c.ok(json!({"t": "list"}))["sessions"], json!([]));
+        assert_eq!(c.acp_open("a1", 0)["code"], "not_found");
+
+        let retried = c.ok(open);
+        assert_eq!(retried["new"], true);
+        assert_eq!(retried["summary"]["acp"]["task"], "work");
+        assert_eq!(retried["summary"]["acp"].get("policy"), initial_policy);
+        c.event("a1", "session");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hub_task_write_fault_does_not_clear_the_last_recorded_value() {
+    let hub = Hub::start_with_env(
+        |cfg| stub(cfg, "basic", &["--scenario", "basic"]),
+        &[("WB_HUB_TEST_FAIL_WRITE_AT", "4")],
+    );
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "basic");
+    assert_eq!(set_task(&mut c, "a1", json!("keep"))["t"], "ok");
+    assert_eq!(set_task(&mut c, "a1", Value::Null)["code"], "faulted");
+    let summary = c.summary_until("a1", "faulted and dead", |s| {
+        s["fault"]["code"] == "journal_write" && s["alive"] == false
+    });
+    assert_eq!(summary["acp"]["task"], "keep");
+    assert_eq!(hub.kinds("a1"), ["spawn", "session", "task"]);
 }
 
 #[test]

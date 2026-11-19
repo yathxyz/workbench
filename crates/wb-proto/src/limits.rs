@@ -30,6 +30,8 @@ pub const ACP_CONFIG_MAX: usize = 16;
 pub const ACP_CONFIG_OPTIONS_MAX: usize = 64;
 /// Largest serialized agent configuration offering. Larger is malformed.
 pub const ACP_CONFIG_OPTIONS_BYTES: usize = 64 * KIB;
+/// Largest trimmed session task reference in UTF-8 bytes. Larger ACP requests are `bad_request`.
+pub const TASK_MAX: usize = 512;
 /// Largest serialized permission policy; excess is `bad_request`.
 pub const POLICY_MAX: usize = 256 * KIB;
 /// Most ordered rules in a session permission policy; excess is `bad_request`.

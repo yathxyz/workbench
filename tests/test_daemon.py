@@ -436,6 +436,33 @@ def configured_open(t, h):
             wbctl.acp_session(ep, sid, kill=True)
 
 
+def session_task(t, h):
+    sid = "conformance_task"
+    hub = wbctl.HubClient(h.hub_sock)
+    card = wbctl.AcpCard(wbctl.Endpoint(ORIGIN, unix=h.caddy_sock), sid)
+    try:
+        reply, _ = hub.request({"t": "acp.open", "rid": 1, "sid": sid, "since": 0,
+                                "spawn": {"agent": "stub", "cwd": str(h.home.resolve()), "task": "issue 44"}})
+        if not t.check("task: attached page receives the initial reference and its journal event",
+                       reply.get("new") and card.open()
+                       and card.result["hello"]["info"]["acp"].get("task") == "issue 44"
+                       and [e["task"] for e in card.since(0, ("task",))] == ["issue 44"],
+                       repr((reply, card.result))):
+            return
+
+        cursor = card.cursor()
+        reply, _ = hub.request({"t": "acp.set_task", "rid": 2, "sid": sid, "task": None})
+        t.check("task: clearing updates an attached page without reconnecting",
+                reply.get("t") == "ok" and card.wait(lambda:
+                    "task" not in card.result["info"]["acp"]
+                    and [e["task"] for e in card.since(cursor, ("task",))] == [None]),
+                repr((reply, card.result)))
+    finally:
+        card.close()
+        hub.request({"t": "acp.kill", "rid": 3, "sid": sid, "forget": True})
+        hub.close()
+
+
 def session_policy(t, h):
     ep = wbctl.Endpoint(ORIGIN, unix=h.caddy_sock)
     cwd = str(h.home.resolve())
@@ -461,6 +488,14 @@ def session_policy(t, h):
                 self.snapshots.append(message.get("info") or {})
             super().handle(message)
 
+        def wait_for_published(self, mark, kinds):
+            def published():
+                events = self.since(mark, kinds)
+                head = (self.result["info"] or {}).get("acp", {}).get("headSeq", 0)
+                return events and head >= events[-1]["seq"]
+
+            return self.wait(published)
+
     def request(kind, **fields):
         hub = wbctl.HubClient(h.hub_sock)
         try:
@@ -482,7 +517,7 @@ def session_policy(t, h):
 
     def auto_turn(card, action):
         mark = start_turn(card)
-        ended = card.wait(lambda: card.since(mark, wbctl.TURN_END))
+        ended = card.wait_for_published(mark, wbctl.TURN_END)
         automatic = card.since(mark, ("permission_auto",))
         expected = {"rule": 0, "action": action}
         kind = "allow_once" if action == "allow" else "reject_once"
@@ -514,7 +549,7 @@ def session_policy(t, h):
 
     def pending_turn(card):
         mark = start_turn(card)
-        waiting = card.wait(lambda: card.since(mark, ("permission",)))
+        waiting = card.wait_for_published(mark, ("permission",))
         permissions = card.since(mark, ("permission",))
         permission = permissions[0] if permissions else None
         current = summary(card.sid)
@@ -686,7 +721,7 @@ def session_policy(t, h):
         wbctl.acp_session(ep, sid, kill=True)
 
 
-SECTIONS = [board, fs, session_config, configured_open, session_policy]
+SECTIONS = [board, fs, session_config, configured_open, session_task, session_policy]
 
 
 def main():

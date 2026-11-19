@@ -191,6 +191,14 @@ impl Client {
         }
     }
 
+    /// An attached `acp.ev` can arrive before `list` reflects it. Wait for that fold.
+    pub fn summary_through(&mut self, sid: &str, event: &Value) -> Value {
+        let seq = event["seq"].as_u64().unwrap();
+        self.summary_until(sid, &format!("summary through event {seq}"), |s| {
+            s["acp"]["headSeq"].as_u64().unwrap() >= seq
+        })
+    }
+
     /// `acp.prompt` with one text block; the reply.
     pub fn acp_prompt(&mut self, sid: &str, text: &str) -> Value {
         self.request(json!({"t": "acp.prompt", "sid": sid,

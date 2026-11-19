@@ -792,6 +792,84 @@ fn envelope_fields_are_untrusted() {
 }
 
 #[test]
+fn task_is_replaced_only_by_an_explicit_string() {
+    let f = fx();
+    f.process(PID, START);
+    for (task, want) in [
+        (Some(json!("  #44  ")), Some("#44")),
+        (Some(json!("ship release")), Some("ship release")),
+        (None, Some("ship release")),
+        (Some(Value::Null), Some("ship release")),
+        (Some(json!("")), None),
+        (Some(json!("#45")), Some("#45")),
+        (Some(json!("   ")), None),
+    ] {
+        let mut ev = claude("s1", T0, "SessionStart", json!({}));
+        if let Some(value) = task {
+            ev["task"] = value;
+        }
+        f.reg.ingest(HOST, ev, NOW).unwrap();
+        let session = serde_json::to_value(top(&f.reg)).unwrap();
+        assert_eq!(session.get("task"), want.map(|s| json!(s)).as_ref());
+        f.reg.save().unwrap();
+        assert_eq!(top(&f.reload(NOW)), top(&f.reg));
+    }
+}
+
+#[test]
+fn invalid_tasks_preserve_the_reference_without_losing_permission_or_end_events() {
+    let f = fx();
+    let mut ev = claude("s1", T0, "SessionStart", json!({}));
+    ev["task"] = json!("keep me");
+    f.reg.ingest(HOST, ev, NOW).unwrap();
+    for task in [
+        json!(17),
+        json!(true),
+        json!({}),
+        json!(["a"]),
+        json!("work\n"),
+        json!("a\u{7f}b"),
+        json!("a\u{202e}b"),
+        json!("é".repeat(257)),
+        json!(format!("{}x", " ".repeat(OBS_TEXT_MAX))),
+    ] {
+        for (hook, payload, state) in [
+            ("PermissionRequest", edit(), State::WaitingPermission),
+            ("SessionEnd", json!({}), State::Exited),
+        ] {
+            let mut ev = claude("s1", T0 + 1, hook, payload);
+            ev["task"] = task.clone();
+            f.reg.ingest(HOST, ev, NOW).unwrap();
+            let session = top(&f.reg);
+            assert_eq!(session.task.as_deref(), Some("keep me"));
+            assert_eq!(session.state, state, "{hook} with {task}");
+        }
+    }
+}
+
+#[test]
+fn absent_and_malformed_persisted_tasks_do_not_lose_old_records() {
+    let f = fx();
+    f.process(PID, START);
+    feed(&f.reg, &[("SessionStart", json!({}))]);
+    f.reg.save().unwrap();
+    let path = f.dir.path().join(FILE);
+    let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(saved["sessions"][0].get("task").is_none());
+    let old = top(&f.reload(NOW));
+    assert_eq!(old.task, None);
+    for bad in [
+        json!({"oops": 7}),
+        json!("bad\0task"),
+        json!("a".repeat(513)),
+    ] {
+        saved["sessions"][0]["task"] = bad;
+        fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(top(&f.reload(NOW)), old);
+    }
+}
+
+#[test]
 fn attach_is_validated_and_sticky() {
     let good = [
         json!({"kind": "claude", "id": "0123abcd"}),

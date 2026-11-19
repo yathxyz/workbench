@@ -52,6 +52,7 @@ fn summary(sid: &str, head_seq: u64) -> Summary {
             title: None,
             mode_id: Some("default".into()),
             config_options: None,
+            task: None,
             policy: None,
         }),
     }
@@ -245,6 +246,7 @@ async fn spawn_fields_go_only_with_agent_and_cwd() {
                 cwd: "/home/alice".into(),
                 host: None,
                 config: Vec::new(),
+                task: None,
                 policy: None,
             });
             // The id is sanitised to the sid alphabet; since and epoch pass through.
