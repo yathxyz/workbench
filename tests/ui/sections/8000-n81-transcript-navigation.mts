@@ -4,6 +4,10 @@ import { TMP, check, section, shot, skip, state, until } from '../shared.mts';
 import { H } from '../daemon.mts';
 import { acpIdle, gatedPage } from '../acp.mts';
 import { measureTranscript } from '../transcript-stress.mts';
+import { largeReplacement } from '../transcript-cost.mts';
+import { foldRegressions } from '../transcript-folds.mts';
+import { transcriptIdentities } from '../transcript-identities.mts';
+import { checkTranscriptScroll } from '../transcript-scroll.mts';
 
 // Keep the real viewer, socket, reducer and reset handshake; only this page receives the fixture journal.
 type Body<E = JournalEvent> = E extends JournalEvent ? Omit<E, 'seq' | 'ts'> : never;
@@ -72,7 +76,7 @@ await section('N81', async () => {
     const idle = await acpIdle(P, '$agents'); if (!idle) throw new Error('N81 viewer did not finish replay');
     await reader.locator('.ed-input').waitFor();
     let seq = idle.seq;
-    const event = (body: Body) => { socket.ws.send(JSON.stringify({ t: 'ev', ev: { ...body, ts: Date.now(), seq: ++seq } })); return seq; };
+    const event = (body: Body) => { socket.ws.send(JSON.stringify({ t: 'ev', ev: { ...body, seq: ++seq, ts: 1700000000000 + seq } })); return seq; };
     const update = (update: JsonObject) => event({ e: 'update', update });
     const prompt = (s: string) => event({ e: 'prompt', prompt: [{ type: 'text', text: s }] });
     const chunk = (kind: string, id: string, text: string) => update({ sessionUpdate: kind, messageId: id, content: { type: 'text', text } });
@@ -309,7 +313,7 @@ await section('N81', async () => {
       const sentBeforeAttach = g.sent.length;
       g.hold = true; await open(); await beginReplay();
       const attach = g.sent.slice(sentBeforeAttach).find(m => m?.t === 'open' && m.id === sid);
-      prompt('N81 reattached'); tool('tool-a', 'reattached A'); tool('tool-b', 'reattached B'); await endReplay('reattached B');
+      prompt('N81 reset'); tool('tool-a', 'reattached A'); tool('tool-b', 'reattached B'); await endReplay('reattached B');
       const fresh = await old.evaluate(o => {
         const b = window.__canvas.live.$agents.backend;
         return b !== o.backend && b.transcript.buf !== o.buf && b.transcript.frame !== o.frame;
@@ -318,11 +322,12 @@ await section('N81', async () => {
       const childB = await jump(']'); await z('t'); const afterB = await display();
       check('N81: leaving Agents destroys the reader; a fresh attach from zero restores the closed parent and its distinct child choices',
         destroyed && fresh && attach?.t === 'open' && attach.since === 0 && shut(beforeLeave, resetTurn, resetB)
-        && parent === 'Prompt: N81 reattached' && shut(hidden, parent, 'reattached A') && !has(hidden.rows, 'reattached B')
+        && parent === resetTurn && shut(hidden, parent, 'reattached A') && !has(hidden.rows, 'reattached B')
         && childA === 'Tool: edit [pending] reattached A' && shut(afterA, childA, outA)
         && childB === 'Tool: edit [pending] reattached B' && expanded(afterB, childB, outB),
         { destroyed, fresh, attach, beforeLeave, hidden, childA, afterA, childB, afterB });
     } finally { await old.dispose(); }
+    await checkTranscriptScroll(P, prompt, (id, s) => chunk('agent_message_chunk', id, s));
 
     // The benchmark reopens the session itself for a fresh reader. Check work bounds, not machine-dependent timings.
     g.drop = () => false;
@@ -336,6 +341,10 @@ await section('N81', async () => {
     check('N81: the independent append measurement keeps exactly 500 native folds closed for all 96 chunks',
       perf.append250.turns === 250 && perf.append250.closedBefore === 500 && perf.append250.closedAfter === 500
       && perf.append250.chunks === 96 && perf.append250.chunkToPaintMeanMs > 0, perf.append250);
+    await foldRegressions(P);
+    const body = await largeReplacement(P);
+    check('N81: a 4 MiB tool event and a same-length replacement both reach the Edwin buffer intact', body.onset.projected === body.update.projected && body.update.edits > 0);
+    await transcriptIdentities(P);
   } finally {
     await P.close();
     if (created) { const r = await api('/' + sid + '?forget=true', 'DELETE'); if (!r.ok) throw new Error('N81 cleanup: ' + r.status); }

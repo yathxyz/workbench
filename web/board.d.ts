@@ -803,7 +803,7 @@ interface EdwinBuffer {
 interface EdwinWindow { buffer: EdwinBuffer; view: HTMLElement; start: number }
 /* An Edwin frame mounted in a page card (contentWindow and src are never set: they tell it from an iframe). */
 interface EdwinFrame {
-  buffer: EdwinBuffer; focused: boolean; root: HTMLElement; wroot: unknown;
+  buffer: EdwinBuffer; focused: boolean; root: HTMLElement; wroot: unknown; sel: EdwinWindow;
   destroy(): void; point(): number; setPoint(p: number): void; lineTop(pos: number): number | null;
   posFromPoint(x: number, y: number): number | null;
   focus(): void; blur(): void;
@@ -845,6 +845,9 @@ interface EdwinApi {
   setBufferFolds?(b: EdwinBuffer, ranges: { s: number; e: number }[]): void;
   getBufferFolds?(b: EdwinBuffer): { s: number; e: number }[];
   leaves(root: unknown): EdwinWindow[];
+  vLineNo(buf: EdwinBuffer, position: number): number;
+  vLineStart(buf: EdwinBuffer, shownLine: number): number;
+  windowRows(w: EdwinWindow): number;
   selectFrame(f: EdwinFrame): void;
   selectWindow(w: EdwinWindow): void;
   windowAt(x: number, y: number): EdwinWindow | null;
