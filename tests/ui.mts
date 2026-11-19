@@ -22,7 +22,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import zlib from 'node:zlib';
-import { HARNESS, ROOT, TMP, check, errors, fails, sectionFiles, skips, state } from './ui/shared.mts';
+import { HARNESS, ROOT, TMP, check, errors, fails, loadSection, sectionFiles, skips, state } from './ui/shared.mts';
 import { MEDIA, ctx, hlog, startDaemon } from './ui/daemon.mts';
 
 const { chromium } = await import(process.env.WB_PLAYWRIGHT || 'playwright') as typeof import('playwright-core');
@@ -58,7 +58,7 @@ const MEDIA_URL = `http://127.0.0.1:${(media.address() as net.AddressInfo).port}
 const harness = spawn('python3', ['-I', HARNESS, '--web-root', ROOT, '--api', '--media', MEDIA_URL], { stdio: ['pipe', 'pipe', 'pipe'], env: harnessEnv });
 const fwd = await startDaemon(harness);
 
-for (const file of sectionFiles(new URL('./ui/sections/', import.meta.url))) await import(file.href);
+for (const file of sectionFiles(new URL('./ui/sections/', import.meta.url))) await loadSection(file);
 
 await ctx.close(); await browser.close();
 harness.stdin.end(); fwd.close(); media.close();

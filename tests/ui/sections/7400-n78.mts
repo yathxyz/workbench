@@ -1,4 +1,4 @@
-import { check, section, sectionFiles, skip, state, until } from '../shared.mts';
+import { check, loadSection, section, sectionFiles, skip, state, until } from '../shared.mts';
 import { H, sessions, settled } from '../daemon.mts';
 import { openFixture, type N78Fixture, type N78Resources } from './7400-n78/fixtures.mts';
 
@@ -102,10 +102,10 @@ await section('N78', async () => {
       && known.model === 'stub-model' && known.reasoning === 'high' && !!hubInfo.started && !!hubInfo['last active'] && hubRow.harness === harnessLabel && hubRow.model === known.model, JSON.stringify({ hubInfo, known, hubRow, harnessLabel }));
 
     const fixture: N78Fixture = { ...helpers, before, ids, edwin, externalPty, hasTerminal };
-    // Numbered steps retain their own section wrappers, if any. An unwrapped throw stops N78.
+    // Import failures skip one file. An unwrapped throw while running a step still stops N78.
     for (const file of sectionFiles(new URL('./7400-n78/', import.meta.url))) {
-      const { default: run } = await import(file.href);
-      await run(fixture, resources);
+      const step = await loadSection(file);
+      if (step) await step.default(fixture, resources);
     }
   } finally {
     const { externalPty, unloadPage, owned, ownedPty } = resources;
