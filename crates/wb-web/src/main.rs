@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::serve::ListenerExt;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -254,6 +255,12 @@ async fn run(config: &Path) -> Result<()> {
     let wb = tokio::spawn(websock::serve(app.clone(), web_sock));
     let service = routes::app(app.clone()).into_make_service_with_connect_info::<SocketAddr>();
     let graceful = app.clone();
+    // Send successive terminal frames to the proxy without waiting for a delayed TCP ACK.
+    let listener = listener.tap_io(|stream| {
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::warn!(%error, "could not set TCP_NODELAY on frontend connection");
+        }
+    });
     let server = axum::serve(listener, service)
         .with_graceful_shutdown(async move { graceful.stopped().await });
     let mut sockets = app.sockets.subscribe();
