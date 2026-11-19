@@ -235,12 +235,12 @@ async fn write_loop(mut wr: OwnedWriteHalf, q: Arc<OutQ>) {
     while let Some(output) = q.next().await {
         let write = async {
             match output {
-                Output::Line(line) => wr.write_all(&line).await,
+                Output::Line(line) => wr.write_all(&line).await.map(|()| true),
                 Output::Snapshot(snapshot) => snapshot.write(&mut wr).await,
             }
         };
         tokio::select! {
-            r = write => if r.is_err() { break },
+            r = write => if !matches!(r, Ok(true)) { break },
             () = q.closed() => break,
         }
     }
@@ -279,15 +279,20 @@ impl Conn {
             }
         };
         let rid = v.get("rid").and_then(Value::as_u64);
-        let t = v
-            .get("t")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
+        // Diagnostic echoes must not grow the reply beyond the framing limit.
+        let t = v.get("t").and_then(Value::as_str).unwrap_or_default();
+        let t = t[..t.floor_char_boundary(128)].to_owned();
         let req = match serde_json::from_value::<HubRequest>(v) {
             Ok(req) => req,
             Err(e) => {
-                return self.error(rid, None, ErrorCode::BadRequest, format!("bad {t:?}: {e}"));
+                let why = e.to_string();
+                let why = &why[..why.floor_char_boundary(256)];
+                return self.error(
+                    rid,
+                    None,
+                    ErrorCode::BadRequest,
+                    format!("bad {t:?}: {why}"),
+                );
             }
         };
         if rid == Some(0) {

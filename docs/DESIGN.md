@@ -332,10 +332,12 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 **`list` and `watch` snapshots.**
 - With `stream:true`, concatenate the `sessions` arrays from any `sessions.page{rid,sessions}` lines and the final `ok{rid,sessions}`.
   Each line fits `MAX_LINE` (newline excluded), independent of session count; each summary is whole.
-  A summary too large for even an empty page ends the request with `err{rid,sid,code:"internal"}`; discard the partial snapshot.
+  The last summary uses the final `ok` line's budget.
+  If a summary cannot fit its envelope even on a line of its own, the hub sends `err{rid,sid,code:"internal"}` and closes the connection if it was a `watch` request.
 - A `watch` captures the snapshot and subscribes atomically.
   All live `session` and `gone` events from that subscription follow the snapshot, including changes made while it is being sent.
-  A single oversized `session` event is replaced by `err{sid,code:"internal"}`.
+  If a live or legacy catch-up `session` event cannot fit `MAX_LINE`, the hub closes the watch connection.
+  A `list` on a watching connection is ordered with any live events at the moment its snapshot is captured.
 - Without `stream:true`, the hub sends the original single `ok` reply when it fits.
   If it does not fit, `list` returns `bad_request` directing the caller to `stream:true`; `watch` sends a bounded `ok` with a prefix of the snapshot, then ordinary `session` events for the rest, before any live changes.
   This lets older web fronts retain all summaries and options using their existing upsert path.
@@ -477,6 +479,8 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 
 #### 3.2.10 Hub availability as seen from the web
 - The control connection reconnects with backoff: 250 ms doubling to 5 s, with jitter.
+- The web treats an incomplete or undecodable initial watch as a lost connection and discards its staged summaries.
+- Readiness and the session map change together; the web reports the hub up only after the final watch reply.
 - While the hub is down:
   - `/api/info.hub.status="down"`;
   - new card sockets are accepted, then closed with 1013;

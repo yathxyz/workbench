@@ -1120,7 +1120,9 @@ def session_snapshots(t, web_root, bin_dir, wide=False):
             sessions = []
             while True:
                 reply = recv(hub)
-                if reply["t"] == "sessions.page" and reply["rid"] == 1:
+                if reply["t"] == "sessions.page":
+                    if not stream or reply["rid"] != 1:
+                        raise ValueError("unexpected sessions.page")
                     if on_page is not None:
                         on_page()
                         on_page = None

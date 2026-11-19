@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use common::{FakeHub, Hello, Web, Ws, next_json, pty_summary, read_to_close};
 use serde_json::{Value, json};
 use wb_proto::hub::{Agent, ErrorCode, HubMessage, HubRequest};
+use wb_proto::line::encode;
 
 const STARTED_AT: u64 = 1_700_000_000_000;
 /// What the web under test was built with; the binary and this crate share the build.
@@ -153,6 +154,74 @@ async fn hub_status_and_sessions_follow_the_hub() {
     assert_eq!(web.req("GET", "/api/sessions").send().await.status, 503);
     let mut pty = web.ws("/pty").await;
     assert_eq!(read_to_close(&mut pty).await.0, 1013);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_is_unavailable_until_the_final_reply() {
+    let hub = FakeHub::start();
+    hub.manual_watch();
+    let web = Web::start(&hub.path);
+    let (conn, _) = hub
+        .wait_for(|r| matches!(r, HubRequest::Watch { .. }))
+        .await;
+    let first = pty_summary("first", 1, true, false);
+    let last = pty_summary("last", 2, true, false);
+    hub.send_raw(
+        conn,
+        encode(&HubMessage::SessionsPage {
+            rid: 1,
+            sessions: vec![first.clone()],
+        }),
+    )
+    .await;
+
+    let res = web.req("GET", "/api/sessions").send().await;
+    assert_eq!(res.status, 503);
+    assert_eq!(res.json(), json!({"error": "hub unavailable"}));
+    let mut rpc = web.ws("/rpc").await;
+    assert_eq!(
+        next_json(&mut rpc).await,
+        json!({"t": "hub", "status": "down"})
+    );
+    assert_eq!(next_json(&mut rpc).await["t"], "board");
+
+    hub.send(conn, HubMessage::ok(1, &json!({"sessions": [last]})));
+    assert_eq!(next_json(&mut rpc).await["status"], "up");
+    assert_eq!(
+        next_json(&mut rpc).await["sessions"],
+        json!([with_state(&first, "idle"), with_state(&last, "idle")])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_watch_page_discards_the_entire_snapshot() {
+    let hub = FakeHub::start();
+    hub.manual_watch();
+    let web = Web::start(&hub.path);
+    let is_watch = |r: &HubRequest| matches!(r, HubRequest::Watch { .. });
+    let (conn, _) = hub.wait_for(is_watch).await;
+    let mut rpc = web.ws("/rpc").await;
+    assert_eq!(next_json(&mut rpc).await["status"], "down");
+    assert_eq!(next_json(&mut rpc).await["t"], "board");
+
+    let mut bad = encode(&HubMessage::SessionsPage {
+        rid: 1,
+        sessions: vec![pty_summary("discard-me", 1, true, false)],
+    });
+    bad.extend_from_slice(b"{\"t\":\"sessions.page\",\"rid\":1,\"sessions\":[null]}\n");
+    bad.extend(encode(&HubMessage::ok(1, &json!({"sessions": []}))));
+    hub.send_raw(conn, bad).await;
+    let retry = hub.wait_count(2, is_watch).await[1].0;
+    assert_ne!(retry, conn);
+    assert_eq!(web.req("GET", "/api/sessions").send().await.status, 503);
+
+    let fresh = pty_summary("fresh", 2, true, false);
+    hub.send(retry, HubMessage::ok(1, &json!({"sessions": [fresh]})));
+    assert_eq!(next_json(&mut rpc).await["status"], "up");
+    assert_eq!(
+        next_json(&mut rpc).await["sessions"],
+        json!([with_state(&fresh, "idle")])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

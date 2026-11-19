@@ -14,7 +14,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use wb_proto::hub::ErrorCode;
+use wb_proto::hub::{ErrorCode, Summary};
 use wb_proto::limits::CAPTURE_MAX;
 use wb_proto::state::derive;
 
@@ -38,7 +38,7 @@ pub fn routes() -> Router<AppState> {
 
 async fn info(State(app): State<AppState>) -> Json<Value> {
     let edit = app.edit_status().await;
-    let status = app.hub.status.borrow().clone();
+    let status = app.hub.status();
     let (agents, shells, default_shell, hub) = match &status {
         HubStatus::Up(h) => (
             json!(h.agents),
@@ -94,7 +94,11 @@ async fn info(State(app): State<AppState>) -> Json<Value> {
 
 /// 503 unless the hub is up.
 pub fn hub_up(app: &AppState) -> Result<(), ApiError> {
-    match *app.hub.status.borrow() {
+    hub_ready(&app.hub.state().status)
+}
+
+pub(crate) fn hub_ready(status: &HubStatus) -> Result<(), ApiError> {
+    match status {
         HubStatus::Up(_) => Ok(()),
         HubStatus::Down => Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -107,11 +111,14 @@ pub fn hub_up(app: &AppState) -> Result<(), ApiError> {
     }
 }
 
+pub(crate) fn hub_sessions(app: &AppState) -> Result<Vec<Summary>, ApiError> {
+    let state = app.hub.state();
+    hub_ready(&state.status)?;
+    Ok(state.sessions.values().cloned().collect())
+}
+
 async fn sessions(State(app): State<AppState>) -> Result<Json<Value>, ApiError> {
-    hub_up(&app)?;
-    let sessions: Vec<Value> = app
-        .hub
-        .sessions()
+    let sessions: Vec<Value> = hub_sessions(&app)?
         .iter()
         .map(|s| app.session_summary(s))
         .collect();
@@ -146,9 +153,8 @@ async fn status(State(app): State<AppState>) -> Json<Value> {
     let host = tokio::task::spawn_blocking(host_status)
         .await
         .unwrap_or_default();
-    let sessions = match hub_up(&app) {
-        Ok(()) => {
-            let sessions = app.hub.sessions();
+    let sessions = match hub_sessions(&app) {
+        Ok(sessions) => {
             let mut by_state = BTreeMap::new();
             for s in &sessions {
                 let state = serde_json::to_value(derive(s)).unwrap_or_default();

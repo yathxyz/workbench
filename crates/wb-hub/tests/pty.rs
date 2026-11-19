@@ -321,6 +321,26 @@ fn a_line_over_max_line_closes_the_connection() {
 }
 
 #[test]
+fn unknown_request_at_max_line_gets_a_bounded_error() {
+    let hub = Hub::start();
+    let mut c = hub.connect();
+    let mut request = br#"{"t":"unknown."#.to_vec();
+    let end = b"\",\"rid\":8}";
+    request.resize(MAX_LINE - end.len(), b'x');
+    request.extend_from_slice(end);
+    request.push(b'\n');
+    c.write_raw(&request).unwrap();
+
+    let reply = c.next().unwrap();
+    assert_eq!(reply["t"], "err");
+    assert_eq!(reply["rid"], 8);
+    assert_eq!(reply["code"], "unknown_type");
+    assert!(reply["message"].as_str().unwrap().contains("unknown."));
+    assert!(serde_json::to_vec(&reply).unwrap().len() <= MAX_LINE);
+    c.ok(json!({"t": "list"}));
+}
+
+#[test]
 fn owed_replies_arrive_after_the_client_stops_sending() {
     let hub = Hub::start();
     let mut a = hub.connect();

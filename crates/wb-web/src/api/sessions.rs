@@ -27,7 +27,7 @@ use crate::http::{ApiError, ApiQuery, Body, Param};
 use crate::hub::{
     CallError, ConnectError, HubConn, HubInfo, HubStatus, REPLY_TIMEOUT, acp_open_timeout,
 };
-use crate::info::hub_up;
+use crate::info::{hub_ready, hub_sessions, hub_up};
 use crate::util::valid_sid;
 
 /// The rid of the one request a connection carries.
@@ -154,7 +154,7 @@ fn parse_object<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
 
 async fn info(_: Read, State(api): State<ApiState>) -> Json<Value> {
     let app = &api.app;
-    let status = app.hub.status.borrow().clone();
+    let status = app.hub.status();
     let (hub, agents, hosts) = match &status {
         HubStatus::Up(h) => (
             json!({
@@ -191,10 +191,7 @@ async fn info(_: Read, State(api): State<ApiState>) -> Json<Value> {
 
 async fn list(_: Read, State(api): State<ApiState>) -> Result<Json<Value>, ApiError> {
     let app = &api.app;
-    hub_up(app)?;
-    let sessions: Vec<Value> = app
-        .hub
-        .sessions()
+    let sessions: Vec<Value> = hub_sessions(app)?
         .iter()
         .map(|s| app.session_summary(s))
         .collect();
@@ -203,9 +200,10 @@ async fn list(_: Read, State(api): State<ApiState>) -> Result<Json<Value>, ApiEr
 
 /// The Summary of `sid` as the control connection last heard it, or 404.
 fn summary(app: &AppState, sid: &str) -> Result<Summary, ApiError> {
-    hub_up(app)?;
-    let sessions = app.hub.sessions.lock().unwrap_or_else(|e| e.into_inner());
-    sessions
+    let state = app.hub.state();
+    hub_ready(&state.status)?;
+    state
+        .sessions
         .get(sid)
         .cloned()
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no session {sid}")))
@@ -743,14 +741,10 @@ async fn kill(
 ) -> Result<Json<Value>, ApiError> {
     let sid = sid_of(id)?;
     let forget = query.forget.unwrap_or(false);
-    let kind = api
-        .app
-        .hub
-        .sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&sid)
-        .map(|s| s.kind);
+    let kind = {
+        let state = api.app.hub.state();
+        state.sessions.get(&sid).map(|s| s.kind)
+    };
     let req = match kind {
         Some(Kind::Acp) | None => HubRequest::AcpKill {
             rid: RID,

@@ -36,12 +36,11 @@ fn event(name: &str, data: &impl Serialize) -> Event {
 
 /// `hub`, and while the hub is up one `session` for every session it knows. A client
 /// drops the hub sessions it held when a `hub` event arrives.
-fn hub_events(app: &AppState, status: &HubStatus, out: &mut VecDeque<Event>) {
+fn hub_events(app: &AppState, out: &mut VecDeque<Event>) {
+    let (status, sessions) = app.hub.snapshot();
     out.push_back(event("hub", &json!({"status": status.name()})));
-    if let HubStatus::Up(_) = status {
-        for session in app.hub.sessions() {
-            out.push_back(event("session", &app.session_summary(&session)));
-        }
+    for session in sessions {
+        out.push_back(event("session", &app.session_summary(&session)));
     }
 }
 
@@ -71,7 +70,10 @@ impl Feed {
             tokio::select! {
                 () = self.app.stopped() => return None,
                 msg = self.hub.recv() => match msg {
-                    Ok(FeedMsg::Hub(status)) => hub_events(&self.app, &status, &mut self.out),
+                    Ok(FeedMsg::Hub(HubStatus::Up(_))) => hub_events(&self.app, &mut self.out),
+                    Ok(FeedMsg::Hub(status)) => {
+                        self.out.push_back(event("hub", &json!({"status": status.name()})));
+                    }
                     Ok(FeedMsg::Session(session)) => {
                         self.out.push_back(event("session", &self.app.session_summary(&session)));
                     }
@@ -100,8 +102,7 @@ async fn stream(
     let hub = app.feed.subscribe();
     let observed = api.changes.subscribe();
     let mut out = VecDeque::new();
-    let status = app.hub.status.borrow().clone();
-    hub_events(&app, &status, &mut out);
+    hub_events(&app, &mut out);
     for session in api.registry.list() {
         out.push_back(event("observed", &session));
     }

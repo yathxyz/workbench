@@ -144,18 +144,18 @@ impl Registry {
 
     pub fn list(&self, outq: &OutQ, rid: u64, stream: bool) {
         let mode = if stream {
-            SnapshotMode::Stream
+            SnapshotMode::Stream { watch: false }
         } else {
             SnapshotMode::LegacyList
         };
-        let snapshot = lock(&self.inner).snapshot(rid, mode);
-        outq.push_snapshot(snapshot);
+        let inner = lock(&self.inner);
+        outq.push_snapshot(inner.snapshot(rid, mode));
     }
 
     /// Replies to `watch` with every Summary and subscribes `viewer` to later changes.
     pub fn watch(&self, viewer: Viewer, rid: u64, stream: bool) {
         let mode = if stream {
-            SnapshotMode::Stream
+            SnapshotMode::Stream { watch: true }
         } else {
             SnapshotMode::LegacyWatch
         };
@@ -255,7 +255,13 @@ impl Registry {
         let session = entry.summary.insert(summary);
         if !watchers.is_empty() {
             let mut buf = Vec::new();
-            snapshot::update(&mut buf, session);
+            if !snapshot::update(&mut buf, session) {
+                tracing::warn!(sid = %session.sid, "watch update exceeds MAX_LINE");
+                for viewer in watchers.drain(..) {
+                    viewer.outq.close();
+                }
+                return;
+            }
             let msg: Arc<[u8]> = buf.into();
             watchers.retain(|w| w.outq.push_event(msg.clone()).is_ok());
         }
