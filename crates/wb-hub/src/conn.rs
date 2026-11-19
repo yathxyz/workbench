@@ -178,6 +178,7 @@ fn hello(ctx: &Ctx) -> HubMessage {
         shells: ctx.cfg.available_shells(),
         default_shell: ctx.cfg.default_shell.clone(),
         acp_config: true,
+        acp_task: true,
         hosts: ctx
             .cfg
             .hosts
@@ -403,6 +404,9 @@ impl Conn {
                     },
                 )
                 .await;
+            }
+            HubRequest::AcpSetTask { rid, sid, task } => {
+                self.act(rid, sid, Act::SetTask(task)).await;
             }
             HubRequest::AcpSeen { rid, sid, seq } => self.act(rid, sid, Act::Seen(seq)).await,
             HubRequest::AcpRevive { rid, sid } => self.act(rid, sid, Act::Revive).await,

@@ -368,6 +368,14 @@ fn config() {
 }
 
 #[test]
+fn task() {
+    for task in [Some("issue 44".to_owned()), None] {
+        let event = round_trip(ev(22, "task", json!({"task": task})));
+        assert_eq!(event.body, EventBody::Task { task });
+    }
+}
+
+#[test]
 fn notice() {
     for (wire, level) in [
         ("info", NoticeLevel::Info),
@@ -477,6 +485,7 @@ fn missing_seq_ts_e_or_payload_fields_are_errors() {
         r#"{"seq":1,"e":"mode","modeId":"plan"}"#,
         r#"{"seq":1,"ts":1,"modeId":"plan"}"#,
         r#"{"seq":1,"ts":1,"e":"mode"}"#,
+        r#"{"seq":1,"ts":1,"e":"task"}"#,
     ] {
         assert!(
             serde_json::from_str::<JournalEvent>(line).is_err(),

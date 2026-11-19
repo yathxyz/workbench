@@ -201,10 +201,11 @@ flake.nix flake.lock   (inputs: nixpkgs, edwin = github:yathxyz/edwin)
 
 #### 3.2.3 Handshake and versioning
 1. The hub sends first:
-   `{"t":"hello","proto":1,"server":"wb-hub","version":"0.1.0","build":"<WB_HUB_BUILD>","host":"devbox","pid":1234,"startedAt":…,"acpConfig":true,"agents":[{"name":"claude","label":"Claude"},…],"shells":["bash","nu"],"defaultShell":"bash"}`
+   `{"t":"hello","proto":1,"server":"wb-hub","version":"0.1.0","build":"<WB_HUB_BUILD>","host":"devbox","pid":1234,"startedAt":…,"acpConfig":true,"acpTask":true,"agents":[{"name":"claude","label":"Claude"},…],"shells":["bash","nu"],"defaultShell":"bash"}`
    - `build` comes from `option_env!("WB_HUB_BUILD")`. It is absent in local cargo builds.
    - `shells` lists the names of the configured shells that have an existing, executable path when the connection opens (the hub re-checks at each spawn). `defaultShell` is the configured default (§3.7.2).
    - `acpConfig:true` advertises ordered startup configuration and live configuration requests. Missing or false means unsupported; clients must not infer support from the version or build. Older hubs ignore an unknown `SpawnAcp.config`, so the web refuses a non-empty batch unless the connected hub advertises support.
+   - `acpTask:true` advertises support for both `SpawnAcp.task` and `acp.set_task`; absent or false means unsupported.
 2. The client answers within `HELLO_TIMEOUT` with `{"t":"hello","proto":1,"client":"wb-web/0.1.0"}`, or it is closed.
 3. A `proto` mismatch gives `err{code:"proto"}`, then close.
 4. **Additive rule:** `proto` stays 1 while changes are additive. Receivers ignore unknown fields and unknown events. An unknown request gets `err{code:"unknown_type"}` and the connection stays open.
@@ -274,6 +275,7 @@ The error codes are a closed set:
     "headSeq": 815, "seenSeq": 790,
     "title": "Fix flaky test",
     "modeId": "default",
+    "task": "issue 44",               // optional; absent when there is no task
     "configOptions": null             // null until offered; otherwise the agent's full config option list
   }
 }
@@ -311,6 +313,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `acp.elicitation` | `sid, req, epoch, response` | `{}` | `epoch` mismatch → `stale`. First answer wins. `content` must be an object of string, number, boolean or string[]. |
 | `acp.set_mode` | `sid, modeId` | `{}` after the agent answers (30 s) | `modeId` must be in `availableModes`. Journals `mode{modeId}`. |
 | `acp.set_config_option` | `sid, epoch, configId, value: string\|boolean` | `{}` after the agent answers and the result is journaled (30 s) | `configId` must be offered in `configOptions`. A select value must be offered (including within grouped options); a boolean option requires a JSON boolean. Sends `session/set_config_option`; journals `config{configOptions}` from the agent's result. The result is authoritative, not a local patch of the requested value. |
+| `acp.set_task` | `sid, task: string\|null` | `{}` after journaling | Replace the reference, or clear it with null or an empty trimmed string. This changes hub metadata, not the agent's configuration. |
 | `acp.seen` | `sid, seq` | `{}` | `seenSeq = max(seenSeq, min(seq, headSeq))`, persisted |
 | `acp.revive` | `sid` | `{}` once started | only when `!alive && revivable && fault == null`, else `not_revivable`/`faulted`. §3.4.5. |
 | `acp.authenticate` | `sid, methodId` | `{}` after the agent answers | only during a failed setup, agent-handled methods only (`type:"terminal"` → `bad_option`) |
@@ -332,9 +335,10 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 - Cwd precedence: the cwd of a live `cwdFrom`, then `cwd`, then `$HOME`. A missing or non-directory cwd falls back to `$HOME`.
 - `env`: at most 32 entries. Keys match `^[A-Za-z_][A-Za-z0-9_]{0,63}$`, values are ≤ 4096 bytes, and keys the hub sets cannot be overridden.
 
-**`SpawnAcp`** = `{agent, cwd: absolute existing directory, config?: ConfigOption[]}`.
+**`SpawnAcp`** = `{agent, cwd: absolute existing directory, config?: ConfigOption[], task?: string}`.
 - **`ConfigValue`** is a JSON string or boolean, never a number, null, array or object. **`ConfigOption`** = `{id: string, value: ConfigValue}`. The optional `config` array is ordered: at most 16 entries, with distinct ids. The hub rejects an invalid batch with `bad_request` before spawning. Absent or empty `config` preserves the old asynchronous open behaviour; serializers omit the empty array.
 - **`ConfigError`** = `{id: string, value: ConfigValue, code: ErrorCode, error: string}`. `AcpOpenReply.configErrors` reports failed entries in input order, retaining their requested values and a required hub error code. It is omitted when empty and defaults to an empty array when absent. These errors belong only to the initiating open reply, not to the session facts or later attaches.
+- **`task`** is a free-text reference (F-A51): reject any C0 control or DEL, trim surrounding whitespace, then reject more than `TASK_MAX` UTF-8 bytes. An empty result means no task; invalid input returns `bad_request`, never a truncated value. A spawn task applies only to a new session.
 
 **`pty.open` rules.** Principle: **a request without `spawn` never starts a process**.
 - **Alive:** attach, whether or not `spawn` is present. An alive session is never respawned.
@@ -383,6 +387,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `ACP_CONFIG_MAX` | 16 initial configuration entries, with distinct ids | hub `bad_request`; API 400 "bad body", before spawn |
 | `ACP_CONFIG_OPTIONS_MAX` | 64 options in an agent's full offering | a larger list is malformed |
 | `ACP_CONFIG_OPTIONS_BYTES` | 64 KiB of compact serialized UTF-8 JSON for the full offering | a larger list is malformed; oversized legacy journal offerings fold to none (§3.4.5) |
+| `TASK_MAX` | 512 UTF-8 bytes after trimming | hub `bad_request`; API 400 without applying the change |
 | `VT_SCROLLBACK` | 1000 lines | |
 | `SNAPSHOT_MAX` | 4 MiB | halve the scrollback budget until it fits |
 | `ESC_HOLDBACK_MAX` | 4 KiB | flush the held tail as is |
@@ -528,6 +533,7 @@ Each line is `{"seq":N,"ts":…,"e":KIND,…}`.
 | `elicitation_complete` | `elicitationId` | `elicitation/complete` arrived (url mode) |
 | `mode` | `modeId` | `session/set_mode` succeeded |
 | `config` | `configOptions` (full list) | `session/set_config_option` succeeded; written before its hub reply |
+| `task` | `task: string\|null` | task reference set on creation, replaced or cleared; the latest event determines `Summary.acp.task` across revive and restart |
 | `notice` | `level, text` | hub notes: initial configuration entry failures, the revive method, `agent stderr: <last line>` (≤ 500 characters) for an unclean exit, "agent stopped after failed setup", and the fault probe's `warn` |
 | `exit` | `code, signal, reason: "exited"\|"killed"\|"hub_restart"` | the process ended. `code` and `signal` are the agent's real exit status, including on a graceful stop; they are null only in the lines startup normalisation writes. |
 
@@ -1083,13 +1089,14 @@ A sid in a path that does not match `^[A-Za-z0-9_-]{1,64}$` is 400 "bad id". Req
 | `GET /v1/observed` | read | `{sessions:[ObservedSession]}` (§3.8.3), live first, then by `lastAt`, newest first. |
 | `GET /v1/observed/{id}` | read | One `ObservedSession` by its `id`; 404. |
 | `GET /v1/stream` | read | Server-sent events (§3.8.4). |
-| `POST /v1/sessions` | control | Starts an ACP agent. Body `{agent, cwd, host?, sid?, config?: {optionId: string\|boolean}}`. `sid` defaults to `api_` and 16 random hex digits. `host` absent, or the hub's own, starts it on the hub's host; another name must be one of the hub's `hosts` as its hello lists them, else 400 "no host H" (so a hub that predates §3.8.5 is never asked). 201 `{sid, session: Summary+state, configErrors:[{id, value, code, error}]}`; configuration rules below. A sid that an agent session has is 409 "session exists", and one that a shell has is 409 with the hub's `kind_mismatch`; that session is left as it is. |
+| `POST /v1/sessions` | control | Starts an ACP agent. Body `{agent, cwd, host?, sid?, config?: {optionId: string\|boolean}, task?: string}`. `sid` defaults to `api_` and 16 random hex digits. `host` absent, or the hub's own, starts it on the hub's host; another name must be one of the hub's `hosts` as its hello lists them, else 400 "no host H" (so a hub that predates §3.8.5 is never asked). 201 `{sid, session: Summary+state, configErrors:[{id, value, code, error}]}`; configuration rules below. A sid that an agent session has is 409 "session exists", and one that a shell has is 409 with the hub's `kind_mismatch`; that session is left as it is. |
 | `POST /v1/sessions/{sid}/prompt` | control | Body `{text}` or `{blocks:[ContentBlock]}`, exactly one of them; `text` becomes one text block. `acp.prompt`. 200 `{}`. |
 | `POST /v1/sessions/{sid}/cancel` | control | `acp.cancel`. 200 `{}`. |
 | `POST /v1/sessions/{sid}/permission` | control | Body `{req, epoch, outcome}`: `acp.permission`. 200 `{}`. |
 | `POST /v1/sessions/{sid}/elicitation` | control | Body `{req, epoch, response}`: `acp.elicitation`. 200 `{}`. |
 | `POST /v1/sessions/{sid}/mode` | control | Body `{modeId}`: `acp.set_mode`. 200 `{}`. |
 | `POST /v1/sessions/{sid}/config` | control | Body `{id, value: string\|boolean}`: `acp.set_config_option{sid, epoch: current Summary.createdAt, configId:id, value}`. 200 `{}` only after the agent result is journaled; hub timeout 30 s, API reply wait 40 s. No request body epoch is accepted. |
+| `POST /v1/sessions/{sid}/task` | control | Body `{"task": string\|null}`, with the member required. Sends `acp.set_task`; 200 `{}` after the replacement or clear is journaled. |
 | `POST /v1/sessions/{sid}/revive` | control | `acp.revive`. 200 `{}`. |
 | `DELETE /v1/sessions/{sid}?forget=true\|false` | control | `acp.kill` or `pty.kill` by the session's kind, `forget` defaulting to `false`. 200 `{}`; 404 for a sid the hub does not know. |
 | `POST /v1/events` | events | One session event (§3.8.3). 204. |
@@ -1099,6 +1106,8 @@ A body that is not the JSON the endpoint takes, an unknown key included, is 400 
 **Configuration on create.** `config`, when present, is a JSON object with at most **16 distinct option ids**, each value a string or boolean. A non-object, another value type, duplicate id or a seventeenth option is 400 "bad body", before any spawn. The web retains the input object's member order and passes it as the hub's ordered `SpawnAcp.config` array `[{id, value}]`; it does not wait for setup events and issue its own configuration RPCs. With no config or `{}`, create keeps its immediate post-open behaviour and does not wait for ACP setup. With non-empty config, the hub delays the initiating `acp.open` reply until setup and the ordered batch end or terminate (§3.4.5), blocking prompts and the other listed live actions from every client in the meantime. The API waits up to `40 s × (1 + number of options)` for that reply, then returns its resulting session and opener `configErrors` verbatim. This outer HTTP wait is not a total setup timeout: the hub still uses `SETUP_IDLE_TIMEOUT`, which can be extended by agent messages or paused for pending requests. Individual configuration failures and setup failure do not turn accepted creation into a failed start: the response remains 201, with every unapplied option accounted for and `configErrors:[]` when all succeeded. Later option validation uses the latest authoritative full list. Create never sends a prompt, with or without configuration.
 
 Non-empty `config` requires `acpConfig:true` in the connected hub's hello. Otherwise creation is 400 "hub does not support session configuration", before any open or spawn is sent; a missing capability on an older hub is not success. Missing config or `{}` keeps the old behaviour.
+
+**Task reference.** Both endpoints validate the reference as for `SpawnAcp.task` (§3.2.7). Creating with a non-empty normalized task, or setting or clearing a task later, requires `acpTask:true` on the connection that would send the request; otherwise the API returns 400 without forwarding it. The task, when present, is returned in `session.acp.task` on create and in `acp.task` in session summaries.
 
 **Who answers permission requests.** `control` includes `permission` and `elicitation`: a client that holds it can approve what an agent asks. Whether an orchestrating client does so, or leaves those to the owner, is that client's configuration. The owner sees every pending request in Workbench either way.
 
@@ -1125,6 +1134,7 @@ An observed session is what the harnesses report about one agent session: a reco
 - `harness` matches `^[a-z0-9-]{1,32}$`. Every other field but `payload` is optional and may be `null`; unknown fields are ignored.
 - `at` is the sender's wall clock in ms; absent, or later than the server's, it is the server's.
 - `wbSession` is the sender's `$WB_SESSION`, kept only when it is a sid (`^[A-Za-z0-9_-]{1,64}$`): the agent runs under the hub as that session.
+- `task` is an optional task reference with the same validation as `SpawnAcp.task`. A string replaces the previous task; an empty trimmed string clears it. Absent or null leaves the task unchanged. An invalid value is 400 with no registry changes.
 - `attach` is `{kind:"claude", id}` with `id` matching `^[0-9a-f]{8}$`, or `{kind:"tmux", socket, pane}` with `socket` matching `^/[A-Za-z0-9._/-]{1,200}$`, containing no `..`, and integer `pane` in `0..999999`. No extra fields. Malformed values count as absent; like `wbSession`, an absent, null or malformed value leaves the previous valid value intact, and a later valid value replaces it. For example, `{"kind":"tmux","socket":"/tmp/tmux-1000/default","pane":7}`.
 - `pid` and `pidStart` name the harness process: its pid and field 22 of its `/proc/<pid>/stat`. `projectRoot` is the nearest directory at or above the session's cwd that holds `.git`.
 - `repoRoot`, `repo`, `worktree` and `branch` are optional strings or `null`, derived by the reporter **on the session's host** by the rule below, never typed by the user. The four fields are one replacement set: an event containing **any** of these keys, with any value including `null`, MUST replace all four stored fields. A string of at most 2,048 UTF-8 bytes is stored; a null, absent, wrong-type or oversized value becomes null. An event containing **none** of these keys MUST leave all four unchanged, so reporters that have not been updated retain the old behavior. `projectRoot` keeps its existing retain-when-absent semantics. They are display metadata, not paths for the server to open or addresses from which to fetch.
@@ -1147,6 +1157,7 @@ interface ObservedSession {
   attach: null|{kind:'claude'; id:string}|{kind:'tmux'; socket:string; pane:number};
   cwd: string|null; projectRoot: string|null;
   repoRoot: string|null; repo: string|null; worktree: string|null; branch: string|null;
+  task?: string;         // persisted task reference; absent when not set
   project: string;       // basename(projectRoot ?? cwd), else "(no cwd)"
   model: string|null; permissionMode: string|null;
   title: string;         // the first line of the first prompt (≤ 120 bytes), else agentType, else `${harness} · ${project}`
@@ -1459,6 +1470,7 @@ A fourth rule is a convention, not checked: **K4**, reuse a key across layers wh
 **Where keys live.** `web/keys.ts` is a module with no DOM: keymaps, interiors, transients, `resolve(ctx, key)`, `leaderResolve`, `whereIs` (the palette's labels), `rows` (which-key) and `check()`. `app.js` keeps one capture keydown listener that computes the context (`keyContext()`), walks `resolve` and runs the command in `KC`. A `cmd()` entry whose keys begin with `@` shows the keys bound to that command, so the palette, which-key and the bindings cannot disagree. New keys (desks included) are rows in `keys.js`; a pull request that adds one runs the checker.
 
 Agents is reached by Alt-8 or the palette's Agents view command. Its list keys apply only while the keyboard is outside a composer, terminal or Edwin frame: Enter focuses the selected live control, the composer for ACP. Shift-Tab from the composer (past any request controls) can reach the transcript frame in the browser's tab order. Escape from the composer returns to the list; leader then Escape leaves the transcript frame for the list, while plain `j`/`k`, Enter and Escape inside the frame belong to Edwin. When Edwin is ready, the composer button or `C-c C-e` in either the composer or transcript frame opens a local unsaved prompt buffer; `C-c C-c` sends and `C-c C-k` restores its current text unsent, without a page file or canvas card.
+In the Agents list, `g` toggles grouping of root rows between repository (default) and task, keeping descendants with their parent and roots without a task in one last group in task mode (F-A51). Like the Details disclosure, grouping is local to this page and resets on reload.
 
 ---
 

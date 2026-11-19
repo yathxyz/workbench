@@ -108,6 +108,7 @@
       ['k', 'agents.prev', 'previous session', 'j k / arrows'], ['<up>', 'agents.prev', 'previous session', 'j k / arrows'],
       ['RET', 'agents.enter', 'open or focus the session'], ['ESC', 'agents.back', 'back to the session list'],
       ['t', 'agents.source', 'switch between Transcript and Terminal'],
+      ['g', 'agents.group', 'group sessions by task or repository'],
     ],
     graph: [
       ['h', 'graph.left', 'select the neighbour node', 'h j k l'], ['j', 'graph.down', 'select the neighbour node', 'h j k l'],

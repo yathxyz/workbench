@@ -2261,6 +2261,132 @@ fn hub_config_journal_failure_is_not_acknowledged_or_folded() {
     fold_equals_live(&mut hub);
 }
 
+fn set_task(c: &mut Client, sid: &str, task: Value) -> Value {
+    c.request(json!({"t": "acp.set_task", "sid": sid, "task": task}))
+}
+
+#[test]
+fn hub_validates_task_before_creation_or_mutation() {
+    let hub = Hub::with_scenarios(&["basic"]);
+    let mut c = hub.connect();
+    let max = "é".repeat(wb_proto::limits::TASK_MAX / 2);
+    let invalid = [
+        json!(format!("{max}x")),
+        json!("\nissue 44"),
+        json!("issue\u{7f}44"),
+        json!(false),
+    ];
+    let spawn = |task: &Value| {
+        json!({"t": "acp.open", "sid": "a1", "since": 0,
+               "spawn": {"agent": "basic", "cwd": hub.home(), "task": task}})
+    };
+    for value in &invalid {
+        assert_eq!(c.request(spawn(value))["code"], "bad_request");
+    }
+    assert_eq!(c.ok(json!({"t": "list"}))["sessions"], json!([]));
+    assert!(!hub.acp_file("a1.jsonl").exists());
+    let opened = c.ok(spawn(&json!(format!("  {max}  "))));
+    assert_eq!(opened["summary"]["acp"]["task"], max);
+    c.event("a1", "session");
+    for value in invalid {
+        assert_eq!(set_task(&mut c, "a1", value)["code"], "bad_request");
+    }
+    assert_eq!(
+        c.request(json!({"t": "acp.set_task", "sid": "a1"}))["code"],
+        "bad_request"
+    );
+    let reopened = c.ok(spawn(&json!("not a mutation")));
+    assert_eq!(reopened["new"], false);
+    assert_eq!(reopened["summary"]["acp"]["task"], max);
+    assert_eq!(hub.kinds("a1"), ["task", "spawn", "session"]);
+}
+
+#[test]
+fn hub_task_and_clear_survive_restart_and_revive_independently_of_config() {
+    let mut hub = Hub::with_scenarios(&["config-result", "basic"]);
+    let mut c = hub.connect();
+    assert_eq!(c.hello["acpTask"], true);
+    let opened = c.ok(json!({
+        "t": "acp.open", "sid": "a1", "since": 0,
+        "spawn": {"agent": "config-result", "cwd": hub.home(), "task": "  issue 44  ",
+                  "config": [{"id": "model", "value": "large"}]}
+    }));
+    let options = &opened["summary"]["acp"]["configOptions"];
+    assert_eq!(options[0]["currentValue"], "large");
+    assert_eq!(opened["summary"]["acp"]["task"], "issue 44");
+    let (replay, _) = c.replay("a1");
+    assert_eq!(replay[0]["e"], "task");
+    assert_eq!(replay[0]["task"], "issue 44");
+    assert_eq!(set_task(&mut c, "a1", json!("  issue 45  "))["t"], "ok");
+    assert_eq!(c.event("a1", "task")["task"], "issue 45");
+    assert_eq!(&c.summary("a1")["acp"]["configOptions"], options);
+
+    let cleared = c.ok(json!({"t": "acp.open", "sid": "cleared", "since": 0,
+        "spawn": {"agent": "basic", "cwd": hub.home(), "task": "   "}}));
+    assert!(cleared["summary"]["acp"].get("task").is_none());
+    c.event("cleared", "session");
+    assert_eq!(hub.kinds("cleared"), ["spawn", "session"]);
+    for clear in [json!("  "), Value::Null] {
+        assert_eq!(set_task(&mut c, "cleared", json!("work"))["t"], "ok");
+        assert_eq!(c.event("cleared", "task")["task"], "work");
+        assert_eq!(set_task(&mut c, "cleared", clear)["t"], "ok");
+        assert_eq!(c.event("cleared", "task").get("task"), Some(&Value::Null));
+        assert!(c.summary("cleared")["acp"].get("task").is_none());
+    }
+    drop(c);
+    fold_equals_live(&mut hub);
+
+    let mut c = hub.connect();
+    let reopened = c.ok(json!({"t": "acp.open", "sid": "a1", "since": 0}));
+    assert_eq!(reopened["summary"]["acp"]["task"], "issue 45");
+    assert_eq!(&reopened["summary"]["acp"]["configOptions"], options);
+    c.replay("a1");
+    revive(&mut c, "a1");
+    assert_eq!(c.summary("a1")["acp"]["task"], "issue 45");
+    let reopened = c.ok(json!({"t": "acp.open", "sid": "cleared", "since": 0}));
+    assert!(reopened["summary"]["acp"].get("task").is_none());
+    c.replay("cleared");
+    revive(&mut c, "cleared");
+    assert!(c.summary("cleared")["acp"].get("task").is_none());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hub_initial_task_write_fault_refuses_creation_before_starting_the_agent() {
+    let hub = Hub::start_with_env(
+        |cfg| stub(cfg, "basic", &["--scenario", "basic"]),
+        &[("WB_HUB_TEST_FAIL_WRITE_AT", "1")],
+    );
+    let mut c = hub.connect();
+    let reply = c.request(json!({"t": "acp.open", "sid": "a1", "since": 0,
+        "spawn": {"agent": "basic", "cwd": hub.home(), "task": "work",
+                  "config": [{"id": "model", "value": "large"}]}}));
+    assert_eq!(reply["code"], "faulted");
+    let summary = c.summary("a1");
+    assert_eq!(summary["fault"]["code"], "journal_write");
+    assert!(summary["acp"].get("task").is_none());
+    assert!(hub.kinds("a1").is_empty());
+    assert!(hub.received("basic").is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hub_task_write_fault_does_not_clear_the_last_recorded_value() {
+    let hub = Hub::start_with_env(
+        |cfg| stub(cfg, "basic", &["--scenario", "basic"]),
+        &[("WB_HUB_TEST_FAIL_WRITE_AT", "4")],
+    );
+    let mut c = hub.connect();
+    ready(&mut c, &hub, "a1", "basic");
+    assert_eq!(set_task(&mut c, "a1", json!("keep"))["t"], "ok");
+    assert_eq!(set_task(&mut c, "a1", Value::Null)["code"], "faulted");
+    let summary = c.summary_until("a1", "faulted and dead", |s| {
+        s["fault"]["code"] == "journal_write" && s["alive"] == false
+    });
+    assert_eq!(summary["acp"]["task"], "keep");
+    assert_eq!(hub.kinds("a1"), ["spawn", "session", "task"]);
+}
+
 #[test]
 fn hub_kill_forget_outlasts_a_stubborn_agent_then_respawns_fresh() {
     let mut hub = Hub::with_scenarios(&["kill-stubborn", "basic"]);

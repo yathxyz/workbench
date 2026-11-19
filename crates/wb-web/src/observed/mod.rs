@@ -16,6 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
+use wb_proto::hub::normalize_task;
 use wb_proto::state::State;
 
 use crate::util::{atomic_write, now_ms};
@@ -192,6 +193,12 @@ pub struct ObservedSession {
     pub branch: Option<String>,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "de_task",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub task: Option<String>,
     pub title: String,
     #[serde(deserialize_with = "de_state")]
     pub state: State,
@@ -214,6 +221,20 @@ fn de_metadata<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Err
         .as_str()
         .filter(|s| s.len() <= OBS_TEXT_MAX)
         .map(str::to_owned))
+}
+
+fn read_task(value: Value) -> Result<Option<String>, &'static str> {
+    let Value::String(task) = value else {
+        return Err("task must be a string");
+    };
+    Ok(match normalize_task(&task)? {
+        Some(text) if text.len() == task.len() => Some(task),
+        trimmed => trimmed.map(str::to_owned),
+    })
+}
+
+fn de_task<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(read_task(Value::deserialize(d)?).ok().flatten())
 }
 
 /// `State` by its §3.4.6 name; wb-proto only serialises it.
@@ -351,10 +372,12 @@ fn id_of(key: &str) -> String {
     format!("o_{hex}")
 }
 
-/// The envelope fields of an event; wrong types count as absent values.
+/// The envelope fields of an event; a malformed task refuses the whole event.
 struct Envelope {
     at: u64,
     wb_session: Option<String>,
+    /// Outer `None` leaves the task alone; `Some(None)` clears it.
+    task: Option<Option<String>>,
     attach: Option<Attach>,
     pid: Option<u32>,
     pid_start: Option<u64>,
@@ -367,9 +390,14 @@ struct Envelope {
 }
 
 impl Envelope {
-    fn read(body: &Map<String, Value>, now_ms: u64) -> Envelope {
+    fn read(body: &mut Map<String, Value>, now_ms: u64) -> Result<Envelope, &'static str> {
+        let task = body
+            .remove("task")
+            .filter(|v| !v.is_null())
+            .map(read_task)
+            .transpose()?;
         let str_of = |k: &str| body.get(k).and_then(Value::as_str);
-        Envelope {
+        Ok(Envelope {
             // Never later than this clock: a sender cannot date its records ahead of
             // the others'.
             at: body
@@ -379,6 +407,7 @@ impl Envelope {
             wb_session: str_of("wbSession")
                 .filter(|s| crate::util::sanitize_sid(s) == *s && !s.is_empty())
                 .map(str::to_owned),
+            task,
             attach: body
                 .get("attach")
                 .and_then(|v| Attach::deserialize(v).ok())
@@ -406,7 +435,7 @@ impl Envelope {
             branch: str_of("branch")
                 .filter(|s| s.len() <= OBS_TEXT_MAX)
                 .map(str::to_owned),
-        }
+        })
     }
 }
 
@@ -533,6 +562,7 @@ impl Inner {
                 project: String::new(),
                 model: None,
                 permission_mode: None,
+                task: None,
                 title: String::new(),
                 state: State::Idle,
                 started_at: at,
@@ -569,6 +599,9 @@ impl Inner {
         take(&mut s.permission_mode, ev.permission_mode);
         take(&mut s.agent_type, ev.agent_type);
         take(&mut s.wb_session, env.wb_session);
+        if let Some(task) = env.task {
+            s.task = task;
+        }
         take(&mut s.project_root, env.project_root);
         // Reporters send a complete set; older events without any keys retain it.
         if env.git_metadata_present {
@@ -834,9 +867,10 @@ impl Registry {
     /// Folds one event (the whole POST body, already parsed JSON) filed under `host`.
     /// `Err(message)` means 400 with that message and the registry unchanged.
     pub fn ingest(&self, host: &str, event: Value, now_ms: u64) -> Result<(), String> {
-        let Value::Object(body) = event else {
+        let Value::Object(mut body) = event else {
             return Err("bad event".into());
         };
+        let env = Envelope::read(&mut body, now_ms)?;
         let harness = match body.get("harness").and_then(Value::as_str) {
             Some(h) if valid_harness(h) => h,
             _ => return Err("bad harness".into()),
@@ -845,7 +879,6 @@ impl Registry {
             return Err("bad event".into());
         };
         let ev = normalize(harness, payload)?;
-        let env = Envelope::read(&body, now_ms);
         self.lock().apply(host, harness, env, ev);
         Ok(())
     }

@@ -30,6 +30,8 @@ pub const ACP_CONFIG_MAX: usize = 16;
 pub const ACP_CONFIG_OPTIONS_MAX: usize = 64;
 /// Largest serialized agent configuration offering. Larger is malformed.
 pub const ACP_CONFIG_OPTIONS_BYTES: usize = 64 * KIB;
+/// Largest trimmed session task reference, in UTF-8 bytes. Larger is `bad_request`.
+pub const TASK_MAX: usize = 512;
 /// Scrollback lines kept by the VT state.
 pub const VT_SCROLLBACK: usize = 1000;
 /// Largest snapshot. The scrollback budget is halved until it fits.

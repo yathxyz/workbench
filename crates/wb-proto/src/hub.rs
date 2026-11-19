@@ -129,6 +129,15 @@ pub enum HubRequest {
         config_id: String,
         value: Value,
     },
+    /// Replace or clear the session's task reference. Reply: `{}` after journaling.
+    #[serde(rename = "acp.set_task")]
+    AcpSetTask {
+        rid: u64,
+        sid: String,
+        // The member is required; only an explicit null or empty string clears it.
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        task: Option<String>,
+    },
     /// The client has seen the events up to `seq`. Reply: `{}`.
     #[serde(rename = "acp.seen")]
     AcpSeen { rid: u64, sid: String, seq: u64 },
@@ -183,6 +192,9 @@ pub enum HubMessage {
         /// False from an older hub.
         #[serde(default)]
         acp_config: bool,
+        /// Whether the hub journals ACP task references. False from an older hub.
+        #[serde(default)]
+        acp_task: bool,
     },
     /// Success reply to the request with this `rid`; `result` holds the reply fields.
     #[serde(rename = "ok")]
@@ -386,6 +398,18 @@ pub struct ConfigError {
     pub error: String,
 }
 
+/// Validate a hub or harness task reference. An empty trimmed value clears it.
+pub fn normalize_task(raw: &str) -> Result<Option<&str>, &'static str> {
+    let task = raw.trim();
+    if task.len() > crate::limits::TASK_MAX {
+        return Err("task too long");
+    }
+    if raw.bytes().any(|b| b.is_ascii_control()) {
+        return Err("control character in task");
+    }
+    Ok((!task.is_empty()).then_some(task))
+}
+
 /// How to start an ACP agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnAcp {
@@ -400,6 +424,9 @@ pub struct SpawnAcp {
     /// Startup options, applied sequentially in the supplied order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config: Vec<ConfigOption>,
+    /// Optional task reference for the new session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
 }
 
 /// Where a viewer's terminal stopped: honoured if `stream` matches and the ring still
@@ -521,6 +548,8 @@ pub struct AcpFacts {
     pub title: Option<String>,
     pub mode_id: Option<String>,
     pub config_options: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
 }
 
 /// What is outstanding to the agent.

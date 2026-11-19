@@ -59,6 +59,8 @@ test('the board keeps its keys; views with key functions are tried first', () =>
   assert.equal(outcome(ctx(), '.'), 'card.actions');
   assert.equal(outcome(ctx(), 'm'), 'arrange');
   assert.equal(outcome(ctx({ view: 'graph' }), 'l'), 'graph.right');
+  assert.equal(outcome(ctx({ view: 'agents' }), 'g'), 'agents.group');
+  assert.equal(outcome(ctx({ view: 'agents', interior: 'text' }), 'g'), 'pass');
   const r = K.resolve(ctx({ view: 'ranger' }), 'j');
   assert.equal(r[0].fn, 'ranger');
   assert.equal(outcome(ctx({ view: 'ranger' }), 'M-b'), 'tree.toggle');

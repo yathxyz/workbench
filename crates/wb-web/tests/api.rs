@@ -140,6 +140,7 @@ fn rid_of(r: &HubRequest) -> u64 {
         | HubRequest::AcpElicitation { rid, .. }
         | HubRequest::AcpSetMode { rid, .. }
         | HubRequest::AcpSetConfigOption { rid, .. }
+        | HubRequest::AcpSetTask { rid, .. }
         | HubRequest::AcpRevive { rid, .. }
         | HubRequest::AcpKill { rid, .. }
         | HubRequest::PtyKill { rid, .. } => *rid,
@@ -172,6 +173,7 @@ fn summary(sid: &str, host: &str) -> Summary {
             title: None,
             mode_id: Some("default".into()),
             config_options: None,
+            task: None,
         }),
     }
 }
@@ -263,6 +265,13 @@ async fn scopes_paths_and_methods_are_checked_after_the_token() {
             403,
             json!("forbidden"),
         ),
+        (
+            "POST",
+            "/v1/sessions/a/task",
+            READER,
+            403,
+            json!("forbidden"),
+        ),
         ("DELETE", "/v1/sessions/a", READER, 403, json!("forbidden")),
         ("POST", "/v1/events", READER, 403, json!("forbidden")),
         ("POST", "/v1/events", OWNER, 403, json!("forbidden")),
@@ -321,10 +330,9 @@ async fn info_and_sessions_are_the_hubs() {
         ..Hello::default()
     };
     let hub = FakeHub::start_with(hello);
-    hub.set_sessions(vec![
-        summary("a1", "testhost"),
-        pty_summary("p1", EPOCH, true, false),
-    ]);
+    let mut agent = summary("a1", "testhost");
+    agent.acp.as_mut().unwrap().task = Some("workbench#44".into());
+    hub.set_sessions(vec![agent, pty_summary("p1", EPOCH, true, false)]);
     let api = Api::without_hub(hub).await;
     api.web.wait_hub("up").await;
 
@@ -350,10 +358,12 @@ async fn info_and_sessions_are_the_hubs() {
         .collect();
     assert_eq!(sids, ["a1", "p1"]);
     assert_eq!(list["sessions"][0]["state"], "idle");
+    assert_eq!(list["sessions"][0]["acp"]["task"], "workbench#44");
 
     let one = api.get("/v1/sessions/a1").await;
     assert_eq!(one.status, 200);
     assert_eq!(one.json()["acp"]["agent"], "claude");
+    assert_eq!(one.json()["acp"]["task"], "workbench#44");
     assert_eq!(one.json()["state"], "idle");
     let res = api.get("/v1/sessions/nope").await;
     assert_eq!(
@@ -484,6 +494,7 @@ async fn a_post_starts_an_agent() {
             cwd: "/home/alice/src".into(),
             host: None,
             config: Vec::new(),
+            task: None,
         })
     );
     assert_eq!(res.status, 201);
@@ -628,6 +639,151 @@ async fn startup_configuration_requires_the_hubs_advertised_support() {
             .await;
         assert_eq!(res.status, 201);
         assert_eq!(res.json()["configErrors"], json!([]));
+    }
+}
+
+#[tokio::test]
+async fn task_references_are_normalized_on_create_set_and_clear() {
+    let api = Api::start().await;
+    let req = api.req("POST", "/v1/sessions", OWNER).body(
+        json!({"agent": "claude", "cwd": "/x", "sid": "mine", "task": "  workbench#44  "})
+            .to_string(),
+    );
+    let (request, res) = api
+        .answered(req, |rid| {
+            let mut reply = open_reply("mine", "testhost", true);
+            reply.summary.acp.as_mut().unwrap().task = Some("workbench#44".into());
+            HubMessage::ok(rid, &reply)
+        })
+        .await;
+    let HubRequest::AcpOpen {
+        spawn: Some(spawn), ..
+    } = request
+    else {
+        panic!("{request:?}");
+    };
+    assert_eq!(spawn.task.as_deref(), Some("workbench#44"));
+    assert_eq!(res.status, 201);
+    assert_eq!(res.json()["session"]["acp"]["task"], "workbench#44");
+
+    for (task, expected) in [
+        (json!("  issue 45  "), Some("issue 45")),
+        (json!("   "), None),
+        (json!(""), None),
+        (Value::Null, None),
+    ] {
+        let req = api
+            .req("POST", "/v1/sessions/mine/task", OWNER)
+            .body(json!({"task": task}).to_string());
+        let (request, res) = api.answered(req, ok).await;
+        assert_eq!(
+            request,
+            HubRequest::AcpSetTask {
+                rid: 1,
+                sid: "mine".into(),
+                task: expected.map(str::to_owned),
+            }
+        );
+        assert_eq!((res.status, res.json()), (200, json!({})));
+    }
+
+    for (sid, code, status) in [
+        ("gone", ErrorCode::NotFound, 404),
+        ("pty", ErrorCode::KindMismatch, 409),
+    ] {
+        let req = api
+            .req("POST", &format!("/v1/sessions/{sid}/task"), OWNER)
+            .body(r#"{"task":"issue 45"}"#);
+        let (_, res) = api.answered(req, refusal(code, "refused")).await;
+        assert_eq!(res.status, status);
+        assert_eq!(res.json(), json!({"error": "refused", "code": code}));
+    }
+}
+
+#[tokio::test]
+async fn invalid_task_references_do_not_reach_the_hub() {
+    let api = Api::start().await;
+    let before = api.hub.requests().len();
+    for task in [
+        json!(false),
+        json!(["issue 44"]),
+        json!("é".repeat(257)),
+        json!("\nissue 44"),
+        json!("issue\u{7f}44"),
+    ] {
+        for (path, body) in [
+            (
+                "/v1/sessions",
+                json!({"agent": "claude", "cwd": "/x", "task": task}),
+            ),
+            ("/v1/sessions/mine/task", json!({"task": task})),
+        ] {
+            let req = api.req("POST", path, OWNER).body(body.to_string());
+            assert_eq!(req.send().await.status, 400, "{path} {body}");
+        }
+    }
+    for body in [json!({}), json!([null]), json!({"task": null, "extra": 1})] {
+        let req = api
+            .req("POST", "/v1/sessions/mine/task", OWNER)
+            .body(body.to_string());
+        assert_eq!(req.send().await.status, 400, "{body}");
+    }
+    assert_eq!(api.hub.requests().len(), before);
+}
+
+#[tokio::test]
+async fn tasks_require_support_on_the_connection_used_for_the_request() {
+    let api = Api::start().await; // Control's hello advertised acpTask.
+    for acp_task in [None, Some(false)] {
+        api.hub.set_hello(Hello {
+            acp_task,
+            ..Hello::default()
+        });
+        let before = api.hub.requests().len();
+        for (path, body) in [
+            (
+                "/v1/sessions",
+                json!({"agent": "claude", "cwd": "/x", "task": "issue 44"}),
+            ),
+            ("/v1/sessions/mine/task", json!({"task": "issue 44"})),
+            ("/v1/sessions/mine/task", json!({"task": null})),
+            ("/v1/sessions/mine/task", json!({"task": "   "})),
+        ] {
+            let res = api
+                .req("POST", path, OWNER)
+                .body(body.to_string())
+                .send()
+                .await;
+            assert_eq!(
+                (res.status, res.json()),
+                (400, json!({"error": "hub does not support session tasks"}))
+            );
+        }
+        assert!(
+            api.hub
+                .requests()
+                .into_iter()
+                .skip(before)
+                .all(|(_, r)| matches!(r, HubRequest::Hello { .. }))
+        );
+    }
+
+    // With no initial reference there is no feature to require.
+    for task in [None, Some(Value::Null), Some(json!("  "))] {
+        let mut body = json!({"agent": "claude", "cwd": "/x", "sid": "mine"});
+        if let Some(task) = task {
+            body["task"] = task;
+        }
+        let (request, res) = api
+            .answered(
+                api.req("POST", "/v1/sessions", OWNER)
+                    .body(body.to_string()),
+                |rid| HubMessage::ok(rid, &open_reply("mine", "testhost", true)),
+            )
+            .await;
+        assert!(matches!(request, HubRequest::AcpOpen { spawn: Some(s), .. } if s.task.is_none()));
+        assert_eq!(res.status, 201);
+        assert!(res.json()["session"]["acp"].get("task").is_none());
     }
 }
 

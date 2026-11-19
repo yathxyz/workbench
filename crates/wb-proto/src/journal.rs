@@ -108,6 +108,12 @@ pub enum EventBody {
     /// `session/set_config_option` succeeded; the full agent-provided list.
     #[serde(rename = "config")]
     Config { config_options: Value },
+    /// The task reference was set (at creation or later) or explicitly cleared.
+    #[serde(rename = "task")]
+    Task {
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        task: Option<String>,
+    },
     /// A note from the hub, such as the revive method or the agent's last stderr line.
     #[serde(rename = "notice")]
     Notice { level: NoticeLevel, text: String },

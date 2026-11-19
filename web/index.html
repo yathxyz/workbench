@@ -163,7 +163,7 @@
 <section id="v-agents" class="view" hidden aria-label="Agents">
   <div class="mesh-layout">
     <nav class="mesh-side" aria-label="Agent sessions">
-      <div class="mesh-bar"><span id="mesh-sum"></span><label title="Also list the sessions that have ended"><input type="checkbox" id="mesh-ended"> Ended</label></div>
+      <div class="mesh-bar"><span id="mesh-sum"></span><label title="Group sessions by task instead of repository (g)"><input type="checkbox" id="mesh-by-task" autocomplete="off"> By task</label><label title="Also list the sessions that have ended"><input type="checkbox" id="mesh-ended"> Ended</label></div>
       <div id="mesh-list" role="list" tabindex="0" aria-label="Sessions"></div>
     </nav>
     <div id="mesh-grip" role="separator" aria-orientation="vertical" aria-label="Session list width" aria-controls="mesh-list mesh-detail" tabindex="0" title="Drag to resize · double-click to reset"></div>
@@ -234,7 +234,7 @@
           <dt><kbd data-modkey="Mod-K">Ctrl-K</kbd></dt><dd>Fuzzy search over pages, shells, agents, folders, anchors, saved views and every command. Type letters in order: <code>cwb</code> finds canvas-workbench.</dd>
           <dt><kbd>:</kbd> · <kbd data-modkey="Mod-Shift-P">Ctrl-Shift-P</kbd> · <code>&gt;</code></dt><dd>Commands only</dd>
           <dt>Ctrl-N / Ctrl-P, Ctrl-J / Ctrl-K</dt><dd>Move in the palette</dd>
-          <dt>Alt-1 … Alt-8</dt><dd>Canvas, Navigator, Graph, Editor, Outline, Tasks, Review, Agents. In Agents: j/k or arrows select a session, Enter focuses it, Escape from the composer returns to the list.</dd>
+          <dt>Alt-1 … Alt-8</dt><dd>Canvas, Navigator, Graph, Editor, Outline, Tasks, Review, Agents. In Agents: j/k or arrows select a session, g switches between repository and task groups, Enter focuses the session, Escape from the composer returns to the list.</dd>
           <dt>Alt-B · Ctrl-` (or Ctrl-J)</dt><dd>Folder tree · docked terminal. Inside a shell, every key goes to the program except Ctrl-`; inside a page, these keys, Ctrl-K and the views stay with the board.</dd>
           <dt>h j k l · H J K L · f · . · m</dt><dd>On the board: select the neighbour card · swap with it · hints (a label on every card and on the selected card's buttons; type one to pick it) · the selected card's actions · arrange it (h j k l move, H J K L resize, Enter done, Esc puts it back)</dd>
           <dt>Arrows · - = · z · ! · Alt-← Alt-→</dt><dd>Pan · zoom out, in · the selected card at 100 % · fit everything · previous and next view</dd>

@@ -144,6 +144,7 @@ pub enum Act {
         config_id: String,
         value: Value,
     },
+    SetTask(Option<String>),
     Seen(u64),
     Revive,
     Authenticate(String),
@@ -173,9 +174,13 @@ impl Cmd {
 /// registers the session and starts its actor.
 ///
 /// Boxed because a forgotten actor routes its queued opens through here again.
-pub fn open(ctx: Arc<Ctx>, sid: String, open: Open) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+pub fn open(
+    ctx: Arc<Ctx>,
+    sid: String,
+    mut open: Open,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     Box::pin(async move {
-        if let Some(spawn) = &open.spawn {
+        if let Some(spawn) = &mut open.spawn {
             if spawn.config.len() > ACP_CONFIG_MAX {
                 return open
                     .reply
@@ -187,6 +192,10 @@ pub fn open(ctx: Arc<Ctx>, sid: String, open: Open) -> Pin<Box<dyn Future<Output
                     .reply
                     .err(ErrorCode::BadRequest, "config has duplicate ids");
             }
+            spawn.task = match checked_task(spawn.task.take()) {
+                Ok(task) => task,
+                Err(msg) => return open.reply.err(ErrorCode::BadRequest, msg),
+            };
         }
         // The second round covers an actor that was forgotten between the lookup and
         // the send; it removed its registry entry before it stopped receiving.
@@ -210,6 +219,15 @@ pub fn open(ctx: Arc<Ctx>, sid: String, open: Open) -> Pin<Box<dyn Future<Output
         }
         open.reply.err(ErrorCode::Internal, "session actor is gone");
     })
+}
+
+/// Retains the request string when it is already canonical.
+fn checked_task(task: Option<String>) -> Result<Option<String>, &'static str> {
+    let Some(raw) = &task else { return Ok(None) };
+    match wb_proto::hub::normalize_task(raw)? {
+        Some(trimmed) if trimmed.len() == raw.len() => Ok(task),
+        trimmed => Ok(trimmed.map(str::to_owned)),
+    }
 }
 
 /// Registers and starts the session `sid` found in the state directory at startup. A
@@ -644,8 +662,8 @@ struct Acp {
     /// What the watchers and viewers last got, and when.
     published: Option<(Summary, AcpSessionInfo)>,
     published_at: Option<Instant>,
-    /// Holds Summaries back while `finalise` writes the death lines, so watchers see
-    /// the end state once, never a user kill's interim `error` (ROB-13).
+    /// Holds Summaries back while creating or finalising a session: watchers see the
+    /// initial task with the spawn, and never a user kill's interim `error` (ROB-13).
     quiet: bool,
     /// When the setup gives up on a silent agent.
     setup_at: Option<Instant>,
@@ -899,6 +917,15 @@ impl Acp {
                 return self.abandon(o.reply, ErrorCode::Internal, msg);
             }
         }
+        if let Some(task) = spawn.task {
+            self.quiet = true;
+            let recorded = self.record(EventBody::Task { task: Some(task) });
+            self.quiet = false;
+            if !recorded {
+                self.publish();
+                return o.reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
+            }
+        }
         if spawn.config.is_empty() {
             let _ = self.spawn(SpawnVia::New);
             self.open(o, true);
@@ -1081,6 +1108,7 @@ impl Acp {
                 | EventBody::TurnEnd { .. }
                 | EventBody::TurnError { .. }
                 | EventBody::Config { .. }
+                | EventBody::Task { .. }
                 | EventBody::Exit { .. }
         );
         if durable && let Some(journal) = &self.journal {
@@ -1210,6 +1238,7 @@ impl Acp {
                 title: facts.title.clone(),
                 mode_id: facts.mode_id.clone(),
                 config_options: facts.config_options.clone(),
+                task: facts.task.clone(),
             }),
         };
         let init = self.meta.init.as_ref();
@@ -1434,6 +1463,16 @@ impl Acp {
             } => {
                 self.set_config_option(epoch, config_id, value, reply);
             }
+            Act::SetTask(task) => match checked_task(task) {
+                Err(msg) => reply.err(ErrorCode::BadRequest, msg),
+                Ok(task) => {
+                    if self.record(EventBody::Task { task }) {
+                        reply.done();
+                    } else {
+                        reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
+                    }
+                }
+            },
             Act::Seen(seq) => {
                 self.set_seen(seq);
                 reply.done();

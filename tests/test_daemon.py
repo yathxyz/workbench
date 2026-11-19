@@ -436,7 +436,34 @@ def configured_open(t, h):
             wbctl.acp_session(ep, sid, kill=True)
 
 
-SECTIONS = [board, fs, session_config, configured_open]
+def session_task(t, h):
+    sid = "conformance_task"
+    hub = wbctl.HubClient(h.hub_sock)
+    card = wbctl.AcpCard(wbctl.Endpoint(ORIGIN, unix=h.caddy_sock), sid)
+    try:
+        reply, _ = hub.request({"t": "acp.open", "rid": 1, "sid": sid, "since": 0,
+                                "spawn": {"agent": "stub", "cwd": str(h.home.resolve()), "task": "issue 44"}})
+        if not t.check("task: attached page receives the initial reference and its journal event",
+                       reply.get("new") and card.open()
+                       and card.result["hello"]["info"]["acp"].get("task") == "issue 44"
+                       and [e["task"] for e in card.since(0, ("task",))] == ["issue 44"],
+                       repr((reply, card.result))):
+            return
+
+        cursor = card.cursor()
+        reply, _ = hub.request({"t": "acp.set_task", "rid": 2, "sid": sid, "task": None})
+        t.check("task: clearing updates an attached page without reconnecting",
+                reply.get("t") == "ok" and card.wait(lambda:
+                    "task" not in card.result["info"]["acp"]
+                    and [e["task"] for e in card.since(cursor, ("task",))] == [None]),
+                repr((reply, card.result)))
+    finally:
+        card.close()
+        hub.request({"t": "acp.kill", "rid": 3, "sid": sid, "forget": True})
+        hub.close()
+
+
+SECTIONS = [board, fs, session_config, configured_open, session_task]
 
 
 def main():

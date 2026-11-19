@@ -24,6 +24,7 @@ pub struct Facts {
     pub mode_id: Option<String>,
     pub modes: Option<Value>,
     pub config_options: Option<Value>,
+    pub task: Option<String>,
     pub available_commands: Option<Value>,
     pub plan: Option<Value>,
     pub usage: Option<Value>,
@@ -45,6 +46,7 @@ impl Default for Facts {
             mode_id: None,
             modes: None,
             config_options: None,
+            task: None,
             available_commands: None,
             plan: None,
             usage: None,
@@ -128,6 +130,7 @@ impl Facts {
             }
             EventBody::Mode { mode_id } => self.set_mode(mode_id),
             EventBody::Config { config_options } => self.set_config_options(config_options),
+            EventBody::Task { task } => self.task.clone_from(task),
             EventBody::Exit { .. } => {
                 self.activity = Activity::None;
                 self.running = false;
@@ -409,6 +412,24 @@ mod tests {
         assert_eq!(f.config_options, Some(json!([])));
         f.apply(&ev(5, session("s", None)));
         assert_eq!(f.config_options, None);
+    }
+
+    #[test]
+    fn task_events_only_change_the_reference_and_head() {
+        let before = fold(vec![spawn(), session("s", None), prompt()]);
+        let mut f = before.clone();
+        for (seq, value) in [(4, Some("issue 44")), (5, Some("other work")), (6, None)] {
+            let task = value.map(str::to_owned);
+            f.apply(&ev(seq, EventBody::Task { task: task.clone() }));
+            assert_eq!(
+                f,
+                Facts {
+                    head_seq: seq,
+                    task,
+                    ..before.clone()
+                }
+            );
+        }
     }
 
     #[test]
