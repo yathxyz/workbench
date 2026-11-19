@@ -16,6 +16,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
@@ -1069,6 +1070,138 @@ def session_policy(t, h):
         wbctl.acp_session(ep, sid, kill=True)
 
 
+def session_snapshots(t, web_root, bin_dir, wide=False):
+    """Exercise the actual line decoder with a restored fleet, without starting agents."""
+    max_line = 16 << 20
+    option_limit = 64 << 10
+
+    def compact(value):
+        return json.dumps(value, separators=(",", ":")).encode()
+
+    option = {"id": "thinking", "name": "Thinking", "type": "boolean",
+              "currentValue": False, "description": ""}
+    option["description"] = "x" * (option_limit - len(compact([option])))
+    options = None if wide else [option]
+    title = '"' * (option_limit // 2) if wide else None
+    assert len(compact([option])) == option_limit
+    ids = {f"limit-{i:03}" for i in range(max_line // option_limit)}
+    label = " without options" if wide else ""
+
+    h = harness.Harness(web_root, bin_dir)
+    try:
+        directory = Path(h.hub_config["stateDir"]) / "acp"
+        directory.mkdir(parents=True)
+        for i, sid in enumerate(sorted(ids), 1):
+            epoch = 1_750_000_000_000 + i
+            (directory / f"{sid}.json").write_bytes(compact({
+                "sid": sid, "agent": "config", "cwd": str(h.home), "createdAt": epoch,
+                "agentSessionId": sid, "seenSeq": 0,
+            }))
+            events = [{"seq": 1, "ts": epoch, "e": "session", "via": "new",
+                       "sessionId": sid, "configOptions": options}]
+            if wide:
+                events.append({"seq": 2, "ts": epoch + 1, "e": "update",
+                               "update": {"sessionUpdate": "session_info_update", "title": title}})
+            (directory / f"{sid}.jsonl").write_bytes(b"".join(compact(e) + b"\n" for e in events))
+        h.start_hub()
+
+        def recv(hub):
+            # Inspect the full line for diagnostics, but refuse it at the wb-web cap.
+            raw = hub.file.readline()
+            if len(raw) > max_line + 1:
+                raise ValueError(f"refused {len(raw) - 1}-byte line (MAX_LINE={max_line})")
+            return json.loads(raw)
+
+        def snapshot(hub, kind, stream, on_page=None):
+            req = {"t": kind, "rid": 1}
+            if stream:
+                req["stream"] = True
+            hub.send(req)
+            sessions = []
+            while True:
+                reply = recv(hub)
+                if reply["t"] == "sessions.page" and reply["rid"] == 1:
+                    if on_page is not None:
+                        on_page()
+                        on_page = None
+                    sessions.extend(reply["sessions"])
+                else:
+                    return reply, sessions + reply.get("sessions", [])
+
+        def complete(sessions):
+            return (len(sessions) == len(ids) and {s["sid"] for s in sessions} == ids
+                    and all(s["acp"]["configOptions"] == options and s["acp"]["title"] == title
+                            for s in sessions))
+
+        sid = min(ids)
+
+        def change_task(task):
+            with closing(wbctl.HubClient(h.hub_sock)) as client:
+                reply, _ = client.request({"t": "acp.set_task", "rid": 1, "sid": sid, "task": task})
+                assert reply["t"] == "ok", reply["t"]
+
+        for kind in ("list", "watch"):
+            with closing(wbctl.HubClient(h.hub_sock)) as hub:
+                name = f"snapshot: streamed {kind} returns every complete summary{label}"
+                if kind == "watch":
+                    name += " before live changes"
+                try:
+                    change = (lambda: change_task("during snapshot")) if kind == "watch" else None
+                    reply, sessions = snapshot(hub, kind, stream=True, on_page=change)
+                    ok = reply["t"] == "ok" and complete(sessions)
+                    if ok and change:
+                        update = recv(hub)
+                        original = next(s for s in sessions if s["sid"] == sid)
+                        ok = ("task" not in original["acp"] and update["t"] == "session"
+                              and update["session"]["sid"] == sid
+                              and update["session"]["acp"]["task"] == "during snapshot"
+                              and update["session"]["acp"]["configOptions"] == options)
+                    t.check(name, ok, f'{reply["t"]}, {len(sessions)} sessions')
+                except ValueError as e:
+                    t.check(name, False, str(e))
+
+        if wide:
+            return
+
+        for kind in ("list", "watch"):
+            with closing(wbctl.HubClient(h.hub_sock)) as hub:
+                name = f"snapshot: legacy {kind} uses only bounded lines"
+                try:
+                    reply, sessions = snapshot(hub, kind, stream=False)
+                    if kind == "list":
+                        t.check(name, reply["t"] == "err" and reply["code"] == "bad_request"
+                                and reply["rid"] == 1 and "stream" in reply["message"])
+                    elif reply["t"] == "ok":
+                        # Old wb-web seeds its map from the reply, then inserts session events.
+                        while len(sessions) < len(ids):
+                            update = recv(hub)
+                            assert update["t"] == "session", update["t"]
+                            sessions.append(update["session"])
+                        t.check(name, complete(sessions), f"{len(sessions)} sessions")
+                    else:
+                        t.check(name, False, reply["t"])
+                except ValueError as e:
+                    t.check(name, False, str(e))
+
+        h.start_web()
+        ep = wbctl.Endpoint(ORIGIN, secret=h.secret)
+        ep.addr = WEB
+        # On the broken build prove repeat failure in the real web decoder, not
+        # merely an early HTTP request before the first watch has been processed.
+        deadline = time.monotonic() + 10
+        while True:
+            status, _, raw = wbctl.http_request(ep.addr, "GET", "/api/sessions", ep.headers())
+            refused = h.log_tail("web").count("hub connection failed")
+            if status == 200 or refused >= 2 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        t.check("snapshot: wb-web installs the whole watch before reporting up",
+                status == 200 and complete(json.loads(raw)["sessions"]),
+                f"HTTP {status}, decoder failures on {refused} watch attempts")
+    finally:
+        h.stop()
+
+
 SECTIONS = [board, fs, session_config, configured_open, session_task, session_policy, worktrees]
 
 
@@ -1085,6 +1218,8 @@ def main():
     with h:
         for section in SECTIONS:
             section(t, h)
+    session_snapshots(t, a.web_root, a.bin_dir)
+    session_snapshots(t, a.web_root, a.bin_dir, wide=True)
 
     print(f"{len(t.failed)} failed" if t.failed else "all passed")
     return 1 if t.failed else 0

@@ -25,12 +25,20 @@ pub enum HubRequest {
     /// The client's answer to the hub's hello, and its first line.
     #[serde(rename = "hello")]
     Hello { proto: u32, client: String },
-    /// Every known session. Reply: [`SessionsReply`].
+    /// Every known session. `stream` allows `sessions.page` before the [`SessionsReply`].
     #[serde(rename = "list")]
-    List { rid: u64 },
+    List {
+        rid: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stream: bool,
+    },
     /// Like `list`, then a `session` event on every Summary change and `gone` on forget.
     #[serde(rename = "watch")]
-    Watch { rid: u64 },
+    Watch {
+        rid: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stream: bool,
+    },
     /// Attach to a PTY session. Only a request with `spawn` starts a process.
     /// Reply: [`PtyOpenReply`].
     #[serde(rename = "pty.open")]
@@ -257,6 +265,9 @@ pub enum HubMessage {
         /// The oldest events were dropped to fit `ACP_REPLAY_MAX`.
         truncated: bool,
     },
+    /// A page of the initial snapshot, before the matching `ok` or `err`.
+    #[serde(rename = "sessions.page")]
+    SessionsPage { rid: u64, sessions: Vec<Summary> },
     /// An attached ACP session's Summary or session info changed.
     #[serde(rename = "acp.info")]
     AcpInfo {

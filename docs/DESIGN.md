@@ -214,6 +214,7 @@ flake.nix flake.lock   (inputs: nixpkgs, edwin = github:yathxyz/edwin)
 
 #### 3.2.4 Envelope and error codes
 - A request carries `rid` (u64, nonzero, unique per connection) and gets exactly one reply: `{"t":"ok","rid":N,…}` or `{"t":"err","rid":N,"code":…,"message":…}`.
+- A `list` or `watch` request with `stream:true` may also receive `sessions.page{rid,sessions}` before its one terminal reply.
 - `pty.input` and `pty.resize` have no `rid` and get no reply.
 - Events never carry `rid`. An asynchronous error is `{"t":"err","sid":…,"code":…,"message":…}`.
 
@@ -289,6 +290,8 @@ The error codes are a closed set:
   - `req` is the journal seq of the announcing event;
   - `title` is the permission's `toolCall.title` or the elicitation's `message`, cut to 200 characters for both kinds. It is `""` when the request has none.
 - **`AcpSessionInfo`:** `{protocolVersion, agentInfo, agentCapabilities, promptCapabilities, authMethods, modes, configOptions, availableCommands, plan, usage}`. It holds the latest materialised values; absent optional values are omitted. `Summary.acp.configOptions` is always present, with `null` when absent.
+- Snapshots and watch events carry complete summaries, including the full option list.
+  This preserves the session summary returned by the browser and mesh HTTP APIs.
 - **`Summary.acp.managedWorktree`** is present only for a recorded worktree: `{path, branch, mainRoot}`, with both paths absolute.
   This record is independent of the web's best-effort top-level git metadata (`repo`, `worktree`, `branch`).
 - **`Summary.acp.policy`:** the session's non-empty `Policy` (§3.4.5), omitted when none. It is a hub fact, not an agent config option. Optional rule `programs` is an ordinary policy field, preserved along with roots and command regexes through validation, installation, journaling and replay.
@@ -302,8 +305,8 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 
 | t | Fields | ok reply | Semantics |
 |---|---|---|---|
-| `list` | – | `{sessions: Summary[]}` | every known session |
-| `watch` | – | `{sessions}` | then `session` on every Summary change and `gone` on forget |
+| `list` | `stream?: bool` | `{sessions: Summary[]}` | snapshot of every known session, in sid order; see below |
+| `watch` | `stream?: bool` | `{sessions: Summary[]}` | snapshot and subscription; then `session` on every Summary change and `gone` on forget |
 | `pty.open` | `sid, cols, rows, spawn?: SpawnPty, resume?: {stream, out}` | `{new, pid?, cwd, exit?, epoch, stream, out, resumed, replay?}` | rules below |
 | `pty.detach` | `sid` | `{}` | |
 | `pty.input` | `sid, d` | – | `d` ≤ 1 MiB. Written completely and in order. If queued input would exceed 8 MiB, the whole message is dropped and the connection gets `err{sid, code:"input_overflow"}`. Input to a dead session is dropped silently. |
@@ -325,6 +328,19 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `acp.authenticate` | `sid, methodId` | `{}` after the agent answers | only during a failed setup, agent-handled methods only (`type:"terminal"` → `bad_option`) |
 | `acp.kill` | `sid, forget` | `{}` | teardown stages in §3.4.5. **`forget:false`:** ok when the kill starts; the session stays revivable. **`forget:true`:** ok only after exit, deletion of `acp/<sid>.*` and registry removal. `gone` goes to attached connections and watchers. |
 | `acp.remove_worktree` | `sid` | `{}` | Verify `workbench-session` in the recorded checkout's private git directory, remove without force, then persist and publish the cleared record; an absent record is `not_found`, a running agent or dirty worktree is `conflict`. A missing checkout, missing marker or different sid clears the record without deletion and returns `not_found`: “session worktree already gone; record cleared; nothing deleted”. |
+
+**`list` and `watch` snapshots.**
+- With `stream:true`, concatenate the `sessions` arrays from any `sessions.page{rid,sessions}` lines and the final `ok{rid,sessions}`.
+  Each line fits `MAX_LINE` (newline excluded), independent of session count; each summary is whole.
+  A summary too large for even an empty page ends the request with `err{rid,sid,code:"internal"}`; discard the partial snapshot.
+- A `watch` captures the snapshot and subscribes atomically.
+  All live `session` and `gone` events from that subscription follow the snapshot, including changes made while it is being sent.
+  A single oversized `session` event is replaced by `err{sid,code:"internal"}`.
+- Without `stream:true`, the hub sends the original single `ok` reply when it fits.
+  If it does not fit, `list` returns `bad_request` directing the caller to `stream:true`; `watch` sends a bounded `ok` with a prefix of the snapshot, then ordinary `session` events for the rest, before any live changes.
+  This lets older web fronts retain all summaries and options using their existing upsert path.
+- Older hubs ignore `stream:true` and respond with their original single-line snapshot.
+  The web accepts that reply without requiring a page, but the old hub's snapshot is still subject to `MAX_LINE`.
 
 **Check order.** While a non-empty initial configuration batch is active (including its preceding setup), `acp.prompt`, `acp.cancel`, `acp.set_mode`, `acp.set_config_option`, `acp.revive` and `acp.authenticate` fail with `busy` before their normal actor checks. They are rejected, never queued for a future turn. Permission and elicitation answers, `acp.seen` and `acp.kill` remain usable. Otherwise, when a request fails several checks, the first in this list applies:
 - `acp.prompt`: `faulted`, `not_alive`, `bad_request` (no ACP session yet), `busy`, then the content rules.

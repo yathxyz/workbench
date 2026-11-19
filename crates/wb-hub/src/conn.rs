@@ -22,7 +22,7 @@ use wb_proto::line::encode;
 use crate::Ctx;
 use crate::acp::{self, Act};
 use crate::env::check_client_env;
-use crate::outq::OutQ;
+use crate::outq::{OutQ, Output};
 use crate::pty::{self, Cmd, Open};
 use crate::registry::SessionCmd;
 
@@ -232,9 +232,15 @@ async fn read_line(r: &mut Lines) -> std::io::Result<Option<String>> {
 }
 
 async fn write_loop(mut wr: OwnedWriteHalf, q: Arc<OutQ>) {
-    while let Some(line) = q.pop().await {
+    while let Some(output) = q.next().await {
+        let write = async {
+            match output {
+                Output::Line(line) => wr.write_all(&line).await,
+                Output::Snapshot(snapshot) => snapshot.write(&mut wr).await,
+            }
+        };
         tokio::select! {
-            r = wr.write_all(&line) => if r.is_err() { break },
+            r = write => if r.is_err() { break },
             () = q.closed() => break,
         }
     }
@@ -297,8 +303,10 @@ impl Conn {
                 let msg = "hello was already exchanged".into();
                 self.error(None, None, ErrorCode::BadRequest, msg);
             }
-            HubRequest::List { rid } => self.outq.push_reply(self.ctx.registry.list(rid)),
-            HubRequest::Watch { rid } => self.ctx.registry.watch(self.viewer(), rid),
+            HubRequest::List { rid, stream } => self.ctx.registry.list(&self.outq, rid, stream),
+            HubRequest::Watch { rid, stream } => {
+                self.ctx.registry.watch(self.viewer(), rid, stream)
+            }
             HubRequest::PtyOpen {
                 rid,
                 sid,

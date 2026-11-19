@@ -8,11 +8,12 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use serde::{Serialize, Serializer};
 use tokio::sync::mpsc;
 use wb_proto::hub::{ErrorCode, HubMessage, Kind, Summary};
 
 use crate::conn::{ConnId, Viewer, line};
+use crate::outq::OutQ;
+use crate::snapshot::{self, Snapshot, SnapshotMode};
 use crate::{acp, lock, now_ms, pty};
 
 /// Commands a session actor buffers before senders wait.
@@ -36,6 +37,16 @@ struct Inner {
 impl Inner {
     fn summaries(&self) -> impl Clone + Iterator<Item = &Arc<Summary>> {
         self.sessions.values().filter_map(|e| e.summary.as_ref())
+    }
+
+    fn snapshot(&self, rid: u64, mode: SnapshotMode) -> Snapshot {
+        let mut sessions = Vec::with_capacity(self.sessions.len());
+        sessions.extend(self.summaries().cloned());
+        Snapshot {
+            rid,
+            mode,
+            sessions,
+        }
     }
 }
 
@@ -126,51 +137,30 @@ pub enum Route<C> {
     Stopping,
 }
 
-/// Encode the complete, sid-sorted snapshot directly rather than materializing it
-/// as a tree of JSON values in `HubMessage::ok`.
-fn sessions_line<'a>(
-    rid: u64,
-    sessions: impl Clone + Iterator<Item = &'a Arc<Summary>>,
-) -> Arc<[u8]> {
-    #[derive(Serialize)]
-    #[serde(tag = "t", rename = "ok")]
-    struct Snapshot<T> {
-        rid: u64,
-        sessions: T,
-    }
-
-    struct Summaries<I>(I);
-    impl<'a, I: Clone + Iterator<Item = &'a Arc<Summary>>> Serialize for Summaries<I> {
-        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.collect_seq(self.0.clone().map(Arc::as_ref))
-        }
-    }
-
-    line(&Snapshot {
-        rid,
-        sessions: Summaries(sessions),
-    })
-}
-
 impl Registry {
     pub fn published_count(&self) -> usize {
         lock(&self.inner).summaries().count()
     }
 
-    pub fn list(&self, rid: u64) -> Arc<[u8]> {
-        let inner = lock(&self.inner);
-        let mut snapshot = Vec::with_capacity(inner.sessions.len());
-        snapshot.extend(inner.summaries().cloned());
-        drop(inner);
-        sessions_line(rid, snapshot.iter())
+    pub fn list(&self, outq: &OutQ, rid: u64, stream: bool) {
+        let mode = if stream {
+            SnapshotMode::Stream
+        } else {
+            SnapshotMode::LegacyList
+        };
+        let snapshot = lock(&self.inner).snapshot(rid, mode);
+        outq.push_snapshot(snapshot);
     }
 
     /// Replies to `watch` with every Summary and subscribes `viewer` to later changes.
-    pub fn watch(&self, viewer: Viewer, rid: u64) {
+    pub fn watch(&self, viewer: Viewer, rid: u64, stream: bool) {
+        let mode = if stream {
+            SnapshotMode::Stream
+        } else {
+            SnapshotMode::LegacyWatch
+        };
         let mut inner = lock(&self.inner);
-        viewer
-            .outq
-            .push_reply(sessions_line(rid, inner.summaries()));
+        viewer.outq.push_snapshot(inner.snapshot(rid, mode));
         inner.watchers.retain(|w| w.id != viewer.id);
         inner.watchers.push(viewer);
     }
@@ -264,12 +254,9 @@ impl Registry {
         }
         let session = entry.summary.insert(summary);
         if !watchers.is_empty() {
-            #[derive(Serialize)]
-            #[serde(tag = "t", rename = "session")]
-            struct Update<'a> {
-                session: &'a Summary,
-            }
-            let msg = line(&Update { session });
+            let mut buf = Vec::new();
+            snapshot::update(&mut buf, session);
+            let msg: Arc<[u8]> = buf.into();
             watchers.retain(|w| w.outq.push_event(msg.clone()).is_ok());
         }
     }

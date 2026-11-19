@@ -59,7 +59,10 @@ mod tests {
 
     #[test]
     fn encode_is_compact_with_newline() {
-        let msg = crate::hub::HubRequest::List { rid: 1 };
+        let msg = crate::hub::HubRequest::List {
+            rid: 1,
+            stream: false,
+        };
         assert_eq!(encode(&msg), b"{\"t\":\"list\",\"rid\":1}\n");
     }
 

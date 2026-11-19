@@ -808,7 +808,7 @@ async fn serve(
                 let req: HubRequest = serde_json::from_str(&line).unwrap();
                 record.send_modify(|all| all.push((id, req.clone())));
                 match req {
-                    HubRequest::Watch { rid } | HubRequest::List { rid } => {
+                    HubRequest::Watch { rid, .. } | HubRequest::List { rid, .. } => {
                         let sessions = script.sessions.lock().unwrap().clone();
                         HubMessage::ok(rid, &SessionsReply { sessions })
                     }

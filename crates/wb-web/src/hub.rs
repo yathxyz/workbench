@@ -370,24 +370,47 @@ impl Control {
     /// current and serves captures until the connection ends. Captures still waiting
     /// for their reply then fail as unavailable.
     async fn watch(&self, mut conn: HubConn, info: HubInfo, calls: &mut mpsc::Receiver<Capture>) {
-        if conn.send(&HubRequest::Watch { rid: 1 }).await.is_err() {
+        let request = HubRequest::Watch {
+            rid: 1,
+            stream: true,
+        };
+        if conn.send(&request).await.is_err() {
             return;
         }
-        // Nothing else is subscribed on this connection, so the reply comes first.
-        let reply = match timeout(REPLY_TIMEOUT, conn.recv()).await {
-            Ok(Some(HubMessage::Ok { rid: 1, result })) => {
-                serde_json::from_value::<SessionsReply>(Value::Object(result))
+        let mut snapshot = BTreeMap::new();
+        // Older hubs ignore `stream` and send just the final reply. Do not publish
+        // a partial map, and give each page its own timeout on a large snapshot.
+        loop {
+            match timeout(REPLY_TIMEOUT, conn.recv()).await {
+                Ok(Some(HubMessage::SessionsPage { rid: 1, sessions })) => {
+                    snapshot.extend(sessions.into_iter().map(|s| (s.sid.clone(), s)));
+                }
+                Ok(Some(HubMessage::Ok { rid: 1, result })) => {
+                    let Ok(SessionsReply { sessions }) =
+                        serde_json::from_value::<SessionsReply>(Value::Object(result))
+                    else {
+                        tracing::warn!("undecodable watch reply");
+                        return;
+                    };
+                    snapshot.extend(sessions.into_iter().map(|s| (s.sid.clone(), s)));
+                    break;
+                }
+                Ok(Some(HubMessage::Err {
+                    rid: Some(1),
+                    code,
+                    message,
+                    ..
+                })) => {
+                    tracing::warn!(?code, %message, "the hub refused watch");
+                    return;
+                }
+                _ => {
+                    tracing::warn!("the hub did not complete watch");
+                    return;
+                }
             }
-            _ => {
-                tracing::warn!("the hub did not answer watch");
-                return;
-            }
-        };
-        let Ok(SessionsReply { sessions }) = reply else {
-            tracing::warn!("undecodable watch reply");
-            return;
-        };
-        *self.sessions() = sessions.into_iter().map(|s| (s.sid.clone(), s)).collect();
+        }
+        *self.sessions() = snapshot;
         self.set(HubStatus::Up(info));
         let mut rid = 1;
         let mut pending: HashMap<u64, Reply> = HashMap::new();
