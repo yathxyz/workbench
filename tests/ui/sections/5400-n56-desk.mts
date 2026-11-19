@@ -56,6 +56,21 @@ await section('N56', async () => {
       return { n: n.id, k: k.id, joined, onBoard, kid, rel: kid && [kid[0] - (C.deskAt(2).members[n.id] || [0, 0])[0]], dx: k.x - n.x }; }, m);
     check('N56: a card made on a desk joins it and has a place on the Board; a card spawned on the Board joins its parent\'s desks beside the parent',
       made.joined && made.onBoard && !!made.kid && made.rel?.[0] === made.dx, JSON.stringify(made));
+    const flight = await D.evaluate(async (member: string) => {
+      const C = window.__canvas, world = () => document.getElementById('world')!.style.transform;
+      const hidden = C.addNode({ kind: 'sketch', name: 'n56-board-only', in: null, x: 50000, y: 35000, w: 320, h: 240 });
+      C.deskGo(2, true); const desk = world(); C.deskGo(0, true); const board = world();
+      let landed = false; C.jumpNode(hidden, 1, () => { landed = true; }); C.deskGo(2, true);
+      await new Promise(r => setTimeout(r, C.MOTION.slow + 100));
+      const afterSwitch = world();
+      C.jumpNode(C.S.nodes[member]); C.focusOpen(hidden); C.focusClose(hidden.id);
+      const afterFocus = world(); C.removeNode(hidden.id);
+      return { landed, desk, afterSwitch, board, afterFocus };
+    }, m.a);
+    check('N56: switching desks cancels the old flight and its arrival callback',
+      !flight.landed && flight.afterSwitch === flight.desk, JSON.stringify(flight));
+    check('N56: focusing a hidden card during a desk flight returns to the Board camera when closed',
+      flight.afterFocus === flight.board, JSON.stringify(flight));
     await D.evaluate(() => { const C = window.__canvas; C.deskGo(2, true); C.deskPin(); }); await sleep(800); await settled(D);
     disk = boardFile()!;
     B = await devB();

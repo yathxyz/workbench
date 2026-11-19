@@ -9308,6 +9308,7 @@ function deskGo(slot: number | string, quiet?: boolean) {
   if (slot === DESK.cur && perspCur() === 'manual') { if (!quiet) toast('Already on desk ' + deskName(deskAt(slot)) + '.'); return; }
   let d = slot === 9 ? deskAttention() : deskAt(slot), made = false;
   if (slot === 9 && !d) { toast('Nothing on the board needs a look: the attention desk is empty.'); return; }
+  camStop(false); hashCancelRestore();
   if (VIEW !== 'canvas') setView('canvas');
   if (FOCUS.cur) focusHide();
   if (WS.cur) { WS.cur = null; WS.last = null; wsApply(false); }
