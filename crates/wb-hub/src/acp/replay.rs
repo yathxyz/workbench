@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -37,15 +37,30 @@ pub struct Replay {
 /// `spawn_blocking`.
 ///
 /// A `since` above `head` counts as 0; the caller reports that as `reset`. Lines after
-/// `head` are never read, so a line being appended meanwhile does not matter.
-pub fn scan(path: &Path, since: u64, head: u64, pending: &[u64], cap: usize) -> Result<Replay> {
-    let since = if since > head { 0 } else { since };
+/// `head` are never used, so a line being appended meanwhile does not matter.
+/// `offset` is a validated line boundary at or before the first requested event.
+pub fn scan(
+    path: &Path,
+    offset: u64,
+    since: u64,
+    head: u64,
+    pending: &[u64],
+    cap: usize,
+) -> Result<Replay> {
+    let (since, mut at) = if since > head {
+        (0, 0)
+    } else {
+        (since, offset)
+    };
     let mut replay = Builder::new(since, cap);
     if since < head {
-        let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        let mut file =
+            File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        if at != 0 {
+            file.seek(SeekFrom::Start(at))?;
+        }
         let mut reader = BufReader::new(file);
         let mut line = Vec::new();
-        let mut at = 0usize;
         loop {
             line.clear();
             let n = reader
@@ -76,7 +91,7 @@ pub fn scan(path: &Path, since: u64, head: u64, pending: &[u64], cap: usize) -> 
             if seq == head {
                 break;
             }
-            at += n;
+            at += n as u64;
         }
     }
     Ok(replay.finish())
@@ -361,7 +376,7 @@ mod tests {
             },
         ]);
         let path = journal("coalesce", &evs);
-        let r = scan(&path, 0, 5, &[], BIG).unwrap();
+        let r = scan(&path, 0, 0, 5, &[], BIG).unwrap();
         assert_eq!(seqs(&r), [1, 4, 5]);
         assert_eq!(r.events[1].ts, 1003, "the run's last ts");
         assert_eq!(r.events[1].body, msg(Some("m1"), "abc"));
@@ -395,7 +410,7 @@ mod tests {
             ), // 10
         ]);
         let path = journal("breaks", &evs);
-        let r = scan(&path, 0, 10, &[], BIG).unwrap();
+        let r = scan(&path, 0, 0, 10, &[], BIG).unwrap();
         assert_eq!(seqs(&r), [1, 2, 3, 4, 5, 6, 7, 8, 10]);
         assert_eq!(text(&r.events[8]), "gh", "absent and null ids are the same");
     }
@@ -405,15 +420,15 @@ mod tests {
         let evs = events((0..10).map(|i| notice(&format!("n{i}"))).collect());
         let path = journal("trunc", &evs);
         let cap: usize = evs[7..].iter().map(encoded_len).sum();
-        let r = scan(&path, 0, 10, &[], cap).unwrap();
+        let r = scan(&path, 0, 0, 10, &[], cap).unwrap();
         assert_eq!(seqs(&r), [8, 9, 10]);
         assert_eq!((r.from, r.truncated), (8, true));
 
-        let r = scan(&path, 0, 10, &[], cap - 1).unwrap();
+        let r = scan(&path, 0, 0, 10, &[], cap - 1).unwrap();
         assert_eq!(seqs(&r), [9, 10]);
         assert_eq!(r.from, 9);
 
-        let r = scan(&path, 4, 10, &[], BIG).unwrap();
+        let r = scan(&path, 0, 4, 10, &[], BIG).unwrap();
         assert_eq!(seqs(&r), [5, 6, 7, 8, 9, 10]);
         assert_eq!((r.from, r.truncated), (5, false));
     }
@@ -422,7 +437,7 @@ mod tests {
     fn the_newest_event_is_kept_even_over_the_cap() {
         let evs = events(vec![notice("a"), notice(&"x".repeat(5000))]);
         let path = journal("newest", &evs);
-        let r = scan(&path, 0, 2, &[], 100).unwrap();
+        let r = scan(&path, 0, 0, 2, &[], 100).unwrap();
         assert_eq!(seqs(&r), [2]);
         assert_eq!((r.from, r.truncated), (2, true));
     }
@@ -445,7 +460,7 @@ mod tests {
             body: msg(Some("m"), "xyz"),
         };
         let cap = encoded_len(&merged) + encoded_len(&evs[6]);
-        let r = scan(&path, 0, 7, &[], cap).unwrap();
+        let r = scan(&path, 0, 0, 7, &[], cap).unwrap();
         assert_eq!(r.events, [merged, evs[6].clone()]);
         assert_eq!((r.from, r.truncated), (4, true));
     }
@@ -468,7 +483,7 @@ mod tests {
             .filter(|e| e.seq != 15)
             .map(encoded_len)
             .sum();
-        let r = scan(&path, 0, 20, &[5, 15], pinned_bytes + rest).unwrap();
+        let r = scan(&path, 0, 0, 20, &[5, 15], pinned_bytes + rest).unwrap();
         assert_eq!(seqs(&r), [5, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
         assert_eq!((r.from, r.truncated), (12, true));
         assert_eq!(r.events[0], evs[4]);
@@ -486,7 +501,7 @@ mod tests {
             msg(Some("m"), "b"),
         ]);
         let path = journal("pin-run", &evs);
-        let r = scan(&path, 0, 3, &[2], BIG).unwrap();
+        let r = scan(&path, 0, 0, 3, &[2], BIG).unwrap();
         assert_eq!(seqs(&r), [1, 2, 3]);
         assert_eq!((text(&r.events[0]), text(&r.events[2])), ("a", "b"));
     }
@@ -495,7 +510,7 @@ mod tests {
     fn pinned_events_the_client_holds_are_not_sent() {
         let evs = events((1..=10).map(|i| notice(&i.to_string())).collect());
         let path = journal("pin-since", &evs);
-        let r = scan(&path, 6, 10, &[5], BIG).unwrap();
+        let r = scan(&path, 0, 6, 10, &[5], BIG).unwrap();
         assert_eq!(seqs(&r), [7, 8, 9, 10]);
         assert_eq!(r.from, 7);
     }
@@ -504,7 +519,7 @@ mod tests {
     fn since_above_head_replays_from_the_start() {
         let evs = events(vec![notice("a"), notice("b"), notice("c")]);
         let path = journal("reset", &evs);
-        let r = scan(&path, 50, 3, &[], BIG).unwrap();
+        let r = scan(&path, 0, 50, 3, &[], BIG).unwrap();
         assert_eq!(r.events, evs);
         assert_eq!((r.from, r.truncated), (1, false));
     }
@@ -512,7 +527,7 @@ mod tests {
     #[test]
     fn nothing_after_since_reads_nothing() {
         let missing = fresh_dir("none").join("missing.jsonl");
-        let r = scan(&missing, 7, 7, &[3], BIG).unwrap();
+        let r = scan(&missing, 0, 7, 7, &[3], BIG).unwrap();
         assert_eq!(
             r,
             Replay {
@@ -521,7 +536,7 @@ mod tests {
                 truncated: false
             }
         );
-        assert!(scan(&missing, 0, 7, &[], BIG).is_err());
+        assert!(scan(&missing, 0, 0, 7, &[], BIG).is_err());
     }
 
     #[test]
@@ -531,12 +546,12 @@ mod tests {
         let mut bytes = fs::read(&path).unwrap();
         bytes.extend_from_slice(br#"{"seq":5,"ts":1,"e":"not"#);
         fs::write(&path, &bytes).unwrap();
-        assert_eq!(seqs(&scan(&path, 0, 3, &[], BIG).unwrap()), [1, 2, 3]);
-        assert_eq!(seqs(&scan(&path, 0, 4, &[], BIG).unwrap()), [1, 2, 3, 4]);
+        assert_eq!(seqs(&scan(&path, 0, 0, 3, &[], BIG).unwrap()), [1, 2, 3]);
+        assert_eq!(seqs(&scan(&path, 0, 0, 4, &[], BIG).unwrap()), [1, 2, 3, 4]);
 
         bytes.extend_from_slice(b"garbage\n");
         fs::write(&path, &bytes).unwrap();
-        assert_eq!(seqs(&scan(&path, 0, 4, &[], BIG).unwrap()), [1, 2, 3, 4]);
+        assert_eq!(seqs(&scan(&path, 0, 0, 4, &[], BIG).unwrap()), [1, 2, 3, 4]);
     }
 
     #[test]
@@ -546,7 +561,7 @@ mod tests {
         let mut bytes = b"garbage\n".to_vec();
         bytes.extend(fs::read(&path).unwrap());
         fs::write(&path, &bytes).unwrap();
-        assert!(scan(&path, 0, 1, &[], BIG).is_err());
+        assert!(scan(&path, 0, 0, 1, &[], BIG).is_err());
     }
 
     #[test]
@@ -558,7 +573,7 @@ mod tests {
         bytes.extend(line::encode(&evs[2]));
         fs::write(&path, &bytes).unwrap();
 
-        let r = scan(&path, 0, 3, &[], BIG).unwrap();
+        let r = scan(&path, 0, 0, 3, &[], BIG).unwrap();
         assert_eq!(seqs(&r), [3]);
         assert_eq!(text(&r.events[0]), "ab");
     }
@@ -568,7 +583,7 @@ mod tests {
         let block = "x".repeat(1000);
         let evs = events((0..6).map(|_| msg(Some("m"), &block)).collect());
         let path = journal("run-cap", &evs);
-        let r = scan(&path, 0, 6, &[], 2500).unwrap();
+        let r = scan(&path, 0, 0, 6, &[], 2500).unwrap();
         assert_eq!(seqs(&r), [6]);
         assert_eq!(text(&r.events[0]).len(), 2000);
         assert_eq!((r.from, r.truncated), (5, true));

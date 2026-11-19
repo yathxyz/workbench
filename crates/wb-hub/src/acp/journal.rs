@@ -25,6 +25,15 @@ use super::facts::Facts;
 /// The message of the `turn_error`/`setup_error` that startup normalisation writes.
 const HUB_RESTART: &str = "interrupted by a hub restart";
 
+/// One byte offset per 128 committed lines, rebuilt by the validation pass at open.
+const CHECKPOINT_STRIDE: u64 = 128;
+
+fn checkpoint(offsets: &mut Vec<u64>, seq: u64, end: u64) {
+    if seq.is_multiple_of(CHECKPOINT_STRIDE) {
+        offsets.push(end);
+    }
+}
+
 /// The append handle of one session's journal.
 pub struct Journal {
     file: File,
@@ -32,6 +41,7 @@ pub struct Journal {
     end: u64,
     /// Seq of the last line written; 0 for an empty journal.
     head: u64,
+    offsets: Vec<u64>,
     /// The append of this seq fails once after writing half its line (fault injection).
     #[cfg(any(test, debug_assertions))]
     fail_at: Option<u64>,
@@ -62,6 +72,7 @@ impl Journal {
         let mut reader = BufReader::new(&file);
         let mut head = 0;
         let mut end = 0u64;
+        let mut offsets = Vec::new();
         let mut line = Vec::new();
         loop {
             line.clear();
@@ -93,12 +104,14 @@ impl Journal {
             }
             end += n as u64;
             head = ev.seq;
+            checkpoint(&mut offsets, head, end);
             visit(ev);
         }
         Ok(Journal {
             file,
             end,
             head,
+            offsets,
             #[cfg(any(test, debug_assertions))]
             fail_at: fail_at_from_env(),
         })
@@ -122,6 +135,7 @@ impl Journal {
         }
         self.end += bytes.len() as u64;
         self.head = ev.seq;
+        checkpoint(&mut self.offsets, self.head, self.end);
         Ok(ev)
     }
 
@@ -170,6 +184,15 @@ impl Journal {
     /// The head seq: the seq of the last event written, 0 for an empty journal.
     pub fn len(&self) -> u64 {
         self.head
+    }
+
+    /// A line boundary at or before the first event requested by this cursor.
+    pub fn replay_offset(&self, since: u64) -> u64 {
+        debug_assert!(since <= self.head);
+        match since / CHECKPOINT_STRIDE {
+            0 => 0,
+            block => self.offsets[block as usize - 1],
+        }
     }
 
     /// One `pwrite(2)` of `bytes` at the end of the last complete line; a short write
@@ -424,6 +447,36 @@ mod tests {
             live,
             "the live facts are the fold of the disk"
         );
+    }
+
+    #[test]
+    fn replay_crosses_checkpoints_after_a_write_fault_and_reload() {
+        let path = fresh_dir("seek").join("s.jsonl");
+        let mut j = Journal::open(&path, drop).unwrap();
+        for seq in 1..=2 * CHECKPOINT_STRIDE + 2 {
+            if seq == CHECKPOINT_STRIDE {
+                j.fail_at = Some(seq);
+                assert!(j.append(&chunk(&"x".repeat(5000)), seq).is_err());
+            }
+            j.append(&prompt(), seq).unwrap();
+        }
+        let check = |j: &Journal| {
+            for since in [0, CHECKPOINT_STRIDE - 1, CHECKPOINT_STRIDE, j.len() - 1] {
+                let replay = super::super::replay::scan(
+                    &path,
+                    j.replay_offset(since),
+                    since,
+                    j.len(),
+                    &[],
+                    usize::MAX,
+                )
+                .unwrap();
+                assert!(replay.events.iter().map(|e| e.seq).eq(since + 1..=j.len()));
+            }
+        };
+        check(&j);
+        drop(j);
+        check(&Journal::open(&path, drop).unwrap());
     }
 
     #[test]

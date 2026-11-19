@@ -1631,6 +1631,7 @@ impl Acp {
         let pump = Pump {
             sid: self.sid.clone(),
             path: self.path("jsonl"),
+            offset: self.journal.as_ref().map_or(0, |j| j.replay_offset(since)),
             since,
             pinned: self.facts.pending.iter().map(|p| p.req).collect(),
             ok,
@@ -3012,6 +3013,7 @@ impl Acp {
 struct Pump {
     sid: String,
     path: PathBuf,
+    offset: u64,
     since: u64,
     pinned: Vec<u64>,
     ok: AcpOpenReply,
@@ -3027,6 +3029,7 @@ impl Pump {
         let Pump {
             sid,
             path,
+            offset,
             since,
             pinned,
             mut ok,
@@ -3045,7 +3048,7 @@ impl Pump {
             })
         } else {
             tokio::task::spawn_blocking(move || {
-                replay::scan(&path, since, head, &pinned, ACP_REPLAY_MAX)
+                replay::scan(&path, offset, since, head, &pinned, ACP_REPLAY_MAX)
             })
             .await
             .unwrap_or_else(|e| Err(anyhow!("the replay panicked: {e}")))
