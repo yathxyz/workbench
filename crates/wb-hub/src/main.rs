@@ -13,6 +13,7 @@ mod procfs;
 mod pty;
 mod registry;
 mod shutdown;
+mod snapshot;
 mod store;
 
 use std::fs::{DirBuilder, OpenOptions, Permissions};

@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -11,7 +11,7 @@ use serde_json::{Map, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{sleep, timeout};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use wb_proto::hub::{
@@ -121,7 +121,7 @@ pub const HUB_LOST: End = End::Close(close::HUB_LOST, "hub connection lost");
 /// A hub connection of its own for one browser socket, and the hub's hello; or the close
 /// reason (with `HUB_UNAVAILABLE`) while the hub is down, incompatible or refuses it.
 pub async fn connect_relay(app: &AppState) -> Result<(HubConn, HubInfo), &'static str> {
-    let refused = match &*app.hub.status.borrow() {
+    let refused = match &app.hub.state().status {
         HubStatus::Up(_) => None,
         HubStatus::Down => Some("hub unavailable"),
         HubStatus::Incompatible { .. } => Some("hub incompatible"),
@@ -237,10 +237,18 @@ impl HubConn {
     /// The next message, or `None` once the connection has ended. Lines that do not
     /// decode are skipped. Cancel safe.
     pub async fn recv(&mut self) -> Option<HubMessage> {
+        self.recv_mode(false).await
+    }
+
+    async fn recv_mode(&mut self, snapshot: bool) -> Option<HubMessage> {
         loop {
             match self.rx.next().await? {
                 Ok(line) => match serde_json::from_str(&line) {
                     Ok(msg) => return Some(msg),
+                    Err(e) if snapshot => {
+                        tracing::warn!(error = %e, "undecodable watch snapshot");
+                        return None;
+                    }
                     Err(e) => tracing::warn!(error = %e, "undecodable hub line skipped"),
                 },
                 Err(e) => {
@@ -272,19 +280,39 @@ struct Capture {
     reply: Reply,
 }
 
+/// Hub feed messages are published under this lock with their state changes.
+pub(crate) struct HubState {
+    pub status: HubStatus,
+    /// Every session the hub knows, by sid; empty while the hub is not up.
+    pub sessions: BTreeMap<String, Arc<Summary>>,
+}
+
 /// The control connection's results, shared with the handlers.
 pub struct HubHandle {
-    pub status: watch::Receiver<HubStatus>,
-    /// Every session the hub knows, by sid; empty while the hub is not up.
-    pub sessions: Arc<Mutex<BTreeMap<String, Summary>>>,
+    state: Arc<Mutex<HubState>>,
     calls: mpsc::Sender<Capture>,
 }
 
 impl HubHandle {
-    /// A copy of the session map.
-    pub fn sessions(&self) -> Vec<Summary> {
-        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.values().cloned().collect()
+    pub(crate) fn state(&self) -> MutexGuard<'_, HubState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn status(&self) -> HubStatus {
+        self.state().status.clone()
+    }
+
+    /// A copy of the session handles.
+    pub fn sessions(&self) -> Vec<Arc<Summary>> {
+        self.state().sessions.values().cloned().collect()
+    }
+
+    pub fn snapshot(&self) -> (HubStatus, Vec<Arc<Summary>>) {
+        let state = self.state();
+        (
+            state.status.clone(),
+            state.sessions.values().cloned().collect(),
+        )
     }
 
     /// The plain text of the last `lines` lines of PTY `sid`, over the control
@@ -315,25 +343,21 @@ pub fn with_state(summary: &Summary) -> Value {
 /// Starts the control connection task (§3.2.10). Every status change, session change
 /// and forget is also sent on `feed`.
 pub fn spawn_control(path: PathBuf, feed: broadcast::Sender<FeedMsg>) -> HubHandle {
-    let (status_tx, status) = watch::channel(HubStatus::Down);
-    let sessions = Arc::new(Mutex::new(BTreeMap::new()));
+    let state = Arc::new(Mutex::new(HubState {
+        status: HubStatus::Down,
+        sessions: BTreeMap::new(),
+    }));
     let (calls, calls_rx) = mpsc::channel(CALLS);
     let control = Control {
-        status: status_tx,
-        sessions: sessions.clone(),
+        state: state.clone(),
         feed,
     };
     tokio::spawn(control.run(path, calls_rx));
-    HubHandle {
-        status,
-        sessions,
-        calls,
-    }
+    HubHandle { state, calls }
 }
 
 struct Control {
-    status: watch::Sender<HubStatus>,
-    sessions: Arc<Mutex<BTreeMap<String, Summary>>>,
+    state: Arc<Mutex<HubState>>,
     feed: broadcast::Sender<FeedMsg>,
 }
 
@@ -345,20 +369,19 @@ impl Control {
                 Ok((conn, info)) => {
                     let since = Instant::now();
                     self.watch(conn, info, &mut calls).await;
-                    self.sessions().clear();
-                    self.set(HubStatus::Down);
+                    self.set(HubStatus::Down, BTreeMap::new());
                     if since.elapsed() >= STABLE {
                         backoff = BACKOFF_MIN;
                     }
                     jitter(next_backoff(&mut backoff, BACKOFF_MAX))
                 }
                 Err(ConnectError::Incompatible(proto)) => {
-                    self.set(HubStatus::Incompatible { proto });
+                    self.set(HubStatus::Incompatible { proto }, BTreeMap::new());
                     BACKOFF_MAX
                 }
                 Err(ConnectError::Unavailable(why)) => {
                     tracing::debug!(why, "hub not reachable");
-                    self.set(HubStatus::Down);
+                    self.set(HubStatus::Down, BTreeMap::new());
                     jitter(next_backoff(&mut backoff, BACKOFF_MAX))
                 }
             };
@@ -370,25 +393,47 @@ impl Control {
     /// current and serves captures until the connection ends. Captures still waiting
     /// for their reply then fail as unavailable.
     async fn watch(&self, mut conn: HubConn, info: HubInfo, calls: &mut mpsc::Receiver<Capture>) {
-        if conn.send(&HubRequest::Watch { rid: 1 }).await.is_err() {
+        let request = HubRequest::Watch {
+            rid: 1,
+            stream: true,
+        };
+        if conn.send(&request).await.is_err() {
             return;
         }
-        // Nothing else is subscribed on this connection, so the reply comes first.
-        let reply = match timeout(REPLY_TIMEOUT, conn.recv()).await {
-            Ok(Some(HubMessage::Ok { rid: 1, result })) => {
-                serde_json::from_value::<SessionsReply>(Value::Object(result))
+        let mut snapshot = BTreeMap::new();
+        // Older hubs ignore `stream` and send just the final reply. Do not publish
+        // a partial map, and give each page its own timeout on a large snapshot.
+        loop {
+            match timeout(REPLY_TIMEOUT, conn.recv_mode(true)).await {
+                Ok(Some(HubMessage::SessionsPage { rid: 1, sessions })) => {
+                    snapshot.extend(sessions.into_iter().map(|s| (s.sid.clone(), Arc::new(s))));
+                }
+                Ok(Some(HubMessage::Ok { rid: 1, result })) => {
+                    let Ok(SessionsReply { sessions }) =
+                        serde_json::from_value::<SessionsReply>(Value::Object(result))
+                    else {
+                        tracing::warn!("undecodable watch reply");
+                        return;
+                    };
+                    snapshot.extend(sessions.into_iter().map(|s| (s.sid.clone(), Arc::new(s))));
+                    break;
+                }
+                Ok(Some(HubMessage::Err {
+                    rid: Some(1),
+                    code,
+                    message,
+                    ..
+                })) => {
+                    tracing::warn!(?code, %message, "the hub refused watch");
+                    return;
+                }
+                _ => {
+                    tracing::warn!("the hub did not complete watch");
+                    return;
+                }
             }
-            _ => {
-                tracing::warn!("the hub did not answer watch");
-                return;
-            }
-        };
-        let Ok(SessionsReply { sessions }) = reply else {
-            tracing::warn!("undecodable watch reply");
-            return;
-        };
-        *self.sessions() = sessions.into_iter().map(|s| (s.sid.clone(), s)).collect();
-        self.set(HubStatus::Up(info));
+        }
+        self.set(HubStatus::Up(info), snapshot);
         let mut rid = 1;
         let mut pending: HashMap<u64, Reply> = HashMap::new();
         loop {
@@ -417,16 +462,23 @@ impl Control {
     fn hub_msg(&self, msg: HubMessage, pending: &mut HashMap<u64, Reply>) {
         match msg {
             HubMessage::Session { session } => {
-                self.sessions()
-                    .insert(session.sid.clone(), (*session).clone());
+                let session = Arc::<Summary>::from(session);
+                let mut state = self.state();
+                let old = state
+                    .sessions
+                    .insert(session.sid.clone(), Arc::clone(&session));
                 let _ = self.feed.send(FeedMsg::Session(session));
+                drop(state);
+                drop(old);
             }
             HubMessage::Gone { sid, epoch } => {
+                let mut state = self.state();
+                if state
+                    .sessions
+                    .get(&sid)
+                    .is_some_and(|s| s.created_at == epoch)
                 {
-                    let mut sessions = self.sessions();
-                    if sessions.get(&sid).is_some_and(|s| s.created_at == epoch) {
-                        sessions.remove(&sid);
-                    }
+                    state.sessions.remove(&sid);
                 }
                 let _ = self.feed.send(FeedMsg::Gone { sid, epoch });
             }
@@ -454,22 +506,24 @@ impl Control {
         }
     }
 
-    fn sessions(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Summary>> {
-        self.sessions.lock().unwrap_or_else(|e| e.into_inner())
+    fn state(&self) -> MutexGuard<'_, HubState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn set(&self, new: HubStatus) {
-        let changed = self.status.send_if_modified(|cur| {
-            let changed = *cur != new;
-            if changed {
-                *cur = new.clone();
-            }
-            changed
-        });
+    fn set(&self, new: HubStatus, sessions: BTreeMap<String, Arc<Summary>>) {
+        let mut state = self.state();
+        let old = std::mem::replace(&mut state.sessions, sessions);
+        let changed = state.status != new;
+        let name = new.name();
         if changed {
-            tracing::info!(status = new.name(), "hub status");
+            state.status = new.clone();
             let _ = self.feed.send(FeedMsg::Hub(new));
         }
+        drop(state);
+        if changed {
+            tracing::info!(status = name, "hub status");
+        }
+        drop(old);
     }
 }
 

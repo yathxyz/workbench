@@ -55,6 +55,7 @@ use self::worktree::CreateFailure::{self, Clean, PossibleLeftover};
 use crate::conn::{ConnId, Reply, Viewer, line};
 use crate::outq::OutQ;
 use crate::registry::Route;
+use crate::snapshot::fit_summary;
 use crate::store::write_atomic;
 use crate::{Ctx, lock, now_ms};
 
@@ -1462,11 +1463,11 @@ impl Acp {
         self.publish();
     }
 
-    /// The Summary and session info as they are now, with the last `updatedAt`.
-    fn snapshot(&self) -> (Summary, AcpSessionInfo) {
+    /// The wire Summary and session info as they are now.
+    fn snapshot(&self, updated_at: u64) -> (Summary, AcpSessionInfo) {
         let viewers = lock(&self.shared.viewers).len();
         let facts = &self.facts;
-        let summary = Summary {
+        let mut summary = Summary {
             sid: self.sid.clone(),
             kind: Kind::Acp,
             host: self
@@ -1476,7 +1477,7 @@ impl Acp {
                 .unwrap_or(&self.ctx.cfg.host)
                 .clone(),
             created_at: self.created_at,
-            updated_at: self.updated_at,
+            updated_at,
             alive: self.proc.is_some(),
             viewers: u32::try_from(viewers).unwrap_or(u32::MAX),
             cwd: self.meta.cwd.clone(),
@@ -1503,6 +1504,7 @@ impl Acp {
                 task: facts.task.clone(),
             }),
         };
+        fit_summary(&mut summary);
         let init = self.meta.init.as_ref();
         let field = |key: &str| init.and_then(|i| i.get(key)).cloned();
         let session = AcpSessionInfo {
@@ -1530,12 +1532,14 @@ impl Acp {
         if self.quiet {
             return;
         }
-        let (mut summary, session) = self.snapshot();
+        let updated_at = now_ms().max(self.updated_at);
+        let (mut summary, session) = self.snapshot(updated_at);
         if let Some((last, last_session)) = &self.published
             && let (Some(now), Some(then)) = (&mut summary.acp, &last.acp)
         {
-            // Compare at the published head without copying the rest of the Summary.
+            // Compare at the published head and time without copying the Summary.
             now.head_seq = then.head_seq;
+            summary.updated_at = last.updated_at;
             if summary == *last
                 && session == *last_session
                 && (self.facts.head_seq == then.head_seq || self.defer_head())
@@ -1543,6 +1547,7 @@ impl Acp {
                 return;
             }
             summary.acp.as_mut().unwrap().head_seq = self.facts.head_seq;
+            summary.updated_at = updated_at;
         }
         self.send_info(summary, session);
     }
@@ -1559,14 +1564,13 @@ impl Acp {
     }
 
     fn flush_info(&mut self) {
-        let (summary, session) = self.snapshot();
+        let (summary, session) = self.snapshot(now_ms().max(self.updated_at));
         self.send_info(summary, session);
     }
 
-    fn send_info(&mut self, mut summary: Summary, session: AcpSessionInfo) {
+    fn send_info(&mut self, summary: Summary, session: AcpSessionInfo) {
         self.info_at = None;
-        self.updated_at = now_ms().max(self.updated_at);
-        summary.updated_at = self.updated_at;
+        self.updated_at = summary.updated_at;
         self.ctx.registry.publish(Arc::new(summary.clone()));
         let msg = line(&HubMessage::AcpInfo {
             sid: self.sid.clone(),
@@ -1637,7 +1641,7 @@ impl Acp {
             });
         }
         self.publish();
-        let (summary, session) = self.snapshot();
+        let (summary, session) = self.snapshot(self.updated_at);
         let ok = AcpOpenReply {
             new,
             summary,

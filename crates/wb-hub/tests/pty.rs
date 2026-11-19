@@ -321,6 +321,26 @@ fn a_line_over_max_line_closes_the_connection() {
 }
 
 #[test]
+fn unknown_request_at_max_line_gets_a_bounded_error() {
+    let hub = Hub::start();
+    let mut c = hub.connect();
+    let mut request = br#"{"t":"unknown."#.to_vec();
+    let end = b"\",\"rid\":8}";
+    request.resize(MAX_LINE - end.len(), b'x');
+    request.extend_from_slice(end);
+    request.push(b'\n');
+    c.write_raw(&request).unwrap();
+
+    let reply = c.next().unwrap();
+    assert_eq!(reply["t"], "err");
+    assert_eq!(reply["rid"], 8);
+    assert_eq!(reply["code"], "unknown_type");
+    assert!(reply["message"].as_str().unwrap().contains("unknown."));
+    assert!(serde_json::to_vec(&reply).unwrap().len() <= MAX_LINE);
+    c.ok(json!({"t": "list"}));
+}
+
+#[test]
 fn owed_replies_arrive_after_the_client_stops_sending() {
     let hub = Hub::start();
     let mut a = hub.connect();
@@ -734,6 +754,38 @@ fn a_clean_restart_keeps_the_last_screen_in_a_hub_restart_corpse() {
         corpse["replay"].as_str().unwrap().contains("LAST42"),
         "{corpse}"
     );
+}
+
+#[test]
+fn an_oversized_restored_cwd_does_not_break_watch() {
+    let mut hub = Hub::start();
+    assert!(hub.terminate().success());
+    // The field fits in raw UTF-8, but not once the JSON control bytes are escaped.
+    let record = json!({
+        "sid": "large", "shell": "bash", "argv": ["bash"],
+        "cwd": format!("/{}", "\u{1}".repeat(MAX_LINE / 6)),
+        "env": {}, "createdAt": 1, "cols": 80, "rows": 24,
+        "exit": {"code": 0, "reason": "exited", "at": 2}
+    });
+    fs::write(
+        hub.pty_file("large.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    hub.restart();
+
+    for stream in [true, false] {
+        let reply = hub
+            .connect()
+            .request(json!({"t": "watch", "stream": stream}));
+        assert_eq!(reply["t"], "ok");
+        let [restored] = reply["sessions"].as_array().unwrap().as_slice() else {
+            panic!("expected the restored session in watch")
+        };
+        assert_eq!(restored["sid"], "large");
+        assert_eq!(restored["cwd"], "");
+        assert_eq!(restored["pty"]["exit"]["reason"], "exited");
+    }
 }
 
 #[test]

@@ -166,7 +166,7 @@ fn shell_nodes(app: &AppState) -> HashMap<u32, String> {
         .sessions()
         .into_iter()
         .filter(|s| s.alive)
-        .filter_map(|s| Some((s.pty.as_ref()?.pid?, s.sid)))
+        .filter_map(|s| Some((s.pty.as_ref()?.pid?, s.sid.clone())))
         .collect()
 }
 

@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
 
@@ -564,6 +565,7 @@ pub fn spawned() -> PtyOpenReply {
 
 enum Inject {
     Line(Box<HubMessage>),
+    Raw(Vec<u8>, oneshot::Sender<()>),
     Close,
 }
 
@@ -573,6 +575,7 @@ type Requests = watch::Sender<Vec<(usize, HubRequest)>>;
 #[derive(Default)]
 struct Script {
     sessions: Mutex<Vec<Summary>>,
+    manual_watch: AtomicBool,
     opens: Mutex<VecDeque<OpenReply>>,
     captures: Mutex<VecDeque<CaptureResult>>,
 }
@@ -708,6 +711,22 @@ impl FakeHub {
             .unwrap();
     }
 
+    /// A test will supply the entire watch response using `send_raw`.
+    pub fn manual_watch(&self) {
+        self.script.manual_watch.store(true, Ordering::Relaxed);
+    }
+
+    pub async fn send_raw(&self, conn: usize, bytes: Vec<u8>) {
+        let (written, wait) = oneshot::channel();
+        self.conns.lock().unwrap()[conn]
+            .send(Inject::Raw(bytes, written))
+            .unwrap();
+        timeout(WAIT, wait)
+            .await
+            .expect("hub did not write")
+            .unwrap();
+    }
+
     /// Closes connection `conn` from the hub side.
     pub fn close(&self, conn: usize) {
         let _ = self.conns.lock().unwrap()[conn].send(Inject::Close);
@@ -808,7 +827,10 @@ async fn serve(
                 let req: HubRequest = serde_json::from_str(&line).unwrap();
                 record.send_modify(|all| all.push((id, req.clone())));
                 match req {
-                    HubRequest::Watch { rid } | HubRequest::List { rid } => {
+                    HubRequest::Watch { .. } if script.manual_watch.load(Ordering::Relaxed) => {
+                        continue;
+                    }
+                    HubRequest::Watch { rid, .. } | HubRequest::List { rid, .. } => {
                         let sessions = script.sessions.lock().unwrap().clone();
                         HubMessage::ok(rid, &SessionsReply { sessions })
                     }
@@ -858,6 +880,13 @@ async fn serve(
             }
             msg = inject.recv() => match msg {
                 Some(Inject::Line(msg)) => *msg,
+                Some(Inject::Raw(bytes, written)) => {
+                    if tx.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                    let _ = written.send(());
+                    continue;
+                }
                 Some(Inject::Close) | None => return,
             },
         };

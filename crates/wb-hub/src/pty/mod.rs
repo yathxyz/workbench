@@ -34,6 +34,7 @@ use self::vt::Vt;
 use crate::conn::{ConnId, Reply, Viewer, line};
 use crate::outq::OutQ;
 use crate::registry::Route;
+use crate::snapshot::fit_summary;
 use crate::store::{self, Record, Store};
 use crate::{Ctx, env, lock, now_ms, procfs};
 
@@ -1005,10 +1006,11 @@ impl Pty {
         self.store.write(&self.rec, snap);
     }
 
+    /// Uses the same wire projection for live state and restored records.
     fn publish(&mut self) {
         self.updated_at = now_ms().max(self.updated_at);
         let viewers = lock(&self.viewers).len();
-        self.ctx.registry.publish(Arc::new(Summary {
+        let mut summary = Summary {
             sid: self.sid.clone(),
             kind: Kind::Pty,
             host: self.ctx.cfg.host.clone(),
@@ -1028,7 +1030,9 @@ impl Pty {
                 exit: self.rec.exit.clone(),
             }),
             acp: None,
-        }));
+        };
+        fit_summary(&mut summary);
+        self.ctx.registry.publish(Arc::new(summary));
     }
 }
 

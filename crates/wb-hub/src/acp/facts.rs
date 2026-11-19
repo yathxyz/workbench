@@ -7,9 +7,7 @@ use wb_proto::journal::{EventBody, JournalEvent, ResolvedBy, SetupErrorCode, Tur
 use wb_proto::policy::Policy;
 
 use super::config::{valid_options, within_limits};
-
-/// `Pending.title` is cut to this many characters.
-const TITLE_MAX: usize = 200;
+use crate::snapshot::PENDING_TITLE_CHARS;
 
 /// What the journal says about a session (DESIGN §3.4.5 "Facts", 10 §7.8 "Fold").
 #[derive(Clone, Debug, PartialEq)]
@@ -277,10 +275,10 @@ fn wire<T: serde::Serialize>(code: &T) -> String {
     }
 }
 
-/// A title string cut to `TITLE_MAX` characters; empty if absent or not a string.
+/// A title cut to `PENDING_TITLE_CHARS` characters; empty if absent or not a string.
 fn cut(v: Option<&Value>) -> String {
     v.and_then(Value::as_str)
-        .map(|s| s.chars().take(TITLE_MAX).collect())
+        .map(|s| s.chars().take(PENDING_TITLE_CHARS).collect())
         .unwrap_or_default()
 }
 
@@ -471,7 +469,7 @@ mod tests {
     fn task_events_only_change_the_reference_and_head() {
         let before = fold(vec![spawn(), session("s", None), prompt()]);
         let mut f = before.clone();
-        for (seq, value) in [(4, Some("issue 44")), (5, Some("other work")), (6, None)] {
+        for (seq, value) in [(4, Some("issue 44")), (5, Some(" task ")), (6, None)] {
             let task = value.map(str::to_owned);
             f.apply(&ev(seq, EventBody::Task { task: task.clone() }));
             assert_eq!(

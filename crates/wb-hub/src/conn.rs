@@ -22,14 +22,11 @@ use wb_proto::line::encode;
 use crate::Ctx;
 use crate::acp::{self, Act};
 use crate::env::check_client_env;
-use crate::outq::OutQ;
+use crate::outq::{OutQ, Output};
 use crate::pty::{self, Cmd, Open};
 use crate::registry::SessionCmd;
+use crate::snapshot::{ARGV_BYTES_MAX, ARGV_MAX};
 
-/// Most items in `SpawnPty.argv`.
-const ARGV_MAX: usize = 256;
-/// Most bytes in all of `SpawnPty.argv`.
-const ARGV_BYTES_MAX: usize = 256 << 10;
 /// How long a connection whose client stopped sending may take to deliver the replies
 /// it still owes; a `kill{forget:true}` waits for the exit, up to about 3 s for a PTY
 /// and about 8 s for an agent.
@@ -232,9 +229,15 @@ async fn read_line(r: &mut Lines) -> std::io::Result<Option<String>> {
 }
 
 async fn write_loop(mut wr: OwnedWriteHalf, q: Arc<OutQ>) {
-    while let Some(line) = q.pop().await {
+    while let Some(output) = q.next().await {
+        let write = async {
+            match output {
+                Output::Line(line) => wr.write_all(&line).await.map(|()| true),
+                Output::Snapshot(snapshot) => snapshot.write(&mut wr).await,
+            }
+        };
         tokio::select! {
-            r = wr.write_all(&line) => if r.is_err() { break },
+            r = write => if !matches!(r, Ok(true)) { break },
             () = q.closed() => break,
         }
     }
@@ -273,15 +276,20 @@ impl Conn {
             }
         };
         let rid = v.get("rid").and_then(Value::as_u64);
-        let t = v
-            .get("t")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
+        // Diagnostic echoes must not grow the reply beyond the framing limit.
+        let t = v.get("t").and_then(Value::as_str).unwrap_or_default();
+        let t = t[..t.floor_char_boundary(128)].to_owned();
         let req = match serde_json::from_value::<HubRequest>(v) {
             Ok(req) => req,
             Err(e) => {
-                return self.error(rid, None, ErrorCode::BadRequest, format!("bad {t:?}: {e}"));
+                let why = e.to_string();
+                let why = &why[..why.floor_char_boundary(256)];
+                return self.error(
+                    rid,
+                    None,
+                    ErrorCode::BadRequest,
+                    format!("bad {t:?}: {why}"),
+                );
             }
         };
         if rid == Some(0) {
@@ -297,8 +305,10 @@ impl Conn {
                 let msg = "hello was already exchanged".into();
                 self.error(None, None, ErrorCode::BadRequest, msg);
             }
-            HubRequest::List { rid } => self.outq.push_reply(self.ctx.registry.list(rid)),
-            HubRequest::Watch { rid } => self.ctx.registry.watch(self.viewer(), rid),
+            HubRequest::List { rid, stream } => self.ctx.registry.list(&self.outq, rid, stream),
+            HubRequest::Watch { rid, stream } => {
+                self.ctx.registry.watch(self.viewer(), rid, stream)
+            }
             HubRequest::PtyOpen {
                 rid,
                 sid,

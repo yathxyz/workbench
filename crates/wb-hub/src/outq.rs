@@ -16,6 +16,7 @@ use tokio::sync::Notify;
 use wb_proto::limits::CONN_QUEUE;
 
 use crate::lock;
+use crate::snapshot::Snapshot;
 
 /// The connection is closed; nothing more will be written to it.
 #[derive(Debug, PartialEq, Eq)]
@@ -27,9 +28,15 @@ pub struct OutQ {
     changed: Notify,
 }
 
+pub enum Output {
+    Line(Arc<[u8]>),
+    Snapshot(Snapshot),
+}
+
 #[derive(Default)]
 struct State {
-    q: VecDeque<Arc<[u8]>>,
+    q: VecDeque<Output>,
+    snapshot_pending: bool,
     bytes: usize,
     closed: bool,
     finished: bool,
@@ -48,7 +55,7 @@ impl OutQ {
             return Err(Closed);
         }
         st.bytes += line.len();
-        st.q.push_back(line);
+        st.q.push_back(Output::Line(line));
         drop(st);
         self.changed.notify_waiters();
         Ok(())
@@ -60,12 +67,25 @@ impl OutQ {
             return;
         }
         st.bytes += line.len();
-        st.q.push_back(line);
+        st.q.push_back(Output::Line(line));
         drop(st);
         self.changed.notify_waiters();
     }
 
-    /// Ignores later pushes; [`pop`](Self::pop) ends once the queue is empty.
+    /// Queue the point-in-time view ahead of later events without queuing its encoded bytes.
+    pub fn push_snapshot(&self, snapshot: Snapshot) {
+        let mut st = lock(&self.st);
+        if st.closed || st.finished {
+            return;
+        }
+        debug_assert!(!st.snapshot_pending);
+        st.snapshot_pending = true;
+        st.q.push_back(Output::Snapshot(snapshot));
+        drop(st);
+        self.changed.notify_waiters();
+    }
+
+    /// Ignores later pushes; [`next`](Self::next) ends once the queue is empty.
     pub fn finish(&self) {
         lock(&self.st).finished = true;
         self.changed.notify_waiters();
@@ -77,22 +97,33 @@ impl OutQ {
         self.changed.notify_waiters();
     }
 
-    /// The next line to write, or `None` once the queue is closed, or finished and empty.
-    pub async fn pop(&self) -> Option<Arc<[u8]>> {
-        let line = self
+    /// The next output item, or `None` once the queue is closed, or finished and empty.
+    pub async fn next(&self) -> Option<Output> {
+        let output = self
             .wait(|st| {
                 if st.closed || (st.finished && st.q.is_empty()) {
                     return Some(None);
                 }
-                let line = st.q.pop_front()?;
-                st.bytes -= line.len();
-                Some(Some(line))
+                let output = st.q.pop_front()?;
+                match &output {
+                    Output::Line(line) => st.bytes -= line.len(),
+                    Output::Snapshot(_) => st.snapshot_pending = false,
+                }
+                Some(Some(output))
             })
             .await;
-        if line.is_some() {
+        if output.is_some() {
             self.changed.notify_waiters();
         }
-        line
+        output
+    }
+
+    #[cfg(test)]
+    async fn pop(&self) -> Option<Arc<[u8]>> {
+        self.next().await.map(|output| match output {
+            Output::Line(line) => line,
+            Output::Snapshot(_) => panic!("expected a line"),
+        })
     }
 
     /// Waits until `line` fits under the cap, or the queue is empty, then queues it
@@ -107,7 +138,7 @@ impl OutQ {
                     Some(false)
                 } else if st.bytes == 0 || st.bytes + line.len() <= CONN_QUEUE {
                     st.bytes += line.len();
-                    st.q.push_back(line.clone());
+                    st.q.push_back(Output::Line(line.clone()));
                     Some(true)
                 } else {
                     None
@@ -135,12 +166,12 @@ impl OutQ {
         .await
     }
 
-    /// Waits until the queue is below the cap.
+    /// Waits until the queue is below the cap and the writer has taken any queued snapshot.
     pub async fn room(&self) -> Result<(), Closed> {
         self.wait(|st| {
             if st.closed {
                 Some(Err(Closed))
-            } else if st.bytes < CONN_QUEUE {
+            } else if st.bytes < CONN_QUEUE && !st.snapshot_pending {
                 Some(Ok(()))
             } else {
                 None
@@ -170,6 +201,7 @@ impl State {
         self.closed = true;
         self.q.clear();
         self.bytes = 0;
+        self.snapshot_pending = false;
     }
 }
 

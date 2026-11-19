@@ -214,6 +214,7 @@ flake.nix flake.lock   (inputs: nixpkgs, edwin = github:yathxyz/edwin)
 
 #### 3.2.4 Envelope and error codes
 - A request carries `rid` (u64, nonzero, unique per connection) and gets exactly one reply: `{"t":"ok","rid":N,…}` or `{"t":"err","rid":N,"code":…,"message":…}`.
+- A `list` or `watch` request with `stream:true` may also receive `sessions.page{rid,sessions}` before its one terminal reply.
 - `pty.input` and `pty.resize` have no `rid` and get no reply.
 - Events never carry `rid`. An asynchronous error is `{"t":"err","sid":…,"code":…,"message":…}`.
 
@@ -289,6 +290,8 @@ The error codes are a closed set:
   - `req` is the journal seq of the announcing event;
   - `title` is the permission's `toolCall.title` or the elicitation's `message`, cut to 200 characters for both kinds. It is `""` when the request has none.
 - **`AcpSessionInfo`:** `{protocolVersion, agentInfo, agentCapabilities, promptCapabilities, authMethods, modes, configOptions, availableCommands, plan, usage}`. It holds the latest materialised values; absent optional values are omitted. `Summary.acp.configOptions` is always present, with `null` when absent.
+- Snapshots and watch events publish live and restored summaries unchanged, including the full option list, whenever they fit in a single-summary page with the longest request ID.
+  Only on overflow does the hub shorten the wire summary; it leaves the journal and session records unchanged.
 - **`Summary.acp.managedWorktree`** is present only for a recorded worktree: `{path, branch, mainRoot}`, with both paths absolute.
   This record is independent of the web's best-effort top-level git metadata (`repo`, `worktree`, `branch`).
 - **`Summary.acp.policy`:** the session's non-empty `Policy` (§3.4.5), omitted when none. It is a hub fact, not an agent config option. Optional rule `programs` is an ordinary policy field, preserved along with roots and command regexes through validation, installation, journaling and replay.
@@ -302,8 +305,8 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 
 | t | Fields | ok reply | Semantics |
 |---|---|---|---|
-| `list` | – | `{sessions: Summary[]}` | every known session |
-| `watch` | – | `{sessions}` | then `session` on every Summary change and `gone` on forget |
+| `list` | `stream?: bool` | `{sessions: Summary[]}` | snapshot of every known session, in sid order; see below |
+| `watch` | `stream?: bool` | `{sessions: Summary[]}` | snapshot and subscription; then `session` on every Summary change and `gone` on forget |
 | `pty.open` | `sid, cols, rows, spawn?: SpawnPty, resume?: {stream, out}` | `{new, pid?, cwd, exit?, epoch, stream, out, resumed, replay?}` | rules below |
 | `pty.detach` | `sid` | `{}` | |
 | `pty.input` | `sid, d` | – | `d` ≤ 1 MiB. Written completely and in order. If queued input would exceed 8 MiB, the whole message is dropped and the connection gets `err{sid, code:"input_overflow"}`. Input to a dead session is dropped silently. |
@@ -325,6 +328,21 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `acp.authenticate` | `sid, methodId` | `{}` after the agent answers | only during a failed setup, agent-handled methods only (`type:"terminal"` → `bad_option`) |
 | `acp.kill` | `sid, forget` | `{}` | teardown stages in §3.4.5. **`forget:false`:** ok when the kill starts; the session stays revivable. **`forget:true`:** ok only after exit, deletion of `acp/<sid>.*` and registry removal. `gone` goes to attached connections and watchers. |
 | `acp.remove_worktree` | `sid` | `{}` | Verify `workbench-session` in the recorded checkout's private git directory, remove without force, then persist and publish the cleared record; an absent record is `not_found`, a running agent or dirty worktree is `conflict`. A missing checkout, missing marker or different sid clears the record without deletion and returns `not_found`: “session worktree already gone; record cleared; nothing deleted”. |
+
+**`list` and `watch` snapshots.**
+- With `stream:true`, concatenate the `sessions` arrays from any `sessions.page{rid,sessions}` lines and the final `ok{rid,sessions}`.
+  Each line fits `MAX_LINE` (newline excluded), independent of session count; each summary is whole.
+  The last summary uses the final `ok` line's budget.
+  If a summary cannot fit its envelope even on a line of its own, the hub sends `err{rid,sid,code:"internal"}` and closes the connection if it was a `watch` request.
+- A `watch` captures the snapshot and subscribes atomically.
+  All live `session` and `gone` events from that subscription follow the snapshot, including changes made while it is being sent.
+  If a live or legacy catch-up `session` event cannot fit `MAX_LINE`, the hub closes the watch connection.
+  A `list` on a watching connection is ordered with any live events at the moment its snapshot is captured.
+- Without `stream:true`, the hub sends the original single `ok` reply when it fits.
+  If it does not fit, `list` returns `bad_request` directing the caller to `stream:true`; `watch` sends a bounded `ok` with a prefix of the snapshot, then ordinary `session` events for the rest, before any live changes.
+  This lets older web fronts retain all summaries and options using their existing upsert path.
+- Older hubs ignore `stream:true` and respond with their original single-line snapshot.
+  The web accepts that reply without requiring a page, but the old hub's snapshot is still subject to `MAX_LINE`.
 
 **Check order.** While a non-empty initial configuration batch is active (including its preceding setup), `acp.prompt`, `acp.cancel`, `acp.set_mode`, `acp.set_config_option`, `acp.revive` and `acp.authenticate` fail with `busy` before their normal actor checks. They are rejected, never queued for a future turn. Permission and elicitation answers, `acp.seen` and `acp.kill` remain usable. Otherwise, when a request fails several checks, the first in this list applies:
 - `acp.prompt`: `faulted`, `not_alive`, `bad_request` (no ACP session yet), `busy`, then the content rules.
@@ -461,6 +479,8 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 
 #### 3.2.10 Hub availability as seen from the web
 - The control connection reconnects with backoff: 250 ms doubling to 5 s, with jitter.
+- The web treats an incomplete or undecodable initial watch as a lost connection and discards its staged summaries.
+- Readiness and the session map change together; the web reports the hub up only after the final watch reply.
 - While the hub is down:
   - `/api/info.hub.status="down"`;
   - new card sockets are accepted, then closed with 1013;
@@ -1380,7 +1400,11 @@ Server-sent events, each `event: <name>` with one line of JSON as `data`:
 | `observed_gone` | `{id, key}` | a record was dropped that a stream or a listing had shown |
 | `ready` | `{}` | once, after the snapshot |
 
-A comment line goes out every 15 s. A client that falls so far behind that events were lost is disconnected and takes a new snapshot when it reconnects. A change that lands between the subscription and the snapshot may be sent twice; both carry the same state. The stream ends when wb-web shuts down.
+A comment line goes out every 15 s.
+A client that falls so far behind that events were lost is disconnected and takes a new snapshot when it reconnects.
+On an `up` notification, the stream takes the current hub status and snapshot and starts a new subscription at the same point, dropping any queued hub deltas that the snapshot supersedes.
+An observed-session change that lands between the subscription and the initial snapshot may be sent twice.
+The stream ends when wb-web shuts down.
 
 #### 3.8.5 Remote hosts (hub)
 

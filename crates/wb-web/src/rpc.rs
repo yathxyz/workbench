@@ -64,15 +64,10 @@ fn hub_msg(status: &HubStatus) -> Value {
 
 /// The hub status, and while the hub is up every session it knows.
 fn snapshot(app: &AppState) -> Vec<Value> {
-    let status = app.hub.status.borrow().clone();
+    let (status, sessions) = app.hub.snapshot();
     let mut msgs = vec![hub_msg(&status)];
     if let HubStatus::Up(_) = status {
-        let sessions: Vec<Value> = app
-            .hub
-            .sessions()
-            .iter()
-            .map(|s| app.session_summary(s))
-            .collect();
+        let sessions: Vec<Value> = sessions.iter().map(|s| app.session_summary(s)).collect();
         msgs.push(json!({"t": "sessions", "sessions": sessions}));
     }
     msgs
@@ -162,7 +157,7 @@ async fn run(app: AppState, mut ws: WebSocket) {
                 Delivery::Plain(msg) => vec![msg],
             },
             msg = feed.recv() => match msg {
-                // The control task fills the session map before it reports up.
+                // Read status and summaries from the same control snapshot.
                 Ok(FeedMsg::Hub(HubStatus::Up(_))) => snapshot(&app),
                 Ok(FeedMsg::Hub(status)) => vec![hub_msg(&status)],
                 Ok(FeedMsg::Session(session)) => {
