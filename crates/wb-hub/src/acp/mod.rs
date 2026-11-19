@@ -361,13 +361,12 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
     if meta.sid != sid {
         bail!("{name} holds sid {:?}", meta.sid);
     }
-    let (mut journal, events) = Journal::open(&dir.join(format!("{sid}.jsonl")))?;
     let mut facts = Facts::default();
     let mut announced = BTreeMap::new();
     let mut policy_notice = false;
-    for ev in &events {
-        facts.apply(ev);
-        announce(&mut announced, ev);
+    let mut journal = Journal::open(&dir.join(format!("{sid}.jsonl")), |ev| {
+        facts.apply(&ev);
+        announce(&mut announced, &ev);
         match &ev.body {
             // The fold already validated it; nonempty rules folding to none were invalid.
             EventBody::Policy { policy } => {
@@ -379,7 +378,7 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
             } if text == INVALID_POLICY_NOTICE => policy_notice = false,
             _ => {}
         }
-    }
+    })?;
     let policy = facts
         .policy
         .as_ref()
@@ -1103,7 +1102,7 @@ impl Acp {
             // Files an earlier incarnation failed to delete must not leak into this one.
             delete(&dir, &sid)?;
             let opened = write_atomic(&dir, &format!("{sid}.json"), &json?).and_then(|()| {
-                Journal::open(&dir.join(format!("{sid}.jsonl")))
+                Journal::open(&dir.join(format!("{sid}.jsonl")), drop)
                     .map_err(|e| io::Error::other(format!("{e:#}")))
             });
             if opened.is_err() {
@@ -1114,7 +1113,7 @@ impl Acp {
         .await
         .unwrap_or_else(|e| Err(io::Error::other(e)));
         match made {
-            Ok((journal, _)) => self.journal = Some(journal),
+            Ok(journal) => self.journal = Some(journal),
             Err(e) => {
                 warn!("creating the session's files: {e}");
                 let msg = format!("creating the session's files: {e}");

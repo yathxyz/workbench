@@ -45,12 +45,12 @@ pub struct WriteFault {
 }
 
 impl Journal {
-    /// Opens the journal at `path`, creating it with mode 0600 if missing, and returns
-    /// its events in file order. Bytes after the last `\n` are a torn tail: they are
+    /// Opens the journal at `path`, creating it with mode 0600 if missing, visiting
+    /// validated events in file order. Bytes after the last `\n` are a torn tail: they are
     /// truncated away and logged. Any complete line that is not a journal event, or
     /// whose seq is not the previous one plus 1 (starting at 1), is an error, so the
     /// caller quarantines the session (DESIGN §3.4.4).
-    pub fn open(path: &Path) -> Result<(Journal, Vec<JournalEvent>)> {
+    pub fn open(path: &Path, mut visit: impl FnMut(JournalEvent)) -> Result<Journal> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -60,7 +60,7 @@ impl Journal {
             .open(path)
             .with_context(|| format!("cannot open {}", path.display()))?;
         let mut reader = BufReader::new(&file);
-        let mut events: Vec<JournalEvent> = Vec::new();
+        let mut head = 0;
         let mut end = 0u64;
         let mut line = Vec::new();
         loop {
@@ -83,7 +83,7 @@ impl Journal {
                     path.display()
                 )
             })?;
-            let due = events.len() as u64 + 1;
+            let due = head + 1;
             if ev.seq != due {
                 bail!(
                     "{}: the line at byte {end} has seq {} where {due} is due",
@@ -92,16 +92,16 @@ impl Journal {
                 );
             }
             end += n as u64;
-            events.push(ev);
+            head = ev.seq;
+            visit(ev);
         }
-        let journal = Journal {
+        Ok(Journal {
             file,
             end,
-            head: events.len() as u64,
+            head,
             #[cfg(any(test, debug_assertions))]
             fail_at: fail_at_from_env(),
-        };
-        Ok((journal, events))
+        })
     }
 
     /// Writes `body` as the next event with one `write(2)`. Only a complete write
@@ -267,6 +267,12 @@ mod tests {
         facts
     }
 
+    fn open_events(path: &Path) -> Result<(Journal, Vec<JournalEvent>)> {
+        let mut events = Vec::new();
+        let journal = Journal::open(path, |ev| events.push(ev))?;
+        Ok((journal, events))
+    }
+
     fn fold(events: &[JournalEvent]) -> Facts {
         let mut f = Facts::default();
         for ev in events {
@@ -278,7 +284,7 @@ mod tests {
     #[test]
     fn append_and_reload_round_trip() {
         let path = fresh_dir("round").join("s.jsonl");
-        let (mut j, events) = Journal::open(&path).unwrap();
+        let (mut j, events) = open_events(&path).unwrap();
         assert!(events.is_empty());
         assert_eq!(j.len(), 0);
         let notice = EventBody::Notice {
@@ -300,7 +306,7 @@ mod tests {
         let expected: Vec<u8> = written.iter().flat_map(line::encode).collect();
         assert_eq!(fs::read(&path).unwrap(), expected);
 
-        let (j, events) = Journal::open(&path).unwrap();
+        let (j, events) = open_events(&path).unwrap();
         assert_eq!(events, written);
         assert_eq!(j.len(), 5);
     }
@@ -328,7 +334,7 @@ mod tests {
     fn a_torn_final_line_is_truncated_and_logged() {
         let _torn = crate::lock(&TORN_WARN);
         let path = fresh_dir("torn").join("s.jsonl");
-        let (mut j, _) = Journal::open(&path).unwrap();
+        let mut j = Journal::open(&path, drop).unwrap();
         write_all(&mut j, &[spawn(), session()]);
         drop(j);
         let good = fs::read(&path).unwrap();
@@ -345,7 +351,7 @@ mod tests {
             })
             .finish();
         let (mut j, events) =
-            tracing::subscriber::with_default(subscriber, || Journal::open(&path)).unwrap();
+            tracing::subscriber::with_default(subscriber, || open_events(&path)).unwrap();
         let logged = String::from_utf8(crate::lock(&logs.0).clone()).unwrap();
         assert!(logged.contains("torn journal tail"), "{logged}");
         assert_eq!(events.len(), 2);
@@ -354,7 +360,7 @@ mod tests {
 
         let ev = j.append(&prompt(), 3).unwrap();
         assert_eq!(ev.seq, 3);
-        let (_, events) = Journal::open(&path).unwrap();
+        let (_, events) = open_events(&path).unwrap();
         assert_eq!(events.last(), Some(&ev));
     }
 
@@ -376,7 +382,7 @@ mod tests {
         for (name, content) in cases {
             let path = dir.join(format!("{name}.jsonl"));
             fs::write(&path, &content).unwrap();
-            assert!(Journal::open(&path).is_err(), "{name} loaded");
+            assert!(Journal::open(&path, drop).is_err(), "{name} loaded");
             assert_eq!(
                 fs::read_to_string(&path).unwrap(),
                 content,
@@ -388,7 +394,7 @@ mod tests {
     #[test]
     fn a_write_fault_truncates_and_reuses_no_seq() {
         let path = fresh_dir("fault").join("s.jsonl");
-        let (mut j, _) = Journal::open(&path).unwrap();
+        let mut j = Journal::open(&path, drop).unwrap();
         let mut live = write_all(&mut j, &[spawn(), session()]);
         let before = fs::read(&path).unwrap();
 
@@ -410,7 +416,7 @@ mod tests {
         }
         assert_eq!(seqs, [1, 2, 3, 4]);
 
-        let (j, events) = Journal::open(&path).unwrap();
+        let (j, events) = open_events(&path).unwrap();
         assert_eq!(j.len(), 4);
         assert_eq!(events[2].body, prompt());
         assert_eq!(
@@ -424,7 +430,7 @@ mod tests {
     fn bytes_left_by_a_failed_truncation_heal() {
         let _torn = crate::lock(&TORN_WARN);
         let path = fresh_dir("heal").join("s.jsonl");
-        let (mut j, _) = Journal::open(&path).unwrap();
+        let mut j = Journal::open(&path, drop).unwrap();
         write_all(&mut j, &[spawn()]);
         let end = fs::metadata(&path).unwrap().len();
         let junk = br#"{"seq":2,"ts":2,"e":"update","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"#;
@@ -441,7 +447,7 @@ mod tests {
             "junk is left after the line"
         );
         drop(j);
-        let (j, events) = Journal::open(&path).unwrap();
+        let (j, events) = open_events(&path).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1], ev2);
         assert_eq!(fs::metadata(&path).unwrap().len(), j.end);
@@ -477,7 +483,7 @@ mod tests {
 
     /// Opens the journal at `path`, folds it and normalises it at ts 99.
     fn load(path: &Path) -> (Journal, Facts, Result<Vec<JournalEvent>, WriteFault>) {
-        let (mut j, events) = Journal::open(path).unwrap();
+        let (mut j, events) = open_events(path).unwrap();
         let mut facts = fold(&events);
         let res = j.normalise(&mut facts, 99);
         (j, facts, res)
@@ -486,7 +492,7 @@ mod tests {
     #[test]
     fn normalisation_appends_exactly_the_death_invariant() {
         let path = fresh_dir("norm").join("s.jsonl");
-        let (mut j, _) = Journal::open(&path).unwrap();
+        let mut j = Journal::open(&path, drop).unwrap();
         write_all(&mut j, &mid_turn());
         drop(j);
         let before = fs::read(&path).unwrap();
@@ -526,7 +532,7 @@ mod tests {
     #[test]
     fn normalisation_ends_a_setup() {
         let path = fresh_dir("norm-setup").join("s.jsonl");
-        let (mut j, _) = Journal::open(&path).unwrap();
+        let mut j = Journal::open(&path, drop).unwrap();
         write_all(&mut j, &[spawn()]);
         drop(j);
         let (_, facts, res) = load(&path);
@@ -561,7 +567,7 @@ mod tests {
             ("auth", vec![spawn(), auth_wait]),
         ] {
             let path = fresh_dir(&format!("norm-{name}")).join("s.jsonl");
-            let (mut j, _) = Journal::open(&path).unwrap();
+            let mut j = Journal::open(&path, drop).unwrap();
             write_all(&mut j, &bodies);
             drop(j);
             let (_, _, res) = load(&path);
@@ -595,7 +601,7 @@ mod tests {
             ("ended", vec![spawn(), session(), exited]),
         ] {
             let path = fresh_dir(&format!("alone-{name}")).join("s.jsonl");
-            let (mut j, _) = Journal::open(&path).unwrap();
+            let mut j = Journal::open(&path, drop).unwrap();
             write_all(&mut j, &bodies);
             drop(j);
             let before = fs::read(&path).unwrap();
@@ -608,19 +614,19 @@ mod tests {
     #[test]
     fn a_fault_during_normalisation_folds_what_was_written_and_a_retry_completes() {
         let path = fresh_dir("norm-fault").join("s.jsonl");
-        let (mut j, _) = Journal::open(&path).unwrap();
+        let mut j = Journal::open(&path, drop).unwrap();
         write_all(&mut j, &mid_turn());
         drop(j);
         let before = fs::read(&path).unwrap();
 
-        let (mut j, events) = Journal::open(&path).unwrap();
+        let (mut j, events) = open_events(&path).unwrap();
         let mut facts = fold(&events);
         j.fail_at = Some(7);
         assert!(j.normalise(&mut facts, 99).is_err());
         assert_eq!(facts.head_seq, 6);
         assert_eq!(facts.pending.iter().map(|p| p.req).collect::<Vec<_>>(), [5]);
         assert!(facts.running);
-        let (_, on_disk) = Journal::open(&path).unwrap();
+        let (_, on_disk) = open_events(&path).unwrap();
         assert_eq!(fold(&on_disk), facts, "the facts are the fold of the disk");
 
         let retried = j.normalise(&mut facts, 99).unwrap();
@@ -636,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn sync_reaches_the_disk_off_the_caller() {
         let path = fresh_dir("sync").join("s.jsonl");
-        let (mut j, _) = Journal::open(&path).unwrap();
+        let mut j = Journal::open(&path, drop).unwrap();
         write_all(&mut j, &[spawn()]);
         j.sync().await.unwrap().unwrap();
     }
