@@ -793,7 +793,7 @@ interface ClipItems { v: 1; cards: CopiedCard[]; strokes: Stroke[]; shapes: Shap
 interface EdwinBuffer {
   id: string; name: string; text: string; mode: string;
   pt: number; mark: number | null; markActive: boolean;
-  rope: { length: number; slice(from: number, to: number): string };
+  rope: { length: number; slice(from: number, to: number): string; lastIndexOf(needle: string, from?: number): number };
   undo: unknown[]; redo: unknown[]; pendingUndo: unknown;
   shared: boolean; sver: number; ver: number; modified: boolean;
   meta: { anchors?: PageAnchor[]; [k: string]: unknown };
@@ -803,7 +803,7 @@ interface EdwinBuffer {
 interface EdwinWindow { buffer: EdwinBuffer; view: HTMLElement; start: number }
 /* An Edwin frame mounted in a page card (contentWindow and src are never set: they tell it from an iframe). */
 interface EdwinFrame {
-  buffer: EdwinBuffer; focused: boolean; root: HTMLElement; wroot: unknown;
+  buffer: EdwinBuffer; focused: boolean; root: HTMLElement; wroot: unknown; sel: EdwinWindow;
   destroy(): void; point(): number; setPoint(p: number): void; lineTop(pos: number): number | null;
   posFromPoint(x: number, y: number): number | null;
   focus(): void; blur(): void;
@@ -839,8 +839,15 @@ interface EdwinApi {
   setLeaderKey(name: string): void;
   onFrameEvent(fn: (...args: any[]) => void): void; // any: frame events carry per-event payloads
   withFrame<R>(f: EdwinFrame, fn: () => R): R;
+  runCallback<R>(fn: () => R): R | undefined;
   applyOps(b: EdwinBuffer, ops: unknown[], origin: string): void;
+  // Optional on a host serving an older Edwin. Workbench never mutates Edwin's fold cache.
+  setBufferFolds?(b: EdwinBuffer, ranges: { s: number; e: number }[]): void;
+  getBufferFolds?(b: EdwinBuffer): { s: number; e: number }[];
   leaves(root: unknown): EdwinWindow[];
+  vLineNo(buf: EdwinBuffer, position: number): number;
+  vLineStart(buf: EdwinBuffer, shownLine: number): number;
+  windowRows(w: EdwinWindow): number;
   selectFrame(f: EdwinFrame): void;
   selectWindow(w: EdwinWindow): void;
   windowAt(x: number, y: number): EdwinWindow | null;
