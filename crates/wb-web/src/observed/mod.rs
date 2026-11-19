@@ -223,18 +223,22 @@ fn de_metadata<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Err
         .map(str::to_owned))
 }
 
-fn read_task(value: Value) -> Result<Option<String>, &'static str> {
+/// Ignore a malformed field; only a valid empty string can clear the stored reference.
+fn read_task(value: Value) -> Option<Option<String>> {
     let Value::String(task) = value else {
-        return Err("task must be a string");
+        return None;
     };
-    Ok(match normalize_task(&task)? {
+    if task.len() > OBS_TEXT_MAX {
+        return None;
+    }
+    Some(match normalize_task(&task).ok()? {
         Some(text) if text.len() == task.len() => Some(task),
         trimmed => trimmed.map(str::to_owned),
     })
 }
 
 fn de_task<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    Ok(read_task(Value::deserialize(d)?).ok().flatten())
+    Ok(read_task(Value::deserialize(d)?).flatten())
 }
 
 /// `State` by its §3.4.6 name; wb-proto only serialises it.
@@ -372,7 +376,7 @@ fn id_of(key: &str) -> String {
     format!("o_{hex}")
 }
 
-/// The envelope fields of an event; a malformed task refuses the whole event.
+/// The optional envelope metadata of an event.
 struct Envelope {
     at: u64,
     wb_session: Option<String>,
@@ -390,14 +394,10 @@ struct Envelope {
 }
 
 impl Envelope {
-    fn read(body: &mut Map<String, Value>, now_ms: u64) -> Result<Envelope, &'static str> {
-        let task = body
-            .remove("task")
-            .filter(|v| !v.is_null())
-            .map(read_task)
-            .transpose()?;
+    fn read(body: &mut Map<String, Value>, now_ms: u64) -> Self {
+        let task = body.remove("task").and_then(read_task);
         let str_of = |k: &str| body.get(k).and_then(Value::as_str);
-        Ok(Envelope {
+        Self {
             // Never later than this clock: a sender cannot date its records ahead of
             // the others'.
             at: body
@@ -435,7 +435,7 @@ impl Envelope {
             branch: str_of("branch")
                 .filter(|s| s.len() <= OBS_TEXT_MAX)
                 .map(str::to_owned),
-        })
+        }
     }
 }
 
@@ -870,7 +870,7 @@ impl Registry {
         let Value::Object(mut body) = event else {
             return Err("bad event".into());
         };
-        let env = Envelope::read(&mut body, now_ms)?;
+        let env = Envelope::read(&mut body, now_ms);
         let harness = match body.get("harness").and_then(Value::as_str) {
             Some(h) if valid_harness(h) => h,
             _ => return Err("bad harness".into()),

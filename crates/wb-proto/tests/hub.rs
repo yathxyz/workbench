@@ -817,8 +817,23 @@ fn task_reference_bounds_and_normalization() {
     assert_eq!(normalize_task(&padded), Ok(Some(full.as_str())));
     assert!(normalize_task(&format!("{full}a")).is_err());
     assert_eq!(normalize_task(" \u{2003} "), Ok(None));
-    for b in (0..=0x1f).chain([0x7f]) {
-        assert!(normalize_task(&format!("task{}", char::from(b))).is_err());
+    assert_eq!(normalize_task(" مهمة 44 "), Ok(Some("مهمة 44")));
+    for c in [
+        '\0'..='\u{1f}',
+        '\u{7f}'..='\u{9f}',
+        '\u{061c}'..='\u{061c}',
+        '\u{200e}'..='\u{200f}',
+        '\u{2028}'..='\u{202e}',
+        '\u{2066}'..='\u{2069}',
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(
+            normalize_task(&format!("task{c}")).is_err(),
+            "U+{:04X}",
+            c as u32
+        );
     }
 }
 

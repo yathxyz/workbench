@@ -710,6 +710,7 @@ async fn invalid_task_references_do_not_reach_the_hub() {
         json!("é".repeat(257)),
         json!("\nissue 44"),
         json!("issue\u{7f}44"),
+        json!("https://example.test/\u{202e}44"),
     ] {
         for (path, body) in [
             (

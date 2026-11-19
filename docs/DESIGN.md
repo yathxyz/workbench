@@ -338,7 +338,10 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 **`SpawnAcp`** = `{agent, cwd: absolute existing directory, config?: ConfigOption[], task?: string}`.
 - **`ConfigValue`** is a JSON string or boolean, never a number, null, array or object. **`ConfigOption`** = `{id: string, value: ConfigValue}`. The optional `config` array is ordered: at most 16 entries, with distinct ids. The hub rejects an invalid batch with `bad_request` before spawning. Absent or empty `config` preserves the old asynchronous open behaviour; serializers omit the empty array.
 - **`ConfigError`** = `{id: string, value: ConfigValue, code: ErrorCode, error: string}`. `AcpOpenReply.configErrors` reports failed entries in input order, retaining their requested values and a required hub error code. It is omitted when empty and defaults to an empty array when absent. These errors belong only to the initiating open reply, not to the session facts or later attaches.
-- **`task`** is a free-text reference (F-A51): reject any C0 control or DEL, trim surrounding whitespace, then reject more than `TASK_MAX` UTF-8 bytes. An empty result means no task; invalid input returns `bad_request`, never a truncated value. A spawn task applies only to a new session.
+- **`task`** is a free-text reference (F-A51): reject Unicode control characters, line and paragraph separators (U+2028 and U+2029), and bidirectional controls (U+061C, U+200E, U+200F, U+202A–U+202E and U+2066–U+2069) anywhere in the input.
+  Trim surrounding whitespace, then reject more than `TASK_MAX` UTF-8 bytes; an empty result means no task.
+  Invalid input returns `bad_request`, never a truncated value.
+  A spawn task applies only to a new session; failure to journal it leaves no session or files and the sid can be reused.
 
 **`pty.open` rules.** Principle: **a request without `spawn` never starts a process**.
 - **Alive:** attach, whether or not `spawn` is present. An alive session is never respawned.
@@ -387,7 +390,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `ACP_CONFIG_MAX` | 16 initial configuration entries, with distinct ids | hub `bad_request`; API 400 "bad body", before spawn |
 | `ACP_CONFIG_OPTIONS_MAX` | 64 options in an agent's full offering | a larger list is malformed |
 | `ACP_CONFIG_OPTIONS_BYTES` | 64 KiB of compact serialized UTF-8 JSON for the full offering | a larger list is malformed; oversized legacy journal offerings fold to none (§3.4.5) |
-| `TASK_MAX` | 512 UTF-8 bytes after trimming | hub `bad_request`; API 400 without applying the change |
+| `TASK_MAX` | 512 UTF-8 bytes after trimming | ACP: hub `bad_request`, API 400; harness report: ignore the field, keep the stored task |
 | `VT_SCROLLBACK` | 1000 lines | |
 | `SNAPSHOT_MAX` | 4 MiB | halve the scrollback budget until it fits |
 | `ESC_HOLDBACK_MAX` | 4 KiB | flush the held tail as is |
@@ -1134,7 +1137,9 @@ An observed session is what the harnesses report about one agent session: a reco
 - `harness` matches `^[a-z0-9-]{1,32}$`. Every other field but `payload` is optional and may be `null`; unknown fields are ignored.
 - `at` is the sender's wall clock in ms; absent, or later than the server's, it is the server's.
 - `wbSession` is the sender's `$WB_SESSION`, kept only when it is a sid (`^[A-Za-z0-9_-]{1,64}$`): the agent runs under the hub as that session.
-- `task` is an optional task reference with the same validation as `SpawnAcp.task`. A string replaces the previous task; an empty trimmed string clears it. Absent or null leaves the task unchanged. An invalid value is 400 with no registry changes.
+- `task` is an optional task reference with the same validation as `SpawnAcp.task` and the envelope's 2,048-byte string limit before trimming.
+  A valid string replaces the previous task; an empty trimmed string clears it.
+  An absent, null or invalid value leaves the task unchanged; the rest of the report is processed.
 - `attach` is `{kind:"claude", id}` with `id` matching `^[0-9a-f]{8}$`, or `{kind:"tmux", socket, pane}` with `socket` matching `^/[A-Za-z0-9._/-]{1,200}$`, containing no `..`, and integer `pane` in `0..999999`. No extra fields. Malformed values count as absent; like `wbSession`, an absent, null or malformed value leaves the previous valid value intact, and a later valid value replaces it. For example, `{"kind":"tmux","socket":"/tmp/tmux-1000/default","pane":7}`.
 - `pid` and `pidStart` name the harness process: its pid and field 22 of its `/proc/<pid>/stat`. `projectRoot` is the nearest directory at or above the session's cwd that holds `.git`.
 - `repoRoot`, `repo`, `worktree` and `branch` are optional strings or `null`, derived by the reporter **on the session's host** by the rule below, never typed by the user. The four fields are one replacement set: an event containing **any** of these keys, with any value including `null`, MUST replace all four stored fields. A string of at most 2,048 UTF-8 bytes is stored; a null, absent, wrong-type or oversized value becomes null. An event containing **none** of these keys MUST leave all four unchanged, so reporters that have not been updated retain the old behavior. `projectRoot` keeps its existing retain-when-absent semantics. They are display metadata, not paths for the server to open or addresses from which to fetch.
@@ -1470,7 +1475,9 @@ A fourth rule is a convention, not checked: **K4**, reuse a key across layers wh
 **Where keys live.** `web/keys.ts` is a module with no DOM: keymaps, interiors, transients, `resolve(ctx, key)`, `leaderResolve`, `whereIs` (the palette's labels), `rows` (which-key) and `check()`. `app.js` keeps one capture keydown listener that computes the context (`keyContext()`), walks `resolve` and runs the command in `KC`. A `cmd()` entry whose keys begin with `@` shows the keys bound to that command, so the palette, which-key and the bindings cannot disagree. New keys (desks included) are rows in `keys.js`; a pull request that adds one runs the checker.
 
 Agents is reached by Alt-8 or the palette's Agents view command. Its list keys apply only while the keyboard is outside a composer, terminal or Edwin frame: Enter focuses the selected live control, the composer for ACP. Shift-Tab from the composer (past any request controls) can reach the transcript frame in the browser's tab order. Escape from the composer returns to the list; leader then Escape leaves the transcript frame for the list, while plain `j`/`k`, Enter and Escape inside the frame belong to Edwin. When Edwin is ready, the composer button or `C-c C-e` in either the composer or transcript frame opens a local unsaved prompt buffer; `C-c C-c` sends and `C-c C-k` restores its current text unsent, without a page file or canvas card.
-In the Agents list, `g` toggles grouping of root rows between repository (default) and task, keeping descendants with their parent and roots without a task in one last group in task mode (F-A51). Like the Details disclosure, grouping is local to this page and resets on reload.
+In the Agents list, `g` toggles grouping of root rows between repository (default) and task, keeping descendants with their parent and roots without a task in one last group in task mode (F-A51).
+In task groups, each root row shows its repository, and a nested row shows its repository when it differs from its parent's.
+Like the Details disclosure, grouping is local to this page and resets on reload.
 
 ---
 

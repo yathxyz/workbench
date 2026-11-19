@@ -404,8 +404,13 @@ pub fn normalize_task(raw: &str) -> Result<Option<&str>, &'static str> {
     if task.len() > crate::limits::TASK_MAX {
         return Err("task too long");
     }
-    if raw.bytes().any(|b| b.is_ascii_control()) {
-        return Err("control character in task");
+    // Inspect the original input: trimming must not hide a trailing newline or separator.
+    if raw.chars().any(|c| {
+        c.is_control()
+            || matches!(c, '\u{2028}' | '\u{2029}' | '\u{061c}' | '\u{200e}' | '\u{200f}'
+                | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    }) {
+        return Err("control character or line separator in task");
     }
     Ok((!task.is_empty()).then_some(task))
 }

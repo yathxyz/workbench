@@ -799,8 +799,7 @@ impl Acp {
         }
         match self.phase {
             Phase::Forget => {
-                let (dir, sid) = (self.ctx.acp_dir.clone(), self.sid.clone());
-                if let Ok(Err(e)) = tokio::task::spawn_blocking(move || delete(&dir, &sid)).await {
+                if let Err(e) = self.delete_files().await {
                     warn!("deleting the session's files: {e}");
                 }
                 let viewers = take_viewers(&self.shared);
@@ -864,6 +863,13 @@ impl Acp {
         self.ctx.acp_dir.join(format!("{}.{ext}", self.sid))
     }
 
+    async fn delete_files(&self) -> io::Result<()> {
+        let (dir, sid) = (self.ctx.acp_dir.clone(), self.sid.clone());
+        tokio::task::spawn_blocking(move || delete(&dir, &sid))
+            .await
+            .map_err(io::Error::other)?
+    }
+
     /// Creates the session of a new sid: its record and journal, then the agent. A
     /// failed spawn is journaled, and the session stays.
     async fn create(&mut self, mut o: Open) {
@@ -919,12 +925,18 @@ impl Acp {
         }
         if let Some(task) = spawn.task {
             self.quiet = true;
-            let recorded = self.record(EventBody::Task { task: Some(task) });
-            self.quiet = false;
-            if !recorded {
-                self.publish();
-                return o.reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
+            if !self.record(EventBody::Task { task: Some(task) }) {
+                // Nothing has been published. Keep the sid reserved until its files
+                // are gone, so cleanup cannot delete a racing retry's journal.
+                self.journal = None;
+                if let Err(e) = self.delete_files().await {
+                    let msg = format!("deleting the session's files: {e}");
+                    warn!("{msg}");
+                    return self.abandon(o.reply, ErrorCode::Internal, msg);
+                }
+                return self.abandon(o.reply, ErrorCode::Faulted, JOURNAL_FAILED.into());
             }
+            self.quiet = false;
         }
         if spawn.config.is_empty() {
             let _ = self.spawn(SpawnVia::New);
@@ -958,12 +970,12 @@ impl Acp {
         Ok(())
     }
 
-    /// Answers the open that would have created this session and removes it again.
+    /// Releases the unpublished sid before answering the open that would have created it.
     fn abandon(&mut self, reply: Reply, code: ErrorCode, message: String) {
-        reply.err(code, message);
         if self.ctx.registry.abandon(&self.sid, self.created_at) {
             self.phase = Phase::Abandoned;
         }
+        reply.err(code, message);
     }
 
     /// Starts the agent and sends `initialize`. A failure is journaled as

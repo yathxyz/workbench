@@ -4384,7 +4384,7 @@ function toggleDockTerm() {
 // Observed sessions from /rpc: observed replaces, observed_put upserts, observed_gone deletes.
 const OBS: Record<string, ObservedSession> = {};
 const MESH: { open: string | null; ended: boolean; facts: boolean; collapsed: Set<string>; graph: string; topo: string; t: number } = { open: null, ended: false, facts: false, collapsed: new Set(), graph: '', topo: '', t: 0 };
-const MESH_ROWS = new Map<string, HTMLElement>(), MESH_GROUPS = new Map<string, HTMLElement>();
+const MESH_ROWS = new Map<string, HTMLElement>(), MESH_GROUPS = new Map<string | null, HTMLElement>();
 const meshByTask = $<HTMLInputElement>('#mesh-by-task')!;
 const MESH_PANE: { row: string | null; hubKey: string; actions: string; node: TermNode | AcpNode | null; attach: string; committed: boolean; terminal: boolean; rows: string[] } =
   { row: null, hubKey: '', actions: '', node: null, attach: '', committed: false, terminal: false, rows: [] };
@@ -4483,7 +4483,7 @@ function meshRowEl(r: MeshRow): HTMLElement {
   return row;
 }
 // A row's texts, set in place: a row under the pointer is not replaced while its session works.
-function meshFill(row: HTMLElement, r: MeshRow, depth: number, groupRepo: string | undefined, visible: Set<string>): void {
+function meshFill(row: HTMLElement, r: MeshRow, depth: number, showRepo: boolean, visible: Set<string>): void {
   row.className = 'mesh-row' + (r.live ? '' : ' ended') + (meshBad(r) ? ' bad' : '') + (r.id === MESH.open ? ' on' : '');
   row.style.setProperty('--d', String(depth)); row.dataset.depth = String(depth); row.dataset.card = r.card?.id || '';
   row.setAttribute('aria-current', r.id === MESH.open ? 'true' : 'false');
@@ -4495,7 +4495,7 @@ function meshFill(row: HTMLElement, r: MeshRow, depth: number, groupRepo: string
   set('.mesh-harness', meshShort(harness)).title = harness; set('.mesh-model', model ? meshShort(model) + ' · ' : '').title = model;
   set('.mesh-doing', [...(depth ? [] : ['@' + r.host]), meshDoing(r)].join(' · '));
   const worktree = r.worktree?.replace(/\/+$/, '').split('/').pop() || '', branch = r.branch && r.branch !== r.worktree ? r.branch : '';
-  set('.mesh-repo', depth && r.repo !== groupRepo ? meshShort(r.repo) + ' · ' : '').title = r.repo;
+  set('.mesh-repo', showRepo ? meshShort(r.repo) + ' · ' : '').title = r.repo;
   set('.mesh-worktree', worktree ? meshShort(worktree) + ' · ' : '').title = r.worktree || '';
   set('.mesh-branch', branch ? meshShort(branch) + ' · ' : '').title = r.branch || '';
   const toggle = $('.mesh-collapse', row) as HTMLButtonElement, collapsed = MESH.collapsed.has(r.id), descendants = meshFlat(r.kids).filter(k => MESH.ended || k.live || k.id === MESH.open);
@@ -4709,7 +4709,7 @@ function meshRender(commit = false): void {
   if (!box || VIEW !== 'agents') return;
   if (!document.body.classList.contains('pane-drag')) setMeshW(S.meshW);
   const shown = (r: MeshRow): boolean => MESH.ended || r.live || r.id === MESH.open;
-  const all = meshRows(), flat = meshFlat(all), waiting = new Map<string, boolean>(), groups = new Map<string, MeshRow[]>();
+  const all = meshRows(), flat = meshFlat(all), waiting = new Map<string, boolean>(), groups = new Map<string | null, MeshRow[]>();
   const waits = (r: MeshRow): boolean => {
     const cached = waiting.get(r.id); if (cached != null) return cached;
     const value = meshBad(r) || r.kids.some(waits); waiting.set(r.id, value); return value;
@@ -4718,15 +4718,16 @@ function meshRender(commit = false): void {
   const order = (a: MeshRow, b: MeshRow) => rank(a) - rank(b) || b.since - a.since || a.id.localeCompare(b.id);
   const byTask = meshByTask.checked;
   for (const r of all.filter(shown).sort((a, b) => (byTask ? Number(!a.task) - Number(!b.task) : 0) || order(a, b))) {
-    const key = byTask ? r.task || '' : r.repo, group = groups.get(key);
+    const key = byTask ? r.task : r.repo, group = groups.get(key);
     if (group) group.push(r); else groups.set(key, [r]);
   }
-  const lines: { r: MeshRow; d: number; head?: string; groupRepo?: string }[] = [];
-  const walk = (r: MeshRow, d: number, head?: string, groupRepo = r.repo) => {
-    lines.push({ r, d, head, groupRepo });
-    if (!MESH.collapsed.has(r.id)) r.kids.filter(shown).sort(order).forEach(k => walk(k, d + 1, undefined, groupRepo));
+  const lines: { r: MeshRow; d: number; showRepo: boolean; head?: string | null }[] = [];
+  // A repository heading supplies context throughout its tree; in task mode only the immediate parent does.
+  const walk = (r: MeshRow, d: number, contextRepo: string | null, head?: string | null) => {
+    lines.push({ r, d, showRepo: r.repo !== contextRepo && (!byTask || !!r.repo), head });
+    if (!MESH.collapsed.has(r.id)) r.kids.filter(shown).sort(order).forEach(k => walk(k, d + 1, byTask ? r.repo : contextRepo));
   };
-  for (const [name, rows] of groups) rows.forEach((r, i) => walk(r, 0, i ? undefined : name));
+  for (const [name, rows] of groups) rows.forEach((r, i) => walk(r, 0, byTask ? null : r.repo, i ? undefined : name));
   MESH_PANE.rows = lines.map(l => l.r.id);
   const visible = new Set(MESH_PANE.rows), present = new Set(flat.map(r => r.id));
   if (!MESH.open || !visible.has(MESH.open)) MESH.open = lines[0]?.r.id || null;
@@ -4735,8 +4736,8 @@ function meshRender(commit = false): void {
   // Reconcile by id even when shape/order/actions change: activity never replaces an existing row.
   const elements: HTMLElement[] = [];
   for (const l of lines) {
-    if (l.head != null) {
-      let group = MESH_GROUPS.get(l.head); if (!group) { const label = l.head || 'No task'; group = el('div', 'mesh-group', label); group.title = label; MESH_GROUPS.set(l.head, group); }
+    if (l.head !== undefined) {
+      let group = MESH_GROUPS.get(l.head); if (!group) { const label = l.head ?? 'No task'; group = el('div', 'mesh-group', label); group.title = label; MESH_GROUPS.set(l.head, group); }
       elements.push(group);
     }
     let row = MESH_ROWS.get(l.r.id); if (!row) { row = meshRowEl(l.r); MESH_ROWS.set(l.r.id, row); }
@@ -4756,7 +4757,7 @@ function meshRender(commit = false): void {
     meshHeader(selected);
     meshInfo($('#mesh-detail .mesh-info')!, selected);
   } else { meshClose(); $('#mesh-detail')!.replaceChildren(el('p', 'muted', 'Select a session.')); $('#v-agents')!.classList.remove('detail-open'); }
-  lines.forEach(l => meshFill(MESH_ROWS.get(l.r.id)!, l.r, l.d, l.groupRepo, visible));
+  lines.forEach(l => meshFill(MESH_ROWS.get(l.r.id)!, l.r, l.d, l.showRepo, visible));
 }
 // Open the Agents view, selecting the named session without adding a card.
 function meshOpen(id?: string | null): void {
@@ -4774,7 +4775,7 @@ function graphMesh(): void {
 // A session in a few lines, for its card in the graph.
 function meshText(r: MeshRow): string { const o = r.obs; return [meshDoing(r), o?.cwd || r.sess?.cwd, o?.lastPrompt && '› ' + o.lastPrompt, ...(o?.tail.slice(-5).map(t => hhmm(t.at) + ' ' + t.kind.replace(/_/g, ' ') + (t.text ? ' ' + t.text : '')) || [])].filter(Boolean).join('\n'); }
 $('#mesh-ended')!.onchange = e => { MESH.ended = (e.target as HTMLInputElement).checked; meshRender(); };
-meshByTask.onchange = () => meshRender();
+meshByTask.onchange = () => { MESH_GROUPS.clear(); meshRender(); };
 setInterval(() => meshRender(), 30000);   // the ages
 cmd('Agents: every session', () => meshOpen(), '@view.agents');
 

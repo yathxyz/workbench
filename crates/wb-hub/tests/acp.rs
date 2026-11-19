@@ -2266,6 +2266,23 @@ fn set_task(c: &mut Client, sid: &str, task: Value) -> Value {
 }
 
 #[test]
+fn hub_set_task_refuses_an_absent_sid() {
+    let hub = Hub::start();
+    let mut c = hub.connect();
+    let reply = set_task(&mut c, "missing", json!("work"));
+    assert_eq!(reply["code"], "not_found");
+}
+
+#[test]
+fn hub_set_task_refuses_a_pty_session() {
+    let hub = Hub::start();
+    let mut c = hub.connect();
+    c.spawn("p1", &["sleep", "1000"]);
+    let reply = set_task(&mut c, "p1", json!("work"));
+    assert_eq!(reply["code"], "kind_mismatch");
+}
+
+#[test]
 fn hub_validates_task_before_creation_or_mutation() {
     let hub = Hub::with_scenarios(&["basic"]);
     let mut c = hub.connect();
@@ -2358,15 +2375,21 @@ fn hub_initial_task_write_fault_refuses_creation_before_starting_the_agent() {
         &[("WB_HUB_TEST_FAIL_WRITE_AT", "1")],
     );
     let mut c = hub.connect();
-    let reply = c.request(json!({"t": "acp.open", "sid": "a1", "since": 0,
+    let open = json!({"t": "acp.open", "sid": "a1", "since": 0,
         "spawn": {"agent": "basic", "cwd": hub.home(), "task": "work",
-                  "config": [{"id": "model", "value": "large"}]}}));
+                  "config": [{"id": "model", "value": "large"}]}});
+    let reply = c.request(open.clone());
+    assert_eq!(reply["t"], "err");
     assert_eq!(reply["code"], "faulted");
-    let summary = c.summary("a1");
-    assert_eq!(summary["fault"]["code"], "journal_write");
-    assert!(summary["acp"].get("task").is_none());
-    assert!(hub.kinds("a1").is_empty());
-    assert!(hub.received("basic").is_empty());
+    assert!(fs::read_dir(hub.acp_file("")).unwrap().next().is_none());
+    assert!(hub.record("basic").is_empty());
+    assert_eq!(c.ok(json!({"t": "list"}))["sessions"], json!([]));
+    assert_eq!(c.acp_open("a1", 0)["code"], "not_found");
+
+    let retried = c.ok(open);
+    assert_eq!(retried["new"], true);
+    assert_eq!(retried["summary"]["acp"]["task"], "work");
+    c.event("a1", "session");
 }
 
 #[cfg(debug_assertions)]

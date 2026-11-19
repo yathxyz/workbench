@@ -817,13 +817,11 @@ fn task_is_replaced_only_by_an_explicit_string() {
 }
 
 #[test]
-fn invalid_tasks_refuse_the_event_without_changing_the_registry() {
+fn invalid_tasks_preserve_the_reference_without_losing_permission_or_end_events() {
     let f = fx();
     let mut ev = claude("s1", T0, "SessionStart", json!({}));
     ev["task"] = json!("keep me");
     f.reg.ingest(HOST, ev, NOW).unwrap();
-    let before = f.reg.list();
-    f.reg.drain();
     for task in [
         json!(17),
         json!(true),
@@ -831,14 +829,22 @@ fn invalid_tasks_refuse_the_event_without_changing_the_registry() {
         json!(["a"]),
         json!("work\n"),
         json!("a\u{7f}b"),
+        json!("a\u{202e}b"),
         json!("é".repeat(257)),
+        json!(format!("{}x", " ".repeat(OBS_TEXT_MAX))),
     ] {
-        let mut ev = claude("s1", T0 + 1, "UserPromptSubmit", json!({"prompt": "new"}));
-        ev["task"] = task;
-        assert!(f.reg.ingest(HOST, ev, NOW).is_err());
+        for (hook, payload, state) in [
+            ("PermissionRequest", edit(), State::WaitingPermission),
+            ("SessionEnd", json!({}), State::Exited),
+        ] {
+            let mut ev = claude("s1", T0 + 1, hook, payload);
+            ev["task"] = task.clone();
+            f.reg.ingest(HOST, ev, NOW).unwrap();
+            let session = top(&f.reg);
+            assert_eq!(session.task.as_deref(), Some("keep me"));
+            assert_eq!(session.state, state, "{hook} with {task}");
+        }
     }
-    assert_eq!(f.reg.list(), before);
-    assert!(f.reg.drain().is_empty());
 }
 
 #[test]
