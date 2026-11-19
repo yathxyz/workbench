@@ -292,6 +292,12 @@ The error codes are a closed set:
 - **`AcpSessionInfo`:** `{protocolVersion, agentInfo, agentCapabilities, promptCapabilities, authMethods, modes, configOptions, availableCommands, plan, usage}`. It holds the latest materialised values; absent optional values are omitted. `Summary.acp.configOptions` is always present, with `null` when absent.
 - Snapshots and watch events carry complete summaries, including the full option list.
   This preserves the session summary returned by the browser and mesh HTTP APIs.
+- Live and restored summaries use the same bounds.
+  Display strings (`fault.message`, `pty.fg.comm`, ACP `title`, `last.outcome` and `last.error.message`) are cut at a UTF-8 boundary to 32 KiB each.
+  Longer `host`, `cwd` or `acp.agent` values are represented by empty strings; longer agent-session IDs, mode IDs or managed worktrees with any longer field are absent.
+  `pty.argv` contains the longest prefix of at most 256 arguments and 256 KiB of UTF-8.
+  `acp.pending` contains the oldest 4096 unresolved requests at most; this does not change which requests the hub handles or records in the journal.
+  Session records keep their operational paths and identifiers; these limits apply when making a summary, not when executing a command or resuming an agent.
 - **`Summary.acp.managedWorktree`** is present only for a recorded worktree: `{path, branch, mainRoot}`, with both paths absolute.
   This record is independent of the web's best-effort top-level git metadata (`repo`, `worktree`, `branch`).
 - **`Summary.acp.policy`:** the session's non-empty `Policy` (§3.4.5), omitted when none. It is a hub fact, not an agent config option. Optional rule `programs` is an ordinary policy field, preserved along with roots and command regexes through validation, installation, journaling and replay.
@@ -1400,7 +1406,11 @@ Server-sent events, each `event: <name>` with one line of JSON as `data`:
 | `observed_gone` | `{id, key}` | a record was dropped that a stream or a listing had shown |
 | `ready` | `{}` | once, after the snapshot |
 
-A comment line goes out every 15 s. A client that falls so far behind that events were lost is disconnected and takes a new snapshot when it reconnects. A change that lands between the subscription and the snapshot may be sent twice; both carry the same state. The stream ends when wb-web shuts down.
+A comment line goes out every 15 s.
+A client that falls so far behind that events were lost is disconnected and takes a new snapshot when it reconnects.
+On an `up` notification, the stream takes the current hub status and snapshot and starts a new subscription at the same point, dropping any queued hub deltas that the snapshot supersedes.
+An observed-session change that lands between the subscription and the initial snapshot may be sent twice.
+The stream ends when wb-web shuts down.
 
 #### 3.8.5 Remote hosts (hub)
 

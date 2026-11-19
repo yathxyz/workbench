@@ -34,8 +34,8 @@ use tokio::time::Instant;
 use tracing::{Instrument, error, info, info_span, warn};
 use wb_proto::hub::{
     AcpFacts, AcpOpenReply, AcpSessionInfo, Activity, ConfigError, ConfigOption, ErrorCode,
-    ExitReason, Fault, FaultCode, HubMessage, Kind, ManagedWorktree, PendingKind, SpawnAcp,
-    Summary,
+    ExitReason, Fault, FaultCode, HubMessage, Kind, Last, LastError, ManagedWorktree, PendingKind,
+    SpawnAcp, Summary,
 };
 use wb_proto::journal::{
     EventBody, JournalEvent, NoticeLevel, ResolvedBy, SessionVia, SetupErrorCode, SpawnVia,
@@ -55,6 +55,7 @@ use self::worktree::CreateFailure::{self, Clean, PossibleLeftover};
 use crate::conn::{ConnId, Reply, Viewer, line};
 use crate::outq::OutQ;
 use crate::registry::Route;
+use crate::snapshot::{SUMMARY_PENDING_MAX, summary_id, summary_text};
 use crate::store::write_atomic;
 use crate::{Ctx, lock, now_ms};
 
@@ -1463,43 +1464,74 @@ impl Acp {
     }
 
     /// The Summary and session info as they are now, with the last `updatedAt`.
+    /// Applies the same wire bounds to live facts and to facts restored from disk.
     fn snapshot(&self) -> (Summary, AcpSessionInfo) {
         let viewers = lock(&self.shared.viewers).len();
         let facts = &self.facts;
         let summary = Summary {
             sid: self.sid.clone(),
             kind: Kind::Acp,
-            host: self
-                .meta
-                .host
-                .as_ref()
-                .unwrap_or(&self.ctx.cfg.host)
-                .clone(),
+            host: summary_id(self.meta.host.as_deref().unwrap_or(&self.ctx.cfg.host))
+                .unwrap_or_default()
+                .to_owned(),
             created_at: self.created_at,
             updated_at: self.updated_at,
             alive: self.proc.is_some(),
             viewers: u32::try_from(viewers).unwrap_or(u32::MAX),
-            cwd: self.meta.cwd.clone(),
-            fault: self.fault.clone(),
+            cwd: summary_id(&self.meta.cwd).unwrap_or_default().to_owned(),
+            fault: self.fault.as_ref().map(|fault| Fault {
+                code: fault.code,
+                message: summary_text(&fault.message),
+            }),
             pty: None,
             acp: Some(AcpFacts {
-                agent: self.meta.agent.clone(),
-                agent_session_id: facts.agent_session_id.clone(),
+                agent: summary_id(&self.meta.agent).unwrap_or_default().to_owned(),
+                agent_session_id: facts
+                    .agent_session_id
+                    .as_deref()
+                    .and_then(summary_id)
+                    .map(str::to_owned),
                 revivable: facts.revivable(self.meta.init.as_ref()),
                 activity: if self.startup_config.is_some() {
                     Activity::Setup
                 } else {
                     facts.activity
                 },
-                pending: facts.pending.clone(),
-                last: facts.last.clone(),
+                pending: facts
+                    .pending
+                    .iter()
+                    .take(SUMMARY_PENDING_MAX)
+                    .cloned()
+                    .collect(),
+                last: facts.last.as_ref().map(|last| Last {
+                    seq: last.seq,
+                    ts: last.ts,
+                    outcome: summary_text(&last.outcome),
+                    error: last.error.as_ref().map(|error| LastError {
+                        code: error.code.clone(),
+                        message: summary_text(&error.message),
+                    }),
+                }),
                 head_seq: facts.head_seq,
                 seen_seq: self.meta.seen_seq,
-                title: facts.title.clone(),
-                mode_id: facts.mode_id.clone(),
+                title: facts.title.as_deref().map(summary_text),
+                mode_id: facts
+                    .mode_id
+                    .as_deref()
+                    .and_then(summary_id)
+                    .map(str::to_owned),
                 policy: facts.policy.clone(),
                 config_options: facts.config_options.clone(),
-                managed_worktree: self.meta.managed_worktree.clone(),
+                managed_worktree: self
+                    .meta
+                    .managed_worktree
+                    .as_ref()
+                    .filter(|wt| {
+                        [&wt.path, &wt.branch, &wt.main_root]
+                            .into_iter()
+                            .all(|field| summary_id(field).is_some())
+                    })
+                    .cloned(),
                 task: facts.task.clone(),
             }),
         };

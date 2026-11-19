@@ -6,12 +6,52 @@ use std::sync::Arc;
 use serde::Serialize;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use wb_proto::hub::{ErrorCode, HubMessage, Summary};
-use wb_proto::limits::MAX_LINE;
+use wb_proto::limits::{ACP_CONFIG_OPTIONS_BYTES, MAX_LINE, POLICY_MAX, TASK_MAX};
 use wb_proto::line::encode;
 
 const LINE_BYTES: usize = MAX_LINE + 1; // includes the newline
 const OK: &[u8] = b"],\"t\":\"ok\"}\n";
 const PAGE: &[u8] = b"],\"t\":\"sessions.page\"}\n";
+
+pub const ARGV_MAX: usize = 256;
+pub const ARGV_BYTES_MAX: usize = 256 << 10;
+pub const PENDING_TITLE_CHARS: usize = 200;
+pub const SUMMARY_PENDING_MAX: usize = 4096;
+const SUMMARY_TEXT_BYTES: usize = 32 << 10;
+
+// Budget both kinds together, although only one is present. serde_json writes a
+// string byte (or Unicode scalar for a pending title) as at most 6 escaped bytes.
+// 128 per pending request and 4 KiB elsewhere cover keys, punctuation, envelopes,
+// enums, numbers, and argv separators (3 bytes per item).
+const _: () = assert!(
+    6 * (16 * SUMMARY_TEXT_BYTES + ARGV_BYTES_MAX + TASK_MAX)
+        + SUMMARY_PENDING_MAX * (6 * PENDING_TITLE_CHARS + 128)
+        + ACP_CONFIG_OPTIONS_BYTES
+        + POLICY_MAX
+        + 4096
+        < MAX_LINE
+);
+
+/// Preserve identifiers and paths verbatim, or leave them unavailable.
+pub fn summary_id(value: &str) -> Option<&str> {
+    (value.len() <= SUMMARY_TEXT_BYTES).then_some(value)
+}
+
+/// Display text can be clipped without altering the session's stored facts.
+pub fn summary_text(value: &str) -> String {
+    value[..value.floor_char_boundary(SUMMARY_TEXT_BYTES)].to_owned()
+}
+
+pub fn summary_argv(argv: &[String]) -> Vec<String> {
+    let mut left = ARGV_BYTES_MAX;
+    argv.iter()
+        .take(ARGV_MAX)
+        .map_while(|arg| {
+            left = left.checked_sub(arg.len())?;
+            Some(arg.clone())
+        })
+        .collect()
+}
 
 pub enum SnapshotMode {
     Stream { watch: bool },

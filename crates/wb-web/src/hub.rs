@@ -280,10 +280,11 @@ struct Capture {
     reply: Reply,
 }
 
+/// Hub feed messages are published under this lock with their state changes.
 pub(crate) struct HubState {
     pub status: HubStatus,
     /// Every session the hub knows, by sid; empty while the hub is not up.
-    pub sessions: BTreeMap<String, Summary>,
+    pub sessions: BTreeMap<String, Arc<Summary>>,
 }
 
 /// The control connection's results, shared with the handlers.
@@ -301,11 +302,12 @@ impl HubHandle {
         self.state().status.clone()
     }
 
-    pub fn sessions(&self) -> Vec<Summary> {
+    /// A copy of the session handles.
+    pub fn sessions(&self) -> Vec<Arc<Summary>> {
         self.state().sessions.values().cloned().collect()
     }
 
-    pub fn snapshot(&self) -> (HubStatus, Vec<Summary>) {
+    pub fn snapshot(&self) -> (HubStatus, Vec<Arc<Summary>>) {
         let state = self.state();
         (
             state.status.clone(),
@@ -404,7 +406,7 @@ impl Control {
         loop {
             match timeout(REPLY_TIMEOUT, conn.recv_mode(true)).await {
                 Ok(Some(HubMessage::SessionsPage { rid: 1, sessions })) => {
-                    snapshot.extend(sessions.into_iter().map(|s| (s.sid.clone(), s)));
+                    snapshot.extend(sessions.into_iter().map(|s| (s.sid.clone(), Arc::new(s))));
                 }
                 Ok(Some(HubMessage::Ok { rid: 1, result })) => {
                     let Ok(SessionsReply { sessions }) =
@@ -413,7 +415,7 @@ impl Control {
                         tracing::warn!("undecodable watch reply");
                         return;
                     };
-                    snapshot.extend(sessions.into_iter().map(|s| (s.sid.clone(), s)));
+                    snapshot.extend(sessions.into_iter().map(|s| (s.sid.clone(), Arc::new(s))));
                     break;
                 }
                 Ok(Some(HubMessage::Err {
@@ -460,18 +462,23 @@ impl Control {
     fn hub_msg(&self, msg: HubMessage, pending: &mut HashMap<u64, Reply>) {
         match msg {
             HubMessage::Session { session } => {
-                self.state()
+                let session = Arc::<Summary>::from(session);
+                let mut state = self.state();
+                let old = state
                     .sessions
-                    .insert(session.sid.clone(), (*session).clone());
+                    .insert(session.sid.clone(), Arc::clone(&session));
                 let _ = self.feed.send(FeedMsg::Session(session));
+                drop(state);
+                drop(old);
             }
             HubMessage::Gone { sid, epoch } => {
+                let mut state = self.state();
+                if state
+                    .sessions
+                    .get(&sid)
+                    .is_some_and(|s| s.created_at == epoch)
                 {
-                    let mut state = self.state();
-                    let sessions = &mut state.sessions;
-                    if sessions.get(&sid).is_some_and(|s| s.created_at == epoch) {
-                        sessions.remove(&sid);
-                    }
+                    state.sessions.remove(&sid);
                 }
                 let _ = self.feed.send(FeedMsg::Gone { sid, epoch });
             }
@@ -503,15 +510,19 @@ impl Control {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn set(&self, new: HubStatus, sessions: BTreeMap<String, Summary>) {
+    fn set(&self, new: HubStatus, sessions: BTreeMap<String, Arc<Summary>>) {
         let mut state = self.state();
         let old = std::mem::replace(&mut state.sessions, sessions);
-        if state.status != new {
+        let changed = state.status != new;
+        let name = new.name();
+        if changed {
             state.status = new.clone();
-            tracing::info!(status = new.name(), "hub status");
             let _ = self.feed.send(FeedMsg::Hub(new));
         }
         drop(state);
+        if changed {
+            tracing::info!(status = name, "hub status");
+        }
         drop(old);
     }
 }

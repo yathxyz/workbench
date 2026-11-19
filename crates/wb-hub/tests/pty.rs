@@ -757,6 +757,38 @@ fn a_clean_restart_keeps_the_last_screen_in_a_hub_restart_corpse() {
 }
 
 #[test]
+fn an_oversized_restored_cwd_does_not_break_watch() {
+    let mut hub = Hub::start();
+    assert!(hub.terminate().success());
+    // The field fits in raw UTF-8, but not once the JSON control bytes are escaped.
+    let record = json!({
+        "sid": "large", "shell": "bash", "argv": ["bash"],
+        "cwd": format!("/{}", "\u{1}".repeat(MAX_LINE / 6)),
+        "env": {}, "createdAt": 1, "cols": 80, "rows": 24,
+        "exit": {"code": 0, "reason": "exited", "at": 2}
+    });
+    fs::write(
+        hub.pty_file("large.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    hub.restart();
+
+    for stream in [true, false] {
+        let reply = hub
+            .connect()
+            .request(json!({"t": "watch", "stream": stream}));
+        assert_eq!(reply["t"], "ok");
+        let [restored] = reply["sessions"].as_array().unwrap().as_slice() else {
+            panic!("expected the restored session in watch")
+        };
+        assert_eq!(restored["sid"], "large");
+        assert_eq!(restored["cwd"], "");
+        assert_eq!(restored["pty"]["exit"]["reason"], "exited");
+    }
+}
+
+#[test]
 fn a_crashed_hub_leaves_a_snapshot_at_most_30_s_stale() {
     let mut hub = Hub::start();
     let mut c = hub.connect();

@@ -3,6 +3,7 @@
 //! connection of its own, since no socket stays open between two HTTP requests.
 
 use std::io::Read as _;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
@@ -199,7 +200,7 @@ async fn list(_: Read, State(api): State<ApiState>) -> Result<Json<Value>, ApiEr
 }
 
 /// The Summary of `sid` as the control connection last heard it, or 404.
-fn summary(app: &AppState, sid: &str) -> Result<Summary, ApiError> {
+fn summary(app: &AppState, sid: &str) -> Result<Arc<Summary>, ApiError> {
     let state = app.hub.state();
     hub_ready(&state.status)?;
     state
@@ -215,7 +216,8 @@ async fn one(
     Param(id): Param<String>,
 ) -> Result<Json<Value>, ApiError> {
     let sid = sid_of(id)?;
-    Ok(Json(api.app.session_summary(&summary(&api.app, &sid)?)))
+    let summary = summary(&api.app, &sid)?;
+    Ok(Json(api.app.session_summary(&summary)))
 }
 
 #[derive(Deserialize)]
@@ -743,6 +745,7 @@ async fn kill(
     let forget = query.forget.unwrap_or(false);
     let kind = {
         let state = api.app.hub.state();
+        hub_ready(&state.status)?;
         state.sessions.get(&sid).map(|s| s.kind)
     };
     let req = match kind {

@@ -25,11 +25,8 @@ use crate::env::check_client_env;
 use crate::outq::{OutQ, Output};
 use crate::pty::{self, Cmd, Open};
 use crate::registry::SessionCmd;
+use crate::snapshot::{ARGV_BYTES_MAX, ARGV_MAX};
 
-/// Most items in `SpawnPty.argv`.
-const ARGV_MAX: usize = 256;
-/// Most bytes in all of `SpawnPty.argv`.
-const ARGV_BYTES_MAX: usize = 256 << 10;
 /// How long a connection whose client stopped sending may take to deliver the replies
 /// it still owes; a `kill{forget:true}` waits for the exit, up to about 3 s for a PTY
 /// and about 8 s for an agent.

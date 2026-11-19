@@ -6,6 +6,7 @@
 //! Paths are relative to `/api`.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
@@ -111,7 +112,7 @@ pub(crate) fn hub_ready(status: &HubStatus) -> Result<(), ApiError> {
     }
 }
 
-pub(crate) fn hub_sessions(app: &AppState) -> Result<Vec<Summary>, ApiError> {
+pub(crate) fn hub_sessions(app: &AppState) -> Result<Vec<Arc<Summary>>, ApiError> {
     let state = app.hub.state();
     hub_ready(&state.status)?;
     Ok(state.sessions.values().cloned().collect())

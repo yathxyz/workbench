@@ -34,6 +34,7 @@ use self::vt::Vt;
 use crate::conn::{ConnId, Reply, Viewer, line};
 use crate::outq::OutQ;
 use crate::registry::Route;
+use crate::snapshot::{summary_argv, summary_id, summary_text};
 use crate::store::{self, Record, Store};
 use crate::{Ctx, env, lock, now_ms, procfs};
 
@@ -1005,26 +1006,33 @@ impl Pty {
         self.store.write(&self.rec, snap);
     }
 
+    /// Uses the same wire projection for live state and restored records.
     fn publish(&mut self) {
         self.updated_at = now_ms().max(self.updated_at);
         let viewers = lock(&self.viewers).len();
         self.ctx.registry.publish(Arc::new(Summary {
             sid: self.sid.clone(),
             kind: Kind::Pty,
-            host: self.ctx.cfg.host.clone(),
+            host: summary_id(&self.ctx.cfg.host)
+                .unwrap_or_default()
+                .to_owned(),
             created_at: self.created_at,
             updated_at: self.updated_at,
             alive: self.pid.is_some(),
             viewers: u32::try_from(viewers).unwrap_or(u32::MAX),
-            cwd: self.rec.cwd.clone(),
-            fault: self.fault.clone().map(|message| Fault {
+            cwd: summary_id(&self.rec.cwd).unwrap_or_default().to_owned(),
+            fault: self.fault.as_deref().map(|message| Fault {
                 code: FaultCode::LoadFailed,
-                message,
+                message: summary_text(message),
             }),
             pty: Some(PtyFacts {
-                argv: self.rec.argv.clone(),
+                argv: summary_argv(&self.rec.argv),
                 pid: self.pid,
-                fg: self.fg.clone(),
+                fg: self.fg.as_ref().map(|fg| Fg {
+                    comm: summary_text(&fg.comm),
+                    pgid: fg.pgid,
+                    leader: fg.leader,
+                }),
                 exit: self.rec.exit.clone(),
             }),
             acp: None,

@@ -2,14 +2,12 @@
 //! at startup, so the folded journal and the live facts agree by construction.
 
 use serde_json::{Value, json};
-use wb_proto::hub::{Activity, Last, LastError, Pending, PendingKind};
+use wb_proto::hub::{Activity, Last, LastError, Pending, PendingKind, normalize_task};
 use wb_proto::journal::{EventBody, JournalEvent, ResolvedBy, SetupErrorCode, TurnErrorCode};
 use wb_proto::policy::Policy;
 
 use super::config::{valid_options, within_limits};
-
-/// `Pending.title` is cut to this many characters.
-const TITLE_MAX: usize = 200;
+use crate::snapshot::PENDING_TITLE_CHARS;
 
 /// What the journal says about a session (DESIGN §3.4.5 "Facts", 10 §7.8 "Fold").
 #[derive(Clone, Debug, PartialEq)]
@@ -134,7 +132,12 @@ impl Facts {
             }
             EventBody::Mode { mode_id } => self.set_mode(mode_id),
             EventBody::Config { config_options } => self.set_config_options(config_options),
-            EventBody::Task { task } => self.task.clone_from(task),
+            EventBody::Task { task } => {
+                self.task = task
+                    .as_deref()
+                    .and_then(|task| normalize_task(task).ok().flatten())
+                    .map(str::to_owned);
+            }
             EventBody::Policy { policy } => {
                 self.policy =
                     (policy.validate().is_ok() && !policy.rules.is_empty()).then(|| policy.clone());
@@ -277,10 +280,10 @@ fn wire<T: serde::Serialize>(code: &T) -> String {
     }
 }
 
-/// A title string cut to `TITLE_MAX` characters; empty if absent or not a string.
+/// A title cut to `PENDING_TITLE_CHARS` characters; empty if absent or not a string.
 fn cut(v: Option<&Value>) -> String {
     v.and_then(Value::as_str)
-        .map(|s| s.chars().take(TITLE_MAX).collect())
+        .map(|s| s.chars().take(PENDING_TITLE_CHARS).collect())
         .unwrap_or_default()
 }
 

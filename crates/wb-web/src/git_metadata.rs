@@ -105,8 +105,7 @@ pub async fn refresh(app: crate::AppState) {
         tokio::select! {
             () = app.stopped() => return,
             _ = tick.tick() => {
-                let state = app.hub.state();
-                for session in state.sessions.values().filter(|s| s.host == app.cfg.host) {
+                for session in app.hub.sessions().into_iter().filter(|s| s.host == app.cfg.host) {
                     if app.git_metadata.start(&session.cwd) {
                         let cwd = session.cwd.clone();
                         jobs.spawn_blocking(move || {
@@ -120,7 +119,7 @@ pub async fn refresh(app: crate::AppState) {
                 if app.git_metadata.finish(&cwd, metadata) {
                     let state = app.hub.state();
                     for session in state.sessions.values().filter(|s| s.host == app.cfg.host && s.cwd == cwd) {
-                        let _ = app.feed.send(crate::FeedMsg::Session(Box::new(session.clone())));
+                        let _ = app.feed.send(crate::FeedMsg::Session(session.clone()));
                     }
                 }
             }
