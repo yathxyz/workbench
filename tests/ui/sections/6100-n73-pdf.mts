@@ -33,6 +33,7 @@ await section('N73', async () => {
     const up = await api('/api/blob', { method: 'POST', headers: { 'Content-Type': 'application/pdf' }, body: new Uint8Array(bytes) }), upj = await up.json();
     const got = await api('/blob/' + upj.hash), blob = { status: up.status, type: upj.type, served: got.headers.get('content-type'), disp: got.headers.get('content-disposition') };
     D = await dpage(); await settled(D);
+    const pageErrors: string[] = []; D.on('pageerror', e => pageErrors.push(e.message));
     const st = await D.evaluate(async (file: string) => {
       const C = window.__canvas, S = C.S, out: Record<string, any> = {}; // any: each step's findings, read by the checks below
       if (C.WS.cur) C.wsLeave(); if (C.DESK.cur) C.deskGo(0, true); C.pickClear();
@@ -74,7 +75,7 @@ await section('N73', async () => {
       out.readNode = await tool('read_node').run({ path: n.name });
       // Hold the second card in getPage(1) until removal has destroyed its loading task.
       const proto: PdfJsDocument = Object.getPrototypeOf(L().doc), getPage = proto.getPage;
-      const first = Promise.withResolvers<PdfJsPage>();
+      let first = Promise.withResolvers<PdfJsPage>();
       let waiting = false;
       proto.getPage = function (page) {
         if (this === L().doc || page !== 1) return getPage.call(this, page);
@@ -85,10 +86,75 @@ await section('N73', async () => {
         out.opened = p2 && { kind: p2.kind, path: p2.path, other: p2.id !== n.id };
         const P: PdfLive = C.live[p2.id].pdf;
         if (!await until(() => waiting)) throw new Error('second PDF never requested page 1');
+        const task = P.task!, destroy = task.destroy.bind(task);
+        let destroys = 0, released: Promise<void> | undefined;
+        task.destroy = () => { destroys++; released = destroy(); return released.then(() => { throw new Error('N73 destroyed transport'); }); };
         C.removeNode(p2.id);
         first.reject(new Error('Transport destroyed'));
         out.closedLoading = await P.load === null && !P.err && !C.live[p2.id];
+        await released; out.destroys = destroys;
+
+        first = Promise.withResolvers<PdfJsPage>(); waiting = false;
+        const bad = C.pdfFromPath(file), entry = C.live[bad.id];
+        if (!await until(() => waiting)) throw new Error('live PDF never requested page 1');
+        const failedTask: PdfJsLoadingTask = entry.pdf.task, destroyFailed = failedTask.destroy.bind(failedTask);
+        let failedReleases = 0;
+        failedTask.destroy = () => { failedReleases++; return destroyFailed(); };
+        first.reject(new Error('N73 broken first page'));
+        out.badFirst = { noDoc: await entry.pdf.load === null, err: entry.pdf.err, shown: !entry.note.hidden && entry.note.textContent };
+        out.badFirst.released = failedReleases === 1 && entry.pdf.task === null;
+        C.removeNode(bad.id);
+        out.badFirst.releasedOnce = failedReleases === 1;
       } finally { proto.getPage = getPage; }
+      // Delay page 2 on another real document. Its visible-page update is fire-and-forget.
+      const later = C.pdfFromPath(file, null, { pos: { page: 2, y: 0 }, h: 320 }), laterEntry = C.live[later.id];
+      const laterDoc: PdfJsDocument = await laterEntry.pdf.load, readPage = laterDoc.getPage.bind(laterDoc), second = Promise.withResolvers<PdfJsPage>();
+      let readingSecond = false;
+      laterDoc.getPage = i => { if (i !== 2) return readPage(i); readingSecond = true; return second.promise; };
+      if (!await until(() => readingSecond)) throw new Error('visible PDF never requested page 2');
+      second.reject(new Error('N73 broken later page'));
+      const turn = () => new Promise<void>(r => setTimeout(r, 0));
+      await turn(); out.badLater = { err: laterEntry.pdf.err, shown: !laterEntry.note.hidden && laterEntry.note.textContent };
+      laterDoc.getPage = readPage; C.removeNode(later.id);
+
+      const draw = C.pdfFromPath(file, null, { h: 320 }), entry = C.live[draw.id], pdf: PdfLive = entry.pdf;
+      await pdf.load;
+      const pg = pdf.pages[0], page = pg.page!, render = page.render.bind(page);
+      const jobs: { task: PdfJsRenderTask; reject: (error: Error) => void; cancelled: boolean }[] = [];
+      page.render = () => {
+        const gate = Promise.withResolvers<void>();
+        const job = { task: { promise: gate.promise, cancel: () => { job.cancelled = true; } }, reject: gate.reject, cancelled: false };
+        jobs.push(job); return job.task;
+      };
+      if (!await until(() => jobs.length === 1)) throw new Error('PDF never requested its bitmap');
+      draw.w -= 160; C.nodeResized(draw);
+      if (!await until(() => jobs.length === 2)) throw new Error('resized PDF never requested its replacement bitmap');
+      jobs[0].reject(new Error('N73 obsolete bitmap')); await turn();
+      out.oldRender = jobs[0].cancelled && pg.task === jobs[1].task && !pdf.err && entry.note.hidden;
+      jobs[1].reject(new Error('N73 broken bitmap')); await turn();
+      out.badRender = { clear: pg.task === null, err: pdf.err, shown: !entry.note.hidden && entry.note.textContent };
+      if (pg.task === null) {
+        C.pdfGo(draw, 0, 0, true);
+        if (!await until(() => jobs.length === 3)) throw new Error('failed PDF bitmap never retried at the same scale');
+        jobs[2].reject(Object.assign(new Error('N73 cancelled bitmap'), { name: 'RenderingCancelledException' })); await turn();
+        out.cancelled = pg.task === null && entry.note.textContent === out.badRender.shown && pdf.err === out.badRender.err;
+      }
+      page.render = render;
+      C.pdfGo(draw, 0, 0, true); out.redrawn = !pg.task && !!await until(() => pg.canvas?.width);
+
+      // Close after Quote has read the real selection but before getTextContent settles.
+      await pg.textReady;
+      const spanToQuote = [...pg.text!.querySelectorAll('span')].find(sp => sp.textContent!.includes('quote target'))!;
+      const sel = document.createRange(); sel.selectNodeContents(spanToQuote);
+      getSelection()!.removeAllRanges(); getSelection()!.addRange(sel);
+      const content = Promise.withResolvers<Awaited<ReturnType<PdfJsPage['getTextContent']>>>();
+      let extracting = false;
+      page.getTextContent = () => { extracting = true; return content.promise; };
+      const quote = C.pdfQuote(draw).then((r?: RefNode) => r?.id || null, (e: Error) => e.message);
+      if (!await until(() => extracting)) throw new Error('Quote never requested its page text');
+      C.removeNode(draw.id); content.reject(new Error('N73 closed quote'));
+      out.closedQuote = { result: await quote, refs: Object.values<BoardNode>(S.nodes).filter(m => m.kind === 'ref' && m.src?.node === draw.id).length,
+        edges: S.edges.filter((e: Edge) => e.from === draw.id).length, err: pdf.err };
       // a dropped PDF is a card on its bytes in the blob store
       const dt = new DataTransfer(); dt.items.add(new File([await (await fetch('/api/raw?path=' + encodeURIComponent(file))).blob()], 'dropped.pdf', { type: 'application/pdf' }));
       const vp = document.querySelector('#viewport')!.getBoundingClientRect();
@@ -107,7 +173,19 @@ await section('N73', async () => {
     check('N73: a PDF on the host opens as a pdf card: two pages, the one in view drawn with a text layer and its link, "p. 1 / 2" on the badge; pdfText reads pages with markers; agents read it (read_pdf; read_node from the reading page, by then page 2) and open another (open_pdf)',
       st.open.pages === 2 && st.open.drawn && st.open.text && st.open.link && st.open.badge === 'p. 1 / 2' && st.open.ident && /--- n68 paper p\. 1 ---[\s\S]*quote target[\s\S]*--- n68 paper p\. 2 ---[\s\S]*Second page text/.test(st.text)
       && /p\. 2 ---[\s\S]*Beta section/.test(st.read) && !/Alpha/.test(st.read) && /p\. 2 ---[\s\S]*Beta section/.test(st.readNode) && st.opened?.kind === 'pdf' && st.opened.path === file && st.opened.other, JSON.stringify(st.open) + st.text.slice(0, 300));
-    check('N73: closing a PDF while page 1 is loading cancels the load without an error', st.closedLoading);
+    check('N73: closing a PDF while page 1 loads destroys its loading task once and ignores the cancelled load and teardown rejection',
+      st.closedLoading && st.destroys === 1 && !pageErrors.some(e => e.includes('N73 destroyed transport')), JSON.stringify({ closed: st.closedLoading, destroys: st.destroys, pageErrors }));
+    check('N73: a live first-page failure is shown on the PDF card', st.badFirst.noDoc && st.badFirst.err === 'Cannot open the PDF: N73 broken first page' && st.badFirst.shown === st.badFirst.err, JSON.stringify(st.badFirst));
+    check('N73: failed first-page loading releases the document while its error card remains open, not twice on close',
+      st.badFirst.released && st.badFirst.releasedOnce, JSON.stringify(st.badFirst));
+    check('N73: a delayed getPage failure on a visible later page is shown on the PDF card without an unhandled rejection',
+      st.badLater.err === 'Cannot open the PDF: N73 broken later page' && st.badLater.shown === st.badLater.err && !pageErrors.some(e => e.includes('N73 broken later page')), JSON.stringify({ ...st.badLater, pageErrors }));
+    check('N73: a superseded bitmap rejection is silent and cannot clear the replacement task', st.oldRender);
+    check('N73: a live bitmap failure is shown, clears its task, and allows drawing again at the same scale',
+      st.badRender.clear && st.badRender.err === 'Cannot open the PDF: N73 broken bitmap' && st.badRender.shown === st.badRender.err && st.redrawn, JSON.stringify({ ...st.badRender, redrawn: st.redrawn }));
+    check('N73: a cancelled current bitmap clears its task without reporting the cancellation', st.cancelled);
+    check('N73: closing a PDF during quote extraction is silent and leaves no dangling quote or edge',
+      st.closedQuote.result === null && !st.closedQuote.refs && !st.closedQuote.edges && st.closedQuote.err === st.badRender.err, JSON.stringify(st.closedQuote));
     check('N73: the selection quotes as a ref card holding the page and the text around it (TextQuoteSelector), linked to the PDF; the quote is found again (asked on page 2, found on page 1, lit up), a text that is not there is not',
       st.sel === 'quote target' && st.selOf === 'quote target' && st.quote?.text === 'quote target' && st.quote.src.page === 1 && /The $/.test(st.quote.src.prefix) && /^ sits/.test(st.quote.src.suffix) && st.quote.label === 'n68 paper › p. 1' && st.quote.edge
       && st.find === true && st.hit && st.miss === false, JSON.stringify({ sel: st.sel, quote: st.quote, find: st.find, hit: st.hit, miss: st.miss }));

@@ -8342,6 +8342,11 @@ function mountPdf(n: PdfNode, L: LiveEntry) {
   P.load = pdfOpen(n, L);
 }
 function pdfFail(L: LiveEntry, msg: string) { if (L.pdf) L.pdf.err = msg; if (L.note) { L.note.hidden = false; L.note.textContent = msg; } }
+function pdfError(n: PdfNode, P: PdfLive, cause: unknown) {
+  const L = live[n.id]; if (L?.pdf !== P) return;   // an error from a removed or remounted card
+  const m = String(cause && typeof cause === 'object' && 'message' in cause ? cause.message : cause);
+  pdfFail(L, /Missing PDF|Unexpected server response \((400|404)\)/.test(m) ? `Cannot open ${n.path || 'the PDF'}: the file is missing or not a PDF.` : 'Cannot open the PDF: ' + m);
+}
 async function pdfOpen(n: PdfNode, L: LiveEntry): Promise<PdfJsDocument | null> {
   const url = pdfUrl(n); if (!url) { pdfFail(L, 'This card names no PDF.'); return null; }
   let doc: PdfJsDocument, first: PdfJsPage;
@@ -8355,8 +8360,7 @@ async function pdfOpen(n: PdfNode, L: LiveEntry): Promise<PdfJsDocument | null> 
     first = await doc.getPage(1);
   } catch (e) {
     if (live[n.id] !== L) return null;   // pdfClose destroyed the task while it was loading
-    const m = String(e?.message || e);
-    pdfFail(L, /Missing PDF|Unexpected server response \((400|404)\)/.test(m) ? `Cannot open ${n.path || 'the PDF'}: the file is missing or not a PDF.` : 'Cannot open the PDF: ' + m);
+    pdfClose(L); pdfError(n, L.pdf!, e);
     return null;
   }
   if (live[n.id] !== L) return null;
@@ -8376,8 +8380,8 @@ async function pdfOpen(n: PdfNode, L: LiveEntry): Promise<PdfJsDocument | null> 
 }
 function pdfClose(L: LiveEntry) {
   const P = L.pdf; if (!P) return;
-  for (const p of P.pages) { p.task?.cancel(); if (p.canvas) p.canvas.width = 0; }
-  P.task?.destroy(); P.task = null; P.doc = null; P.pages = []; clearTimeout(P.posT);
+  for (const p of P.pages) pdfEvict(p);
+  P.task?.destroy().catch(() => {}); P.task = null; P.doc = null; P.pages = []; clearTimeout(P.posT);
 }
 // the page boxes at the card's width; true when it changed (the text layers and links are made again at the new scale)
 function pdfLayout(n: PdfNode): boolean {
@@ -8464,7 +8468,9 @@ async function pdfPage(P: PdfLive, p: PdfPageLive): Promise<PdfJsPage | null> {
   return page;
 }
 async function pdfDraw(n: PdfNode, P: PdfLive, p: PdfPageLive) {
-  const page = await pdfPage(P, p); if (!page || !P.doc) return;
+  let page: PdfJsPage | null;
+  try { page = await pdfPage(P, p); } catch (e) { pdfError(n, P, e); return; }
+  if (!page || !P.doc) return;
   const k = P.w / p.pw, r = Math.min(k * cam().z * Math.min(devicePixelRatio || 1, 3), PDF_MAXPX / p.pw, PDF_MAXPX / p.ph);
   if (!(p.canvas && Math.abs(p.r - r) / r < 0.12) && !(p.task && p.taskR && Math.abs(p.taskR - r) / r < 0.12)) {
     p.task?.cancel();
@@ -8475,7 +8481,11 @@ async function pdfDraw(n: PdfNode, P: PdfLive, p: PdfPageLive) {
       if (p.task !== task) { c.width = 0; return; }
       p.task = null; if (p.canvas) { p.canvas.width = 0; p.canvas.remove(); }
       p.el.querySelector('.pdf-ph')?.remove(); p.el.prepend(c); p.canvas = c; p.r = r;
-    }, () => { c.width = 0; });
+    }, e => {
+      c.width = 0; if (p.task !== task) return;
+      p.task = null;
+      if (e?.name !== 'RenderingCancelledException') pdfError(n, P, e);
+    });
   }
   if (!p.text) pdfTextLayer(P, p, page);
   if (!p.links) pdfLinks(n, P, p, page);
@@ -8535,7 +8545,11 @@ function pdfSel(n: PdfNode): { text: string; p: PdfPageLive } | null {
 }
 async function pdfQuote(n: PdfNode) {
   const s = pdfSel(n); if (!s) return toast('Select some text in the PDF first.');
-  const full = flat(await pdfPageText(n, s.p.i)), k = full.indexOf(s.text);
+  const P = live[n.id].pdf!;
+  let full: string;
+  try { full = flat(await pdfPageText(n, s.p.i)); } catch (e) { pdfError(n, P, e); return; }
+  if (live[n.id]?.pdf !== P) return;
+  const k = full.indexOf(s.text);
   const prefix = k > 0 ? full.slice(Math.max(0, k - PDF_CTX), k) : '', suffix = k >= 0 ? full.slice(k + s.text.length, k + s.text.length + PDF_CTX) : '';
   const kids = childrenOf(n.id, 'ref').filter(c => c.kind === 'ref'), lines = Math.ceil(s.text.length / 44);
   const r: RefNode = { id: uid('n'), kind: 'ref', in: n.in, name: uniqueName(`${n.name}-q${kids.length + 1}`, 'ref'), text: s.text, src: { node: n.id, page: s.p.i + 1, prefix, suffix },
