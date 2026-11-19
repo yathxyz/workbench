@@ -793,7 +793,7 @@ interface ClipItems { v: 1; cards: CopiedCard[]; strokes: Stroke[]; shapes: Shap
 interface EdwinBuffer {
   id: string; name: string; text: string; mode: string;
   pt: number; mark: number | null; markActive: boolean;
-  rope: { length: number; slice(from: number, to: number): string };
+  rope: { length: number; slice(from: number, to: number): string; lastIndexOf(needle: string, from?: number): number };
   undo: unknown[]; redo: unknown[]; pendingUndo: unknown;
   shared: boolean; sver: number; ver: number; modified: boolean;
   meta: { anchors?: PageAnchor[]; [k: string]: unknown };
@@ -840,6 +840,8 @@ interface EdwinApi {
   onFrameEvent(fn: (...args: any[]) => void): void; // any: frame events carry per-event payloads
   withFrame<R>(f: EdwinFrame, fn: () => R): R;
   applyOps(b: EdwinBuffer, ops: unknown[], origin: string): void;
+  // Optional on a host serving an older Edwin. Workbench never mutates Edwin's fold cache.
+  setBufferFolds?(b: EdwinBuffer, ranges: { s: number; e: number }[]): void;
   leaves(root: unknown): EdwinWindow[];
   selectFrame(f: EdwinFrame): void;
   selectWindow(w: EdwinWindow): void;
