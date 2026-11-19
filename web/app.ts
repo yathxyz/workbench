@@ -8346,14 +8346,17 @@ function mountPdf(n: PdfNode, L: LiveEntry) {
   L.ro = new ResizeObserver(() => { if (pdfLayout(n)) pdfSoon(60); }); L.ro.observe(L.body!);
   P.load = pdfOpen(n, L);
 }
-function pdfFail(L: LiveEntry, msg: string) { if (L.pdf) L.pdf.err = msg; if (L.note) { L.note.hidden = false; L.note.textContent = msg; } }
-function pdfError(n: PdfNode, P: PdfLive, cause: unknown) {
+function pdfSetError(L: LiveEntry, msg: string, bitmap?: number) {
+  L.pdf!.err = msg; L.pdf!.errBitmap = bitmap;
+  L.note!.textContent = msg; L.note!.hidden = !msg;
+}
+function pdfError(n: PdfNode, P: PdfLive, cause: unknown, bitmap?: number) {
   const L = live[n.id]; if (L?.pdf !== P) return;   // an error from a removed or remounted card
   const m = String(cause && typeof cause === 'object' && 'message' in cause ? cause.message : cause);
-  pdfFail(L, /Missing PDF|Unexpected server response \((400|404)\)/.test(m) ? `Cannot open ${n.path || 'the PDF'}: the file is missing or not a PDF.` : 'Cannot open the PDF: ' + m);
+  pdfSetError(L, /Missing PDF|Unexpected server response \((400|404)\)/.test(m) ? `Cannot open ${n.path || 'the PDF'}: the file is missing or not a PDF.` : 'Cannot open the PDF: ' + m, bitmap);
 }
 async function pdfOpen(n: PdfNode, L: LiveEntry): Promise<PdfJsDocument | null> {
-  const url = pdfUrl(n); if (!url) { pdfFail(L, 'This card names no PDF.'); return null; }
+  const url = pdfUrl(n); if (!url) { pdfSetError(L, 'This card names no PDF.'); return null; }
   let doc: PdfJsDocument, first: PdfJsPage;
   try {
     const lib = await pdfLib().catch(() => { throw new Error('pdf.js is not in this build of Workbench'); });
@@ -8484,12 +8487,13 @@ async function pdfDraw(n: PdfNode, P: PdfLive, p: PdfPageLive) {
     const task = page.render({ canvasContext: c.getContext('2d')!, viewport: vp }); p.task = task; p.taskR = r;
     task.promise.then(() => {
       if (p.task !== task) { c.width = 0; return; }
+      if (P.errBitmap === p.i) pdfSetError(live[n.id], '');
       p.task = null; if (p.canvas) { p.canvas.width = 0; p.canvas.remove(); }
       p.el.querySelector('.pdf-ph')?.remove(); p.el.prepend(c); p.canvas = c; p.r = r;
     }, e => {
       c.width = 0; if (p.task !== task) return;
       p.task = null;
-      if (e?.name !== 'RenderingCancelledException') pdfError(n, P, e);
+      if (e?.name !== 'RenderingCancelledException') pdfError(n, P, e, p.i);
     });
   }
   if (!p.text) pdfTextLayer(P, p, page);

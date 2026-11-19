@@ -156,6 +156,7 @@ await section('N73', async () => {
       }
       page.render = render;
       C.pdfGo(draw, 0, 0, true); out.redrawn = !pg.task && !!await until(() => pg.canvas?.width);
+      out.retryCleared = !pdf.err && entry.note.hidden;
 
       // Close after Quote has read the real selection but before getTextContent settles.
       await pg.textReady;
@@ -167,9 +168,10 @@ await section('N73', async () => {
       page.getTextContent = () => { extracting = true; return content.promise; };
       const quote = C.pdfQuote(draw).then((r?: RefNode) => r?.id || null, (e: Error) => e.message);
       if (!await until(() => extracting)) throw new Error('Quote never requested its page text');
+      const beforeClose = pdf.err;
       C.removeNode(draw.id); content.reject(new Error('N73 closed quote'));
       out.closedQuote = { result: await quote, refs: Object.values<BoardNode>(S.nodes).filter(m => m.kind === 'ref' && m.src?.node === draw.id).length,
-        edges: S.edges.filter((e: Edge) => e.from === draw.id).length, err: pdf.err };
+        edges: S.edges.filter((e: Edge) => e.from === draw.id).length, silent: pdf.err === beforeClose };
       // a dropped PDF is a card on its bytes in the blob store
       const dt = new DataTransfer(); dt.items.add(new File([await (await fetch('/api/raw?path=' + encodeURIComponent(file))).blob()], 'dropped.pdf', { type: 'application/pdf' }));
       const vp = document.querySelector('#viewport')!.getBoundingClientRect();
@@ -198,9 +200,10 @@ await section('N73', async () => {
     check('N73: a superseded bitmap rejection is silent and cannot clear the replacement task', st.oldRender);
     check('N73: a live bitmap failure is shown, clears its task, and allows drawing again at the same scale',
       st.badRender.clear && st.badRender.err === 'Cannot open the PDF: N73 broken bitmap' && st.badRender.shown === st.badRender.err && st.redrawn, JSON.stringify({ ...st.badRender, redrawn: st.redrawn }));
+    check('N73: a successful bitmap retry clears its error note', st.retryCleared);
     check('N73: a cancelled current bitmap clears its task without reporting the cancellation', st.cancelled);
     check('N73: closing a PDF during quote extraction is silent and leaves no dangling quote or edge',
-      st.closedQuote.result === null && !st.closedQuote.refs && !st.closedQuote.edges && st.closedQuote.err === st.badRender.err, JSON.stringify(st.closedQuote));
+      st.closedQuote.result === null && !st.closedQuote.refs && !st.closedQuote.edges && st.closedQuote.silent, JSON.stringify(st.closedQuote));
     check('N73: the selection quotes as a ref card holding the page and the text around it (TextQuoteSelector), linked to the PDF; the quote is found again (asked on page 2, found on page 1, lit up), a text that is not there is not',
       st.sel === 'quote target' && st.selOf === 'quote target' && st.quote?.text === 'quote target' && st.quote.src.page === 1 && /The $/.test(st.quote.src.prefix) && /^ sits/.test(st.quote.src.suffix) && st.quote.label === 'n68 paper › p. 1' && st.quote.edge
       && st.find === true && st.hit && st.miss === false, JSON.stringify({ sel: st.sel, quote: st.quote, find: st.find, hit: st.hit, miss: st.miss }));

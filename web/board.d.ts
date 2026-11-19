@@ -356,6 +356,7 @@ interface PdfLive {
   load: Promise<PdfJsDocument | null> | null;
   task?: PdfJsLoadingTask | null;      // pdf.js's loading task: destroying it lets go of the document and its worker
   err: string;
+  errBitmap?: number;                  // the page whose bitmap retry can clear this error
   scroll: HTMLElement;                 // the card body's scroller (.pdf-pages), which takes the keyboard
   pages: PdfPageLive[];
   w: number;                           // the page width in CSS px the boxes were laid out for
