@@ -391,7 +391,25 @@ impl Relay {
         self.sid.as_deref() == Some(sid)
     }
 
-    async fn hub_msg(&mut self, ws: &mut WebSocket, msg: HubMessage) -> Result<(), End> {
+    async fn hub_msg(&mut self, ws: &mut WebSocket, mut msg: HubMessage) -> Result<(), End> {
+        let sid = self.sid.as_deref();
+        let frame = |msg: &HubMessage| match msg {
+            HubMessage::AcpEv { sid: s, ev }
+                if Some(s.as_str()) == sid && ev.body != EventBody::Unknown =>
+            {
+                Some(json!({"t": "ev", "ev": ev}))
+            }
+            _ => None,
+        };
+        if let Some(out) = frame(&msg) {
+            if !self.hub.has_buffered_line() {
+                return send_json(ws, &out).await.map_err(|_| End::Gone);
+            }
+            let Some(next) = self.hub.send_ready(ws, out, frame).await? else {
+                return Ok(());
+            };
+            msg = next;
+        }
         let out = match msg {
             HubMessage::Ok { rid, result } => match self.replies.remove(&rid) {
                 Some((Pending::Open, _)) => {
@@ -445,11 +463,8 @@ impl Relay {
             HubMessage::AcpEv { sid, ev } if self.is_ours(&sid) => {
                 // An unknown kind decodes without its payload; the browser skips
                 // unknown kinds anyway, and the cursor allows the gap.
-                if ev.body == EventBody::Unknown {
-                    tracing::warn!(seq = ev.seq, "unknown journal event not relayed");
-                    return Ok(());
-                }
-                json!({"t": "ev", "ev": ev})
+                tracing::warn!(seq = ev.seq, "unknown journal event not relayed");
+                return Ok(());
             }
             HubMessage::AcpReplayed {
                 sid,

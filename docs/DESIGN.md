@@ -458,6 +458,8 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 - Replies are always admitted. The hub stops reading a connection's requests while its queue is at the cap, so replies are bounded too.
 - Replay is paced: each replayed event, and `acp.replayed`, waits until the queue has room.
 - Live events that arrive during a replay wait in a per-connection backlog with its own `CONN_QUEUE` cap (an empty backlog admits one event of any size). Overflowing the backlog closes the connection. The backlog is released only after the writer has drained the replay from the queue. Queue and backlog together can therefore hold up to 2 × `CONN_QUEUE`.
+- The hub writer may send consecutive queued lines together; a blocked write keeps all but its current line charged to the queue.
+- On `/acp` and `/pty`, the web may flush already available output frames together, without changing frame boundaries or waiting for another message.
 
 #### 3.2.10 Hub availability as seen from the web
 - The control connection reconnects with backoff: 250 ms doubling to 5 s, with jitter.

@@ -232,9 +232,13 @@ async fn read_line(r: &mut Lines) -> std::io::Result<Option<String>> {
 }
 
 async fn write_loop(mut wr: OwnedWriteHalf, q: Arc<OutQ>) {
-    while let Some(line) = q.pop().await {
+    while let Ok(Some((line, offset))) = q.pop_write(|iov| wr.try_write_vectored(iov)).await {
+        if offset == line.len() {
+            tokio::task::consume_budget().await;
+            continue;
+        }
         tokio::select! {
-            r = wr.write_all(&line) => if r.is_err() { break },
+            r = wr.write_all(&line[offset..]) => if r.is_err() { break },
             () = q.closed() => break,
         }
     }
@@ -636,6 +640,20 @@ mod tests {
             cwd_from: None,
             env: None,
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_reader_ends_the_writer_and_its_queue() {
+        let (sender, reader) = UnixStream::pair().unwrap();
+        let (_, wr) = sender.into_split();
+        let q = Arc::new(OutQ::default());
+        q.push_reply(Arc::from(&b"first\n"[..]));
+        q.push_reply(Arc::from(&b"second\n"[..]));
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(2), write_loop(wr, q.clone()))
+            .await
+            .expect("writer hung after peer closed");
+        assert!(q.room().await.is_err());
     }
 
     #[test]

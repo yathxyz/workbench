@@ -312,7 +312,23 @@ impl Relay {
         self.cur.as_deref() == Some(sid)
     }
 
-    async fn hub_msg(&mut self, ws: &mut WebSocket, msg: HubMessage) -> Result<(), End> {
+    async fn hub_msg(&mut self, ws: &mut WebSocket, mut msg: HubMessage) -> Result<(), End> {
+        let sid = self.cur.as_deref();
+        let frame = |msg: &HubMessage| match msg {
+            HubMessage::PtyOut { sid: s, d, out } if Some(s.as_str()) == sid => {
+                Some(json!({"t": "out", "d": d, "out": out}))
+            }
+            _ => None,
+        };
+        if let Some(out) = frame(&msg) {
+            if !self.hub.has_buffered_line() {
+                return send_json(ws, &out).await.map_err(|_| End::Gone);
+            }
+            let Some(next) = self.hub.send_ready(ws, out, frame).await? else {
+                return Ok(());
+            };
+            msg = next;
+        }
         let out = match msg {
             HubMessage::Ok { rid, result } => {
                 if let Some((sid, reply)) = self.open_ok(rid, result).await? {
@@ -355,9 +371,6 @@ impl Relay {
                         return Ok(());
                     }
                 }
-            }
-            HubMessage::PtyOut { sid, d, out } if self.is_cur(&sid) => {
-                json!({"t": "out", "d": d, "out": out})
             }
             HubMessage::PtyFg { sid, comm, cwd } if self.is_cur(&sid) => {
                 json!({"t": "fg", "comm": comm, "cwd": cwd})

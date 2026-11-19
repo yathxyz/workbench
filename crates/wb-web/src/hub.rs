@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures_util::StreamExt;
+use axum::extract::ws::{Message, WebSocket};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::{Map, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -246,6 +247,56 @@ impl HubConn {
                 Err(e) => {
                     tracing::warn!(error = %e, "hub connection failed");
                     return None;
+                }
+            }
+        }
+    }
+
+    pub fn has_buffered_line(&self) -> bool {
+        self.rx.read_buffer().contains(&b'\n')
+    }
+
+    /// Send consecutive data frames already in the decoder, then give the
+    /// relay its first non-data message back. Never await the next hub line.
+    pub async fn send_ready(
+        &mut self,
+        ws: &mut WebSocket,
+        mut out: Value,
+        frame: impl Fn(&HubMessage) -> Option<Value>,
+    ) -> Result<Option<HubMessage>, End> {
+        const MAX_BYTES: usize = 64 * 1024;
+        let mut bytes = 0;
+        let mut count = 0;
+        loop {
+            count += 1;
+            let text = out.to_string();
+            let size = text.len() + 10; // largest unmasked WebSocket header
+            if bytes != 0 && bytes + size > MAX_BYTES {
+                ws.flush().await.map_err(|_| End::Gone)?;
+                bytes = 0;
+            }
+            bytes += size;
+            let data = Message::Text(text.into());
+            if bytes >= MAX_BYTES || count == 64 || (count > 1 && !self.has_buffered_line()) {
+                ws.send(data).await.map_err(|_| End::Gone)?;
+                return Ok(None);
+            }
+            ws.feed(data).await.map_err(|_| End::Gone)?;
+            match self.recv().now_or_never() {
+                Some(Some(next)) => match frame(&next) {
+                    Some(data) => out = data,
+                    None => {
+                        ws.flush().await.map_err(|_| End::Gone)?;
+                        return Ok(Some(next));
+                    }
+                },
+                ended => {
+                    ws.flush().await.map_err(|_| End::Gone)?;
+                    return if ended.is_some() {
+                        Err(HUB_LOST)
+                    } else {
+                        Ok(None)
+                    };
                 }
             }
         }
