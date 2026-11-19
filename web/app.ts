@@ -107,7 +107,8 @@ function zoomAt(sx: number, sy: number, f: number): void {
   c.x = w.x - sx / c.z; c.y = w.y - sy / c.z;
   applyCam();
 }
-let anim: number | null = null, animDone: (() => void) | null = null;
+interface CamFlight { raf: number; target: Cam; card?: string; done?: () => unknown }
+let anim: CamFlight | null = null;
 const GLIDE = { raf: 0, ok: false, trail: [] as [number, number, number][] };   // a flicked one-finger pan carrying on; trail: its last moves, [time, x, y]
 // R1: a mouse wheel's zoom notch eases to its target about the pointer over MOTION.fast; a notch during the ease adds to
 // the target. at: the last wheel event (the far-zoom swap waits for the wheel to rest, LOD.busy).
@@ -124,26 +125,28 @@ function zoomPath(cx0: number, cy0: number, w0: number, cx1: number, cy1: number
   const r0 = -Math.asinh(b0), r1 = -Math.asinh(b1), S = (r1 - r0) / RHO;   // ln(√(b²+1) − b), without the cancellation
   return k => { const s = k * S, u = w0 / (r2 * d) * (Math.cosh(r0) * Math.tanh(RHO * s + r0) - Math.sinh(r0)); return [cx0 + u * dx, cy0 + u * dy, w0 * Math.cosh(r0) / Math.cosh(RHO * s + r0)]; };
 }
-function animateTo(t: Cam, done?: (() => void) | null): void {
+function animateTo(t: Cam, done?: () => unknown, card?: string): void {
   camStop(false);
   const c = cam(), T = reduceMotion ? 0 : MOTION.slow, t0 = performance.now(), W = VW(), H = VH();
   // the path runs on the screen centre and the width of world in view
   const path = zoomPath(c.x + W / 2 / c.z, c.y + H / 2 / c.z, W / c.z, t.x + W / 2 / t.z, t.y + H / 2 / t.z, W / t.z);
-  animDone = done || null;
+  const flight = anim = { raf: 0, target: t, card, done };
   const step: FrameRequestCallback = now => {
     const k = T ? clamp((now - t0) / T, 0, 1) : 1, e = 1 - Math.pow(1 - k, 3);
     if (k < 1) { const [cx, cy, w] = path(e); c.z = W / w; c.x = cx - W / 2 / c.z; c.y = cy - H / 2 / c.z; }
     else { c.x = t.x; c.y = t.y; c.z = t.z; }   // land exactly on the target
     applyCam();
-    if (k < 1) anim = requestAnimationFrame(step); else { anim = null; const d = animDone; animDone = null; lodSettle(); d?.(); }   // the near look first: a done step may focus a card's body, which the far look hides
+    if (k < 1) flight.raf = requestAnimationFrame(step); else { anim = null; lodSettle(); done?.(); }   // the near look first: a done step may focus a card's body, which the far look hides
   };
-  anim = requestAnimationFrame(step);
+  flight.raf = requestAnimationFrame(step);
 }
 // stop whatever moves the camera on its own (a flight, a glide); a cut-short flight still runs its done step
 function camStop(finish = true) {
-  if (anim) { cancelAnimationFrame(anim); anim = null; const d = animDone; animDone = null; if (finish) { lodSettle(); d?.(); } }
+  const flight = anim;
+  if (flight) { cancelAnimationFrame(flight.raf); anim = null; if (finish) { lodSettle(); flight.done?.(); } }
   if (GLIDE.raf) { cancelAnimationFrame(GLIDE.raf); GLIDE.raf = 0; }
   if (WHEEL.raf) { cancelAnimationFrame(WHEEL.raf); WHEEL.raf = 0; }
+  return flight;
 }
 function pushHistory() { camBack.push({ ...cam() }); if (camBack.length > 60) camBack.shift(); camFwd.length = 0; }
 function camArea(): { left: number; top: number; vw: number; vh: number } {   // the part of the viewport a fit aims at
@@ -157,6 +160,7 @@ function camTarget(x: number, y: number, w: number, h: number, maxZ = 1): Cam {
   return { z, x: x + w / 2 - (left + vw / 2) / z, y: y + h / 2 - (top + vh / 2) / z };
 }
 function fitAll(animate = true) {
+  if (FOCUS.cur) focusHide();   // fit the board rectangles, not the temporary full-screen card
   const items = Object.values(S.nodes).filter(n => !stashed(n));
   if (!items.length) return;
   const x0 = Math.min(...items.map(n => n.x)), y0 = Math.min(...items.map(n => n.y - (n.kind === 'frame' ? LABEL_H : 0)));
@@ -2973,6 +2977,7 @@ function pullCard(ev: PointerEvent, row: HTMLElement, deck: FrameNode, k: BoardN
 }
 function jumpFolder(f: FrameNode) {
   if (VIEW !== 'canvas') setView('canvas');
+  if (FOCUS.cur) focusHide();
   reveal(f); pushHistory(); activate(f.id);
   animateTo(camTarget(f.x, f.y - LABEL_H, f.w, f.h + LABEL_H, 1));
 }
@@ -3451,7 +3456,12 @@ function anchorAtCursor(n: PageNode) {
 }
 
 // ------------------------------------------------------------------ jumping
-function jumpNode(n: BoardNode, maxZ = 1, done?: () => unknown) { if (VIEW !== 'canvas') setView('canvas'); reveal(n); pushHistory(); activate(n.id); animateTo(camTarget(n.x, n.y, n.w, n.h, maxZ), done); }
+function jumpNode(n: BoardNode, maxZ = 1, done?: () => unknown) {
+  if (VIEW !== 'canvas') setView('canvas');
+  if (FOCUS.cur) focusHide();
+  reveal(n); pushHistory(); activate(n.id);
+  animateTo(camTarget(n.x, n.y, n.w, n.h, maxZ), done, n.id);
+}
 function jumpBuffer(n: PageNode, pos: number) {
   if (VIEW === 'editor') return edOpen(n, pos);
   jumpNode(n, 1, () => {
@@ -9092,13 +9102,14 @@ function focusShow(id: string) {
   const n = S.nodes[id]; if (!n || n.kind === 'frame') return;
   if (VIEW !== 'canvas') setView('canvas');
   deskReveal(n);
-  camStop(false);
-  if (FOCUS.cur && FOCUS.cur !== id) focusRestoreNode();
-  if (!FOCUS.cur) FOCUS.saved = { ...cam() };
+  const flight = camStop(false);
+  if (!FOCUS.cur) FOCUS.saved = { ...(flight?.target ?? cam()) };
+  else if (FOCUS.cur !== id) focusRestoreNode();
   if (FOCUS.cur !== id) { reveal(n); FOCUS.rect = { x: n.x, y: n.y, w: n.w, h: n.h }; }
   FOCUS.cur = id; activate(id);
   live[id]?.el!.classList.add('focused'); document.body.classList.add('focus');
   focusGeometry(n); focusStrip(); ringNote();
+  if (flight?.card === id) flight.done?.();   // the card is at reading size; finish its quote jump, cursor placement, etc.
 }
 function focusRestoreNode() {
   const n = FOCUS.cur && S.nodes[FOCUS.cur]; const L = n && live[n.id];

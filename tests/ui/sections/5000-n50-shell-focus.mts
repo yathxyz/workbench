@@ -1,5 +1,6 @@
 import { check, section, sleep, until } from '../shared.mts';
 import { dpage, newTerm, termText } from '../daemon.mts';
+import { focusFlights } from '../focus-flights.mts';
 
 // N50: Enter on the active shell card puts the keyboard in that shell where the card stands; Shift-Enter opens it full screen.
 await section('N50', async () => {
@@ -15,5 +16,6 @@ await section('N50', async () => {
     const tab = await P.evaluate(() => window.__canvas.FOCUS.cur);
     await P.evaluate(() => window.__canvas.focusHide());
     check('N50: Enter on the active shell card puts the keyboard in its terminal on the canvas; Shift-Enter opens it as a focus tab', inTerm.term && !inTerm.focus && !!typed && tab === id, JSON.stringify({ inTerm, typed: !!typed, tab, id }));
+    await focusFlights(P, id);
   } finally { await P.close(); }
 });
