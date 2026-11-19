@@ -1,11 +1,11 @@
-// bash tests/run-front-bench.sh front-page-bench.mts [desktop|phone] [load|input|navigator]
+// bash tests/run-front-bench.sh front-page-bench.mts [desktop|phone] [load|input|navigator|pages]
 import { withBoard, metrics, stats } from './front-browser.mts';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { strict as assert } from 'node:assert';
 import type { Page } from 'playwright-core';
 
 const [device = 'desktop', workload = 'load'] = process.argv.slice(2);
-if (!['desktop', 'phone'].includes(device) || !['load', 'input', 'navigator'].includes(workload)) throw Error('expected desktop|phone load|input|navigator');
+if (!['desktop', 'phone'].includes(device) || !['load', 'input', 'navigator', 'pages'].includes(workload)) throw Error('expected desktop|phone load|input|navigator|pages');
 const phone = device === 'phone', repeats = Number(process.env.WB_BENCH_REPEATS || 5);
 const viewport = phone ? { width: 390, height: 844 } : { width: 1280, height: 800 };
 interface Probe { frames: number[]; long: number[]; boot: number; heap: number; key: number; paints: number[] }
@@ -32,6 +32,10 @@ await withBoard(async (browser, info) => {
   const seed = await browser.newPage({ viewport });
   await seed.goto(info.caddy);
   await seed.waitForFunction(() => window.__canvas?.BOOTED && window.__canvas.SAVE.lastJson);
+  if (workload === 'pages') {
+    await seed.evaluate(() => window.__canvas.addNode({ id: 'shared', kind: 'term', backend: 'pty', name: 'shared shell', x: 0, y: 0, w: 405, h: 240 }));
+    await seed.waitForFunction(() => JSON.parse(window.__canvas.SAVE.lastJson).nodes.shared && window.__canvas.live.shared.backend.helloSeen);
+  }
   const board: Board = JSON.parse(await seed.evaluate(() => window.__canvas.SAVE.lastJson));
   await seed.close();
   const r = await browser.newContext();
@@ -49,6 +53,35 @@ await withBoard(async (browser, info) => {
     const save = await r.request.put(`${info.caddy}/api/board`, { headers: { 'If-Match': res.headers().etag, Origin: info.caddy }, data: board });
     assert.equal(save.status(), 204, await save.text());
   } finally { await r.close(); }
+  if (workload === 'pages') {
+    // Warm server after the seed visit. Five extra complete pages, not five extra bare /pty sockets.
+    const usage = () => {
+      const mem = readFileSync(`/proc/${info.webPid}/smaps_rollup`, 'utf8');
+      return { rssKiB: Number(/^Rss:\s+(\d+)/m.exec(mem)![1]), pssKiB: Number(/^Pss:\s+(\d+)/m.exec(mem)![1]) };
+    };
+    const pages: Page[] = [];
+    console.log(JSON.stringify({ device, pages: 0, ...usage() }));
+    for (let n = 1; n <= 6; n++) {
+      const page = await browser.newPage({ viewport }); pages.push(page);
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send('Emulation.setCPUThrottlingRate', { rate: phone ? 4 : 1 });
+      await page.goto(info.caddy);
+      await page.waitForFunction(() => {
+        const b = window.__canvas?.live.shared?.term?.buffer.active;
+        return window.__perf?.frame?.online && b && /[$#] +$/.test(b.getLine(b.baseY + b.cursorY).translateToString());
+      });
+      if (n !== 1 && n !== 6) continue;
+      await pages[0].evaluate(n => window.__canvas.live.shared.backend.input(`printf 'viewers-%d\\n' ${n}\r`), n);
+      await Promise.all(pages.map(p => p.waitForFunction(n => {
+        const b = window.__canvas.live.shared.term.buffer.active;
+        for (let i = Math.max(0, b.baseY + b.cursorY - 4); i <= b.baseY + b.cursorY; i++)
+          if (b.getLine(i)?.translateToString(true) === `viewers-${n}`) return true;
+        return false;
+      }, n)));
+      console.log(JSON.stringify({ device, pages: n, ...usage() }));
+    }
+    return;
+  }
   for (let i = 0; i < (workload === 'load' ? repeats : 1); i++) {
     const ctx = await browser.newContext({ viewport });
     try {

@@ -3,7 +3,7 @@ import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import type { Browser, CDPSession } from 'playwright-core';
 
-interface BoardInfo { caddy: string; host: string }
+interface BoardInfo { caddy: string; host: string; webPid: number }
 interface MeshInfo extends BoardInfo { api: string; apiTokenFiles: { near: string; far: string } }
 export function withBoard(run: (browser: Browser, info: MeshInfo) => Promise<void>, args: ['--api']): Promise<void>;
 export function withBoard(run: (browser: Browser, info: BoardInfo) => Promise<void>): Promise<void>;
