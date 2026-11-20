@@ -412,15 +412,6 @@ impl Registry {
         lock(&self.inner).sessions.get(sid).and_then(Entry::pid)
     }
 
-    /// The child pids of every live PTY session.
-    pub fn live_pids(&self) -> Vec<u32> {
-        lock(&self.inner)
-            .sessions
-            .values()
-            .filter_map(Entry::pid)
-            .collect()
-    }
-
     /// Stops creating sessions and returns every session's sender.
     pub fn stop(&self) -> Vec<Tx> {
         let mut inner = lock(&self.inner);

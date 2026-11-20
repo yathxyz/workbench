@@ -14,16 +14,15 @@
 
 use std::time::Duration;
 
-use rustix::process::Signal;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::registry::Tx;
-use crate::{Ctx, acp, procfs, pty};
+use crate::{Ctx, acp, pty};
 
 /// How long the children have to exit after the hangup.
-const HANGUP_WAIT: Duration = Duration::from_secs(5);
+pub const HANGUP_WAIT: Duration = Duration::from_secs(5);
 /// How long the sessions have to record the exits after the SIGKILL; it covers an
 /// agent's SIGKILL 6 s into the stop.
 const KILL_WAIT: Duration = Duration::from_secs(3);
@@ -44,14 +43,10 @@ pub async fn run(ctx: &Ctx) {
     if all_done(&mut waits, HANGUP_WAIT).await {
         return;
     }
-    let survivors = ctx.registry.live_pids();
     warn!(
-        "{} sessions still running after {HANGUP_WAIT:?}; killing them",
-        survivors.len()
+        "{} sessions have not finished after {HANGUP_WAIT:?}",
+        waits.len()
     );
-    for pid in survivors {
-        procfs::signal_session(pid, Signal::KILL);
-    }
     if !all_done(&mut waits, KILL_WAIT).await {
         warn!("{} sessions did not record their exit", waits.len());
     }

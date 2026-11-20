@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rustix::process::Signal;
+use rustix::process::{Signal, pidfd_send_signal};
 use rustix::termios::{Winsize, tcgetpgrp, tcsetwinsize};
 use tokio::io::unix::AsyncFd;
 use tokio::process::Child;
@@ -181,9 +181,6 @@ async fn supervise(
         };
         // Every write the actor queued lands before the session is read back.
         let _ = writes.await;
-        if let Some(pid) = ctx.registry.live_pid(&sid) {
-            kill_session(pid);
-        }
         let dropped = std::mem::take(&mut *lock(&viewers));
         let Some(next) = next else {
             return tell_reloaded(&sid, dropped);
@@ -225,12 +222,21 @@ fn tell_reloaded(sid: &str, viewers: Vec<Viewer>) {
 }
 
 /// SIGHUP to every member of the session of `leader` now, SIGKILL to the survivors later.
-fn kill_session(leader: u32) {
-    procfs::signal_session(leader, Signal::HUP);
-    tokio::spawn(async move {
-        tokio::time::sleep(KILL_AFTER).await;
-        procfs::signal_session(leader, Signal::KILL);
-    });
+fn kill_session(leader: u32, grace: Duration) {
+    tokio::spawn(hangup_session(Path::new("/proc"), leader, grace));
+}
+
+fn hangup_session(proc: &Path, leader: u32, grace: Duration) -> impl Future<Output = ()> + 'static {
+    let members = procfs::session_members(proc, leader);
+    for member in &members {
+        let _ = pidfd_send_signal(member, Signal::HUP);
+    }
+    async move {
+        tokio::time::sleep(grace).await;
+        for member in members {
+            let _ = pidfd_send_signal(member, Signal::KILL);
+        }
+    }
 }
 
 /// The connections attached to a session, shared with its supervisor.
@@ -830,7 +836,7 @@ impl Pty {
         if let Some(pid) = self.pid {
             if !self.killing {
                 self.killing = true;
-                kill_session(pid);
+                kill_session(pid, KILL_AFTER);
             }
             if forget {
                 self.forgets.push(reply);
@@ -856,7 +862,7 @@ impl Pty {
         match self.pid {
             Some(pid) => {
                 self.save(true);
-                procfs::signal_session(pid, Signal::HUP);
+                kill_session(pid, crate::shutdown::HANGUP_WAIT);
             }
             None => self.phase = Phase::Stopped,
         }
@@ -1037,6 +1043,19 @@ impl Pty {
     }
 }
 
+impl Drop for Pty {
+    fn drop(&mut self) {
+        // In particular on actor panic: take the snapshot before dropping Child,
+        // not later from a supervisor looking at a possibly stale Summary.
+        if !self.killing
+            && self.stopping.is_none()
+            && let Some(pid) = self.child.as_ref().and_then(Child::id)
+        {
+            kill_session(pid, KILL_AFTER);
+        }
+    }
+}
+
 /// Route an open as a new request; other commands keep their original epoch guard.
 async fn redeliver(ctx: &Arc<Ctx>, sid: &str, cmd: Cmd) {
     match cmd {
@@ -1072,6 +1091,64 @@ async fn sleep_until(at: Option<Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn escalation_does_not_follow_a_reused_session_id() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::fs::symlink;
+        use std::process::{Command, Stdio};
+
+        // Only our children appear in this proc view. All report the same kernel
+        // session id; swapping the entries models its reassignment during the grace.
+        let proc = tempfile::tempdir().unwrap();
+        let spawn = |hup: &str| {
+            let mut child = Command::new("sh")
+                .args([
+                    "-c",
+                    &format!("trap '{hup}' HUP; echo ready; read line || :"),
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut ready = String::new();
+            BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready, "ready\n");
+            child
+        };
+        let expose = |pid: u32| {
+            let entry = proc.path().join(pid.to_string());
+            symlink(format!("/proc/{pid}"), &entry).unwrap();
+            entry
+        };
+        let mut leader = spawn("exit 42");
+        let mut straggler = spawn("");
+        let mut replacement = spawn("");
+        let leader_entry = expose(leader.id());
+        let old_member = expose(straggler.id());
+        let stat = std::fs::read_to_string(leader_entry.join("stat")).unwrap();
+        let sid = stat
+            .split_ascii_whitespace()
+            .nth(5)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let escalation = hangup_session(proc.path(), sid, KILL_AFTER);
+
+        assert_eq!(leader.wait().unwrap().code(), Some(42));
+        std::fs::remove_file(leader_entry).unwrap();
+        std::fs::remove_file(&old_member).unwrap();
+        // The straggler still lives, but its numeric slot now resolves to a
+        // different process. No slot names a reaped pid at escalation time.
+        symlink(format!("/proc/{}", replacement.id()), old_member).unwrap();
+        expose(replacement.id());
+        escalation.await;
+        let old = straggler.wait().unwrap();
+        let new = replacement.wait().unwrap();
+        assert_eq!((old.signal(), new.code()), (Some(9), Some(0)));
+    }
 
     #[test]
     fn sizes_are_clamped() {

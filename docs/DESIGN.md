@@ -314,7 +314,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `pty.detach` | `sid` | `{}` | |
 | `pty.input` | `sid, d` | – | `d` ≤ 1 MiB. Written completely and in order. If queued input would exceed 8 MiB, the whole message is dropped and the connection gets `err{sid, code:"input_overflow"}`. Input to a dead session is dropped silently. |
 | `pty.resize` | `sid, cols, rows` | – | `TIOCSWINSZ` plus the VT resize (§3.4.3). Clamped to cols 2..=1000 and rows 1..=500. Last writer wins. |
-| `pty.kill` | `sid, forget, epoch?` | `{}` | SIGHUP to every member of the PTY's session (/proc stat field 6), SIGKILL survivors after 3 s, close the master. **`forget:false`:** ok when the kill starts. **`forget:true`:** ok only after the exit, the file deletion and the registry removal. Every attached connection, and every watcher, gets `gone`. |
+| `pty.kill` | `sid, forget, epoch?` | `{}` | SIGHUP to the captured members of the PTY's session, SIGKILL survivors from that set after 3 s, close the master. **`forget:false`:** ok when the kill starts. **`forget:true`:** ok only after the exit, the file deletion and the registry removal. Every attached connection, and every watcher, gets `gone`. |
 | `pty.capture` | `sid, lines?` (default 200, max 1000) | `{text}` | plain text from the VT state, each row right-trimmed and blank rows after the last text left out; works on dead sessions |
 | `acp.open` | `sid, since, epoch?, spawn?: SpawnAcp` | `{new, summary, session, head, from, reset, configErrors?: ConfigError[]}` | then the replay as `acp.ev`, then `acp.replayed`, then live events. With a non-empty spawn config, the initiating reply waits for the hub-owned batch or its termination. Rules below. |
 | `acp.detach` | `sid` | `{}` | |
@@ -558,6 +558,8 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
   - argv is the request's `argv` with `argv[0]` replaced by the chosen shell's resolved path (§3.2.7): a single-item `argv` also gets the shell's configured `args` (an interactive, non-login start), and `[shell, "-c", cmd]` runs `cmd`;
   - the shell name is persisted in `pty/<sid>.json`. A respawn without `shell` uses it. A `shell` that names another shell wins and is persisted;
   - reaped by `Child::wait()` (pidfd).
+- **Kill:** while the leader is still unreaped, the hub opens `/proc/<pid>` handles and checks session membership (stat field 6) through those handles.
+  Both SIGHUP and the delayed SIGKILL use those same handles, so a survivor is still targeted after the leader exits, but a reused pid or session id is not.
 - **Output path:**
   1. read ≤ 64 KiB;
   2. **OutStream** holds back an incomplete UTF-8 tail (≤ 3 bytes) and an unterminated ESC/CSI/OSC/DCS tail (≤ `ESC_HOLDBACK_MAX`, counted from the sequence's ESC). The next read releases both. After 20 ms without output only the escape tail is released, as is: an incomplete character cannot be shown and waits for the next read, which completes it or turns it into U+FFFD. A respawn resets the decoder;
@@ -767,7 +769,7 @@ A pinned event appears at its own seq position, never ahead of a lower seq. Clie
   1. Every session actor refuses later requests with `err{internal, "hub stopping"}`.
   2. PTY actors snapshot their screens and SIGHUP their sessions. Agent actors close stdin and, if the agent is still there, send SIGTERM to its group at 5 s and SIGKILL at 6 s.
   3. The hub waits up to 5 s (`HANGUP_WAIT`) for the children to exit. Each exit is recorded with `reason:"hub_restart"` and the real `code`/`signal`.
-  4. It then SIGKILLs the PTY sessions that survive and waits up to 3 s (`KILL_WAIT`) for every record to be written. This covers an agent's SIGKILL at 6 s.
+  4. Five seconds after hangup, each PTY's escalation sends SIGKILL to its captured survivors if the hub is still running. The hub waits up to 3 s more (`KILL_WAIT`) for every record to be written. This covers an agent's SIGKILL at 6 s.
   5. Exit 0.
 
   `KillMode=mixed` reaps the rest, and the next start completes any record the stop did not finish.
