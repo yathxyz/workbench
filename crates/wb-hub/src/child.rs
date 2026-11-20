@@ -79,17 +79,25 @@ impl ExitWatch {
     }
 }
 
+async fn wait_pidfd(
+    fd: &AsyncFd<OwnedFd>,
+    mut peek: impl FnMut() -> io::Result<Option<WaitIdStatus>>,
+) -> io::Result<WaitIdStatus> {
+    loop {
+        let mut ready = fd.readable().await?;
+        if let Some(status) = peek()? {
+            return Ok(status);
+        }
+        ready.clear_ready();
+    }
+}
+
 pub(crate) async fn wait(watch: Option<&mut ExitWatch>) -> io::Result<WaitNotice> {
     let Some(ExitWatch { pid, wake }) = watch else {
         return std::future::pending().await;
     };
     let status = match wake {
-        ExitWake::Fd(fd) => {
-            fd.async_io(tokio::io::Interest::READABLE, |_| {
-                peek_exit(*pid)?.ok_or(io::ErrorKind::WouldBlock.into())
-            })
-            .await?
-        }
+        ExitWake::Fd(fd) => wait_pidfd(fd, || peek_exit(*pid)).await?,
         ExitWake::Sigchld(signal, check) => loop {
             if std::mem::take(check)
                 && let Some(status) = peek_exit(*pid)?
@@ -166,6 +174,23 @@ mod tests {
     use std::os::fd::AsFd;
     use std::process::{Command, Stdio};
     use std::time::Instant;
+
+    #[tokio::test]
+    async fn pidfd_returns_waitid_eagain() {
+        let mut child = Command::new("true").spawn().unwrap();
+        let fd = exit_fd(child.id()).unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            wait_pidfd(&fd, || Err(rustix::io::Errno::AGAIN.into())),
+        )
+        .await;
+        assert!(child.wait().unwrap().success());
+        let error = error.expect("waitid error swallowed").unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::AGAIN.raw_os_error())
+        );
+    }
 
     #[test]
     fn reaps_an_exited_child_while_another_stays_alive() {

@@ -589,6 +589,7 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
   - the shell name is persisted in `pty/<sid>.json`. A respawn without `shell` uses it. A `shell` that names another shell wins and is persisted;
   - before starting Tokio the hub restores the default `SIGCHLD` disposition and unblocks it, so the hub can collect exit status and receive child-exit notifications.
     Normally `waitid` with `WNOWAIT` observes exit without reaping until the actor has drained output and recorded the exit.
+    For both terminals and agents, pidfd readability triggers that observation; only a successful probe with no exit clears readiness, and `waitid` errors reach the actor.
     `ECHILD` ends the wait with unknown code and signal; cleanup may use previously captured handles, never the released pid.
     On other wait errors the actor keeps the child until its owned child handle confirms exit; where reaping releases the leader early, pre-reap handles protect panic cleanup.
     One reaper thread per hub polls PTY, agent and git helper children that could not be reaped immediately, without waiting on any one child.
