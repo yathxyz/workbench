@@ -591,7 +591,7 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
     Normally `waitid` with `WNOWAIT` observes exit without reaping until the actor has drained output and recorded the exit.
     `ECHILD` ends the wait with unknown code and signal; cleanup may use previously captured handles, never the released pid.
     On other wait errors the actor keeps the child until its owned child handle confirms exit; where reaping releases the leader early, pre-reap handles protect panic cleanup.
-    One reaper thread per hub polls PTY and agent children that could not be reaped immediately, without waiting on any one child.
+    One reaper thread per hub polls PTY, agent and git helper children that could not be reaped immediately, without waiting on any one child.
 - **Kill:** while the leader is still unreaped, the hub opens `/proc/<pid>` handles and checks session membership (stat field 6) through those handles.
   Both SIGHUP and the delayed SIGKILL use those same handles, so a survivor is still targeted after the leader exits, but a reused pid or session id is not.
   A process forked after the snapshot is not killed by this escalation; covering later forks would require containment at spawn.
@@ -655,12 +655,12 @@ Each line is `{"seq":N,"ts":…,"e":KIND,…}`.
 | `task` | `task: string\|null` | task reference set on creation, replaced or cleared; the latest event determines `Summary.acp.task` across revive and restart |
 | `policy` | `policy: Policy` | supplied spawn policy, before starting the agent, or accepted replacement/removal before replying; an empty rule array explicitly removes the policy |
 | `notice` | `level, text` | hub notes: initial configuration entry failures, the revive method, `agent stderr: <last line>` (≤ 500 characters) for an unclean exit, "agent stopped after failed setup", and the fault probe's `warn` |
-| `exit` | `code, signal, reason: "exited"\|"killed"\|"hub_restart"` | the process ended. `code` and `signal` are the agent's real exit status, including on a graceful stop; they are null only in the lines startup normalisation writes. |
+| `exit` | `code, signal, reason: "exited"\|"killed"\|"hub_restart"` | `code` or `signal` gives the agent's observed exit status, including on a graceful stop. Both are null when the status is unavailable, as on `ECHILD` or startup normalisation. |
 
 **Death invariant (pure fold).** When an agent dies, the hub writes, in order:
 1. one `*_resolved{by:"hub"}` per pending request;
 2. `turn_error` if `activity=="turn"`, or `setup_error` if `"setup"`, with code `agent_exited`, or `interrupted` for a kill or SIGTERM;
-3. for an unclean exit (a non-zero code or a signal) with a non-empty last stderr line, `notice{error, "agent stderr: …"}` (≤ 500 characters);
+3. during live finalisation, if the agent did not report exit code zero and the last stderr line is non-empty, `notice{error, "agent stderr: …"}` (≤ 500 characters);
 4. `exit`.
 
 For the live death notice, the hub includes stderr bytes already in the pipe without waiting for descendants to close it.
