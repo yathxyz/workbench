@@ -8,6 +8,7 @@
 //! A finished queue admits nothing more but still delivers what it holds.
 
 use std::collections::VecDeque;
+use std::io::{self, IoSlice};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,13 +23,25 @@ use crate::snapshot::Snapshot;
 #[derive(Debug, PartialEq, Eq)]
 pub struct Closed;
 
+pub struct WriteProgress {
+    pub line: Arc<[u8]>,
+    pub offset: usize,
+    /// Lines completed by the nonblocking write, without an async I/O budget charge.
+    pub completed: usize,
+}
+
 #[derive(Default)]
 pub struct OutQ {
     st: Mutex<State>,
     changed: Notify,
 }
 
-pub enum Output {
+pub enum WriteItem {
+    Lines(WriteProgress),
+    Snapshot(Snapshot),
+}
+
+enum Output {
     Line(Arc<[u8]>),
     Snapshot(Snapshot),
 }
@@ -85,7 +98,7 @@ impl OutQ {
         self.changed.notify_waiters();
     }
 
-    /// Ignores later pushes; [`next`](Self::next) ends once the queue is empty.
+    /// Ignores later pushes; the writer ends once the queue is empty.
     pub fn finish(&self) {
         lock(&self.st).finished = true;
         self.changed.notify_waiters();
@@ -97,33 +110,58 @@ impl OutQ {
         self.changed.notify_waiters();
     }
 
-    /// The next output item, or `None` once the queue is closed, or finished and empty.
-    pub async fn next(&self) -> Option<Output> {
+    /// Take the next snapshot whole, or try one nonblocking write across lines
+    /// ahead of it. Return the last line taken and the offset to finish outside
+    /// the lock. A blocked socket takes only the first line.
+    pub async fn pop_write(
+        &self,
+        mut try_write: impl FnMut(&[IoSlice<'_>]) -> io::Result<usize>,
+    ) -> io::Result<Option<WriteItem>> {
         let output = self
             .wait(|st| {
-                if st.closed || (st.finished && st.q.is_empty()) {
-                    return Some(None);
+                match st.q.front() {
+                    None => return (st.closed || st.finished).then_some(Ok(None)),
+                    Some(Output::Snapshot(_)) => {
+                        let Some(Output::Snapshot(snapshot)) = st.q.pop_front() else {
+                            unreachable!();
+                        };
+                        st.snapshot_pending = false;
+                        return Some(Ok(Some(WriteItem::Snapshot(snapshot))));
+                    }
+                    Some(Output::Line(_)) => {}
                 }
-                let output = st.q.pop_front()?;
-                match &output {
-                    Output::Line(line) => st.bytes -= line.len(),
-                    Output::Snapshot(_) => st.snapshot_pending = false,
+                let mut written = if st.q.len() == 1 {
+                    0
+                } else {
+                    match st.try_batch(&mut try_write) {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => 0,
+                        Err(e) => return Some(Err(e)),
+                    }
+                };
+                let mut completed = 0;
+                loop {
+                    let Some(Output::Line(line)) = st.q.pop_front() else {
+                        unreachable!("write cannot extend past queued lines");
+                    };
+                    st.bytes -= line.len();
+                    if written <= line.len() {
+                        completed += usize::from(written == line.len());
+                        return Some(Ok(Some(WriteItem::Lines(WriteProgress {
+                            line,
+                            offset: written,
+                            completed,
+                        }))));
+                    }
+                    written -= line.len();
+                    completed += 1;
                 }
-                Some(Some(output))
             })
-            .await;
+            .await?;
         if output.is_some() {
             self.changed.notify_waiters();
         }
-        output
-    }
-
-    #[cfg(test)]
-    async fn pop(&self) -> Option<Arc<[u8]>> {
-        self.next().await.map(|output| match output {
-            Output::Line(line) => line,
-            Output::Snapshot(_) => panic!("expected a line"),
-        })
+        Ok(output)
     }
 
     /// Waits until `line` fits under the cap, or the queue is empty, then queues it
@@ -197,6 +235,31 @@ impl OutQ {
 }
 
 impl State {
+    fn try_batch(
+        &self,
+        write: &mut impl FnMut(&[IoSlice<'_>]) -> io::Result<usize>,
+    ) -> io::Result<usize> {
+        let mut iov = [IoSlice::new(&[]); 64];
+        let mut bytes = 0;
+        let mut count = 0;
+        for (slot, output) in iov.iter_mut().zip(&self.q) {
+            let Output::Line(line) = output else { break };
+            bytes += line.len();
+            if bytes > 64 * 1024 {
+                break;
+            }
+            *slot = IoSlice::new(line);
+            count += 1;
+        }
+        if count < 2 {
+            return Ok(0); // large lines go through the ordinary single-line writer
+        }
+        match write(&iov[..count])? {
+            0 => Err(io::ErrorKind::WriteZero.into()),
+            n => Ok(n),
+        }
+    }
+
     fn close(&mut self) {
         self.closed = true;
         self.q.clear();
@@ -209,8 +272,88 @@ impl State {
 mod tests {
     use super::*;
 
+    impl OutQ {
+        // Exercise queue admission with a writer that takes one line at a time.
+        async fn pop(&self) -> Option<Arc<[u8]>> {
+            self.pop_write(|_| Err(io::ErrorKind::WouldBlock.into()))
+                .await
+                .unwrap()
+                .map(|item| match item {
+                    WriteItem::Lines(w) => w.line,
+                    WriteItem::Snapshot(_) => panic!("expected a line"),
+                })
+        }
+    }
+
     fn line(n: usize) -> Arc<[u8]> {
         vec![b'x'; n].into()
+    }
+
+    #[tokio::test]
+    async fn short_vectored_write_releases_only_through_the_partial_line() {
+        let q = OutQ::default();
+        for s in ["one\n", "two\n", "three\n"] {
+            q.push_reply(Arc::from(s.as_bytes()));
+        }
+        let WriteItem::Lines(partial) = q
+            .pop_write(|iov| {
+                assert_eq!(iov.len(), 3);
+                Ok(6) // "one\ntw" made it to the peer
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected lines");
+        };
+        assert_eq!(partial.completed, 1);
+        assert_eq!(&partial.line[partial.offset..], b"o\n");
+        assert_eq!(lock(&q.st).bytes, b"three\n".len());
+        assert_eq!(q.push_event(line(CONN_QUEUE)), Err(Closed));
+    }
+
+    #[tokio::test]
+    async fn blocked_batch_keeps_the_tail_charged_and_batches_stay_bounded() {
+        let q = OutQ::default();
+        for _ in 0..100 {
+            q.push_reply(line(2048));
+        }
+        let WriteItem::Lines(first) = q
+            .pop_write(|iov| {
+                assert!(iov.len() > 1 && iov.len() <= 64);
+                assert!(iov.iter().map(|s| s.len()).sum::<usize>() <= 64 * 1024);
+                Err(std::io::ErrorKind::WouldBlock.into())
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected lines");
+        };
+        assert_eq!(
+            (first.line.len(), first.offset, first.completed),
+            (2048, 0, 0)
+        );
+        assert_eq!(lock(&q.st).bytes, 99 * 2048);
+
+        let q = OutQ::default();
+        for n in [1, 65_537, 1] {
+            q.push_reply(line(n));
+        }
+        for n in [1, 65_537, 1] {
+            let WriteItem::Lines(single) = q
+                .pop_write(|_| panic!("oversize line batched with a neighbour"))
+                .await
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("expected lines");
+            };
+            assert_eq!(
+                (single.line.len(), single.offset, single.completed),
+                (n, 0, 0)
+            );
+        }
     }
 
     #[tokio::test]

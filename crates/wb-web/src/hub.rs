@@ -6,13 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use futures_util::StreamExt;
+use axum::extract::ws::Message;
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{Map, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{sleep, timeout};
+use tokio_util::bytes::Buf;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use wb_proto::hub::{
     Agent, CaptureReply, ErrorCode, Host, HubMessage, HubRequest, PROTO, SessionsReply, Summary,
@@ -137,9 +139,20 @@ pub async fn connect_relay(app: &AppState) -> Result<(HubConn, HubInfo), &'stati
 pub struct HubConn {
     rx: FramedRead<OwnedReadHalf, LinesCodec>,
     tx: OwnedWriteHalf,
+    /// Non-data lookahead belongs to the relay even if the browser flush fails.
+    pending: Option<HubMessage>,
 }
 
 impl HubConn {
+    pub(super) fn from_stream(stream: UnixStream) -> Self {
+        let (rx, tx) = stream.into_split();
+        Self {
+            rx: FramedRead::new(rx, LinesCodec::new_with_max_length(MAX_LINE)),
+            tx,
+            pending: None,
+        }
+    }
+
     /// Connects and does the handshake (§3.2.3). Returns what the hub's hello says.
     pub async fn connect(path: &Path) -> Result<(Self, HubInfo), ConnectError> {
         let unavailable = |why: String| ConnectError::Unavailable(why);
@@ -147,11 +160,7 @@ impl HubConn {
             .await
             .map_err(|_| unavailable("connect timed out".into()))?
             .map_err(|e| unavailable(e.to_string()))?;
-        let (rx, tx) = stream.into_split();
-        let mut conn = HubConn {
-            rx: FramedRead::new(rx, LinesCodec::new_with_max_length(MAX_LINE)),
-            tx,
-        };
+        let mut conn = Self::from_stream(stream);
         let hello = timeout(HELLO_TIMEOUT, conn.recv())
             .await
             .map_err(|_| unavailable("no hello".into()))?;
@@ -241,6 +250,10 @@ impl HubConn {
     }
 
     async fn recv_mode(&mut self, snapshot: bool) -> Option<HubMessage> {
+        // Lookahead only parks a decoded line and never consumes a malformed one.
+        if let Some(msg) = self.take_parked() {
+            return Some(msg);
+        }
         loop {
             match self.rx.next().await? {
                 Ok(line) => match serde_json::from_str(&line) {
@@ -257,6 +270,88 @@ impl HubConn {
                 }
             }
         }
+    }
+
+    /// Take the decoded lookahead without waiting for another hub message.
+    pub(super) fn take_parked(&mut self) -> Option<HubMessage> {
+        self.pending.take()
+    }
+
+    /// Keep unrelated lookahead queued for the next normal receive.
+    pub(super) fn take_parked_if(
+        &mut self,
+        predicate: impl FnOnce(&HubMessage) -> bool,
+    ) -> Option<HubMessage> {
+        self.pending.take_if(|msg| predicate(msg))
+    }
+
+    pub fn has_buffered_line(&self) -> bool {
+        self.rx.read_buffer().contains(&b'\n')
+    }
+
+    /// Take at most one complete buffered line. A malformed or oversize line
+    /// stays in the codec for normal receive after the preceding frames flush.
+    fn buffered_frame(
+        &mut self,
+        room: usize,
+        frame: &impl Fn(&HubMessage) -> Option<Value>,
+    ) -> Option<String> {
+        let buf = self.rx.read_buffer();
+        let end = buf[..room.min(buf.len())]
+            .iter()
+            .position(|&b| b == b'\n')?;
+        let msg = serde_json::from_str(std::str::from_utf8(&buf[..end]).ok()?).ok()?;
+        let text = match frame(&msg) {
+            Some(data) => {
+                let text = data.to_string();
+                // The relay strips the hub envelope. Still enforce the wire cap
+                // if re-encoding a noncanonical hub line increases its size.
+                if text.len() > room {
+                    return None;
+                }
+                Some(text)
+            }
+            None => {
+                self.pending = Some(msg);
+                None
+            }
+        };
+        self.rx.read_buffer_mut().advance(end + 1);
+        text
+    }
+
+    /// Flush consecutive data frames already in the decoder; never read the socket.
+    pub async fn send_ready(
+        &mut self,
+        ws: &mut (impl Sink<Message> + Unpin),
+        out: Value,
+        frame: impl Fn(&HubMessage) -> Option<Value>,
+    ) -> Result<(), End> {
+        const HEADER: usize = 10; // largest unmasked WebSocket header
+        let mut remaining: usize = 64 * 1024;
+        let mut text = out.to_string();
+        drop(out);
+        let mut count = 1;
+        loop {
+            remaining = remaining.saturating_sub(text.len() + HEADER);
+            ws.feed(Message::Text(text.into()))
+                .await
+                .map_err(|_| End::Gone)?;
+            if count == 64 {
+                break;
+            }
+            let Some(next) = self.buffered_frame(remaining.saturating_sub(HEADER), &frame) else {
+                break;
+            };
+            text = next;
+            count += 1;
+        }
+        ws.flush().await.map_err(|_| End::Gone)?;
+        // Buffered frames and a ready sink can drain without yielding to other relays.
+        if count > 1 {
+            tokio::task::yield_now().await;
+        }
+        Ok(())
     }
 }
 
@@ -550,3 +645,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod ready_tests;

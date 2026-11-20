@@ -42,6 +42,137 @@ Cells are medians of four run statistics. Six-viewer burst p95 ranges **45.29–
 
 Linux `/proc/PID/io` doesn't count these socket calls. In a separate baseline trace, 32 extra bursts/2,400 extra frames added 2,402 `sendto` and 900 `recvfrom`. To count allocations, preload jemalloc on **wb-web only**, subtract lifetime `small.nrequests + large.nrequests` for 16 bursts from the same setup with 80 bursts, six viewers, 20 keys. Baseline: 212,794 requests / 6,894 additional frames = 30.9/frame. Candidate: 201,432 / 6,366 = 31.6/frame. These short diagnostics include startup variance and use a different allocator from the timed release. No allocator improvement or lock-wait reduction claimed.
 
+## Queued writes after TCP_NODELAY
+
+Baseline `97fdfa1a5811` already has `TCP_NODELAY` on wb-web's accepted TCP sockets; the hub-to-web connection is Unix, not TCP.
+The earlier PTY trace above found roughly one socket write per output frame.
+On a warm replay of 5,004 journal events (734,723 bytes), the first baseline trace counted **5,007 successful writes on each link**: hello, events, replay marker and the trailing viewer update.
+These are sender syscalls, not packets or reads by the client.
+Before editing the senders, the separate untraced run took 133.0 ms (40.8 ms hub CPU, 57.4 ms web CPU); the isolated one-byte PTY echo measured 0.531 / 4.235 / 8.059 ms at p50 / p95 / p99.
+
+`tests/front-replay-bench.py` runs a fresh hub, web front, Caddy and WebSocket client in a private network namespace.
+It checks every event against the journal, in sequence, and requires the final replay marker.
+Timing starts at `open` on the upgraded socket and ends at receipt of the marker; CPU is scheduler time for each daemon, not the client or proxy.
+The latency probe has one byte in flight and leaves 10 ms between echoes.
+It measures delivery through Caddy and a real PTY, not key-to-paint time in a browser.
+Separate `--trace` runs count only positive write results on the two replay sockets, including the trailing update, and check byte totals against the receivers.
+Tracing can change queue depth, so write counts and timings come from different runs.
+Only the hub's nonblocking write runs under its queue lock; on a short write, the writer keeps the unfinished line and leaves later lines charged.
+The web feeds independent journal or PTY output frames to its existing sink while another complete hub line is buffered, then flushes before returning to the relay loop.
+Both paths group at most 64 messages and 64 KiB; a larger message goes alone.
+To compare release directories containing both `wb-hub` and `wb-web`, run:
+
+```sh
+bash tests/run-front-bench.sh front-replay-bench.py --bin-dir "$before" --bin-dir "$after" --repeat 8 --keys 400
+bash tests/run-front-bench.sh front-replay-bench.py --bin-dir "$before" --bin-dir "$after" --repeat 4 --trace
+```
+
+In a preliminary version the single-frame send also entered the batch routine.
+Eight paired runs cut replay wall time from 151 to 62 ms, but isolated echo p99 rose from 4.779 to 5.174 ms; a longer four-core comparison moved the other way (5.101 to 4.980 ms).
+With the hub fixed, the existing PTY benchmark also saw a higher one-key p99 (0.669 to 2.638 ms).
+The final version bypasses the batch routine entirely when no complete second line is ready and uses the original `send_json` path.
+For the longer comparison, prefix the same replay command with `taskset -c 0,2,4,6` and use `--repeat 8 --keys 1600` (four different physical cores on the measurement host).
+The web-only cross-check uses `front-relay-bench.py --web-bin "$before/wb-web" --web-bin "$after/wb-web" --viewers 1 --keys 400 --bursts 64 --repeat 4`, with the candidate hub fixed.
+The trace did not measure Caddy's downstream writes, packets, browser wakeups, rendering or WAN latency.
+
+Final results below are medians of run statistics, except for the indicated ranges.
+Each timing comparison used eight alternating A/B, B/A pairs; counts used four separate alternating traced pairs.
+
+| Per warm attach, unless noted | Before | After |
+|---|---:|---:|
+| Hub → web successful writes (range) | 5,007 | 89–279 |
+| Hub → web bytes | 961,523 | 961,523 |
+| Web → proxy successful writes (range) | 5,007 | 122–126 |
+| Web → proxy bytes (range) | 827,382–827,674 | 827,382–827,674 |
+| Replay wall, ms | 86.99 | 49.09 |
+| Hub CPU / web CPU, ms | 33.03 / 56.60 | 24.48 / 27.37 |
+| Isolated echo p50 / p95 / p99, ms (400 per run) | 0.366 / 1.465 / 3.461 | 0.351 / 2.059 / 3.707 |
+| Isolated echo p50 / p95 / p99, ms (1,600 per run, four cores) | 0.393 / 2.235 / 4.180 | 0.364 / 2.112 / 3.955 |
+
+The largest observed hub write grew from 784 to 12,377 bytes; the largest web write grew from 1,053 to 7,046 bytes, with the same events and frame boundaries.
+The shorter echo comparison's median p95 and p99 rose; the median **within-pair** differences (after minus before) were −0.017 / −0.057 / −0.401 ms.
+The longer comparison, 12,800 isolated echoes per build, had lower medians at all three percentiles; its per-run p99 ranges were 3.74–4.66 versus 3.55–5.19 ms.
+There was no consistent isolated-message slowdown, but neither a tail-latency improvement nor exact equality is established on this shared machine.
+In the web-only PTY cross-check, one-key p50 / p95 / p99 was 0.171 / 0.486 / 1.943 versus 0.178 / 0.298 / 0.940 ms; burst throughput rose from 6.94 to 8.52 MiB/s and web CPU fell from 68.82 to 56.00 ms.
+
+### One-byte echo on another connection during replay
+
+`--loaded-echo` opens a real `/pty` connection in a separate client process and drains an `/acp` replay on the first connection.
+Each attach carries 25,004 events from a 3,713,728-byte journal; the client checks the full wire image against a warm replay already verified event by event against that journal.
+The first event starts the probe window; receipt of one-quarter of the replay bytes stops new probes, leaving the rest of the stream for any outstanding echo.
+The benchmark rejects the run if any measured RTT ends at or after the replay marker, rather than discarding a slow echo.
+This measures overlapping end-to-end delivery on loopback, not time holding the hub queue lock, kernel packet timing or browser paint.
+
+```sh
+taskset -c 0,2,4,6 bash tests/run-front-bench.sh front-replay-bench.py \
+  --loaded-echo --bin-dir "$unbatched" --bin-dir "$reviewed" --bin-dir "$after" \
+  --repeat 4 --keys 400
+```
+
+The unbatched build is `97fdfa1a`, and the reviewed build is `f5b031a`.
+All three ran on the same four physical cores, in forward and then reverse order on alternate runs.
+Repeating with `--loaded-hub-workers 1` makes both connections share one hub executor worker; the web front keeps four workers in both comparisons.
+Each entry below is the median of four run percentiles (400 one-byte round trips per run), in milliseconds.
+
+| Hub workers | Unbatched p50 / p95 / p99 | Reviewed, one budget unit per batch | Web fixes only, same hub budget |
+|---|---:|---:|---:|
+| 4 | 1.783 / 5.286 / 7.482 | 5.263 / 15.043 / 18.540 | 4.656 / 13.535 / 16.809 |
+| 1 | 1.006 / 4.348 / 6.061 | 7.006 / 9.542 / 13.375 | 6.858 / 9.039 / 12.846 |
+
+Even with the web fixes, all three percentiles were slower than the unbatched build in every matched run at either worker count.
+All 9,600 RTTs finished inside their verified replay windows; the smallest observed margin to the marker was 33.8 ms.
+
+The hub now charges Tokio's cooperative budget per complete line accepted by the nonblocking write, not per batch.
+A short write charges the completed prefix only; the async write that finishes the partial line already participates in the budget.
+In a controlled test, a ready socket and 512 queued two-byte lines used to drain without yielding; another ready future can now run before the replay is drained.
+
+A second interleaved comparison kept the web fixes constant and changed only the hub budget between the last two columns.
+
+| Hub workers | Unbatched p50 / p95 / p99, ms | Web fixes, per-batch budget | Web fixes, per-line budget |
+|---|---:|---:|---:|
+| 4 | 1.558 / 4.840 / 6.451 | 6.078 / 12.789 / 15.563 | 6.017 / 12.432 / 15.787 |
+| 1 | 1.536 / 5.031 / 6.402 | 6.580 / 12.049 / 15.460 | 6.871 / 12.563 / 16.388 |
+
+With four workers the median first-event-to-marker window was 160.0 ms unbatched versus 65.8 ms with per-line accounting.
+The workload replays a fixed journal as fast as possible; it does not compare echoes at a fixed events-per-second rate.
+Per-line charging fixes the writer's scheduling behavior, but did not restore unbatched end-to-end latency under replay.
+The slowest measured echo still finished before its marker: all 9,600 RTTs in this comparison passed the overlap check, with a minimum margin of 36.1 ms.
+The remaining penalty followed the batched web front, not the hub writer: crossing the binaries reproduced it with an unbatched hub, and yielding after a successful multi-frame WebSocket flush removed it with the hub unchanged.
+
+#### Replay admission, relay scheduling and sampling
+
+The follow-up used the same 25,004-event fixture, with `97fdfa1a` unbatched and `1108586` batched, on four pinned physical cores.
+Each timing cell is the median of four interleaved run statistics: 180 echoes per run for pacing and the yield comparison, 120 for the crossed binaries, and exactly one echo on each of 64 attaches per run for the first-probe comparison.
+Pacing admitted 512 journal events every 6 ms inside the hub replay pump, with identical bursts in both builds and no delay between attaches.
+Delivery rate counts complete event frames received from the first-event observation to the quarter-wire-byte probe cutoff, divided by that interval.
+Replay duration is first event to marker, not the probe cutoff.
+
+| Experiment | Hub / web | Echo p50 / p95 / p99, ms (4 hub workers) | Echo p50 / p95 / p99, ms (1 hub worker) | Replay p50, ms (4 / 1 workers) | Probe window, k events/s (4 / 1 workers) |
+|---|---|---:|---:|---:|---:|
+| Equal load | Unbatched / unbatched | 0.93 / 2.94 / 3.66 | 1.00 / 2.98 / 3.72 | 290.5 / 290.5 | 86.3 / 86.4 |
+| Equal load | Batched / batched | 0.55 / 1.82 / 2.47 | 1.62 / 1.94 / 2.72 | 288.9 / 288.9 | 87.4 / 87.3 |
+| Fixed hub | Batched / batched | 6.38 / 12.01 / 15.74 | 6.77 / 8.70 / 11.99 | 63.1 / 62.0 | 366.7 / 391.5 |
+| Fixed hub | Batched / batched + yield | 1.21 / 4.18 / 6.12 | 0.44 / 3.10 / 4.14 | 65.5 / 64.3 | 357.6 / 375.9 |
+| Crossed binaries | Unbatched / unbatched | 1.06 / 4.02 / 5.36 | 0.39 / 1.77 / 2.55 | 146.6 / 146.3 | 171.6 / 172.6 |
+| Crossed binaries | Batched / unbatched | 0.94 / 4.46 / 6.03 | 0.28 / 2.43 / 3.48 | 142.4 / 142.8 | 182.0 / 177.5 |
+| Crossed binaries | Unbatched / batched | 4.66 / 11.00 / 13.90 | 7.28 / 13.82 / 16.33 | 66.6 / 65.6 | 356.5 / 363.5 |
+| Crossed binaries | Batched / batched | 8.07 / 13.29 / 15.29 | 6.92 / 7.91 / 8.41 | 61.4 / 61.0 | 394.8 / 390.0 |
+| First probe only | Unbatched / unbatched | 2.17 / 4.60 / 6.66 | 0.86 / 3.47 / 4.91 | 145.4 / 148.2 | 169.4 / 171.1 |
+| First probe only | Batched / batched | 8.72 / 12.38 / 14.77 | 7.08 / 8.10 / 9.33 | 61.6 / 61.4 | 394.5 / 389.4 |
+| First probe only | Batched / batched + yield | 1.20 / 3.77 / 6.48 | 0.53 / 2.81 / 3.77 | 69.0 / 63.7 | 341.5 / 374.6 |
+
+Three separate traced pairs (four hub workers, same replay) found 25,007 web-to-proxy writes unbatched and 691–697 batched at equal load; at maximum admission the batched web used 602–603 without the yield and 601–602 with it.
+Pacing brought the probe-window rate within 1.3% and suppressed most of the penalty without undoing batching, but did not make all percentiles equal.
+The fixed-hub yield lowered p50 by at least 3.7 ms in every pair while adding 2.0–2.5 ms to the paired median replay window and reducing the delivered probe-window rate by only 2.5–4.0% across the two worker settings.
+The first-probe-only comparison rules out unequal probes per attach as the explanation.
+Keep the scheduling point after a successful multi-frame flush; a single frame or failed flush does not yield there.
+
+Before the relay yield, on the original 5,004-event fixture, two interleaved trace pairs found 88 hub writes and 122–123 web writes on `f5b031a` versus 88–89 and 123 on `1108586`; all sent 961,455 hub bytes and 827,314 web bytes.
+In four untraced pairs replay took 23.78 versus 24.74 ms, with 11.12 / 13.28 versus 13.45 / 13.37 ms of hub / web CPU.
+The short isolated echo comparison (400 per run) was 0.330 / 0.645 / 1.696 versus 0.335 / 0.705 / 2.070 ms at p50 / p95 / p99.
+In eight longer alternating pairs (1,600 isolated echoes per run), the run medians were 0.315 / 0.562 / 1.405 versus 0.291 / 0.506 / 1.555 ms; median within-pair differences were −0.021 / −0.038 / −0.035 ms.
+Isolated p99 ranged from 0.975–2.221 versus 0.961–2.071 ms; these data do not establish a consistent isolated RTT change.
+
 ## Agents: switching views and live updates
 
 Three alternating pairs on desktop and 390×844 Chromium at 4× CPU throttling. 240 parent sessions plus 48 subagents, 12 repositories, eight waves of 24 real HTTP reports across the server and a page `/rpc` subscription. Wait for expected row text, selection and next frame. Timings include the existing application's update cadence. The separate DOM pass uses MutationObserver so row instrumentation isn't on the timed path.

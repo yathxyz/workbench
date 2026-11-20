@@ -22,7 +22,7 @@ use wb_proto::line::encode;
 use crate::Ctx;
 use crate::acp::{self, Act};
 use crate::env::check_client_env;
-use crate::outq::{OutQ, Output};
+use crate::outq::{OutQ, WriteItem};
 use crate::pty::{self, Cmd, Open};
 use crate::registry::SessionCmd;
 use crate::snapshot::{ARGV_BYTES_MAX, ARGV_MAX};
@@ -229,16 +229,25 @@ async fn read_line(r: &mut Lines) -> std::io::Result<Option<String>> {
 }
 
 async fn write_loop(mut wr: OwnedWriteHalf, q: Arc<OutQ>) {
-    while let Some(output) = q.next().await {
-        let write = async {
-            match output {
-                Output::Line(line) => wr.write_all(&line).await.map(|()| true),
-                Output::Snapshot(snapshot) => snapshot.write(&mut wr).await,
+    while let Ok(Some(item)) = q.pop_write(|iov| wr.try_write_vectored(iov)).await {
+        match item {
+            WriteItem::Lines(w) => {
+                if w.offset < w.line.len() {
+                    tokio::select! {
+                        r = wr.write_all(&w.line[w.offset..]) => if r.is_err() { break },
+                        () = q.closed() => break,
+                    }
+                }
+                for _ in 0..w.completed {
+                    tokio::task::consume_budget().await;
+                }
             }
-        };
-        tokio::select! {
-            r = write => if !matches!(r, Ok(true)) { break },
-            () = q.closed() => break,
+            // Each page uses its own budgeted write_all; a failed watch writes
+            // its final error before returning false and closing this queue.
+            WriteItem::Snapshot(snapshot) => tokio::select! {
+                r = snapshot.write(&mut wr) => if !matches!(r, Ok(true)) { break },
+                () = q.closed() => break,
+            },
         }
     }
     q.close();
@@ -646,6 +655,88 @@ mod tests {
             cwd_from: None,
             env: None,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_reader_ends_the_writer_and_its_queue() {
+        let (sender, reader) = UnixStream::pair().unwrap();
+        sender.writable().await.unwrap();
+        let reader = reader.into_std().unwrap();
+        // Model another test's child inheriting the socket until exec.
+        let inherited = reader.try_clone().unwrap();
+        let (_, wr) = sender.into_split();
+        let q = Arc::new(OutQ::default());
+        q.push_reply(Arc::from(&b"first\n"[..]));
+        q.push_reply(Arc::from(&b"second\n"[..]));
+        // Close the socket in both directions, even while the duplicate exists.
+        reader.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(2), write_loop(wr, q.clone()))
+            .await
+            .expect("writer hung after peer closed");
+        assert!(q.room().await.is_err());
+        drop(inherited);
+    }
+
+    #[tokio::test]
+    async fn a_ready_replay_yields_before_draining_every_line() {
+        let (sender, mut reader) = UnixStream::pair().unwrap();
+        sender.writable().await.unwrap();
+        let (_, wr) = sender.into_split();
+        let q = Arc::new(OutQ::default());
+        let line = Arc::<[u8]>::from(&b"x\n"[..]);
+        for _ in 0..512 {
+            q.push_reply(line.clone());
+        }
+        q.finish();
+
+        let mut writer = std::pin::pin!(write_loop(wr, q));
+        tokio::select! {
+            biased;
+            () = &mut writer => panic!("ready replay monopolized the worker"),
+            () = std::future::ready(()) => {}
+        }
+        let mut buf = [0; 1024];
+        let sent = reader.read(&mut buf).await.unwrap();
+        assert!((1..buf.len()).contains(&sent));
+        writer.await;
+        reader.read_exact(&mut buf[sent..]).await.unwrap();
+        assert!(buf.as_chunks::<2>().0.iter().all(|line| line == b"x\n"));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_stays_between_queued_lines() {
+        use crate::snapshot::{Snapshot, SnapshotMode};
+
+        let (sender, mut reader) = UnixStream::pair().unwrap();
+        let (_, wr) = sender.into_split();
+        let q = Arc::new(OutQ::default());
+        for line in [b"first\n".as_slice(), b"second\n"] {
+            q.push_reply(Arc::from(line));
+        }
+        q.push_snapshot(Snapshot {
+            rid: 1,
+            mode: SnapshotMode::Stream { watch: true },
+            sessions: Vec::new(),
+        });
+        for line in [b"third\n".as_slice(), b"fourth\n"] {
+            q.push_event(Arc::from(line)).unwrap();
+        }
+        q.finish();
+
+        let mut wire = String::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(write_loop(wr, q), reader.read_to_string(&mut wire)).1
+        })
+        .await
+        .expect("writer did not finish")
+        .unwrap();
+        let mut lines = wire.lines();
+        assert_eq!(lines.next(), Some("first"));
+        assert_eq!(lines.next(), Some("second"));
+        let reply: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(reply, serde_json::json!({"t":"ok","rid":1,"sessions":[]}));
+        assert!(lines.eq(["third", "fourth"]));
     }
 
     #[test]
