@@ -4305,10 +4305,8 @@ mod tests {
         };
         ctx.registry.deliver("a", cmd).await;
         // The supervisor notifies attached viewers after publishing the new actor.
-        watchdog(async {
-            while read_reply(&viewer).await["message"] != "session reloaded" {}
-        })
-        .await;
+        watchdog(async { while read_reply(&viewer).await["message"] != "session reloaded" {} })
+            .await;
     }
 
     #[tokio::test]
