@@ -469,7 +469,7 @@ Otherwise, when a request fails several checks, the first in this list applies:
 | `ACP_CONFIG_OPTIONS_MAX` | 64 options in an agent's full offering | a larger list is malformed |
 | `ACP_CONFIG_OPTIONS_BYTES` | 64 KiB of compact serialized UTF-8 JSON for the full offering | a larger list is malformed; oversized legacy journal offerings fold to none (§3.4.5) |
 | `GIT_NAME_MAX` | 255 bytes per requested branch or base | `bad_request` |
-| `GIT_TIMEOUT` / `GIT_WORKTREE_TIMEOUT` | 30 s for git queries and branch/lock updates; 120 s for `worktree add` and `worktree remove` | kill the process group and fail the request |
+| `GIT_TIMEOUT` / `GIT_WORKTREE_TIMEOUT` | 30 s for git queries and branch/lock updates; 120 s for `worktree add` and `worktree remove` | kill the owned git helper and its original process group, then fail the request |
 | `TASK_MAX` | 512 UTF-8 bytes after trimming | ACP: hub `bad_request`, API 400; harness report: ignore the field, keep the stored task |
 | `POLICY_MAX` | 256 KiB serialized JSON per policy | hub `bad_request`; API 400 "bad body", before spawn; invalid journal replacements clear policy until a later valid event |
 | `POLICY_RULES_MAX` / `POLICY_PATTERNS_MAX` / `POLICY_PATTERN_MAX` | 64 rules / 128 command patterns across all rules / 4096 bytes per pattern | hub `bad_request`; API 400 "bad body", before spawn |

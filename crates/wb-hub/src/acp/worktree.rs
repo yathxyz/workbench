@@ -13,7 +13,7 @@ use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use rustix::fs::OFlags;
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdout};
@@ -130,7 +130,10 @@ impl GitChild<'_> {
 }
 
 fn kill_helper(child: &Child) {
-    let _ = kill_process_group(Pid::from_child(child), Signal::KILL);
+    let pid = Pid::from_child(child);
+    let _ = kill_process_group(pid, Signal::KILL);
+    // A configured wrapper can move itself out of its original group.
+    let _ = kill_process(pid, Signal::KILL);
 }
 
 impl Drop for GitChild<'_> {

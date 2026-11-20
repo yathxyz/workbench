@@ -953,6 +953,46 @@ async fn git_echild_leaves_the_old_group_alone() {
 }
 
 #[tokio::test]
+async fn abort_kills_git_that_left_its_group() {
+    use rustix::process::{getpgid, getpgrp, getpid, getppid, setpgid};
+
+    if env::var_os("WB_TEST_REGROUP_GIT").is_some() {
+        // Running as the configured wrapper, initially leader of the git group.
+        assert_eq!(getpgrp(), getpid());
+        setpgid(None, Some(getpgid(getppid()).unwrap())).unwrap();
+        fs::write("pid", std::process::id().to_string()).unwrap();
+        fs::rename("pid", "ready").unwrap();
+        std::thread::sleep(Duration::from_secs(90));
+        return;
+    }
+
+    let f = Fixture::new();
+    symlink(env::current_exe().unwrap(), f.temp.join("test")).unwrap();
+    let fake = f.temp.join("git-wrapper");
+    script(
+        &fake,
+        "WB_TEST_REGROUP_GIT=1 exec ./test abort_kills_git_that_left_its_group",
+    );
+    let mut command = Box::pin(run(
+        test_git(&fake),
+        &f.temp,
+        &["status"],
+        GIT_WORKTREE_TIMEOUT,
+    ));
+    let ready = f.temp.join("ready");
+    tokio::select! {
+        result = &mut command => panic!("wrapper exited early: {result:?}"),
+        _ = wait_for("git wrapper to change group", || ready.is_file()) => {}
+    }
+    let pid = fs::read_to_string(ready).unwrap().parse().unwrap();
+    drop(command); // JoinSet::shutdown drops run_with here.
+    wait_for("escaped git wrapper to be killed and reaped", || {
+        crate::child::peek_exit(pid).is_err_and(|e| is_echild(&e))
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn git_deadline_includes_descendants_holding_the_pipes() {
     let f = Fixture::new();
     let fake = f.temp.join("sleeping-git");
