@@ -232,9 +232,14 @@ pub enum Route<C> {
 impl Registry {
     pub fn open(dir: &Path, instance_lock: &File) -> io::Result<Self> {
         let last = match std::fs::read_to_string(dir.join(EPOCH_FILE)) {
-            Ok(text) => text
-                .parse()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            Ok(text) => {
+                let last = text
+                    .parse()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                // A previous seed may have renamed the mark but failed its directory sync.
+                store::sync_dir(dir)?;
+                last
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
             Err(e) => return Err(e),
         };
@@ -767,6 +772,37 @@ mod tests {
             meta.exists(),
             "the only copy of the old epoch was quarantined before seeding"
         );
+    }
+
+    #[tokio::test]
+    async fn restart_must_sync_visible_recovery_seed() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = state.path();
+        let instance_lock = File::create(dir.join("hub.lock")).unwrap();
+        await_successor_lock(&instance_lock);
+        let fault = dir.join(store::FAIL_DIR_SYNC);
+        std::fs::write(&fault, b"").unwrap();
+
+        // No mark yet: opening still works, but the seed fails after its rename.
+        let high = 100;
+        let hub = Registry::open(dir, &instance_lock).unwrap();
+        assert!(hub.seed_recovered(high).await.is_err());
+        drop(hub);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(EPOCH_FILE)).unwrap(),
+            high.to_string()
+        );
+
+        // The visible mark equals the recovered maximum. Its rename still
+        // needs a successful directory sync before startup can trust it.
+        assert!(
+            Registry::open(dir, &instance_lock).is_err(),
+            "restart trusted the visible seed without syncing its directory"
+        );
+        std::fs::remove_file(fault).unwrap();
+        let hub = Registry::open(dir, &instance_lock).unwrap();
+        hub.seed_recovered(high).await.unwrap();
+        assert_eq!(create(&hub, 1).await, high + 1);
     }
 
     #[tokio::test]

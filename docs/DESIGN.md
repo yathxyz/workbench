@@ -551,6 +551,8 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
 - `last-created` uses the same atomic write and is never deleted by forget.
   On upgrade, the hub seeds the mark from the maximum epoch in valid PTY and ACP metadata, including ACP records shadowed by a PTY or paired with an unreadable journal. The mark is durable before any such metadata is quarantined, any faulted record gets a new epoch, or clients are accepted.
   This ordering guarantee cannot cover a session forgotten before the upgrade: its epoch is no longer on disk.
+  On the first start without a mark, recovery continues past unreadable metadata; its epoch cannot seed the mark and may be issued again.
+  Before trusting an existing mark, startup fsyncs the state directory even if the recovered maximum equals the mark.
   An unreadable or malformed mark is an error, not a reset.
   An orderly stop waits for outstanding mark writes before releasing `hub.lock`. Each writer also retains the same flocked open file description through its write, so unwinding without an orderly stop cannot hand the lock to a successor too early.
 - The journal is appended with one `pwrite(2)` per event at the tracked end of its last complete line, never with `O_APPEND`. If a failed append cannot even be truncated away, what is left is a prefix of a line with no `\n`: the next append overwrites it, and the next open truncates it. `fdatasync` runs on `session`, `setup_error`, `turn_end`, `turn_error`, `exit` and SIGTERM.

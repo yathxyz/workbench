@@ -163,6 +163,18 @@ async fn blocking<T: Send + 'static>(
         .unwrap_or_else(|e| Err(io::Error::other(e)))
 }
 
+#[cfg(test)]
+pub(crate) const FAIL_DIR_SYNC: &str = ".fail-dir-sync";
+
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
+    // Fault only this test's temporary directory, including on blocking workers.
+    #[cfg(test)]
+    if dir.join(FAIL_DIR_SYNC).exists() {
+        return Err(rustix::io::Errno::IO.into());
+    }
+    File::open(dir)?.sync_all()
+}
+
 /// Replaces `dir/name` with `data`: a temporary file, fsync, rename, fsync of `dir`.
 pub fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> io::Result<()> {
     let tmp = dir.join(format!("{name}.tmp"));
@@ -176,7 +188,7 @@ pub fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> io::Result<()> {
     f.sync_all()?;
     drop(f);
     fs::rename(&tmp, dir.join(name))?;
-    File::open(dir)?.sync_all()
+    sync_dir(dir)
 }
 
 fn delete(dir: &Path, sid: &str) -> io::Result<()> {
