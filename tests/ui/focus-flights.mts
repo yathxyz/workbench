@@ -101,7 +101,7 @@ async function interruptedQuote(p: Page, id: string, shell: string, action: 'car
   check(`N50: leaving via ${action} during PDF text lookup cancels the quote scroll and focus`, result.navigated && !result.scrolled && !result.focused, JSON.stringify(result));
 }
 
-async function quoteDuringRender(p: Page, id: string, other: string, action: 'layout' | 'clamp' | 'clamp-return' | 'quote-scroll' | 'close' | 'switch' | 'manual' | 'manual-layout') {
+async function quoteDuringRender(p: Page, id: string, other: string, action: 'layout' | 'clamp' | 'clamp-return' | 'clamp-commands' | 'quote-scroll' | 'close' | 'switch' | 'manual' | 'manual-layout') {
   const size = p.viewportSize()!;
   if (action === 'layout') {
     await p.exposeFunction('n50ResizePdf', (width: number) => p.setViewportSize({ ...size, width }));
@@ -126,6 +126,7 @@ async function quoteDuringRender(p: Page, id: string, other: string, action: 'la
     }));
     let count = 0, focused = false;
     const manual = action === 'manual' || action === 'manual-layout';
+    const clampReturn = action === 'clamp-return' || action === 'clamp-commands';
     const done = Promise.withResolvers<void>(), saveFocus = P.scroll.focus;
     page.streamTextContent = function () {
       const render = renders[count++];
@@ -136,13 +137,13 @@ async function quoteDuringRender(p: Page, id: string, other: string, action: 'la
         async pull(controller) {
           await render.release.promise;
           if (render.cancelled) return;
-          if (action !== 'manual' && action !== 'quote-scroll' && action !== 'clamp' && action !== 'clamp-return') controller.enqueue(content);
+          if (action !== 'manual' && action !== 'quote-scroll' && action !== 'clamp' && !clampReturn) controller.enqueue(content);
           controller.close();
         },
         cancel() { render.cancelled = true; render.release.resolve(); },
       });
     };
-    P.scroll.focus = function (options) { focused = true; saveFocus.call(this, options); if (manual || action === 'clamp-return') done.resolve(); };
+    P.scroll.focus = function (options) { focused = true; saveFocus.call(this, options); if (manual || clampReturn) done.resolve(); };
     try {
       if (manual) {
         C.jumpNode(n);
@@ -171,7 +172,7 @@ async function quoteDuringRender(p: Page, id: string, other: string, action: 'la
         return { ok: before === 2 && clamped === 1 && removed && !focusedEarly && cancelled === 3 && landed === 2 && hit && focused,
           before, clamped, removed, focusedEarly, cancelled, landed, hit, focused };
       }
-      if (action === 'clamp-return') {
+      if (clampReturn) {
         const layout = Promise.withResolvers<void>(), scroll = P.scroll;
         const observer = new MutationObserver(() => { if (!initial.isConnected) layout.resolve(); });
         observer.observe(pg.el, { childList: true });
@@ -187,16 +188,29 @@ async function quoteDuringRender(p: Page, id: string, other: string, action: 'la
           finally { abort.abort(); }
           return scroll.scrollTop;
         };
-        const away = await scrollTo(pg.el.offsetTop);
-        await wait('holding the replacement render', renders[1].started.promise);
-        const returned = await scrollTo(0);
+        let away: number, returned: number, reported: number | undefined;
+        if (action === 'clamp-commands') {
+          await wait('holding the visible replacement render', renders[1].started.promise);
+          const event = Promise.withResolvers<number>(), abort = new AbortController();
+          scroll.addEventListener('scroll', () => event.resolve(scroll.scrollTop), { once: true, signal: abort.signal });
+          try {
+            C.KC['pdf.down'](); away = scroll.scrollTop;
+            C.KC['pdf.up'](); returned = scroll.scrollTop;
+            reported = await wait('dispatching the coalesced scroll event', event.promise);
+          } finally { abort.abort(); }
+        } else {
+          away = await scrollTo(pg.el.offsetTop);
+          await wait('holding the replacement render', renders[1].started.promise);
+          returned = await scrollTo(0);
+        }
         const focusedEarly = focused;
         renders[1].release.resolve(); renders[0].release.resolve();
         await wait('rendering the layer without spans', pg.textReady!);
         await wait('finishing the quote after returning to the top', done.promise);
         const landed = scroll.scrollTop, hit = !!pg.el.querySelector('.pdf-hit');
-        return { ok: before === 2 && clamped === 0 && clampedPage === 1 && away > 100 &&
-          returned === 0 && !focusedEarly && landed === 0 && !hit, before, clamped, clampedPage, away, returned, focusedEarly, landed, hit };
+        return { ok: before === 2 && clamped === 0 && clampedPage === 1 && returned === 0 && !focusedEarly && landed === 0 && !hit &&
+          (action === 'clamp-commands' ? away === 60 && reported === 0 : away > 100),
+          before, clamped, clampedPage, away, returned, reported, focusedEarly, landed, hit };
       }
       if (action === 'manual-layout' || action === 'clamp') {
         C.focusOpen(n);
@@ -243,6 +257,7 @@ async function quoteDuringRender(p: Page, id: string, other: string, action: 'la
     layout: 'a quote follows repeated layout replacements without waiting for discarded text layers',
     clamp: 'a quote with no spans restores the target page when the layout clamps it',
     'clamp-return': 'returning to the top during a clamped quote render preserves the user scroll',
+    'clamp-commands': 'coalesced reader Down and Up commands preserve the return to a clamped position',
     'quote-scroll': 'a quote with no spans preserves a scroll made during rendering without a resize',
     close: 'closing a PDF settles its pending quote and cancels the discarded render',
     switch: 'switching PDFs settles the pending quote without waiting for the old render',
@@ -252,9 +267,9 @@ async function quoteDuringRender(p: Page, id: string, other: string, action: 'la
   check(`N50: ${name}`, result.ok, JSON.stringify(result));
 }
 
-async function quoteAfterFind(p: Page, id: string) {
-  const result = await p.evaluate(async id => {
-    const C = window.__canvas, n = C.S.nodes[id], P: PdfLive = C.live[id].pdf;
+async function quoteAfterFind(p: Page, id: string, resize = false) {
+  const result = await p.evaluate(async ({ id, resize }) => {
+    const C = window.__canvas, n = C.S.nodes[id], L = C.live[id], P: PdfLive = L.pdf;
     async function wait<T>(stage: string, promise: Promise<T>): Promise<T> {
       let timer: number;
       try {
@@ -267,15 +282,22 @@ async function quoteAfterFind(p: Page, id: string) {
     await wait('warming lookup', C.pdfText(n));
     const pg = P.pages[1], page = pg.page!, scroll = P.scroll, stream = page.streamTextContent;
     const content = await wait('reading fixture text', page.getTextContent());
-    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(), positioned = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>(), replacement = Promise.withResolvers<void>(), positioned = Promise.withResolvers<void>();
+    const renders = [release, replacement].map(gate => ({ gate, started: Promise.withResolvers<void>(), cancelled: false }));
     const frame = () => new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
     const top = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop')!;
     const a = 'manual find alpha', b = 'manual find omega';
-    let renders = 0;
+    let count = 0;
     page.streamTextContent = function () {
-      renders++; entered.resolve();
+      const render = renders[count++];
+      if (!render) return stream.call(this);
+      render.started.resolve();
       return new ReadableStream({
-        async pull(controller) { await release.promise; controller.enqueue(content); controller.close(); },
+        async pull(controller) {
+          await render.gate.promise;
+          if (!render.cancelled) { controller.enqueue(content); controller.close(); }
+        },
+        cancel() { render.cancelled = true; },
       });
     };
     try {
@@ -283,8 +305,8 @@ async function quoteAfterFind(p: Page, id: string) {
       C.CMDS.find((c: PaletteItem) => c.l === 'PDF: find in the active PDF…').run();
       document.querySelector<HTMLInputElement>('#ask-in')!.value = a;
       document.querySelector<HTMLFormElement>('#ask-form')!.requestSubmit();
-      await wait('entering the manual find render', entered.promise);
-      const layer = pg.text;
+      await wait('entering the manual find render', renders[0].started.promise);
+      const original = pg.text, prior = pg.textReady!;
       Object.defineProperty(scroll, 'scrollTop', {
         configurable: true, get: () => top.get!.call(scroll),
         set: y => { top.set!.call(scroll, y); positioned.resolve(); },
@@ -292,8 +314,16 @@ async function quoteAfterFind(p: Page, id: string) {
       C.jumpRef({ text: b, src: { node: id, page: 2 } });
       await wait('positioning the quote at the shared page', positioned.promise);
       await wait('joining the shared text layer', frame());
+      if (resize) {
+        const body: HTMLElement = L.body;
+        body.style.width = `${body.clientWidth + 80}px`;
+        await wait('starting the replacement render', renders[1].started.promise);
+        replacement.resolve();
+        await wait('rendering the replacement before releasing the old stream', pg.textReady!);
+      }
+      const layer = pg.text;
       release.resolve();
-      await wait('rendering the shared text layer', pg.textReady!);
+      await wait('settling the original text layer', prior);
       await wait('finishing both continuations', frame());
       const spans = [...layer!.querySelectorAll('span')];
       const where = (text: string) => {
@@ -301,14 +331,14 @@ async function quoteAfterFind(p: Page, id: string) {
         return Math.min(scroll.scrollHeight - scroll.clientHeight, pg.el.offsetTop - P.pages[0].el.offsetTop + Math.max(0, span.offsetTop - 60));
       };
       const alpha = where(a), omega = where(b), landed = scroll.scrollTop;
-      return { ok: pg.text === layer && renders === 1 && omega - alpha > 100 && Math.abs(landed - omega) <= 1 &&
-        spans.some(s => s.textContent === b && s.classList.contains('pdf-hit')),
-        renders, shared: pg.text === layer, alpha, omega, landed };
+      return { ok: count === (resize ? 2 : 1) && pg.text === layer && (layer !== original) === resize &&
+        omega - alpha > 100 && Math.abs(landed - omega) <= 1 && spans.some(s => s.textContent === b && s.classList.contains('pdf-hit')),
+        renders: count, replaced: layer !== original, alpha, omega, landed };
     } finally {
-      release.resolve(); delete (scroll as Partial<HTMLElement>).scrollTop; page.streamTextContent = stream;
+      release.resolve(); replacement.resolve(); delete (scroll as Partial<HTMLElement>).scrollTop; page.streamTextContent = stream;
     }
-  }, id);
-  check('N50: a quote takes precedence over an earlier find waiting for the same text layer', result.ok, JSON.stringify(result));
+  }, { id, resize });
+  check(`N50: a quote takes precedence over an earlier find ${resize ? 'after replacing' : 'waiting for'} the shared text layer`, result.ok, JSON.stringify(result));
 }
 
 async function quoteWhileLoadFails(p: Page) {
@@ -440,13 +470,17 @@ export async function focusFlights(p: Page, shell: string) {
     } finally { await p.evaluate(name => { delete window.__canvas.S.views[name]; }, name); }
   } finally { await close(id); }
 
-  const find = await add('n50-find-then-quote');
-  try { await quoteAfterFind(p, find); } finally { await close(find); }
+  for (const resize of [false, true]) {
+    const find = await add(resize ? 'n50-replaced-waiters' : 'n50-find-then-quote');
+    try { await quoteAfterFind(p, find, resize); } finally { await close(find); }
+  }
   const size = p.viewportSize()!;
   await p.setViewportSize({ ...size, height: 1700 }); // Taller than the stale pages, but not the enlarged layout.
   try {
-    const clamp = await add('n50-clamp-return');
-    try { await quoteDuringRender(p, clamp, '', 'clamp-return'); } finally { await close(clamp); }
+    for (const action of ['clamp-return', 'clamp-commands'] as const) {
+      const clamp = await add(`n50-${action}`);
+      try { await quoteDuringRender(p, clamp, '', action); } finally { await close(clamp); }
+    }
   } finally { await p.setViewportSize(size); }
   await quoteWhileLoadFails(p);
 }

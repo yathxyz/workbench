@@ -8375,8 +8375,7 @@ function mountPdf(n: PdfNode, L: LiveEntry) {
   L.body!.append(scroll, note); L.note = note;
   const P: PdfLive = L.pdf = { doc: null, load: null, err: '', scroll, pages: [], w: 0, texts: [] };
   scroll.addEventListener('scroll', () => {
-    const jump = pdfQuoteJump;
-    if (jump?.owner === P && jump.clampedTop !== scroll.scrollTop) jump.clampedTop = undefined;
+    pdfUnclampOnScroll(P);
     pdfSoon(80); pdfPosSave(n);
   }, { passive: true });
   scroll.addEventListener('pointerdown', () => activate(n.id));
@@ -8672,6 +8671,10 @@ async function pdfFind(n: PdfNode, text: string, i: number, prefix = '', suffix 
 }
 interface PdfQuoteJump { id: string; owner: PdfLive; want: string; page?: PdfPageLive; clampedTop?: number; start(): Promise<void>; finish(): void }
 let pdfQuoteJump: PdfQuoteJump | null = null;
+function pdfUnclampOnScroll(P: PdfLive) {
+  const jump = pdfQuoteJump;
+  if (jump?.owner === P && jump.clampedTop !== P.scroll.scrollTop) jump.clampedTop = undefined;
+}
 // Layout redraws the target even if clamping put it off screen. Only its current render can land the jump.
 function pdfQuoteDraw(P: PdfLive) {
   const jump = pdfQuoteJump;
@@ -8680,11 +8683,11 @@ function pdfQuoteDraw(P: PdfLive) {
   if (!p.text && p.page) pdfTextLayer(P, p, p.page);
   if (p.textTask === null) pdfQuoteReady(P, p);
   else {
-    // Join this layer after any find already waiting for it.
+    // Give a find rejoining after cancellation its turn on the replacement layer first.
     const ready = p.textReady;
-    void ready?.then(() => {
+    void ready?.then(() => queueMicrotask(() => {
       if (pdfQuoteJump === jump && p.textReady === ready) pdfQuoteReady(P, p);
-    });
+    }));
   }
 }
 function pdfQuoteReady(P: PdfLive, p: PdfPageLive) {
@@ -8787,8 +8790,9 @@ function pdfKeyCard(): PdfNode | null {
   return n?.kind === 'pdf' ? n : null;
 }
 function pdfKey(f: (n: PdfNode, P: PdfLive) => unknown) { return () => { const n = pdfKeyCard(), P = n && live[n.id]?.pdf; if (!n || !P) return false; f(n, P); }; }
+const pdfStep = (top: number) => pdfKey((_, P) => { P.scroll.scrollBy({ top }); pdfUnclampOnScroll(P); });
 const PDF_KC: Record<string, KeyCmdFn> = {
-  'pdf.down': pdfKey((n, P) => P.scroll.scrollBy({ top: 60 })), 'pdf.up': pdfKey((n, P) => P.scroll.scrollBy({ top: -60 })),
+  'pdf.down': pdfStep(60), 'pdf.up': pdfStep(-60),
   'pdf.screen': pdfKey((n, P) => P.scroll.scrollBy({ top: P.scroll.clientHeight * 0.9, behavior: reduceMotion ? 'auto' : 'smooth' })),
   'pdf.screenBack': pdfKey((n, P) => P.scroll.scrollBy({ top: -P.scroll.clientHeight * 0.9, behavior: reduceMotion ? 'auto' : 'smooth' })),
   'pdf.next': pdfKey(n => pdfGo(n, pdfWhere(n).page)), 'pdf.prev': pdfKey(n => { const w = pdfWhere(n); pdfGo(n, w.y > 0.05 ? w.page - 1 : w.page - 2); }),
