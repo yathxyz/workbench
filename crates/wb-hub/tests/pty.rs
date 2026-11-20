@@ -463,7 +463,11 @@ fn kill_reaches_every_member_of_the_session() {
     c.ok(json!({"t": "pty.kill", "sid": "tree", "forget": false}));
     let exit = c.until("pty.exit", |m| m["t"] == "pty.exit");
     assert_eq!(exit["reason"], "killed", "{exit}");
-    assert!(!running(shell), "the shell was not reaped");
+    // The exit event can arrive before the actor reaps the leader.
+    let proc_path = format!("/proc/{shell}");
+    eventually(Duration::from_secs(5), "the shell was not reaped", || {
+        !fs::exists(&proc_path).unwrap()
+    });
     assert!(
         wait_gone(bg, Duration::from_secs(6)),
         "background job {bg} survived"
@@ -487,7 +491,12 @@ fn exit_is_reported_and_the_corpse_can_be_attached_and_respawned() {
         exit,
         json!({"t": "pty.exit", "sid": "ex", "code": 7, "signal": null, "reason": "exited"})
     );
-    assert!(!running(pid), "the child is a zombie or still running");
+    let proc_path = format!("/proc/{pid}");
+    eventually(
+        Duration::from_secs(5),
+        "the child is a zombie or still running",
+        || !fs::exists(&proc_path).unwrap(),
+    );
 
     let mut other = hub.connect();
     let corpse = other.ok(json!({"t": "pty.open", "sid": "ex", "cols": 80, "rows": 24}));
