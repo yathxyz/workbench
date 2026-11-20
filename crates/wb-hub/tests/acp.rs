@@ -2859,6 +2859,10 @@ fn hub_startup_config_journal_failure_releases_open_and_fails_remaining_entries(
             .len(),
         1
     );
+    // Probe the one-shot failure and record the held-back exit before comparing folds.
+    c.ok(json!({"t": "acp.kill", "sid": "a1", "forget": false}));
+    assert!(c.summary("a1")["fault"].is_null());
+    assert_eq!(hub.kinds("a1"), ["spawn", "session", "exit"]);
     drop(c);
     fold_equals_live(&mut hub);
 }
@@ -3565,8 +3569,7 @@ fn hub_sigterm_midturn_writes_hub_restart_and_ends_the_group() {
     fold_equals_live(&mut hub);
 }
 
-// The hub reads WB_HUB_TEST_FAIL_WRITE_AT only in debug builds; nix runs these tests
-// against the release binary, which has no hook.
+// The release `package` check omits this test; `debug-tests` runs it with the hook enabled.
 #[cfg(debug_assertions)]
 #[test]
 fn hub_journal_write_fault_fails_closed_and_recovers() {

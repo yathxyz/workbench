@@ -35,7 +35,7 @@ Against a local Edwin checkout, add `--override-input edwin git+file:///path/to/
 
 ```sh
 cargo test --workspace      # in nix develop: wb-cli's tests start the edwind of WB_EDWIND_MAIN
-nix flake check -L          # package, clippy, fmt, security (end to end), vm (needs KVM), and Edwin's own checks
+nix flake check -L          # package, debug-tests (hub), clippy, fmt, security (end to end), vm (needs KVM), and Edwin's own checks
 ```
 
 The JavaScript is TypeScript (erasable syntax only, `tsc --strict`, the flake check `typecheck`). Node 24 runs the
