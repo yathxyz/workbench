@@ -1,8 +1,6 @@
-# `nix flake check`: package (with cargo test), clippy, fmt, the black-box conformance suite, the end-to-end security
-# suite, the browser suite, the key contexts, the board's addresses against Edwin's, the adapter probe against the
-# stub, the VM test, the module's assertions. The harness registers wb-fake-acp (the package's `fake` output) as its
-# `stub` agent, so every check that starts it has that output on PATH; edwind and edwin-web (WB_EDWIN_WEB_ROOT) are
-# the edwin input's, which only the tests use.
+# `package` tests the workspace in release; `debug-tests` also exercises the hub's debug-only hooks.
+# The harness registers wb-fake-acp (the package's `fake` output) as its `stub` agent, so every check that
+# starts it has that output on PATH; edwind and edwin-web (WB_EDWIN_WEB_ROOT) are the edwin input's.
 {
   pkgs,
   self,
@@ -100,6 +98,17 @@ let
 in
 {
   package = workbench;
+
+  debug-tests = workbench.overrideAttrs (_: {
+    pname = "workbench-debug-tests";
+    outputs = [ "out" ];
+    dontBuild = true;
+    cargoCheckType = "debug";
+    cargoTestFlags = [ "--package=wb-hub" ];
+    preCheck = "export BASH";
+    installPhase = "touch $out";
+    postInstall = "";
+  });
 
   clippy = workbench.overrideAttrs (old: {
     pname = "workbench-clippy";
