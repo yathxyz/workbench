@@ -451,6 +451,23 @@ export async function focusFlights(p: Page, shell: string) {
       const address = await p.evaluate(() => { window.__canvas.hashSync(); return decodeURIComponent(location.hash.slice(1)); });
       check(`N50: browser Back from focus restores canvas geometry before navigating to ${target}`, landed && address === target && !actual.focus && actual.world === expected.world && actual.w === expected.w && actual.h === expected.h, JSON.stringify({ landed, address, expected, actual }));
     }
+
+    // Back has landed at the root. Queue both fragment changes before either hashchange runs.
+    const visits = await p.evaluateHandle(shell => {
+      const C = window.__canvas, selected: (string | null)[] = [], events = new AbortController();
+      addEventListener('popstate', e => e.stopImmediatePropagation(), { capture: true, signal: events.signal });
+      addEventListener('hashchange', () => {
+        selected.push(C.activeId);
+        if (selected.length === 2) events.abort();
+      }, { signal: events.signal });
+      location.hash = C.addrOf(C.S.nodes[shell]);
+      location.hash = 'board:/';
+      return selected;
+    }, shell);
+    await p.waitForFunction(visits => visits.length === 2, visits);
+    const selected = await visits.jsonValue();
+    check('N50: queued hashchanges select the card then return to the board root', selected[0] === shell && selected[1] === null, JSON.stringify(selected));
+
     for (const action of ['card', 'fit', 'workspace'] as const) await interruptedQuote(p, id, shell, action);
 
     const saved = { x: 400, y: -600, z: 0.35 }, point = '@1024,2048', name = 'n50-saved';
