@@ -689,6 +689,26 @@ async fn gone_closes_1000() {
     let (mut ws, _, conn) = attached(&hub, &web, "g1").await;
     send_json(&mut ws, json!({"t": "kill", "forget": true})).await;
     wait_on_conn(&hub, conn, 2).await;
+    // Independent frames on both sides of the write-batch size, followed
+    // immediately by a close. Neither the tail nor the close can overtake one.
+    let mut expected = Vec::new();
+    for (i, n) in [20, 48_000, 20_000, 70_000, 10, 10].into_iter().enumerate() {
+        let event = ev(
+            i as u64 + 1,
+            EventBody::Notice {
+                level: wb_proto::journal::NoticeLevel::Info,
+                text: "x".repeat(n),
+            },
+        );
+        expected.push(json!({"t": "ev", "ev": event}));
+        hub.send(
+            conn,
+            HubMessage::AcpEv {
+                sid: "g1".into(),
+                ev: event,
+            },
+        );
+    }
     hub.send(
         conn,
         HubMessage::Gone {
@@ -705,7 +725,8 @@ async fn gone_closes_1000() {
     );
     let (code, texts) = read_to_close(&mut ws).await;
     assert_eq!(code, 1000);
-    assert_eq!(texts, [json!({"t": "gone", "epoch": EPOCH})]);
+    expected.push(json!({"t": "gone", "epoch": EPOCH}));
+    assert_eq!(texts, expected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

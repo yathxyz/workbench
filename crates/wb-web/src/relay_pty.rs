@@ -83,7 +83,10 @@ async fn run(app: AppState, mut ws: WebSocket) {
                 Err(End::Close(close::POLICY, "no open in time"))
             }
             () = sleep_until(reply_by.unwrap_or_else(Instant::now)), if reply_by.is_some() => {
-                Err(End::Close(close::HUB_LOST, "the hub did not answer open"))
+                match relay.reply_deadline_msg() {
+                    Ok(msg) => relay.hub_msg(&mut ws, msg).await,
+                    Err(end) => Err(end),
+                }
             }
             tick = keepalive.tick() => match tick {
                 Tick::Ping => ws.send(Message::Ping(Bytes::new())).await.map_err(|_| End::Gone),
@@ -143,6 +146,13 @@ impl Relay {
 
     async fn send(&mut self, req: &HubRequest) -> Result<(), End> {
         self.hub.send(req).await.map_err(|_| HUB_LOST)
+    }
+
+    fn reply_deadline_msg(&mut self) -> Result<HubMessage, End> {
+        // A browser flush may have outlasted this deadline with a message already decoded.
+        self.hub
+            .take_parked()
+            .ok_or(End::Close(close::HUB_LOST, "the hub did not answer open"))
     }
 
     async fn browser(
@@ -319,6 +329,20 @@ impl Relay {
     }
 
     async fn hub_msg(&mut self, ws: &mut WebSocket, msg: HubMessage) -> Result<(), End> {
+        let sid = self.cur.as_deref();
+        let frame = |msg: &HubMessage| match msg {
+            HubMessage::PtyOut { sid: s, d, out } if Some(s.as_str()) == sid => {
+                Some(json!({"t": "out", "d": d, "out": out}))
+            }
+            _ => None,
+        };
+        if let Some(out) = frame(&msg) {
+            drop(msg);
+            if !self.hub.has_buffered_line() {
+                return send_json(ws, &out).await.map_err(|_| End::Gone);
+            }
+            return self.hub.send_ready(ws, out, frame).await;
+        }
         let out = match msg {
             HubMessage::Ok { rid, result } => {
                 if let Some((sid, reply)) = self.open_ok(rid, result).await? {
@@ -361,9 +385,6 @@ impl Relay {
                         return Ok(());
                     }
                 }
-            }
-            HubMessage::PtyOut { sid, d, out } if self.is_cur(&sid) => {
-                json!({"t": "out", "d": d, "out": out})
             }
             HubMessage::PtyFg { sid, comm, cwd } if self.is_cur(&sid) => {
                 json!({"t": "fg", "comm": comm, "cwd": cwd})
@@ -435,40 +456,60 @@ impl Relay {
     /// their opens. Refusals and the original open deadlines end that ownership.
     async fn finish_kills(&mut self) -> Result<(), End> {
         loop {
-            let now = Instant::now();
-            self.pending
-                .take_if(|p| p.kill.is_some() && p.deadline <= now);
-            self.superseded
-                .retain(|_, p| p.kill.is_none() || p.deadline > now);
-            let deadline = self
-                .pending
-                .iter()
-                .chain(self.superseded.values())
-                .filter(|p| p.kill.is_some())
-                .map(|p| p.deadline)
-                .min();
-            let Some(deadline) = deadline else {
-                return Ok(());
+            let parked = self.hub.take_parked_if(|msg| match msg {
+                HubMessage::Ok { rid, .. } | HubMessage::Err { rid: Some(rid), .. } => {
+                    self.pending
+                        .as_ref()
+                        .is_some_and(|p| p.rid == *rid && p.kill.is_some())
+                        || self.superseded.get(rid).is_some_and(|p| p.kill.is_some())
+                }
+                _ => false,
+            });
+            let msg = if let Some(msg) = parked {
+                // This kill's open already answered, even if the browser flush outlasted it.
+                msg
+            } else {
+                let now = Instant::now();
+                self.pending
+                    .take_if(|p| p.kill.is_some() && p.deadline <= now);
+                self.superseded
+                    .retain(|_, p| p.kill.is_none() || p.deadline > now);
+                let deadline = self
+                    .pending
+                    .iter()
+                    .chain(self.superseded.values())
+                    .filter(|p| p.kill.is_some())
+                    .map(|p| p.deadline)
+                    .min();
+                let Some(deadline) = deadline else {
+                    return Ok(());
+                };
+                match timeout_at(deadline, self.hub.recv()).await {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => return Err(HUB_LOST),
+                    Err(_) => {
+                        tracing::warn!("hub did not answer an open with a pending pty kill");
+                        continue;
+                    }
+                }
             };
-            match timeout_at(deadline, self.hub.recv()).await {
-                Ok(Some(HubMessage::Ok { rid, result })) => {
+            match msg {
+                HubMessage::Ok { rid, result } => {
                     if let Some((sid, _)) = self.open_ok(rid, result).await? {
                         self.cur = Some(sid);
                     }
                 }
-                Ok(Some(HubMessage::Err {
+                HubMessage::Err {
                     rid: Some(rid),
                     code,
                     message,
                     ..
-                })) => {
+                } => {
                     self.pending.take_if(|p| p.rid == rid);
                     self.superseded.remove(&rid);
                     tracing::debug!(?code, message, "hub refused a request during pty cleanup");
                 }
-                Ok(Some(_)) => {}
-                Ok(None) => return Err(HUB_LOST),
-                Err(_) => tracing::warn!("hub did not answer an open with a pending pty kill"),
+                _ => {}
             }
         }
     }
@@ -623,3 +664,6 @@ mod tests {
         assert_eq!(dim(&m, "missing"), None);
     }
 }
+
+#[cfg(test)]
+mod flush_tests;
