@@ -2859,6 +2859,10 @@ fn hub_startup_config_journal_failure_releases_open_and_fails_remaining_entries(
             .len(),
         1
     );
+    // Probe the one-shot failure and record the held-back exit before comparing folds.
+    c.ok(json!({"t": "acp.kill", "sid": "a1", "forget": false}));
+    assert!(c.summary("a1")["fault"].is_null());
+    assert_eq!(hub.kinds("a1"), ["spawn", "session", "exit"]);
     drop(c);
     fold_equals_live(&mut hub);
 }
