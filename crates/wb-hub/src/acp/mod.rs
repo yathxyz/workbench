@@ -169,6 +169,8 @@ pub enum Act {
         forget: bool,
     },
     RemoveWorktree,
+    #[cfg(test)]
+    Panic,
 }
 
 impl Cmd {
@@ -280,6 +282,13 @@ fn checked_task(task: Option<String>) -> Result<Option<String>, &'static str> {
     }
 }
 
+/// Held until the startup scan has made its creation-time seed durable.
+pub struct RestoreFault {
+    sid: String,
+    error: anyhow::Error,
+    shared: Arc<Shared>,
+}
+
 /// Seed from valid metadata even if the PTY namespace shadows it or its journal
 /// cannot be loaded. Defer quarantine until the seed is durable.
 pub async fn restore(
@@ -287,12 +296,18 @@ pub async fn restore(
     sid: String,
     shadowed: bool,
     high: &mut u64,
-) -> Result<(), (String, anyhow::Error)> {
+) -> Result<(), RestoreFault> {
     let meta = match read_meta(ctx, &sid).await {
         Ok(Some(meta)) => meta,
         Ok(None) => return Ok(()),
         Err(_) if shadowed => return Ok(()),
-        Err(fault) => return Err((sid, fault)),
+        Err(error) => {
+            return Err(RestoreFault {
+                sid,
+                error,
+                shared: Arc::default(),
+            });
+        }
     };
     let created_at = meta.created_at;
     *high = (*high).max(created_at);
@@ -302,7 +317,7 @@ pub async fn restore(
     let shared = Arc::<Shared>::default();
     let loaded = match read_journal(ctx, meta, shared.sync.clone()).await {
         Ok(loaded) => loaded,
-        Err(fault) => return Err((sid, fault)),
+        Err(error) => return Err(RestoreFault { sid, error, shared }),
     };
     let rx = ctx.registry.restore(&sid, created_at);
     start(
@@ -316,7 +331,8 @@ pub async fn restore(
     Ok(())
 }
 
-pub async fn load_faulted(ctx: &Arc<Ctx>, sid: String, error: anyhow::Error) -> io::Result<()> {
+pub async fn load_faulted(ctx: &Arc<Ctx>, fault: RestoreFault) -> io::Result<()> {
+    let RestoreFault { sid, error, shared } = fault;
     let (created_at, rx) = ctx.registry.register_faulted(&sid).await?;
     let fault = load_failure(ctx, &sid, error).await;
     start(
@@ -324,7 +340,7 @@ pub async fn load_faulted(ctx: &Arc<Ctx>, sid: String, error: anyhow::Error) -> 
         sid,
         created_at,
         rx,
-        Arc::default(),
+        shared,
         Start::Faulted(fault),
     );
     Ok(())
@@ -396,6 +412,10 @@ async fn read(ctx: &Ctx, sid: &str, sync: Arc<SyncGate>) -> anyhow::Result<Optio
     let Some(meta) = read_meta(ctx, sid).await? else {
         return Ok(None);
     };
+    ctx.registry
+        .seed_recovered(meta.created_at)
+        .await
+        .context("seeding the recovered session's creation time")?;
     read_journal(ctx, meta, sync).await.map(Some)
 }
 
@@ -1825,6 +1845,8 @@ impl Acp {
             return reply.err(ErrorCode::Busy, "startup configuration is being applied");
         }
         match act {
+            #[cfg(test)]
+            Act::Panic => panic!("test actor panic"),
             Act::Prompt(blocks) => self.prompt(blocks, reply),
             Act::Cancel => self.cancel(reply),
             Act::Permission {
@@ -4257,24 +4279,88 @@ mod tests {
         crate::load_sessions(ctx).await.unwrap();
     }
 
+    async fn attach_session(ctx: &Arc<Ctx>) -> (Value, Arc<OutQ>) {
+        let q = Arc::new(OutQ::default());
+        let o = Open {
+            viewer: Viewer {
+                id: 1,
+                outq: q.clone(),
+            },
+            since: 0,
+            epoch: None,
+            spawn: None,
+            reply: Reply::for_test(1, q.clone()),
+        };
+        open(ctx.clone(), "a".into(), o).await;
+        (next_reply(&q).await, q)
+    }
+
+    async fn reload_writerless(ctx: &Arc<Ctx>) {
+        let (opened, viewer) = attach_session(ctx).await;
+        assert_eq!(opened["summary"]["fault"]["code"], "load_failed");
+        let cmd = Cmd::Act {
+            epoch: None,
+            act: Act::Panic,
+            reply: Reply::for_test(2, Arc::default()),
+        };
+        ctx.registry.deliver("a", cmd).await;
+        // The supervisor notifies attached viewers after publishing the new actor.
+        watchdog(async {
+            while read_reply(&viewer).await["message"] != "session reloaded" {}
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn writerless_reload_keeps_startup_sync_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let (actor, _rx) = dormant(dir.path()).await;
+        let (ctx, epoch, journal) = (actor.ctx.clone(), actor.created_at, actor.path("jsonl"));
+        drop(actor);
+
+        // /dev/null reads as an empty journal, but its fdatasync fails on Linux.
+        let original = dir.path().join("original");
+        fs::rename(&journal, &original).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &journal).unwrap();
+        restart(&ctx, epoch).await;
+        fs::rename(original, journal).unwrap();
+        reload_writerless(&ctx).await;
+        let (opened, _) = attach_session(&ctx).await;
+        assert_eq!(opened["summary"]["fault"]["code"], "load_failed");
+        assert_eq!(opened["head"], 0);
+    }
+
+    #[tokio::test]
+    async fn writerless_reload_seeds_newly_readable_metadata_before_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(Ctx::for_test(dir.path()));
+        let meta = ctx.acp_dir.join("a.json");
+        fs::create_dir(&meta).unwrap(); // Listed, but reading it fails even as root.
+        fs::write(ctx.acp_dir.join("a.jsonl"), b"!\n").unwrap();
+        crate::load_sessions(&ctx).await.unwrap();
+
+        let high = u64::MAX - 1;
+        fs::remove_dir(&meta).unwrap();
+        let record = Meta {
+            sid: "a".into(),
+            created_at: high,
+            ..Meta::default()
+        };
+        fs::write(&meta, serde_json::to_vec(&record).unwrap()).unwrap();
+        let block_seed = dir.path().join("last-created.tmp");
+        fs::create_dir(&block_seed).unwrap();
+        reload_writerless(&ctx).await;
+        assert!(meta.exists(), "quarantined metadata despite a failed seed");
+        fs::remove_dir(block_seed).unwrap();
+
+        reload_writerless(&ctx).await;
+        assert!(!meta.exists(), "invalid journal was not quarantined");
+        let mark = fs::read_to_string(dir.path().join("last-created")).unwrap();
+        assert!(mark.parse::<u64>().unwrap() >= high);
+    }
+
     #[tokio::test]
     async fn load_io_fault_preserves_files_through_actions_stop_and_retry() {
-        async fn attach(ctx: &Arc<Ctx>) -> Value {
-            let q = Arc::new(OutQ::default());
-            let o = Open {
-                viewer: Viewer {
-                    id: 1,
-                    outq: q.clone(),
-                },
-                since: 0,
-                epoch: None,
-                spawn: None,
-                reply: Reply::for_test(1, q.clone()),
-            };
-            open(ctx.clone(), "a".into(), o).await;
-            next_reply(&q).await
-        }
-
         for ext in ["jsonl", "json"] {
             let dir = tempfile::tempdir().unwrap();
             let (actor, _rx) = dormant(dir.path()).await;
@@ -4292,7 +4378,7 @@ mod tests {
             std::os::unix::fs::symlink(&backing, &backing).unwrap();
             std::os::unix::fs::symlink(&backing, &path).unwrap();
             restart(&ctx, epoch).await;
-            let opened = attach(&ctx).await;
+            let (opened, _) = attach_session(&ctx).await;
             assert_eq!(opened["summary"]["fault"]["code"], "load_failed");
             assert_eq!(opened["summary"]["alive"], false);
             assert_eq!(opened["head"], 0);
@@ -4316,7 +4402,7 @@ mod tests {
             assert_eq!(fs::read(&journal).unwrap(), prefix);
 
             restart(&ctx, opened["summary"]["createdAt"].as_u64().unwrap()).await;
-            let opened = attach(&ctx).await;
+            let (opened, _) = attach_session(&ctx).await;
             assert_eq!(opened["summary"]["fault"], Value::Null);
             assert_eq!(opened["summary"]["createdAt"], epoch);
             assert_eq!(opened["summary"]["acp"]["task"], "original");
