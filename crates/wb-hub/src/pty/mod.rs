@@ -5,12 +5,9 @@
 
 mod io;
 mod out;
-pub(crate) mod reaper;
 pub mod spawn;
 mod vt;
 
-use std::collections::HashMap;
-use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::pin::Pin;
@@ -18,7 +15,6 @@ use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rustix::process::{Pid, PidfdFlags, WaitId, WaitIdOptions, WaitIdStatus, pidfd_open, waitid};
 use rustix::termios::{Winsize, tcgetpgrp, tcsetwinsize};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, oneshot};
@@ -34,6 +30,7 @@ use wb_proto::limits::{FG_POLL, PTY_RING, SNAPSHOT_EVERY};
 use self::io::{InputQueue, Master};
 use self::out::{OutStream, Ring};
 use self::vt::Vt;
+use crate::child::{ExitWatch, WaitNotice, is_echild, peek_exit, reap, wait};
 use crate::conn::{ConnId, Reply, Viewer, line};
 use crate::outq::OutQ;
 use crate::registry::Route;
@@ -226,51 +223,6 @@ fn tell_reloaded(sid: &str, viewers: Vec<Viewer>) {
     });
     for v in viewers {
         let _ = v.outq.push_event(reloaded.clone());
-    }
-}
-
-/// The hub, not the actor or its sleep task, owns targets until KILL is delivered.
-pub struct Escalations(Mutex<Option<HashMap<tokio::task::Id, procfs::SessionMembers>>>);
-
-impl Default for Escalations {
-    fn default() -> Self {
-        Self(Mutex::new(Some(HashMap::new())))
-    }
-}
-
-impl Escalations {
-    fn arm(self: &Arc<Self>, members: procfs::SessionMembers, grace: Duration) {
-        let mut pending = lock(&self.0);
-        let Some(sets) = pending.as_mut() else {
-            return members.kill();
-        };
-        let owner = Arc::downgrade(self);
-        let deadline = Instant::now() + grace;
-        let timer = tokio::spawn(async move {
-            tokio::time::sleep_until(deadline).await;
-            let Some(owner) = owner.upgrade() else { return };
-            let mut pending = lock(&owner.0);
-            if let Some(members) = pending.as_mut().and_then(|s| s.remove(&tokio::task::id())) {
-                members.kill();
-            }
-        });
-        sets.insert(timer.id(), members);
-    }
-
-    pub fn finish(&self) {
-        // Serialize delivery itself with the timers, not just removal from the map.
-        let mut pending = lock(&self.0);
-        if let Some(sets) = pending.take() {
-            for members in sets.into_values() {
-                members.kill();
-            }
-        }
-    }
-}
-
-impl Drop for Escalations {
-    fn drop(&mut self) {
-        self.finish();
     }
 }
 
@@ -1183,19 +1135,9 @@ impl Pty {
     }
 
     fn reap_owned(&mut self) {
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Err(e) if is_echild(&e) => return,
-            Err(e) => warn!(sid = %self.sid, "reaping PTY leader: {e}"),
-            Ok(None) => {}
+        if let Some(child) = self.child.take() {
+            reap(child, &self.ctx.reaper);
         }
-        self.ctx
-            .reaper
-            .send(child)
-            .expect("reaper runs until all senders are dropped");
     }
 
     /// Queues a write of the record and, with `snapshot`, of the screen.
@@ -1268,115 +1210,6 @@ fn winsize(cols: u32, rows: u32) -> Winsize {
     }
 }
 
-fn exit_fd(pid: u32) -> std::io::Result<AsyncFd<OwnedFd>> {
-    let pid = Pid::from_raw(pid as i32).expect("positive child pid");
-    AsyncFd::new(pidfd_open(pid, PidfdFlags::empty())?)
-}
-
-/// Peek, never reap: the actor may still need the leader's kernel session id
-/// for panic cleanup during the output drain or final save.
-fn peek_exit(pid: u32) -> std::io::Result<Option<WaitIdStatus>> {
-    let pid = Pid::from_raw(pid as i32).expect("positive child pid");
-    let opts = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
-    Ok(rustix::io::retry_on_intr(|| {
-        waitid(WaitId::Pid(pid), opts)
-    })?)
-}
-
-fn is_echild(e: &std::io::Error) -> bool {
-    e.raw_os_error() == Some(rustix::io::Errno::CHILD.raw_os_error())
-}
-
-enum WaitNotice {
-    Exited(Option<i32>, Option<i32>),
-    ProbeChild,
-}
-
-enum ExitWake {
-    Fd(AsyncFd<OwnedFd>),
-    Sigchld(tokio::signal::unix::Signal, bool),
-    Child {
-        sigchld: Option<tokio::signal::unix::Signal>,
-        probe_at: Option<Instant>,
-    },
-}
-
-struct ExitWatch {
-    pid: u32,
-    wake: ExitWake,
-}
-
-impl ExitWatch {
-    fn new(pid: u32) -> std::io::Result<Self> {
-        let wake = match exit_fd(pid) {
-            Ok(fd) => ExitWake::Fd(fd),
-            // As with Tokio's Child, pidfd_open is not required for an ordinary
-            // spawn. Check once *after* subscribing so an early exit isn't lost.
-            Err(_) => ExitWake::Sigchld(
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?,
-                true,
-            ),
-        };
-        Ok(Self { pid, wake })
-    }
-
-    fn use_child_wait(&mut self) {
-        self.wake = ExitWake::Child {
-            sigchld: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).ok(),
-            probe_at: Some(Instant::now()),
-        };
-    }
-
-    fn retry_child(&mut self) {
-        if let ExitWake::Child { probe_at, .. } = &mut self.wake {
-            *probe_at = Some(Instant::now() + Duration::from_secs(1));
-        }
-    }
-}
-
-async fn wait(watch: Option<&mut ExitWatch>) -> std::io::Result<WaitNotice> {
-    let Some(ExitWatch { pid, wake }) = watch else {
-        return std::future::pending().await;
-    };
-    let status = match wake {
-        ExitWake::Fd(fd) => {
-            fd.async_io(tokio::io::Interest::READABLE, |_| {
-                peek_exit(*pid)?.ok_or(std::io::ErrorKind::WouldBlock.into())
-            })
-            .await?
-        }
-        ExitWake::Sigchld(signal, check) => loop {
-            if std::mem::take(check)
-                && let Some(status) = peek_exit(*pid)?
-            {
-                break status;
-            }
-            signal
-                .recv()
-                .await
-                .ok_or_else(|| std::io::Error::other("SIGCHLD stream closed"))?;
-            *check = true;
-        },
-        ExitWake::Child { sigchld, probe_at } => {
-            if let Some(at) = *probe_at {
-                tokio::time::sleep_until(at).await;
-            } else if let Some(signal) = sigchld
-                && signal.recv().await.is_none()
-            {
-                *sigchld = None;
-            }
-            *probe_at = sigchld
-                .is_none()
-                .then(|| Instant::now() + Duration::from_secs(1));
-            return Ok(WaitNotice::ProbeChild);
-        }
-    };
-    Ok(WaitNotice::Exited(
-        status.exit_status(),
-        status.terminating_signal(),
-    ))
-}
-
 async fn sleep_until(at: Option<Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at).await,
@@ -1388,7 +1221,12 @@ async fn sleep_until(at: Option<Instant>) {
 mod tests {
     use super::*;
 
-    use rustix::process::{Signal, pidfd_send_signal};
+    use std::os::fd::OwnedFd;
+
+    use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, pidfd_send_signal, waitid};
+
+    use crate::child::exit_fd;
+    use crate::escalation::Escalations;
 
     async fn session_with_straggler(ctx: &Arc<Ctx>) -> (Pty, JoinHandle<()>, AsyncFd<OwnedFd>) {
         // The shell exits on HUP; its child installs SIG_IGN before publishing its pid.
@@ -1448,7 +1286,7 @@ mod tests {
         }
         // Hold the captured handles outside the timer's map before yielding.
         // Only HUP can cause the exit observed by this wait.
-        let gated = Escalations(Mutex::new(lock(&ctx.escalations.0).take()));
+        let gated = ctx.escalations.take_pending_for_test();
         tokio::time::timeout(Duration::from_secs(30), async {
             while actor.status.is_none() {
                 let st = wait(actor.exit_watch.as_mut()).await;
