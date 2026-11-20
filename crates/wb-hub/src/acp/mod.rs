@@ -3796,7 +3796,10 @@ mod tests {
 
     mod group_cleanup {
         use super::*;
-        use rustix::process::{Pid, WaitOptions, waitpid};
+        use rustix::process::{
+            Pid, PidfdFlags, WaitId, WaitIdOptions, WaitOptions, pidfd_open, waitid, waitpid,
+        };
+        use std::os::fd::AsFd;
         use std::os::unix::process::ExitStatusExt;
         use std::process::Stdio;
         use tokio::io::AsyncReadExt;
@@ -3842,8 +3845,13 @@ mod tests {
             let ctx = actor.ctx.clone(); // Own the pending group even after actor unwind.
             actor.spawn(SpawnVia::New).unwrap();
             let agent = &mut actor.proc.as_mut().unwrap().agent;
-            let pid = agent.pid();
-            let (mut member, _keep_open, mut output) = witness(pid as i32).await;
+            let pid = agent.pid() as i32;
+            let leader = pidfd_open(Pid::from_raw(pid).unwrap(), PidfdFlags::empty()).unwrap();
+            let peek_leader = || {
+                let opts = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+                rustix::io::retry_on_intr(|| waitid(WaitId::PidFd(leader.as_fd()), opts))
+            };
+            let (mut member, _keep_open, mut output) = witness(pid).await;
             let (mut unrelated, release, _output) = witness(0).await;
             agent.stdin = None;
             let st = watchdog(wait_success(agent)).await;
@@ -3880,7 +3888,7 @@ mod tests {
             assert_eq!(watchdog(output.read_u8()).await.unwrap(), b'T');
             // WNOWAIT must still see the exited leader after TERM, not just
             // find a process with that numeric PID in /proc.
-            let status = child::peek_exit(pid).unwrap().expect("leader still pinned");
+            let status = peek_leader().unwrap().expect("leader still pinned");
             assert_eq!(status.exit_status(), Some(0));
             assert!(member.try_wait().unwrap().is_none(), "KILL before release");
 
@@ -3891,8 +3899,8 @@ mod tests {
             );
             watchdog(async {
                 loop {
-                    match child::peek_exit(pid) {
-                        Err(e) if child::is_echild(&e) => break,
+                    match peek_leader() {
+                        Err(rustix::io::Errno::CHILD) => break,
                         Ok(Some(_)) => tokio::time::sleep(Duration::from_millis(10)).await,
                         other => panic!("expected exited or reaped leader: {other:?}"),
                     }
