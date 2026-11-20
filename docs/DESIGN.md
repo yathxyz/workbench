@@ -289,7 +289,7 @@ The error codes are a closed set:
 - **`Pending`:**
   - `kind` is `"permission"` or `"elicitation"`;
   - `req` is the seq of the immutable journal event that announced the question, not the agent's JSON-RPC id;
-  - within an incarnation, `(sid, epoch, req)` identifies exactly one published human-answerable question, even after a crash loses the unsynced journal tail: answering or cancelling consumes it, and another question gets a fresh seq even if the agent reuses its id;
+  - within an incarnation, `(sid, epoch, req)` identifies exactly one human-answerable question published after its journal sync barrier, even after a crash loses the unsynced tail: answering or cancelling consumes it, and another question gets a fresh seq even if the agent reuses its id;
   - `title` is the permission's `toolCall.title` or the elicitation's `message`, cut to 200 characters for both kinds. It is `""` when the request has none.
 - **`AcpSessionInfo`:** `{protocolVersion, agentInfo, agentCapabilities, promptCapabilities, authMethods, modes, configOptions, availableCommands, plan, usage}`. It holds the latest materialised values; absent optional values are omitted. `Summary.acp.configOptions` is always present, with `null` when absent.
 - Snapshots and watch events publish live and restored summaries unchanged, including the full option list, whenever they fit in a single-summary page with the longest request ID.
@@ -551,6 +551,7 @@ pty/<sid>.json                            {sid, shell (name), argv (argv[0] = th
 pty/<sid>.snap                            last VT snapshot (on exit, on SIGTERM, every 30 s while dirty)
 acp/<sid>.json                            {sid, agent, cwd, createdAt, agentSessionId|null, init|null, seenSeq, managedWorktree?}
 acp/<sid>.jsonl                           journal (§3.4.4)
+acp/<sid>.jsonl.sync                      sparse journal I/O witness (not a request counter or a rollback boundary)
 acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one generation kept)
 <kind>/<sid>.quarantine-<ms>.<ext>        files of a session that failed to load (kept for inspection, never loaded)
 ```
@@ -558,8 +559,10 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
 - `.json` and `.snap` are written atomically: tmp, fsync, rename, fsync the directory.
 - The journal is appended with one `pwrite(2)` per event at the tracked end, never with `O_APPEND`.
 - On open, the hub validates the journal and syncs its directory entry before replay.
-- Unless the inode has a known-durable prefix covering its entire contents, recovery copies the validated complete lines to a new file, syncs it, then atomically installs it and syncs the directory.
-- A clean close or a completed recovery can leave the synced length in an optional inode attribute; losing the attribute costs a copy, not durability.
+- An ordinary open, including after upgrade, syncs the validated prefix in place; neither an unsynced ordinary update nor an absent length hint calls for a copy.
+- Before a journal write, truncate or sync, the hub marks a per-handle witness nonempty; it clears it when the last overlapping operation finishes without a writeback fault.
+- A nonempty witness at recovery means a writeback error was observed or the previous hub stopped before it could report the outcome.
+- Only then does recovery rewrite the validated lines to a fresh inode, sync it, atomically install it and sync the directory: a later successful sync of the original inode cannot re-dirty failed pages.
 - A human-answerable `permission` or `elicitation` waits for `fdatasync` before publication, without a deadline; a stalled disk delays that session's shutdown as well as the question.
 - A policy decision (`permission_auto`) never offers a question to clients and adds no sync barrier.
 - Lifecycle events retain their background syncs; SIGTERM also syncs the journal.
@@ -652,6 +655,7 @@ At startup, a journal whose last `spawn` has no `exit` gets these lines with `re
 
 On a short write, write error or required sync failure:
 - `ftruncate` back to the last good length and sync the shrink; if either operation fails, keep the rollback pending and retry it before any later append;
+- rollback and its retries on ordinary append and probe paths run on runtime workers; a storage fault can therefore stall other sessions' actors as well;
 - set `fault = {code:"journal_write"}`;
 - record nothing more;
 - fail every unapplied initial configuration entry with `faulted`, release the batch gate and answer the creating open, even if spawning failed before an agent process existed;
@@ -666,13 +670,19 @@ While faulted:
 - On success the fault clears and the session is an ordinary dead session; a triggering `acp.revive` then proceeds under the normal rules.
 - All syncs of the live journal share one error state: a background sync that observes a writeback error prevents a later question from passing its publication barrier.
 - Neither a successful shrink nor a successful later sync clears a writeback error; appends remain blocked until recovery opens a known-good prefix.
+- Revive checks the journal before starting a child; failure to record `spawn` returns `faulted` without sending `initialize` to that child.
 
-A crash can lose or reuse sequence numbers from an unsynced tail, including ordinary updates and automatically decided permissions, but never the `req` of a published human-answerable question.
+A crash may lose or reuse a seq from an unsynced tail, including ordinary updates and automatically decided permissions.
+The no-reuse guarantee covers only human-answerable questions published through the sync barrier; upgrading cannot protect a number an older hub published and then lost.
+If both the question sync and the following truncate fail, a crash loses the in-memory rollback boundary and may leave a complete, never-offered question in history.
+That phantom event is not reuse of a published request number.
 
 **Load and quarantine.**
 - Every session (both kinds) loads in its own task under `catch_unwind` plus error handling.
 - A torn journal tail is the bytes after the last `\n`. They are truncated away and logged. A failed truncation is a load failure.
-- Any other load failure, including a complete line that does not parse and a `seq` that is not the previous one plus 1 (starting at 1; a gap or a repeat): rename the session's files to `<sid>.quarantine-<ms>.<ext>`, then register a dead Summary with:
+- On any ACP recovery I/O failure (including lack of space), keep the session's filenames intact and register the dead `load_failed` Summary below without opening it for appends.
+- A later start retries recovery; until then even `kill{forget:true}` returns `faulted`, since the hub cannot establish ownership from unavailable files.
+- For invalid contents, including a complete line that does not parse or a `seq` that is not the previous one plus 1 (starting at 1), or a loader panic, quarantine the session's files as `<sid>.quarantine-<ms>.<ext>` and register a dead Summary with:
   - `fault={code:"load_failed", message}`;
   - `createdAt=now`;
   - `revivable:false`;
@@ -1498,7 +1508,7 @@ The stream ends when wb-web shuts down.
 | H-7 | The nudge restores the *currently desired* size, and a `pty.resize` during the nudge cancels the restore. Attach size is applied only for a sole viewer. | `pty/mod.rs` |
 | H-8 | Replay is pinned ∪ kept in **one ascending-seq stream** (§3.4.4). | `acp/replay.rs` |
 | H-9 | Journal is fail-closed: write first (one `pwrite` at the tracked end), then fold. On a short write: ftruncate, `fault{journal_write}`, teardown, `faulted`, and a recovery probe. | `acp/journal.rs`, `acp/mod.rs`, `acp/facts.rs` |
-| H-10 | Per-session load under `catch_unwind` plus error handling. Failure means quarantine (rename) plus a dead `fault{load_failed}` Summary. A quarantined PTY also carries a `hub_restart` exit, so its card attaches as a corpse and a respawn clears the fault. A supervisor reload uses the same path, never on the main task. | `registry.rs`, `main.rs` |
+| H-10 | Per-session load under `catch_unwind` plus error handling. Failed loads publish a dead `fault{load_failed}` Summary. ACP recovery I/O errors leave files in place for the next start; invalid contents are quarantined. A quarantined PTY also carries a `hub_restart` exit, so its card attaches as a corpse and a respawn clears the fault. A supervisor reload uses the same path, never on the main task. | `registry.rs`, `main.rs` |
 | H-11 | After **any** agent exit, the leftover process group is terminated: TERM, then KILL after 2 s. `setsid` descendants survive. `seenSeq = headSeq` after finalising a user kill only. | `acp/agent.rs`, `acp/mod.rs` |
 | H-12 | `revivable` is false after `setup_error{revive_failed}` until the next `session`. | `acp/facts.rs` |
 | H-13 | Every `std::sync::Mutex` uses `lock().unwrap_or_else(PoisonError::into_inner)`, with panic-free critical sections. A session-actor panic is reloaded and attached connections get `err{internal,"session reloaded"}`. | all |

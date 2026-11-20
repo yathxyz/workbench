@@ -38,32 +38,25 @@ fn checkpoint(offsets: &mut Vec<u64>, seq: u64, end: u64) {
     }
 }
 
-/// The inode's bytes at this length were successfully synced. Recording the
-/// hint *after* sync is essential. Losing it just forces a copy on next open.
-const SYNCED_LEN: &str = "user.wb.journal.synced_len";
-
-fn synced_len(file: &File) -> Option<u64> {
-    let mut bytes = [0; 8];
-    match rustix::fs::fgetxattr(file, SYNCED_LEN, &mut bytes[..]) {
-        Ok(8) => Some(u64::from_le_bytes(bytes)),
-        Err(Errno::NODATA | Errno::OPNOTSUPP) => Some(0),
-        _ => None,
-    }
+/// Nonempty while a syscall can consume writeback errors, or after it did.
+/// Arm *before* the syscall: the process may be killed before it handles EIO.
+/// Only process crashes need this witness: after a kernel crash the old page
+/// cache is gone and the validated bytes themselves came from storage.
+struct Witness {
+    file: File,
+    users: usize,
 }
 
-fn remember_sync(file: &File, end: u64) {
-    let _ = rustix::fs::fsetxattr(
-        file,
-        SYNCED_LEN,
-        &end.to_le_bytes(),
-        rustix::fs::XattrFlags::empty(),
-    );
-}
+#[cfg(test)]
+type Pause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
 
 enum SyncOp {
     Prefix,
+    Question(#[cfg(test)] Option<Pause>),
     Shrink,
-    Close(u64),
 }
 
 /// All syncs of this open file description pass through the same gate. Linux
@@ -73,6 +66,7 @@ struct SyncFile {
     file: File,
     gate: Mutex<()>,
     failed: OnceLock<Errno>,
+    witness: Mutex<Witness>,
 }
 
 impl SyncFile {
@@ -80,22 +74,54 @@ impl SyncFile {
         self.failed.get().map_or(Ok(()), |e| Err((*e).into()))
     }
 
+    fn latch(&self, error: &io::Error) {
+        let errno = error
+            .raw_os_error()
+            .map_or(Errno::IO, Errno::from_raw_os_error);
+        let _ = self.failed.set(errno);
+    }
+
+    fn observed<T>(&self, sync: bool, op: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        {
+            let mut w = crate::lock(&self.witness);
+            if w.users == 0 && self.failed.get().is_none() {
+                w.file.set_len(1).inspect_err(|e| self.latch(e))?;
+            }
+            w.users += 1;
+        }
+        let result = op();
+        let mut w = crate::lock(&self.witness);
+        if let Err(e) = &result
+            && (sync || e.raw_os_error() == Some(Errno::IO.raw_os_error()))
+        {
+            self.latch(e);
+        }
+        w.users -= 1;
+        if w.users == 0 && self.failed.get().is_none() {
+            w.file.set_len(0).inspect_err(|e| self.latch(e))?;
+        }
+        result
+    }
+
     fn sync(&self, op: SyncOp, #[cfg(test)] inject_eio: bool) -> io::Result<()> {
         let _guard = crate::lock(&self.gate);
         if !matches!(op, SyncOp::Shrink) {
             self.healthy()?;
         }
-        let flush = || rustix::fs::fdatasync(&self.file);
+        let fdatasync = || rustix::io::retry_on_intr(|| rustix::fs::fdatasync(&self.file));
         #[cfg(test)]
-        let flush = || if inject_eio { Err(Errno::IO) } else { flush() };
-        if let Err(e) = flush() {
-            let _ = self.failed.set(e);
-            return Err(e.into());
-        }
-        if let SyncOp::Close(end) = op {
-            remember_sync(&self.file, end);
-        }
-        Ok(())
+        let fdatasync = || {
+            if inject_eio {
+                return Err(Errno::IO);
+            }
+            fdatasync()?;
+            if let SyncOp::Question(Some((entered, release))) = op {
+                entered.send(()).unwrap();
+                release.blocking_recv().unwrap();
+            }
+            Ok(())
+        };
+        self.observed(true, || Ok(fdatasync()?))
     }
 }
 
@@ -111,16 +137,13 @@ pub struct Journal {
     truncate_before_write: bool,
     /// The append of this seq fails once after writing half its line (fault injection).
     #[cfg(any(test, debug_assertions))]
-    fail_at: Option<u64>,
+    pub(super) fail_at: Option<u64>,
     #[cfg(test)]
     pub(super) fail_sync: bool,
     #[cfg(test)]
     pub(super) fail_background_sync: bool,
     #[cfg(test)]
-    pub(super) pause_question: Option<(
-        tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<()>,
-    )>,
+    pub(super) pause_question: Option<Pause>,
     #[cfg(test)]
     pub(super) fail_truncate: bool,
     #[cfg(test)]
@@ -134,6 +157,10 @@ pub struct WriteFault {
 }
 
 impl Journal {
+    pub(super) fn healthy(&self) -> io::Result<()> {
+        self.disk.healthy()
+    }
+
     /// Opens the journal at `path`, creating it with mode 0600 if missing, visiting
     /// validated events in file order. Bytes after the last `\n` are a torn tail: they are
     /// truncated away and logged. Any complete line that is not a journal event, or
@@ -153,13 +180,15 @@ impl Journal {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         let len = file.metadata()?.len();
-        let mut last = [0];
-        let clean = synced_len(&file) == Some(len)
-            && (len == 0 || (file.read_at(&mut last, len - 1)? == 1 && last[0] == b'\n'));
-        // A reopened fd cannot report an already-consumed writeback error. For
-        // an uncertified prefix write the exact validated bytes to a fresh inode:
-        // syncing clean pages (or reflinking them) wouldn't retry failed writes.
-        let mut replacement = if clean {
+        let marker = path.with_extension("jsonl.sync");
+        let interrupted = match std::fs::metadata(&marker) {
+            Ok(meta) => meta.len() != 0,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        // No witness on upgrade. An idle journal with no recorded error also
+        // takes the in-place path, even if it contains unsynced ordinary updates.
+        let mut replacement = if !interrupted {
             None
         } else {
             Some(BufWriter::new(
@@ -181,8 +210,6 @@ impl Journal {
             }
             if line.last() != Some(&b'\n') {
                 warn!(path = %path.display(), bytes = n, "truncating a torn journal tail");
-                // The candidate copy contains complete validated lines only.
-                anyhow::ensure!(!clean, "journal changed during validation");
                 break;
             }
             let ev: JournalEvent = serde_json::from_slice(&line[..n - 1]).with_context(|| {
@@ -208,25 +235,40 @@ impl Journal {
             }
             visit(ev);
         }
+        // Detached syncs of an old handle must never clear the new writer's
+        // witness (e.g. supervisor reload). Give each handle its own inode.
+        let witness = tempfile::Builder::new().suffix(".tmp").tempfile_in(dir)?;
+        witness.as_file().set_len(1)?;
+        let witness = witness.persist(marker).map_err(|e| e.error)?;
         let file = if let Some(copy) = replacement {
             let tmp = copy.into_inner().map_err(|e| e.into_error())?;
             tmp.as_file()
                 .sync_data()
                 .context("syncing recovered journal")?;
-            remember_sync(tmp.as_file(), end);
-            tmp.persist(path).context("installing recovered journal")?
+            tmp.persist(path)
+                .map_err(|e| e.error)
+                .context("installing recovered journal")?
         } else {
+            if end != len {
+                file.set_len(end).context("truncating torn journal tail")?;
+            }
+            file.sync_data().context("syncing recovered journal")?;
             file
         };
         // Commit both a newly created file and the rename of a repaired one.
         File::open(dir)?
             .sync_all()
             .context("syncing journal directory")?;
+        witness.set_len(0)?;
         Ok(Journal {
             disk: Arc::new(SyncFile {
                 file,
                 gate: Mutex::new(()),
                 failed: OnceLock::new(),
+                witness: Mutex::new(Witness {
+                    file: witness,
+                    users: 0,
+                }),
             }),
             end,
             head,
@@ -262,17 +304,7 @@ impl Journal {
         self.disk.healthy().map_err(|error| WriteFault { error })?;
         let bytes = line::encode(&ev);
         if let Err(error) = self.write(&bytes) {
-            if error.raw_os_error() == Some(Errno::IO.raw_os_error()) {
-                let _ = self.disk.failed.set(Errno::IO);
-            }
             return Err(self.rollback(error));
-        }
-        #[cfg(test)]
-        if is_question(&ev.body)
-            && let Some((entered, release)) = self.pause_question.take()
-        {
-            entered.send(()).unwrap();
-            release.blocking_recv().unwrap();
         }
         if is_question(&ev.body)
             && let Err(error) = self.sync_question()
@@ -298,7 +330,8 @@ impl Journal {
         if self.fail_truncate {
             return Err(io::Error::other("injected truncate failure"));
         }
-        self.disk.file.set_len(self.end)?;
+        self.disk
+            .observed(false, || self.disk.file.set_len(self.end))?;
         // Even on a poisoned fd we must commit removal of a never-offered
         // question. This sync cannot certify the preceding data.
         self.disk.sync(
@@ -310,9 +343,12 @@ impl Journal {
         Ok(())
     }
 
-    fn sync_question(&self) -> io::Result<()> {
+    fn sync_question(&mut self) -> io::Result<()> {
         self.disk.sync(
-            SyncOp::Prefix,
+            SyncOp::Question(
+                #[cfg(test)]
+                self.pause_question.take(),
+            ),
             #[cfg(test)]
             self.fail_sync,
         )
@@ -374,7 +410,7 @@ impl Journal {
                 self.shrink()?;
             }
             self.disk.sync(
-                SyncOp::Close(self.end),
+                SyncOp::Prefix,
                 #[cfg(test)]
                 self.fail_background_sync,
             )
@@ -402,12 +438,14 @@ impl Journal {
         #[cfg(any(test, debug_assertions))]
         if self.fail_at == Some(self.head + 1) {
             self.fail_at = None;
-            self.disk
-                .file
-                .write_at(&bytes[..bytes.len() / 2], self.end)?;
+            self.disk.observed(false, || {
+                self.disk.file.write_at(&bytes[..bytes.len() / 2], self.end)
+            })?;
             return Err(io::Error::other("injected journal write fault"));
         }
-        let n = self.disk.file.write_at(bytes, self.end)?;
+        let n = self
+            .disk
+            .observed(false, || self.disk.file.write_at(bytes, self.end))?;
         if n == bytes.len() {
             Ok(())
         } else {
@@ -1025,11 +1063,48 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn upgrade_and_clean_restart_do_not_copy_a_healthy_journal() {
+        use std::os::unix::fs::MetadataExt;
+        let path = fresh_dir("upgrade").join("s.jsonl");
+        let row = line::encode(&JournalEvent {
+            seq: 1,
+            ts: 1,
+            body: spawn(),
+        });
+        fs::write(&path, [&row[..], b"torn"].concat()).unwrap();
+        let original = File::open(&path).unwrap();
+        for _ in 0..2 {
+            let (j, events) = open_events(&path).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                original.metadata().unwrap().ino(),
+                fs::metadata(&path).unwrap().ino()
+            );
+            assert_eq!(fs::read(&path).unwrap(), row);
+            j.close().await.unwrap().unwrap();
+        }
+        let mut j = Journal::open(&path, drop).unwrap();
+        j.append(chunk("unsynced update"), 2).unwrap();
+        drop(j);
+        let (_, events) = open_events(&path).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            original.metadata().unwrap().ino(),
+            fs::metadata(&path).unwrap().ino()
+        );
+    }
+
     #[test]
     fn recovery_rewrites_the_validated_prefix_before_reuse() {
         let path = fresh_dir("rewrite").join("s.jsonl");
         let mut j = Journal::open(&path, drop).unwrap();
         write_all(&mut j, &[spawn(), chunk(&"a".repeat(128 * 1024))]);
+        j.fail_sync = true;
+        assert!(
+            j.append(EventBody::Elicitation { request: json!({}) }, 3)
+                .is_err()
+        );
         drop(j);
         let prefix = fs::read(&path).unwrap();
         // Reopening loses the original fd's writeback-error cursor. A read and a
@@ -1045,9 +1120,10 @@ mod tests {
         assert_eq!(events.len(), 2);
         drop(reopened);
         let mut reopened = Journal::open(&path, drop).unwrap();
-        // If the filesystem stores the hint, the second load retains the inode.
-        let retained = fs::metadata(&path).unwrap().ino() == repaired.metadata().unwrap().ino();
-        assert_eq!(retained, synced_len(&repaired) == Some(prefix.len() as u64));
+        assert_eq!(
+            fs::metadata(&path).unwrap().ino(),
+            repaired.metadata().unwrap().ino()
+        );
         assert_eq!(fs::read(&path).unwrap(), prefix);
         let question = EventBody::Elicitation { request: json!({}) };
         assert_eq!(reopened.append(question, 3).unwrap().seq, 3);

@@ -104,7 +104,7 @@ const HISTORY: [&str; 6] = [
     "plan",
 ];
 /// The files of a session, by extension.
-const FILES: [&str; 4] = ["json", "jsonl", "stderr.log", "stderr.log.1"];
+const FILES: [&str; 5] = ["json", "jsonl", "jsonl.sync", "stderr.log", "stderr.log.1"];
 const JOURNAL_FAILED: &str = "the journal could not be written";
 const NOT_RUNNING: &str = "the agent is not running";
 const ENQUEUE_FAILED: &str = "could not queue input for the agent";
@@ -274,8 +274,8 @@ fn checked_task(task: Option<String>) -> Result<Option<String>, &'static str> {
     }
 }
 
-/// Registers and starts the session `sid` found in the state directory at startup. A
-/// session that fails to load is quarantined and shows the fault.
+/// Registers and starts the session `sid` found at startup. A failed load publishes a
+/// dead, faulted session; an I/O failure leaves its files in place for the next start.
 pub async fn load(ctx: &Arc<Ctx>, sid: String) {
     let (created_at, from) = match read(ctx, &sid).await {
         Ok(Some(loaded)) => (
@@ -295,8 +295,14 @@ enum Start {
     Create(Box<Open>),
     /// A session read from the state directory: a dead one.
     Loaded(Box<Loaded>),
-    /// A session whose files failed to load and were quarantined; the reason.
-    Faulted(String),
+    Faulted(LoadFailure),
+}
+
+#[derive(Debug)]
+struct LoadFailure {
+    message: String,
+    /// Original names remain reserved for a later recovery, not deletion or reuse.
+    keep_files: bool,
 }
 
 struct Loaded {
@@ -305,8 +311,6 @@ struct Loaded {
     facts: Facts,
     policy: Option<CompiledPolicy>,
     announced: BTreeMap<u64, PendingKind>,
-    /// Startup normalisation could not complete the journal.
-    fault: Option<String>,
 }
 
 /// `acp/<sid>.json`.
@@ -329,29 +333,58 @@ struct Meta {
 }
 
 /// Reads the session `sid` off the calling task and completes a journal that a hub
-/// stop or crash left with a live agent (startup normalisation). `Ok(None)`: there is
-/// no session. A session that fails to load, by an error or a panic, is quarantined,
-/// and the error is the fault message.
-async fn read(ctx: &Ctx, sid: &str) -> Result<Option<Loaded>, String> {
+/// stop or crash left with a live agent (startup normalisation). `Ok(None)` means no
+/// session. Only invalid content or a panicking load goes to quarantine.
+async fn read(ctx: &Ctx, sid: &str) -> Result<Option<Loaded>, LoadFailure> {
     let (dir, s) = (ctx.acp_dir.clone(), sid.to_owned());
-    let failure = match tokio::task::spawn_blocking(move || read_files(&dir, &s)).await {
-        Ok(Ok(None)) => return Ok(None),
-        Ok(Ok(Some((mut loaded, appended)))) => {
-            if appended && let Ok(Err(e)) = loaded.journal.sync().await {
-                warn!(%sid, "syncing the journal: {e}");
-                loaded.fault = Some(fault_message(&WriteFault { error: e }));
-            }
-            return Ok(Some(loaded));
+    let attempt: anyhow::Result<_> = async {
+        let files = tokio::task::spawn_blocking(move || read_files(&dir, &s))
+            .await
+            .context("session load task failed")??;
+        let Some((loaded, appended)) = files else {
+            return Ok(None);
+        };
+        if appended {
+            loaded
+                .journal
+                .sync()
+                .await
+                .context("journal sync task failed")?
+                .context("syncing completed journal")?;
         }
-        Ok(Err(e)) => format!("{e:#}"),
-        Err(e) => format!("loading panicked: {e}"),
+        Ok(Some(loaded))
+    }
+    .await;
+    let error = match attempt {
+        Ok(loaded) => return Ok(loaded),
+        Err(error) => error,
     };
-    warn!(%sid, "quarantining the session: {failure}");
+    let message = format!("{error:#}");
+    if error.chain().any(|cause| {
+        cause.is::<io::Error>()
+            || cause
+                .downcast_ref::<JoinError>()
+                .is_some_and(JoinError::is_cancelled)
+    }) {
+        warn!(%sid, "leaving session files in place for the next start: {message}");
+        return Err(LoadFailure {
+            message,
+            keep_files: true,
+        });
+    }
+
+    warn!(%sid, "quarantining the session: {message}");
     let (dir, s) = (ctx.acp_dir.clone(), sid.to_owned());
-    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || quarantine(&dir, &s)).await {
+    let moved = tokio::task::spawn_blocking(move || quarantine(&dir, &s))
+        .await
+        .unwrap_or_else(|e| Err(io::Error::other(e)));
+    if let Err(e) = &moved {
         warn!(%sid, "quarantining the session: {e}");
     }
-    Err(failure)
+    Err(LoadFailure {
+        message,
+        keep_files: moved.is_err(),
+    })
 }
 
 /// The record, the journal and its fold, normalised; whether normalisation appended.
@@ -390,28 +423,22 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
         .map(|policy| CompiledPolicy::new(policy, &meta.cwd, meta.agent == "omp"))
         .transpose()
         .map_err(anyhow::Error::msg)?;
-    let (mut appended, mut fault) = match journal.normalise(&mut facts, now_ms()) {
-        Ok(written) => (!written.is_empty(), None),
-        Err(f) => {
-            error!(%sid, "completing the journal: {}", f.error);
-            (false, Some(fault_message(&f)))
-        }
-    };
-    if policy_notice && fault.is_none() {
+    let mut appended = !journal
+        .normalise(&mut facts, now_ms())
+        .map_err(|fault| fault.error)
+        .context("completing the journal")?
+        .is_empty();
+    if policy_notice {
         let notice = EventBody::Notice {
             level: NoticeLevel::Warn,
             text: INVALID_POLICY_NOTICE.into(),
         };
-        match journal.append(notice, now_ms()) {
-            Ok(ev) => {
-                facts.apply(&ev);
-                appended = true;
-            }
-            Err(f) => {
-                error!(%sid, "recording the cleared policy notice: {}", f.error);
-                fault = Some(fault_message(&f));
-            }
-        }
+        let ev = journal
+            .append(notice, now_ms())
+            .map_err(|fault| fault.error)
+            .context("recording the cleared policy notice")?;
+        facts.apply(&ev);
+        appended = true;
     }
     let loaded = Loaded {
         meta,
@@ -419,7 +446,6 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
         facts,
         policy,
         announced,
-        fault,
     };
     Ok(Some((loaded, appended)))
 }
@@ -734,6 +760,8 @@ struct Acp {
     /// The kind of every permission and elicitation request ever announced, by `req`.
     announced: BTreeMap<u64, PendingKind>,
     fault: Option<Fault>,
+    /// Loading failed without quarantining the files; do not release the sid for reuse.
+    keep_files: bool,
     /// How the agent ended while the journal was faulted, for the probe's `exit`.
     fault_exit: Option<(Option<i32>, Option<i32>, ExitReason)>,
     proc: Option<Proc>,
@@ -790,6 +818,7 @@ impl Acp {
             facts: Facts::default(),
             announced: BTreeMap::new(),
             fault: None,
+            keep_files: false,
             fault_exit: None,
             proc: None,
             startup_config: None,
@@ -828,26 +857,18 @@ impl Acp {
                     facts,
                     policy,
                     announced,
-                    fault,
                 } = *loaded;
                 self.meta = meta;
                 self.journal = Some(journal);
                 self.facts = facts;
                 self.policy = policy;
                 self.announced = announced;
-                if let Some(message) = fault {
-                    self.fault = Some(Fault {
-                        code: FaultCode::JournalWrite,
-                        message,
-                    });
-                    self.fault_exit = Some((None, None, ExitReason::HubRestart));
-                    self.probe_at = Some(Instant::now() + PROBE_EVERY);
-                }
             }
-            Start::Faulted(message) => {
+            Start::Faulted(failure) => {
+                self.keep_files = failure.keep_files;
                 self.fault = Some(Fault {
                     code: FaultCode::LoadFailed,
-                    message,
+                    message: failure.message,
                 });
             }
         }
@@ -1215,9 +1236,16 @@ impl Acp {
         reply.err(code, message);
     }
 
-    /// Starts the agent and sends `initialize`. A failure is journaled as
-    /// `setup_error{spawn_failed}` with no `spawn` (DESIGN §3.4.4) and returned.
-    fn spawn(&mut self, via: SpawnVia) -> Result<(), String> {
+    /// Starts the agent and sends `initialize` only after recording `spawn`.
+    /// An agent start failure is `spawn_failed` if its `setup_error` was recorded;
+    /// a journal failure in either path is `faulted` (DESIGN §3.4.4).
+    fn spawn(&mut self, via: SpawnVia) -> Result<(), (ErrorCode, String)> {
+        // A previous background sync can have latched EIO without the actor noticing.
+        let journal = self.journal.as_ref().expect("spawn requires a journal");
+        if let Err(error) = journal.healthy() {
+            self.journal_fault(&WriteFault { error });
+            return Err((ErrorCode::Faulted, JOURNAL_FAILED.into()));
+        }
         let (sid, meta, log) = (&self.sid, &self.meta, self.path("stderr.log"));
         let started = match &meta.host {
             None => match self.ctx.cfg.agents.get(&meta.agent) {
@@ -1241,16 +1269,19 @@ impl Acp {
             Ok(agent) => agent,
             Err(message) => {
                 warn!(agent = %self.meta.agent, "{message}");
-                self.record(EventBody::SetupError {
+                if !self.record(EventBody::SetupError {
                     code: SetupErrorCode::SpawnFailed,
                     message: message.clone(),
                     rpc: None,
-                });
-                return Err(message);
+                }) {
+                    return Err((ErrorCode::Faulted, JOURNAL_FAILED.into()));
+                }
+                return Err((ErrorCode::SpawnFailed, message));
             }
         };
         let pid = agent.pid;
         info!(pid, agent = %self.meta.agent, ?via, "spawned");
+        // Register the child first so journal_fault can stop it if the append fails.
         *lock(&self.shared.pgid) = Some(pid);
         self.proc = Some(Proc {
             agent,
@@ -1261,10 +1292,11 @@ impl Acp {
             eof: false,
             drain_until: None,
         });
-        self.setup_at = Some(Instant::now() + SETUP_IDLE_TIMEOUT);
-        if self.record(EventBody::Spawn { pid, via }) {
-            let _ = self.request(Purpose::Init, rpc::initialize);
+        if !self.record(EventBody::Spawn { pid, via }) {
+            return Err((ErrorCode::Faulted, JOURNAL_FAILED.into()));
         }
+        self.setup_at = Some(Instant::now() + SETUP_IDLE_TIMEOUT);
+        let _ = self.request(Purpose::Init, rpc::initialize);
         Ok(())
     }
 
@@ -2201,7 +2233,7 @@ impl Acp {
 
     async fn write_meta(&mut self) -> io::Result<()> {
         self.meta_at = None;
-        // An unpublished or quarantined session has no record of its own to write.
+        // Never replace an unreadable record with the faulted actor's default metadata.
         if self.journal.is_none() {
             return Ok(());
         }
@@ -2232,7 +2264,7 @@ impl Acp {
         self.set_seen(self.facts.head_seq);
         match self.spawn(SpawnVia::Revive) {
             Ok(()) => reply.done(),
-            Err(msg) => reply.err(ErrorCode::SpawnFailed, msg),
+            Err((code, message)) => reply.err(code, message),
         }
     }
 
@@ -2283,6 +2315,9 @@ impl Acp {
     }
 
     fn kill(&mut self, forget: bool, reply: Reply) {
+        if forget && self.keep_files {
+            return reply.err(ErrorCode::Faulted, "cannot forget an unreadable session");
+        }
         self.probe();
         if self.proc.is_some() {
             self.stop_agent(Cause::User);
@@ -3456,11 +3491,14 @@ mod tests {
             let (entered_tx, entered) = oneshot::channel();
             let (release, release_rx) = oneshot::channel();
             actor.journal.as_mut().unwrap().pause_question = Some((entered_tx, release_rx));
-            let asked = tokio::spawn(async move {
+            let mut asked = tokio::spawn(async move {
                 ask(&mut actor).await;
                 actor
             });
-            entered.await.unwrap();
+            tokio::select! {
+                result = entered => result.expect("question skipped its sync"),
+                _ = &mut asked => panic!("published without waiting for the sync"),
+            }
             // The worker has written the entire question, including its newline.
             let disk = fs::read_to_string(path).unwrap();
             assert!(disk.ends_with('\n'));
@@ -3519,6 +3557,128 @@ mod tests {
     }
 
     const READ_INPUT: &str = "while read -r line; do :; done";
+
+    mod revive_journal {
+        use super::*;
+
+        async fn dormant_revivable(dir: &Path) -> (Acp, mpsc::Receiver<Cmd>) {
+            let (mut acp, rx) = dormant(dir).await;
+            acp.facts.agent_session_id = Some("s".into());
+            acp.meta.init = Some(json!({"agentCapabilities":{"loadSession":true}}));
+            (acp, rx)
+        }
+
+        async fn revive(acp: &mut Acp) -> Value {
+            let out = Arc::new(OutQ::default());
+            acp.act(Act::Revive, Reply::for_test(1, out.clone()));
+            next_reply(&out).await
+        }
+
+        #[tokio::test]
+        async fn acknowledged_background_eio_refuses_revive_before_starting_child() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut acp, _rx) = dormant_revivable(dir.path()).await;
+            configure_test_agent(&mut acp, READ_INPUT);
+            let prefix = fs::read(acp.path("jsonl")).unwrap();
+            let journal = acp.journal.as_mut().unwrap();
+            journal.fail_background_sync = true;
+            let error = journal.sync().await.unwrap().unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(rustix::io::Errno::IO.raw_os_error())
+            );
+            journal.fail_background_sync = false;
+            assert!(acp.fault.is_none(), "actor has not yet observed the EIO");
+
+            let reply = revive(&mut acp).await;
+            // agent::start opens this log synchronously after spawning the process.
+            assert!(
+                !acp.path("stderr.log").exists(),
+                "started an unjournalable agent"
+            );
+            assert!(acp.proc.is_none() && lock(&acp.shared.pgid).is_none());
+            assert_eq!(reply["code"], "faulted", "{reply}");
+            assert_eq!(acp.fault.as_ref().unwrap().code, FaultCode::JournalWrite);
+            assert_eq!(fs::read(acp.path("jsonl")).unwrap(), prefix);
+        }
+
+        #[tokio::test]
+        async fn failed_spawn_append_refuses_revive_and_reaps_without_initialize() {
+            watchdog(check_spawn_append_and_retry()).await;
+        }
+
+        async fn check_spawn_append_and_retry() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut acp, _rx) = dormant_revivable(dir.path()).await;
+            // Echo the first RPC, if any, and exit when stdin closes.
+            configure_test_agent(
+                &mut acp,
+                r#"if read -r request; then printf '%s\n' "$request"; fi"#,
+            );
+            let prefix = fs::read(acp.path("jsonl")).unwrap();
+            acp.journal.as_mut().unwrap().fail_at = Some(acp.facts.head_seq + 1);
+            let reply = revive(&mut acp).await;
+
+            let proc = acp
+                .proc
+                .as_mut()
+                .expect("started child is tracked for teardown");
+            let status = proc.agent.child.wait().await.unwrap();
+            assert!(status.success());
+            assert!(
+                matches!(proc.agent.stdout.recv().await, Some(Out::Eof)),
+                "agent received an RPC"
+            );
+            acp.child_exited(Ok(status));
+            acp.stdout_closed();
+            assert!(acp.proc.is_none() && lock(&acp.shared.pgid).is_none());
+            assert_eq!(reply["code"], "faulted", "{reply}");
+            assert_eq!(acp.fault.as_ref().unwrap().code, FaultCode::JournalWrite);
+            assert_eq!(fs::read(acp.path("jsonl")).unwrap(), prefix);
+
+            // The probe heals this one-shot write fault. A healthy revive sends initialize.
+            assert_eq!(revive(&mut acp).await["t"], "ok");
+            let agent = &mut acp.proc.as_mut().unwrap().agent;
+            let Some(Out::Msg(request)) = agent.stdout.recv().await else {
+                panic!("expected initialize");
+            };
+            assert_eq!(request["method"], "initialize");
+            assert!(agent.child.wait().await.unwrap().success());
+        }
+
+        #[tokio::test]
+        async fn spawn_failure_reports_spawn_failed_only_if_setup_error_was_written() {
+            for fail_append in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let (mut acp, _rx) = dormant_revivable(dir.path()).await;
+                let head = acp.facts.head_seq;
+                if fail_append {
+                    acp.journal.as_mut().unwrap().fail_at = Some(head + 1);
+                }
+                let reply = revive(&mut acp).await; // dormant's agent is unavailable
+                assert!(acp.proc.is_none());
+                if fail_append {
+                    assert_eq!(reply["code"], "faulted", "{reply}");
+                    assert_eq!(acp.fault.as_ref().unwrap().code, FaultCode::JournalWrite);
+                    assert_eq!(acp.facts.head_seq, head);
+                } else {
+                    assert_eq!(reply["code"], "spawn_failed", "{reply}");
+                    assert!(acp.fault.is_none());
+                    let log = fs::read_to_string(acp.path("jsonl")).unwrap();
+                    let last: JournalEvent =
+                        serde_json::from_str(log.lines().last().unwrap()).unwrap();
+                    assert_eq!(last.seq, head + 1);
+                    assert!(matches!(
+                        last.body,
+                        EventBody::SetupError {
+                            code: SetupErrorCode::SpawnFailed,
+                            ..
+                        }
+                    ));
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn rejected_prompt_enqueue_ends_the_journaled_turn() {
@@ -4016,6 +4176,77 @@ mod tests {
             to_agent(PendingKind::Permission, selected.clone()),
             json!({"outcome": selected})
         );
+    }
+
+    #[tokio::test]
+    async fn load_io_fault_preserves_files_through_actions_stop_and_retry() {
+        async fn attach(ctx: &Arc<Ctx>) -> Value {
+            let q = Arc::new(OutQ::default());
+            let o = Open {
+                viewer: Viewer {
+                    id: 1,
+                    outq: q.clone(),
+                },
+                since: 0,
+                epoch: None,
+                spawn: None,
+                reply: Reply::for_test(1, q.clone()),
+            };
+            open(ctx.clone(), "a".into(), o).await;
+            next_reply(&q).await
+        }
+
+        for ext in ["jsonl", "json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (actor, _rx) = dormant(dir.path()).await;
+            let (ctx, epoch) = (actor.ctx.clone(), actor.created_at);
+            let (meta, journal) = (actor.path("json"), actor.path("jsonl"));
+            let (metadata, prefix) = (fs::read(&meta).unwrap(), fs::read(&journal).unwrap());
+            let path = actor.path(ext);
+            drop(actor);
+
+            // ELOOP on just this file, even as root. Repair the backing link, not
+            // the session name, so a quarantine cannot be undone by the fixture.
+            let original = dir.path().join("original");
+            let backing = dir.path().join("backing");
+            fs::rename(&path, &original).unwrap();
+            std::os::unix::fs::symlink(&backing, &backing).unwrap();
+            std::os::unix::fs::symlink(&backing, &path).unwrap();
+            load(&ctx, "a".into()).await;
+            let opened = attach(&ctx).await;
+            assert_eq!(opened["summary"]["fault"]["code"], "load_failed");
+            assert_eq!(opened["summary"]["alive"], false);
+            assert_eq!(opened["head"], 0);
+            assert!(path.is_symlink(), "I/O failure quarantined {ext}");
+            fs::rename(&original, &backing).unwrap();
+
+            let q = Arc::new(OutQ::default());
+            for act in [
+                Act::SetTask(Some("must not commit".into())),
+                Act::Revive,
+                Act::Kill { forget: true },
+            ] {
+                let cmd = Cmd::Act {
+                    epoch: None,
+                    act,
+                    reply: Reply::for_test(2, q.clone()),
+                };
+                ctx.registry.deliver("a", cmd).await;
+                assert_eq!(next_reply(&q).await["code"], "faulted");
+            }
+            let (done, stopped) = oneshot::channel();
+            ctx.registry.deliver("a", Cmd::Shutdown { done }).await;
+            stopped.await.unwrap();
+            assert_eq!(fs::read(&meta).unwrap(), metadata);
+            assert_eq!(fs::read(&journal).unwrap(), prefix);
+
+            load(&ctx, "a".into()).await;
+            let opened = attach(&ctx).await;
+            assert_eq!(opened["summary"]["fault"], Value::Null);
+            assert_eq!(opened["summary"]["createdAt"], epoch);
+            assert_eq!(opened["summary"]["acp"]["task"], "original");
+            assert_eq!(opened["head"], 1);
+        }
     }
 
     #[test]
