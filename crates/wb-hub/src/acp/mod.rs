@@ -1893,7 +1893,10 @@ impl Acp {
         if queued {
             reply.done();
         } else {
-            reply.err(ErrorCode::Internal, ENQUEUE_FAILED);
+            reply.err(
+                ErrorCode::Internal,
+                "agent input was not queued; the answer is already recorded and final",
+            );
         }
     }
 
@@ -3489,12 +3492,19 @@ mod tests {
         (cmd, outq)
     }
 
-    async fn next_reply(outq: &OutQ) -> Value {
-        let line = tokio::time::timeout(Duration::from_secs(5), outq.pop())
-            .await
-            .expect("actor did not reply")
-            .unwrap();
+    async fn read_reply(outq: &OutQ) -> Value {
+        let line = outq.pop().await.expect("reply queue closed");
         serde_json::from_slice(&line).unwrap()
+    }
+
+    async fn watchdog<F: Future>(f: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(120), f)
+            .await
+            .expect("ACP test timed out")
+    }
+
+    async fn next_reply(outq: &OutQ) -> Value {
+        watchdog(read_reply(outq)).await
     }
 
     fn configure_test_agent(acp: &mut Acp, script: &str) {
@@ -3591,6 +3601,8 @@ mod tests {
         assert!(acp.facts.pending.is_empty());
         assert_eq!(turn_cancel["code"], "internal");
         assert_eq!(answer["code"], "internal");
+        let message = answer["message"].as_str().unwrap();
+        assert!(message.contains("not queued") && message.contains("already recorded"));
         assert_eq!(idle_cancel["code"], "internal");
     }
 
@@ -4058,6 +4070,15 @@ mod tests {
     mod setup_drain {
         use super::*;
 
+        async fn case(run: impl AsyncFnOnce(&mut Acp)) {
+            watchdog(async {
+                let dir = tempfile::tempdir().unwrap();
+                let (mut acp, _rx) = dormant(dir.path()).await;
+                run(&mut acp).await;
+            })
+            .await;
+        }
+
         fn init() -> Value {
             json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,
                 "authMethods":[{"id":"login","name":"Log in"}],
@@ -4088,10 +4109,7 @@ mod tests {
 
         async fn output(acp: &mut Acp) -> Out {
             let stdout = &mut acp.proc.as_mut().unwrap().agent.stdout;
-            tokio::time::timeout(Duration::from_secs(5), stdout.recv())
-                .await
-                .expect("agent did not answer")
-                .unwrap()
+            stdout.recv().await.expect("stdout reader disappeared")
         }
 
         async fn response(acp: &mut Acp) {
@@ -4101,14 +4119,24 @@ mod tests {
             acp.agent_message(msg).await;
         }
 
-        async fn exit(acp: &mut Acp) {
-            let child = &mut acp.proc.as_mut().unwrap().agent.child;
-            let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
-                .await
-                .expect("agent did not exit")
-                .unwrap();
-            assert!(status.success());
-            acp.child_exited(Ok(status));
+        async fn begin_drain(acp: &mut Acp, eof_first: bool) -> mpsc::UnboundedReceiver<Vec<u8>> {
+            let agent = &mut acp.proc.as_mut().unwrap().agent;
+            let status = if eof_first {
+                assert!(matches!(agent.stdout.recv().await, Some(Out::Eof)));
+                None
+            } else {
+                let status = agent.child.wait().await.unwrap();
+                assert!(status.success());
+                Some(status)
+            };
+            // A dead pipe could reject a continuation without advancing next_id.
+            // Keep stdin receptive from the instant the actor observes exit/EOF.
+            let writes = agent.stdin.as_mut().unwrap().capture();
+            match status {
+                Some(status) => acp.child_exited(Ok(status)),
+                None => acp.stdout_closed(),
+            }
+            writes
         }
 
         async fn eof(acp: &mut Acp) {
@@ -4116,86 +4144,78 @@ mod tests {
             acp.stdout_closed();
         }
 
-        fn no_next_request(acp: &Acp, next_id: u64) {
-            let p = acp.proc.as_ref().unwrap();
-            assert_eq!(p.next_id, next_id, "enqueued an RPC during drain");
-            assert!(p.outstanding.is_empty());
+        fn no_next_request(acp: &Acp, mut writes: mpsc::UnboundedReceiver<Vec<u8>>) {
+            match writes.try_recv() {
+                Ok(line) => panic!("RPC during drain: {}", String::from_utf8_lossy(&line)),
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(e) => panic!("test stdin closed: {e}"),
+            }
+            assert!(acp.proc.as_ref().unwrap().outstanding.is_empty());
         }
 
         #[tokio::test]
         async fn failed_setup_refuses_authenticate_after_exit_or_eof() {
             for eof_first in [false, true] {
-                let dir = tempfile::tempdir().unwrap();
-                let (mut acp, _rx) = dormant(dir.path()).await;
-                spawn(
-                    &mut acp,
-                    SpawnVia::New,
-                    &[init(), auth_required()],
-                    eof_first,
-                );
-                response(&mut acp).await;
-                response(&mut acp).await;
-                let last = acp.facts.last.as_ref().unwrap();
-                assert_eq!(last.error.as_ref().unwrap().code, "auth_required");
-                assert!(!acp.has_session && acp.stage.is_none());
-                if eof_first {
-                    eof(&mut acp).await;
-                } else {
-                    exit(&mut acp).await;
-                }
+                case(async |acp| {
+                    spawn(acp, SpawnVia::New, &[init(), auth_required()], eof_first);
+                    response(acp).await;
+                    response(acp).await;
+                    let last = acp.facts.last.as_ref().unwrap();
+                    assert_eq!(last.error.as_ref().unwrap().code, "auth_required");
+                    assert!(!acp.has_session && acp.stage.is_none());
+                    let writes = begin_drain(acp, eof_first).await;
 
-                let path = acp.path("jsonl");
-                let before = fs::read(&path).unwrap();
-                let seen = acp.meta.seen_seq;
-                let q = Arc::new(OutQ::default());
-                acp.act(
-                    Act::Authenticate("login".into()),
-                    Reply::for_test(1, q.clone()),
-                );
-                no_next_request(&acp, 3);
-                assert_eq!(next_reply(&q).await["code"], "not_alive");
-                assert_eq!(acp.meta.seen_seq, seen);
-                assert_eq!(fs::read(path).unwrap(), before);
+                    let path = acp.path("jsonl");
+                    let before = fs::read(&path).unwrap();
+                    let seen = acp.meta.seen_seq;
+                    let q = Arc::new(OutQ::default());
+                    acp.act(
+                        Act::Authenticate("login".into()),
+                        Reply::for_test(1, q.clone()),
+                    );
+                    no_next_request(acp, writes);
+                    assert_eq!(read_reply(&q).await["code"], "not_alive");
+                    assert_eq!(acp.meta.seen_seq, seen);
+                    assert_eq!(fs::read(path).unwrap(), before);
+                })
+                .await;
             }
         }
 
         #[tokio::test]
         async fn buffered_authenticate_answers_without_opening_a_session() {
-            let dir = tempfile::tempdir().unwrap();
-            let (mut acp, _rx) = dormant(dir.path()).await;
-            let ok = json!({"jsonrpc":"2.0","id":3,"result":{}});
-            spawn(
-                &mut acp,
-                SpawnVia::New,
-                &[init(), auth_required(), ok],
-                false,
-            );
-            response(&mut acp).await;
-            response(&mut acp).await;
-            let q = Arc::new(OutQ::default());
-            acp.act(
-                Act::Authenticate("login".into()),
-                Reply::for_test(1, q.clone()),
-            );
-            exit(&mut acp).await;
-            response(&mut acp).await;
-            assert_eq!(next_reply(&q).await["t"], "ok");
-            no_next_request(&acp, 4);
+            case(async |acp| {
+                let ok = json!({"jsonrpc":"2.0","id":3,"result":{}});
+                spawn(acp, SpawnVia::New, &[init(), auth_required(), ok], false);
+                response(acp).await;
+                response(acp).await;
+                let q = Arc::new(OutQ::default());
+                acp.act(
+                    Act::Authenticate("login".into()),
+                    Reply::for_test(1, q.clone()),
+                );
+                let writes = begin_drain(acp, false).await;
+                response(acp).await;
+                no_next_request(acp, writes);
+                assert_eq!(read_reply(&q).await["t"], "ok");
+            })
+            .await;
         }
 
         #[tokio::test]
         async fn buffered_resume_failure_does_not_fall_back_to_load() {
-            let dir = tempfile::tempdir().unwrap();
-            let (mut acp, _rx) = dormant(dir.path()).await;
-            acp.facts.agent_session_id = Some("old".into());
-            let failed =
-                json!({"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"no resume"}});
-            spawn(&mut acp, SpawnVia::Revive, &[init(), failed], false);
-            response(&mut acp).await;
-            exit(&mut acp).await;
-            response(&mut acp).await;
-            no_next_request(&acp, 3);
-            assert!(!acp.load_filter);
+            case(async |acp| {
+                acp.facts.agent_session_id = Some("old".into());
+                let failed =
+                    json!({"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"no resume"}});
+                spawn(acp, SpawnVia::Revive, &[init(), failed], false);
+                response(acp).await;
+                let writes = begin_drain(acp, false).await;
+                response(acp).await;
+                no_next_request(acp, writes);
+                assert!(!acp.load_filter);
+            })
+            .await;
         }
 
         fn initial_batch(acp: &mut Acp) -> Arc<OutQ> {
@@ -4221,46 +4241,59 @@ mod tests {
             q
         }
 
-        async fn initial_options(responses: usize) {
-            let dir = tempfile::tempdir().unwrap();
-            let (mut acp, _rx) = dormant(dir.path()).await;
-            let q = initial_batch(&mut acp);
-            let options = |applied| {
-                json!([
-                    {"id":"first","name":"First","type":"boolean","currentValue":applied},
-                    {"id":"second","name":"Second","type":"boolean","currentValue":false}
-                ])
-            };
-            let replies = [
-                init(),
-                json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s","configOptions":options(false)}}),
-                json!({"jsonrpc":"2.0","id":3,"result":{"configOptions":options(true)}}),
-            ];
-            spawn(&mut acp, SpawnVia::New, &replies[..responses], false);
-            for _ in 1..responses {
-                response(&mut acp).await;
-            }
-            exit(&mut acp).await;
-            if responses != 0 {
-                response(&mut acp).await;
-                no_next_request(&acp, responses as u64 + 1);
-                assert_eq!(acp.meta.init.as_ref(), Some(&replies[0]["result"]));
-            }
-            eof(&mut acp).await;
-
-            let opened = next_reply(&q).await;
+        async fn creating_reply(acp: &Acp, q: &OutQ) -> Value {
+            assert!(acp.startup_config.is_none(), "creating open still held");
+            let opened = read_reply(q).await;
             assert_eq!(opened["new"], true, "{opened}");
-            let applied = responses == 3;
-            if responses >= 2 {
-                assert_eq!(acp.meta.agent_session_id.as_deref(), Some("s"));
-                assert_eq!(opened["session"]["configOptions"], options(applied));
-            }
-            let unapplied = if applied {
-                &["second"][..]
-            } else {
-                &["first", "second"][..]
-            };
-            assert_unapplied(&opened, unapplied);
+            opened
+        }
+
+        async fn initial_options(responses: usize) {
+            case(async |acp| {
+                let q = initial_batch(acp);
+                let options = |applied| {
+                    json!([
+                        {"id":"first","name":"First","type":"boolean","currentValue":applied},
+                        {"id":"second","name":"Second","type":"boolean","currentValue":false}
+                    ])
+                };
+                let replies = [
+                    init(),
+                    json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s","configOptions":options(false)}}),
+                    json!({"jsonrpc":"2.0","id":3,"result":{"configOptions":options(true)}}),
+                ];
+                spawn(acp, SpawnVia::New, &replies[..responses], false);
+                for _ in 1..responses {
+                    response(acp).await;
+                }
+                let writes = begin_drain(acp, false).await;
+                if responses == 0 {
+                    // Exit alone cannot settle initialize: only EOF tells the actor
+                    // that no buffered response will arrive to release the open.
+                    assert!(acp.startup_config.is_some());
+                    eof(acp).await;
+                } else {
+                    response(acp).await;
+                    no_next_request(acp, writes);
+                    assert_eq!(acp.meta.init.as_ref(), Some(&replies[0]["result"]));
+                }
+                let opened = creating_reply(acp, &q).await;
+                let applied = responses == 3;
+                if responses >= 2 {
+                    assert_eq!(acp.meta.agent_session_id.as_deref(), Some("s"));
+                    assert_eq!(opened["session"]["configOptions"], options(applied));
+                }
+                let unapplied = if applied {
+                    &["second"][..]
+                } else {
+                    &["first", "second"][..]
+                };
+                assert_unapplied(&opened, unapplied);
+                if responses != 0 {
+                    eof(acp).await;
+                }
+            })
+            .await;
         }
 
         fn assert_unapplied(opened: &Value, unapplied: &[&str]) {
@@ -4275,17 +4308,18 @@ mod tests {
 
         #[tokio::test]
         async fn buffered_setup_error_is_recorded_but_unattempted_options_are_not_alive() {
-            let dir = tempfile::tempdir().unwrap();
-            let (mut acp, _rx) = dormant(dir.path()).await;
-            let q = initial_batch(&mut acp);
-            spawn(&mut acp, SpawnVia::New, &[init(), auth_required()], false);
-            response(&mut acp).await;
-            exit(&mut acp).await;
-            response(&mut acp).await;
-            let last = acp.facts.last.as_ref().unwrap();
-            assert_eq!(last.error.as_ref().unwrap().code, "auth_required");
-            no_next_request(&acp, 3);
-            assert_unapplied(&next_reply(&q).await, &["first", "second"]);
+            case(async |acp| {
+                let q = initial_batch(acp);
+                spawn(acp, SpawnVia::New, &[init(), auth_required()], false);
+                response(acp).await;
+                let writes = begin_drain(acp, false).await;
+                response(acp).await;
+                let last = acp.facts.last.as_ref().unwrap();
+                assert_eq!(last.error.as_ref().unwrap().code, "auth_required");
+                no_next_request(acp, writes);
+                assert_unapplied(&creating_reply(acp, &q).await, &["first", "second"]);
+            })
+            .await;
         }
 
         #[tokio::test]

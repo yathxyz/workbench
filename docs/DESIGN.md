@@ -355,7 +355,7 @@ This holds even if a command was queued as the old session was being forgotten.
 
 A successful enqueue means the agent's stdin queue accepted the message, not that the agent read it.
 If the queue rejects a journaled prompt, the hub records `turn_error{agent_error}` and returns `internal`; if it cannot record that error, it returns `faulted`.
-Cancel and question answers also report `internal` on enqueue failure; a resolution already journaled remains final, so retrying the answer returns `already_resolved`.
+Cancel and question answers also report `internal` on enqueue failure; for an answer the error says the input was not queued but the answer was recorded and is final, so retrying returns `already_resolved`.
 
 Once the actor observes child exit or stdout EOF, it drains the remaining output or waits for the exit status before publishing the final `exit`.
 During that interval it refuses prompt, mode, config, cancel, answers to still-pending questions and an otherwise eligible authenticate with `not_alive`, without queuing agent input, journaling the action or advancing `seenSeq`.
