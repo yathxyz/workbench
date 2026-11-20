@@ -371,6 +371,7 @@ interface PdfPageLive {
   canvas: HTMLCanvasElement | null; r: number;   // the drawn bitmap and its pixels per PDF unit
   task: PdfJsRenderTask | null; taskR?: number;  // the bitmap being drawn and its pixels per PDF unit
   textReady?: Promise<void>;           // the text layer, once its spans are in
+  textTask?: PdfJsTextTask | null;      // null once the current layer settles
   text: HTMLElement | null; links: HTMLElement | null; used: number;
 }
 /* A media card's controls. */
@@ -379,10 +380,11 @@ interface OpLive { prompt: HTMLTextAreaElement; out: HTMLElement; ins: HTMLEleme
 interface PdfJsLib {
   GlobalWorkerOptions: { workerSrc: string };
   getDocument(src: { url?: string; data?: Uint8Array; enableXfa?: boolean; stopAtErrors?: boolean; cMapUrl?: string; cMapPacked?: boolean }): PdfJsLoadingTask;
-  TextLayer: new (o: { textContentSource: unknown; container: HTMLElement; viewport: PdfJsViewport }) => { render(): Promise<void>; cancel(): void };
+  TextLayer: new (o: { textContentSource: unknown; container: HTMLElement; viewport: PdfJsViewport }) => PdfJsTextTask;
   version: string;
 }
 interface PdfJsLoadingTask { promise: Promise<PdfJsDocument>; destroy(): Promise<void> }
+interface PdfJsTextTask { render(): Promise<void>; cancel(): void }
 interface PdfJsDocument {
   numPages: number;
   getPage(n: number): Promise<PdfJsPage>;
