@@ -11358,7 +11358,7 @@ function hashInit(): void {
     HASH.pending = start; notesReady().then(() => hashRestore('note'), hashCancelRestore);
   } else if (a && !goAddr(start, false) && a.kind === 'board' && DAEMON) HASH.pending = start;
   if (HASH.pending) setTimeout(hashCancelRestore, 5000);   // only boot can arm a restore
-  addEventListener('hashchange', () => { hashCancelRestore(); if (HASH.busy) return; const a = decodeURIComponent(location.hash.slice(1)); if (a && parseAddr(a) && a !== HASH.last) { HASH.last = a; goAddr(a, false); } });
+  addEventListener('hashchange', e => { hashCancelRestore(); if (HASH.busy) return; const a = decodeURIComponent(new URL(e.newURL).hash.slice(1)); if (a && parseAddr(a) && a !== HASH.last) { HASH.last = a; goAddr(a, false); } });
   setInterval(() => { if (!HASH.pending && !HASH.busy && !document.hidden) hashSync(); }, 1500);
 }
 cmd('Go to address…', () => askName('Address (board:/path · fs:@host/dir · note:Title#Heading · tag:x · journal:2026/10/10 · link:Page · proc:@host/PID · unit:@host/NAME)', currentAddr(), v => goAddr(v)), 'Ctrl-Space a · ga in the navigator');
