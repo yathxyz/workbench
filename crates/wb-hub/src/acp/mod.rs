@@ -1333,8 +1333,16 @@ impl Acp {
     /// Folds an event that is on disk, sends it to the viewers and publishes.
     fn applied(&mut self, ev: JournalEvent) {
         let setup_error = match &ev.body {
+            // Keep the agent's buffered setup error in the journal. The initial
+            // options, however, can no longer be attempted.
+            EventBody::SetupError { .. } if self.draining() => {
+                Some((ErrorCode::NotAlive, NOT_RUNNING.to_owned()))
+            }
             EventBody::SetupError { code, message, .. } => Some((
                 match code {
+                    SetupErrorCode::AgentExited | SetupErrorCode::Interrupted => {
+                        ErrorCode::NotAlive
+                    }
                     SetupErrorCode::Timeout => ErrorCode::Timeout,
                     SetupErrorCode::SpawnFailed => ErrorCode::SpawnFailed,
                     _ => ErrorCode::AgentError,
@@ -2028,6 +2036,9 @@ impl Acp {
     }
 
     fn advance_startup_config(&mut self) {
+        if self.draining() {
+            return self.fail_startup_config(ErrorCode::NotAlive, NOT_RUNNING);
+        }
         let Some(batch) = &mut self.startup_config else {
             return;
         };
@@ -2245,6 +2256,9 @@ impl Acp {
                 ErrorCode::BadRequest,
                 "authenticate only after a failed setup",
             );
+        }
+        if self.draining() {
+            return reply.err(ErrorCode::NotAlive, NOT_RUNNING);
         }
         if !self.record(EventBody::Authenticate {
             method_id: method_id.to_owned(),
@@ -2725,6 +2739,11 @@ impl Acp {
     }
 
     fn session_request(&mut self, via: SessionVia) {
+        // Keep the response that got us here, but don't start session/new,
+        // resume or a fallback load while collecting the agent's final output.
+        if self.draining() {
+            return self.fail_startup_config(ErrorCode::NotAlive, NOT_RUNNING);
+        }
         let cwd = self.meta.cwd.clone();
         let session = self.facts.agent_session_id.clone().unwrap_or_default();
         self.load_filter = via == SessionVia::Load;
@@ -3901,5 +3920,259 @@ mod tests {
             json!({"path": meta.cwd, "branch": "feature/a", "mainRoot": "/home/alice/project"})
         );
         assert_eq!(serde_json::from_value::<Meta>(v).unwrap(), meta);
+    }
+
+    mod setup_drain {
+        use super::*;
+
+        fn init() -> Value {
+            json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,
+                "authMethods":[{"id":"login","name":"Log in"}],
+                "agentCapabilities":{"loadSession":true,"sessionCapabilities":{"resume":{}}}}})
+        }
+
+        fn auth_required() -> Value {
+            json!({"jsonrpc":"2.0","id":2,"error":{"code":AUTH_REQUIRED,"message":"log in"}})
+        }
+
+        // Answer each outstanding request through the real pipes. Drive the actor inputs
+        // separately so its last response is buffered when it first observes the exit.
+        fn spawn(acp: &mut Acp, via: SpawnVia, replies: &[Value], eof_first: bool) {
+            let mut script = String::from(
+                r#"for reply in "$@"; do read -r request || exit 1; printf '%s\n' "$reply"; done"#,
+            );
+            if eof_first {
+                script.push_str("; exec 1>&-; ");
+                script.push_str(READ_INPUT);
+            }
+            configure_test_agent(acp, &script);
+            let cfg = &mut Arc::get_mut(&mut acp.ctx).unwrap().cfg;
+            let argv = &mut cfg.agents.get_mut("offline").unwrap().argv;
+            argv.push("setup-test-agent".into()); // shell's $0
+            argv.extend(replies.iter().map(Value::to_string));
+            acp.spawn(via).unwrap();
+        }
+
+        async fn output(acp: &mut Acp) -> Out {
+            let stdout = &mut acp.proc.as_mut().unwrap().agent.stdout;
+            tokio::time::timeout(Duration::from_secs(5), stdout.recv())
+                .await
+                .expect("agent did not answer")
+                .unwrap()
+        }
+
+        async fn response(acp: &mut Acp) {
+            let Out::Msg(msg) = output(acp).await else {
+                panic!("expected a response before EOF");
+            };
+            acp.agent_message(msg).await;
+        }
+
+        async fn exit(acp: &mut Acp) {
+            let child = &mut acp.proc.as_mut().unwrap().agent.child;
+            let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .expect("agent did not exit")
+                .unwrap();
+            assert!(status.success());
+            acp.child_exited(Ok(status));
+        }
+
+        async fn eof(acp: &mut Acp) {
+            assert!(matches!(output(acp).await, Out::Eof));
+            acp.stdout_closed();
+        }
+
+        fn no_next_request(acp: &Acp, next_id: u64) {
+            let p = acp.proc.as_ref().unwrap();
+            assert_eq!(p.next_id, next_id, "enqueued an RPC during drain");
+            assert!(p.outstanding.is_empty());
+        }
+
+        #[tokio::test]
+        async fn failed_setup_refuses_authenticate_after_exit_or_eof() {
+            for eof_first in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let (mut acp, _rx) = dormant(dir.path()).await;
+                spawn(
+                    &mut acp,
+                    SpawnVia::New,
+                    &[init(), auth_required()],
+                    eof_first,
+                );
+                response(&mut acp).await;
+                response(&mut acp).await;
+                let last = acp.facts.last.as_ref().unwrap();
+                assert_eq!(last.error.as_ref().unwrap().code, "auth_required");
+                assert!(!acp.has_session && acp.stage.is_none());
+                if eof_first {
+                    eof(&mut acp).await;
+                } else {
+                    exit(&mut acp).await;
+                }
+
+                let path = acp.path("jsonl");
+                let before = fs::read(&path).unwrap();
+                let seen = acp.meta.seen_seq;
+                let q = Arc::new(OutQ::default());
+                acp.act(
+                    Act::Authenticate("login".into()),
+                    Reply::for_test(1, q.clone()),
+                );
+                no_next_request(&acp, 3);
+                assert_eq!(next_reply(&q).await["code"], "not_alive");
+                assert_eq!(acp.meta.seen_seq, seen);
+                assert_eq!(fs::read(path).unwrap(), before);
+            }
+        }
+
+        #[tokio::test]
+        async fn buffered_authenticate_answers_without_opening_a_session() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut acp, _rx) = dormant(dir.path()).await;
+            let ok = json!({"jsonrpc":"2.0","id":3,"result":{}});
+            spawn(
+                &mut acp,
+                SpawnVia::New,
+                &[init(), auth_required(), ok],
+                false,
+            );
+            response(&mut acp).await;
+            response(&mut acp).await;
+            let q = Arc::new(OutQ::default());
+            acp.act(
+                Act::Authenticate("login".into()),
+                Reply::for_test(1, q.clone()),
+            );
+            exit(&mut acp).await;
+            response(&mut acp).await;
+            assert_eq!(next_reply(&q).await["t"], "ok");
+            no_next_request(&acp, 4);
+        }
+
+        #[tokio::test]
+        async fn buffered_resume_failure_does_not_fall_back_to_load() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut acp, _rx) = dormant(dir.path()).await;
+            acp.facts.agent_session_id = Some("old".into());
+            let failed =
+                json!({"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"no resume"}});
+            spawn(&mut acp, SpawnVia::Revive, &[init(), failed], false);
+            response(&mut acp).await;
+            exit(&mut acp).await;
+            response(&mut acp).await;
+            no_next_request(&acp, 3);
+            assert!(!acp.load_filter);
+        }
+
+        fn initial_batch(acp: &mut Acp) -> Arc<OutQ> {
+            let q = Arc::new(OutQ::default());
+            acp.startup_config = Some(StartupConfig {
+                open: Open {
+                    viewer: Viewer {
+                        id: 1,
+                        outq: q.clone(),
+                    },
+                    since: 0,
+                    epoch: None,
+                    spawn: None,
+                    reply: Reply::for_test(1, q.clone()),
+                },
+                remaining: serde_json::from_value(json!([
+                    {"id":"first","value":true},{"id":"second","value":true}
+                ]))
+                .unwrap(),
+                current: None,
+                errors: Vec::new(),
+            });
+            q
+        }
+
+        async fn initial_options(responses: usize) {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut acp, _rx) = dormant(dir.path()).await;
+            let q = initial_batch(&mut acp);
+            let options = |applied| {
+                json!([
+                    {"id":"first","name":"First","type":"boolean","currentValue":applied},
+                    {"id":"second","name":"Second","type":"boolean","currentValue":false}
+                ])
+            };
+            let replies = [
+                init(),
+                json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s","configOptions":options(false)}}),
+                json!({"jsonrpc":"2.0","id":3,"result":{"configOptions":options(true)}}),
+            ];
+            spawn(&mut acp, SpawnVia::New, &replies[..responses], false);
+            for _ in 1..responses {
+                response(&mut acp).await;
+            }
+            exit(&mut acp).await;
+            if responses != 0 {
+                response(&mut acp).await;
+                no_next_request(&acp, responses as u64 + 1);
+                assert_eq!(acp.meta.init.as_ref(), Some(&replies[0]["result"]));
+            }
+            eof(&mut acp).await;
+
+            let opened = next_reply(&q).await;
+            assert_eq!(opened["new"], true, "{opened}");
+            let applied = responses == 3;
+            if responses >= 2 {
+                assert_eq!(acp.meta.agent_session_id.as_deref(), Some("s"));
+                assert_eq!(opened["session"]["configOptions"], options(applied));
+            }
+            let unapplied = if applied {
+                &["second"][..]
+            } else {
+                &["first", "second"][..]
+            };
+            assert_unapplied(&opened, unapplied);
+        }
+
+        fn assert_unapplied(opened: &Value, unapplied: &[&str]) {
+            let errors = opened["configErrors"].as_array().unwrap();
+            assert_eq!(errors.len(), unapplied.len());
+            for (error, id) in errors.iter().zip(unapplied) {
+                assert_eq!(error["id"], *id);
+                assert_eq!(error["value"], true);
+                assert_eq!(error["code"], "not_alive");
+            }
+        }
+
+        #[tokio::test]
+        async fn buffered_setup_error_is_recorded_but_unattempted_options_are_not_alive() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut acp, _rx) = dormant(dir.path()).await;
+            let q = initial_batch(&mut acp);
+            spawn(&mut acp, SpawnVia::New, &[init(), auth_required()], false);
+            response(&mut acp).await;
+            exit(&mut acp).await;
+            response(&mut acp).await;
+            let last = acp.facts.last.as_ref().unwrap();
+            assert_eq!(last.error.as_ref().unwrap().code, "auth_required");
+            no_next_request(&acp, 3);
+            assert_unapplied(&next_reply(&q).await, &["first", "second"]);
+        }
+
+        #[tokio::test]
+        async fn exit_during_initialize_fails_unapplied_options() {
+            initial_options(0).await;
+        }
+
+        #[tokio::test]
+        async fn buffered_initialize_is_saved_without_opening_a_session() {
+            initial_options(1).await;
+        }
+
+        #[tokio::test]
+        async fn buffered_session_is_recorded_without_starting_initial_options() {
+            initial_options(2).await;
+        }
+
+        #[tokio::test]
+        async fn buffered_option_is_applied_without_starting_the_next() {
+            initial_options(3).await;
+        }
     }
 }

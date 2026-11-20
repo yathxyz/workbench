@@ -358,7 +358,7 @@ If the queue rejects a journaled prompt, the hub records `turn_error{agent_error
 Cancel and question answers also report `internal` on enqueue failure; a resolution already journaled remains final, so retrying the answer returns `already_resolved`.
 
 Once the actor observes child exit or stdout EOF, it drains the remaining output or waits for the exit status before publishing the final `exit`.
-During that interval it refuses prompt, mode, config, cancel and answers to still-pending questions with `not_alive`, without queuing agent input, journaling a client action or advancing `seenSeq`.
+During that interval it refuses prompt, mode, config, cancel, answers to still-pending questions and an otherwise eligible authenticate with `not_alive`, without queuing agent input, journaling the action or advancing `seenSeq`.
 Epoch preconditions, answer lookup (`bad_request` or `already_resolved`) and existing journal faults retain their usual precedence.
 
 **Check order.** Outside that drain interval, while a non-empty initial configuration batch is active (including its preceding setup), `acp.prompt`, `acp.cancel`, `acp.set_mode` and `acp.set_config_option` fail with `busy` before their normal actor checks.
@@ -370,7 +370,7 @@ Otherwise, when a request fails several checks, the first in this list applies:
 - `acp.set_config_option`: `faulted`, `not_alive`, `bad_request` (no ACP session yet), `stale` (epoch differs from `createdAt`), then `bad_option` (unknown id, unsupported option type or wrong/unoffered value). Registry errors `not_found` and `kind_mismatch` apply before these actor checks.
 - `acp.set_policy`: registry `not_found`/`kind_mismatch`, then `stale`, `faulted`, `bad_request` (invalid policy). It is usable during setup, an initial config batch, a turn, or while dead.
 - `acp.permission`, `acp.elicitation`: `stale`; an unknown `req` is `bad_request` (`already_resolved` when that request was announced and has been answered); then `bad_option` or the shape rules.
-- `acp.authenticate`: `bad_option` (a method that is not offered, or one with a `type`), `faulted`, then `bad_request` unless the agent is alive and waiting after a failed setup.
+- `acp.authenticate`: `bad_option` (a method that is not offered, or one with a `type`), `faulted`, `bad_request` unless the process is waiting after a failed setup, then `not_alive` if exit or EOF was observed.
 - `acp.revive`: `faulted`, then `not_revivable`.
 
 **`SpawnPty`** = `{argv: string[1..=256] (≤256 KiB in total), shell?: string, cwd?: absolute path, cwdFrom?: sid, env?: {KEY: value}}`.
@@ -704,6 +704,8 @@ A pinned event appears at its own seq position, never ahead of a lower seq. Clie
   - A failed setup ends with `auth_required` and at least one agent-handled auth method (one without a `type`): the agent is kept and waits for `acp.authenticate`.
   - Any other failed setup journals `notice{warn, "agent stopped after failed setup"}` and kills the agent.
   - A setup response that arrives once teardown has started is ignored.
+  - During exit/EOF drain, a buffered final response still determines the result of the RPC already sent, but cannot start a new setup RPC, a resume-to-load fallback or the next initial option.
+  - Unattempted initial options in that state fail with `not_alive`; an already-applied option remains in the journal and is not reported as failed.
   - A malformed `configOptions` list in a successful `session/new`, `session/resume` or `session/load` result is omitted from the `session` event, not a setup failure. Setup continues; an initial batch without an offering fails each entry with `bad_option`. This does not change the resume-error fallback to load.
 - **Initial configuration batch (non-empty `SpawnAcp.config`):**
   1. The hub owns the batch from creation, including the setup interval. It blocks the live actions listed in §3.2.7 for every client, not only the opener. No prompt is sent implicitly.
