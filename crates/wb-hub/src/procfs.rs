@@ -2,22 +2,24 @@
 
 use std::fs::File;
 use std::io::{self, Read};
+use std::os::fd::OwnedFd;
 use std::path::Path;
+use std::sync::{Arc, Weak};
 
 use rustix::fs::{Mode, OFlags, openat};
 use rustix::io::Errno;
-use rustix::process::{Signal, pidfd_send_signal};
+use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use tracing::warn;
 
-struct Member {
-    /// For diagnostics only. Signals always go through the captured directory.
+pub struct Member {
+    /// For diagnostics only. Signals always go through the captured handle.
     pid: u32,
-    dir: File,
+    fd: OwnedFd,
 }
 
 impl Member {
-    fn signal(&self, sid: &str, signal: Signal) -> io::Result<()> {
-        match pidfd_send_signal(&self.dir, signal) {
+    pub fn signal(&self, sid: &str, signal: Signal) -> io::Result<()> {
+        match pidfd_send_signal(&self.fd, signal) {
             Ok(()) | Err(Errno::SRCH) => Ok(()),
             Err(e) => {
                 warn!(%sid, pid = self.pid, ?signal, "signalling captured session member: {e}");
@@ -27,13 +29,65 @@ impl Member {
     }
 }
 
+enum Leader {
+    Captured(Member),
+    /// Only a failed HUP needs to share the still-pending KILL target with the actor.
+    Retriable(Arc<Member>),
+}
+
+impl std::ops::Deref for Leader {
+    type Target = Member;
+
+    fn deref(&self) -> &Member {
+        match self {
+            Self::Captured(member) => member,
+            Self::Retriable(member) => member,
+        }
+    }
+}
+
 pub struct SessionMembers {
     sid: String,
-    leader: Option<Member>,
+    leader: Option<Leader>,
     others: Vec<Member>,
 }
 
 impl SessionMembers {
+    /// Capture just the owned, unreaped child, never enumerate its session again.
+    pub fn leader_only(pid: u32, sid: &str) -> io::Result<Self> {
+        let id = Pid::from_raw(pid as i32).expect("positive child pid");
+        let fd = pidfd_open(id, PidfdFlags::empty()).or_else(|_| {
+            // Also works where pidfd_open is unavailable.
+            rustix::fs::open(
+                format!("/proc/{pid}"),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+        })?;
+        Ok(Self {
+            sid: sid.to_owned(),
+            leader: Some(Leader::Captured(Member { pid, fd })),
+            others: Vec::new(),
+        })
+    }
+
+    /// While the original KILL is pending, retry HUP through its very same handle.
+    /// Once that set is gone a later attempt can instead arm a new leader-only KILL.
+    pub fn track_leader(&mut self) -> Weak<Member> {
+        match self.leader.take() {
+            None => Weak::new(),
+            Some(leader) => {
+                let member = match leader {
+                    Leader::Captured(member) => Arc::new(member),
+                    Leader::Retriable(member) => member,
+                };
+                let pending = Arc::downgrade(&member);
+                self.leader = Some(Leader::Retriable(member));
+                pending
+            }
+        }
+    }
+
     /// Attempt every member. If the leader wasn't captured or its HUP failed,
     /// only the owner of the Child can distinguish a live leader from a dead one.
     pub fn hangup(&self) -> io::Result<()> {
@@ -47,7 +101,7 @@ impl SessionMembers {
     }
 
     pub fn kill(&self) {
-        for member in self.leader.iter().chain(&self.others) {
+        for member in self.leader.as_deref().into_iter().chain(&self.others) {
             let _ = member.signal(&self.sid, Signal::KILL);
         }
     }
@@ -92,10 +146,10 @@ pub fn session_members(proc: &Path, leader: u32, sid: &str) -> SessionMembers {
             }
         };
         match process_dir_and_session(&path, &mut stat) {
-            Ok((dir, session)) if session == leader => {
-                let member = Member { pid, dir };
+            Ok((fd, session)) if session == leader => {
+                let member = Member { pid, fd };
                 if pid == leader {
-                    members.leader = Some(member);
+                    members.leader = Some(Leader::Captured(member));
                 } else {
                     members.others.push(member);
                 }
@@ -110,7 +164,7 @@ pub fn session_members(proc: &Path, leader: u32, sid: &str) -> SessionMembers {
     members
 }
 
-fn process_dir_and_session(path: &Path, stat: &mut Vec<u8>) -> io::Result<(File, u32)> {
+fn process_dir_and_session(path: &Path, stat: &mut Vec<u8>) -> io::Result<(OwnedFd, u32)> {
     let dir = rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -126,7 +180,7 @@ fn process_dir_and_session(path: &Path, stat: &mut Vec<u8>) -> io::Result<(File,
     File::from(fd).read_to_end(stat)?;
     let session = session_of(stat)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed process stat"))?;
-    Ok((File::from(dir), session))
+    Ok((dir, session))
 }
 
 /// The session id in a `/proc/<pid>/stat` line. The fields are counted after the last

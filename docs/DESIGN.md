@@ -566,11 +566,13 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
   - `pre_exec`: restore the child umask, write `800` to `/proc/self/oom_score_adj`, `setsid()`, `TIOCSCTTY`;
   - argv is the request's `argv` with `argv[0]` replaced by the chosen shell's resolved path (§3.2.7): a single-item `argv` also gets the shell's configured `args` (an interactive, non-login start), and `[shell, "-c", cmd]` runs `cmd`;
   - the shell name is persisted in `pty/<sid>.json`. A respawn without `shell` uses it. A `shell` that names another shell wins and is persisted;
-  - exit is observed without reaping (`waitid` with `WNOWAIT`); the actor reaps after draining output and recording the exit, so a panic during either step still has an unambiguous session leader.
+  - normally `waitid` with `WNOWAIT` observes exit without reaping until the actor has drained output and recorded the exit.
+    If that wait fails, the actor keeps the child live until its owned child handle confirms exit; where reaping releases the leader early, pre-reap handles protect panic cleanup.
 - **Kill:** while the leader is still unreaped, the hub opens `/proc/<pid>` handles and checks session membership (stat field 6) through those handles.
   Both SIGHUP and the delayed SIGKILL use those same handles, so a survivor is still targeted after the leader exits, but a reused pid or session id is not.
   A process forked after the snapshot is not killed by this escalation; covering later forks would require containment at spawn.
   The hub warns with the session id on capture or signal-delivery errors other than a vanished process; a kill request fails if SIGHUP could not be delivered to a still-live leader.
+  A failed hangup leaves the live leader owed: a retry or teardown targets only the owned leader, without taking another snapshot.
 - **Output path:**
   1. read ≤ 64 KiB;
   2. **OutStream** holds back an incomplete UTF-8 tail (≤ 3 bytes) and an unterminated ESC/CSI/OSC/DCS tail (≤ `ESC_HOLDBACK_MAX`, counted from the sequence's ESC). The next read releases both. After 20 ms without output only the escape tail is released, as is: an incomplete character cannot be shown and waits for the next read, which completes it or turns it into U+FFFD. A respawn resets the decoder;
@@ -776,13 +778,15 @@ A pinned event appears at its own seq position, never ahead of a lower seq. Clie
     - write the death-invariant lines and `exit`, then `fdatasync`;
     - after a **user** `acp.kill`, set `seenSeq = headSeq` **after** finalising. Other kills (a failed setup, a fault, a hub stop) leave `seenSeq` alone.
   - **Not touched:** descendants that left the group with `setsid`/`setpgid` survive, like processes after an ssh logout. They are visible in `/api/proc`.
-- **SIGTERM shutdown**, within `TimeoutStopSec=15`. Accepting has stopped first.
+- **SIGTERM shutdown** (`TimeoutStopSec=15` is systemd's external limit). Accepting has stopped first.
   1. Every session actor refuses later requests with `err{internal, "hub stopping"}`.
   2. PTY actors snapshot their screens and SIGHUP their sessions. Agent actors close stdin and, if the agent is still there, send SIGTERM to its group at 5 s and SIGKILL at 6 s.
-  3. The hub waits up to 5 s (`HANGUP_WAIT`) for the children to exit. Each exit is recorded with `reason:"hub_restart"` and the real `code`/`signal`.
+  3. The shared 5 s `HANGUP_WAIT` starts only after the hub has fenced in-flight epoch writes and awaited every shutdown mailbox send.
+     A stalled mark write or a full mailbox delays the start of this deadline.
+     Each exit is recorded with `reason:"hub_restart"` and the real `code`/`signal`.
   4. As soon as every actor acknowledges, or the shared 5 s grace expires, the hub sends SIGKILL through all remaining captured PTY handles, including those of sessions already forgotten.
-     Later captures escalate immediately; shutdown never waits out another PTY's grace period.
-     The hub waits up to 3 s more (`KILL_WAIT`) for outstanding exit records, covering an agent's SIGKILL at 6 s.
+     This can shorten the ordinary three-second grace for a user kill; later captures escalate immediately.
+     After sending KILL, the hub waits up to 3 s more (`KILL_WAIT`) for any outstanding exit records, covering an agent's SIGKILL at 6 s.
   5. Exit 0.
 
   `KillMode=mixed` reaps the rest, and the next start completes any record the stop did not finish.

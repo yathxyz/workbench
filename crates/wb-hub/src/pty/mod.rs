@@ -10,7 +10,6 @@ mod vt;
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
-#[cfg(test)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::pin::Pin;
@@ -244,10 +243,11 @@ impl Escalations {
         let Some(sets) = pending.as_mut() else {
             return members.kill();
         };
-        let owner = self.clone();
+        let owner = Arc::downgrade(self);
         let deadline = Instant::now() + grace;
         let timer = tokio::spawn(async move {
             tokio::time::sleep_until(deadline).await;
+            let Some(owner) = owner.upgrade() else { return };
             let mut pending = lock(&owner.0);
             if let Some(members) = pending.as_mut().and_then(|s| s.remove(&tokio::task::id())) {
                 members.kill();
@@ -267,6 +267,12 @@ impl Escalations {
     }
 }
 
+impl Drop for Escalations {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 /// The connections attached to a session, shared with its supervisor.
 type Viewers = Arc<Mutex<Vec<Viewer>>>;
 
@@ -282,11 +288,18 @@ enum Phase {
     Stopped,
 }
 
+enum Cleanup {
+    Unarmed,
+    /// Never rescan. A captured but unsignalled leader may already have a pending KILL.
+    LeaderOwed(std::sync::Weak<procfs::Member>),
+    Armed,
+}
+
 enum Event {
     Cmd(Option<Cmd>),
     Read(std::io::Result<usize>),
     Wrote(std::io::Result<usize>),
-    Exited(std::io::Result<(Option<i32>, Option<i32>)>),
+    Exited(std::io::Result<WaitNotice>),
     Drained,
     Release,
     NudgeEnd,
@@ -320,16 +333,18 @@ struct Pty {
     /// From spawn until the exit is finished; `alive` is `pid.is_some()`.
     pid: Option<u32>,
     master: Option<Master>,
-    /// Kept unreaped through the output drain and final save, including on panic.
+    /// Normally unreaped through the output drain and final save.
     child: Option<Child>,
     exit_watch: Option<ExitWatch>,
+    /// Only the reaping wait fallback needs a pre-reap snapshot for panic cleanup.
+    reaped_cleanup: Option<procfs::SessionMembers>,
     /// The master reported end of output.
     eof: bool,
     /// Code and signal of an exited child whose remaining output is being drained.
     status: Option<(Option<i32>, Option<i32>)>,
     fg: Option<Fg>,
     killing: bool,
-    cleanup_armed: bool,
+    cleanup: Cleanup,
     /// Set on `Shutdown`; fires once the exit is recorded on disk.
     stopping: Option<oneshot::Sender<()>>,
     /// `pty.kill{forget:true}` replies, sent after the exit and the forget.
@@ -386,11 +401,12 @@ impl Pty {
             master: None,
             child: None,
             exit_watch: None,
+            reaped_cleanup: None,
             eof: false,
             status: None,
             fg: None,
             killing: false,
-            cleanup_armed: false,
+            cleanup: Cleanup::Unarmed,
             stopping: None,
             forgets: Vec::new(),
             rerouted: None,
@@ -733,12 +749,12 @@ impl Pty {
         };
         let pid = spawned.child.id().expect("new child has a pid");
         self.child = Some(spawned.child);
-        self.cleanup_armed = false;
+        self.cleanup = Cleanup::Unarmed;
         let (master, exit_watch) =
             match AsyncFd::new(spawned.master).and_then(|m| Ok((m, ExitWatch::new(pid)?))) {
                 Ok(fds) => fds,
                 Err(e) => {
-                    let _ = self.hangup(KILL_AFTER);
+                    self.teardown(KILL_AFTER);
                     self.child = None;
                     return self.spawn_failed(&e, reply);
                 }
@@ -874,12 +890,37 @@ impl Pty {
     }
 
     fn hangup(&mut self, grace: Duration) -> std::io::Result<()> {
-        let child = self.child.as_ref().expect("unreaped session leader");
+        self.hangup_from(Path::new("/proc"), grace)
+    }
+
+    fn hangup_from(&mut self, proc_root: &Path, grace: Duration) -> std::io::Result<()> {
+        let Some(child) = &self.child else {
+            return Ok(()); // Already reaped; its numeric identity is no longer ours.
+        };
         let pid = child.id().expect("unreaped child has a pid");
-        let members = procfs::session_members(Path::new("/proc"), pid, &self.sid);
-        let hup = members.hangup();
+        let mut members = match &self.cleanup {
+            Cleanup::Unarmed => procfs::session_members(proc_root, pid, &self.sid),
+            Cleanup::LeaderOwed(pending) => {
+                if let Some(leader) = pending.upgrade() {
+                    let hup = leader.signal(&self.sid, rustix::process::Signal::HUP);
+                    return self.check_hup(pid, hup);
+                }
+                match procfs::SessionMembers::leader_only(pid, &self.sid) {
+                    Ok(members) => members,
+                    Err(e) => return self.check_hup(pid, Err(e)),
+                }
+            }
+            Cleanup::Armed => return Ok(()),
+        };
+        let hup = self.check_hup(pid, members.hangup());
+        if hup.is_err() {
+            self.cleanup = Cleanup::LeaderOwed(members.track_leader());
+        }
         self.ctx.escalations.arm(members, grace);
-        self.cleanup_armed = true;
+        hup
+    }
+
+    fn check_hup(&mut self, pid: u32, hup: std::io::Result<()>) -> std::io::Result<()> {
         // Do not mistake a missing handle for an exited leader, or reap it to check.
         if let Err(e) = hup
             && !matches!(peek_exit(pid), Ok(Some(_)))
@@ -887,7 +928,19 @@ impl Pty {
             warn!(sid = %self.sid, "could not hang up PTY leader {pid}: {e}");
             return Err(e);
         }
+        self.cleanup = Cleanup::Armed;
         Ok(())
+    }
+
+    fn teardown(&mut self, grace: Duration) {
+        if matches!(self.cleanup, Cleanup::Unarmed) {
+            let _ = self.hangup(grace);
+        }
+        // This can be the last chance to open a handle through the owned Child,
+        // even if teardown itself was the first to discover an incomplete capture.
+        if matches!(self.cleanup, Cleanup::LeaderOwed(_)) {
+            let _ = self.hangup(grace);
+        }
     }
 
     fn kill(&mut self, forget: bool, reply: Reply) {
@@ -923,9 +976,7 @@ impl Pty {
         match self.pid {
             Some(_) => {
                 self.save(true);
-                if !self.cleanup_armed {
-                    let _ = self.hangup(crate::shutdown::HANGUP_WAIT);
-                }
+                self.teardown(crate::shutdown::HANGUP_WAIT);
             }
             None => self.phase = Phase::Stopped,
         }
@@ -996,15 +1047,37 @@ impl Pty {
         self.finish_exit();
     }
 
-    fn exited(&mut self, st: std::io::Result<(Option<i32>, Option<i32>)>) {
-        self.exit_watch = None;
+    fn exited(&mut self, st: std::io::Result<WaitNotice>) {
         let status = match st {
-            Ok(status) => status,
+            Ok(WaitNotice::Exited(code, signal)) => (code, signal),
+            Ok(WaitNotice::ProbeChild) => {
+                let child = self.child.as_mut().expect("waiting for an owned child");
+                let pid = child.id().expect("unreaped child");
+                // try_wait can release the pid. Keep handles for Drop if the
+                // actor unwinds while draining or recording this exit.
+                let members = matches!(self.cleanup, Cleanup::Unarmed)
+                    .then(|| procfs::session_members(Path::new("/proc"), pid, &self.sid));
+                match child.try_wait() {
+                    Ok(None) => return,
+                    Ok(Some(status)) => {
+                        self.reaped_cleanup = members;
+                        self.child = None;
+                        (status.code(), status.signal())
+                    }
+                    Err(e) => {
+                        warn!(sid = %self.sid, "waiting for owned PTY child: {e}");
+                        self.exit_watch.as_mut().unwrap().retry_child();
+                        return;
+                    }
+                }
+            }
             Err(e) => {
-                warn!("waiting for the child: {e}");
-                (None, None)
+                warn!(sid = %self.sid, "observing PTY exit: {e}; switching to child wait");
+                self.exit_watch.as_mut().unwrap().use_child_wait();
+                return;
             }
         };
+        self.exit_watch = None;
         self.status = Some(status);
         if self.eof {
             self.finish_exit();
@@ -1073,6 +1146,7 @@ impl Pty {
                 Err(e) => warn!(sid = %self.sid, "reaping PTY leader: {e}"),
             }
         }
+        self.reaped_cleanup = None;
     }
 
     /// Queues a write of the record and, with `snapshot`, of the screen.
@@ -1118,9 +1192,11 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        if self.child.is_some() && !self.cleanup_armed {
-            let _ = self.hangup(KILL_AFTER);
+        if let Some(members) = self.reaped_cleanup.take() {
+            let _ = members.hangup();
+            self.ctx.escalations.arm(members, KILL_AFTER);
         }
+        self.teardown(KILL_AFTER);
     }
 }
 
@@ -1157,9 +1233,18 @@ fn peek_exit(pid: u32) -> std::io::Result<Option<WaitIdStatus>> {
     })?)
 }
 
+enum WaitNotice {
+    Exited(Option<i32>, Option<i32>),
+    ProbeChild,
+}
+
 enum ExitWake {
     Fd(AsyncFd<OwnedFd>),
     Sigchld(tokio::signal::unix::Signal, bool),
+    Child {
+        sigchld: Option<tokio::signal::unix::Signal>,
+        probe_at: Option<Instant>,
+    },
 }
 
 struct ExitWatch {
@@ -1180,9 +1265,22 @@ impl ExitWatch {
         };
         Ok(Self { pid, wake })
     }
+
+    fn use_child_wait(&mut self) {
+        self.wake = ExitWake::Child {
+            sigchld: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).ok(),
+            probe_at: Some(Instant::now()),
+        };
+    }
+
+    fn retry_child(&mut self) {
+        if let ExitWake::Child { probe_at, .. } = &mut self.wake {
+            *probe_at = Some(Instant::now() + Duration::from_secs(1));
+        }
+    }
 }
 
-async fn wait(watch: Option<&mut ExitWatch>) -> std::io::Result<(Option<i32>, Option<i32>)> {
+async fn wait(watch: Option<&mut ExitWatch>) -> std::io::Result<WaitNotice> {
     let Some(ExitWatch { pid, wake }) = watch else {
         return std::future::pending().await;
     };
@@ -1205,8 +1303,24 @@ async fn wait(watch: Option<&mut ExitWatch>) -> std::io::Result<(Option<i32>, Op
                 .ok_or_else(|| std::io::Error::other("SIGCHLD stream closed"))?;
             *check = true;
         },
+        ExitWake::Child { sigchld, probe_at } => {
+            if let Some(at) = *probe_at {
+                tokio::time::sleep_until(at).await;
+            } else if let Some(signal) = sigchld
+                && signal.recv().await.is_none()
+            {
+                *sigchld = None;
+            }
+            *probe_at = sigchld
+                .is_none()
+                .then(|| Instant::now() + Duration::from_secs(1));
+            return Ok(WaitNotice::ProbeChild);
+        }
     };
-    Ok((status.exit_status(), status.terminating_signal()))
+    Ok(WaitNotice::Exited(
+        status.exit_status(),
+        status.terminating_signal(),
+    ))
 }
 
 async fn sleep_until(at: Option<Instant>) {
@@ -1223,9 +1337,15 @@ mod tests {
     use rustix::process::{Signal, pidfd_send_signal};
 
     async fn session_with_straggler(ctx: &Arc<Ctx>) -> (Pty, JoinHandle<()>, AsyncFd<OwnedFd>) {
-        let (mut actor, writes) = Pty::new(ctx.clone(), "job".into(), 17, Viewers::default());
         // The shell exits on HUP; its child installs SIG_IGN before publishing its pid.
-        let script = r#"trap 'exit 42' HUP; sh -c 'trap "" HUP; echo $$; exec sleep 60' & wait"#;
+        let script = r#"trap 'exit 42' HUP; sh -c 'trap "" HUP; echo $$; exec sleep 60 </dev/null >/dev/null 2>&1' & wait"#;
+        let (actor, writes) = test_session(ctx, script);
+        let pid = read_test_pid(&actor).await;
+        (actor, writes, exit_fd(pid).unwrap())
+    }
+
+    fn test_session(ctx: &Arc<Ctx>, script: &str) -> (Pty, JoinHandle<()>) {
+        let (mut actor, writes) = Pty::new(ctx.clone(), "job".into(), 17, Viewers::default());
         let spawned = spawn::spawn(
             Path::new("sh"),
             &["sh".into(), "-c".into(), script.into()],
@@ -1239,6 +1359,10 @@ mod tests {
         actor.exit_watch = Some(ExitWatch::new(actor.pid.unwrap()).unwrap());
         actor.child = Some(spawned.child);
         actor.master = Some(AsyncFd::new(spawned.master).unwrap());
+        (actor, writes)
+    }
+
+    async fn read_test_pid(actor: &Pty) -> u32 {
         let mut line = Vec::new();
         while !line.contains(&b'\n') {
             let mut buf = [0; 32];
@@ -1246,12 +1370,65 @@ mod tests {
             assert_ne!(n, 0);
             line.extend_from_slice(&buf[..n]);
         }
-        let pid = std::str::from_utf8(&line).unwrap().trim().parse().unwrap();
-        (actor, writes, exit_fd(pid).unwrap())
+        std::str::from_utf8(&line).unwrap().trim().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn wait_error_on_live_child_does_not_acknowledge_a_noop_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(Ctx::for_test(dir.path()));
+        let (mut actor, _writes, descendant) = session_with_straggler(&ctx).await;
+        let leader = exit_fd(actor.pid.unwrap()).unwrap();
+        actor.exited(Err(std::io::Error::other("injected waitid failure")));
+        assert!(actor.status.is_none(), "wait error fabricated an exit");
+        let st = wait(actor.exit_watch.as_mut()).await;
+        actor.exited(st); // The fallback probes a still-live child.
+        actor.kill(false, Reply::for_test(1, Arc::default()));
+        if !actor.killing {
+            let _ = pidfd_send_signal(leader.get_ref(), Signal::KILL);
+            let _ = pidfd_send_signal(descendant.get_ref(), Signal::KILL);
+            panic!("kill treated a child with a failed wait as already dead");
+        }
+        // The fallback must also observe the real exit and its status after HUP.
+        while actor.status.is_none() {
+            let st = wait(actor.exit_watch.as_mut()).await;
+            actor.exited(st);
+        }
+        assert_eq!(actor.status, Some((Some(42), None)));
+        ctx.escalations.finish();
+        assert_killed(descendant).await;
+    }
+
+    fn runtime(paused: bool) -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(paused)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn dropping_runtime_flushes_pending_kills_without_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(false);
+        let descendant = rt.block_on(async {
+            let ctx = Arc::new(Ctx::for_test(dir.path()));
+            let (mut actor, _writes, child) = session_with_straggler(&ctx).await;
+            actor.hangup(Duration::from_secs(3600)).unwrap();
+            // Make runtime teardown itself cancel the last owner, not this scope.
+            tokio::spawn(async move {
+                std::future::pending::<()>().await;
+                drop(actor);
+            });
+            child.into_inner()
+        });
+        // No shutdown sequence, no opportunity for the ordinary timer to fire.
+        drop(rt);
+        runtime(false).block_on(async { assert_killed(AsyncFd::new(descendant).unwrap()).await });
     }
 
     async fn assert_killed(child: AsyncFd<OwnedFd>) {
-        let died = tokio::time::timeout(Duration::from_secs(1), child.readable()).await;
+        let died = tokio::time::timeout(Duration::from_secs(30), child.readable()).await;
         if died.is_err() {
             pidfd_send_signal(child.get_ref(), Signal::KILL).unwrap();
             panic!("shutdown returned without killing the captured descendant");
@@ -1259,30 +1436,59 @@ mod tests {
         drop(died.unwrap().unwrap());
     }
 
-    #[tokio::test]
-    async fn shutdown_kills_captured_descendant_after_leader_acknowledges() {
+    #[test]
+    fn shutdown_kills_captured_descendant_after_leader_acknowledges() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = Arc::new(Ctx::for_test(dir.path()));
-        let rx = ctx.registry.restore("job", 17);
-        let (actor, writes, descendant) = session_with_straggler(&ctx).await;
-        tokio::spawn(supervise(actor, writes, rx, None));
-        crate::shutdown::run(&ctx).await;
-        assert_killed(descendant).await;
+        let rt = runtime(true);
+        let (_ctx, descendant) = rt.block_on(async {
+            let ctx = Arc::new(Ctx::for_test(dir.path()));
+            let mut rx = ctx.registry.restore("job", 17);
+            let (mut actor, writes, descendant) = session_with_straggler(&ctx).await;
+            // A blocking task inhibits Tokio's auto-advance: neither the ordinary
+            // escalation nor shutdown's shared five-second deadline can fire.
+            let (hold, gate) = oneshot::channel::<()>();
+            let _gate = tokio::task::spawn_blocking(move || gate.blocking_recv());
+            let acknowledge = async {
+                let Some(Cmd::Shutdown { done }) = rx.recv().await else {
+                    panic!("expected shutdown");
+                };
+                let (report, ack) = oneshot::channel();
+                actor.shutdown(report);
+                tokio::spawn(supervise(actor, writes, rx, None));
+                ack.await
+                    .expect("actor must acknowledge, not drop its sender");
+                done.send(())
+                    .expect("hub must still be waiting for the ack");
+            };
+            tokio::join!(crate::shutdown::run(&ctx), acknowledge);
+            drop(hold);
+            (ctx, descendant.into_inner())
+        });
+        // Keep the hub and its dormant runtime alive: neither a timer nor the
+        // drop guard can satisfy this check. Only process exit has a watchdog.
+        runtime(false).block_on(async { assert_killed(AsyncFd::new(descendant).unwrap()).await });
     }
 
     #[tokio::test]
     async fn drop_during_exit_drain_arms_cleanup_even_if_shutdown_started() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = Arc::new(Ctx::for_test(dir.path()));
-        let (mut actor, _writes, descendant) = session_with_straggler(&ctx).await;
-        let leader = exit_fd(actor.pid.unwrap()).unwrap();
-        pidfd_send_signal(leader.get_ref(), Signal::HUP).unwrap();
-        let status = wait(actor.exit_watch.as_mut()).await;
-        actor.exited(status);
-        actor.stopping = Some(oneshot::channel().0);
-        drop(actor); // Unwind before any explicit hangup was armed.
-        crate::shutdown::run(&ctx).await; // No registered actor remains.
-        assert_killed(descendant).await;
+        for reaping_fallback in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = Arc::new(Ctx::for_test(dir.path()));
+            let (mut actor, _writes, descendant) = session_with_straggler(&ctx).await;
+            let leader = exit_fd(actor.pid.unwrap()).unwrap();
+            if reaping_fallback {
+                actor.exited(Err(std::io::Error::other("injected waitid failure")));
+            }
+            pidfd_send_signal(leader.get_ref(), Signal::HUP).unwrap();
+            while actor.status.is_none() {
+                let st = wait(actor.exit_watch.as_mut()).await;
+                actor.exited(st);
+            }
+            actor.stopping = Some(oneshot::channel().0);
+            drop(actor); // Unwind before any explicit hangup was armed.
+            crate::shutdown::run(&ctx).await; // No registered actor remains.
+            assert_killed(descendant).await;
+        }
     }
 
     #[tokio::test]
@@ -1316,6 +1522,90 @@ mod tests {
         ));
         // wait closes stdin, letting our unsignalled child finish the read.
         actor.child.take().unwrap().wait().await.unwrap();
+    }
+
+    enum AfterMiss {
+        Retry,
+        Shutdown,
+        Drop,
+    }
+
+    async fn exercise_partial_capture(after: AfterMiss) {
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+
+        struct TestChild(AsyncFd<OwnedFd>);
+        impl Drop for TestChild {
+            fn drop(&mut self) {
+                let _ = pidfd_send_signal(self.0.get_ref(), Signal::KILL);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(Ctx::for_test(dir.path()));
+        let gate = dir.path().join("gate");
+        rustix::fs::mkfifoat(rustix::fs::CWD, &gate, rustix::fs::Mode::RWXU).unwrap();
+        let mut gate = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(gate)
+            .unwrap();
+        let (mut actor, _writes) = test_session(
+            &ctx,
+            "trap '' HUP; sleep 60 & echo $!; read fork < gate; \
+             (read finish < gate && : > late-survived) & echo $!; wait; : > leader-survived",
+        );
+        let leader = TestChild(exit_fd(actor.pid.unwrap()).unwrap());
+        let pid = read_test_pid(&actor).await;
+        let old = TestChild(exit_fd(pid).unwrap());
+        // A real captured descendant, but a proc view that missed the live leader.
+        let proc = tempfile::tempdir().unwrap();
+        symlink(format!("/proc/{pid}"), proc.path().join(pid.to_string())).unwrap();
+        actor.hangup_from(proc.path(), KILL_AFTER).unwrap_err();
+        writeln!(gate, "fork").unwrap();
+        let late = TestChild(exit_fd(read_test_pid(&actor).await).unwrap());
+
+        match after {
+            AfterMiss::Retry => {
+                actor.kill(false, Reply::for_test(1, Arc::new(OutQ::default())));
+                assert!(actor.killing, "retry did not deliver the leader's HUP");
+            }
+            AfterMiss::Shutdown => actor.shutdown(oneshot::channel().0),
+            AfterMiss::Drop => drop(actor),
+        }
+        ctx.escalations.finish();
+        writeln!(gate, "finish").unwrap();
+        for child in [&old, &late, &leader] {
+            drop(
+                tokio::time::timeout(Duration::from_secs(30), child.0.readable())
+                    .await
+                    .expect("test child still alive after escalation")
+                    .unwrap(),
+            );
+        }
+        assert!(
+            !dir.path().join("leader-survived").exists(),
+            "leader escaped KILL"
+        );
+        assert!(
+            dir.path().join("late-survived").exists(),
+            "post-capture child was signalled"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_capture_retries_only_the_leader() {
+        exercise_partial_capture(AfterMiss::Retry).await;
+    }
+
+    #[tokio::test]
+    async fn partial_capture_shutdown_still_targets_the_leader() {
+        exercise_partial_capture(AfterMiss::Shutdown).await;
+    }
+
+    #[tokio::test]
+    async fn partial_capture_drop_still_targets_the_leader() {
+        exercise_partial_capture(AfterMiss::Drop).await;
     }
 
     #[tokio::test(start_paused = true)]
