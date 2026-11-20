@@ -289,7 +289,7 @@ The error codes are a closed set:
 - **`Pending`:**
   - `kind` is `"permission"` or `"elicitation"`;
   - `req` is the seq of the immutable journal event that announced the question, not the agent's JSON-RPC id;
-  - within an incarnation, `(sid, epoch, req)` identifies exactly one published question, even after a crash loses the unsynced journal tail: answering or cancelling consumes it, and another question gets a fresh seq even if the agent reuses its id;
+  - within an incarnation, `(sid, epoch, req)` identifies exactly one published human-answerable question, even after a crash loses the unsynced journal tail: answering or cancelling consumes it, and another question gets a fresh seq even if the agent reuses its id;
   - `title` is the permission's `toolCall.title` or the elicitation's `message`, cut to 200 characters for both kinds. It is `""` when the request has none.
 - **`AcpSessionInfo`:** `{protocolVersion, agentInfo, agentCapabilities, promptCapabilities, authMethods, modes, configOptions, availableCommands, plan, usage}`. It holds the latest materialised values; absent optional values are omitted. `Summary.acp.configOptions` is always present, with `null` when absent.
 - Snapshots and watch events publish live and restored summaries unchanged, including the full option list, whenever they fit in a single-summary page with the longest request ID.
@@ -557,8 +557,11 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
 - The loader considers only `<sid>.json` files whose stem matches the sid regex. Quarantined names contain a dot, so they never match.
 - `.json` and `.snap` are written atomically: tmp, fsync, rename, fsync the directory.
 - The journal is appended with one `pwrite(2)` per event at the tracked end, never with `O_APPEND`.
-- Opening a journal syncs its directory entry and, if it contains human-answerable questions, its recovered contents before replay.
-- Appending `permission` or `elicitation` waits for `fdatasync` before publishing its `req`; a policy decision (`permission_auto`) never offers a question to clients.
+- On open, the hub validates the journal and syncs its directory entry before replay.
+- Unless the inode has a known-durable prefix covering its entire contents, recovery copies the validated complete lines to a new file, syncs it, then atomically installs it and syncs the directory.
+- A clean close or a completed recovery can leave the synced length in an optional inode attribute; losing the attribute costs a copy, not durability.
+- A human-answerable `permission` or `elicitation` waits for `fdatasync` before publication, without a deadline; a stalled disk delays that session's shutdown as well as the question.
+- A policy decision (`permission_auto`) never offers a question to clients and adds no sync barrier.
 - Lifecycle events retain their background syncs; SIGTERM also syncs the journal.
 
 **Web `stateDir`** (`…/workbench/web`): `web.lock`, `artifacts/<node>/…`, artifact `db.json`. **There is no `index.db`**: the notes index lives in memory.
@@ -648,7 +651,7 @@ At startup, a journal whose last `spawn` has no `exit` gets these lines with `re
 4. only after success advance head, fold, fan out and publish.
 
 On a short write, write error or required sync failure:
-- `ftruncate` back to the last good length; if a complete unsynced line cannot be truncated, retry the truncation before any later append;
+- `ftruncate` back to the last good length and sync the shrink; if either operation fails, keep the rollback pending and retry it before any later append;
 - set `fault = {code:"journal_write"}`;
 - record nothing more;
 - fail every unapplied initial configuration entry with `faulted`, release the batch gate and answer the creating open, even if spawning failed before an agent process existed;
@@ -658,9 +661,13 @@ On a short write, write error or required sync failure:
 While faulted:
 - `prompt` and `revive` get `faulted`. No `err` event is sent: the Summary's `fault` is the signal.
 - The agent's `exit`, once it has happened, is held back until the fault clears.
-- On `acp.revive`, on `acp.kill`, and every 60 s, the hub probes the journal. If the death-invariant lines are outstanding, it appends them, including the held-back `exit`. Otherwise it appends a `notice{warn}`. On success the fault clears and the session is an ordinary dead session; a triggering `acp.revive` then proceeds under the normal rules.
+- On `acp.revive`, on `acp.kill`, and every 60 s, the hub probes the journal.
+- If rollback is complete and the prefix is known good, the probe appends the outstanding death-invariant lines, including the held-back `exit`, or a `notice{warn}` if there are none.
+- On success the fault clears and the session is an ordinary dead session; a triggering `acp.revive` then proceeds under the normal rules.
+- All syncs of the live journal share one error state: a background sync that observes a writeback error prevents a later question from passing its publication barrier.
+- Neither a successful shrink nor a successful later sync clears a writeback error; appends remain blocked until recovery opens a known-good prefix.
 
-A crash can lose an unsynced tail, but no `req` a client could have answered is in that tail.
+A crash can lose or reuse sequence numbers from an unsynced tail, including ordinary updates and automatically decided permissions, but never the `req` of a published human-answerable question.
 
 **Load and quarantine.**
 - Every session (both kinds) loads in its own task under `catch_unwind` plus error handling.

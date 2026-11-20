@@ -336,9 +336,10 @@ async fn read(ctx: &Ctx, sid: &str) -> Result<Option<Loaded>, String> {
     let (dir, s) = (ctx.acp_dir.clone(), sid.to_owned());
     let failure = match tokio::task::spawn_blocking(move || read_files(&dir, &s)).await {
         Ok(Ok(None)) => return Ok(None),
-        Ok(Ok(Some((loaded, appended)))) => {
+        Ok(Ok(Some((mut loaded, appended)))) => {
             if appended && let Ok(Err(e)) = loaded.journal.sync().await {
                 warn!(%sid, "syncing the journal: {e}");
+                loaded.fault = Some(fault_message(&WriteFault { error: e }));
             }
             return Ok(Some(loaded));
         }
@@ -927,8 +928,8 @@ impl Acp {
             Phase::Abandoned => self.reroute(rx).await,
             Phase::Stopped => {
                 self.save_meta().await;
-                if let Some(journal) = &self.journal
-                    && let Ok(Err(e)) = journal.sync().await
+                if let Some(journal) = self.journal.take()
+                    && let Ok(Err(e)) = journal.close().await
                 {
                     warn!("syncing the journal: {e}");
                 }
@@ -1914,7 +1915,10 @@ impl Acp {
         if !self.record(body) {
             return None;
         }
-        let held = self.held.remove(&req).expect("just journaled a held answer");
+        let held = self
+            .held
+            .remove(&req)
+            .expect("just journaled a held answer");
         let queued = self.send(&rpc::result(&held.rpc_id, to_agent(kind, answer)));
         if self.held.is_empty() {
             // Deviation 8: the setup clock restarts once nobody is waited for.
@@ -3344,6 +3348,135 @@ mod tests {
         }));
         acp.write_meta().await.unwrap();
         (acp, rx)
+    }
+
+    mod barrier {
+        use super::*;
+
+        fn attach(actor: &Acp) -> Arc<OutQ> {
+            let queue = Arc::new(OutQ::default());
+            lock(&actor.shared.viewers).push(Attached {
+                viewer: Viewer {
+                    id: 1,
+                    outq: queue.clone(),
+                },
+                backlog: None,
+            });
+            queue
+        }
+
+        async fn ask(actor: &mut Acp) {
+            actor
+                .agent_request(json!(1), "elicitation/create", json!({"message":"Colour?"}))
+                .await;
+        }
+
+        #[tokio::test]
+        async fn consumed_background_eio_blocks_question_and_probe() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut actor, _rx) = dormant(dir.path()).await;
+            let path = actor.path("jsonl");
+            let prefix = fs::read(&path).unwrap();
+            let q = attach(&actor);
+            let journal = actor.journal.as_mut().unwrap();
+            journal.fail_background_sync = true;
+            let error = journal.sync().await.unwrap().unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(rustix::io::Errno::IO.raw_os_error())
+            );
+            journal.fail_background_sync = false;
+            ask(&mut actor).await;
+            assert_eq!(
+                actor.fault.as_ref().map(|f| f.code),
+                Some(FaultCode::JournalWrite)
+            );
+            assert!(actor.announced.is_empty() && actor.held.is_empty());
+            assert!(actor.facts.pending.is_empty());
+            actor.probe();
+            assert!(
+                actor.fault.is_some(),
+                "an ordinary append cleared the writeback error"
+            );
+            assert_eq!(fs::read(&path).unwrap(), prefix);
+            q.finish();
+            while let Some(line) = q.pop().await {
+                let msg: Value = serde_json::from_slice(&line).unwrap();
+                assert!(msg.get("ev").is_none());
+                assert!(msg.pointer("/summary/acp/pending/0/req").is_none());
+            }
+        }
+
+        #[tokio::test]
+        async fn probe_retries_failed_shrink_without_publishing_a_phantom() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut actor, _rx) = dormant(dir.path()).await;
+            let path = actor.path("jsonl");
+            let prefix = fs::read(&path).unwrap();
+            let journal = actor.journal.as_mut().unwrap();
+            journal.fail_sync = true;
+            journal.fail_truncate = true;
+            ask(&mut actor).await;
+            assert!(actor.fault.is_some() && actor.held.is_empty());
+            assert!(fs::metadata(&path).unwrap().len() > prefix.len() as u64);
+            let journal = actor.journal.as_mut().unwrap();
+            journal.fail_sync = false;
+            journal.fail_truncate = false;
+            actor.probe();
+            assert!(
+                actor.fault.is_some(),
+                "a successful shrink certified failed data"
+            );
+            assert_eq!(fs::read(&path).unwrap(), prefix);
+            let ctx = actor.ctx.clone();
+            let epoch = actor.created_at;
+            drop(actor);
+            let loaded = read(&ctx, "a").await.unwrap().unwrap();
+            assert!(
+                loaded.announced.is_empty(),
+                "replayed a never-offered question"
+            );
+            let mut recovered = Acp::new(ctx, "a".into(), epoch, Arc::default());
+            recovered.begin(Start::Loaded(Box::new(loaded)));
+            ask(&mut recovered).await;
+            assert_eq!(recovered.facts.pending.len(), 1);
+            assert!(recovered.fault.is_none());
+        }
+
+        #[tokio::test]
+        async fn question_publication_waits_for_sync() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut actor, _rx) = dormant(dir.path()).await;
+            let q = attach(&actor);
+            let path = actor.path("jsonl");
+            let req = actor.facts.head_seq + 1;
+            let (entered_tx, entered) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            actor.journal.as_mut().unwrap().pause_question = Some((entered_tx, release_rx));
+            let asked = tokio::spawn(async move {
+                ask(&mut actor).await;
+                actor
+            });
+            entered.await.unwrap();
+            // The worker has written the entire question, including its newline.
+            let disk = fs::read_to_string(path).unwrap();
+            assert!(disk.ends_with('\n'));
+            let last: JournalEvent = serde_json::from_str(disk.lines().last().unwrap()).unwrap();
+            assert_eq!(last.seq, req);
+            assert!(matches!(last.body, EventBody::Elicitation { .. }));
+            // A sentinel must be the very first item in the viewer's queue,
+            // without using a timeout or racing a poll against the worker.
+            q.push_reply(Arc::from(&b"sentinel"[..]));
+            assert_eq!(q.pop().await.unwrap().as_ref(), b"sentinel");
+            release.send(()).unwrap();
+            let actor = asked.await.unwrap();
+            assert!(actor.held.contains_key(&req));
+            assert_eq!(next_reply(&q).await["ev"]["seq"], req);
+            assert_eq!(
+                next_reply(&q).await["summary"]["acp"]["pending"][0]["req"],
+                req
+            );
+        }
     }
 
     fn guarded_forget(epoch: u64) -> (Cmd, Arc<OutQ>) {
