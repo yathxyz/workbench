@@ -7,10 +7,25 @@ use std::time::Duration;
 use tokio::task::Id;
 use tokio::time::Instant;
 
+use crate::acp::Group;
 use crate::lock;
 use crate::procfs::SessionMembers;
 
-pub(crate) struct Escalations(Mutex<Option<HashMap<Id, SessionMembers>>>);
+enum Target {
+    Session(SessionMembers),
+    Group(Group),
+}
+
+impl Target {
+    fn kill(self) {
+        match self {
+            Self::Session(members) => members.kill(),
+            Self::Group(group) => drop(group), // KILL before releasing/reaping the leader.
+        }
+    }
+}
+
+pub(crate) struct Escalations(Mutex<Option<HashMap<Id, Target>>>);
 
 impl Default for Escalations {
     fn default() -> Self {
@@ -19,7 +34,15 @@ impl Default for Escalations {
 }
 
 impl Escalations {
-    pub(crate) fn arm(self: &Arc<Self>, target: SessionMembers, grace: Duration) {
+    pub(crate) fn arm(self: &Arc<Self>, members: SessionMembers, grace: Duration) {
+        self.arm_target(Target::Session(members), grace);
+    }
+
+    pub(crate) fn arm_group(self: &Arc<Self>, group: Group, grace: Duration) {
+        self.arm_target(Target::Group(group), grace);
+    }
+
+    fn arm_target(self: &Arc<Self>, target: Target, grace: Duration) {
         let mut pending = lock(&self.0);
         let Some(targets) = pending.as_mut() else {
             return target.kill();

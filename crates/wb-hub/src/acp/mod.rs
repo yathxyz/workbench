@@ -16,10 +16,8 @@ mod worktree;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -46,12 +44,14 @@ use wb_proto::limits::{
 };
 use wb_proto::policy::{CompiledPolicy, Policy, PolicyMatch};
 
+pub(crate) use self::agent::Group;
 use self::agent::{Agent, Out};
 use self::facts::Facts;
 use self::journal::{Journal, SyncGate, WriteFault};
 use self::replay::Replay;
 use self::rpc::Incoming;
 use self::worktree::CreateFailure::{self, Clean, PossibleLeftover};
+use crate::child::{self, WaitNotice};
 use crate::conn::{ConnId, Reply, Viewer, line};
 use crate::outq::OutQ;
 use crate::registry::Route;
@@ -580,9 +580,6 @@ async fn supervise(mut acp: Acp, mut rx: mpsc::Receiver<Cmd>, mut first: Option<
             }
             _ => return,
         };
-        if let Some(pgid) = lock(&shared.pgid).take() {
-            agent::end_group(pgid, PANIC_GRACE);
-        }
         let dropped = take_viewers(&shared);
         let Some(next) = next else {
             return tell_reloaded(&sid, dropped);
@@ -636,7 +633,6 @@ async fn redeliver(ctx: &Arc<Ctx>, sid: &str, cmd: Cmd) {
 struct Shared {
     sync: Arc<SyncGate>,
     viewers: Mutex<Vec<Attached>>,
-    pgid: Mutex<Option<u32>>,
 }
 
 struct Attached {
@@ -710,7 +706,7 @@ struct Proc {
     via: SpawnVia,
     next_id: u64,
     outstanding: HashMap<u64, Purpose>,
-    /// Code and signal once `wait` returned.
+    /// Code and signal once exit was observed, without reaping the leader.
     status: Option<(Option<i32>, Option<i32>)>,
     /// Stdout reached its end.
     eof: bool,
@@ -802,7 +798,7 @@ enum Event {
     Worktree(Result<WorktreeResult, JoinError>),
     Replayed(Replayed),
     Out(Option<Out>),
-    Exited(io::Result<ExitStatus>),
+    Exited(io::Result<WaitNotice>),
     Drained,
     SetupIdle,
     RpcTimeout,
@@ -977,10 +973,10 @@ impl Acp {
             let rpc_at = self.rpc_deadline();
             let stage_at = self.stage.and_then(|(_, at)| at);
             let (info_at, meta_at, probe_at) = (self.info_at, self.meta_at, self.probe_at);
-            let (out, child, drain_until) = match &mut self.proc {
+            let (out, watch, drain_until) = match &mut self.proc {
                 Some(p) => (
                     (!p.eof).then_some(&mut p.agent.stdout),
-                    p.status.is_none().then_some(&mut p.agent.child),
+                    p.status.is_none().then_some(&mut p.agent.watch),
                     p.drain_until,
                 ),
                 None => (None, None, None),
@@ -990,7 +986,7 @@ impl Acp {
                 Some(result) = self.git.join_next(), if self.worktree_op.is_some() => Event::Worktree(result),
                 Some(r) = self.replayed_rx.recv() => Event::Replayed(r),
                 out = recv(out) => Event::Out(out),
-                st = wait(child) => Event::Exited(st),
+                st = child::wait(watch) => Event::Exited(st),
                 () = sleep_until(drain_until) => Event::Drained,
                 () = sleep_until(setup_at) => Event::SetupIdle,
                 () = sleep_until(rpc_at) => Event::RpcTimeout,
@@ -1364,10 +1360,9 @@ impl Acp {
                 return Err((ErrorCode::SpawnFailed, message));
             }
         };
-        let pid = agent.pid;
+        let pid = agent.pid();
         info!(pid, agent = %self.meta.agent, ?via, "spawned");
         // Register the child first so journal_fault can stop it if the append fails.
-        *lock(&self.shared.pgid) = Some(pid);
         self.proc = Some(Proc {
             agent,
             via,
@@ -2628,11 +2623,10 @@ impl Acp {
         self.enter(next);
     }
 
-    /// Signals the agent's process group, unless the agent was reaped and its pid may
-    /// be reused.
+    /// Staged signals stop at observed exit; finalise handles the surviving group.
     fn signal(&self, sig: Signal) {
         if let Some(p) = self.proc.as_ref().filter(|p| p.status.is_none()) {
-            agent::signal_group(p.agent.pid, sig);
+            p.agent.signal(sig);
         }
     }
 
@@ -3135,11 +3129,15 @@ impl Acp {
         }
     }
 
-    fn child_exited(&mut self, st: io::Result<ExitStatus>) {
+    fn child_exited(&mut self, st: io::Result<WaitNotice>) {
         let Some(p) = &mut self.proc else { return };
         p.status = Some(match st {
-            Ok(st) => (st.code(), st.signal()),
+            Ok(WaitNotice::Exited(code, signal)) => (code, signal),
+            Ok(WaitNotice::ProbeChild) => unreachable!("ACP never enables reaping probes"),
             Err(e) => {
+                if child::is_echild(&e) {
+                    p.agent.lost_child();
+                }
                 warn!("waiting for the agent: {e}");
                 (None, None)
             }
@@ -3160,19 +3158,18 @@ impl Acp {
             self.finalise();
         } else {
             warn!("the agent closed stdout but did not exit; killing its process group");
-            agent::signal_group(p.agent.pid, Signal::KILL);
+            p.agent.signal(Signal::KILL);
         }
     }
 
     /// The agent is gone: what is left of its process group is ended (H-11), the death
     /// invariant is journaled (DESIGN §3.4.4), and what waited on the agent is answered.
     fn finalise(&mut self) {
-        let Some(p) = self.proc.take() else { return };
+        let Some(mut p) = self.proc.take() else {
+            return;
+        };
         let (code, signal) = p.status.unwrap_or((None, None));
-        if agent::group_alive(p.agent.pid) {
-            agent::end_group(p.agent.pid, LEFTOVER_GRACE);
-        }
-        *lock(&self.shared.pgid) = None;
+        p.agent.end_group(LEFTOVER_GRACE);
         let reason = if self.stopping.is_some() {
             ExitReason::HubRestart
         } else if self.cause.is_some() {
@@ -3426,13 +3423,6 @@ async fn recv(rx: Option<&mut mpsc::Receiver<Out>>) -> Option<Out> {
     }
 }
 
-async fn wait(child: Option<&mut tokio::process::Child>) -> io::Result<ExitStatus> {
-    match child {
-        Some(child) => child.wait().await,
-        None => std::future::pending().await,
-    }
-}
-
 async fn sleep_until(at: Option<Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at).await,
@@ -3639,6 +3629,12 @@ mod tests {
         watchdog(read_reply(outq)).await
     }
 
+    async fn wait_success(agent: &mut Agent) -> WaitNotice {
+        let status = child::wait(Some(&mut agent.watch)).await.unwrap();
+        assert!(matches!(status, WaitNotice::Exited(Some(0), None)));
+        status
+    }
+
     fn configure_test_agent(acp: &mut Acp, script: &str) {
         let shell = std::env::var("BASH").unwrap_or_else(|_| "/bin/sh".into());
         let cfg = &mut Arc::get_mut(&mut acp.ctx).unwrap().cfg;
@@ -3690,7 +3686,7 @@ mod tests {
                 !acp.path("stderr.log").exists(),
                 "started an unjournalable agent"
             );
-            assert!(acp.proc.is_none() && lock(&acp.shared.pgid).is_none());
+            assert!(acp.proc.is_none());
             assert_eq!(reply["code"], "faulted", "{reply}");
             assert_eq!(acp.fault.as_ref().unwrap().code, FaultCode::JournalWrite);
             assert_eq!(fs::read(acp.path("jsonl")).unwrap(), prefix);
@@ -3717,15 +3713,14 @@ mod tests {
                 .proc
                 .as_mut()
                 .expect("started child is tracked for teardown");
-            let status = proc.agent.child.wait().await.unwrap();
-            assert!(status.success());
+            let status = wait_success(&mut proc.agent).await;
             assert!(
                 matches!(proc.agent.stdout.recv().await, Some(Out::Eof)),
                 "agent received an RPC"
             );
             acp.child_exited(Ok(status));
             acp.stdout_closed();
-            assert!(acp.proc.is_none() && lock(&acp.shared.pgid).is_none());
+            assert!(acp.proc.is_none());
             assert_eq!(reply["code"], "faulted", "{reply}");
             assert_eq!(acp.fault.as_ref().unwrap().code, FaultCode::JournalWrite);
             assert_eq!(fs::read(acp.path("jsonl")).unwrap(), prefix);
@@ -3737,7 +3732,7 @@ mod tests {
                 panic!("expected initialize");
             };
             assert_eq!(request["method"], "initialize");
-            assert!(agent.child.wait().await.unwrap().success());
+            wait_success(agent).await;
         }
 
         #[tokio::test]
@@ -4018,7 +4013,7 @@ mod tests {
 
         let agent = &mut acp.proc.as_mut().unwrap().agent;
         if exit_first {
-            let status = agent.child.wait().await.unwrap();
+            let status = wait_success(agent).await;
             acp.child_exited(Ok(status));
         } else {
             assert!(matches!(agent.stdout.recv().await, Some(Out::Eof)));
@@ -4590,9 +4585,7 @@ mod tests {
                 assert!(matches!(agent.stdout.recv().await, Some(Out::Eof)));
                 None
             } else {
-                let status = agent.child.wait().await.unwrap();
-                assert!(status.success());
-                Some(status)
+                Some(wait_success(agent).await)
             };
             // A dead pipe could reject a continuation without advancing next_id.
             // Keep stdin receptive from the instant the actor observes exit/EOF.

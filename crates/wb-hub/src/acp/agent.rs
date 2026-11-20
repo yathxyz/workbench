@@ -8,21 +8,25 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+use rustix::process::{Pid, Signal, kill_process_group};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use wb_proto::limits::{MAX_LINE, PROMPT_MAX};
 
 use super::lines::{Read, read_line_capped};
+use crate::child::{self, ExitWatch};
 use crate::config::{ChildConfig, HostConfig};
 use crate::env::Identity;
+use crate::escalation::Escalations;
 use crate::pty::spawn::spawn_agent;
 use crate::{Ctx, lock};
 
@@ -43,10 +47,11 @@ pub enum Out {
     Eof,
 }
 
-/// A running agent. Dropping it stops its I/O tasks; the process is not signalled.
+/// Dropping a live agent transfers its owned group to panic cleanup.
 pub struct Agent {
-    pub pid: u32,
-    pub child: Child,
+    pub watch: ExitWatch,
+    group: Option<Group>,
+    escalations: Arc<Escalations>,
     /// `None` once closed: the writer sends what is queued, then closes the pipe.
     pub stdin: Option<Stdin>,
     pub stdout: mpsc::Receiver<Out>,
@@ -54,8 +59,35 @@ pub struct Agent {
     tasks: [JoinHandle<()>; 3],
 }
 
+impl Agent {
+    pub fn pid(&self) -> u32 {
+        self.group.as_ref().unwrap().child.as_ref().unwrap().id()
+    }
+
+    pub fn signal(&self, sig: Signal) {
+        if let Some(group) = &self.group {
+            group.signal(sig);
+        }
+    }
+
+    /// ECHILD: we own neither a wait status nor the number, even on unwind.
+    pub fn lost_child(&mut self) {
+        if let Some(mut group) = self.group.take() {
+            group.child.take();
+        }
+    }
+
+    pub fn end_group(&mut self, grace: Duration) {
+        if let Some(group) = self.group.take() {
+            group.signal(Signal::TERM);
+            self.escalations.arm_group(group, grace);
+        }
+    }
+}
+
 impl Drop for Agent {
     fn drop(&mut self) {
+        self.end_group(super::PANIC_GRACE);
         for task in &self.tasks {
             task.abort();
         }
@@ -83,14 +115,22 @@ pub fn start(
         std::env::var_os(n)
     });
     let (program, args) = argv.split_first().ok_or("empty argv")?;
-    let mut child = spawn_agent(Path::new(program), args, &env, cwd, ctx.child_umask)
-        .map_err(|e| format!("spawn failed: {e}"))?;
-    let pid = child.id().ok_or("the agent was reaped at once")?;
-    let (Some(stdin), Some(stdout), Some(stderr)) =
-        (child.stdin.take(), child.stdout.take(), child.stderr.take())
-    else {
-        return Err("the agent's pipes are missing".into());
+    let setup_error = |e| format!("spawn failed: {e}");
+    let child =
+        spawn_agent(Path::new(program), args, &env, cwd, ctx.child_umask).map_err(setup_error)?;
+    // Arm cleanup before any fallible post-spawn setup.
+    let mut group = Group {
+        child: Some(child),
+        reaper: ctx.reaper.clone(),
     };
+    let child = group.child.as_mut().unwrap();
+    let watch = ExitWatch::new(child.id()).map_err(setup_error)?;
+    let stdin =
+        ChildStdin::from_std(child.stdin.take().expect("piped stdin")).map_err(setup_error)?;
+    let stdout =
+        ChildStdout::from_std(child.stdout.take().expect("piped stdout")).map_err(setup_error)?;
+    let stderr =
+        ChildStderr::from_std(child.stderr.take().expect("piped stderr")).map_err(setup_error)?;
     let log = Log::open(log);
     let queued = Arc::new(AtomicUsize::new(0));
     let (in_tx, in_rx) = mpsc::unbounded_channel();
@@ -101,8 +141,9 @@ pub fn start(
         tokio::spawn(read_stderr(stderr, log.clone())),
     ];
     Ok(Agent {
-        pid,
-        child,
+        watch,
+        group: Some(group),
+        escalations: ctx.escalations.clone(),
         stdin: Some(Stdin { tx: in_tx, queued }),
         stdout: out_rx,
         log,
@@ -329,30 +370,26 @@ fn open_log(path: &Path) -> Option<File> {
         .ok()
 }
 
-/// Sends `sig` to the process group `pgid`.
-pub fn signal_group(pgid: u32, sig: Signal) {
-    if let Some(pid) = i32::try_from(pgid).ok().and_then(Pid::from_raw) {
-        let _ = kill_process_group(pid, sig);
+/// Sole wait owner from spawn through the last killpg. Never give a timer just the pid.
+pub(crate) struct Group {
+    child: Option<Child>,
+    reaper: Sender<Child>,
+}
+
+impl Group {
+    fn signal(&self, sig: Signal) {
+        let pid = self.child.as_ref().expect("owned group leader").id();
+        let _ = kill_process_group(Pid::from_raw(pid as i32).expect("positive child pid"), sig);
     }
 }
 
-/// Whether the process group `pgid` still has members.
-pub fn group_alive(pgid: u32) -> bool {
-    i32::try_from(pgid)
-        .ok()
-        .and_then(Pid::from_raw)
-        .is_some_and(|pid| test_kill_process_group(pid).is_ok())
-}
-
-/// SIGTERM to the group now and SIGKILL to what is left of it after `grace`.
-pub fn end_group(pgid: u32, grace: Duration) {
-    signal_group(pgid, Signal::TERM);
-    tokio::spawn(async move {
-        tokio::time::sleep(grace).await;
-        if group_alive(pgid) {
-            signal_group(pgid, Signal::KILL);
+impl Drop for Group {
+    fn drop(&mut self) {
+        if self.child.is_some() {
+            self.signal(Signal::KILL);
+            child::reap(self.child.take().unwrap(), &self.reaper);
         }
-    });
+    }
 }
 
 #[cfg(test)]

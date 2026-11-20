@@ -591,7 +591,7 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
     Normally `waitid` with `WNOWAIT` observes exit without reaping until the actor has drained output and recorded the exit.
     `ECHILD` ends the wait with unknown code and signal; cleanup may use previously captured handles, never the released pid.
     On other wait errors the actor keeps the child until its owned child handle confirms exit; where reaping releases the leader early, pre-reap handles protect panic cleanup.
-    One reaper thread takes ownership of abandoned PTY children and polls them without waiting on any one child.
+    One reaper thread per hub polls PTY and agent children that could not be reaped immediately, without waiting on any one child.
 - **Kill:** while the leader is still unreaped, the hub opens `/proc/<pid>` handles and checks session membership (stat field 6) through those handles.
   Both SIGHUP and the delayed SIGKILL use those same handles, so a survivor is still targeted after the leader exits, but a reused pid or session id is not.
   A process forked after the snapshot is not killed by this escalation; covering later forks would require containment at spawn.
@@ -814,7 +814,12 @@ A pinned event appears at its own seq position, never ahead of a lower seq. Clie
     4. SIGKILL the process group.
 
     A hub stop skips step 1 and waits 5 s after closing stdin and 1 s after SIGTERM, so SIGKILL comes 6 s in.
-  - **After the agent process exits by any path, crash included:** stdout may still deliver for ≤ 1 s. If stdout reaches EOF first, the agent has 3 s to exit before the process group is killed. If the process group still has members (`kill(-pgid, 0)` succeeds), SIGTERM it and SIGKILL it after 2 s.
+  - **After agent exit, crash included:** the hub observes the exit with `waitid(WNOWAIT)` and drains stdout for ≤ 1 s.
+    If stdout reaches EOF first, the agent has 3 s to exit before the process group is killed.
+    The hub sends SIGTERM to the group at finalisation and schedules SIGKILL after 2 s, without delaying the death record or viewer notifications.
+    The escalation owns the unreaped leader through SIGKILL, so its group number cannot be reused even if no live members remain.
+    Only then is the leader reaped.
+    An actor panic transfers the same ownership to a 3 s escalation; `ECHILD` instead discards the number without signalling.
   - **Then finalise:**
     - write the death-invariant lines and `exit`, then `fdatasync`;
     - after a **user** `acp.kill`, set `seenSeq = headSeq` **after** finalising. Other kills (a failed setup, a fault, a hub stop) leave `seenSeq` alone.
@@ -825,8 +830,8 @@ A pinned event appears at its own seq position, never ahead of a lower seq. Clie
   3. The shared 5 s `HANGUP_WAIT` starts only after the hub has fenced in-flight epoch writes and awaited every shutdown mailbox send.
      A stalled mark write or a full mailbox delays the start of this deadline.
      Each exit is recorded with `reason:"hub_restart"` and the observed `code`/`signal`, both null if the child was already reaped.
-  4. As soon as all acknowledgement channels resolve or close, or the shared 5 s grace expires, the hub sends SIGKILL through all remaining captured PTY handles, including those of sessions already forgotten.
-     This can shorten the ordinary three-second grace for a user kill; later captures escalate immediately.
+  4. As soon as all acknowledgement channels resolve or close, or the shared 5 s grace expires, the hub sends SIGKILL through all pending PTY handles and to all pending owned agent groups, including those of sessions already forgotten.
+     This can shorten the ordinary grace; later escalations fire immediately.
      After sending KILL, the hub waits up to 3 s more (`KILL_WAIT`) for any outstanding exit records.
   5. Exit 0.
 
@@ -1534,7 +1539,7 @@ The stream ends when wb-web shuts down.
 | H-8 | Replay is pinned ∪ kept in **one ascending-seq stream** (§3.4.4). | `acp/replay.rs` |
 | H-9 | Journal is fail-closed: write first (one `pwrite` at the tracked end), then fold. On a short write: ftruncate, `fault{journal_write}`, teardown, `faulted`, and a recovery probe. | `acp/journal.rs`, `acp/mod.rs`, `acp/facts.rs` |
 | H-10 | Per-session load under `catch_unwind` plus error handling. Failed loads publish a dead `fault{load_failed}` Summary. ACP recovery I/O errors leave files in place for the next start; invalid contents are quarantined. A quarantined PTY also carries a `hub_restart` exit, so its card attaches as a corpse and a respawn clears the fault. A supervisor reload uses the same path, never on the main task. | `registry.rs`, `main.rs` |
-| H-11 | After **any** agent exit, the leftover process group is terminated: TERM, then KILL after 2 s. `setsid` descendants survive. `seenSeq = headSeq` after finalising a user kill only. | `acp/agent.rs`, `acp/mod.rs` |
+| H-11 | After agent exit, TERM and the delayed KILL target the group while its unreaped leader still pins the number. `setsid` descendants survive. `seenSeq = headSeq` after finalising a user kill only. | `acp/agent.rs`, `acp/mod.rs`, `escalation.rs` |
 | H-12 | `revivable` is false after `setup_error{revive_failed}` until the next `session`. | `acp/facts.rs` |
 | H-13 | Every `std::sync::Mutex` uses `lock().unwrap_or_else(PoisonError::into_inner)`, with panic-free critical sections. A session-actor panic is reloaded and attached connections get `err{internal,"session reloaded"}`. | all |
 | H-14 | `hello.build = option_env!("WB_HUB_BUILD")`, set by nix to the hub fileset hash. | `conn.rs` |

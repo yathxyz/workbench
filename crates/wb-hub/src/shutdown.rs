@@ -7,7 +7,8 @@
 //!    later.
 //! 2. Up to [`HANGUP_WAIT`] for the children to exit; each exit is recorded as
 //!    `exit{reason:"hub_restart", code, signal}`.
-//! 3. SIGKILL to the PTY sessions still alive, and up to [`KILL_WAIT`] for every record.
+//! 3. Deliver pending SIGKILLs, including PTY sessions still alive and ACP groups
+//!    handed off by their actors, and wait up to [`KILL_WAIT`] for every record.
 //!
 //! systemd (`KillMode=mixed`) kills whatever is left after the hub exits, and the next
 //! start completes any record this did not finish.
@@ -23,7 +24,7 @@ use crate::{Ctx, acp, pty};
 
 /// How long the children have to exit after the hangup.
 pub const HANGUP_WAIT: Duration = Duration::from_secs(5);
-/// Extra time for outstanding acknowledgements after PTY escalation.
+/// Extra time for outstanding acknowledgements after flushing pending escalations.
 const KILL_WAIT: Duration = Duration::from_secs(3);
 
 pub async fn run(ctx: &Ctx) {
@@ -40,8 +41,8 @@ pub async fn run(ctx: &Ctx) {
         }
     }
     let finished = all_done(&mut waits, HANGUP_WAIT).await;
-    // Even a forgotten actor or one that already acknowledged may have left a
-    // captured descendant behind. Do not leave delivery to a dying runtime.
+    // Even a forgotten actor or one that already acknowledged may have handed
+    // off targets. Do not leave delivery to a dying runtime.
     ctx.escalations.finish();
     if !finished {
         warn!(

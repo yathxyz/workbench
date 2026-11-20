@@ -11,7 +11,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use rustix::fs::OFlags;
-use rustix::process::Signal;
+use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdout, Command};
@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use wb_proto::hub::{ErrorCode, ManagedWorktree, WorktreeRequest};
 use wb_proto::limits::{GIT_TIMEOUT, GIT_WORKTREE_TIMEOUT};
 
-use super::agent::signal_group;
+use crate::child::is_echild;
 
 type Error = (ErrorCode, String);
 
@@ -93,12 +93,12 @@ async fn first_error(pipe: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
     }
 }
 
-struct KillGroup(Option<u32>);
+struct KillGroup(Option<Pid>);
 
 impl Drop for KillGroup {
     fn drop(&mut self) {
         if let Some(id) = self.0 {
-            signal_group(id, Signal::KILL);
+            let _ = kill_process_group(id, Signal::KILL);
         }
     }
 }
@@ -148,24 +148,26 @@ async fn run_with<T>(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true);
+        .process_group(0);
     for key in ["HOME", "XDG_CONFIG_HOME", "PATH"] {
         if let Some(value) = env::var_os(key) {
             cmd.env(key, value);
         }
     }
     let mut child = cmd.spawn().map_err(RunError::Io)?;
-    let mut group = KillGroup(child.id());
+    let mut group = KillGroup(child.id().and_then(|id| Pid::from_raw(id as i32)));
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let collect = async {
         // Don't reap the group leader until the pipes close: a filter can inherit a
         // pipe, outlive git and hang the request. Its group ID stays ours to kill.
         let (stdout, stderr) = tokio::try_join!(read_stdout(stdout), first_error(stderr))?;
-        let status = child.wait().await?;
+        let status = child.wait().await;
+        if status.is_ok() || status.as_ref().is_err_and(is_echild) {
+            group.0 = None; // The leader no longer pins the group number.
+        }
         io::Result::Ok(Output {
-            status,
+            status: status?,
             stdout,
             stderr,
         })
@@ -188,9 +190,7 @@ async fn run_with<T>(
             Err(RunError::Interrupted((ErrorCode::Timeout, format!("git {command} timed out"))))
         }
     };
-    if result.is_ok() {
-        group.0 = None;
-    } else {
+    if group.0.is_some() {
         // Reap the killed command before starting any cleanup of its registration.
         drop(group);
         let _ = child.wait().await;
