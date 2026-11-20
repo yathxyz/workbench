@@ -1003,7 +1003,7 @@ impl Acp {
                     act: Act::Kill { .. },
                     reply,
                     ..
-                } if self.journal.is_none() => {
+                } if matches!(op, WorktreeOp::Create { .. } | WorktreeOp::Rollback { .. }) => {
                     if self.create_kill.is_some() {
                         return reply.err(ErrorCode::Conflict, WORKTREE_BUSY);
                     }
@@ -2369,6 +2369,9 @@ impl Acp {
     }
 
     fn remove_worktree(&mut self, reply: Reply) {
+        if self.journal.is_none() {
+            return reply.err(ErrorCode::Faulted, "the session has no journal writer");
+        }
         let Some(record) = &self.meta.managed_worktree else {
             return reply.err(ErrorCode::NotFound, "the session has no managed worktree");
         };
@@ -4302,6 +4305,42 @@ mod tests {
         assert_eq!(next_reply(&forgotten).await["t"], "ok");
         assert!(ctx.registry.kind("a").is_none());
         assert!(!meta.exists() && !journal.is_symlink());
+    }
+
+    #[tokio::test]
+    async fn writerless_worktree_removal_does_not_strand_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _rx) = dormant(dir.path()).await;
+        // A failed forget drops the writer but retains the managed checkout record.
+        actor.journal = None;
+        actor.meta.managed_worktree = Some(ManagedWorktree {
+            main_root: actor.meta.cwd.clone(),
+            path: dir.path().join("absent-checkout").display().to_string(),
+            branch: "topic".into(),
+        });
+        Arc::get_mut(&mut actor.ctx).unwrap().cfg.git = Some(dir.path().join("unused-git"));
+        let remove = Arc::new(OutQ::default());
+        let kill = Arc::new(OutQ::default());
+        for (act, q) in [
+            (Act::RemoveWorktree, &remove),
+            (Act::Kill { forget: false }, &kill),
+        ] {
+            actor
+                .command(Cmd::Act {
+                    epoch: None,
+                    act,
+                    reply: Reply::for_test(1, q.clone()),
+                })
+                .await;
+        }
+        // Deliver any git completion *after* the kill, without racing the actor's select.
+        if let Some(result) = actor.git.join_next().await {
+            actor.worktree_done(result).await;
+        }
+        kill.finish();
+        assert_eq!(read_reply(&kill).await["t"], "ok");
+        assert_eq!(next_reply(&remove).await["code"], "faulted");
+        assert!(actor.meta.managed_worktree.is_some());
     }
 
     #[test]

@@ -404,6 +404,7 @@ Otherwise, when a request fails several checks, the first in this list applies:
   During unpublished worktree creation, including rollback, all `acp.open` requests (with or without `spawn`) and all ACP actions except the first `acp.kill` get `conflict` immediately; `acp.detach` is handled normally.
   The first `acp.kill`, whether `forget` is true or false, requests cancellation and waits for cleanup; if creation fails independently, the opener receives its original error and the kill succeeds unless a leftover is reported.
   During explicit removal, only `acp.open` with `spawn.worktree`, `acp.remove_worktree`, `acp.revive` and `acp.kill` (either `forget` value) get `conflict` because of the removal; everything else, including attach, detach, `acp.prompt` and `acp.seen`, follows the normal session rules.
+  A session without a journal writer refuses `acp.remove_worktree` with `faulted` and leaves its checkout alone.
   Once a session is accepted, killing or forgetting it never removes the checkout.
   Only a timed-out or cancelled `worktree add` permits forced cleanup: the hub verifies the reserved directory's device and inode before it unlocks and force-removes the incomplete checkout; no agent has run in it.
   If the hub itself stops before creation completes, an incomplete, locked worktree can remain without a session record; inspect the path and recover it manually as described in F-A52.
