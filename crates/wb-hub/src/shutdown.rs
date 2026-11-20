@@ -23,8 +23,7 @@ use crate::{Ctx, acp, pty};
 
 /// How long the children have to exit after the hangup.
 pub const HANGUP_WAIT: Duration = Duration::from_secs(5);
-/// How long the sessions have to record the exits after the SIGKILL; it covers an
-/// agent's SIGKILL 6 s into the stop.
+/// Extra time for outstanding acknowledgements after PTY escalation.
 const KILL_WAIT: Duration = Duration::from_secs(3);
 
 pub async fn run(ctx: &Ctx) {

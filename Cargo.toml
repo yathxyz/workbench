@@ -14,6 +14,7 @@ agent-client-protocol-schema = { version = "=1.11.0", default-features = false }
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false }
 futures-util = "0.3.34"
+libc = "0.2.190"
 regex = "1.13.1"
 reqwest = { version = "0.13.5", default-features = false }
 rustix = "1.1.5"

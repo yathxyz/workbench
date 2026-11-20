@@ -171,6 +171,7 @@ flake.nix flake.lock   (inputs: nixpkgs, edwin = github:yathxyz/edwin)
 | sha2 | 0.11.0 | web | static ETags, artifact versions |
 | tracing / tracing-subscriber | 0.1.44 / 0.3.23 | hub, web | `fmt` to stderr (journald) |
 | anyhow | 1.0.104 | bins | binary edges only |
+| libc | 0.2.190 | hub | restore `SIGCHLD` to `SIG_DFL` before starting Tokio |
 | agent-client-protocol-schema | =1.11.0 | hub dev-dep | `default-features=false`, round-trip conformance |
 | tokio-tungstenite, tempfile | 0.29, latest | web dev-deps | test clients |
 
@@ -179,12 +180,12 @@ flake.nix flake.lock   (inputs: nixpkgs, edwin = github:yathxyz/edwin)
 - `rusqlite`/sqlite: the notes index is in memory;
 - `clap`, `cmake`, `hyper`/`tungstenite` directly;
 - the `agent-client-protocol` SDK 3.3.0, `portable-pty`, `alacritty_terminal`, `avt`;
-- `sd-notify`, `chrono`, `rand`, `nix`, `libc`, `bytes`.
+- `sd-notify`, `chrono`, `rand`, `nix`, `bytes`.
 
 **Toolchain.**
 - Nixpkgs `e7439b6b14ad`, with rustc/cargo 1.98.1. The highest MSRV in the tree is 1.89 (uuid).
 - Release profile: `panic="unwind"`, `lto="thin"`.
-- `#![forbid(unsafe_code)]` in every crate except the one hub module `pty/spawn.rs`. It holds the `pre_exec` closures and makes only async-signal-safe raw syscalls.
+- Unsafe code is confined to `pty/spawn.rs`: startup signal setup and the `pre_exec` closures, which make only async-signal-safe raw syscalls.
 
 ### 3.2 Hub protocol (`hub.sock`; the same framing is used by `web.sock`)
 
@@ -564,12 +565,14 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
 #### 3.4.3 PTY sessions
 - **Spawn:**
   - `openpt(O_RDWR|O_NOCTTY|O_CLOEXEC)`, `grantpt`, `unlockpt`, slave via `ioctl_tiocgptpeer`;
-  - tokio `Command` with stdio = slave, `env_clear()` + §3.7.3, and cwd;
+  - `std::process::Command` with stdio = slave, `env_clear()` + §3.7.3, and cwd;
   - `pre_exec`: restore the child umask, write `800` to `/proc/self/oom_score_adj`, `setsid()`, `TIOCSCTTY`;
   - argv is the request's `argv` with `argv[0]` replaced by the chosen shell's resolved path (§3.2.7): a single-item `argv` also gets the shell's configured `args` (an interactive, non-login start), and `[shell, "-c", cmd]` runs `cmd`;
   - the shell name is persisted in `pty/<sid>.json`. A respawn without `shell` uses it. A `shell` that names another shell wins and is persisted;
-  - normally `waitid` with `WNOWAIT` observes exit without reaping until the actor has drained output and recorded the exit.
-    If that wait fails, the actor keeps the child live until its owned child handle confirms exit; where reaping releases the leader early, pre-reap handles protect panic cleanup.
+  - the hub restores the default `SIGCHLD` disposition before the first spawn so an inherited `SIG_IGN` cannot discard child status.
+    Normally `waitid` with `WNOWAIT` observes exit without reaping until the actor has drained output and recorded the exit.
+    `ECHILD` ends the wait with unknown code and signal; cleanup may use previously captured handles, never the released pid.
+    On other wait errors the actor keeps the child until its owned child handle confirms exit; where reaping releases the leader early, pre-reap handles protect panic cleanup.
 - **Kill:** while the leader is still unreaped, the hub opens `/proc/<pid>` handles and checks session membership (stat field 6) through those handles.
   Both SIGHUP and the delayed SIGKILL use those same handles, so a survivor is still targeted after the leader exits, but a reused pid or session id is not.
   A process forked after the snapshot is not killed by this escalation; covering later forks would require containment at spawn.
@@ -782,13 +785,13 @@ A pinned event appears at its own seq position, never ahead of a lower seq. Clie
   - **Not touched:** descendants that left the group with `setsid`/`setpgid` survive, like processes after an ssh logout. They are visible in `/api/proc`.
 - **SIGTERM shutdown** (`TimeoutStopSec=15` is systemd's external limit). Accepting has stopped first.
   1. Every session actor refuses later requests with `err{internal, "hub stopping"}`.
-  2. PTY actors snapshot their screens and SIGHUP their sessions. Agent actors close stdin and, if the agent is still there, send SIGTERM to its group at 5 s and SIGKILL at 6 s.
+  2. PTY actors snapshot their screens and SIGHUP their sessions. Agent actors close stdin and, if the agent is still there, send SIGTERM to its group at 5 s and SIGKILL at 6 s, measured from the start of actor teardown, not the shutdown mailbox send.
   3. The shared 5 s `HANGUP_WAIT` starts only after the hub has fenced in-flight epoch writes and awaited every shutdown mailbox send.
      A stalled mark write or a full mailbox delays the start of this deadline.
-     Each exit is recorded with `reason:"hub_restart"` and the real `code`/`signal`.
-  4. As soon as every actor acknowledges, or the shared 5 s grace expires, the hub sends SIGKILL through all remaining captured PTY handles, including those of sessions already forgotten.
+     Each exit is recorded with `reason:"hub_restart"` and the observed `code`/`signal`, both null if the child was already reaped.
+  4. As soon as all acknowledgement channels resolve or close, or the shared 5 s grace expires, the hub sends SIGKILL through all remaining captured PTY handles, including those of sessions already forgotten.
      This can shorten the ordinary three-second grace for a user kill; later captures escalate immediately.
-     After sending KILL, the hub waits up to 3 s more (`KILL_WAIT`) for any outstanding exit records, covering an agent's SIGKILL at 6 s.
+     After sending KILL, the hub waits up to 3 s more (`KILL_WAIT`) for any outstanding exit records.
   5. Exit 0.
 
   `KillMode=mixed` reaps the rest, and the next start completes any record the stop did not finish.

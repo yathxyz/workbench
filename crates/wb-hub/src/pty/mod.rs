@@ -13,13 +13,13 @@ use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::pin::Pin;
+use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rustix::process::{Pid, PidfdFlags, WaitId, WaitIdOptions, WaitIdStatus, pidfd_open, waitid};
 use rustix::termios::{Winsize, tcgetpgrp, tcsetwinsize};
 use tokio::io::unix::AsyncFd;
-use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -330,7 +330,7 @@ struct Pty {
     decoder: OutStream,
     ring: Ring,
     input: InputQueue,
-    /// From spawn until the exit is finished; `alive` is `pid.is_some()`.
+    /// Cleared immediately on ECHILD, even if the PTY is still draining.
     pid: Option<u32>,
     master: Option<Master>,
     /// Normally unreaped through the output drain and final save.
@@ -632,7 +632,7 @@ impl Pty {
                 }
                 self.spawn(viewer, size, spawn, reply).await;
             }
-            _ if self.pid.is_some() => self.attach_live(viewer, size, resume, reply),
+            _ if self.master.is_some() => self.attach_live(viewer, size, resume, reply),
             _ => self.attach_corpse(viewer, size, reply).await,
         }
     }
@@ -747,7 +747,7 @@ impl Pty {
             Ok(spawned) => spawned,
             Err(e) => return self.spawn_failed(&e, reply),
         };
-        let pid = spawned.child.id().expect("new child has a pid");
+        let pid = spawned.child.id();
         self.child = Some(spawned.child);
         self.cleanup = Cleanup::Unarmed;
         let (master, exit_watch) =
@@ -755,7 +755,7 @@ impl Pty {
                 Ok(fds) => fds,
                 Err(e) => {
                     self.teardown(KILL_AFTER);
-                    self.child = None;
+                    self.reap_owned();
                     return self.spawn_failed(&e, reply);
                 }
             };
@@ -897,7 +897,11 @@ impl Pty {
         let Some(child) = &self.child else {
             return Ok(()); // Already reaped; its numeric identity is no longer ours.
         };
-        let pid = child.id().expect("unreaped child has a pid");
+        let pid = child.id();
+        if peek_exit(pid).is_err_and(|e| is_echild(&e)) {
+            self.lost_child();
+            return Ok(());
+        }
         let mut members = match &self.cleanup {
             Cleanup::Unarmed => procfs::session_members(proc_root, pid, &self.sid),
             Cleanup::LeaderOwed(pending) => {
@@ -916,17 +920,23 @@ impl Pty {
         if hup.is_err() {
             self.cleanup = Cleanup::LeaderOwed(members.track_leader());
         }
-        self.ctx.escalations.arm(members, grace);
+        if self.child.is_some() {
+            self.ctx.escalations.arm(members, grace);
+        }
         hup
     }
 
     fn check_hup(&mut self, pid: u32, hup: std::io::Result<()>) -> std::io::Result<()> {
         // Do not mistake a missing handle for an exited leader, or reap it to check.
-        if let Err(e) = hup
-            && !matches!(peek_exit(pid), Ok(Some(_)))
-        {
-            warn!(sid = %self.sid, "could not hang up PTY leader {pid}: {e}");
-            return Err(e);
+        if let Err(e) = hup {
+            match peek_exit(pid) {
+                Ok(Some(_)) => {}
+                Err(wait) if is_echild(&wait) => self.lost_child(),
+                _ => {
+                    warn!(sid = %self.sid, "could not hang up PTY leader {pid}: {e}");
+                    return Err(e);
+                }
+            }
         }
         self.cleanup = Cleanup::Armed;
         Ok(())
@@ -1052,11 +1062,18 @@ impl Pty {
             Ok(WaitNotice::Exited(code, signal)) => (code, signal),
             Ok(WaitNotice::ProbeChild) => {
                 let child = self.child.as_mut().expect("waiting for an owned child");
-                let pid = child.id().expect("unreaped child");
+                let pid = child.id();
                 // try_wait can release the pid. Keep handles for Drop if the
                 // actor unwinds while draining or recording this exit.
-                let members = matches!(self.cleanup, Cleanup::Unarmed)
-                    .then(|| procfs::session_members(Path::new("/proc"), pid, &self.sid));
+                let members = if matches!(self.cleanup, Cleanup::Unarmed) {
+                    match peek_exit(pid) {
+                        Ok(None) => return, // Still live; no need to scan or reap.
+                        Err(e) if is_echild(&e) => return self.lost_child(),
+                        _ => Some(procfs::session_members(Path::new("/proc"), pid, &self.sid)),
+                    }
+                } else {
+                    None
+                };
                 match child.try_wait() {
                     Ok(None) => return,
                     Ok(Some(status)) => {
@@ -1064,6 +1081,7 @@ impl Pty {
                         self.child = None;
                         (status.code(), status.signal())
                     }
+                    Err(e) if is_echild(&e) => return self.lost_child(),
                     Err(e) => {
                         warn!(sid = %self.sid, "waiting for owned PTY child: {e}");
                         self.exit_watch.as_mut().unwrap().retry_child();
@@ -1071,6 +1089,7 @@ impl Pty {
                     }
                 }
             }
+            Err(e) if is_echild(&e) => return self.lost_child(),
             Err(e) => {
                 warn!(sid = %self.sid, "observing PTY exit: {e}; switching to child wait");
                 self.exit_watch.as_mut().unwrap().use_child_wait();
@@ -1083,6 +1102,21 @@ impl Pty {
             self.finish_exit();
         } else {
             self.drain_until = Some(Instant::now() + DRAIN);
+        }
+    }
+
+    /// Neither the wait status nor the numeric process/session id is ours anymore.
+    fn lost_child(&mut self) {
+        self.child = None;
+        self.exit_watch = None;
+        if self.pid.take().is_some() {
+            self.fg = None;
+            self.status = Some((None, None));
+            // A kill/shutdown command may itself have discovered ECHILD. Finish
+            // after the command has installed its pending replies, even at EOF.
+            let now = Instant::now();
+            self.drain_until = Some(if self.eof { now } else { now + DRAIN });
+            self.publish(); // In particular, cwd_from must not follow the old pid.
         }
     }
 
@@ -1137,16 +1171,29 @@ impl Pty {
             self.phase = Phase::Stopped;
         }
         // No more exit handling can panic after the kernel releases this leader's id.
-        if let Some(mut child) = self.child.take() {
-            match child.try_wait() {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    warn!(sid = %self.sid, "PTY leader not waitable after exit notification")
-                }
-                Err(e) => warn!(sid = %self.sid, "reaping PTY leader: {e}"),
-            }
-        }
+        self.reap_owned();
         self.reaped_cleanup = None;
+    }
+
+    fn reap_owned(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Err(e) if is_echild(&e) => return,
+            Err(e) => warn!(sid = %self.sid, "reaping PTY leader: {e}"),
+            Ok(None) => {}
+        }
+        // A cancelled actor (or failed master setup) can leave a still-live
+        // child. Don't block its Drop, or tie runtime shutdown to HUP delivery.
+        if let Err(e) = std::thread::Builder::new().spawn(move || {
+            if let Err(e) = child.wait() {
+                warn!("reaping abandoned PTY leader: {e}");
+            }
+        }) {
+            warn!(sid = %self.sid, "starting PTY leader reaper: {e}");
+        }
     }
 
     /// Queues a write of the record and, with `snapshot`, of the screen.
@@ -1170,7 +1217,7 @@ impl Pty {
             host: self.ctx.cfg.host.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
-            alive: self.pid.is_some(),
+            alive: self.master.is_some(),
             viewers: u32::try_from(viewers).unwrap_or(u32::MAX),
             cwd: self.rec.cwd.clone(),
             fault: self.fault.clone().map(|message| Fault {
@@ -1197,6 +1244,7 @@ impl Drop for Pty {
             self.ctx.escalations.arm(members, KILL_AFTER);
         }
         self.teardown(KILL_AFTER);
+        self.reap_owned();
     }
 }
 
@@ -1231,6 +1279,10 @@ fn peek_exit(pid: u32) -> std::io::Result<Option<WaitIdStatus>> {
     Ok(rustix::io::retry_on_intr(|| {
         waitid(WaitId::Pid(pid), opts)
     })?)
+}
+
+fn is_echild(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(rustix::io::Errno::CHILD.raw_os_error())
 }
 
 enum WaitNotice {
@@ -1355,7 +1407,7 @@ mod tests {
             ctx.child_umask,
         )
         .unwrap();
-        actor.pid = spawned.child.id();
+        actor.pid = Some(spawned.child.id());
         actor.exit_watch = Some(ExitWatch::new(actor.pid.unwrap()).unwrap());
         actor.child = Some(spawned.child);
         actor.master = Some(AsyncFd::new(spawned.master).unwrap());
@@ -1389,13 +1441,19 @@ mod tests {
             let _ = pidfd_send_signal(descendant.get_ref(), Signal::KILL);
             panic!("kill treated a child with a failed wait as already dead");
         }
-        // The fallback must also observe the real exit and its status after HUP.
-        while actor.status.is_none() {
-            let st = wait(actor.exit_watch.as_mut()).await;
-            actor.exited(st);
-        }
+        // Hold the captured handles outside the timer's map before yielding.
+        // Only HUP can cause the exit observed by this wait.
+        let gated = Escalations(Mutex::new(lock(&ctx.escalations.0).take()));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while actor.status.is_none() {
+                let st = wait(actor.exit_watch.as_mut()).await;
+                actor.exited(st);
+            }
+        })
+        .await
+        .expect("fallback did not observe the leader's exit after HUP");
         assert_eq!(actor.status, Some((Some(42), None)));
-        ctx.escalations.finish();
+        gated.finish();
         assert_killed(descendant).await;
     }
 
@@ -1498,12 +1556,12 @@ mod tests {
         let (mut actor, _writes) = Pty::new(ctx, "job".into(), 17, Viewers::default());
         // Not a session leader: no process in /proc can have this live child's
         // pid as its kernel session id. Capture misses it without signalling anyone.
-        let child = tokio::process::Command::new("sh")
+        let child = std::process::Command::new("sh")
             .args(["-c", "read line"])
             .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        actor.pid = child.id();
+        actor.pid = Some(child.id());
         actor.child = Some(child);
         let outq = Arc::new(OutQ::default());
         actor.kill(true, Reply::for_test(1, outq.clone()));
@@ -1521,7 +1579,7 @@ mod tests {
             }
         ));
         // wait closes stdin, letting our unsignalled child finish the read.
-        actor.child.take().unwrap().wait().await.unwrap();
+        actor.child.take().unwrap().wait().unwrap();
     }
 
     enum AfterMiss {
@@ -1668,6 +1726,52 @@ mod tests {
         let old = straggler.wait().unwrap();
         let new = replacement.wait().unwrap();
         assert_eq!((old.signal(), new.code()), (Some(9), Some(0)));
+    }
+
+    async fn externally_reaped_child(fallback: Option<Cleanup>) {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(Ctx::for_test(dir.path()));
+        let _rx = ctx.registry.restore::<Cmd>("job", 17);
+        let (mut actor, writes) = test_session(&ctx, "exit 7");
+        actor.publish();
+        assert_eq!(ctx.registry.live_pid("job"), actor.pid);
+        let pid = Pid::from_raw(actor.pid.unwrap() as i32).unwrap();
+        // Reap only the process this test spawned, bypassing Child's status cache.
+        rustix::io::retry_on_intr(|| waitid(WaitId::Pid(pid), WaitIdOptions::EXITED)).unwrap();
+        if let Some(cleanup) = fallback {
+            actor.cleanup = cleanup;
+            actor.exit_watch.as_mut().unwrap().use_child_wait();
+        }
+        let notice = wait(actor.exit_watch.as_mut()).await;
+        actor.exited(notice);
+
+        // Take the stale handle before asserting so even a failing test cannot
+        // make the actor scan or signal by the released pid during unwinding.
+        let retained = actor.child.take();
+        assert_eq!(actor.status, Some((None, None)));
+        assert!(retained.is_none());
+        assert!(actor.pid.is_none());
+        assert!(ctx.registry.live_pid("job").is_none());
+        assert!(actor.exit_watch.is_none());
+        assert!(actor.reaped_cleanup.is_none());
+        actor.finish_exit();
+        let exit = actor.rec.exit.as_ref().unwrap();
+        assert_eq!((exit.code, exit.signal), (None, None));
+        drop(actor);
+        writes.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn waitid_echild_confirms_exit_without_cleanup_targets() {
+        externally_reaped_child(None).await;
+    }
+
+    #[tokio::test]
+    async fn try_wait_echild_confirms_exit_without_cleanup_targets() {
+        // Before capturing a new snapshot, and in try_wait itself when an
+        // earlier kill has already armed cleanup.
+        externally_reaped_child(Some(Cleanup::Unarmed)).await;
+        externally_reaped_child(Some(Cleanup::Armed)).await;
     }
 
     #[test]

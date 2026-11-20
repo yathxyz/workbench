@@ -1,12 +1,12 @@
-//! Starting a PTY child or an ACP agent. This is the only module of the hub with `unsafe`
-//! code: the `pre_exec` closures, which run between `fork` and `exec` and therefore make
-//! only async-signal-safe raw syscalls (rustix's linux_raw backend: no allocation, no
-//! locks).
+//! Starting a PTY child or an ACP agent. Unsafe code is confined to the startup
+//! signal disposition and the `pre_exec` closures, which use only async-signal-safe
+//! raw syscalls between `fork` and `exec`.
 #![allow(unsafe_code)]
 
 use std::ffi::OsString;
 use std::io;
 use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -15,8 +15,19 @@ use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
 use rustix::termios::{Winsize, tcsetwinsize};
 use tokio::process::{Child, Command};
 
+/// An explicitly ignored SIGCHLD survives exec and lets the kernel discard exit status.
+pub(crate) fn reset_sigchld() -> io::Result<()> {
+    // SAFETY: called at startup before Tokio installs handlers or any child exists.
+    // SIG_DFL is a valid disposition and installs no Rust signal handler.
+    if unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } == libc::SIG_ERR {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub struct Spawned {
-    pub child: Child,
+    /// Unlike Tokio's Child, Drop does not hand a released pid to an orphan reaper.
+    pub child: std::process::Child,
     /// Non-blocking and close-on-exec. The hub holds no slave fd, so reads return EOF
     /// once every process has closed the slave.
     pub master: OwnedFd,
@@ -39,11 +50,12 @@ pub fn spawn(
     unlockpt(&master)?;
     let slave = ioctl_tiocgptpeer(&master, flags)?;
     tcsetwinsize(&master, size)?;
+    rustix::io::ioctl_fionbio(&master, true)?;
 
     let (arg0, args) = argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty argv"))?;
-    let mut cmd = Command::new(program);
+    let mut cmd = std::process::Command::new(program);
     cmd.arg0(arg0)
         .args(args)
         .env_clear()
@@ -51,8 +63,7 @@ pub fn spawn(
         .current_dir(cwd)
         .stdin(Stdio::from(slave.try_clone()?))
         .stdout(Stdio::from(slave.try_clone()?))
-        .stderr(Stdio::from(slave))
-        .kill_on_drop(false);
+        .stderr(Stdio::from(slave));
     // SAFETY: the closure runs in the forked child before exec. It only calls rustix
     // syscall wrappers, which neither allocate nor take locks.
     unsafe {
@@ -61,7 +72,6 @@ pub fn spawn(
     let child = cmd.spawn()?;
     // The command still owns the three slave fds; close them in the hub.
     drop(cmd);
-    rustix::io::ioctl_fionbio(&master, true)?;
     Ok(Spawned { child, master })
 }
 

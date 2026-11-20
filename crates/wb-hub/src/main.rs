@@ -1,7 +1,6 @@
 //! `wb-hub`: owns the PTY and ACP sessions of one host and serves them on `hub.sock`.
 //!
-//! `unsafe` is denied everywhere except `pty/spawn.rs`, which allows it for the
-//! `pre_exec` closure.
+//! `unsafe` is confined to startup signal setup and `pre_exec` in `pty/spawn.rs`.
 #![deny(unsafe_code)]
 
 mod acp;
@@ -103,8 +102,7 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let [flag, path] = args.as_slice() else {
         eprintln!("usage: wb-hub --config PATH");
@@ -122,7 +120,10 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .with_max_level(level)
         .init();
-    match run(PathBuf::from(path)).await {
+    match pty::spawn::reset_sigchld()
+        .context("restoring default SIGCHLD disposition")
+        .and_then(|()| run(PathBuf::from(path)))
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("{e:#}");
@@ -145,6 +146,7 @@ fn lock_instance(dir: &Path) -> anyhow::Result<File> {
     Ok(lock_file)
 }
 
+#[tokio::main]
 async fn run(config: PathBuf) -> anyhow::Result<()> {
     let cfg = config::load(&config)?;
     let ident = Identity::from_env()?;
