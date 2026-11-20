@@ -43,6 +43,7 @@ pub struct Ctx {
     /// The umask the hub was started with, restored in its children.
     pub child_umask: Mode,
     pub registry: Registry,
+    pub escalations: Arc<pty::Escalations>,
     pub started_at: u64,
     /// `stateDir/pty`.
     pub pty_dir: PathBuf,
@@ -72,6 +73,7 @@ impl Ctx {
             },
             child_umask: Mode::empty(),
             registry: Registry::open(dir).unwrap(),
+            escalations: Arc::default(),
             started_at: 1,
             pty_dir,
             acp_dir,
@@ -156,6 +158,7 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
         ident,
         child_umask,
         registry,
+        escalations: Arc::default(),
         started_at: now_ms(),
         pty_dir,
         acp_dir,

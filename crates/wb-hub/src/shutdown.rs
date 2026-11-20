@@ -40,14 +40,17 @@ pub async fn run(ctx: &Ctx) {
             waits.spawn(finished);
         }
     }
-    if all_done(&mut waits, HANGUP_WAIT).await {
-        return;
+    let finished = all_done(&mut waits, HANGUP_WAIT).await;
+    // Even a forgotten actor or one that already acknowledged may have left a
+    // captured descendant behind. Do not leave delivery to a dying runtime.
+    ctx.escalations.finish();
+    if !finished {
+        warn!(
+            "{} sessions have not finished after {HANGUP_WAIT:?}",
+            waits.len()
+        );
     }
-    warn!(
-        "{} sessions have not finished after {HANGUP_WAIT:?}",
-        waits.len()
-    );
-    if !all_done(&mut waits, KILL_WAIT).await {
+    if !finished && !all_done(&mut waits, KILL_WAIT).await {
         warn!("{} sessions did not record their exit", waits.len());
     }
 }
