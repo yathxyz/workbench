@@ -171,6 +171,7 @@ flake.nix flake.lock   (inputs: nixpkgs, edwin = github:yathxyz/edwin)
 | sha2 | 0.11.0 | web | static ETags, artifact versions |
 | tracing / tracing-subscriber | 0.1.44 / 0.3.23 | hub, web | `fmt` to stderr (journald) |
 | anyhow | 1.0.104 | bins | binary edges only |
+| libc | 0.2.190 | hub | restore `SIGCHLD` to `SIG_DFL` before starting Tokio |
 | agent-client-protocol-schema | =1.11.0 | hub dev-dep | `default-features=false`, round-trip conformance |
 | tokio-tungstenite, tempfile | 0.29, latest | web dev-deps | test clients |
 
@@ -179,12 +180,12 @@ flake.nix flake.lock   (inputs: nixpkgs, edwin = github:yathxyz/edwin)
 - `rusqlite`/sqlite: the notes index is in memory;
 - `clap`, `cmake`, `hyper`/`tungstenite` directly;
 - the `agent-client-protocol` SDK 3.3.0, `portable-pty`, `alacritty_terminal`, `avt`;
-- `sd-notify`, `chrono`, `rand`, `nix`, `libc`, `bytes`.
+- `sd-notify`, `chrono`, `rand`, `nix`, `bytes`.
 
 **Toolchain.**
 - Nixpkgs `e7439b6b14ad`, with rustc/cargo 1.98.1. The highest MSRV in the tree is 1.89 (uuid).
 - Release profile: `panic="unwind"`, `lto="thin"`.
-- `#![forbid(unsafe_code)]` in every crate except the one hub module `pty/spawn.rs`. It holds the `pre_exec` closures and makes only async-signal-safe raw syscalls.
+- Unsafe code is confined to `pty/spawn.rs`: startup signal setup and the `pre_exec` closures, which make only async-signal-safe raw syscalls.
 
 ### 3.2 Hub protocol (`hub.sock`; the same framing is used by `web.sock`)
 
@@ -300,6 +301,9 @@ The error codes are a closed set:
 - **Incarnation:** a sid can be forgotten and recreated, and `createdAt` distinguishes the incarnations.
   - It is persisted in `<kind>/<sid>.json` and survives hub restarts, revive and PTY respawn.
   - A new value is assigned only when a session is created.
+  - Across both kinds the allocator takes the larger of the wall clock in milliseconds and one past its durable high-water mark.
+    It commits the mark before exposing an epoch, so a failed creation may leave a gap, but forget, restart and clock rollback cannot reuse an issued value.
+    After the clock steps backwards, the mark runs ahead of wall time; `createdAt` and `updatedAt` can look future-dated until the clock catches up.
 
 #### 3.2.7 Requests (client to hub)
 
@@ -314,7 +318,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `pty.detach` | `sid` | `{}` | |
 | `pty.input` | `sid, d` | – | `d` ≤ 1 MiB. Written completely and in order. If queued input would exceed 8 MiB, the whole message is dropped and the connection gets `err{sid, code:"input_overflow"}`. Input to a dead session is dropped silently. |
 | `pty.resize` | `sid, cols, rows` | – | `TIOCSWINSZ` plus the VT resize (§3.4.3). Clamped to cols 2..=1000 and rows 1..=500. Last writer wins. |
-| `pty.kill` | `sid, forget, epoch?` | `{}` | SIGHUP to every member of the PTY's session (/proc stat field 6), SIGKILL survivors after 3 s, close the master. **`forget:false`:** ok when the kill starts. **`forget:true`:** ok only after the exit, the file deletion and the registry removal. Every attached connection, and every watcher, gets `gone`. |
+| `pty.kill` | `sid, forget, epoch?` | `{}` | SIGHUP to the captured members of the PTY's session, SIGKILL survivors from that set after 3 s, close the master. **`forget:false`:** ok when the kill starts. **`forget:true`:** ok only after the exit, the file deletion and the registry removal. Every attached connection, and every watcher, gets `gone`. |
 | `pty.capture` | `sid, lines?` (default 200, max 1000) | `{text}` | plain text from the VT state, each row right-trimmed and blank rows after the last text left out; works on dead sessions |
 | `acp.open` | `sid, since, epoch?, spawn?: SpawnAcp` | `{new, summary, session, head, from, reset, configErrors?: ConfigError[]}` | then the replay as `acp.ev`, then `acp.replayed`, then live events. With a non-empty spawn config, the initiating reply waits for the hub-owned batch or its termination. Rules below. |
 | `acp.detach` | `sid` | `{}` | |
@@ -535,6 +539,7 @@ This holds even if a command was queued as the old session was being forgotten.
 **Hub `stateDir`:** the module passes `/home/alice/.local/state/workbench/hub`. Directories are 0700 and files 0600.
 ```
 hub.lock                                  flock, single instance
+last-created                              decimal high-water mark for allocated session epochs
 pty/<sid>.json                            {sid, shell (name), argv (argv[0] = the resolved shell path), cwd, env (client-supplied only), createdAt, cols, rows, exit|null}
 pty/<sid>.snap                            last VT snapshot (on exit, on SIGTERM, every 30 s while dirty)
 acp/<sid>.json                            {sid, agent, cwd, createdAt, agentSessionId|null, init|null, seenSeq, managedWorktree?}
@@ -544,6 +549,14 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
 ```
 - The loader considers only `<sid>.json` files whose stem matches the sid regex. Quarantined names contain a dot, so they never match.
 - `.json` and `.snap` are written atomically: tmp, fsync, rename, fsync the directory.
+- `last-created` uses the same atomic write and is never deleted by forget.
+  On upgrade, the hub seeds the mark from the maximum epoch in valid PTY and ACP metadata, including ACP records shadowed by a PTY or paired with an unreadable journal. The mark is durable before any such metadata is quarantined, any faulted record gets a new epoch, or clients are accepted.
+  This ordering guarantee cannot cover a session forgotten before the upgrade: its epoch is no longer on disk.
+  On the first start without a mark, recovery continues past unreadable metadata; its epoch cannot seed the mark and may be issued again.
+  Before trusting an existing mark, startup fsyncs the state directory even if the recovered maximum equals the mark.
+  This validation happens under `hub.lock`, before creating session directories or removing their temporary files.
+  An unreadable or malformed mark is an error, not a reset.
+  An orderly stop waits for outstanding mark writes before releasing `hub.lock`. Each writer also retains the same flocked open file description through its write, so unwinding without an orderly stop cannot hand the lock to a successor too early.
 - The journal is appended with one `pwrite(2)` per event at the tracked end of its last complete line, never with `O_APPEND`. If a failed append cannot even be truncated away, what is left is a prefix of a line with no `\n`: the next append overwrites it, and the next open truncates it. `fdatasync` runs on `session`, `setup_error`, `turn_end`, `turn_error`, `exit` and SIGTERM.
 
 **Web `stateDir`** (`…/workbench/web`): `web.lock`, `artifacts/<node>/…`, artifact `db.json`. **There is no `index.db`**: the notes index lives in memory.
@@ -553,11 +566,20 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
 #### 3.4.3 PTY sessions
 - **Spawn:**
   - `openpt(O_RDWR|O_NOCTTY|O_CLOEXEC)`, `grantpt`, `unlockpt`, slave via `ioctl_tiocgptpeer`;
-  - tokio `Command` with stdio = slave, `env_clear()` + §3.7.3, and cwd;
+  - `std::process::Command` with stdio = slave, `env_clear()` + §3.7.3, and cwd;
   - `pre_exec`: restore the child umask, write `800` to `/proc/self/oom_score_adj`, `setsid()`, `TIOCSCTTY`;
   - argv is the request's `argv` with `argv[0]` replaced by the chosen shell's resolved path (§3.2.7): a single-item `argv` also gets the shell's configured `args` (an interactive, non-login start), and `[shell, "-c", cmd]` runs `cmd`;
   - the shell name is persisted in `pty/<sid>.json`. A respawn without `shell` uses it. A `shell` that names another shell wins and is persisted;
-  - reaped by `Child::wait()` (pidfd).
+  - before starting Tokio the hub restores the default `SIGCHLD` disposition and unblocks it, so the hub can collect exit status and receive child-exit notifications.
+    Normally `waitid` with `WNOWAIT` observes exit without reaping until the actor has drained output and recorded the exit.
+    `ECHILD` ends the wait with unknown code and signal; cleanup may use previously captured handles, never the released pid.
+    On other wait errors the actor keeps the child until its owned child handle confirms exit; where reaping releases the leader early, pre-reap handles protect panic cleanup.
+    One reaper thread takes ownership of abandoned PTY children and polls them without waiting on any one child.
+- **Kill:** while the leader is still unreaped, the hub opens `/proc/<pid>` handles and checks session membership (stat field 6) through those handles.
+  Both SIGHUP and the delayed SIGKILL use those same handles, so a survivor is still targeted after the leader exits, but a reused pid or session id is not.
+  A process forked after the snapshot is not killed by this escalation; covering later forks would require containment at spawn.
+  The hub warns with the session id on capture or signal-delivery errors other than a vanished process; a kill request fails if SIGHUP could not be delivered to a still-live leader.
+  A failed hangup leaves the live leader owed: a retry or teardown targets only the owned leader, without taking another snapshot.
 - **Output path:**
   1. read ≤ 64 KiB;
   2. **OutStream** holds back an incomplete UTF-8 tail (≤ 3 bytes) and an unterminated ESC/CSI/OSC/DCS tail (≤ `ESC_HOLDBACK_MAX`, counted from the sequence's ESC). The next read releases both. After 20 ms without output only the escape tail is released, as is: an incomplete character cannot be shown and waits for the next read, which completes it or turns it into U+FFFD. A respawn resets the decoder;
@@ -763,11 +785,15 @@ A pinned event appears at its own seq position, never ahead of a lower seq. Clie
     - write the death-invariant lines and `exit`, then `fdatasync`;
     - after a **user** `acp.kill`, set `seenSeq = headSeq` **after** finalising. Other kills (a failed setup, a fault, a hub stop) leave `seenSeq` alone.
   - **Not touched:** descendants that left the group with `setsid`/`setpgid` survive, like processes after an ssh logout. They are visible in `/api/proc`.
-- **SIGTERM shutdown**, within `TimeoutStopSec=15`. Accepting has stopped first.
+- **SIGTERM shutdown** (`TimeoutStopSec=15` is systemd's external limit). Accepting has stopped first.
   1. Every session actor refuses later requests with `err{internal, "hub stopping"}`.
-  2. PTY actors snapshot their screens and SIGHUP their sessions. Agent actors close stdin and, if the agent is still there, send SIGTERM to its group at 5 s and SIGKILL at 6 s.
-  3. The hub waits up to 5 s (`HANGUP_WAIT`) for the children to exit. Each exit is recorded with `reason:"hub_restart"` and the real `code`/`signal`.
-  4. It then SIGKILLs the PTY sessions that survive and waits up to 3 s (`KILL_WAIT`) for every record to be written. This covers an agent's SIGKILL at 6 s.
+  2. PTY actors snapshot their screens and SIGHUP their sessions. Agent actors close stdin and, if the agent is still there, send SIGTERM to its group at 5 s and SIGKILL at 6 s, measured from the start of actor teardown, not the shutdown mailbox send.
+  3. The shared 5 s `HANGUP_WAIT` starts only after the hub has fenced in-flight epoch writes and awaited every shutdown mailbox send.
+     A stalled mark write or a full mailbox delays the start of this deadline.
+     Each exit is recorded with `reason:"hub_restart"` and the observed `code`/`signal`, both null if the child was already reaped.
+  4. As soon as all acknowledgement channels resolve or close, or the shared 5 s grace expires, the hub sends SIGKILL through all remaining captured PTY handles, including those of sessions already forgotten.
+     This can shorten the ordinary three-second grace for a user kill; later captures escalate immediately.
+     After sending KILL, the hub waits up to 3 s more (`KILL_WAIT`) for any outstanding exit records.
   5. Exit 0.
 
   `KillMode=mixed` reaps the rest, and the next start completes any record the stop did not finish.

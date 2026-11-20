@@ -14,24 +14,22 @@
 
 use std::time::Duration;
 
-use rustix::process::Signal;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::registry::Tx;
-use crate::{Ctx, acp, procfs, pty};
+use crate::{Ctx, acp, pty};
 
 /// How long the children have to exit after the hangup.
-const HANGUP_WAIT: Duration = Duration::from_secs(5);
-/// How long the sessions have to record the exits after the SIGKILL; it covers an
-/// agent's SIGKILL 6 s into the stop.
+pub const HANGUP_WAIT: Duration = Duration::from_secs(5);
+/// Extra time for outstanding acknowledgements after PTY escalation.
 const KILL_WAIT: Duration = Duration::from_secs(3);
 
 pub async fn run(ctx: &Ctx) {
     info!("stopping");
     let mut waits = JoinSet::new();
-    for tx in ctx.registry.stop() {
+    for tx in ctx.registry.stop().await {
         let (done, finished) = oneshot::channel();
         let sent = match tx {
             Tx::Pty(tx) => tx.send(pty::Cmd::Shutdown { done }).await.is_ok(),
@@ -41,18 +39,17 @@ pub async fn run(ctx: &Ctx) {
             waits.spawn(finished);
         }
     }
-    if all_done(&mut waits, HANGUP_WAIT).await {
-        return;
+    let finished = all_done(&mut waits, HANGUP_WAIT).await;
+    // Even a forgotten actor or one that already acknowledged may have left a
+    // captured descendant behind. Do not leave delivery to a dying runtime.
+    ctx.escalations.finish();
+    if !finished {
+        warn!(
+            "{} sessions have not finished after {HANGUP_WAIT:?}",
+            waits.len()
+        );
     }
-    let survivors = ctx.registry.live_pids();
-    warn!(
-        "{} sessions still running after {HANGUP_WAIT:?}; killing them",
-        survivors.len()
-    );
-    for pid in survivors {
-        procfs::signal_session(pid, Signal::KILL);
-    }
-    if !all_done(&mut waits, KILL_WAIT).await {
+    if !finished && !all_done(&mut waits, KILL_WAIT).await {
         warn!("{} sessions did not record their exit", waits.len());
     }
 }

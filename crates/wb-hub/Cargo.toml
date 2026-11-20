@@ -11,6 +11,7 @@ path = "src/bin/wb-fake-acp.rs"
 [dependencies]
 wb-proto.workspace = true
 anyhow.workspace = true
+libc.workspace = true
 rustix = { workspace = true, features = ["pty", "termios", "process", "fs"] }
 serde.workspace = true
 serde_json.workspace = true
