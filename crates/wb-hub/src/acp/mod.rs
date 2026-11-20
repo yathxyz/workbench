@@ -277,19 +277,29 @@ fn checked_task(task: Option<String>) -> Result<Option<String>, &'static str> {
     }
 }
 
-/// Registers and starts the session `sid` found in the state directory at startup. A
-/// session that fails to load is quarantined and shows the fault.
-pub async fn load(ctx: &Arc<Ctx>, sid: String) -> io::Result<()> {
-    let (created_at, from) = match read(ctx, &sid).await {
-        Ok(Some(loaded)) => (
-            Some(loaded.meta.created_at),
-            Start::Loaded(Box::new(loaded)),
-        ),
+/// Restore a readable session immediately, without keeping its journal in a
+/// startup backlog. Return the quarantined sid and fault to register after seeding.
+pub async fn restore(ctx: &Arc<Ctx>, sid: String) -> Result<(), (String, String)> {
+    let loaded = match read(ctx, &sid).await {
+        Ok(Some(loaded)) => loaded,
         Ok(None) => return Ok(()),
-        Err(fault) => (None, Start::Faulted(fault)),
+        Err(fault) => return Err((sid, fault)),
     };
-    let (created_at, rx) = ctx.registry.load(&sid, created_at).await?;
-    start(ctx.clone(), sid, created_at, rx, from);
+    let created_at = loaded.meta.created_at;
+    let rx = ctx.registry.restore(&sid, created_at);
+    start(
+        ctx.clone(),
+        sid,
+        created_at,
+        rx,
+        Start::Loaded(Box::new(loaded)),
+    );
+    Ok(())
+}
+
+pub async fn load_faulted(ctx: &Arc<Ctx>, sid: String, fault: String) -> io::Result<()> {
+    let (created_at, rx) = ctx.registry.register_faulted(&sid).await?;
+    start(ctx.clone(), sid, created_at, rx, Start::Faulted(fault));
     Ok(())
 }
 
@@ -3255,11 +3265,13 @@ mod tests {
                 .unwrap(),
         );
         let ctx = Arc::new(ctx);
-        let (epoch, rx) = ctx.registry.load("a", None).await.unwrap();
-        let mut acp = Acp::new(ctx, "a".into(), epoch, Arc::default());
+        let Route::Created { created_at, rx } = ctx.registry.route("a", true).await.unwrap() else {
+            panic!("expected a new sid");
+        };
+        let mut acp = Acp::new(ctx, "a".into(), created_at, Arc::default());
         acp.meta = Meta {
             sid: acp.sid.clone(),
-            created_at: epoch,
+            created_at,
             agent: "offline".into(),
             cwd: dir.to_str().unwrap().into(),
             ..Meta::default()

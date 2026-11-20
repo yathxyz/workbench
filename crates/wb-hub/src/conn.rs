@@ -743,7 +743,8 @@ mod tests {
             permits: Arc::new(Semaphore::new(REQS_IN_FLIGHT)),
             opened: HashSet::new(),
         };
-        let (epoch, mut rx) = ctx.registry.load::<Cmd>("job", None).await.unwrap();
+        let epoch = 1;
+        let mut rx = ctx.registry.restore::<Cmd>("job", epoch);
         let mut held = Vec::new();
         for rid in 1..=REQS_IN_FLIGHT {
             let request = json!({"t": "pty.capture", "rid": rid, "sid": "job"});
@@ -772,7 +773,7 @@ mod tests {
         let mut waiting = std::pin::pin!(conn.dispatch(matching));
         assert!(timeout(Duration::ZERO, &mut waiting).await.is_err());
         ctx.registry.forget("job", epoch, &[]);
-        let (_, _replacement) = ctx.registry.load::<acp::Cmd>("job", None).await.unwrap();
+        let _replacement = ctx.registry.restore::<acp::Cmd>("job", epoch + 1);
         held.pop().unwrap().done();
         assert_eq!(next_reply(&q).await["t"], "ok");
         timeout(Duration::ZERO, waiting).await.unwrap();

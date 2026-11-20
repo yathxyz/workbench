@@ -302,6 +302,7 @@ The error codes are a closed set:
   - A new value is assigned only when a session is created.
   - Across both kinds the allocator takes the larger of the wall clock in milliseconds and one past its durable high-water mark.
     It commits the mark before exposing an epoch, so a failed creation may leave a gap, but forget, restart and clock rollback cannot reuse an issued value.
+    After the clock steps backwards, the mark runs ahead of wall time; `createdAt` and `updatedAt` can look future-dated until the clock catches up.
 
 #### 3.2.7 Requests (client to hub)
 
@@ -548,7 +549,10 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
 - The loader considers only `<sid>.json` files whose stem matches the sid regex. Quarantined names contain a dot, so they never match.
 - `.json` and `.snap` are written atomically: tmp, fsync, rename, fsync the directory.
 - `last-created` uses the same atomic write and is never deleted by forget.
-  On upgrade, a missing mark is seeded from recovered records before clients can forget them; an unreadable or malformed mark is an error, not a reset.
+  On upgrade, the hub seeds the mark from the maximum epoch of the recoverable records of both kinds before allocating epochs for faulted records or accepting clients.
+  This ordering guarantee cannot cover a session forgotten before the upgrade: its epoch is no longer on disk.
+  An unreadable or malformed mark is an error, not a reset.
+  A stopping hub waits for outstanding mark writes before releasing `hub.lock` to its successor.
 - The journal is appended with one `pwrite(2)` per event at the tracked end of its last complete line, never with `O_APPEND`. If a failed append cannot even be truncated away, what is left is a prefix of a line with no `\n`: the next append overwrites it, and the next open truncates it. `fdatasync` runs on `session`, `setup_error`, `turn_end`, `turn_error`, `exit` and SIGTERM.
 
 **Web `stateDir`** (`…/workbench/web`): `web.lock`, `artifacts/<node>/…`, artifact `db.json`. **There is no `index.db`**: the notes index lives in memory.

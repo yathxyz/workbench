@@ -16,6 +16,7 @@ mod shutdown;
 mod snapshot;
 mod store;
 
+use std::collections::BTreeMap;
 use std::fs::{DirBuilder, OpenOptions, Permissions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
@@ -206,26 +207,44 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
 /// Starts a dead actor for every PTY and ACP record in the state directory. A record
 /// that fails to load is quarantined and its session shows the fault.
 async fn load_sessions(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
+    // Restore healthy sessions as we read them; only quarantine reasons need to
+    // survive the scan. A pending PTY fault still owns its sid ahead of ACP.
+    let mut pty_faults = BTreeMap::new();
     let sids =
         store::sids(&ctx.pty_dir).with_context(|| format!("listing {}", ctx.pty_dir.display()))?;
     for sid in sids {
-        let (created_at, from) =
-            match store::load_or_quarantine(ctx.pty_dir.clone(), sid.clone()).await {
-                Ok(Some(rec)) => (Some(rec.created_at), Start::Loaded(rec)),
-                Ok(None) => continue,
-                Err(fault) => (None, Start::Faulted(fault)),
-            };
-        let (created_at, rx) = ctx.registry.load(&sid, created_at).await?;
-        pty::start(ctx.clone(), sid, created_at, rx, from);
+        let rec = match store::load_or_quarantine(ctx.pty_dir.clone(), sid.clone()).await {
+            Ok(Some(rec)) => rec,
+            Ok(None) => continue,
+            Err(fault) => {
+                pty_faults.insert(sid, fault);
+                continue;
+            }
+        };
+        let created_at = rec.created_at;
+        let rx = ctx.registry.restore(&sid, created_at);
+        pty::start(ctx.clone(), sid, created_at, rx, Start::Loaded(rec));
     }
+    let mut acp_faults = Vec::new();
     let sids =
         store::sids(&ctx.acp_dir).with_context(|| format!("listing {}", ctx.acp_dir.display()))?;
     for sid in sids {
-        if ctx.registry.kind(&sid).is_some() {
+        if ctx.registry.kind(&sid).is_some() || pty_faults.contains_key(&sid) {
             warn!(%sid, "an ACP record has the sid of a PTY session; not loading it");
             continue;
         }
-        acp::load(ctx, sid).await?;
+        if let Err(fault) = acp::restore(ctx, sid).await {
+            acp_faults.push(fault);
+        }
+    }
+
+    ctx.registry.seed_recovered().await?;
+    for (sid, fault) in pty_faults {
+        let (created_at, rx) = ctx.registry.register_faulted(&sid).await?;
+        pty::start(ctx.clone(), sid, created_at, rx, Start::Faulted(fault));
+    }
+    for (sid, fault) in acp_faults {
+        acp::load_faulted(ctx, sid, fault).await?;
     }
     info!(sessions = ctx.registry.published_count(), "loaded");
     Ok(())

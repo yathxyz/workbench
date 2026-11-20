@@ -30,7 +30,7 @@ const KILL_WAIT: Duration = Duration::from_secs(3);
 pub async fn run(ctx: &Ctx) {
     info!("stopping");
     let mut waits = JoinSet::new();
-    for tx in ctx.registry.stop() {
+    for tx in ctx.registry.stop().await {
         let (done, finished) = oneshot::channel();
         let sent = match tx {
             Tx::Pty(tx) => tx.send(pty::Cmd::Shutdown { done }).await.is_ok(),
