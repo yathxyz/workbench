@@ -554,6 +554,7 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
   This ordering guarantee cannot cover a session forgotten before the upgrade: its epoch is no longer on disk.
   On the first start without a mark, recovery continues past unreadable metadata; its epoch cannot seed the mark and may be issued again.
   Before trusting an existing mark, startup fsyncs the state directory even if the recovered maximum equals the mark.
+  This validation happens under `hub.lock`, before creating session directories or removing their temporary files.
   An unreadable or malformed mark is an error, not a reset.
   An orderly stop waits for outstanding mark writes before releasing `hub.lock`. Each writer also retains the same flocked open file description through its write, so unwinding without an orderly stop cannot hand the lock to a successor too early.
 - The journal is appended with one `pwrite(2)` per event at the tracked end of its last complete line, never with `O_APPEND`. If a failed append cannot even be truncated away, what is left is a prefix of a line with no `\n`: the next append overwrites it, and the next open truncates it. `fdatasync` runs on `session`, `setup_error`, `turn_end`, `turn_error`, `exit` and SIGTERM.

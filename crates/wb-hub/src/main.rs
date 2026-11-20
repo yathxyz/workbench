@@ -152,21 +152,23 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
     let ident = Identity::from_env()?;
     let child_umask = rustix::process::umask(Mode::from_raw_mode(0o077));
 
-    let pty_dir = cfg.state_dir.join("pty");
-    let acp_dir = cfg.state_dir.join("acp");
-    for dir in [&pty_dir, &acp_dir] {
+    let create_dir = |dir: &Path| {
         DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
-    }
+            .with_context(|| format!("creating {}", dir.display()))
+    };
+    create_dir(&cfg.state_dir)?;
     let lock_file = lock_instance(&cfg.state_dir)?;
-    for dir in [&pty_dir, &acp_dir] {
-        store::remove_tmp(dir).with_context(|| format!("cleaning {}", dir.display()))?;
-    }
     let registry = Registry::open(&cfg.state_dir, &lock_file)
         .context("loading session epoch high-water mark")?;
+    let pty_dir = cfg.state_dir.join("pty");
+    let acp_dir = cfg.state_dir.join("acp");
+    for dir in [&pty_dir, &acp_dir] {
+        create_dir(dir)?;
+        store::remove_tmp(dir).with_context(|| format!("cleaning {}", dir.display()))?;
+    }
     let ctx = Arc::new(Ctx {
         cfg,
         ident,
