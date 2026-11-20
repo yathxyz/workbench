@@ -663,6 +663,8 @@ Each line is `{"seq":N,"ts":…,"e":KIND,…}`.
 3. for an unclean exit (a non-zero code or a signal) with a non-empty last stderr line, `notice{error, "agent stderr: …"}` (≤ 500 characters);
 4. `exit`.
 
+For the live death notice, the hub includes stderr bytes already in the pipe without waiting for descendants to close it.
+
 At startup, a journal whose last `spawn` has no `exit` gets these lines with `reason:"hub_restart"` and `code:"interrupted"`. `Facts::apply` is the single fold used both live and at startup.
 
 **Write rule, fail-closed.** For each event:

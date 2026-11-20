@@ -3193,7 +3193,7 @@ impl Acp {
             _ => "the hub stopped",
         };
         let mut lines = self.facts.death_lines(reason != ExitReason::Exited, why);
-        let last = p.agent.log.last_line();
+        let last = p.agent.finish_stderr();
         if (code != Some(0) || signal.is_some()) && !last.is_empty() {
             let last: String = last.chars().take(NOTICE_MAX).collect();
             lines.push(EventBody::Notice {
@@ -3487,6 +3487,52 @@ mod tests {
             actor
                 .agent_request(json!(1), "elicitation/create", json!({"message":"Colour?"}))
                 .await;
+        }
+
+        #[tokio::test]
+        async fn unread_stderr_is_journaled_and_sent_before_exit() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut actor, _rx) = dormant(dir.path()).await;
+            configure_test_agent(&mut actor, "printf 'last words\\n' >&2; exit 1");
+            let q = attach(&actor);
+            actor.spawn(SpawnVia::New).unwrap();
+
+            // Do not yield this current-thread runtime between spawn and exit:
+            // the child can write and exit, but the stderr task cannot run.
+            let pid = actor.proc.as_ref().unwrap().agent.pid();
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child::peek_exit(pid).unwrap() {
+                    break status;
+                }
+                assert!(std::time::Instant::now() < until, "agent did not exit");
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            actor.child_exited(Ok(WaitNotice::Exited(
+                status.exit_status(),
+                status.terminating_signal(),
+            )));
+            actor.stdout_closed();
+
+            let disk: Vec<Value> = fs::read_to_string(actor.path("jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let tail = &disk[disk.len() - 2..];
+            assert_eq!(tail[0]["e"], "notice", "{tail:?}");
+            assert_eq!(tail[0]["level"], "error");
+            assert_eq!(tail[0]["text"], "agent stderr: last words");
+            assert_eq!(tail[1]["e"], "exit");
+            assert_eq!(tail[1]["code"], 1);
+            q.finish();
+            let mut live = Vec::new();
+            while let Some(line) = q.pop().await {
+                if let Some(ev) = serde_json::from_slice::<Value>(&line).unwrap().get("ev") {
+                    live.push(ev.clone());
+                }
+            }
+            assert!(live.ends_with(tail), "{live:?}");
         }
 
         #[tokio::test]

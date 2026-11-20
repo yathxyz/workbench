@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, ChildStderr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use rustix::process::{Pid, Signal, kill_process_group};
 use serde_json::{Map, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncWriteExt, BufReader, Interest};
+use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use wb_proto::limits::{MAX_LINE, PROMPT_MAX};
@@ -38,6 +39,7 @@ const LOG_MAX: u64 = 1 << 20;
 const STDOUT_NOTE_MAX: usize = 4 << 10;
 /// How much of an unterminated stderr line is kept for the exit notice.
 const TAIL_MAX: usize = 4 << 10;
+const STDERR_CHUNK: usize = 8 << 10;
 /// Objects read from stdout that wait for the actor; backpressure on the agent.
 const STDOUT_QUEUE: usize = 4;
 
@@ -56,6 +58,7 @@ pub struct Agent {
     pub stdin: Option<Stdin>,
     pub stdout: mpsc::Receiver<Out>,
     pub log: Log,
+    stderr: Arc<AsyncFd<ChildStderr>>,
     tasks: [JoinHandle<()>; 3],
 }
 
@@ -82,6 +85,24 @@ impl Agent {
             group.signal(Signal::TERM);
             self.escalations.arm_group(group, grace);
         }
+    }
+
+    /// Include pending pipe bytes in the death notice, not future writes by descendants.
+    pub fn finish_stderr(&self) -> String {
+        let pipe = self.stderr.get_ref();
+        let mut log = lock(&self.log.0);
+        // The reader takes this same lock before reading: no chunk can be in flight.
+        let mut pending =
+            rustix::io::retry_on_intr(|| rustix::io::ioctl_fionread(pipe)).unwrap_or(0) as usize;
+        let mut buf = [0; STDERR_CHUNK];
+        while pending > 0 {
+            let len = pending.min(buf.len());
+            match log.read_stderr(pipe, &mut buf[..len]) {
+                Ok(n @ 1..) => pending -= n,
+                _ => break,
+            }
+        }
+        log.last_line()
     }
 }
 
@@ -129,8 +150,11 @@ pub fn start(
         ChildStdin::from_std(child.stdin.take().expect("piped stdin")).map_err(setup_error)?;
     let stdout =
         ChildStdout::from_std(child.stdout.take().expect("piped stdout")).map_err(setup_error)?;
-    let stderr =
-        ChildStderr::from_std(child.stderr.take().expect("piped stderr")).map_err(setup_error)?;
+    let stderr = child.stderr.take().expect("piped stderr");
+    rustix::io::ioctl_fionbio(&stderr, true)
+        .map_err(std::io::Error::from)
+        .map_err(setup_error)?;
+    let stderr = Arc::new(AsyncFd::with_interest(stderr, Interest::READABLE).map_err(setup_error)?);
     let log = Log::open(log);
     let queued = Arc::new(AtomicUsize::new(0));
     let (in_tx, in_rx) = mpsc::unbounded_channel();
@@ -138,7 +162,7 @@ pub fn start(
     let tasks = [
         tokio::spawn(write_stdin(stdin, in_rx, queued.clone())),
         tokio::spawn(read_stdout(stdout, out_tx, log.clone())),
-        tokio::spawn(read_stderr(stderr, log.clone())),
+        tokio::spawn(read_stderr(stderr.clone(), log.clone())),
     ];
     Ok(Agent {
         watch,
@@ -147,6 +171,7 @@ pub fn start(
         stdin: Some(Stdin { tx: in_tx, queued }),
         stdout: out_rx,
         log,
+        stderr,
         tasks,
     })
 }
@@ -268,11 +293,14 @@ async fn read_stdout(stdout: ChildStdout, tx: mpsc::Sender<Out>, log: Log) {
     let _ = tx.send(Out::Eof).await;
 }
 
-async fn read_stderr(mut stderr: ChildStderr, log: Log) {
-    let mut buf = vec![0; 8 << 10];
-    while let Ok(n @ 1..) = stderr.read(&mut buf).await {
-        log.stderr(&buf[..n]);
-    }
+async fn read_stderr(stderr: Arc<AsyncFd<ChildStderr>>, log: Log) {
+    let mut buf = vec![0; STDERR_CHUNK];
+    while let Ok(1..) = stderr
+        .async_io(Interest::READABLE, |pipe| {
+            lock(&log.0).read_stderr(pipe, &mut buf)
+        })
+        .await
+    {}
 }
 
 /// `acp/<sid>.stderr.log`: the agent's stderr, the stdout lines that are not JSON-RPC
@@ -315,36 +343,42 @@ impl Log {
         let text = String::from_utf8_lossy(&line[..line.len().min(STDOUT_NOTE_MAX)]);
         self.write(format!("[stdout] {text}\n").as_bytes());
     }
+}
 
-    fn stderr(&self, chunk: &[u8]) {
-        let mut log = lock(&self.0);
-        log.write(chunk);
-        log.tail.extend_from_slice(chunk);
-        while let Some(end) = log.tail.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = log.tail.drain(..=end).collect();
+impl LogFile {
+    fn read_stderr(&mut self, pipe: &ChildStderr, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = rustix::io::retry_on_intr(|| rustix::io::read(pipe, &mut *buf))?;
+        if n > 0 {
+            self.stderr(&buf[..n]);
+        }
+        Ok(n)
+    }
+
+    fn stderr(&mut self, chunk: &[u8]) {
+        self.write(chunk);
+        self.tail.extend_from_slice(chunk);
+        while let Some(end) = self.tail.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.tail.drain(..=end).collect();
             let text = String::from_utf8_lossy(&line);
             if !text.trim().is_empty() {
-                log.last = text.trim().to_owned();
+                self.last = text.trim().to_owned();
             }
         }
-        if log.tail.len() > TAIL_MAX {
-            let cut = log.tail.len() - TAIL_MAX;
-            log.tail.drain(..cut);
+        if self.tail.len() > TAIL_MAX {
+            let cut = self.tail.len() - TAIL_MAX;
+            self.tail.drain(..cut);
         }
     }
 
     /// The last non-empty stderr line, an unterminated one included.
-    pub fn last_line(&self) -> String {
-        let log = lock(&self.0);
-        let tail = String::from_utf8_lossy(&log.tail);
+    fn last_line(&self) -> String {
+        let tail = String::from_utf8_lossy(&self.tail);
         match tail.trim() {
-            "" => log.last.clone(),
+            "" => self.last.clone(),
             tail => tail.to_owned(),
         }
     }
-}
 
-impl LogFile {
     fn write(&mut self, bytes: &[u8]) {
         if self.size > 0 && self.size + bytes.len() as u64 > LOG_MAX {
             let mut old = self.path.clone().into_os_string();
@@ -471,6 +505,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
         let log = Log::open(dir.join("s.stderr.log"));
+        let mut log = lock(&log.0);
         log.stderr(b"first\n\n  \nbo");
         assert_eq!(log.last_line(), "bo");
         log.stderr(b"om\n");
