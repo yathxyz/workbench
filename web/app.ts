@@ -142,9 +142,13 @@ function animateTo(t: Cam, done?: () => unknown, card?: string): void {
   flight.raf = requestAnimationFrame(step);
 }
 // stop whatever moves the camera on its own (a flight, a glide); a cut-short flight still runs its done step
-function camStop(finish = true) {
+function camStop(finish = true, resumeCard?: string) {
   const flight = anim;
-  if (flight) { cancelAnimationFrame(flight.raf); anim = null; if (finish) { lodSettle(); flight.done?.(); } }
+  if (flight) {
+    cancelAnimationFrame(flight.raf); anim = null;
+    if (finish) { lodSettle(); flight.done?.(); }
+    else if (pdfQuoteJump && flight.done === pdfQuoteJump.start && flight.card !== resumeCard) pdfQuoteJump.finish();
+  }
   if (GLIDE.raf) { cancelAnimationFrame(GLIDE.raf); GLIDE.raf = 0; }
   if (WHEEL.raf) { cancelAnimationFrame(WHEEL.raf); WHEEL.raf = 0; }
   return flight;
@@ -167,7 +171,7 @@ function camTarget(x: number, y: number, w: number, h: number, maxZ = 1): Cam {
   return { z, x: x + w / 2 - (left + vw / 2) / z, y: y + h / 2 - (top + vh / 2) / z };
 }
 function fitAll(navigate = true) {
-  if (navigate) leaveFocus();   // explicit board navigation, not an automatic desk fit
+  if (navigate) { pdfQuoteJump?.finish(); leaveFocus(); }   // explicit board navigation, not an automatic desk fit
   const items = Object.values(S.nodes).filter(n => !stashed(n));
   if (!items.length) return;
   const x0 = Math.min(...items.map(n => n.x)), y0 = Math.min(...items.map(n => n.y - (n.kind === 'frame' ? LABEL_H : 0)));
@@ -3270,7 +3274,15 @@ function resizeWith(handle: HTMLElement | null, n: BoardNode, minW: number, minH
 const PDOWN: { on: boolean; then: (() => void) | null } = { on: false, then: null };
 document.addEventListener('pointerdown', () => { PDOWN.on = true; PDOWN.then = null; }, true);
 for (const t of ['pointerup', 'pointercancel']) document.addEventListener(t, () => { PDOWN.on = false; const f = PDOWN.then; PDOWN.then = null; if (f) setTimeout(f, 0); }, true);
+function deactivate() {
+  pdfQuoteJump?.finish();
+  if (!activeId) return;
+  live[activeId]?.el!.classList.remove('active');
+  activeId = null;
+  $$('#tp-list .tp-row.on').forEach(row => row.classList.remove('on'));
+}
 function activate(id: string) {
+  if (pdfQuoteJump && pdfQuoteJump.id !== id) pdfQuoteJump.finish();
   if (activeId && live[activeId]) live[activeId].el!.classList.remove('active');
   hashCancelRestore();
   activeId = id;
@@ -3489,9 +3501,9 @@ function jumpBuffer(n: PageNode, pos: number) {
     roScrollTo(n, pos);
   });
 }
-function jumpRef(r: RefNode) {
+function jumpRef(r: RefNode, onQuoteSettled?: () => void) {
   const n = S.nodes[r.src?.node]; if (!n) return toast('The source node is gone.');
-  if (n.kind === 'pdf') return pdfJumpQuote(r, n);
+  if (n.kind === 'pdf') return pdfJumpQuote(r, n, onQuoteSettled);
   if (r.src.aid) {
     const a = pageAnchors(n as PageNode).find(x => x.id === r.src.aid);
     return a ? jumpBuffer(n as PageNode, a.pos) : jumpNode(n);
@@ -3858,7 +3870,7 @@ viewport.addEventListener('pointerdown', ev => {
   ev.preventDefault();
   if (bg && ev.button === 0 && ev.shiftKey && !space) { marquee(ev); return; }
   if (bg && ev.button === 0 && PICKED.size) pickClear();
-  if (bg && ev.button === 0 && activeId) { live[activeId]?.el!.classList.remove('active'); activeId = null; }
+  if (bg && ev.button === 0) deactivate();
   if (bg && selShape) { selShape = null; renderShapes(); }
   camStop();
   viewport.setPointerCapture(ev.pointerId);
@@ -5463,6 +5475,7 @@ function sortPages(list: PageNode[]): PageNode[] { return list.sort((a, b) => (i
 function setView(v: string) {
   if (!VIEWS.includes(v as ViewName)) return;
   if (v !== VIEW) hashCancelRestore();
+  if (v !== 'canvas') pdfQuoteJump?.finish();
   ringNote();   // the place being left, so the first switch away from it can come back
   const prev = VIEW; VIEW = v as ViewName;
   if (S && S.view !== v) { S.view = v as ViewName; dirty(); }
@@ -8408,7 +8421,8 @@ async function pdfOpen(n: PdfNode, L: LiveEntry): Promise<PdfJsDocument | null> 
 }
 function pdfClose(L: LiveEntry) {
   const P = L.pdf; if (!P) return;
-  for (const p of P.pages) pdfEvict(p);
+  if (pdfQuoteJump?.owner === P) pdfQuoteJump.finish();
+  for (const p of P.pages) { pdfEvict(p); pdfDropText(p); }
   P.task?.destroy().catch(() => {}); P.task = null; P.doc = null; P.pages = []; clearTimeout(P.posT);
 }
 // the page boxes at the card's width; true when it changed (the text layers and links are made again at the new scale)
@@ -8417,14 +8431,21 @@ function pdfLayout(n: PdfNode): boolean {
   const w = Math.max(80, Math.floor(P.scroll.clientWidth - 2 * PDF_PAD));
   if (!P.scroll.clientWidth || w === P.w) return false;
   const at = P.w ? pdfWhere(n) : null;
+  const jump = pdfQuoteJump?.owner === P ? pdfQuoteJump : null, target = jump?.page;
+  const top = P.scroll.scrollTop;
+  // The viewport can clamp the old scroll before the page boxes have been resized.
+  const follow = target && at && (at.page === target.i + 1 || top === jump!.clampedTop ||
+    (at.page < target.i + 1 && top + 1 >= P.scroll.scrollHeight - P.scroll.clientHeight));
   P.w = w;
   for (const p of P.pages) {
     const k = w / p.pw;
     Object.assign(p.el.style, { width: w + 'px', height: Math.round(p.ph * k) + 'px' });
     p.el.style.setProperty('--total-scale-factor', String(k));
-    p.text?.remove(); p.text = null; p.links?.remove(); p.links = null;
+    pdfDropText(p); p.links?.remove(); p.links = null;
   }
   if (at) pdfGo(n, at.page - 1, at.y, true);
+  if (target) jump!.clampedTop = follow && pdfWhere(n).page < target.i + 1 ? P.scroll.scrollTop : undefined;
+  pdfQuoteDraw(P);
   return true;
 }
 // where the reading is: the page at the top of the card (from 1) and how far down it, as a fraction
@@ -8521,7 +8542,20 @@ async function pdfDraw(n: PdfNode, P: PdfLive, p: PdfPageLive) {
 }
 function pdfTextLayer(P: PdfLive, p: PdfPageLive, page: PdfJsPage) {
   const div = el('div', 'textLayer'); p.text = div; p.el.append(div);
-  p.textReady = pdfLib().then(lib => new lib.TextLayer({ textContentSource: page.streamTextContent(), container: div, viewport: page.getViewport({ scale: P.w / p.pw }) }).render()).catch(() => {});
+  p.textReady = pdfLib().then(lib => {
+    if (p.text !== div) return;
+    const task = p.textTask = new lib.TextLayer({ textContentSource: page.streamTextContent(), container: div, viewport: page.getViewport({ scale: P.w / p.pw }) });
+    return task.render();
+  }).catch(() => {}).then(() => {
+    if (p.text !== div) return;
+    p.textTask = null;
+    pdfQuoteReady(P, p);
+  });
+}
+function pdfDropText(p: PdfPageLive) {
+  if (!p.text) return;
+  p.text.remove(); p.text = null; p.textReady = undefined;
+  p.textTask?.cancel(); p.textTask = undefined;
 }
 async function pdfLinks(n: PdfNode, P: PdfLive, p: PdfPageLive, page: PdfJsPage) {
   const doc = P.doc, box = p.links = el('div', 'pdf-links'), vp = page.getViewport({ scale: P.w / p.pw });
@@ -8589,45 +8623,98 @@ async function pdfQuote(n: PdfNode) {
   toast(`${r.name}: a quote from p. ${s.p.i + 1}. Its ↗ finds the text in the PDF again.`);
   return r;
 }
-// Finds TEXT (with its prefix and suffix, when given) on page I first, then on every page; scrolls there and lights the
-// text up. False when the text is nowhere in the file.
-async function pdfFind(n: PdfNode, text: string, i: number, prefix = '', suffix = ''): Promise<boolean> {
-  const P = live[n.id]?.pdf; if (!P) return false;
+// Find the quote's page, trying its original page first.
+async function pdfLocate(n: PdfNode, P: PdfLive, want: string, i: number, prefix: string, suffix: string, current?: () => boolean): Promise<PdfPageLive | undefined> {
   if (!P.doc) await P.load;
-  if (live[n.id]?.pdf !== P || !P.doc) return false;
-  const want = flat(text), order = [i, ...P.pages.map(p => p.i).filter(j => j !== i)];
+  if (live[n.id]?.pdf !== P || !P.doc || current?.() === false) return;
+  const context = flat(prefix) + want + flat(suffix), order = [i, ...P.pages.map(p => p.i).filter(j => j !== i)];
   for (const j of order) {
     if (j < 0 || j >= P.pages.length) continue;
-    const t = flat(await pdfPageText(n, j)); if (live[n.id]?.pdf !== P) return false;
-    let k = t.indexOf(flat(prefix) + want + flat(suffix));
-    k = k >= 0 ? k + flat(prefix).length : t.indexOf(want);
-    if (k < 0) continue;
-    pdfGo(n, j, 0, true);
-    const p = P.pages[j]; await pdfDraw(n, P, p); if (live[n.id]?.pdf !== P) return false;
-    await p.textReady; if (live[n.id]?.pdf !== P) return false;
-    const spans = [...(p.text?.querySelectorAll<HTMLElement>('span:not(.markedContent)') || [])];
-    // the text layer's spans as one flat string, each character remembering its span
-    let s = '', own: number[] = [];
-    spans.forEach((sp, si) => { for (const ch of sp.textContent!.replace(/\s+/g, ' ')) { if (ch === ' ' && (!s || s.endsWith(' '))) continue; s += ch; own.push(si); } if (s && !s.endsWith(' ')) { s += ' '; own.push(-1); } });
-    let h = s.indexOf(want); if (h < 0) h = s.indexOf(want.slice(0, 40));
-    const hit = new Set<number>(); if (h >= 0) for (let c = h; c < h + want.length && c < own.length; c++) if (own[c] >= 0) hit.add(own[c]);
-    const firstHit = [...hit][0];
-    if (firstHit != null) P.scroll.scrollTop = p.el.offsetTop - PDF_PAD + Math.max(0, spans[firstHit].offsetTop - 60);
-    hit.forEach(si => spans[si].classList.add('pdf-hit')); setTimeout(() => hit.forEach(si => spans[si].classList.remove('pdf-hit')), 2200);
-    return true;
+    const t = flat(await pdfPageText(n, j)); if (live[n.id]?.pdf !== P || current?.() === false) return;
+    if (t.includes(context) || t.includes(want)) return P.pages[j];
   }
-  return false;
 }
-function pdfJumpQuote(r: RefNode, n: PdfNode) {
-  const P = live[n.id]?.pdf; if (!P) return;
-  jumpNode(n, 1, async () => {
-    if (live[n.id]?.pdf !== P) return;
-    const i = (r.src.page || 1) - 1;
-    const found = await pdfFind(n, r.text, i, r.src.prefix, r.src.suffix).catch(e => pdfError(n, P, e));
-    if (live[n.id]?.pdf !== P || found == null) return;
-    if (!found) { pdfGo(n, i); toast('The quote is no longer in the PDF; here is the page it came from.'); }
+function pdfLight(P: PdfLive, p: PdfPageLive, want: string): boolean {
+  const spans = [...(p.text?.querySelectorAll<HTMLElement>('span:not(.markedContent)') || [])];
+  // the text layer's spans as one flat string, each character remembering its span
+  let s = '', own: number[] = [];
+  spans.forEach((sp, si) => { for (const ch of sp.textContent!.replace(/\s+/g, ' ')) { if (ch === ' ' && (!s || s.endsWith(' '))) continue; s += ch; own.push(si); } if (s && !s.endsWith(' ')) { s += ' '; own.push(-1); } });
+  let h = s.indexOf(want); if (h < 0) h = s.indexOf(want.slice(0, 40));
+  const hit = new Set<number>(); if (h >= 0) for (let c = h; c < h + want.length && c < own.length; c++) if (own[c] >= 0) hit.add(own[c]);
+  const firstHit = hit.values().next().value;
+  if (firstHit == null) return false;
+  P.scroll.scrollTop = p.el.offsetTop - PDF_PAD + Math.max(0, spans[firstHit].offsetTop - 60);
+  hit.forEach(si => spans[si].classList.add('pdf-hit')); setTimeout(() => hit.forEach(si => spans[si].classList.remove('pdf-hit')), 2200);
+  return true;
+}
+// Manual find scrolls to the page once, then scrolls again only if it has a highlight to show.
+async function pdfFind(n: PdfNode, text: string, i: number, prefix = '', suffix = ''): Promise<boolean> {
+  const P = live[n.id]?.pdf; if (!P) return false;
+  const want = flat(text), p = await pdfLocate(n, P, want, i, prefix, suffix);
+  if (!p || live[n.id]?.pdf !== P) return false;
+  pdfGo(n, p.i, 0, true);
+  await pdfDraw(n, P, p); if (live[n.id]?.pdf !== P) return false;
+  for (let ready = p.textReady; ready; ready = p.textReady) {
+    await ready;
+    if (live[n.id]?.pdf !== P || !P.doc) return false;
+    if (ready === p.textReady) break;
+    if (!p.text) await pdfDraw(n, P, p);
+  }
+  if (live[n.id]?.pdf !== P || !P.doc) return false;
+  pdfLight(P, p, want);
+  return true;
+}
+interface PdfQuoteJump { id: string; owner: PdfLive; want: string; page?: PdfPageLive; clampedTop?: number; start(): Promise<void>; finish(): void }
+let pdfQuoteJump: PdfQuoteJump | null = null;
+// Layout redraws the target even if clamping put it off screen. Only its current render can land the jump.
+function pdfQuoteDraw(P: PdfLive) {
+  const jump = pdfQuoteJump;
+  if (jump?.owner !== P || !jump.page) return;
+  const p = jump.page;
+  if (p.textTask === null) pdfQuoteReady(P, p);
+  else if (!p.text && p.page) pdfTextLayer(P, p, p.page);
+}
+function pdfQuoteReady(P: PdfLive, p: PdfPageLive) {
+  const jump = pdfQuoteJump;
+  if (jump?.owner !== P || jump.page !== p) return;
+  try {
+    if (!pdfLight(P, p, jump.want) && P.scroll.scrollTop === jump.clampedTop) P.scroll.scrollTop = p.el.offsetTop - PDF_PAD;
     P.scroll.focus({ preventScroll: true });
-  });
+  } finally { jump.finish(); }
+}
+function pdfJumpQuote(r: RefNode, n: PdfNode, onSettled?: () => void) {
+  const P = live[n.id]?.pdf; if (!P) return;
+  pdfQuoteJump?.finish();
+  const jump: PdfQuoteJump = pdfQuoteJump = {
+    id: n.id, owner: P, want: flat(r.text), start,
+    finish() {
+      if (pdfQuoteJump !== jump) return;
+      pdfQuoteJump = null;
+      onSettled?.();
+    },
+  };
+  const current = () => pdfQuoteJump === jump;
+  jumpNode(n, 1, start);
+  async function start() {
+    if (!current()) return;
+    const P = jump.owner;
+    const i = (r.src.page || 1) - 1;
+    try {
+      const p = await pdfLocate(n, P, jump.want, i, r.src.prefix || '', r.src.suffix || '', current);
+      if (!current()) return;
+      if (p) {
+        jump.page = p;
+        pdfGo(n, p.i, 0, true);
+        pdfQuoteDraw(P);
+        return;
+      }
+      pdfGo(n, i); toast('The quote is no longer in the PDF; here is the page it came from.');
+      P.scroll.focus({ preventScroll: true });
+    } catch (e) {
+      if (current()) pdfError(n, P, e);
+    }
+    jump.finish();
+  }
 }
 const PDF_FIND: { q: string; id: string; page: number } = { q: '', id: '', page: -1 };
 function pdfFindAsk(n: PdfNode) {
@@ -9151,12 +9238,14 @@ function focusGeometry(n: BoardNode) {
   n.w = w; n.h = h; placeAny(n);
   Object.assign(cam(), { z: 1, x: n.x - 1, y: n.y - FT_TOP - FT_H - 1 }); applyCam();
   live[n.id]?.fitNow?.();
+  // The resumed quote jump can find cached text before the resize observer runs.
+  if (n.kind === 'pdf' && pdfLayout(n)) pdfSoon(0);
 }
 function focusShow(id: string) {
   const n = S.nodes[id]; if (!n || n.kind === 'frame') return;
   if (VIEW !== 'canvas') setView('canvas');
   deskReveal(n);
-  const flight = camStop(false);
+  const flight = camStop(false, id);
   if (!FOCUS.cur) FOCUS.saved = { ...(flight?.target ?? cam()) };
   else if (FOCUS.cur !== id) focusRestoreNode();
   if (FOCUS.cur !== id) { reveal(n); focusRememberRect(n); }
@@ -11218,7 +11307,16 @@ function goAddr(addr: string, push = true): boolean {
   hashCancelRestore();
   const r = resolveAddr(addr); if (r.error) { toast(r.error); return false; }
   if (r.n && !isFs(r.key)) { r.n.kind === 'frame' ? (VIEW === 'ranger' ? rgGo(r.key) : jumpFolder(r.n)) : (VIEW === 'ranger' ? rgGo(rgParent(r.key) || 'root', r.key) : jumpNode(r.n)); }
-  else if (r.key === 'root') { if (VIEW === 'ranger') rgGo('root'); else fitAll(); }
+  else if (r.key === 'root') {
+    if (VIEW === 'ranger') rgGo('root');
+    else {
+      fitAll();
+      const focused = document.activeElement;
+      if (activeId && focused instanceof HTMLElement && live[activeId]?.el?.contains(focused)) focused.blur();
+      deactivate();
+      if (WS.cur) { WS.last = WS.cur; WS.cur = null; wsApply(); }
+    }
+  }
   else { if (VIEW !== 'ranger') setView('ranger'); const e = r.entries; if (!r.entries.length && !isFs(r.key) && !/^(tag|note|journal|link):$/.test(r.key)) { const par = rgParent(r.key); rgGo(par || 'root', r.key); } else rgGo(r.key); void e; }
   if (push) hashSync(r.addr, true);
   return true;
