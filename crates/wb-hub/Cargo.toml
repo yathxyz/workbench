@@ -21,6 +21,6 @@ tracing-subscriber = { workspace = true, features = ["fmt"] }
 vt100.workspace = true
 
 [dev-dependencies]
-agent-client-protocol-schema.workspace = true
 tempfile.workspace = true
+agent-client-protocol-schema.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

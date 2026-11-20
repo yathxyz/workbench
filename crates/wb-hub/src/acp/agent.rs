@@ -176,6 +176,17 @@ impl Stdin {
         self.queued.fetch_add(len, Ordering::Relaxed);
         self.tx.send(line).is_ok()
     }
+
+    /// Replace the pipe writer with a receptive queue for observing drain-time sends.
+    #[cfg(test)]
+    pub(super) fn capture(&mut self) -> mpsc::UnboundedReceiver<Vec<u8>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self = Self {
+            tx,
+            queued: Arc::default(),
+        };
+        rx
+    }
 }
 
 async fn write_stdin(

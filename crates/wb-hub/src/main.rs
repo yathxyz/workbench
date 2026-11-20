@@ -229,8 +229,8 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
 /// Starts a dead actor for every PTY and ACP record in the state directory. A record
 /// that fails to load is quarantined and its session shows the fault.
 async fn load_sessions(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
-    // Restore healthy sessions as we read them; only quarantine reasons need to
-    // survive the scan. A pending PTY fault still owns its sid ahead of ACP.
+    // Restore healthy sessions as we read them; defer fault registration until
+    // the seed is durable. A pending PTY fault still owns its sid ahead of ACP.
     let mut pty_faults = BTreeMap::new();
     let mut high = 0;
     let sids =
@@ -267,8 +267,8 @@ async fn load_sessions(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
         let (created_at, rx) = ctx.registry.register_faulted(&sid).await?;
         pty::start(ctx.clone(), sid, created_at, rx, Start::Faulted(fault));
     }
-    for (sid, fault) in acp_faults {
-        acp::load_faulted(ctx, sid, fault).await?;
+    for fault in acp_faults {
+        acp::load_faulted(ctx, fault).await?;
     }
     info!(sessions = ctx.registry.published_count(), "loaded");
     Ok(())

@@ -1,19 +1,18 @@
 //! The per-session ACP journal `acp/<sid>.jsonl`: one `JournalEvent` per line,
-//! appended fail-closed (DESIGN §3.4.4, H-9). Memory never runs ahead of disk, so a
-//! seq is never issued twice.
+//! appended fail-closed (DESIGN §3.4.4, H-9). A question's seq is durable before
+//! it can reach a client as an answerable request id.
 //!
 //! Each line is written with one `pwrite(2)` at the tracked end of the last complete
-//! line, never with `O_APPEND`. Bytes a failed write leaves behind (when even the
-//! truncation fails) are a prefix of a line, so they hold no `\n`: the next append
-//! overwrites them, and whatever is left past the last line is a torn tail that the
-//! next `open` truncates.
+//! line, never with `O_APPEND`. A failed append must roll back to this boundary.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
+use rustix::io::Errno;
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
 use wb_proto::hub::ExitReason;
@@ -39,33 +38,114 @@ fn checkpoint(offsets: &mut Vec<u64>, seq: u64, end: u64) {
     }
 }
 
+#[cfg(test)]
+type Pause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+enum SyncOp {
+    Prefix,
+    Question(#[cfg(test)] Option<Pause>),
+    Shrink,
+}
+
+/// Shared by the session supervisor and every file handle for this incarnation.
+/// Reloading an actor must not discard an error observed by a background sync.
+#[derive(Default)]
+pub(super) struct SyncGate {
+    serial: Mutex<()>,
+    failed: OnceLock<Errno>,
+}
+
+struct SyncFile {
+    file: File,
+    gate: Arc<SyncGate>,
+}
+
+impl SyncFile {
+    fn healthy(&self) -> io::Result<()> {
+        self.gate.failed.get().map_or(Ok(()), |e| Err((*e).into()))
+    }
+
+    fn latch_write_eio(&self, error: &io::Error) {
+        if error.raw_os_error() == Some(Errno::IO.raw_os_error()) {
+            let _ = self.gate.failed.set(Errno::IO);
+        }
+    }
+
+    fn sync(&self, op: SyncOp, #[cfg(test)] inject_eio: bool) -> io::Result<()> {
+        let _guard = crate::lock(&self.gate.serial);
+        if !matches!(op, SyncOp::Shrink) {
+            self.healthy()?;
+        }
+        let fdatasync = || rustix::io::retry_on_intr(|| rustix::fs::fdatasync(&self.file));
+        #[cfg(test)]
+        let fdatasync = || {
+            if inject_eio {
+                return Err(Errno::IO);
+            }
+            fdatasync()?;
+            if let SyncOp::Question(Some((entered, release))) = op {
+                entered.send(()).unwrap();
+                release.blocking_recv().unwrap();
+            }
+            Ok(())
+        };
+        fdatasync()
+            .inspect_err(|errno| {
+                let _ = self.gate.failed.set(*errno);
+            })
+            .map_err(Into::into)
+    }
+}
+
 /// The append handle of one session's journal.
 pub struct Journal {
-    file: File,
+    disk: Arc<SyncFile>,
     /// Byte length of the journal up to its last complete line.
     end: u64,
     /// Seq of the last line written; 0 for an empty journal.
     head: u64,
     offsets: Vec<u64>,
+    /// Neither a failed truncate nor a failed sync of the shrink completes rollback.
+    truncate_before_write: bool,
     /// The append of this seq fails once after writing half its line (fault injection).
     #[cfg(any(test, debug_assertions))]
-    fail_at: Option<u64>,
+    pub(super) fail_at: Option<u64>,
+    #[cfg(test)]
+    pub(super) fail_sync: bool,
+    #[cfg(test)]
+    pub(super) fail_background_sync: bool,
+    #[cfg(test)]
+    pub(super) pause_question: Option<Pause>,
+    #[cfg(test)]
+    pub(super) fail_truncate: bool,
+    #[cfg(test)]
+    fail_shrink_sync: bool,
 }
 
-/// An append that did not complete. The journal was truncated back to its last
-/// complete line, so nothing of the event is on disk and its seq was not used.
+/// An append that did not commit. Its seq was not published.
 #[derive(Debug)]
 pub struct WriteFault {
     pub error: io::Error,
 }
 
 impl Journal {
+    pub(super) fn healthy(&self) -> io::Result<()> {
+        self.disk.healthy()
+    }
+
     /// Opens the journal at `path`, creating it with mode 0600 if missing, visiting
     /// validated events in file order. Bytes after the last `\n` are a torn tail: they are
     /// truncated away and logged. Any complete line that is not a journal event, or
     /// whose seq is not the previous one plus 1 (starting at 1), is an error, so the
     /// caller quarantines the session (DESIGN §3.4.4).
-    pub fn open(path: &Path, mut visit: impl FnMut(JournalEvent)) -> Result<Journal> {
+    pub(super) fn open(
+        path: &Path,
+        gate: Arc<SyncGate>,
+        mut visit: impl FnMut(JournalEvent),
+    ) -> Result<Journal> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -74,6 +154,11 @@ impl Journal {
             .mode(0o600)
             .open(path)
             .with_context(|| format!("cannot open {}", path.display()))?;
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let len = file.metadata()?.len();
         let mut reader = BufReader::new(&file);
         let mut head = 0;
         let mut end = 0u64;
@@ -89,8 +174,6 @@ impl Journal {
             }
             if line.last() != Some(&b'\n') {
                 warn!(path = %path.display(), bytes = n, "truncating a torn journal tail");
-                file.set_len(end)
-                    .with_context(|| format!("cannot truncate {}", path.display()))?;
                 break;
             }
             let ev: JournalEvent = serde_json::from_slice(&line[..n - 1]).with_context(|| {
@@ -112,36 +195,109 @@ impl Journal {
             checkpoint(&mut offsets, head, end);
             visit(ev);
         }
+        let disk = Arc::new(SyncFile { file, gate });
+        if end != len {
+            disk.file
+                .set_len(end)
+                .inspect_err(|e| disk.latch_write_eio(e))
+                .context("truncating torn journal tail")?;
+        }
+        disk.sync(
+            SyncOp::Prefix,
+            #[cfg(test)]
+            false,
+        )
+        .context("syncing recovered journal")?;
+        File::open(dir)?
+            .sync_all()
+            .context("syncing journal directory")?;
         Ok(Journal {
-            file,
+            disk,
             end,
             head,
             offsets,
+            truncate_before_write: false,
             #[cfg(any(test, debug_assertions))]
             fail_at: fail_at_from_env(),
+            #[cfg(test)]
+            fail_sync: false,
+            #[cfg(test)]
+            fail_background_sync: false,
+            #[cfg(test)]
+            pause_question: None,
+            #[cfg(test)]
+            fail_truncate: false,
+            #[cfg(test)]
+            fail_shrink_sync: false,
         })
     }
 
-    /// Writes `body` as the next event with one `write(2)`. Only a complete write
-    /// advances the head; on any failure the file is truncated back and the fault
-    /// returned.
+    /// One pwrite per event. A human-answerable question also requires a successful
+    /// fdatasync before its seq can advance the head or reach a viewer.
     pub fn append(&mut self, body: EventBody, ts: u64) -> Result<JournalEvent, WriteFault> {
         let ev = JournalEvent {
             seq: self.head + 1,
             ts,
             body,
         };
+        if self.truncate_before_write {
+            self.shrink().map_err(|error| WriteFault { error })?;
+        }
+        // Never make ordinary updates wait for a background fdatasync.
+        self.disk.healthy().map_err(|error| WriteFault { error })?;
         let bytes = line::encode(&ev);
         if let Err(error) = self.write(&bytes) {
-            if let Err(e) = self.file.set_len(self.end) {
-                error!(error = %e, end = self.end, "cannot truncate the journal after a failed append");
-            }
-            return Err(WriteFault { error });
+            self.disk.latch_write_eio(&error);
+            return Err(self.rollback(error));
+        }
+        if is_question(&ev.body)
+            && let Err(error) = self.sync_question()
+        {
+            return Err(self.rollback(error));
         }
         self.end += bytes.len() as u64;
         self.head = ev.seq;
         checkpoint(&mut self.offsets, self.head, self.end);
         Ok(ev)
+    }
+
+    fn rollback(&mut self, error: io::Error) -> WriteFault {
+        self.truncate_before_write = true;
+        if let Err(e) = self.shrink() {
+            error!(error = %e, end = self.end, "cannot durably roll back failed journal append");
+        }
+        WriteFault { error }
+    }
+
+    fn shrink(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_truncate {
+            return Err(io::Error::other("injected truncate failure"));
+        }
+        self.disk
+            .file
+            .set_len(self.end)
+            .inspect_err(|e| self.disk.latch_write_eio(e))?;
+        // Even on a poisoned fd we must commit removal of a never-offered
+        // question. This sync cannot certify the preceding data.
+        self.disk.sync(
+            SyncOp::Shrink,
+            #[cfg(test)]
+            self.fail_shrink_sync,
+        )?;
+        self.truncate_before_write = false;
+        Ok(())
+    }
+
+    fn sync_question(&mut self) -> io::Result<()> {
+        self.disk.sync(
+            SyncOp::Question(
+                #[cfg(test)]
+                self.pause_question.take(),
+            ),
+            #[cfg(test)]
+            self.fail_sync,
+        )
     }
 
     /// Startup normalisation (DESIGN §3.4.4, 10 §3 step 5). When `facts`, the fold of
@@ -179,11 +335,32 @@ impl Journal {
         Ok(written)
     }
 
-    /// `fdatasync`s the journal on a cloned fd in `spawn_blocking`, so the caller
-    /// never blocks on the disk.
+    /// Off-thread sync, sharing the question barrier's writeback-error state.
     pub fn sync(&self) -> JoinHandle<io::Result<()>> {
-        let file = self.file.try_clone();
-        tokio::task::spawn_blocking(move || file?.sync_data())
+        let disk = self.disk.clone();
+        #[cfg(test)]
+        let fail = self.fail_background_sync;
+        tokio::task::spawn_blocking(move || {
+            disk.sync(
+                SyncOp::Prefix,
+                #[cfg(test)]
+                fail,
+            )
+        })
+    }
+
+    /// Complete a pending rollback and sync the journal on orderly shutdown.
+    pub fn close(mut self) -> JoinHandle<io::Result<()>> {
+        tokio::task::spawn_blocking(move || {
+            if self.truncate_before_write {
+                self.shrink()?;
+            }
+            self.disk.sync(
+                SyncOp::Prefix,
+                #[cfg(test)]
+                self.fail_background_sync,
+            )
+        })
     }
 
     /// The head seq: the seq of the last event written, 0 for an empty journal.
@@ -207,10 +384,12 @@ impl Journal {
         #[cfg(any(test, debug_assertions))]
         if self.fail_at == Some(self.head + 1) {
             self.fail_at = None;
-            self.file.write_at(&bytes[..bytes.len() / 2], self.end)?;
+            self.disk
+                .file
+                .write_at(&bytes[..bytes.len() / 2], self.end)?;
             return Err(io::Error::other("injected journal write fault"));
         }
-        let n = self.file.write_at(bytes, self.end)?;
+        let n = self.disk.file.write_at(bytes, self.end)?;
         if n == bytes.len() {
             Ok(())
         } else {
@@ -220,6 +399,13 @@ impl Journal {
             ))
         }
     }
+}
+
+fn is_question(body: &EventBody) -> bool {
+    matches!(
+        body,
+        EventBody::Permission { .. } | EventBody::Elicitation { .. }
+    )
 }
 
 /// `WB_HUB_TEST_FAIL_WRITE_AT=N`, in debug builds only (DESIGN §4; also compiled into
@@ -298,7 +484,7 @@ mod tests {
 
     fn open_events(path: &Path) -> Result<(Journal, Vec<JournalEvent>)> {
         let mut events = Vec::new();
-        let journal = Journal::open(path, |ev| events.push(ev))?;
+        let journal = Journal::open(path, Arc::default(), |ev| events.push(ev))?;
         Ok((journal, events))
     }
 
@@ -363,7 +549,7 @@ mod tests {
     fn a_torn_final_line_is_truncated_and_logged() {
         let _torn = crate::lock(&TORN_WARN);
         let path = fresh_dir("torn").join("s.jsonl");
-        let mut j = Journal::open(&path, drop).unwrap();
+        let mut j = Journal::open(&path, Arc::default(), drop).unwrap();
         write_all(&mut j, &[spawn(), session()]);
         drop(j);
         let good = fs::read(&path).unwrap();
@@ -411,7 +597,10 @@ mod tests {
         for (name, content) in cases {
             let path = dir.join(format!("{name}.jsonl"));
             fs::write(&path, &content).unwrap();
-            assert!(Journal::open(&path, drop).is_err(), "{name} loaded");
+            assert!(
+                Journal::open(&path, Arc::default(), drop).is_err(),
+                "{name} loaded"
+            );
             assert_eq!(
                 fs::read_to_string(&path).unwrap(),
                 content,
@@ -423,7 +612,7 @@ mod tests {
     #[test]
     fn a_write_fault_truncates_and_reuses_no_seq() {
         let path = fresh_dir("fault").join("s.jsonl");
-        let mut j = Journal::open(&path, drop).unwrap();
+        let mut j = Journal::open(&path, Arc::default(), drop).unwrap();
         let mut live = write_all(&mut j, &[spawn(), session()]);
         let before = fs::read(&path).unwrap();
 
@@ -458,7 +647,7 @@ mod tests {
     #[test]
     fn replay_crosses_checkpoints_after_a_write_fault_and_reload() {
         let path = fresh_dir("seek").join("s.jsonl");
-        let mut j = Journal::open(&path, drop).unwrap();
+        let mut j = Journal::open(&path, Arc::default(), drop).unwrap();
         for seq in 1..=2 * CHECKPOINT_STRIDE + 2 {
             if seq == CHECKPOINT_STRIDE {
                 j.fail_at = Some(seq);
@@ -482,7 +671,7 @@ mod tests {
         };
         check(&j);
         drop(j);
-        check(&Journal::open(&path, drop).unwrap());
+        check(&Journal::open(&path, Arc::default(), drop).unwrap());
     }
 
     #[test]
@@ -492,7 +681,7 @@ mod tests {
         let path = fresh_dir("seek-shift").join("s.jsonl");
         let since = CHECKPOINT_STRIDE;
         let head = since + 2;
-        let mut journal = Journal::open(&path, drop).unwrap();
+        let mut journal = Journal::open(&path, Arc::default(), drop).unwrap();
         for seq in 1..=head {
             journal.append(prompt(), seq).unwrap();
         }
@@ -510,7 +699,7 @@ mod tests {
             let mut padded = vec![b' '; shift];
             padded.extend_from_slice(&compact);
             fs::write(&path, padded).unwrap();
-            let journal = Journal::open(&path, drop).unwrap();
+            let journal = Journal::open(&path, Arc::default(), drop).unwrap();
             let offset = journal.replay_offset(since);
             assert_eq!(offset as usize, boundary + shift);
             fs::write(&path, &compact).unwrap();
@@ -524,7 +713,7 @@ mod tests {
     #[test]
     fn missing_replay_checkpoint_scans_from_zero() {
         let path = fresh_dir("seek-missing").join("s.jsonl");
-        let mut journal = Journal::open(&path, drop).unwrap();
+        let mut journal = Journal::open(&path, Arc::default(), drop).unwrap();
         let since = CHECKPOINT_STRIDE;
         for seq in 1..=since + 1 {
             journal.append(prompt(), seq).unwrap();
@@ -541,7 +730,7 @@ mod tests {
     /// A checkpoint followed by one requested, complete record.
     fn journal_with_indexed_tail(name: &str) -> (PathBuf, u64) {
         let path = fresh_dir(name).join("s.jsonl");
-        let mut journal = Journal::open(&path, drop).unwrap();
+        let mut journal = Journal::open(&path, Arc::default(), drop).unwrap();
         for seq in 1..=CHECKPOINT_STRIDE + 1 {
             journal.append(prompt(), seq).unwrap();
         }
@@ -578,7 +767,7 @@ mod tests {
     fn bytes_left_by_a_failed_truncation_heal() {
         let _torn = crate::lock(&TORN_WARN);
         let path = fresh_dir("heal").join("s.jsonl");
-        let mut j = Journal::open(&path, drop).unwrap();
+        let mut j = Journal::open(&path, Arc::default(), drop).unwrap();
         write_all(&mut j, &[spawn()]);
         let end = fs::metadata(&path).unwrap().len();
         let junk = br#"{"seq":2,"ts":2,"e":"update","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"#;
@@ -640,7 +829,7 @@ mod tests {
     #[test]
     fn normalisation_appends_exactly_the_death_invariant() {
         let path = fresh_dir("norm").join("s.jsonl");
-        let mut j = Journal::open(&path, drop).unwrap();
+        let mut j = Journal::open(&path, Arc::default(), drop).unwrap();
         write_all(&mut j, &mid_turn());
         drop(j);
         let before = fs::read(&path).unwrap();
@@ -680,7 +869,7 @@ mod tests {
     #[test]
     fn normalisation_ends_a_setup() {
         let path = fresh_dir("norm-setup").join("s.jsonl");
-        let mut j = Journal::open(&path, drop).unwrap();
+        let mut j = Journal::open(&path, Arc::default(), drop).unwrap();
         write_all(&mut j, &[spawn()]);
         drop(j);
         let (_, facts, res) = load(&path);
@@ -715,7 +904,7 @@ mod tests {
             ("auth", vec![spawn(), auth_wait]),
         ] {
             let path = fresh_dir(&format!("norm-{name}")).join("s.jsonl");
-            let mut j = Journal::open(&path, drop).unwrap();
+            let mut j = Journal::open(&path, Arc::default(), drop).unwrap();
             write_all(&mut j, &bodies);
             drop(j);
             let (_, _, res) = load(&path);
@@ -749,7 +938,7 @@ mod tests {
             ("ended", vec![spawn(), session(), exited]),
         ] {
             let path = fresh_dir(&format!("alone-{name}")).join("s.jsonl");
-            let mut j = Journal::open(&path, drop).unwrap();
+            let mut j = Journal::open(&path, Arc::default(), drop).unwrap();
             write_all(&mut j, &bodies);
             drop(j);
             let before = fs::read(&path).unwrap();
@@ -762,7 +951,7 @@ mod tests {
     #[test]
     fn a_fault_during_normalisation_folds_what_was_written_and_a_retry_completes() {
         let path = fresh_dir("norm-fault").join("s.jsonl");
-        let mut j = Journal::open(&path, drop).unwrap();
+        let mut j = Journal::open(&path, Arc::default(), drop).unwrap();
         write_all(&mut j, &mid_turn());
         drop(j);
         let before = fs::read(&path).unwrap();
@@ -774,7 +963,12 @@ mod tests {
         assert_eq!(facts.head_seq, 6);
         assert_eq!(facts.pending.iter().map(|p| p.req).collect::<Vec<_>>(), [5]);
         assert!(facts.running);
-        let (_, on_disk) = open_events(&path).unwrap();
+        // Inspect the active writer without opening a second append handle.
+        let on_disk = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(fold(&on_disk), facts, "the facts are the fold of the disk");
 
         let retried = j.normalise(&mut facts, 99).unwrap();
@@ -787,10 +981,39 @@ mod tests {
         assert!(!facts.running);
     }
 
+    #[test]
+    fn failed_question_shrink_stays_pending_until_synced() {
+        for fail_truncate in [false, true] {
+            let path = fresh_dir(&format!("rollback-{fail_truncate}")).join("s.jsonl");
+            let mut j = Journal::open(&path, Arc::default(), drop).unwrap();
+            j.append(spawn(), 1).unwrap();
+            let prefix = fs::read(&path).unwrap();
+            j.fail_sync = true;
+            j.fail_truncate = fail_truncate;
+            j.fail_shrink_sync = !fail_truncate;
+            let q = EventBody::Elicitation { request: json!({}) };
+            assert!(j.append(q, 2).is_err());
+            assert!(
+                j.truncate_before_write,
+                "missing rollback ({fail_truncate})"
+            );
+            j.fail_truncate = false;
+            j.fail_shrink_sync = false;
+            j.fail_sync = false;
+            assert!(j.append(prompt(), 2).is_err(), "uncertain prefix accepted");
+            assert!(!j.truncate_before_write);
+            assert_eq!(fs::read(&path).unwrap(), prefix);
+            drop(j);
+            let (mut recovered, events) = open_events(&path).unwrap();
+            assert_eq!(events.len(), 1, "replayed a never-offered question");
+            assert_eq!(recovered.append(prompt(), 3).unwrap().seq, 2);
+        }
+    }
+
     #[tokio::test]
     async fn sync_reaches_the_disk_off_the_caller() {
         let path = fresh_dir("sync").join("s.jsonl");
-        let mut j = Journal::open(&path, drop).unwrap();
+        let mut j = Journal::open(&path, Arc::default(), drop).unwrap();
         write_all(&mut j, &[spawn()]);
         j.sync().await.unwrap().unwrap();
     }

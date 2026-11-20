@@ -290,7 +290,7 @@ The error codes are a closed set:
 - **`Pending`:**
   - `kind` is `"permission"` or `"elicitation"`;
   - `req` is the seq of the immutable journal event that announced the question, not the agent's JSON-RPC id;
-  - within the same incarnation and journal history, `(sid, epoch, req)` identifies exactly one question: answering or cancelling consumes it, and another question gets a fresh seq even if the agent reuses its id;
+  - on storage that has not reported a write error, `(sid, epoch, req)` identifies exactly one human-answerable question published after its journal sync barrier, even after a crash loses the unsynced tail: answering or cancelling consumes it, and another question gets a fresh seq even if the agent reuses its id;
   - `title` is the permission's `toolCall.title` or the elicitation's `message`, cut to 200 characters for both kinds. It is `""` when the request has none.
 - **`AcpSessionInfo`:** `{protocolVersion, agentInfo, agentCapabilities, promptCapabilities, authMethods, modes, configOptions, availableCommands, plan, usage}`. It holds the latest materialised values; absent optional values are omitted. `Summary.acp.configOptions` is always present, with `null` when absent.
 - Snapshots and watch events publish live and restored summaries unchanged, including the full option list, whenever they fit in a single-summary page with the longest request ID.
@@ -322,7 +322,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `pty.capture` | `sid, lines?` (default 200, max 1000) | `{text}` | plain text from the VT state, each row right-trimmed and blank rows after the last text left out; works on dead sessions |
 | `acp.open` | `sid, since, epoch?, spawn?: SpawnAcp` | `{new, summary, session, head, from, reset, configErrors?: ConfigError[]}` | then the replay as `acp.ev`, then `acp.replayed`, then live events. With a non-empty spawn config, the initiating reply waits for the hub-owned batch or its termination. Rules below. |
 | `acp.detach` | `sid` | `{}` | |
-| `acp.prompt` | `sid, prompt: ContentBlock[], epoch?` | `{}` once written | needs `alive` (`not_alive`), `activity=="none"` (`busy`) and no fault (`faulted`). Blocks non-empty, ≤ `PROMPT_MAX`. `image`, `audio` and `resource` need the matching `promptCapabilities`. Journals `prompt`, sets `seenSeq=headSeq`. |
+| `acp.prompt` | `sid, prompt: ContentBlock[], epoch?` | `{}` once queued | needs `alive` (`not_alive`), `activity=="none"` (`busy`) and no fault (`faulted`). Blocks non-empty, ≤ `PROMPT_MAX`. `image`, `audio` and `resource` need the matching `promptCapabilities`. Journals `prompt`, sets `seenSeq=headSeq`. |
 | `acp.cancel` | `sid, epoch?` | `{}` | sends the `session/cancel` notification when a turn is running, answers every pending request with cancelled (`by:"cancel"`), sets `seenSeq=headSeq`. Later permissions in that same turn bypass policy and ask through the ordinary manual path. With no turn and nothing pending it only sets `seenSeq`. |
 | `acp.permission` | `sid, req, epoch, outcome` | `{}` | `epoch` mismatch → `stale`. First answer wins; later answers get `already_resolved`. An unknown `optionId` gets `bad_option`. |
 | `acp.elicitation` | `sid, req, epoch, response` | `{}` | `epoch` mismatch → `stale`. First answer wins. `content` must be an object of string, number, boolean or string[]. |
@@ -357,12 +357,24 @@ On set_config_option the wire epoch has always been required; `checkEpochFirst:t
 For these guarded actions, an unknown sid gives `not_found`; an existing sid with a different epoch gives `stale` before kind or actor-state checks, with no action on the replacement.
 This holds even if a command was queued as the old session was being forgotten.
 
-**Check order.** While a non-empty initial configuration batch is active (including its preceding setup), `acp.prompt`, `acp.cancel`, `acp.set_mode`, `acp.set_config_option`, `acp.revive` and `acp.authenticate` fail with `busy` before their normal actor checks. They are rejected, never queued for a future turn. Permission and elicitation answers, `acp.seen` and `acp.kill` remain usable. Otherwise, when a request fails several checks, the first in this list applies:
+A successful enqueue means the agent's stdin queue accepted the message, not that the agent read it.
+If the queue rejects a journaled prompt, the hub records `turn_error{agent_error}` and returns `internal`; if it cannot record that error, it returns `faulted`.
+Cancel and question answers also report `internal` on enqueue failure; for an answer the error says the input was not queued but the answer was recorded and is final, so retrying returns `already_resolved`.
+
+Once the actor observes child exit or stdout EOF, it drains the remaining output or waits for the exit status before publishing the final `exit`.
+During that interval it refuses prompt, mode, config, cancel, answers to still-pending questions and an otherwise eligible authenticate with `not_alive`, without queuing agent input, journaling the action or advancing `seenSeq`.
+Epoch preconditions, answer lookup (`bad_request` or `already_resolved`) and existing journal faults retain their usual precedence.
+
+**Check order.** Outside that drain interval, while a non-empty initial configuration batch is active (including its preceding setup), `acp.prompt`, `acp.cancel`, `acp.set_mode` and `acp.set_config_option` fail with `busy` before their normal actor checks.
+The batch also blocks `acp.revive` and `acp.authenticate` with `busy` until it ends.
+These actions are rejected, never queued for a future turn.
+Permission and elicitation answers, `acp.seen` and `acp.kill` are not blocked by the batch.
+Otherwise, when a request fails several checks, the first in this list applies:
 - `acp.prompt`: `faulted`, `not_alive`, `bad_request` (no ACP session yet), `busy`, then the content rules.
 - `acp.set_config_option`: `faulted`, `not_alive`, `bad_request` (no ACP session yet), `stale` (epoch differs from `createdAt`), then `bad_option` (unknown id, unsupported option type or wrong/unoffered value). Registry errors `not_found` and `kind_mismatch` apply before these actor checks.
 - `acp.set_policy`: registry `not_found`/`kind_mismatch`, then `stale`, `faulted`, `bad_request` (invalid policy). It is usable during setup, an initial config batch, a turn, or while dead.
 - `acp.permission`, `acp.elicitation`: `stale`; an unknown `req` is `bad_request` (`already_resolved` when that request was announced and has been answered); then `bad_option` or the shape rules.
-- `acp.authenticate`: `bad_option` (a method that is not offered, or one with a `type`), `faulted`, then `bad_request` unless the agent is alive and waiting after a failed setup.
+- `acp.authenticate`: `bad_option` (a method that is not offered, or one with a `type`), `faulted`, `bad_request` unless the process is waiting after a failed setup, then `not_alive` if exit or EOF was observed.
 - `acp.revive`: `faulted`, then `not_revivable`.
 
 **`SpawnPty`** = `{argv: string[1..=256] (≤256 KiB in total), shell?: string, cwd?: absolute path, cwdFrom?: sid, env?: {KEY: value}}`.
@@ -396,6 +408,7 @@ This holds even if a command was queued as the old session was being forgotten.
   During unpublished worktree creation, including rollback, all `acp.open` requests (with or without `spawn`) and all ACP actions except the first `acp.kill` get `conflict` immediately; `acp.detach` is handled normally.
   The first `acp.kill`, whether `forget` is true or false, requests cancellation and waits for cleanup; if creation fails independently, the opener receives its original error and the kill succeeds unless a leftover is reported.
   During explicit removal, only `acp.open` with `spawn.worktree`, `acp.remove_worktree`, `acp.revive` and `acp.kill` (either `forget` value) get `conflict` because of the removal; everything else, including attach, detach, `acp.prompt` and `acp.seen`, follows the normal session rules.
+  A session without a journal writer refuses `acp.remove_worktree` with `faulted` and leaves its checkout alone.
   Once a session is accepted, killing or forgetting it never removes the checkout.
   Only a timed-out or cancelled `worktree add` permits forced cleanup: the hub verifies the reserved directory's device and inode before it unlocks and force-removes the incomplete checkout; no agent has run in it.
   If the hub itself stops before creation completes, an incomplete, locked worktree can remain without a session record; inspect the path and recover it manually as described in F-A52.
@@ -557,7 +570,11 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
   This validation happens under `hub.lock`, before creating session directories or removing their temporary files.
   An unreadable or malformed mark is an error, not a reset.
   An orderly stop waits for outstanding mark writes before releasing `hub.lock`. Each writer also retains the same flocked open file description through its write, so unwinding without an orderly stop cannot hand the lock to a successor too early.
-- The journal is appended with one `pwrite(2)` per event at the tracked end of its last complete line, never with `O_APPEND`. If a failed append cannot even be truncated away, what is left is a prefix of a line with no `\n`: the next append overwrites it, and the next open truncates it. `fdatasync` runs on `session`, `setup_error`, `turn_end`, `turn_error`, `exit` and SIGTERM.
+- The journal is appended with one `pwrite(2)` per event at the tracked end, never with `O_APPEND`.
+- On open, the hub validates the journal in place, truncates any torn tail, syncs the file with `fdatasync`, then syncs its directory.
+- A human-answerable `permission` or `elicitation` waits for `fdatasync` before publication, without a deadline; a stalled disk delays that session's shutdown as well as the question.
+- A policy decision (`permission_auto`) never offers a question to clients and adds no sync barrier.
+- Lifecycle events retain their background syncs; SIGTERM also syncs the journal.
 
 **Web `stateDir`** (`…/workbench/web`): `web.lock`, `artifacts/<node>/…`, artifact `db.json`. **There is no `index.db`**: the notes index lives in memory.
 
@@ -623,15 +640,15 @@ Each line is `{"seq":N,"ts":…,"e":KIND,…}`.
 | `session` | `via: "new"\|"resume"\|"load", sessionId, modes?, configOptions?` | setup succeeded |
 | `setup_error` | `code: auth_required\|agent_error\|timeout\|revive_failed\|spawn_failed\|agent_exited\|interrupted, message, rpc?` | setup failed or was cut. An exec failure writes this with no `spawn`/`exit`. |
 | `authenticate` | `methodId` | an accepted `acp.authenticate`; activity re-enters `setup` |
-| `prompt` | `prompt` | a prompt was sent |
+| `prompt` | `prompt` | a prompt was accepted for enqueue |
 | `update` | `update`, plus `sessionId` only when it differs from `agentSessionId` | every `session/update`, unknown variants included |
 | `turn_end` | `stopReason` | the `session/prompt` response arrived |
 | `turn_error` | `code: agent_error\|agent_exited\|interrupted, message, rpc?` | the prompt failed, or the agent died or was killed mid-turn |
 | `permission` | `toolCall, options` | `session/request_permission` arrived; `req` = this seq |
-| `permission_resolved` | `req, outcome, by: "user"\|"cancel"\|"hub"\|"agent"` | the answer was sent; `agent` = the agent's own `$/cancel_request` |
+| `permission_resolved` | `req, outcome, by: "user"\|"cancel"\|"hub"\|"agent"` | the question was resolved; `agent` = the agent's own `$/cancel_request` |
 | `permission_auto` | `toolCall, options, outcome, policy:{rule, action}` | one atomic request-and-answer event for policy; zero-based rule index, `allow` or `reject`, selected once-only option. No `permission` or `permission_resolved` event is written for it. Its seq identifies the resolved request. |
 | `elicitation` | `request` (verbatim params) | `elicitation/create` arrived; `req` = seq |
-| `elicitation_resolved` | `req, response, by` | the answer was sent |
+| `elicitation_resolved` | `req, response, by` | the question was resolved |
 | `elicitation_complete` | `elicitationId` | `elicitation/complete` arrived (url mode) |
 | `mode` | `modeId` | `session/set_mode` succeeded |
 | `config` | `configOptions` (full list) | `session/set_config_option` succeeded; written before its hub reply |
@@ -648,13 +665,15 @@ Each line is `{"seq":N,"ts":…,"e":KIND,…}`.
 
 At startup, a journal whose last `spawn` has no `exit` gets these lines with `reason:"hub_restart"` and `code:"interrupted"`. `Facts::apply` is the single fold used both live and at startup.
 
-**Write rule, fail-closed.** `record(body)`:
+**Write rule, fail-closed.** For each event:
 1. assign `seq = head+1`;
 2. write the full line at the tracked end;
-3. **only on a complete write** advance head, fold, fan out and publish.
+3. for `permission` and `elicitation`, wait for `fdatasync` of that line and everything before it;
+4. only after success advance head, fold, fan out and publish.
 
-On a short or failed write:
-- `ftruncate` back to the last good length;
+On a short write, write error or required sync failure:
+- `ftruncate` back to the last good length and sync the shrink; if either operation fails, keep the rollback pending and retry it before any later append;
+- rollback and its retries on ordinary append and probe paths run on runtime workers; a storage fault can therefore stall other sessions' actors as well;
 - set `fault = {code:"journal_write"}`;
 - record nothing more;
 - fail every unapplied initial configuration entry with `faulted`, release the batch gate and answer the creating open, even if spawning failed before an agent process existed;
@@ -664,14 +683,27 @@ On a short or failed write:
 While faulted:
 - `prompt` and `revive` get `faulted`. No `err` event is sent: the Summary's `fault` is the signal.
 - The agent's `exit`, once it has happened, is held back until the fault clears.
-- On `acp.revive`, on `acp.kill`, and every 60 s, the hub probes the journal. If the death-invariant lines are outstanding, it appends them, including the held-back `exit`. Otherwise it appends a `notice{warn}`. On success the fault clears and the session is an ordinary dead session; a triggering `acp.revive` then proceeds under the normal rules.
+- On `acp.revive`, on `acp.kill`, and every 60 s, the hub probes the journal.
+- If rollback is complete and no sync error is latched, the probe appends the outstanding death-invariant lines, including the held-back `exit`, or a `notice{warn}` if there are none.
+- On success the fault clears and the session is an ordinary dead session; a triggering `acp.revive` then proceeds under the normal rules.
+- All syncs for the journal share one gate, including background syncs and the question barrier.
+- Once `fdatasync` fails, the hub publishes no further question on that journal for the life of the process; even a successful sync of a rollback does not clear the fault.
+- Revive checks the journal before starting a child; failure to record `spawn` returns `faulted` without sending `initialize` to that child.
 
-Memory never runs ahead of disk, so seqs are never reissued.
+A crash may lose or reuse a seq from an unsynced tail, including ordinary updates and automatically decided permissions.
+The no-reuse guarantee covers only human-answerable questions published through the sync barrier; upgrading cannot protect a number an older hub published and then lost.
+It assumes storage that has not reported a write error.
+After a hub restart without a reboot, the hub does not try to detect pages an earlier process failed to write: Linux reports such an error once, and a later sync can succeed without writing those pages.
+If both the question sync and the following truncate fail, a crash loses the in-memory rollback boundary and may leave a complete, never-offered question in history.
+That phantom event is not reuse of a published request number.
 
 **Load and quarantine.**
 - Every session (both kinds) loads in its own task under `catch_unwind` plus error handling.
 - A torn journal tail is the bytes after the last `\n`. They are truncated away and logged. A failed truncation is a load failure.
-- Any other load failure, including a complete line that does not parse and a `seq` that is not the previous one plus 1 (starting at 1; a gap or a repeat): rename the session's files to `<sid>.quarantine-<ms>.<ext>`, then register a dead Summary with:
+- On any ACP recovery I/O failure (including lack of space), keep the session's filenames intact and register the dead `load_failed` Summary below without opening it for appends.
+- A later start retries recovery unless the caller explicitly requests `kill{forget:true}`.
+- Forget deletes the session's files and releases its id only after deletion succeeds; on a deletion error the caller gets `internal` and can retry on the same registration.
+- For invalid contents, including a complete line that does not parse or a `seq` that is not the previous one plus 1 (starting at 1), quarantine the session's files as `<sid>.quarantine-<ms>.<ext>` and register a dead Summary with:
   - `fault={code:"load_failed", message}`;
   - `createdAt=now`;
   - `revivable:false`;
@@ -710,6 +742,8 @@ A pinned event appears at its own seq position, never ahead of a lower seq. Clie
   - A failed setup ends with `auth_required` and at least one agent-handled auth method (one without a `type`): the agent is kept and waits for `acp.authenticate`.
   - Any other failed setup journals `notice{warn, "agent stopped after failed setup"}` and kills the agent.
   - A setup response that arrives once teardown has started is ignored.
+  - During exit/EOF drain, a buffered final response still determines the result of the RPC already sent, but cannot start a new setup RPC, a resume-to-load fallback or the next initial option.
+  - Unattempted initial options in that state fail with `not_alive`; an already-applied option remains in the journal and is not reported as failed.
   - A malformed `configOptions` list in a successful `session/new`, `session/resume` or `session/load` result is omitted from the `session` event, not a setup failure. Setup continues; an initial batch without an offering fails each entry with `bad_option`. This does not change the resume-error fallback to load.
 - **Initial configuration batch (non-empty `SpawnAcp.config`):**
   1. The hub owns the batch from creation, including the setup interval. It blocks the live actions listed in §3.2.7 for every client, not only the opener. No prompt is sent implicitly.
@@ -1499,7 +1533,7 @@ The stream ends when wb-web shuts down.
 | H-7 | The nudge restores the *currently desired* size, and a `pty.resize` during the nudge cancels the restore. Attach size is applied only for a sole viewer. | `pty/mod.rs` |
 | H-8 | Replay is pinned ∪ kept in **one ascending-seq stream** (§3.4.4). | `acp/replay.rs` |
 | H-9 | Journal is fail-closed: write first (one `pwrite` at the tracked end), then fold. On a short write: ftruncate, `fault{journal_write}`, teardown, `faulted`, and a recovery probe. | `acp/journal.rs`, `acp/mod.rs`, `acp/facts.rs` |
-| H-10 | Per-session load under `catch_unwind` plus error handling. Failure means quarantine (rename) plus a dead `fault{load_failed}` Summary. A quarantined PTY also carries a `hub_restart` exit, so its card attaches as a corpse and a respawn clears the fault. A supervisor reload uses the same path, never on the main task. | `registry.rs`, `main.rs` |
+| H-10 | Per-session load under `catch_unwind` plus error handling. Failed loads publish a dead `fault{load_failed}` Summary. ACP recovery I/O errors leave files in place for the next start; invalid contents are quarantined. A quarantined PTY also carries a `hub_restart` exit, so its card attaches as a corpse and a respawn clears the fault. A supervisor reload uses the same path, never on the main task. | `registry.rs`, `main.rs` |
 | H-11 | After **any** agent exit, the leftover process group is terminated: TERM, then KILL after 2 s. `setsid` descendants survive. `seenSeq = headSeq` after finalising a user kill only. | `acp/agent.rs`, `acp/mod.rs` |
 | H-12 | `revivable` is false after `setup_error{revive_failed}` until the next `session`. | `acp/facts.rs` |
 | H-13 | Every `std::sync::Mutex` uses `lock().unwrap_or_else(PoisonError::into_inner)`, with panic-free critical sections. A session-actor panic is reloaded and attached connections get `err{internal,"session reloaded"}`. | all |
