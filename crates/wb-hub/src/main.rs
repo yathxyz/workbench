@@ -43,6 +43,7 @@ pub struct Ctx {
     pub child_umask: Mode,
     pub registry: Registry,
     pub escalations: Arc<pty::Escalations>,
+    reaper: std::sync::mpsc::Sender<std::process::Child>,
     pub started_at: u64,
     /// `stateDir/pty`.
     pub pty_dir: PathBuf,
@@ -79,6 +80,7 @@ impl Ctx {
             child_umask: Mode::empty(),
             registry: Registry::open(dir, &lock_file).unwrap(),
             escalations: Arc::default(),
+            reaper: pty::reaper::start().unwrap(),
             started_at: 1,
             pty_dir,
             acp_dir,
@@ -121,7 +123,7 @@ fn main() -> ExitCode {
         .with_max_level(level)
         .init();
     match pty::spawn::reset_sigchld()
-        .context("restoring default SIGCHLD disposition")
+        .context("resetting SIGCHLD disposition and mask")
         .and_then(|()| run(PathBuf::from(path)))
     {
         Ok(()) => ExitCode::SUCCESS,
@@ -175,6 +177,7 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
         child_umask,
         registry,
         escalations: Arc::default(),
+        reaper: pty::reaper::start().context("starting PTY reaper")?,
         started_at: now_ms(),
         pty_dir,
         acp_dir,

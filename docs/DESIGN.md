@@ -570,10 +570,11 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
   - `pre_exec`: restore the child umask, write `800` to `/proc/self/oom_score_adj`, `setsid()`, `TIOCSCTTY`;
   - argv is the request's `argv` with `argv[0]` replaced by the chosen shell's resolved path (§3.2.7): a single-item `argv` also gets the shell's configured `args` (an interactive, non-login start), and `[shell, "-c", cmd]` runs `cmd`;
   - the shell name is persisted in `pty/<sid>.json`. A respawn without `shell` uses it. A `shell` that names another shell wins and is persisted;
-  - the hub restores the default `SIGCHLD` disposition before the first spawn so an inherited `SIG_IGN` cannot discard child status.
+  - before starting Tokio the hub restores the default `SIGCHLD` disposition and unblocks it, so the hub can collect exit status and receive child-exit notifications.
     Normally `waitid` with `WNOWAIT` observes exit without reaping until the actor has drained output and recorded the exit.
     `ECHILD` ends the wait with unknown code and signal; cleanup may use previously captured handles, never the released pid.
     On other wait errors the actor keeps the child until its owned child handle confirms exit; where reaping releases the leader early, pre-reap handles protect panic cleanup.
+    One reaper thread takes ownership of abandoned PTY children and polls them without waiting on any one child.
 - **Kill:** while the leader is still unreaped, the hub opens `/proc/<pid>` handles and checks session membership (stat field 6) through those handles.
   Both SIGHUP and the delayed SIGKILL use those same handles, so a survivor is still targeted after the leader exits, but a reused pid or session id is not.
   A process forked after the snapshot is not killed by this escalation; covering later forks would require containment at spawn.

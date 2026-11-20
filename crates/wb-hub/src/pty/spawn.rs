@@ -15,12 +15,32 @@ use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
 use rustix::termios::{Winsize, tcsetwinsize};
 use tokio::process::{Child, Command};
 
-/// An explicitly ignored SIGCHLD survives exec and lets the kernel discard exit status.
+/// An inherited SIG_IGN discards exit status; an inherited mask can hide exit wakeups.
 pub(crate) fn reset_sigchld() -> io::Result<()> {
     // SAFETY: called at startup before Tokio installs handlers or any child exists.
     // SIG_DFL is a valid disposition and installs no Rust signal handler.
     if unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } == libc::SIG_ERR {
         return Err(io::Error::last_os_error());
+    }
+    unblock_sigchld()
+}
+
+fn sigchld_set() -> libc::sigset_t {
+    // SAFETY: initialize a sigset_t with just the valid SIGCHLD signal.
+    unsafe {
+        let mut set = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGCHLD);
+        set
+    }
+}
+
+fn unblock_sigchld() -> io::Result<()> {
+    // SAFETY: the set is initialized; only the calling thread's mask is changed.
+    let err =
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &sigchld_set(), std::ptr::null_mut()) };
+    if err != 0 {
+        return Err(io::Error::from_raw_os_error(err));
     }
     Ok(())
 }
@@ -126,4 +146,30 @@ fn child_setup(umask: Mode) -> io::Result<()> {
     let stdin = unsafe { BorrowedFd::borrow_raw(0) };
     rustix::process::ioctl_tiocsctty(stdin)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_unblocks_sigchld() {
+        // Test the mask step alone: disposition is process-wide and other tests use Tokio.
+        // SAFETY: both outputs are valid; restore this thread's original mask before asserting.
+        unsafe {
+            let mut saved = std::mem::zeroed();
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &sigchld_set(), &mut saved),
+                0
+            );
+            let result = unblock_sigchld();
+            let mut actual = std::mem::zeroed();
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_SETMASK, &saved, &mut actual),
+                0
+            );
+            result.unwrap();
+            assert_eq!(libc::sigismember(&actual, libc::SIGCHLD), 0);
+        }
+    }
 }

@@ -5,6 +5,7 @@
 
 mod io;
 mod out;
+pub(crate) mod reaper;
 pub mod spawn;
 mod vt;
 
@@ -1079,6 +1080,7 @@ impl Pty {
                     Ok(Some(status)) => {
                         self.reaped_cleanup = members;
                         self.child = None;
+                        self.withdraw_pid();
                         (status.code(), status.signal())
                     }
                     Err(e) if is_echild(&e) => return self.lost_child(),
@@ -1109,15 +1111,20 @@ impl Pty {
     fn lost_child(&mut self) {
         self.child = None;
         self.exit_watch = None;
-        if self.pid.take().is_some() {
-            self.fg = None;
+        if self.pid.is_some() {
             self.status = Some((None, None));
             // A kill/shutdown command may itself have discovered ECHILD. Finish
             // after the command has installed its pending replies, even at EOF.
             let now = Instant::now();
             self.drain_until = Some(if self.eof { now } else { now + DRAIN });
-            self.publish(); // In particular, cwd_from must not follow the old pid.
+            self.withdraw_pid();
         }
+    }
+
+    fn withdraw_pid(&mut self) {
+        self.pid = None;
+        self.fg = None;
+        self.publish(); // In particular, cwd_from must not follow the old pid.
     }
 
     /// Completes the exit of a child whose output was being drained: closes the master,
@@ -1185,15 +1192,10 @@ impl Pty {
             Err(e) => warn!(sid = %self.sid, "reaping PTY leader: {e}"),
             Ok(None) => {}
         }
-        // A cancelled actor (or failed master setup) can leave a still-live
-        // child. Don't block its Drop, or tie runtime shutdown to HUP delivery.
-        if let Err(e) = std::thread::Builder::new().spawn(move || {
-            if let Err(e) = child.wait() {
-                warn!("reaping abandoned PTY leader: {e}");
-            }
-        }) {
-            warn!(sid = %self.sid, "starting PTY leader reaper: {e}");
-        }
+        self.ctx
+            .reaper
+            .send(child)
+            .expect("reaper runs until all senders are dropped");
     }
 
     /// Queues a write of the record and, with `snapshot`, of the screen.
@@ -1429,7 +1431,10 @@ mod tests {
     async fn wait_error_on_live_child_does_not_acknowledge_a_noop_kill() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = Arc::new(Ctx::for_test(dir.path()));
+        let _rx = ctx.registry.restore::<Cmd>("job", 17);
         let (mut actor, _writes, descendant) = session_with_straggler(&ctx).await;
+        actor.publish();
+        assert_eq!(ctx.registry.live_pid("job"), actor.pid);
         let leader = exit_fd(actor.pid.unwrap()).unwrap();
         actor.exited(Err(std::io::Error::other("injected waitid failure")));
         assert!(actor.status.is_none(), "wait error fabricated an exit");
@@ -1453,6 +1458,7 @@ mod tests {
         .await
         .expect("fallback did not observe the leader's exit after HUP");
         assert_eq!(actor.status, Some((Some(42), None)));
+        assert_eq!(ctx.registry.live_pid("job"), None, "fallback released pid");
         gated.finish();
         assert_killed(descendant).await;
     }
