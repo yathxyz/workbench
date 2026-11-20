@@ -5,8 +5,10 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,7 +16,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, Signal, WaitIdStatus, kill_process_group};
 use serde_json::{Map, Value};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncWriteExt, BufReader, Interest};
@@ -52,6 +54,8 @@ pub enum Out {
 /// Dropping a live agent transfers its owned group to panic cleanup.
 pub struct Agent {
     pub watch: ExitWatch,
+    #[cfg(test)]
+    pub(super) fail_exit_peek: bool,
     group: Option<Group>,
     escalations: Arc<Escalations>,
     /// `None` once closed: the writer sends what is queued, then closes the pipe.
@@ -73,11 +77,37 @@ impl Agent {
         }
     }
 
-    /// ECHILD: we own neither a wait status nor the number, even on unwind.
-    pub fn lost_child(&mut self) {
+    /// Reaping or ECHILD releases the number. Never signal it again, even on unwind.
+    pub fn discard_group(&mut self) {
         if let Some(mut group) = self.group.take() {
             group.child.take();
         }
+    }
+
+    /// After a failed observation, try once more without reaping. Only use the
+    /// reaping fallback if the non-reaping syscall itself still fails.
+    pub fn probe_exit(&mut self) -> io::Result<Option<(Option<i32>, Option<i32>)>> {
+        match self.peek_exit() {
+            Ok(status) => Ok(status.map(|s| (s.exit_status(), s.terminating_signal()))),
+            Err(e) if child::is_echild(&e) => Err(e),
+            Err(_) => {
+                let group = self.group.as_mut().expect("waiting for an owned group");
+                let child = group.child.as_mut().expect("owned group leader");
+                let Some(status) = child.try_wait()? else {
+                    return Ok(None);
+                };
+                self.discard_group();
+                Ok(Some((status.code(), status.signal())))
+            }
+        }
+    }
+
+    fn peek_exit(&self) -> io::Result<Option<WaitIdStatus>> {
+        #[cfg(test)]
+        if self.fail_exit_peek {
+            return Err(rustix::io::Errno::IO.into());
+        }
+        child::peek_exit(self.pid())
     }
 
     pub fn end_group(&mut self, grace: Duration) {
@@ -166,6 +196,8 @@ pub fn start(
     ];
     Ok(Agent {
         watch,
+        #[cfg(test)]
+        fail_exit_peek: false,
         group: Some(group),
         escalations: ctx.escalations.clone(),
         stdin: Some(Stdin { tx: in_tx, queued }),

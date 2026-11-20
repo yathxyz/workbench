@@ -706,7 +706,7 @@ struct Proc {
     via: SpawnVia,
     next_id: u64,
     outstanding: HashMap<u64, Purpose>,
-    /// Code and signal once exit was observed, without reaping the leader.
+    /// Code and signal once exit or loss of the child has been confirmed.
     status: Option<(Option<i32>, Option<i32>)>,
     /// Stdout reached its end.
     eof: bool,
@@ -3137,15 +3137,28 @@ impl Acp {
 
     fn child_exited(&mut self, st: io::Result<WaitNotice>) {
         let Some(p) = &mut self.proc else { return };
-        p.status = Some(match st {
-            Ok(WaitNotice::Exited(code, signal)) => (code, signal),
-            Ok(WaitNotice::ProbeChild) => unreachable!("ACP never enables reaping probes"),
-            Err(e) => {
-                if child::is_echild(&e) {
-                    p.agent.lost_child();
-                }
+        let status = match st {
+            Ok(WaitNotice::Exited(code, signal)) => Ok(Some((code, signal))),
+            Ok(WaitNotice::ProbeChild) => p.agent.probe_exit(),
+            Err(e) if !child::is_echild(&e) => {
+                warn!("observing agent exit: {e}; switching to child wait");
+                p.agent.watch.use_child_wait();
+                return;
+            }
+            Err(e) => Err(e),
+        };
+        p.status = Some(match status {
+            Ok(Some(status)) => status,
+            Ok(None) => return,
+            Err(e) if child::is_echild(&e) => {
+                p.agent.discard_group();
                 warn!("waiting for the agent: {e}");
                 (None, None)
+            }
+            Err(e) => {
+                warn!("waiting for owned agent child: {e}");
+                p.agent.watch.retry_child();
+                return;
             }
         });
         if p.eof {
@@ -3696,6 +3709,89 @@ mod tests {
             args: vec![],
         });
         cfg.agents.get_mut("offline").unwrap().argv = vec![shell, "-c".into(), script.into()];
+    }
+
+    async fn recover_agent_exit_observation(reap: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _rx) = dormant(dir.path()).await;
+        configure_test_agent(&mut actor, "while read -r line; do :; done; exit 37");
+        actor.spawn(SpawnVia::New).unwrap();
+        let agent = &mut actor.proc.as_mut().unwrap().agent;
+        let pid = agent.pid();
+        agent.fail_exit_peek = reap;
+        let mut member = reap.then(|| {
+            // Keep the old group addressable after reaping. Either TERM or
+            // KILL would prevent this member from exiting normally at EOF.
+            tokio::process::Command::new("sh")
+                .args(["-c", "read -r line; exit 0"])
+                .process_group(pid as i32)
+                .stdin(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap()
+        });
+
+        let head = actor.facts.head_seq;
+        actor.child_exited(Err(rustix::io::Errno::IO.into()));
+        assert!(actor.proc.as_ref().unwrap().status.is_none());
+        let p = actor.proc.as_mut().unwrap();
+        let probe = watchdog(child::wait(Some(&mut p.agent.watch))).await;
+        assert!(matches!(probe, Ok(WaitNotice::ProbeChild)));
+        actor.child_exited(probe);
+        let p = actor.proc.as_mut().unwrap();
+        assert!(p.status.is_none());
+        assert!(p.drain_until.is_none());
+        assert_eq!(p.agent.pid(), pid);
+        assert!(child::peek_exit(pid).unwrap().is_none());
+        assert_eq!(actor.facts.head_seq, head);
+
+        p.agent.stdin = None;
+        watchdog(async {
+            while let Some(p) = actor.proc.as_mut().filter(|p| p.status.is_none()) {
+                let notice = child::wait(Some(&mut p.agent.watch)).await;
+                actor.child_exited(notice);
+            }
+        })
+        .await;
+        assert_eq!(actor.proc.as_ref().unwrap().status, Some((Some(37), None)));
+        if reap {
+            assert!(child::peek_exit(pid).is_err_and(|e| child::is_echild(&e)));
+        } else {
+            assert_eq!(
+                child::peek_exit(pid).unwrap().unwrap().exit_status(),
+                Some(37)
+            );
+        }
+
+        actor.stdout_closed();
+        actor.ctx.escalations.finish();
+        if let Some(member) = &mut member {
+            drop(member.stdin.take());
+            assert!(
+                watchdog(member.wait()).await.unwrap().success(),
+                "signalled after the reaping fallback"
+            );
+        }
+        let disk = fs::read_to_string(actor.path("jsonl")).unwrap();
+        let exit: JournalEvent = serde_json::from_str(disk.lines().last().unwrap()).unwrap();
+        assert!(matches!(
+            exit.body,
+            EventBody::Exit {
+                code: Some(37),
+                signal: None,
+                reason: ExitReason::Exited,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn observation_error_recovers_without_reaping_the_leader() {
+        recover_agent_exit_observation(false).await;
+    }
+
+    #[tokio::test]
+    async fn reaping_observation_fallback_never_signals_the_released_group() {
+        recover_agent_exit_observation(true).await;
     }
 
     mod group_cleanup {

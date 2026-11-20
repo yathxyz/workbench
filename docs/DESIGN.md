@@ -822,6 +822,8 @@ A pinned event appears at its own seq position, never ahead of a lower seq. Clie
     The escalation owns the unreaped leader through SIGKILL, so its group number cannot be reused even if no live members remain.
     Only then is the leader reaped.
     An actor panic transfers the same ownership to a 3 s escalation; `ECHILD` instead discards the number without signalling.
+    Other observation errors switch to watching SIGCHLD and probing the owned child, retrying on a timer if waiting fails.
+    These probes still prefer `waitid(WNOWAIT)`; if only the reaping wait can collect the status, cleanup no longer signals the released group number.
   - **Then finalise:**
     - write the death-invariant lines and `exit`, then `fdatasync`;
     - after a **user** `acp.kill`, set `seenSeq = headSeq` **after** finalising. Other kills (a failed setup, a fault, a hub stop) leave `seenSeq` alone.
