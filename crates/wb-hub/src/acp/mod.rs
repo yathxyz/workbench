@@ -3490,7 +3490,7 @@ mod tests {
     mod barrier {
         use super::*;
 
-        fn attach(actor: &Acp) -> Arc<OutQ> {
+        pub(super) fn attach(actor: &Acp) -> Arc<OutQ> {
             let queue = Arc::new(OutQ::default());
             lock(&actor.shared.viewers).push(Attached {
                 viewer: Viewer {
@@ -3797,20 +3797,19 @@ mod tests {
     mod group_cleanup {
         use super::*;
         use rustix::process::{Pid, WaitOptions, waitpid};
+        use std::os::unix::process::ExitStatusExt;
         use std::process::Stdio;
         use tokio::io::AsyncReadExt;
-        use tokio::process::{Child, ChildStdin, Command};
+        use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-        // Exit 42 on TERM if the leader is still pinned, 43 if the number was
-        // released. Closing the gate instead exits 0. An unrelated group can
-        // thus prove it received neither TERM nor KILL, without a timing sample.
-        async fn witness(group: i32) -> (Child, ChildStdin) {
+        // Report TERM but stay alive until KILL or stdin closes. EOF exits 0
+        // only if the group received neither signal.
+        async fn witness(group: i32) -> (Child, ChildStdin, ChildStdout) {
             let mut child = Command::new("sh")
                 .args([
                     "-c",
-                    r#"trap 'test -d "/proc/$1" && exit 42; exit 43' TERM; printf R; read -r line; exit 0"#,
-                    "witness",
-                    &group.to_string(),
+                    r#"trap 'trap "" TERM; printf T; read -r line; exit 42' TERM
+                       printf R; read -r line; exit 0"#,
                 ])
                 .process_group(group)
                 .kill_on_drop(true)
@@ -3818,54 +3817,90 @@ mod tests {
                 .stdout(Stdio::piped())
                 .spawn()
                 .unwrap();
-            let ready = watchdog(child.stdout.take().unwrap().read_u8())
-                .await
-                .unwrap();
-            assert_eq!(ready, b'R');
-            let gate = child.stdin.take().unwrap();
-            (child, gate)
+            let mut output = child.stdout.take().unwrap();
+            assert_eq!(watchdog(output.read_u8()).await.unwrap(), b'R');
+            let input = child.stdin.take().unwrap();
+            (child, input, output)
+        }
+
+        #[tokio::test]
+        async fn normal_exit_signals_only_the_pinned_group() {
+            assert_escalation_pins_leader(false).await;
         }
 
         #[tokio::test]
         async fn panic_during_exit_drain_signals_only_the_pinned_group() {
+            assert_escalation_pins_leader(true).await;
+        }
+
+        async fn assert_escalation_pins_leader(panic_during_drain: bool) {
             let dir = tempfile::tempdir().unwrap();
             let (mut actor, rx) = dormant(dir.path()).await;
             configure_test_agent(&mut actor, READ_INPUT);
+            let (escalations, kill_gate) = crate::escalation::Escalations::gated_for_test();
+            Arc::get_mut(&mut actor.ctx).unwrap().escalations = Arc::new(escalations);
+            let ctx = actor.ctx.clone(); // Own the pending group even after actor unwind.
             actor.spawn(SpawnVia::New).unwrap();
             let agent = &mut actor.proc.as_mut().unwrap().agent;
             let pid = agent.pid();
-            let (mut member, _gate) = witness(pid as i32).await;
-            let (mut unrelated, release) = witness(0).await;
+            let (mut member, _keep_open, mut output) = witness(pid as i32).await;
+            let (mut unrelated, release, _output) = witness(0).await;
             agent.stdin = None;
-            let st = wait_success(agent).await;
+            let st = watchdog(wait_success(agent)).await;
             actor.child_exited(Ok(st));
 
-            // Queue the panic before the actor polls again. Hold the drain open
-            // so it cannot finalise instead, even on a slow test machine.
-            actor.proc.as_mut().unwrap().eof = true;
-            actor.proc.as_mut().unwrap().drain_until = None;
-            let ctx = actor.ctx.clone();
-            ctx.registry
-                .deliver(
-                    "a",
-                    Cmd::Act {
-                        epoch: None,
-                        act: Act::Panic,
-                        reply: Reply::for_test(1, Arc::default()),
-                    },
-                )
+            if panic_during_drain {
+                // Disable the stdout and drain branches so the queued panic
+                // wins without the actor finalising first.
+                let proc = actor.proc.as_mut().unwrap();
+                proc.eof = true;
+                proc.drain_until = None;
+                ctx.registry
+                    .deliver(
+                        "a",
+                        Cmd::Act {
+                            epoch: None,
+                            act: Act::Panic,
+                            reply: Reply::for_test(1, Arc::default()),
+                        },
+                    )
+                    .await;
+                let viewer = barrier::attach(&actor);
+                let supervisor = tokio::spawn(supervise(actor, rx, None));
+                watchdog(async {
+                    while read_reply(&viewer).await["message"] != "session reloaded" {}
+                })
                 .await;
-            let supervisor = tokio::spawn(supervise(actor, rx, None));
-            assert_eq!(watchdog(member.wait()).await.unwrap().code(), Some(42));
+                supervisor.abort();
+            } else {
+                actor.stdout_closed();
+                assert!(actor.proc.is_none());
+            }
+
+            assert_eq!(watchdog(output.read_u8()).await.unwrap(), b'T');
+            // WNOWAIT must still see the exited leader after TERM, not just
+            // find a process with that numeric PID in /proc.
+            let status = child::peek_exit(pid).unwrap().expect("leader still pinned");
+            assert_eq!(status.exit_status(), Some(0));
+            assert!(member.try_wait().unwrap().is_none(), "KILL before release");
+
+            kill_gate.notify_one();
+            assert_eq!(
+                watchdog(member.wait()).await.unwrap().signal(),
+                Some(Signal::KILL.as_raw())
+            );
             watchdog(async {
-                while !child::peek_exit(pid).is_err_and(|e| child::is_echild(&e)) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                loop {
+                    match child::peek_exit(pid) {
+                        Err(e) if child::is_echild(&e) => break,
+                        Ok(Some(_)) => tokio::time::sleep(Duration::from_millis(10)).await,
+                        other => panic!("expected exited or reaped leader: {other:?}"),
+                    }
                 }
             })
             .await;
             drop(release);
             assert!(watchdog(unrelated.wait()).await.unwrap().success());
-            supervisor.abort();
         }
 
         #[tokio::test]
@@ -3878,7 +3913,7 @@ mod tests {
             let pid = Pid::from_raw(agent.pid() as i32).unwrap();
             // Keep a witness at the old number: unlike relying on rapid pid
             // reuse after a group empties, any stale killpg is observable.
-            let (mut member, release) = witness(pid.as_raw_nonzero().get()).await;
+            let (mut member, release, _output) = witness(pid.as_raw_nonzero().get()).await;
             agent.stdin = None;
             let e = tokio::task::spawn_blocking(move || {
                 waitpid(Some(pid), WaitOptions::empty()).unwrap();

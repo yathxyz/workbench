@@ -3331,92 +3331,63 @@ fn wait_reaped(pid: u32) {
     });
 }
 
-// Keep a TERM-resistant witness in the fake's process group. Record the leader's
-// state from the signal handler so the test need not catch the grace window.
-const GROUP_WITNESS: &str = r#"
-witness=$1
-shift
-leader=$$
-(
-    exec 3<>"$witness"
-    trap 'IFS= read -r stat 2>/dev/null <"/proc/$leader/stat" || stat=missing
-          printf "%s\n" "$stat" >"$witness.term"
-          trap "" TERM
-          exec sleep 30' TERM
-    printf '%s\n' "$BASHPID" >"$witness.pid"
-    read -r -t 30 -u 3
-) </dev/null >/dev/null 2>&1 &
-exec "$@"
-"#;
-
-fn hub_with_group_witness(scenario: &str) -> Hub {
-    Hub::with_scenarios_and(&[scenario], |config| {
+#[test]
+fn hub_kills_what_a_crashed_agent_left_in_its_group() {
+    let scenario = "crash-leave-child";
+    let mut hub = Hub::with_scenarios_and(&[scenario], |config| {
         let state = PathBuf::from(config["stateDir"].as_str().unwrap());
-        let witness = state.with_file_name("group-witness");
-        rustix::fs::mkfifoat(rustix::fs::CWD, &witness, rustix::fs::Mode::RWXU).unwrap();
+        let survivor = state.with_file_name("group-survivor.pid");
         let bash = config["shells"][0]["paths"][0].clone();
         let fake = &mut config["agents"][scenario]["argv"];
+        // Publish readiness only after ignoring TERM, so this member needs KILL.
+        let script = r#"
+(
+    trap '' TERM
+    printf '%s\n' "$BASHPID" >"$1"
+    exec sleep 60
+) </dev/null >/dev/null 2>&1 &
+shift
+exec "$@"
+"#;
         let mut argv = vec![
             bash,
             json!("-c"),
-            json!(GROUP_WITNESS),
-            json!("group-witness"),
-            json!(witness),
+            json!(script),
+            json!("survivor"),
+            json!(survivor),
         ];
         argv.append(fake.as_array_mut().unwrap());
         *fake = json!(argv);
-    })
-}
-
-fn sigterm_witness_pid(hub: &Hub, pgid: u32) -> u32 {
-    let witness = hub.dir.join("group-witness.pid");
-    let witness_pid = || {
-        fs::read_to_string(&witness)
+    });
+    let mut c = hub.connect();
+    let (_, evs) = spawn_until(&mut c, &hub, "a1", scenario, "session");
+    let pgid = agent_pid(&evs);
+    let survivor = hub.dir.join("group-survivor.pid");
+    let survivor_pid = || {
+        fs::read_to_string(&survivor)
             .ok()?
             .strip_suffix('\n')?
             .parse::<u32>()
             .ok()
     };
-    eventually(PATIENCE, "the SIGTERM witness is ready", || {
-        witness_pid().is_some()
+    eventually(PATIENCE, "the stubborn group member is ready", || {
+        survivor_pid().is_some()
     });
-    let witness_pid = witness_pid().unwrap();
-    assert!(group_members(pgid).contains(&witness_pid));
-    witness_pid
-}
-
-#[test]
-fn hub_kills_what_a_crashed_agent_left_in_its_group() {
-    let mut hub = hub_with_group_witness("crash-leave-child");
-    let mut c = hub.connect();
-    let (_, evs) = spawn_until(&mut c, &hub, "a1", "crash-leave-child", "session");
-    let pgid = agent_pid(&evs);
-    let witness_pid = sigterm_witness_pid(&hub, pgid);
+    let survivor_pid = survivor_pid().unwrap();
+    assert!(group_members(pgid).contains(&survivor_pid));
     assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
     let exit = c.event("a1", "exit");
     assert_eq!(exit["reason"], "exited");
     assert_eq!(exit["code"], 1);
 
-    let term = hub.dir.join("group-witness.term");
-    eventually(PATIENCE, "the survivor receives SIGTERM", || {
-        fs::read_to_string(&term).is_ok_and(|s| s.ends_with('\n'))
-    });
-    let stat = fs::read_to_string(term).unwrap();
-    assert_eq!(
-        stat.rsplit_once(')')
-            .and_then(|(_, fields)| fields.split_whitespace().next()),
-        Some("Z"),
-        "the leader must still pin the group during escalation; witness saw {stat:?}"
-    );
-
     let note = hub
-        .record("crash-leave-child")
+        .record(scenario)
         .into_iter()
         .find(|e| e["note"] == "child")
         .expect("a child note");
     let child = u32::try_from(note["childPid"].as_u64().unwrap()).unwrap();
     eventually(PATIENCE, "both crash survivors are terminated", || {
-        !running(child) && !running(witness_pid) && group_members(pgid).is_empty()
+        !running(child) && !running(survivor_pid) && group_members(pgid).is_empty()
     });
     wait_reaped(pgid);
     drop(c);

@@ -25,11 +25,19 @@ impl Target {
     }
 }
 
-pub(crate) struct Escalations(Mutex<Option<HashMap<Id, Target>>>);
+pub(crate) struct Escalations {
+    pending: Mutex<Option<HashMap<Id, Target>>>,
+    #[cfg(test)]
+    kill_gate: Option<Arc<tokio::sync::Notify>>,
+}
 
 impl Default for Escalations {
     fn default() -> Self {
-        Self(Mutex::new(Some(HashMap::new())))
+        Self {
+            pending: Mutex::new(Some(HashMap::new())),
+            #[cfg(test)]
+            kill_gate: None,
+        }
     }
 }
 
@@ -43,16 +51,22 @@ impl Escalations {
     }
 
     fn arm_target(self: &Arc<Self>, target: Target, grace: Duration) {
-        let mut pending = lock(&self.0);
+        let mut pending = lock(&self.pending);
         let Some(targets) = pending.as_mut() else {
             return target.kill();
         };
         let owner = Arc::downgrade(self);
         let deadline = Instant::now() + grace;
+        #[cfg(test)]
+        let gate = self.kill_gate.clone();
         let timer = tokio::spawn(async move {
             tokio::time::sleep_until(deadline).await;
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
             let Some(owner) = owner.upgrade() else { return };
-            let mut pending = lock(&owner.0);
+            let mut pending = lock(&owner.pending);
             if let Some(target) = pending.as_mut().and_then(|s| s.remove(&tokio::task::id())) {
                 target.kill();
             }
@@ -62,7 +76,7 @@ impl Escalations {
 
     pub(crate) fn finish(&self) {
         // Serialize delivery itself with the timers, not just removal from the map.
-        let mut pending = lock(&self.0);
+        let mut pending = lock(&self.pending);
         if let Some(targets) = pending.take() {
             for target in targets.into_values() {
                 target.kill();
@@ -70,10 +84,23 @@ impl Escalations {
         }
     }
 
+    /// Hold a single escalation until the test has observed TERM.
+    /// Install before starting the actor, including when the actor may unwind.
+    #[cfg(test)]
+    pub(crate) fn gated_for_test() -> (Self, Arc<tokio::sync::Notify>) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut escalations = Self::default();
+        escalations.kill_gate = Some(gate.clone());
+        (escalations, gate)
+    }
+
     /// Move the captured targets out of the timers' reach without killing them yet.
     #[cfg(test)]
     pub(crate) fn take_pending_for_test(&self) -> Self {
-        Self(Mutex::new(lock(&self.0).take()))
+        Self {
+            pending: Mutex::new(lock(&self.pending).take()),
+            kill_gate: None,
+        }
     }
 }
 
