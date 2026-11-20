@@ -125,21 +125,26 @@ pub fn open(ctx: Arc<Ctx>, sid: String, open: Open) -> Pin<Box<dyn Future<Output
         // The second round covers an actor that was forgotten between the lookup and
         // the send; it removed its registry entry before it stopped receiving.
         for _ in 0..2 {
-            match ctx.registry.route(&sid, open.spawn.is_some()) {
-                Route::Send(tx) => {
+            match ctx.registry.route(&sid, open.spawn.is_some()).await {
+                Ok(Route::Send(tx)) => {
                     if let Ok(permit) = tx.reserve().await {
                         return permit.send(Cmd::Open(open));
                     }
                 }
-                Route::Created { created_at, rx } => {
+                Ok(Route::Created { created_at, rx }) => {
                     return start(ctx.clone(), sid, created_at, rx, Start::Open(open));
                 }
-                Route::NotFound => {
+                Ok(Route::NotFound) => {
                     return open
                         .reply
                         .err(ErrorCode::NotFound, format!("no session {sid}"));
                 }
-                Route::Stopping => return open.reply.err(ErrorCode::Internal, "hub stopping"),
+                Ok(Route::Stopping) => return open.reply.err(ErrorCode::Internal, "hub stopping"),
+                Err(e) => {
+                    return open
+                        .reply
+                        .err(ErrorCode::Internal, format!("reserving epoch: {e}"));
+                }
             }
         }
         open.reply.err(ErrorCode::Internal, "session actor is gone");

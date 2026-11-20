@@ -236,13 +236,13 @@ pub fn open(
         // The second round covers an actor that was forgotten between the lookup and
         // the send; it removed its registry entry before it stopped receiving.
         for _ in 0..2 {
-            match ctx.registry.route(&sid, open.spawn.is_some()) {
-                Route::Send(tx) => {
+            match ctx.registry.route(&sid, open.spawn.is_some()).await {
+                Ok(Route::Send(tx)) => {
                     if let Ok(permit) = tx.reserve().await {
                         return permit.send(Cmd::Open(open));
                     }
                 }
-                Route::Created { created_at, rx } => {
+                Ok(Route::Created { created_at, rx }) => {
                     return start(
                         ctx.clone(),
                         sid,
@@ -251,12 +251,17 @@ pub fn open(
                         Start::Create(Box::new(open)),
                     );
                 }
-                Route::NotFound => {
+                Ok(Route::NotFound) => {
                     return open
                         .reply
                         .err(ErrorCode::NotFound, format!("no session {sid}"));
                 }
-                Route::Stopping => return open.reply.err(ErrorCode::Internal, "hub stopping"),
+                Ok(Route::Stopping) => return open.reply.err(ErrorCode::Internal, "hub stopping"),
+                Err(e) => {
+                    return open
+                        .reply
+                        .err(ErrorCode::Internal, format!("reserving epoch: {e}"));
+                }
             }
         }
         open.reply.err(ErrorCode::Internal, "session actor is gone");
@@ -274,17 +279,18 @@ fn checked_task(task: Option<String>) -> Result<Option<String>, &'static str> {
 
 /// Registers and starts the session `sid` found in the state directory at startup. A
 /// session that fails to load is quarantined and shows the fault.
-pub async fn load(ctx: &Arc<Ctx>, sid: String) {
+pub async fn load(ctx: &Arc<Ctx>, sid: String) -> io::Result<()> {
     let (created_at, from) = match read(ctx, &sid).await {
         Ok(Some(loaded)) => (
             Some(loaded.meta.created_at),
             Start::Loaded(Box::new(loaded)),
         ),
-        Ok(None) => return,
+        Ok(None) => return Ok(()),
         Err(fault) => (None, Start::Faulted(fault)),
     };
-    let (created_at, rx) = ctx.registry.load(&sid, created_at);
+    let (created_at, rx) = ctx.registry.load(&sid, created_at).await?;
     start(ctx.clone(), sid, created_at, rx, from);
+    Ok(())
 }
 
 /// What a session's actor starts from.
@@ -3249,7 +3255,7 @@ mod tests {
                 .unwrap(),
         );
         let ctx = Arc::new(ctx);
-        let (epoch, rx) = ctx.registry.load("a", None);
+        let (epoch, rx) = ctx.registry.load("a", None).await.unwrap();
         let mut acp = Acp::new(ctx, "a".into(), epoch, Arc::default());
         acp.meta = Meta {
             sid: acp.sid.clone(),

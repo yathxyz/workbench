@@ -300,6 +300,8 @@ The error codes are a closed set:
 - **Incarnation:** a sid can be forgotten and recreated, and `createdAt` distinguishes the incarnations.
   - It is persisted in `<kind>/<sid>.json` and survives hub restarts, revive and PTY respawn.
   - A new value is assigned only when a session is created.
+  - Across both kinds the allocator takes the larger of the wall clock in milliseconds and one past its durable high-water mark.
+    It commits the mark before exposing an epoch, so a failed creation may leave a gap, but forget, restart and clock rollback cannot reuse an issued value.
 
 #### 3.2.7 Requests (client to hub)
 
@@ -535,6 +537,7 @@ This holds even if a command was queued as the old session was being forgotten.
 **Hub `stateDir`:** the module passes `/home/alice/.local/state/workbench/hub`. Directories are 0700 and files 0600.
 ```
 hub.lock                                  flock, single instance
+last-created                              decimal high-water mark for allocated session epochs
 pty/<sid>.json                            {sid, shell (name), argv (argv[0] = the resolved shell path), cwd, env (client-supplied only), createdAt, cols, rows, exit|null}
 pty/<sid>.snap                            last VT snapshot (on exit, on SIGTERM, every 30 s while dirty)
 acp/<sid>.json                            {sid, agent, cwd, createdAt, agentSessionId|null, init|null, seenSeq, managedWorktree?}
@@ -544,6 +547,8 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
 ```
 - The loader considers only `<sid>.json` files whose stem matches the sid regex. Quarantined names contain a dot, so they never match.
 - `.json` and `.snap` are written atomically: tmp, fsync, rename, fsync the directory.
+- `last-created` uses the same atomic write and is never deleted by forget.
+  On upgrade, a missing mark is seeded from recovered records before clients can forget them; an unreadable or malformed mark is an error, not a reset.
 - The journal is appended with one `pwrite(2)` per event at the tracked end of its last complete line, never with `O_APPEND`. If a failed append cannot even be truncated away, what is left is a prefix of a line with no `\n`: the next append overwrites it, and the next open truncates it. `fdatasync` runs on `session`, `setup_error`, `turn_end`, `turn_error`, `exit` and SIGTERM.
 
 **Web `stateDir`** (`…/workbench/web`): `web.lock`, `artifacts/<node>/…`, artifact `db.json`. **There is no `index.db`**: the notes index lives in memory.

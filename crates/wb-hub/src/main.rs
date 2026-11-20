@@ -70,7 +70,7 @@ impl Ctx {
                 logname: "user".into(),
             },
             child_umask: Mode::empty(),
-            registry: Registry::default(),
+            registry: Registry::open(dir).unwrap(),
             started_at: 1,
             pty_dir,
             acp_dir,
@@ -148,11 +148,13 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
     for dir in [&pty_dir, &acp_dir] {
         store::remove_tmp(dir).with_context(|| format!("cleaning {}", dir.display()))?;
     }
+    let registry =
+        Registry::open(&cfg.state_dir).context("loading session epoch high-water mark")?;
     let ctx = Arc::new(Ctx {
         cfg,
         ident,
         child_umask,
-        registry: Registry::default(),
+        registry,
         started_at: now_ms(),
         pty_dir,
         acp_dir,
@@ -213,7 +215,7 @@ async fn load_sessions(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
                 Ok(None) => continue,
                 Err(fault) => (None, Start::Faulted(fault)),
             };
-        let (created_at, rx) = ctx.registry.load(&sid, created_at);
+        let (created_at, rx) = ctx.registry.load(&sid, created_at).await?;
         pty::start(ctx.clone(), sid, created_at, rx, from);
     }
     let sids =
@@ -223,7 +225,7 @@ async fn load_sessions(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
             warn!(%sid, "an ACP record has the sid of a PTY session; not loading it");
             continue;
         }
-        acp::load(ctx, sid).await;
+        acp::load(ctx, sid).await?;
     }
     info!(sessions = ctx.registry.published_count(), "loaded");
     Ok(())

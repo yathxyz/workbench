@@ -6,35 +6,95 @@
 //! critical section.
 
 use std::collections::BTreeMap;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, mpsc};
 use wb_proto::hub::{ErrorCode, HubMessage, Kind, Summary};
 
 use crate::conn::{ConnId, Reply, Viewer, line};
 use crate::outq::OutQ;
 use crate::snapshot::{self, Snapshot, SnapshotMode};
-use crate::{acp, lock, now_ms, pty};
+use crate::{acp, lock, now_ms, pty, store};
 
 /// Commands a session actor buffers before senders wait.
 const CMD_QUEUE: usize = 8;
 
-#[derive(Default)]
+const EPOCH_FILE: &str = "last-created";
+
+struct Epochs {
+    dir: PathBuf,
+    last: u64,
+}
+
+impl Epochs {
+    /// An existing record keeps its epoch; every allocation exceeds the durable mark.
+    /// Move the lock into the write so cancellation cannot race another reservation.
+    async fn reserve(
+        mut epochs: OwnedMutexGuard<Self>,
+        restored: Option<u64>,
+        now: u64,
+    ) -> io::Result<(u64, OwnedMutexGuard<Self>)> {
+        let epoch = match restored {
+            Some(epoch) if epoch <= epochs.last => return Ok((epoch, epochs)),
+            Some(epoch) => epoch,
+            None => now.max(
+                epochs
+                    .last
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("session epochs exhausted"))?,
+            ),
+        };
+        tokio::task::spawn_blocking(move || {
+            store::write_atomic(&epochs.dir, EPOCH_FILE, epoch.to_string().as_bytes())?;
+            epochs.last = epoch;
+            Ok((epoch, epochs))
+        })
+        .await?
+    }
+}
+
 pub struct Registry {
     inner: Mutex<Inner>,
+    // Only creators serialize with disk I/O; existing sessions and watches do not.
+    epochs: Arc<AsyncMutex<Epochs>>,
 }
 
 #[derive(Default)]
 struct Inner {
     sessions: BTreeMap<String, Entry>,
     watchers: Vec<Viewer>,
-    /// The last `createdAt` handed out; each new one is larger.
-    last_created: u64,
     /// Set by [`Registry::stop`]: no session is created any more.
     stopping: bool,
 }
 
 impl Inner {
+    fn existing<C: SessionCmd>(&self, sid: &str, create: bool) -> Option<Route<C>> {
+        if let Some(e) = self.sessions.get(sid) {
+            Some(C::unwrap(&e.tx).map_or(Route::NotFound, Route::Send))
+        } else if !create {
+            Some(Route::NotFound)
+        } else if self.stopping {
+            Some(Route::Stopping)
+        } else {
+            None
+        }
+    }
+
+    fn insert<C: SessionCmd>(&mut self, sid: &str, created_at: u64) -> mpsc::Receiver<C> {
+        let (tx, rx) = mpsc::channel(CMD_QUEUE);
+        self.sessions.insert(
+            sid.to_owned(),
+            Entry {
+                created_at,
+                tx: C::wrap(tx),
+                summary: None,
+            },
+        );
+        rx
+    }
+
     fn summaries(&self) -> impl Clone + Iterator<Item = &Arc<Summary>> {
         self.sessions.values().filter_map(|e| e.summary.as_ref())
     }
@@ -164,6 +224,23 @@ pub enum Route<C> {
 }
 
 impl Registry {
+    pub fn open(dir: &Path) -> io::Result<Self> {
+        let last = match std::fs::read_to_string(dir.join(EPOCH_FILE)) {
+            Ok(text) => text
+                .parse()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e),
+        };
+        Ok(Self {
+            inner: Mutex::default(),
+            epochs: Arc::new(AsyncMutex::new(Epochs {
+                dir: dir.to_owned(),
+                last,
+            })),
+        })
+    }
+
     pub fn published_count(&self) -> usize {
         lock(&self.inner).summaries().count()
     }
@@ -284,48 +361,44 @@ impl Registry {
 
     /// Finds the session for `sid`, registering a new one of kind `C` when there is none
     /// and `create` is set.
-    pub fn route<C: SessionCmd>(&self, sid: &str, create: bool) -> Route<C> {
+    pub async fn route<C: SessionCmd>(&self, sid: &str, create: bool) -> io::Result<Route<C>> {
+        self.route_with_clock(sid, create, now_ms).await
+    }
+
+    async fn route_with_clock<C: SessionCmd>(
+        &self,
+        sid: &str,
+        create: bool,
+        clock: impl FnOnce() -> u64,
+    ) -> io::Result<Route<C>> {
+        if let Some(route) = lock(&self.inner).existing(sid, create) {
+            return Ok(route);
+        }
+        let epochs = self.epochs.clone().lock_owned().await;
+        if let Some(route) = lock(&self.inner).existing(sid, create) {
+            return Ok(route);
+        }
+        let (created_at, _reservation) = Epochs::reserve(epochs, None, clock()).await?;
         let mut inner = lock(&self.inner);
-        if let Some(e) = inner.sessions.get(sid) {
-            return C::unwrap(&e.tx).map_or(Route::NotFound, Route::Send);
-        }
-        if !create {
-            return Route::NotFound;
-        }
         if inner.stopping {
-            return Route::Stopping;
+            return Ok(Route::Stopping);
         }
-        let created_at = now_ms().max(inner.last_created + 1);
-        inner.last_created = created_at;
-        let (tx, rx) = mpsc::channel(CMD_QUEUE);
-        let entry = Entry {
-            created_at,
-            tx: C::wrap(tx),
-            summary: None,
-        };
-        inner.sessions.insert(sid.to_owned(), entry);
-        Route::Created { created_at, rx }
+        let rx = inner.insert(sid, created_at);
+        Ok(Route::Created { created_at, rx })
     }
 
     /// Registers a session found in the state directory at startup, with its `createdAt`,
     /// or with a new one when its record could not be read. The caller starts its actor
     /// on the returned channel.
-    pub fn load<C: SessionCmd>(
+    pub async fn load<C: SessionCmd>(
         &self,
         sid: &str,
         created_at: Option<u64>,
-    ) -> (u64, mpsc::Receiver<C>) {
-        let mut inner = lock(&self.inner);
-        let created_at = created_at.unwrap_or_else(|| now_ms().max(inner.last_created + 1));
-        inner.last_created = inner.last_created.max(created_at);
-        let (tx, rx) = mpsc::channel(CMD_QUEUE);
-        let entry = Entry {
-            created_at,
-            tx: C::wrap(tx),
-            summary: None,
-        };
-        inner.sessions.insert(sid.to_owned(), entry);
-        (created_at, rx)
+    ) -> io::Result<(u64, mpsc::Receiver<C>)> {
+        let epochs = self.epochs.clone().lock_owned().await;
+        let (created_at, _reservation) = Epochs::reserve(epochs, created_at, now_ms()).await?;
+        let rx = lock(&self.inner).insert(sid, created_at);
+        Ok((created_at, rx))
     }
 
     /// A new command channel for a session whose actor panicked and is being reloaded;
@@ -425,5 +498,61 @@ async fn send_to<C: SessionCmd>(sid: &str, tx: mpsc::Sender<C>, cmd: C) {
         unsent
             .0
             .refuse(ErrorCode::NotFound, format!("no session {sid}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn create(hub: &Registry, now: u64) -> u64 {
+        match hub.route_with_clock::<pty::Cmd>("job", true, || now).await {
+            Ok(Route::Created { created_at, .. }) => created_at,
+            _ => panic!("expected creation"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forgotten_epoch_cannot_guard_replacement_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let restart = || Registry::open(dir.path()).unwrap();
+        let hub = restart();
+        let old = create(&hub, 100).await;
+        hub.forget("job", old, &[]);
+        drop(hub);
+
+        let hub = restart();
+        let created_at = create(&hub, 100).await;
+        assert!(
+            matches!(
+                hub.action_sender::<pty::Cmd>("job", Some(old)),
+                Err((ErrorCode::Stale, _))
+            ),
+            "epoch {old} guarded replacement {created_at}"
+        );
+
+        // Crash after route hands out the epoch, before the actor writes any record.
+        drop(hub);
+        assert!(create(&restart(), 90).await > created_at);
+    }
+
+    #[tokio::test]
+    async fn forget_immediately_after_upgrade_preserves_restored_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Registry::open(dir.path()).unwrap();
+        let (epoch, _) = hub.load::<acp::Cmd>("job", Some(200)).await.unwrap();
+        assert_eq!(epoch, 200);
+        hub.forget("job", epoch, &[]);
+        drop(hub);
+        assert!(create(&Registry::open(dir.path()).unwrap(), 40).await > epoch);
+    }
+
+    #[tokio::test]
+    async fn failed_epoch_write_does_not_register_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Registry::open(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join(EPOCH_FILE)).unwrap();
+        assert!(hub.route::<acp::Cmd>("job", true).await.is_err());
+        assert!(hub.kind("job").is_none());
     }
 }
