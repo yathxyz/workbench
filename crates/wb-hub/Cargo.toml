@@ -21,4 +21,5 @@ vt100.workspace = true
 
 [dev-dependencies]
 agent-client-protocol-schema.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

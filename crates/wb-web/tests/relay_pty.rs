@@ -137,6 +137,7 @@ async fn pending_kill(browser_gone: bool, session: bool) {
         HubRequest::PtyKill {
             rid: rid_of(&request) + 1,
             sid: "pending".into(),
+            epoch: None,
             forget: !session,
         }
     );

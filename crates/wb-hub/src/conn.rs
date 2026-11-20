@@ -56,6 +56,16 @@ pub struct Reply {
 }
 
 impl Reply {
+    #[cfg(test)]
+    pub(crate) fn for_test(rid: u64, outq: Arc<OutQ>) -> Self {
+        Self {
+            rid,
+            outq,
+            sent: false,
+            _permit: None,
+        }
+    }
+
     pub fn ok(mut self, result: &impl Serialize) {
         self.send(&HubMessage::ok(self.rid, result));
     }
@@ -176,6 +186,7 @@ fn hello(ctx: &Ctx) -> HubMessage {
         acp_config: true,
         acp_worktree: ctx.cfg.git.is_some(),
         acp_task: true,
+        session_action_epoch: true,
         hosts: ctx
             .cfg
             .hosts
@@ -318,6 +329,23 @@ impl Conn {
             HubRequest::Watch { rid, stream } => {
                 self.ctx.registry.watch(self.viewer(), rid, stream)
             }
+            HubRequest::SessionKill {
+                rid,
+                sid,
+                epoch,
+                forget,
+            } => {
+                if !valid_sid(&sid) {
+                    return self.error(
+                        Some(rid),
+                        None,
+                        ErrorCode::BadRequest,
+                        "invalid sid".into(),
+                    );
+                }
+                let reply = self.reply(rid).await;
+                self.ctx.registry.kill(&sid, epoch, forget, reply).await;
+            }
             HubRequest::PtyOpen {
                 rid,
                 sid,
@@ -328,7 +356,7 @@ impl Conn {
             } => self.open(rid, sid, cols, rows, spawn, resume).await,
             HubRequest::PtyDetach { rid, sid } => {
                 let conn = self.id;
-                self.to_session(rid, sid, |reply| Cmd::Detach {
+                self.to_session(rid, sid, None, |reply, _| Cmd::Detach {
                     conn,
                     reply: Some(reply),
                 })
@@ -343,13 +371,22 @@ impl Conn {
                     let _ = tx.send(Cmd::Resize { cols, rows }).await;
                 }
             }
-            HubRequest::PtyKill { rid, sid, forget } => {
-                self.to_session(rid, sid, |reply| Cmd::Kill { forget, reply })
-                    .await;
+            HubRequest::PtyKill {
+                rid,
+                sid,
+                forget,
+                epoch,
+            } => {
+                self.to_session(rid, sid, epoch, |reply, epoch| Cmd::Kill {
+                    epoch,
+                    forget,
+                    reply,
+                })
+                .await;
             }
             HubRequest::PtyCapture { rid, sid, lines } => {
                 let lines = lines.unwrap_or(CAPTURE_DEFAULT).min(CAPTURE_MAX as u32) as usize;
-                self.to_session(rid, sid, |reply| Cmd::Capture { lines, reply })
+                self.to_session(rid, sid, None, |reply, _| Cmd::Capture { lines, reply })
                     .await;
             }
             HubRequest::AcpOpen {
@@ -361,16 +398,21 @@ impl Conn {
             } => self.acp_open(rid, sid, since, epoch, spawn).await,
             HubRequest::AcpDetach { rid, sid } => {
                 let conn = self.id;
-                self.to_session(rid, sid, |reply| acp::Cmd::Detach {
+                self.to_session(rid, sid, None, |reply, _| acp::Cmd::Detach {
                     conn,
                     reply: Some(reply),
                 })
                 .await;
             }
-            HubRequest::AcpPrompt { rid, sid, prompt } => {
-                self.act(rid, sid, Act::Prompt(prompt)).await;
+            HubRequest::AcpPrompt {
+                rid,
+                sid,
+                prompt,
+                epoch,
+            } => self.act(rid, sid, epoch, Act::Prompt(prompt)).await,
+            HubRequest::AcpCancel { rid, sid, epoch } => {
+                self.act(rid, sid, epoch, Act::Cancel).await
             }
-            HubRequest::AcpCancel { rid, sid } => self.act(rid, sid, Act::Cancel).await,
             HubRequest::AcpPermission {
                 rid,
                 sid,
@@ -383,7 +425,7 @@ impl Conn {
                     epoch,
                     outcome,
                 };
-                self.act(rid, sid, act).await;
+                self.act(rid, sid, None, act).await;
             }
             HubRequest::AcpElicitation {
                 rid,
@@ -397,21 +439,26 @@ impl Conn {
                     epoch,
                     response,
                 };
-                self.act(rid, sid, act).await;
+                self.act(rid, sid, None, act).await;
             }
-            HubRequest::AcpSetMode { rid, sid, mode_id } => {
-                self.act(rid, sid, Act::SetMode(mode_id)).await;
-            }
+            HubRequest::AcpSetMode {
+                rid,
+                sid,
+                mode_id,
+                epoch,
+            } => self.act(rid, sid, epoch, Act::SetMode(mode_id)).await,
             HubRequest::AcpSetConfigOption {
                 rid,
                 sid,
                 epoch,
+                check_epoch_first,
                 config_id,
                 value,
             } => {
                 self.act(
                     rid,
                     sid,
+                    check_epoch_first.then_some(epoch),
                     Act::SetConfigOption {
                         epoch,
                         config_id,
@@ -421,7 +468,7 @@ impl Conn {
                 .await;
             }
             HubRequest::AcpSetTask { rid, sid, task } => {
-                self.act(rid, sid, Act::SetTask(task)).await;
+                self.act(rid, sid, None, Act::SetTask(task)).await;
             }
             HubRequest::AcpSetPolicy {
                 rid,
@@ -429,20 +476,24 @@ impl Conn {
                 epoch,
                 policy,
             } => {
-                self.act(rid, sid, Act::SetPolicy { epoch, policy }).await;
+                self.act(rid, sid, None, Act::SetPolicy { epoch, policy })
+                    .await;
             }
-            HubRequest::AcpSeen { rid, sid, seq } => self.act(rid, sid, Act::Seen(seq)).await,
-            HubRequest::AcpRevive { rid, sid } => self.act(rid, sid, Act::Revive).await,
+            HubRequest::AcpSeen { rid, sid, seq } => self.act(rid, sid, None, Act::Seen(seq)).await,
+            HubRequest::AcpRevive { rid, sid } => self.act(rid, sid, None, Act::Revive).await,
             HubRequest::AcpAuthenticate {
                 rid,
                 sid,
                 method_id,
-            } => self.act(rid, sid, Act::Authenticate(method_id)).await,
-            HubRequest::AcpKill { rid, sid, forget } => {
-                self.act(rid, sid, Act::Kill { forget }).await;
-            }
+            } => self.act(rid, sid, None, Act::Authenticate(method_id)).await,
+            HubRequest::AcpKill {
+                rid,
+                sid,
+                forget,
+                epoch,
+            } => self.act(rid, sid, epoch, Act::Kill { forget }).await,
             HubRequest::AcpRemoveWorktree { rid, sid } => {
-                self.act(rid, sid, Act::RemoveWorktree).await;
+                self.act(rid, sid, None, Act::RemoveWorktree).await;
             }
             HubRequest::Unknown => {
                 self.error(
@@ -510,9 +561,13 @@ impl Conn {
         acp::open(self.ctx.clone(), sid, open).await;
     }
 
-    async fn act(&self, rid: u64, sid: String, act: Act) {
-        self.to_session(rid, sid, |reply| acp::Cmd::Act { act, reply })
-            .await;
+    async fn act(&self, rid: u64, sid: String, epoch: Option<u64>, act: Act) {
+        self.to_session(rid, sid, epoch, |reply, epoch| acp::Cmd::Act {
+            epoch,
+            act,
+            reply,
+        })
+        .await;
     }
 
     /// `Some(Err)` if `sid` is a session of the other kind than `C`.
@@ -526,20 +581,32 @@ impl Conn {
         })
     }
 
-    async fn to_session<C: SessionCmd>(&self, rid: u64, sid: String, cmd: impl FnOnce(Reply) -> C) {
+    async fn to_session<C: SessionCmd>(
+        &self,
+        rid: u64,
+        sid: String,
+        epoch: Option<u64>,
+        cmd: impl FnOnce(Reply, Option<u64>) -> C,
+    ) {
         if !valid_sid(&sid) {
             return self.error(Some(rid), None, ErrorCode::BadRequest, "invalid sid".into());
         }
+        if epoch.is_some() {
+            let cmd = cmd(self.reply(rid).await, epoch);
+            return self.ctx.registry.deliver(&sid, cmd).await;
+        }
+        // Legacy kind mismatches do not wait for a reply permit. After waiting,
+        // a missing typed sender (including a changed kind) is always not_found.
         if let Some(Err(msg)) = self.kind_check::<C>(&sid) {
             return self.error(Some(rid), None, ErrorCode::KindMismatch, msg);
         }
         let reply = self.reply(rid).await;
         match self.ctx.registry.sender::<C>(&sid) {
             Some(tx) => {
-                if let Err(unsent) = tx.send(cmd(reply)).await {
+                if let Err(unsent) = tx.send(cmd(reply, None)).await {
                     unsent
                         .0
-                        .refuse(ErrorCode::NotFound, &format!("no session {sid}"));
+                        .refuse(ErrorCode::NotFound, format!("no session {sid}"));
                 }
             }
             None => reply.err(ErrorCode::NotFound, format!("no session {sid}")),
@@ -655,6 +722,64 @@ mod tests {
             cwd_from: None,
             env: None,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hub_action_epoch_unguarded_kind_check_precedes_reply_permit() {
+        use serde_json::json;
+        use tokio::time::timeout;
+
+        async fn next_reply(q: &OutQ) -> Value {
+            let line = timeout(Duration::ZERO, q.pop()).await.unwrap().unwrap();
+            serde_json::from_slice(&line).unwrap()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(Ctx::for_test(dir.path()));
+        let mut conn = Conn {
+            ctx: ctx.clone(),
+            id: 1,
+            outq: Arc::default(),
+            permits: Arc::new(Semaphore::new(REQS_IN_FLIGHT)),
+            opened: HashSet::new(),
+        };
+        let (epoch, mut rx) = ctx.registry.load::<Cmd>("job", None);
+        let mut held = Vec::new();
+        for rid in 1..=REQS_IN_FLIGHT {
+            let request = json!({"t": "pty.capture", "rid": rid, "sid": "job"});
+            conn.dispatch(&request.to_string()).await;
+            let Cmd::Capture { reply, .. } = rx.try_recv().unwrap() else {
+                panic!("expected a capture");
+            };
+            held.push(reply);
+        }
+        assert_eq!(conn.permits.available_permits(), 0);
+
+        // A wrong-kind legacy action must answer even while every reply is held.
+        let wrong = r#"{"t":"acp.cancel","rid":101,"sid":"job"}"#;
+        timeout(Duration::ZERO, conn.dispatch(wrong))
+            .await
+            .expect("unguarded kind mismatch waited for a reply permit");
+        assert_eq!(
+            next_reply(&conn.outq).await,
+            json!({"t":"err","rid":101,"code":"kind_mismatch","message":"job is a pty session"})
+        );
+
+        // A matching action does wait. If the kind changes in that window, the
+        // subsequent typed sender lookup misses; it doesn't run the kind check again.
+        let q = conn.outq.clone();
+        let matching = r#"{"t":"pty.kill","rid":102,"sid":"job","forget":false}"#;
+        let mut waiting = std::pin::pin!(conn.dispatch(matching));
+        assert!(timeout(Duration::ZERO, &mut waiting).await.is_err());
+        ctx.registry.forget("job", epoch, &[]);
+        let (_, _replacement) = ctx.registry.load::<acp::Cmd>("job", None);
+        held.pop().unwrap().done();
+        assert_eq!(next_reply(&q).await["t"], "ok");
+        timeout(Duration::ZERO, waiting).await.unwrap();
+        assert_eq!(
+            next_reply(&q).await,
+            json!({"t":"err","rid":102,"code":"not_found","message":"no session job"})
+        );
     }
 
     #[tokio::test(start_paused = true)]

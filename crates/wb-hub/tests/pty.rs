@@ -26,6 +26,52 @@ fn pid_of(reply: &Value) -> u32 {
 }
 
 #[test]
+fn hub_action_epoch_rechecks_queued_kill_on_redelivery_after_forget() {
+    let hub = Hub::start();
+    let mut c = hub.connect();
+    let old = c.spawn("queue", &["bash", "-c", "exit 0"])["epoch"].clone();
+    c.until("the shell's exit", |m| m["t"] == "pty.exit");
+    // Capture waits for the final snapshot write. Replace it with a FIFO so the
+    // next capture holds the actor while the connection queues the entire race.
+    c.ok(json!({"t": "pty.capture", "sid": "queue"}));
+    let snap = hub.pty_file("queue.snap");
+    let contents = fs::read(&snap).unwrap();
+    fs::remove_file(&snap).unwrap();
+    rustix::fs::mkfifoat(rustix::fs::CWD, &snap, rustix::fs::Mode::RWXU).unwrap();
+    c.send(&json!({"rid": 900, "t": "pty.capture", "sid": "queue"}));
+    c.send(&json!({"rid": 901, "t": "pty.kill", "sid": "queue", "forget": true, "epoch": old}));
+    c.send(
+        &json!({"rid": 902, "t": "pty.open", "sid": "queue", "cols": 80, "rows": 24,
+                   "spawn": {"argv": ["bash"]}}),
+    );
+    c.send(&json!({"rid": 903, "t": "pty.kill", "sid": "queue", "forget": true, "epoch": old}));
+    assert_eq!(c.ok(json!({"t": "list"}))["sessions"][0]["createdAt"], old);
+    fs::write(&snap, contents).unwrap();
+    assert_eq!(c.reply(900)["t"], "ok");
+    assert_eq!(c.reply(901)["t"], "ok");
+    let next = c.reply(902);
+    assert_eq!(next["new"], true);
+    assert_ne!(next["epoch"], old);
+    assert_eq!(c.reply(903)["code"], "stale");
+    assert_eq!(c.attach("queue")["pid"], next["pid"]);
+}
+
+#[test]
+fn hub_action_epoch_rejects_present_null_instead_of_targeting_current_session() {
+    let hub = Hub::start();
+    let mut c = hub.connect();
+    for action in [
+        json!({"t": "acp.prompt", "sid": "absent", "epoch": null, "prompt": []}),
+        json!({"t": "acp.cancel", "sid": "absent", "epoch": null}),
+        json!({"t": "acp.set_mode", "sid": "absent", "epoch": null, "modeId": "plan"}),
+        json!({"t": "acp.kill", "sid": "absent", "epoch": null, "forget": true}),
+        json!({"t": "pty.kill", "sid": "absent", "epoch": null, "forget": true}),
+    ] {
+        assert_eq!(c.request(action)["code"], "bad_request");
+    }
+}
+
+#[test]
 fn hello_names_the_hub_and_its_available_shells() {
     let hub = Hub::start_with(|cfg| with_shell(cfg, "gone", &["/nonexistent/gone"]));
     let c = hub.connect();

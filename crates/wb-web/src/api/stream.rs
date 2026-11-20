@@ -185,6 +185,7 @@ mod tests {
             acp_config: false,
             acp_worktree: false,
             acp_task: false,
+            session_action_epoch: false,
             shells: vec![],
             default_shell: String::new(),
             stale: false,

@@ -61,6 +61,7 @@ pub enum Cmd {
         rows: u32,
     },
     Kill {
+        epoch: Option<u64>,
         forget: bool,
         reply: Reply,
     },
@@ -89,7 +90,7 @@ pub struct Open {
 
 impl Cmd {
     /// Answers a command that the session can no longer carry out.
-    pub fn refuse(self, code: ErrorCode, message: &str) {
+    pub fn refuse(self, code: ErrorCode, message: impl Into<String>) {
         match self {
             Cmd::Open(Open { reply, .. })
             | Cmd::Kill { reply, .. }
@@ -503,7 +504,7 @@ impl Pty {
                 let nudged = self.nudge_until.take().is_some();
                 self.resize(winsize(cols, rows), nudged);
             }
-            Cmd::Kill { forget, reply } => self.kill(forget, reply),
+            Cmd::Kill { forget, reply, .. } => self.kill(forget, reply),
             Cmd::Detach { conn, reply } => {
                 let detached = {
                     let mut viewers = lock(&self.viewers);
@@ -1036,20 +1037,11 @@ impl Pty {
     }
 }
 
-/// Delivers a command that reached a forgotten actor to whatever now holds `sid`: an
-/// open is routed as a new request, anything else goes to the current session, if any.
+/// Route an open as a new request; other commands keep their original epoch guard.
 async fn redeliver(ctx: &Arc<Ctx>, sid: &str, cmd: Cmd) {
-    const FORGOTTEN: &str = "the session was forgotten";
     match cmd {
         Cmd::Open(o) => open(ctx.clone(), sid.to_owned(), o).await,
-        cmd => match ctx.registry.sender(sid) {
-            Some(tx) => {
-                if let Err(unsent) = tx.send(cmd).await {
-                    unsent.0.refuse(ErrorCode::NotFound, FORGOTTEN);
-                }
-            }
-            None => cmd.refuse(ErrorCode::NotFound, FORGOTTEN),
-        },
+        cmd => ctx.registry.redeliver(sid, cmd).await,
     }
 }
 

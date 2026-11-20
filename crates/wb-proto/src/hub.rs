@@ -39,6 +39,14 @@ pub enum HubRequest {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         stream: bool,
     },
+    /// End the session of either kind matching `epoch`; `forget` also deletes it.
+    #[serde(rename = "session.kill")]
+    SessionKill {
+        rid: u64,
+        sid: String,
+        epoch: u64,
+        forget: bool,
+    },
     /// Attach to a PTY session. Only a request with `spawn` starts a process.
     /// Reply: [`PtyOpenReply`].
     #[serde(rename = "pty.open")]
@@ -63,7 +71,17 @@ pub enum HubRequest {
     PtyResize { sid: String, cols: u32, rows: u32 },
     /// End the PTY session; with `forget`, also delete it. Reply: `{}`.
     #[serde(rename = "pty.kill")]
-    PtyKill { rid: u64, sid: String, forget: bool },
+    PtyKill {
+        rid: u64,
+        sid: String,
+        forget: bool,
+        #[serde(
+            default,
+            deserialize_with = "crate::policy::deserialize_optional",
+            skip_serializing_if = "Option::is_none"
+        )]
+        epoch: Option<u64>,
+    },
     /// Plain text of the last `lines` lines (default 200, at most `CAPTURE_MAX`).
     /// Reply: [`CaptureReply`].
     #[serde(rename = "pty.capture")]
@@ -97,10 +115,25 @@ pub enum HubRequest {
         rid: u64,
         sid: String,
         prompt: Vec<Value>,
+        #[serde(
+            default,
+            deserialize_with = "crate::policy::deserialize_optional",
+            skip_serializing_if = "Option::is_none"
+        )]
+        epoch: Option<u64>,
     },
     /// Cancel the turn and every pending request. Reply: `{}`.
     #[serde(rename = "acp.cancel")]
-    AcpCancel { rid: u64, sid: String },
+    AcpCancel {
+        rid: u64,
+        sid: String,
+        #[serde(
+            default,
+            deserialize_with = "crate::policy::deserialize_optional",
+            skip_serializing_if = "Option::is_none"
+        )]
+        epoch: Option<u64>,
+    },
     /// Answer the permission request `req` with an ACP `RequestPermissionOutcome`,
     /// verbatim. Reply: `{}`.
     #[serde(rename = "acp.permission")]
@@ -127,6 +160,12 @@ pub enum HubRequest {
         rid: u64,
         sid: String,
         mode_id: String,
+        #[serde(
+            default,
+            deserialize_with = "crate::policy::deserialize_optional",
+            skip_serializing_if = "Option::is_none"
+        )]
+        epoch: Option<u64>,
     },
     /// Change an offered session configuration option. Reply: `{}` after journaling
     /// the agent's complete resulting configuration.
@@ -135,6 +174,10 @@ pub enum HubRequest {
         rid: u64,
         sid: String,
         epoch: u64,
+        /// Check the incarnation while routing, before kind and session-state checks.
+        /// Without this opt-in, preserve the existing config validation order.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        check_epoch_first: bool,
         config_id: String,
         value: Value,
     },
@@ -171,7 +214,17 @@ pub enum HubRequest {
     },
     /// End the agent; with `forget`, also delete the session. Reply: `{}`.
     #[serde(rename = "acp.kill")]
-    AcpKill { rid: u64, sid: String, forget: bool },
+    AcpKill {
+        rid: u64,
+        sid: String,
+        forget: bool,
+        #[serde(
+            default,
+            deserialize_with = "crate::policy::deserialize_optional",
+            skip_serializing_if = "Option::is_none"
+        )]
+        epoch: Option<u64>,
+    },
     /// Remove only this dead session's recorded managed worktree. Reply: `{}`.
     #[serde(rename = "acp.remove_worktree")]
     AcpRemoveWorktree { rid: u64, sid: String },
@@ -218,6 +271,9 @@ pub enum HubMessage {
         /// Whether the hub journals ACP task references. False from an older hub.
         #[serde(default)]
         acp_task: bool,
+        /// Guarded session actions check the caller's epoch before acting.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        session_action_epoch: bool,
     },
     /// Success reply to the request with this `rid`; `result` holds the reply fields.
     #[serde(rename = "ok")]

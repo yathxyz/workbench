@@ -43,10 +43,12 @@ pub fn routes() -> Router<ApiState> {
         .route("/info", get(info))
         .route("/sessions", get(list).post(create))
         .route("/sessions/{sid}", get(one).delete(kill))
+        .route("/sessions/{sid}/epochs/{epoch}", delete(kill))
         .route("/sessions/{sid}/events", get(events))
         .route("/sessions/{sid}/capture", get(capture))
         .route("/sessions/{sid}/prompt", post(prompt))
         .route("/sessions/{sid}/cancel", post(cancel))
+        .route("/sessions/{sid}/epochs/{epoch}/cancel", post(cancel))
         .route("/sessions/{sid}/permission", post(permission))
         .route("/sessions/{sid}/elicitation", post(elicitation))
         .route("/sessions/{sid}/mode", post(mode))
@@ -121,6 +123,21 @@ async fn act(app: &AppState, req: HubRequest, wait: Duration) -> Result<Json<Val
         match req {
             HubRequest::AcpRemoveWorktree { .. } => require_worktree(&info)?,
             HubRequest::AcpSetTask { .. } => require_task(&info)?,
+            HubRequest::AcpPrompt { epoch: Some(_), .. }
+            | HubRequest::AcpCancel { epoch: Some(_), .. }
+            | HubRequest::AcpSetMode { epoch: Some(_), .. }
+            | HubRequest::AcpSetConfigOption {
+                check_epoch_first: true,
+                ..
+            }
+            | HubRequest::SessionKill { .. }
+                if !info.session_action_epoch =>
+            {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "hub does not support session action epochs",
+                ));
+            }
             _ => {}
         }
         conn.request(&req, RID).await.map_err(call_error)
@@ -505,6 +522,8 @@ async fn create(
 struct Prompt {
     text: Option<String>,
     blocks: Option<Vec<Value>>,
+    #[serde(default, deserialize_with = "wb_proto::policy::deserialize_optional")]
+    epoch: Option<u64>,
 }
 
 async fn prompt(
@@ -528,20 +547,49 @@ async fn prompt(
     let req = HubRequest::AcpPrompt {
         rid: RID,
         sid,
+        epoch: body.epoch,
         prompt,
     };
     act(&api.app, req, REPLY_TIMEOUT).await
 }
 
+/// The legacy route has only `sid`. On the guarded route axum requires the epoch
+/// segment and deserializes it before the handler can run.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionPath {
+    sid: String,
+    epoch: Option<u64>,
+}
+
+fn reject_query_epoch(epoch: Option<u64>) -> Result<(), ApiError> {
+    if epoch.is_some() {
+        Err(ApiError::new(StatusCode::BAD_REQUEST, "use the epoch path"))
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct CancelQuery {
+    epoch: Option<u64>,
+}
+
 async fn cancel(
     _: Control,
     State(api): State<ApiState>,
-    Param(id): Param<String>,
+    Param(path): Param<ActionPath>,
+    ApiQuery(query): ApiQuery<CancelQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let sid = sid_of(id)?;
+    reject_query_epoch(query.epoch)?;
+    let sid = sid_of(path.sid)?;
     act(
         &api.app,
-        HubRequest::AcpCancel { rid: RID, sid },
+        HubRequest::AcpCancel {
+            rid: RID,
+            sid,
+            epoch: path.epoch,
+        },
         REPLY_TIMEOUT,
     )
     .await
@@ -603,6 +651,8 @@ async fn elicitation(
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Mode {
     mode_id: String,
+    #[serde(default, deserialize_with = "wb_proto::policy::deserialize_optional")]
+    epoch: Option<u64>,
 }
 
 async fn mode(
@@ -616,6 +666,7 @@ async fn mode(
     let req = HubRequest::AcpSetMode {
         rid: RID,
         sid,
+        epoch: body.epoch,
         mode_id: body.mode_id,
     };
     act(&api.app, req, CONFIG_TIMEOUT).await
@@ -626,6 +677,8 @@ async fn mode(
 struct Config {
     id: String,
     value: ConfigValue,
+    #[serde(default, deserialize_with = "wb_proto::policy::deserialize_optional")]
+    epoch: Option<u64>,
 }
 
 async fn config(
@@ -636,11 +689,15 @@ async fn config(
 ) -> Result<Json<Value>, ApiError> {
     let sid = sid_of(id)?;
     let body: Config = parse(&body)?;
-    let epoch = summary(&api.app, &sid)?.created_at;
+    let epoch = match body.epoch {
+        Some(epoch) => epoch,
+        None => summary(&api.app, &sid)?.created_at,
+    };
     let req = HubRequest::AcpSetConfigOption {
         rid: RID,
         sid,
         epoch,
+        check_epoch_first: body.epoch.is_some(),
         config_id: body.id,
         value: body.value.into(),
     };
@@ -732,17 +789,32 @@ async fn remove_worktree(
 #[derive(Deserialize)]
 struct KillQuery {
     forget: Option<bool>,
+    epoch: Option<u64>,
 }
 
 /// An unpublished sid can already have an ACP actor preparing its worktree.
 async fn kill(
     _: Control,
     State(api): State<ApiState>,
-    Param(id): Param<String>,
+    Param(path): Param<ActionPath>,
     ApiQuery(query): ApiQuery<KillQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let sid = sid_of(id)?;
+    reject_query_epoch(query.epoch)?;
+    let sid = sid_of(path.sid)?;
     let forget = query.forget.unwrap_or(false);
+    // A kill during worktree preparation can wait for cleanup of the checkout.
+    let worktree_wait = GIT_TIMEOUT * 2 + GIT_WORKTREE_TIMEOUT + REPLY_TIMEOUT;
+    if let Some(epoch) = path.epoch {
+        // Only the hub can choose the kind for this incarnation. Its watch can
+        // still list the previous kind, or nothing, when the request arrives.
+        let req = HubRequest::SessionKill {
+            rid: RID,
+            sid,
+            epoch,
+            forget,
+        };
+        return act(&api.app, req, worktree_wait).await;
+    }
     let kind = {
         let state = api.app.hub.state();
         hub_ready(&state.status)?;
@@ -752,11 +824,13 @@ async fn kill(
         Some(Kind::Acp) | None => HubRequest::AcpKill {
             rid: RID,
             sid,
+            epoch: None,
             forget,
         },
         Some(Kind::Pty) => HubRequest::PtyKill {
             rid: RID,
             sid,
+            epoch: None,
             forget,
         },
         Some(Kind::Unknown) => {
@@ -767,8 +841,7 @@ async fn kill(
         }
     };
     let wait = if kind.is_none() {
-        // Cancelling a pending creation waits for cleanup of the unpublished checkout.
-        GIT_TIMEOUT * 2 + GIT_WORKTREE_TIMEOUT + REPLY_TIMEOUT
+        worktree_wait
     } else {
         REPLY_TIMEOUT
     };
@@ -822,6 +895,7 @@ mod tests {
             acp_config: true,
             acp_worktree: true,
             acp_task: true,
+            session_action_epoch: true,
             hosts: hosts
                 .iter()
                 .map(|name| Host {

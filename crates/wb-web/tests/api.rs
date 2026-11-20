@@ -86,7 +86,7 @@ impl Api {
         self.req("GET", path, OWNER).send().await
     }
 
-    /// Sends `req`, answers the one `acp.*` request it causes with `reply(rid)`, and
+    /// Sends `req`, answers the one action it causes with `reply(rid)`, and
     /// returns that request and the response.
     async fn answered(
         &self,
@@ -146,6 +146,7 @@ fn rid_of(r: &HubRequest) -> u64 {
         | HubRequest::AcpRevive { rid, .. }
         | HubRequest::AcpRemoveWorktree { rid, .. }
         | HubRequest::AcpKill { rid, .. }
+        | HubRequest::SessionKill { rid, .. }
         | HubRequest::PtyKill { rid, .. } => *rid,
         other => panic!("no rid in {other:?}"),
     }
@@ -472,7 +473,9 @@ async fn without_a_hub_the_hubs_endpoints_are_503() {
         ("GET", "/v1/sessions/a1/events"),
         ("GET", "/v1/sessions/a1/capture"),
         ("POST", "/v1/sessions/a1/cancel"),
+        ("POST", "/v1/sessions/a1/epochs/7/cancel"),
         ("DELETE", "/v1/sessions/a1"),
+        ("DELETE", "/v1/sessions/a1/epochs/7"),
         ("DELETE", "/v1/sessions/a1/worktree"),
     ] {
         let res = api.req(method, path, OWNER).send().await;
@@ -1031,7 +1034,10 @@ async fn a_hub_that_lists_no_hosts_is_never_asked_for_one() {
 
 #[tokio::test]
 async fn actions_are_the_hubs_requests() {
-    let hub = FakeHub::start();
+    let hub = FakeHub::start_with(Hello {
+        session_action_epoch: None,
+        ..Hello::default()
+    });
     hub.set_sessions(vec![
         summary("a1", "testhost"),
         pty_summary("p1", EPOCH, true, false),
@@ -1052,6 +1058,7 @@ async fn actions_are_the_hubs_requests() {
             HubRequest::AcpPrompt {
                 rid: 1,
                 sid: sid(),
+                epoch: None,
                 prompt: vec![json!({"type": "text", "text": "run the tests"})],
             },
         ),
@@ -1062,6 +1069,7 @@ async fn actions_are_the_hubs_requests() {
             HubRequest::AcpPrompt {
                 rid: 1,
                 sid: sid(),
+                epoch: None,
                 prompt: blocks.as_array().unwrap().clone(),
             },
         ),
@@ -1069,7 +1077,11 @@ async fn actions_are_the_hubs_requests() {
             "POST",
             "/v1/sessions/a1/cancel",
             Value::Null,
-            HubRequest::AcpCancel { rid: 1, sid: sid() },
+            HubRequest::AcpCancel {
+                rid: 1,
+                sid: sid(),
+                epoch: None,
+            },
         ),
         (
             "POST",
@@ -1102,6 +1114,7 @@ async fn actions_are_the_hubs_requests() {
             HubRequest::AcpSetMode {
                 rid: 1,
                 sid: sid(),
+                epoch: None,
                 mode_id: "plan".into(),
             },
         ),
@@ -1124,6 +1137,7 @@ async fn actions_are_the_hubs_requests() {
             HubRequest::AcpKill {
                 rid: 1,
                 sid: sid(),
+                epoch: None,
                 forget: false,
             },
         ),
@@ -1134,6 +1148,7 @@ async fn actions_are_the_hubs_requests() {
             HubRequest::AcpKill {
                 rid: 1,
                 sid: sid(),
+                epoch: None,
                 forget: true,
             },
         ),
@@ -1168,6 +1183,7 @@ async fn actions_are_the_hubs_requests() {
         HubRequest::PtyKill {
             rid: 1,
             sid: "p1".into(),
+            epoch: None,
             forget: true
         }
     );
@@ -1208,6 +1224,10 @@ async fn actions_are_the_hubs_requests() {
         ("/v1/sessions/a1/prompt", json!({"text": "a", "blocks": []})),
         ("/v1/sessions/a1/prompt", json!({"text": 1})),
         (
+            "/v1/sessions/a1/prompt",
+            json!({"text": "a", "epoch": null}),
+        ),
+        (
             "/v1/sessions/a1/permission",
             json!({"req": 7, "outcome": {}}),
         ),
@@ -1217,10 +1237,18 @@ async fn actions_are_the_hubs_requests() {
         ),
         ("/v1/sessions/a1/elicitation", json!({"req": 8, "epoch": 1})),
         ("/v1/sessions/a1/mode", json!({"mode_id": "plan"})),
+        (
+            "/v1/sessions/a1/mode",
+            json!({"modeId": "plan", "epoch": null}),
+        ),
         ("/v1/sessions/a1/config", json!({"value": "other"})),
         (
             "/v1/sessions/a1/config",
             json!({"id": "model", "value": "other", "extra": 1}),
+        ),
+        (
+            "/v1/sessions/a1/config",
+            json!({"id": "model", "value": "other", "epoch": null}),
         ),
         ("/v1/sessions/a%2Fb/cancel", json!({})),
     ];
@@ -1232,14 +1260,17 @@ async fn actions_are_the_hubs_requests() {
             .await;
         assert_eq!(res.status, 400, "{path} {body}");
     }
-    let res = api
-        .req("DELETE", "/v1/sessions/a1?forget=yes", OWNER)
-        .send()
-        .await;
-    assert_eq!(
-        (res.status, res.json()),
-        (400, json!({"error": "bad query"}))
-    );
+    for (method, path) in [
+        ("DELETE", "/v1/sessions/a1?forget=yes"),
+        ("DELETE", "/v1/sessions/a1?epoch="),
+        ("POST", "/v1/sessions/a1/cancel?epoch=-1"),
+    ] {
+        let res = api.req(method, path, OWNER).send().await;
+        assert_eq!(
+            (res.status, res.json()),
+            (400, json!({"error": "bad query"}))
+        );
+    }
     assert!(
         api.hub
             .requests()
@@ -1359,6 +1390,215 @@ async fn live_config_preserves_agent_errors_and_exposes_current_options() {
         assert_eq!(res.status, status);
         assert_eq!(res.json(), json!({"error":"refused","code":code}));
     }
+}
+
+// Method, path, body, and wire operation for a caller that observed epoch 7.
+const GUARDED_ACTIONS: &[(&str, &str, &str, &str)] = &[
+    (
+        "DELETE",
+        "/v1/sessions/p1/epochs/7?forget=true",
+        "",
+        "session.kill",
+    ),
+    (
+        "POST",
+        "/v1/sessions/a1/epochs/7/cancel",
+        "ignored body",
+        "acp.cancel",
+    ),
+    (
+        "POST",
+        "/v1/sessions/a1/prompt",
+        r#"{"text":"go","epoch":7}"#,
+        "acp.prompt",
+    ),
+    (
+        "POST",
+        "/v1/sessions/a1/mode",
+        r#"{"modeId":"plan","epoch":7}"#,
+        "acp.set_mode",
+    ),
+    (
+        "POST",
+        "/v1/sessions/a1/config",
+        r#"{"id":"model","value":"other","epoch":7}"#,
+        "acp.set_config_option",
+    ),
+    (
+        "DELETE",
+        "/v1/sessions/a1/epochs/7?forget=true",
+        "",
+        "session.kill",
+    ),
+];
+
+async fn action_epoch_api() -> Api {
+    let hub = FakeHub::start();
+    hub.set_sessions(vec![
+        summary("a1", "testhost"),
+        pty_summary("p1", EPOCH, true, false),
+    ]);
+    let api = Api::without_hub(hub).await;
+    api.web.wait_hub("up").await;
+    api
+}
+
+#[tokio::test]
+async fn incarnation_paths_require_control_before_reaching_the_hub() {
+    let api = action_epoch_api().await;
+    let before = api.hub.requests().len();
+    for (method, path) in [
+        ("POST", "/v1/sessions/a1/epochs/7/cancel"),
+        ("DELETE", "/v1/sessions/a1/epochs/7"),
+    ] {
+        let res = api.req(method, path, READER).send().await;
+        assert_eq!(res.status, 403, "{path}");
+    }
+    assert_eq!(api.hub.requests().len(), before);
+}
+
+#[tokio::test]
+async fn session_action_epoch_paths_reject_bad_parameters_before_connecting() {
+    let api = action_epoch_api().await;
+    let before = api.hub.requests().len();
+    for (method, path) in [
+        // The old query spelling must never degrade to an unguarded action.
+        ("DELETE", "/v1/sessions/p1?forget=true&epoch=7"),
+        ("POST", "/v1/sessions/a1/cancel?epoch=7"),
+        ("DELETE", "/v1/sessions/a1/epochs/18446744073709551616"),
+        ("DELETE", "/v1/sessions/a1/epochs/0?forget=yes"),
+        ("POST", "/v1/sessions/a1/epochs/-1/cancel"),
+        ("POST", "/v1/sessions/a1/epochs/1.5/cancel"),
+        ("DELETE", "/v1/sessions/a%2Fb/epochs/7"),
+        ("POST", "/v1/sessions/a%2Fb/epochs/7/cancel"),
+    ] {
+        let res = api.req(method, path, OWNER).send().await;
+        assert_eq!(res.status, 400, "{path}");
+    }
+    assert_eq!(api.hub.requests().len(), before);
+}
+
+#[tokio::test]
+async fn guarded_delete_ignores_a_stale_or_absent_watch_entry() {
+    let api = action_epoch_api().await;
+    // The fake hub now has an ACP at p1, but has not pushed the change to the watch.
+    let mut replacement = summary("p1", "testhost");
+    replacement.created_at = u64::MAX;
+    replacement.updated_at = u64::MAX;
+    api.hub.set_sessions(vec![replacement]);
+    let watched = api.get("/v1/sessions/p1").await.json();
+    assert_eq!(watched["kind"], "pty");
+    assert_eq!(watched["createdAt"], EPOCH);
+    let req = api.req(
+        "DELETE",
+        "/v1/sessions/p1/epochs/18446744073709551615",
+        OWNER,
+    );
+    let (kill, res) = api.answered(req, ok).await;
+    assert_eq!((res.status, res.json()), (200, json!({})));
+    assert_eq!(
+        kill,
+        HubRequest::SessionKill {
+            rid: 1,
+            sid: "p1".into(),
+            epoch: u64::MAX,
+            forget: false,
+        }
+    );
+
+    let req = api.req("DELETE", "/v1/sessions/unseen/epochs/0", OWNER);
+    let (kill, res) = api
+        .answered(req, refusal(ErrorCode::NotFound, "no session unseen"))
+        .await;
+    assert_eq!(res.status, 404);
+    assert_eq!(res.json()["code"], "not_found");
+    assert!(matches!(kill, HubRequest::SessionKill { sid, epoch: 0, .. } if sid == "unseen"));
+}
+
+/// Each guarded HTTP action names the epoch the caller saw, not a newer one
+/// that happens to be in the session list.
+#[tokio::test]
+async fn session_action_epoch_reaches_the_hub_and_preserves_stale() {
+    let api = action_epoch_api().await;
+    for &(method, path, body, tag) in GUARDED_ACTIONS {
+        let call = api.req(method, path, OWNER).body(body);
+        let (req, res) = api
+            .answered(call, refusal(ErrorCode::Stale, "replaced"))
+            .await;
+        assert_eq!(res.status, 409);
+        assert_eq!(res.json(), json!({"error":"replaced","code":"stale"}));
+        let wire = serde_json::to_value(req).unwrap();
+        assert_eq!(wire["t"], tag);
+        assert_eq!(wire["epoch"], 7, "{path}");
+        if tag == "acp.set_config_option" {
+            assert_eq!(wire["checkEpochFirst"], true);
+        }
+        if tag.ends_with(".kill") {
+            assert_eq!(wire["forget"], true);
+        }
+    }
+
+    // A caller-supplied config epoch does not require a watch entry at all.
+    let (req, res) = api
+        .answered(
+            api.req("POST", "/v1/sessions/unseen/config", OWNER)
+                .body(r#"{"id":"model","value":"other","epoch":7}"#),
+            ok,
+        )
+        .await;
+    assert_eq!(res.status, 200);
+    assert_eq!(serde_json::to_value(req).unwrap()["epoch"], 7);
+}
+
+#[tokio::test]
+async fn session_action_epoch_requires_support_on_the_request_connection() {
+    let api = action_epoch_api().await;
+    for session_action_epoch in [None, Some(false)] {
+        // The watch connection advertised support; the per-request hub does not.
+        api.hub.set_hello(Hello {
+            session_action_epoch,
+            ..Hello::default()
+        });
+        let before = api.hub.requests().len();
+        for &(method, path, body, _) in GUARDED_ACTIONS {
+            let res = api.req(method, path, OWNER).body(body).send().await;
+            assert_eq!(res.status, 400, "{path}");
+            assert_eq!(
+                res.json(),
+                json!({"error":"hub does not support session action epochs"})
+            );
+        }
+        assert!(
+            api.hub
+                .requests()
+                .into_iter()
+                .skip(before)
+                .all(|(_, r)| matches!(r, HubRequest::Hello { .. }))
+        );
+    }
+
+    // A legacy cancel ignores even a body containing an epoch. Legacy config
+    // still snapshots createdAt and uses the hub's normal validation order.
+    let (cancel, res) = api
+        .answered(
+            api.req("POST", "/v1/sessions/a1/cancel", OWNER)
+                .body(r#"{"epoch":7}"#),
+            ok,
+        )
+        .await;
+    assert_eq!(res.status, 200);
+    assert!(serde_json::to_value(cancel).unwrap().get("epoch").is_none());
+    let (config, res) = api
+        .answered(
+            api.req("POST", "/v1/sessions/a1/config", OWNER)
+                .body(r#"{"id":"model","value":"other"}"#),
+            ok,
+        )
+        .await;
+    assert_eq!(res.status, 200);
+    let wire = serde_json::to_value(config).unwrap();
+    assert_eq!(wire["epoch"], EPOCH);
+    assert!(wire.get("checkEpochFirst").is_none());
 }
 
 #[tokio::test]

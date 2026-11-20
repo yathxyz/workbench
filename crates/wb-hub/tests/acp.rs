@@ -846,6 +846,104 @@ fn answers(hub: &Hub, agent: &str) -> Vec<Value> {
 }
 
 #[test]
+fn hub_action_epoch_keeps_late_acp_actions_out_of_the_replacement() {
+    let hub = Hub::with_scenarios(&["basic", "cancel"]);
+    let mut c = hub.connect();
+    let old = epoch(&ready(&mut c, &hub, "a1", "basic"));
+    c.ok(json!({"t": "acp.kill", "sid": "a1", "forget": true, "epoch": old}));
+
+    // Pipeline the stale prompt directly behind the replacement open: the registry
+    // must check the incarnation even if the new actor has not published a summary.
+    c.send(
+        &json!({"t": "acp.open", "rid": 900, "sid": "a1", "since": 0,
+                   "spawn": {"agent": "cancel", "cwd": hub.home()}}),
+    );
+    let prompt = json!([{"type": "text", "text": "go"}]);
+    let stale = c.request(json!({"t": "acp.prompt", "sid": "a1", "epoch": old, "prompt": prompt}));
+    assert_eq!(stale["code"], "stale", "{stale}");
+    let current = epoch(&c.reply(900));
+    assert_ne!(old, current);
+    c.event("a1", "session");
+
+    for action in [
+        json!({"t": "acp.set_mode", "sid": "a1", "modeId": "plan", "epoch": old}),
+        json!({"t": "acp.kill", "sid": "a1", "forget": true, "epoch": old}),
+        json!({"t": "pty.kill", "sid": "a1", "forget": true, "epoch": old}),
+    ] {
+        assert_eq!(c.request(action)["code"], "stale");
+    }
+    assert!(hub.received_calls("cancel", "session/prompt").is_empty());
+    assert!(hub.received_calls("cancel", "session/set_mode").is_empty());
+    c.ok(json!({"t": "acp.set_mode", "sid": "a1", "modeId": "plan", "epoch": current}));
+    c.ok(json!({"t": "acp.prompt", "sid": "a1", "prompt": prompt, "epoch": current}));
+    let permission = c.event("a1", "permission");
+    let cancel = c.request(json!({"t": "acp.cancel", "sid": "a1", "epoch": old}));
+    assert_eq!(cancel["code"], "stale");
+    let summary = c.summary_through("a1", &permission);
+    assert_eq!(summary["acp"]["pending"][0]["req"], permission["seq"]);
+    c.ok(json!({"t": "acp.cancel", "sid": "a1", "epoch": current}));
+    assert_eq!(c.event("a1", "turn_end")["stopReason"], "cancelled");
+}
+
+#[test]
+fn session_kill_selects_the_current_kind_by_epoch() {
+    let hub = Hub::with_scenarios(&["basic"]);
+    let mut c = hub.connect();
+    let kill = |epoch| json!({"t": "session.kill", "sid": "s", "epoch": epoch, "forget": true});
+    let agent = epoch(&ready(&mut c, &hub, "s", "basic"));
+    c.ok(kill(agent));
+
+    let replacement = c.spawn("s", &["bash"]);
+    let shell = replacement["epoch"].as_u64().unwrap();
+    assert_ne!(agent, shell);
+    assert_eq!(c.request(kill(agent))["code"], "stale");
+    assert_eq!(c.attach("s")["pid"], replacement["pid"]);
+    c.ok(kill(shell));
+    assert_eq!(c.request(kill(shell))["code"], "not_found");
+}
+
+#[test]
+fn hub_action_epoch_checks_pty_kill_and_wrong_kind_before_acting() {
+    let hub = Hub::with_scenarios(&[]);
+    let mut c = hub.connect();
+    let old = c.spawn("p1", &["bash"])["epoch"].as_u64().unwrap();
+    c.ok(json!({"t": "pty.kill", "sid": "p1", "forget": true, "epoch": old}));
+    let replacement = c.spawn("p1", &["bash"]);
+    let current = replacement["epoch"].as_u64().unwrap();
+    assert_ne!(current, old);
+    for action in [
+        json!({"t": "pty.kill", "sid": "p1", "forget": true, "epoch": old}),
+        json!({"t": "acp.kill", "sid": "p1", "forget": true, "epoch": old}),
+        json!({"t": "acp.set_config_option", "sid": "p1", "configId": "model", "value": "large",
+               "epoch": old, "checkEpochFirst": true}),
+    ] {
+        assert_eq!(c.request(action)["code"], "stale");
+    }
+    let wrong_kind =
+        c.request(json!({"t": "acp.kill", "sid": "p1", "forget": true, "epoch": current}));
+    assert_eq!(wrong_kind["code"], "kind_mismatch");
+    assert_eq!(c.attach("p1")["pid"], replacement["pid"]);
+    c.ok(json!({"t": "pty.kill", "sid": "p1", "forget": true, "epoch": current}));
+}
+
+#[test]
+fn hub_action_epoch_explicit_config_guard_precedes_actor_validation() {
+    let hub = Hub::with_scenarios(&["auth"]);
+    let mut c = hub.connect();
+    let (open, _) = spawn_until(&mut c, &hub, "a1", "auth", "setup_error");
+    let current = epoch(&open);
+    for (expected, code) in [(current + 1, "stale"), (current, "bad_request")] {
+        let reply = c.request(json!({"t": "acp.set_config_option", "sid": "a1",
+            "epoch": expected, "checkEpochFirst": true, "configId": "model", "value": "large"}));
+        assert_eq!(reply["code"], code);
+    }
+    assert!(
+        hub.received_calls("auth", "session/set_config_option")
+            .is_empty()
+    );
+}
+
+#[test]
 fn hub_basic_turn_journal_facts_and_reset() {
     let mut hub = Hub::with_scenarios(&["basic"]);
     let mut c = hub.connect();
@@ -971,6 +1069,113 @@ fn hub_noise_goes_to_stderr_log_and_setup_succeeds() {
     assert_eq!(c.event("a1", "turn_end")["stopReason"], "end_turn");
     drop(c);
     fold_equals_live(&mut hub);
+}
+
+/// A bare req can recur in another journal. Within one journal, even a cancelled
+/// question followed by another of the same kind has a different announcing seq.
+#[test]
+fn answers_bind_to_the_announced_question_across_cancel_and_recreation() {
+    let hub = Hub::with_scenarios(&[]);
+    let mut other = hub.connect();
+    assert_eq!(other.hello["sessionActionEpoch"], true);
+    for (kind, first, next) in [
+        ("permission", "ask-permission", "perm"),
+        ("elicitation", "form", "url"),
+    ] {
+        let sid = kind;
+        let answer = |epoch: u64, req: &Value| match kind {
+            "permission" => json!({"t": "acp.permission", "sid": sid, "epoch": epoch,
+                "req": req, "outcome": selected("allow-once")["outcome"]}),
+            _ => json!({"t": "acp.elicitation", "sid": sid, "epoch": epoch,
+                "req": req, "response": {"action": "decline"}}),
+        };
+        let mut old = hub.connect();
+        let before = epoch(&ready(&mut old, &hub, sid, "stub"));
+        assert_eq!(old.acp_prompt(sid, first)["t"], "ok");
+        let original = old.event(sid, kind);
+        old.ok(json!({"t": "acp.kill", "sid": sid, "forget": true}));
+
+        let mut c = hub.connect();
+        let current = epoch(&ready(&mut c, &hub, sid, "stub"));
+        assert_ne!(before, current);
+        assert_eq!(c.acp_prompt(sid, first)["t"], "ok");
+        let pending = c.event(sid, kind);
+        assert_eq!(original["seq"], pending["seq"]); // exercise a real collision
+        assert_eq!(
+            old.request(answer(before, &original["seq"]))["code"],
+            "stale"
+        );
+
+        // Neither a late answer nor a late cancel may consume the new question.
+        let cancel = |epoch| json!({"t": "acp.cancel", "sid": sid, "epoch": epoch});
+        assert_eq!(old.request(cancel(before))["code"], "stale");
+        c.ok(cancel(current));
+        c.event(sid, "turn_end");
+        assert_eq!(c.acp_prompt(sid, next)["t"], "ok");
+        let replacement = c.event(sid, kind);
+        let question = if kind == "permission" {
+            "toolCall"
+        } else {
+            "request"
+        };
+        assert_ne!(replacement[question], pending[question]);
+        assert!(replacement["seq"].as_u64().unwrap() > pending["seq"].as_u64().unwrap());
+        assert_eq!(
+            other.request(answer(current, &pending["seq"]))["code"],
+            "already_resolved"
+        );
+
+        // Competing clients answer the replacement before either reads its reply.
+        let mut race = answer(current, &replacement["seq"]);
+        race["rid"] = json!(900);
+        c.send(&race);
+        other.send(&race);
+        let (a, b) = (c.reply(900), other.reply(900));
+        let (winner, loser) = if a["t"] == "ok" { (a, b) } else { (b, a) };
+        assert_eq!(winner["t"], "ok");
+        assert_eq!(loser["code"], "already_resolved");
+        c.event(sid, "turn_end");
+        assert_eq!(c.summary(sid)["acp"]["pending"], json!([]));
+    }
+}
+
+#[test]
+fn hub_action_epoch_answers_after_restart_remember_each_announced_kind() {
+    let mut hub = Hub::with_scenarios(&[]);
+    let sid = "questions";
+    let mut c = hub.connect();
+    let epoch = epoch(&ready(&mut c, &hub, sid, "stub"));
+    assert_eq!(c.acp_prompt(sid, "ask-permission")["t"], "ok");
+    let permission = c.event(sid, "permission")["seq"].as_u64().unwrap();
+    let answer_permission = |req| {
+        json!({"t": "acp.permission", "sid": sid, "epoch": epoch,
+               "req": req, "outcome": selected("allow-once")["outcome"]})
+    };
+    c.ok(answer_permission(permission));
+    c.event(sid, "turn_end");
+    assert_eq!(c.acp_prompt(sid, "form")["t"], "ok");
+    let elicitation = c.event(sid, "elicitation")["seq"].as_u64().unwrap();
+    let answer_elicitation = |req| {
+        json!({"t": "acp.elicitation", "sid": sid, "epoch": epoch,
+               "req": req, "response": {"action": "decline"}})
+    };
+
+    // One question was answered by a user and the other was pending at shutdown.
+    // Neither is held by the new process: it must look up their kinds by journal seq.
+    drop(c);
+    hub.terminate();
+    hub.restart();
+    let mut c = hub.connect();
+    let journal = hub.journal(sid);
+    for (answer, expected) in [
+        (answer_permission(permission), "already_resolved"),
+        (answer_elicitation(elicitation), "already_resolved"),
+        (answer_permission(elicitation), "bad_request"),
+        (answer_elicitation(permission), "bad_request"),
+    ] {
+        assert_eq!(c.request(answer)["code"], expected);
+    }
+    assert_eq!(hub.journal(sid), journal, "no second resolution");
 }
 
 #[test]

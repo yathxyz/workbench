@@ -490,11 +490,13 @@ async fn commands_map_onto_acp_requests_and_errors_echo_the_rid() {
         HubRequest::AcpPrompt {
             rid: rid_of(&reqs[1]),
             sid: sid(),
+            epoch: None,
             prompt: vec![block],
         },
         HubRequest::AcpCancel {
             rid: rid_of(&reqs[2]),
             sid: sid(),
+            epoch: None,
         },
         HubRequest::AcpPermission {
             rid: rid_of(&reqs[3]),
@@ -513,6 +515,7 @@ async fn commands_map_onto_acp_requests_and_errors_echo_the_rid() {
         HubRequest::AcpSetMode {
             rid: rid_of(&reqs[5]),
             sid: sid(),
+            epoch: None,
             mode_id: "plan".into(),
         },
         HubRequest::AcpSeen {
@@ -532,6 +535,7 @@ async fn commands_map_onto_acp_requests_and_errors_echo_the_rid() {
         HubRequest::AcpKill {
             rid: rid_of(&reqs[9]),
             sid: sid(),
+            epoch: None,
             forget: false,
         },
     ];
@@ -665,6 +669,7 @@ async fn a_kill_forget_closes_1000_after_its_ok() {
         HubRequest::AcpKill {
             rid: rid_of(&reqs[1]),
             sid: "k1".into(),
+            epoch: None,
             forget: true
         }
     );

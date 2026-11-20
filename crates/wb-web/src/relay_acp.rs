@@ -291,9 +291,14 @@ impl Relay {
             Browser::Prompt { blocks } => HubRequest::AcpPrompt {
                 rid,
                 sid,
+                epoch: None,
                 prompt: blocks,
             },
-            Browser::Cancel => HubRequest::AcpCancel { rid, sid },
+            Browser::Cancel => HubRequest::AcpCancel {
+                rid,
+                sid,
+                epoch: None,
+            },
             Browser::Permission {
                 req,
                 epoch,
@@ -316,7 +321,12 @@ impl Relay {
                 epoch,
                 response,
             },
-            Browser::SetMode { mode_id } => HubRequest::AcpSetMode { rid, sid, mode_id },
+            Browser::SetMode { mode_id } => HubRequest::AcpSetMode {
+                rid,
+                sid,
+                epoch: None,
+                mode_id,
+            },
             Browser::SetConfigOption {
                 epoch,
                 config_id,
@@ -325,6 +335,7 @@ impl Relay {
                 rid,
                 sid,
                 epoch,
+                check_epoch_first: false,
                 config_id,
                 value,
             },
@@ -339,7 +350,12 @@ impl Relay {
                 if forget {
                     pending = Pending::Forget;
                 }
-                HubRequest::AcpKill { rid, sid, forget }
+                HubRequest::AcpKill {
+                    rid,
+                    sid,
+                    epoch: None,
+                    forget,
+                }
             }
         };
         // Re-serialising can grow a browser value (`1e15` comes out as

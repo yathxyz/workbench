@@ -207,6 +207,7 @@ flake.nix flake.lock   (inputs: nixpkgs, edwin = github:yathxyz/edwin)
    - `acpConfig:true` advertises ordered startup configuration and live configuration requests. Missing or false means unsupported; clients must not infer support from the version or build. Older hubs ignore an unknown `SpawnAcp.config`, so the web refuses a non-empty batch unless the connected hub advertises support.
    - `acpWorktree:true` advertises local ACP worktree management and is sent only when `git` is configured (§3.7.2); absent or false means unsupported.
    - `acpTask:true` advertises support for both `SpawnAcp.task` and `acp.set_task`; absent or false means unsupported.
+   - `sessionActionEpoch:true` advertises the action preconditions in §3.2.7; do not send them to a hub that omits it or reports false, since older hubs ignore unknown fields.
 2. The client answers within `HELLO_TIMEOUT` with `{"t":"hello","proto":1,"client":"wb-web/0.1.0"}`, or it is closed.
 3. A `proto` mismatch gives `err{code:"proto"}`, then close.
 4. **Additive rule:** `proto` stays 1 while changes are additive. Receivers ignore unknown fields and unknown events. An unknown request gets `err{code:"unknown_type"}` and the connection stays open.
@@ -287,7 +288,8 @@ The error codes are a closed set:
 - **`Exit.reason`:** `"exited"`, `"killed"`, `"hub_restart"` or `"spawn_failed"`. `code` and `signal` are null when unknown.
 - **`Pending`:**
   - `kind` is `"permission"` or `"elicitation"`;
-  - `req` is the journal seq of the announcing event;
+  - `req` is the seq of the immutable journal event that announced the question, not the agent's JSON-RPC id;
+  - within the same incarnation and journal history, `(sid, epoch, req)` identifies exactly one question: answering or cancelling consumes it, and another question gets a fresh seq even if the agent reuses its id;
   - `title` is the permission's `toolCall.title` or the elicitation's `message`, cut to 200 characters for both kinds. It is `""` when the request has none.
 - **`AcpSessionInfo`:** `{protocolVersion, agentInfo, agentCapabilities, promptCapabilities, authMethods, modes, configOptions, availableCommands, plan, usage}`. It holds the latest materialised values; absent optional values are omitted. `Summary.acp.configOptions` is always present, with `null` when absent.
 - Snapshots and watch events publish live and restored summaries unchanged, including the full option list, whenever they fit in a single-summary page with the longest request ID.
@@ -307,26 +309,27 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 |---|---|---|---|
 | `list` | `stream?: bool` | `{sessions: Summary[]}` | snapshot of every known session, in sid order; see below |
 | `watch` | `stream?: bool` | `{sessions: Summary[]}` | snapshot and subscription; then `session` on every Summary change and `gone` on forget |
+| `session.kill` | `sid, epoch, forget` | `{}` | End the matching incarnation, whether PTY or ACP; the hub selects its kind and checks `createdAt` in the same registry lookup. `forget` has the same semantics as the corresponding kind-specific kill below. |
 | `pty.open` | `sid, cols, rows, spawn?: SpawnPty, resume?: {stream, out}` | `{new, pid?, cwd, exit?, epoch, stream, out, resumed, replay?}` | rules below |
 | `pty.detach` | `sid` | `{}` | |
 | `pty.input` | `sid, d` | – | `d` ≤ 1 MiB. Written completely and in order. If queued input would exceed 8 MiB, the whole message is dropped and the connection gets `err{sid, code:"input_overflow"}`. Input to a dead session is dropped silently. |
 | `pty.resize` | `sid, cols, rows` | – | `TIOCSWINSZ` plus the VT resize (§3.4.3). Clamped to cols 2..=1000 and rows 1..=500. Last writer wins. |
-| `pty.kill` | `sid, forget` | `{}` | SIGHUP to every member of the PTY's session (/proc stat field 6), SIGKILL survivors after 3 s, close the master. **`forget:false`:** ok when the kill starts. **`forget:true`:** ok only after the exit, the file deletion and the registry removal. Every attached connection, and every watcher, gets `gone`. |
+| `pty.kill` | `sid, forget, epoch?` | `{}` | SIGHUP to every member of the PTY's session (/proc stat field 6), SIGKILL survivors after 3 s, close the master. **`forget:false`:** ok when the kill starts. **`forget:true`:** ok only after the exit, the file deletion and the registry removal. Every attached connection, and every watcher, gets `gone`. |
 | `pty.capture` | `sid, lines?` (default 200, max 1000) | `{text}` | plain text from the VT state, each row right-trimmed and blank rows after the last text left out; works on dead sessions |
 | `acp.open` | `sid, since, epoch?, spawn?: SpawnAcp` | `{new, summary, session, head, from, reset, configErrors?: ConfigError[]}` | then the replay as `acp.ev`, then `acp.replayed`, then live events. With a non-empty spawn config, the initiating reply waits for the hub-owned batch or its termination. Rules below. |
 | `acp.detach` | `sid` | `{}` | |
-| `acp.prompt` | `sid, prompt: ContentBlock[]` | `{}` once written | needs `alive` (`not_alive`), `activity=="none"` (`busy`) and no fault (`faulted`). Blocks non-empty, ≤ `PROMPT_MAX`. `image`, `audio` and `resource` need the matching `promptCapabilities`. Journals `prompt`, sets `seenSeq=headSeq`. |
-| `acp.cancel` | `sid` | `{}` | sends the `session/cancel` notification when a turn is running, answers every pending request with cancelled (`by:"cancel"`), sets `seenSeq=headSeq`. Later permissions in that same turn bypass policy and ask through the ordinary manual path. With no turn and nothing pending it only sets `seenSeq`. |
+| `acp.prompt` | `sid, prompt: ContentBlock[], epoch?` | `{}` once written | needs `alive` (`not_alive`), `activity=="none"` (`busy`) and no fault (`faulted`). Blocks non-empty, ≤ `PROMPT_MAX`. `image`, `audio` and `resource` need the matching `promptCapabilities`. Journals `prompt`, sets `seenSeq=headSeq`. |
+| `acp.cancel` | `sid, epoch?` | `{}` | sends the `session/cancel` notification when a turn is running, answers every pending request with cancelled (`by:"cancel"`), sets `seenSeq=headSeq`. Later permissions in that same turn bypass policy and ask through the ordinary manual path. With no turn and nothing pending it only sets `seenSeq`. |
 | `acp.permission` | `sid, req, epoch, outcome` | `{}` | `epoch` mismatch → `stale`. First answer wins; later answers get `already_resolved`. An unknown `optionId` gets `bad_option`. |
 | `acp.elicitation` | `sid, req, epoch, response` | `{}` | `epoch` mismatch → `stale`. First answer wins. `content` must be an object of string, number, boolean or string[]. |
-| `acp.set_mode` | `sid, modeId` | `{}` after the agent answers (30 s) | `modeId` must be in `availableModes`. Journals `mode{modeId}`. |
-| `acp.set_config_option` | `sid, epoch, configId, value: string\|boolean` | `{}` after the agent answers and the result is journaled (30 s) | `configId` must be offered in `configOptions`. A select value must be offered (including within grouped options); a boolean option requires a JSON boolean. Sends `session/set_config_option`; journals `config{configOptions}` from the agent's result. The result is authoritative, not a local patch of the requested value. |
+| `acp.set_mode` | `sid, modeId, epoch?` | `{}` after the agent answers (30 s) | `modeId` must be in `availableModes`. Journals `mode{modeId}`. |
+| `acp.set_config_option` | `sid, epoch, checkEpochFirst?: bool, configId, value: string\|boolean` | `{}` after the agent answers and the result is journaled (30 s) | `configId` must be offered in `configOptions`. A select value must be offered (including within grouped options); a boolean option requires a JSON boolean. Sends `session/set_config_option`; journals `config{configOptions}` from the agent's result. The result is authoritative, not a local patch of the requested value. |
 | `acp.set_task` | `sid, task: string\|null` | `{}` after journaling | Replace the reference, or clear it with null or an empty trimmed string. This changes hub metadata, not the agent's configuration. |
 | `acp.set_policy` | `sid, epoch, policy: Policy` | `{}` after journaling | replace the whole permission policy; `{rules:[]}` removes it. Existing pending requests are unchanged. |
 | `acp.seen` | `sid, seq` | `{}` | `seenSeq = max(seenSeq, min(seq, headSeq))`, persisted |
 | `acp.revive` | `sid` | `{}` once started | only when `!alive && revivable && fault == null`, else `not_revivable`/`faulted`; if the saved local `cwd` is no longer a directory, `not_revivable` before spawn. §3.4.5. |
 | `acp.authenticate` | `sid, methodId` | `{}` after the agent answers | only during a failed setup, agent-handled methods only (`type:"terminal"` → `bad_option`) |
-| `acp.kill` | `sid, forget` | `{}` | teardown stages in §3.4.5. **`forget:false`:** ok when the kill starts; the session stays revivable. **`forget:true`:** ok only after exit, deletion of `acp/<sid>.*` and registry removal. `gone` goes to attached connections and watchers. |
+| `acp.kill` | `sid, forget, epoch?` | `{}` | teardown stages in §3.4.5. **`forget:false`:** ok when the kill starts; the session stays revivable. **`forget:true`:** ok only after exit, deletion of `acp/<sid>.*` and registry removal. `gone` goes to attached connections and watchers. |
 | `acp.remove_worktree` | `sid` | `{}` | Verify `workbench-session` in the recorded checkout's private git directory, remove without force, then persist and publish the cleared record; an absent record is `not_found`, a running agent or dirty worktree is `conflict`. A missing checkout, missing marker or different sid clears the record without deletion and returns `not_found`: “session worktree already gone; record cleared; nothing deleted”. |
 
 **`list` and `watch` snapshots.**
@@ -343,6 +346,12 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
   This lets older web fronts retain all summaries and options using their existing upsert path.
 - Older hubs ignore `stream:true` and respond with their original single-line snapshot.
   The web accepts that reply without requiring a page, but the old hub's snapshot is still subject to `MAX_LINE`.
+
+**Caller-supplied action precondition.**
+On prompt, cancel, set_mode and the kind-specific kills, an optional `epoch` binds the action to that session's `createdAt`; the kind-independent `session.kill` always requires it.
+On set_config_option the wire epoch has always been required; `checkEpochFirst:true` selects the same precondition semantics instead of the legacy check order below.
+For these guarded actions, an unknown sid gives `not_found`; an existing sid with a different epoch gives `stale` before kind or actor-state checks, with no action on the replacement.
+This holds even if a command was queued as the old session was being forgotten.
 
 **Check order.** While a non-empty initial configuration batch is active (including its preceding setup), `acp.prompt`, `acp.cancel`, `acp.set_mode`, `acp.set_config_option`, `acp.revive` and `acp.authenticate` fail with `busy` before their normal actor checks. They are rejected, never queued for a future turn. Permission and elicitation answers, `acp.seen` and `acp.kill` remain usable. Otherwise, when a request fails several checks, the first in this list applies:
 - `acp.prompt`: `faulted`, `not_alive`, `bad_request` (no ACP session yet), `busy`, then the content rules.
@@ -1212,23 +1221,34 @@ A sid in a path that does not match `^[A-Za-z0-9_-]{1,64}$` is 400 "bad id". Req
 | `GET /v1/observed/{id}` | read | One `ObservedSession` by its `id`; 404. |
 | `GET /v1/stream` | read | Server-sent events (§3.8.4). |
 | `POST /v1/sessions` | control | Starts an ACP agent. Body `{agent, cwd, host?, sid?, config?: {optionId: string\|boolean}, task?: string, policy?: Policy, worktree?: {branch, base?}}`. `sid` defaults to `api_` and 16 random hex digits. `host` absent, or the hub's own, starts it on the hub's host; another name must be one of the hub's `hosts` as its hello lists them, else 400 "no host H" (so a hub that predates §3.8.5 is never asked). 201 `{sid, session: Summary+state, configErrors:[{id, value, code, error}]}`; configuration and worktree rules below. A sid that an agent session has is 409 "session exists", and one that a shell has is 409 with the hub's `kind_mismatch`; that session is left as it is. Policy validation, including all regex compilation and limits, precedes spawn; invalid policy is 400 "bad body". |
-| `POST /v1/sessions/{sid}/prompt` | control | Body `{text}` or `{blocks:[ContentBlock]}`, exactly one of them; `text` becomes one text block. `acp.prompt`. 200 `{}`. |
-| `POST /v1/sessions/{sid}/cancel` | control | `acp.cancel`. 200 `{}`. |
+| `POST /v1/sessions/{sid}/prompt` | control | Body `{text, epoch?}` or `{blocks:[ContentBlock], epoch?}`, exactly one of `text` and `blocks`; `text` becomes one text block. `acp.prompt`. 200 `{}`. |
+| `POST /v1/sessions/{sid}/cancel` | control | `acp.cancel` without an incarnation precondition. 200 `{}`. |
+| `POST /v1/sessions/{sid}/epochs/{epoch}/cancel` | control | `acp.cancel` only for the named incarnation. 200 `{}`. |
 | `POST /v1/sessions/{sid}/permission` | control | Body `{req, epoch, outcome}`: `acp.permission`. 200 `{}`. |
 | `POST /v1/sessions/{sid}/elicitation` | control | Body `{req, epoch, response}`: `acp.elicitation`. 200 `{}`. |
-| `POST /v1/sessions/{sid}/mode` | control | Body `{modeId}`: `acp.set_mode`. 200 `{}`. |
-| `POST /v1/sessions/{sid}/config` | control | Body `{id, value: string\|boolean}`: `acp.set_config_option{sid, epoch: current Summary.createdAt, configId:id, value}`. 200 `{}` only after the agent result is journaled; hub timeout 30 s, API reply wait 40 s. No request body epoch is accepted. |
+| `POST /v1/sessions/{sid}/mode` | control | Body `{modeId, epoch?}`: `acp.set_mode`. 200 `{}`. |
+| `POST /v1/sessions/{sid}/config` | control | Body `{id, value: string\|boolean, epoch?}`: `acp.set_config_option` with the supplied epoch, or the current cached `Summary.createdAt` if omitted. 200 `{}` only after the agent result is journaled; hub timeout 30 s, API reply wait 40 s. |
 | `POST /v1/sessions/{sid}/task` | control | Body `{"task": string\|null}`, with the member required. Sends `acp.set_task`; 200 `{}` after the replacement or clear is journaled. |
 | `POST /v1/sessions/{sid}/policy` | control | Body `{policy: Policy}`: `acp.set_policy{sid, epoch: current Summary.createdAt, policy}`. No request-body epoch is accepted. 200 `{}` after journaling; `{policy:{rules:[]}}` removes it. Strict unknown-field/shape/limit/regex validation gives 400 "bad body". Read via session details' `acp.policy`; pending requests remain unchanged. |
 | `POST /v1/sessions/{sid}/revive` | control | `acp.revive`. 200 `{}`. |
-| `DELETE /v1/sessions/{sid}?forget=true\|false` | control | `acp.kill` or `pty.kill` by the session's kind, `forget` defaulting to `false`. 200 `{}`; 404 for a sid the hub does not know. |
+| `DELETE /v1/sessions/{sid}?forget=true\|false` | control | `acp.kill` or `pty.kill` by the session's kind, without an incarnation precondition; `forget` defaults to `false`. 200 `{}`; 404 for an unknown sid. |
+| `DELETE /v1/sessions/{sid}/epochs/{epoch}?forget=true\|false` | control | `session.kill` only for the named incarnation, independent of the web's watch cache; `forget` defaults to `false`. 200 `{}`; 404 for an unknown sid. |
 | `DELETE /v1/sessions/{sid}/worktree` | control | `acp.remove_worktree`; 200 `{}` after deletion, 409 while the agent runs, a worktree operation is in progress or git refuses non-forced removal, 404 for an unknown sid or absent record. A missing or replaced checkout gives a distinct 404 after clearing the record (§3.2.7). |
 | `POST /v1/events` | events | One session event (§3.8.3). 204. |
 
 A body that is not the JSON the endpoint takes, an unknown key included, is 400 "bad body".
-A sid the control connection has not heard of is 404 "no session S" for `GET /v1/sessions/{sid}`, `POST /v1/sessions/{sid}/config` and `POST /v1/sessions/{sid}/policy`; DELETE asks the hub because a sid may have a creation in progress before its first Summary.
+A sid the control connection has not heard of is 404 "no session S" for `GET /v1/sessions/{sid}`, `POST /v1/sessions/{sid}/config` without a caller-supplied epoch, and `POST /v1/sessions/{sid}/policy`; DELETE asks the hub because a sid may have a creation in progress before its first Summary.
 The other endpoints ask the hub and answer with its error.
 The API starts no PTY and sends no PTY input: a shell on the mesh is what ssh is for.
+
+**Binding an action to the session the client saw.**
+Pass the observed `createdAt` as `epoch` (unsigned integer); a mismatch is HTTP 409 with `code:"stale"`, and nothing is sent to or changed in the replacement session.
+If a guarded action's own connection to the hub does not advertise `sessionActionEpoch:true`, the API returns 400 without forwarding the request.
+Omission retains the old behavior and does not require a hub upgrade.
+For guarded cancel and DELETE, use the `/epochs/{epoch}` paths: a previous web router returns 404 rather than matching the unguarded route.
+Never pass `?epoch=` on the unguarded paths: this web rejects it, but older web versions can ignore it and perform the action.
+For permission and elicitation answers, the already-required `epoch` and `req` identify the published question.
+A later answer for a resolved or withdrawn question in that incarnation and journal history is HTTP 409 `already_resolved`, even if there is a new pending question of the same kind.
 
 **Configuration on create.** `config`, when present, is a JSON object with at most **16 distinct option ids**, each value a string or boolean. A non-object, another value type, duplicate id or a seventeenth option is 400 "bad body", before any spawn. The web retains the input object's member order and passes it as the hub's ordered `SpawnAcp.config` array `[{id, value}]`; it does not wait for setup events and issue its own configuration RPCs. With no config or `{}`, create keeps its immediate post-open behaviour and does not wait for ACP setup. With non-empty config, the hub delays the initiating `acp.open` reply until setup and the ordered batch end or terminate (§3.4.5), blocking prompts and the other listed live actions from every client in the meantime. The API waits up to `40 s × (1 + number of options)` for that reply, then returns its resulting session and opener `configErrors` verbatim. This outer HTTP wait is not a total setup timeout: the hub still uses `SETUP_IDLE_TIMEOUT`, which can be extended by agent messages or paused for pending requests. Individual configuration failures and setup failure do not turn accepted creation into a failed start: the response remains 201, with every unapplied option accounted for and `configErrors:[]` when all succeeded. Later option validation uses the latest authoritative full list. Create never sends a prompt, with or without configuration.
 

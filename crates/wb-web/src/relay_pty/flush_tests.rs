@@ -59,6 +59,7 @@ async fn failed_flush_keeps_superseded_open_reply_for_pending_kill() {
         HubRequest::PtyKill {
             rid: 3,
             sid: "B".into(),
+            epoch: None,
             forget: true,
         }
     );
@@ -171,6 +172,7 @@ async fn reply_deadline_dispatches_parked_kill_after_successful_flush() {
         HubRequest::PtyKill {
             rid: 3,
             sid: "B".into(),
+            epoch: None,
             forget: true,
         }
     );

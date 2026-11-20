@@ -274,7 +274,7 @@ mod tests {
 
     impl OutQ {
         // Exercise queue admission with a writer that takes one line at a time.
-        async fn pop(&self) -> Option<Arc<[u8]>> {
+        pub(crate) async fn pop(&self) -> Option<Arc<[u8]>> {
             self.pop_write(|_| Err(io::ErrorKind::WouldBlock.into()))
                 .await
                 .unwrap()
