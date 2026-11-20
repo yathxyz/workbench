@@ -3327,6 +3327,56 @@ fn hub_kill_forget_outlasts_a_stubborn_agent_then_respawns_fresh() {
     fold_equals_live(&mut hub);
 }
 
+#[test]
+fn hub_kills_and_reaps_an_agent_that_left_its_group() {
+    use rustix::process::{Pid, PidfdFlags, Signal, getpgid, pidfd_open, setpgid};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    if let Ok(group) = std::env::var("WB_TEST_AGENT_GROUP") {
+        // Running as the stub: leave the original group and ignore stdin EOF.
+        setpgid(None, Some(Pid::from_raw(group.parse().unwrap()).unwrap())).unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+        return;
+    }
+
+    // Give the stub a private destination group. Its other member must survive.
+    let mut peer = Command::new("cat")
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let hub = Hub::start_with(|cfg| {
+        cfg["agents"]["escape"] = json!({
+            "label": "escape",
+            "argv": [std::env::current_exe().unwrap(), "--exact", "hub_kills_and_reaps_an_agent_that_left_its_group"],
+            "env": {"WB_TEST_AGENT_GROUP": peer.id().to_string()}
+        });
+    });
+    let mut c = hub.connect();
+    let (_, evs) = spawn_until(&mut c, &hub, "a1", "escape", "spawn");
+    let pid = Pid::from_raw(agent_pid(&evs) as i32).unwrap();
+    let fd = pidfd_open(pid, PidfdFlags::empty()).unwrap();
+    eventually(PATIENCE, "the agent joined the peer's group", || {
+        getpgid(Some(pid)) == Ok(Pid::from_child(&peer))
+    });
+
+    c.ok(json!({"t": "acp.kill", "sid": "a1", "forget": true}));
+    let exit = c.event("a1", "exit");
+    assert_eq!(exit["reason"], "killed");
+    assert_eq!(exit["signal"], Signal::KILL.as_raw());
+    // The test is not the parent. This pidfd reports -1 only after reaping.
+    let info = format!("/proc/self/fdinfo/{}", fd.as_raw_fd());
+    eventually(PATIENCE, "the escaped agent is reaped", || {
+        fs::read_to_string(&info)
+            .unwrap()
+            .lines()
+            .any(|line| line == "Pid:\t-1")
+    });
+    assert!(peer.wait().unwrap().success()); // wait closes cat's stdin.
+}
+
 /// Unlike `wait_gone`, this also waits for a zombie to disappear.
 fn wait_reaped(pid: u32) {
     let proc = PathBuf::from(format!("/proc/{pid}"));

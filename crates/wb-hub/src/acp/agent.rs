@@ -16,7 +16,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rustix::process::{Pid, Signal, WaitIdStatus, kill_process_group};
+use rustix::process::{Pid, Signal, WaitIdStatus, kill_process, kill_process_group};
 use serde_json::{Map, Value};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncWriteExt, BufReader, Interest};
@@ -444,8 +444,12 @@ pub(crate) struct Group {
 
 impl Group {
     fn signal(&self, sig: Signal) {
-        let pid = self.child.as_ref().expect("owned group leader").id();
-        let _ = kill_process_group(Pid::from_raw(pid as i32).expect("positive child pid"), sig);
+        let pid = Pid::from_child(self.child.as_ref().expect("owned group leader"));
+        let _ = kill_process_group(pid, sig);
+        if sig == Signal::KILL {
+            // The direct child can change groups; its unreaped pid is still ours.
+            let _ = kill_process(pid, sig);
+        }
     }
 }
 

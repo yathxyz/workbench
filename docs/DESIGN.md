@@ -813,10 +813,11 @@ A pinned event appears at its own seq position, never ahead of a lower seq. Clie
   - **Stages for a deliberate kill:**
     1. `session/close`, only when the agent has a session and advertised `sessionCapabilities.close`; wait ≤ 2 s.
     2. Close stdin; wait ≤ 3 s.
-    3. SIGTERM the process group; wait ≤ 3 s.
-    4. SIGKILL the process group.
+    3. SIGTERM the original process group; wait ≤ 3 s.
+    4. SIGKILL the original process group and the still-owned direct child.
 
     A hub stop skips step 1 and waits 5 s after closing stdin and 1 s after SIGTERM, so SIGKILL comes 6 s in.
+    Every agent SIGKILL targets both, even on shutdown or panic; if the direct child changed groups, the hub never signals its new group.
   - **After agent exit, crash included:** the hub observes the exit with `waitid(WNOWAIT)` and drains stdout for ≤ 1 s.
     If stdout reaches EOF first, the agent has 3 s to exit before the process group is killed.
     The hub sends SIGTERM to the group at finalisation and schedules SIGKILL after 2 s, without delaying the death record or viewer notifications.
