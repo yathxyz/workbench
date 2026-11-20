@@ -3569,8 +3569,7 @@ fn hub_sigterm_midturn_writes_hub_restart_and_ends_the_group() {
     fold_equals_live(&mut hub);
 }
 
-// The hub reads WB_HUB_TEST_FAIL_WRITE_AT only in debug builds; nix runs these tests
-// against the release binary, which has no hook.
+// The release `package` check omits this test; `debug-tests` runs it with the hook enabled.
 #[cfg(debug_assertions)]
 #[test]
 fn hub_journal_write_fault_fails_closed_and_recovers() {
