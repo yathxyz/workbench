@@ -48,7 +48,7 @@ use wb_proto::policy::{CompiledPolicy, Policy, PolicyMatch};
 
 use self::agent::{Agent, Out};
 use self::facts::Facts;
-use self::journal::{Journal, WriteFault};
+use self::journal::{Journal, SyncGate, WriteFault};
 use self::replay::Replay;
 use self::rpc::Incoming;
 use self::worktree::CreateFailure::{self, Clean, PossibleLeftover};
@@ -104,7 +104,7 @@ const HISTORY: [&str; 6] = [
     "plan",
 ];
 /// The files of a session, by extension.
-const FILES: [&str; 5] = ["json", "jsonl", "jsonl.sync", "stderr.log", "stderr.log.1"];
+const FILES: [&str; 4] = ["json", "jsonl", "stderr.log", "stderr.log.1"];
 const JOURNAL_FAILED: &str = "the journal could not be written";
 const NOT_RUNNING: &str = "the agent is not running";
 const ENQUEUE_FAILED: &str = "could not queue input for the agent";
@@ -250,6 +250,7 @@ pub fn open(
                         sid,
                         created_at,
                         rx,
+                        Arc::default(),
                         Start::Create(Box::new(open)),
                     );
                 }
@@ -277,7 +278,8 @@ fn checked_task(task: Option<String>) -> Result<Option<String>, &'static str> {
 /// Registers and starts the session `sid` found at startup. A failed load publishes a
 /// dead, faulted session; an I/O failure leaves its files in place for the next start.
 pub async fn load(ctx: &Arc<Ctx>, sid: String) {
-    let (created_at, from) = match read(ctx, &sid).await {
+    let shared = Arc::<Shared>::default();
+    let (created_at, from) = match read(ctx, &sid, shared.sync.clone()).await {
         Ok(Some(loaded)) => (
             Some(loaded.meta.created_at),
             Start::Loaded(Box::new(loaded)),
@@ -286,7 +288,7 @@ pub async fn load(ctx: &Arc<Ctx>, sid: String) {
         Err(fault) => (None, Start::Faulted(fault)),
     };
     let (created_at, rx) = ctx.registry.load(&sid, created_at);
-    start(ctx.clone(), sid, created_at, rx, from);
+    start(ctx.clone(), sid, created_at, rx, shared, from);
 }
 
 /// What a session's actor starts from.
@@ -295,14 +297,7 @@ enum Start {
     Create(Box<Open>),
     /// A session read from the state directory: a dead one.
     Loaded(Box<Loaded>),
-    Faulted(LoadFailure),
-}
-
-#[derive(Debug)]
-struct LoadFailure {
-    message: String,
-    /// Original names remain reserved for a later recovery, not deletion or reuse.
-    keep_files: bool,
+    Faulted(String),
 }
 
 struct Loaded {
@@ -334,11 +329,11 @@ struct Meta {
 
 /// Reads the session `sid` off the calling task and completes a journal that a hub
 /// stop or crash left with a live agent (startup normalisation). `Ok(None)` means no
-/// session. Only invalid content or a panicking load goes to quarantine.
-async fn read(ctx: &Ctx, sid: &str) -> Result<Option<Loaded>, LoadFailure> {
+/// session. Only invalid content goes to quarantine.
+async fn read(ctx: &Ctx, sid: &str, sync: Arc<SyncGate>) -> Result<Option<Loaded>, String> {
     let (dir, s) = (ctx.acp_dir.clone(), sid.to_owned());
     let attempt: anyhow::Result<_> = async {
-        let files = tokio::task::spawn_blocking(move || read_files(&dir, &s))
+        let files = tokio::task::spawn_blocking(move || read_files(&dir, &s, sync))
             .await
             .context("session load task failed")??;
         let Some((loaded, appended)) = files else {
@@ -360,17 +355,12 @@ async fn read(ctx: &Ctx, sid: &str) -> Result<Option<Loaded>, LoadFailure> {
         Err(error) => error,
     };
     let message = format!("{error:#}");
-    if error.chain().any(|cause| {
-        cause.is::<io::Error>()
-            || cause
-                .downcast_ref::<JoinError>()
-                .is_some_and(JoinError::is_cancelled)
-    }) {
+    if error
+        .chain()
+        .any(|cause| cause.is::<io::Error>() || cause.is::<JoinError>())
+    {
         warn!(%sid, "leaving session files in place for the next start: {message}");
-        return Err(LoadFailure {
-            message,
-            keep_files: true,
-        });
+        return Err(message);
     }
 
     warn!(%sid, "quarantining the session: {message}");
@@ -381,14 +371,15 @@ async fn read(ctx: &Ctx, sid: &str) -> Result<Option<Loaded>, LoadFailure> {
     if let Err(e) = &moved {
         warn!(%sid, "quarantining the session: {e}");
     }
-    Err(LoadFailure {
-        message,
-        keep_files: moved.is_err(),
-    })
+    Err(message)
 }
 
 /// The record, the journal and its fold, normalised; whether normalisation appended.
-fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
+fn read_files(
+    dir: &Path,
+    sid: &str,
+    sync: Arc<SyncGate>,
+) -> anyhow::Result<Option<(Loaded, bool)>> {
     let name = format!("{sid}.json");
     let text = match fs::read(dir.join(&name)) {
         Ok(text) => text,
@@ -402,7 +393,7 @@ fn read_files(dir: &Path, sid: &str) -> anyhow::Result<Option<(Loaded, bool)>> {
     let mut facts = Facts::default();
     let mut announced = BTreeMap::new();
     let mut policy_notice = false;
-    let mut journal = Journal::open(&dir.join(format!("{sid}.jsonl")), |ev| {
+    let mut journal = Journal::open(&dir.join(format!("{sid}.jsonl")), sync, |ev| {
         facts.apply(&ev);
         announce(&mut announced, &ev);
         match &ev.body {
@@ -480,7 +471,8 @@ fn quarantine(dir: &Path, sid: &str) -> io::Result<()> {
 
 /// Deletes the files of `sid`; quarantined ones stay.
 fn delete(dir: &Path, sid: &str) -> io::Result<()> {
-    for ext in FILES {
+    // Remove the metadata last: startup can still find the sid after a failed unlink.
+    for ext in FILES.into_iter().rev() {
         match fs::remove_file(dir.join(format!("{sid}.{ext}"))) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             _ => {}
@@ -491,8 +483,15 @@ fn delete(dir: &Path, sid: &str) -> io::Result<()> {
 
 /// Starts the supervised actor of a registered session. A loaded or faulted session is
 /// published before this returns.
-fn start(ctx: Arc<Ctx>, sid: String, created_at: u64, rx: mpsc::Receiver<Cmd>, from: Start) {
-    let mut acp = Acp::new(ctx, sid, created_at, Arc::default());
+fn start(
+    ctx: Arc<Ctx>,
+    sid: String,
+    created_at: u64,
+    rx: mpsc::Receiver<Cmd>,
+    shared: Arc<Shared>,
+    from: Start,
+) {
+    let mut acp = Acp::new(ctx, sid, created_at, shared);
     let first = acp.begin(from);
     tokio::spawn(supervise(acp, rx, first));
 }
@@ -521,7 +520,7 @@ async fn supervise(mut acp: Acp, mut rx: mpsc::Receiver<Cmd>, mut first: Option<
         let Some(next) = next else {
             return tell_reloaded(&sid, dropped);
         };
-        let from = match read(&ctx, &sid).await {
+        let from = match read(&ctx, &sid, shared.sync.clone()).await {
             Ok(Some(loaded)) => Start::Loaded(Box::new(loaded)),
             Ok(None) => {
                 // The files are gone: so is the session.
@@ -565,10 +564,10 @@ async fn redeliver(ctx: &Arc<Ctx>, sid: &str, cmd: Cmd) {
     }
 }
 
-/// What the supervisor needs after a panic: the attached connections and the agent's
-/// process group.
+/// State that survives an actor panic and belongs to this incarnation only.
 #[derive(Default)]
 struct Shared {
+    sync: Arc<SyncGate>,
     viewers: Mutex<Vec<Attached>>,
     pgid: Mutex<Option<u32>>,
 }
@@ -760,8 +759,6 @@ struct Acp {
     /// The kind of every permission and elicitation request ever announced, by `req`.
     announced: BTreeMap<u64, PendingKind>,
     fault: Option<Fault>,
-    /// Loading failed without quarantining the files; do not release the sid for reuse.
-    keep_files: bool,
     /// How the agent ended while the journal was faulted, for the probe's `exit`.
     fault_exit: Option<(Option<i32>, Option<i32>, ExitReason)>,
     proc: Option<Proc>,
@@ -818,7 +815,6 @@ impl Acp {
             facts: Facts::default(),
             announced: BTreeMap::new(),
             fault: None,
-            keep_files: false,
             fault_exit: None,
             proc: None,
             startup_config: None,
@@ -864,11 +860,10 @@ impl Acp {
                 self.policy = policy;
                 self.announced = announced;
             }
-            Start::Faulted(failure) => {
-                self.keep_files = failure.keep_files;
+            Start::Faulted(message) => {
                 self.fault = Some(Fault {
                     code: FaultCode::LoadFailed,
-                    message: failure.message,
+                    message,
                 });
             }
         }
@@ -880,7 +875,32 @@ impl Acp {
         if let Some(o) = first {
             self.create(o).await;
         }
-        while self.phase == Phase::Running {
+        loop {
+            if self.phase == Phase::Forget
+                && let Err(e) = self.delete_files().await
+            {
+                // A partial unlink may have removed the journal. Never append to it.
+                let message = format!("deleting the session's files: {e}");
+                warn!("{message}");
+                self.journal = None;
+                self.probe_at = None;
+                self.fault = Some(Fault {
+                    code: FaultCode::LoadFailed,
+                    message: message.clone(),
+                });
+                self.publish();
+                for reply in self.forgets.drain(..) {
+                    reply.err(ErrorCode::Internal, &message);
+                }
+                self.phase = if self.stopping.is_some() {
+                    Phase::Stopped
+                } else {
+                    Phase::Running
+                };
+            }
+            if self.phase != Phase::Running {
+                break;
+            }
             // A due record goes to disk before the next event: revive depends on `init`,
             // and a hub killed after the `session` line must still find it (10 §7.4).
             if self.meta_at.is_some_and(|at| at <= Instant::now()) {
@@ -931,9 +951,6 @@ impl Acp {
         }
         match self.phase {
             Phase::Forget => {
-                if let Err(e) = self.delete_files().await {
-                    warn!("deleting the session's files: {e}");
-                }
                 let viewers = take_viewers(&self.shared);
                 self.ctx
                     .registry
@@ -1115,12 +1132,13 @@ impl Acp {
             }
         };
         let (dir, sid) = (self.ctx.acp_dir.clone(), self.sid.clone());
+        let sync = self.shared.sync.clone();
         let json = serde_json::to_vec(&self.meta);
         let made = tokio::task::spawn_blocking(move || {
             // Files an earlier incarnation failed to delete must not leak into this one.
             delete(&dir, &sid)?;
             let opened = write_atomic(&dir, &format!("{sid}.json"), &json?).and_then(|()| {
-                Journal::open(&dir.join(format!("{sid}.jsonl")), drop)
+                Journal::open(&dir.join(format!("{sid}.jsonl")), sync, drop)
                     .map_err(|e| io::Error::other(format!("{e:#}")))
             });
             if opened.is_err() {
@@ -2315,9 +2333,6 @@ impl Acp {
     }
 
     fn kill(&mut self, forget: bool, reply: Reply) {
-        if forget && self.keep_files {
-            return reply.err(ErrorCode::Faulted, "cannot forget an unreadable session");
-        }
         self.probe();
         if self.proc.is_some() {
             self.stop_agent(Cause::User);
@@ -3380,7 +3395,8 @@ mod tests {
             cwd: dir.to_str().unwrap().into(),
             ..Meta::default()
         };
-        acp.journal = Some(Journal::open(&acp.path("jsonl"), drop).unwrap());
+        acp.journal =
+            Some(Journal::open(&acp.path("jsonl"), acp.shared.sync.clone(), drop).unwrap());
         assert!(acp.record(EventBody::Task {
             task: Some("original".into()),
         }));
@@ -3468,13 +3484,17 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), prefix);
             let ctx = actor.ctx.clone();
             let epoch = actor.created_at;
+            let sync = actor.shared.sync.clone();
             drop(actor);
-            let loaded = read(&ctx, "a").await.unwrap().unwrap();
+            // A supervisor reload shares the fault; only a new process starts fresh.
+            assert!(read(&ctx, "a", sync).await.is_err());
+            let shared = Arc::<Shared>::default();
+            let loaded = read(&ctx, "a", shared.sync.clone()).await.unwrap().unwrap();
             assert!(
                 loaded.announced.is_empty(),
                 "replayed a never-offered question"
             );
-            let mut recovered = Acp::new(ctx, "a".into(), epoch, Arc::default());
+            let mut recovered = Acp::new(ctx, "a".into(), epoch, shared);
             recovered.begin(Start::Loaded(Box::new(loaded)));
             ask(&mut recovered).await;
             assert_eq!(recovered.facts.pending.len(), 1);
@@ -3844,9 +3864,10 @@ mod tests {
             .unwrap()
             .set_len(stable_end)
             .unwrap();
-        let loaded = read(&ctx, "a").await.unwrap().unwrap();
+        let shared = Arc::<Shared>::default();
+        let loaded = read(&ctx, "a", shared.sync.clone()).await.unwrap().unwrap();
         assert_eq!(loaded.meta.created_at, epoch);
-        let mut new = Acp::new(ctx, "a".into(), epoch, Arc::default());
+        let mut new = Acp::new(ctx, "a".into(), epoch, shared);
         new.begin(Start::Loaded(Box::new(loaded)));
         new.spawn(SpawnVia::Revive).unwrap();
         assert!(new.record(session(SessionVia::Resume)));
@@ -4221,11 +4242,7 @@ mod tests {
             fs::rename(&original, &backing).unwrap();
 
             let q = Arc::new(OutQ::default());
-            for act in [
-                Act::SetTask(Some("must not commit".into())),
-                Act::Revive,
-                Act::Kill { forget: true },
-            ] {
+            for act in [Act::SetTask(Some("must not commit".into())), Act::Revive] {
                 let cmd = Cmd::Act {
                     epoch: None,
                     act,
@@ -4247,6 +4264,44 @@ mod tests {
             assert_eq!(opened["summary"]["acp"]["task"], "original");
             assert_eq!(opened["head"], 1);
         }
+    }
+
+    #[tokio::test]
+    async fn forget_unreadable_session_releases_sid_only_after_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let (actor, _rx) = dormant(dir.path()).await;
+        let (ctx, journal, meta) = (actor.ctx.clone(), actor.path("jsonl"), actor.path("json"));
+        drop(actor);
+        fs::remove_file(&journal).unwrap();
+        fs::create_dir(&journal).unwrap(); // Both open-for-write and unlink fail, even as root.
+        load(&ctx, "a".into()).await;
+        let forget = || {
+            let q = Arc::new(OutQ::default());
+            let cmd = Cmd::Act {
+                epoch: None,
+                act: Act::Kill { forget: true },
+                reply: Reply::for_test(1, q.clone()),
+            };
+            (cmd, q)
+        };
+        let (cmd, rejected) = forget();
+        ctx.registry.deliver("a", cmd).await;
+        let reply = next_reply(&rejected).await;
+        assert_eq!(reply["code"], "internal", "{reply}");
+        assert!(reply["message"].as_str().unwrap().contains("deleting"));
+        assert_eq!(ctx.registry.kind("a"), Some(Kind::Acp));
+        assert!(
+            meta.is_file(),
+            "failed forget removed the session's lookup name"
+        );
+
+        fs::remove_dir(&journal).unwrap();
+        std::os::unix::fs::symlink(&journal, &journal).unwrap(); // Still unreadable, but removable.
+        let (cmd, forgotten) = forget();
+        ctx.registry.deliver("a", cmd).await;
+        assert_eq!(next_reply(&forgotten).await["t"], "ok");
+        assert!(ctx.registry.kind("a").is_none());
+        assert!(!meta.exists() && !journal.is_symlink());
     }
 
     #[test]

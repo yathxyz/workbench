@@ -289,7 +289,7 @@ The error codes are a closed set:
 - **`Pending`:**
   - `kind` is `"permission"` or `"elicitation"`;
   - `req` is the seq of the immutable journal event that announced the question, not the agent's JSON-RPC id;
-  - within an incarnation, `(sid, epoch, req)` identifies exactly one human-answerable question published after its journal sync barrier, even after a crash loses the unsynced tail: answering or cancelling consumes it, and another question gets a fresh seq even if the agent reuses its id;
+  - on storage that has not reported a write error, `(sid, epoch, req)` identifies exactly one human-answerable question published after its journal sync barrier, even after a crash loses the unsynced tail: answering or cancelling consumes it, and another question gets a fresh seq even if the agent reuses its id;
   - `title` is the permission's `toolCall.title` or the elicitation's `message`, cut to 200 characters for both kinds. It is `""` when the request has none.
 - **`AcpSessionInfo`:** `{protocolVersion, agentInfo, agentCapabilities, promptCapabilities, authMethods, modes, configOptions, availableCommands, plan, usage}`. It holds the latest materialised values; absent optional values are omitted. `Summary.acp.configOptions` is always present, with `null` when absent.
 - Snapshots and watch events publish live and restored summaries unchanged, including the full option list, whenever they fit in a single-summary page with the longest request ID.
@@ -551,18 +551,13 @@ pty/<sid>.json                            {sid, shell (name), argv (argv[0] = th
 pty/<sid>.snap                            last VT snapshot (on exit, on SIGTERM, every 30 s while dirty)
 acp/<sid>.json                            {sid, agent, cwd, createdAt, agentSessionId|null, init|null, seenSeq, managedWorktree?}
 acp/<sid>.jsonl                           journal (§3.4.4)
-acp/<sid>.jsonl.sync                      sparse journal I/O witness (not a request counter or a rollback boundary)
 acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one generation kept)
 <kind>/<sid>.quarantine-<ms>.<ext>        files of a session that failed to load (kept for inspection, never loaded)
 ```
 - The loader considers only `<sid>.json` files whose stem matches the sid regex. Quarantined names contain a dot, so they never match.
 - `.json` and `.snap` are written atomically: tmp, fsync, rename, fsync the directory.
 - The journal is appended with one `pwrite(2)` per event at the tracked end, never with `O_APPEND`.
-- On open, the hub validates the journal and syncs its directory entry before replay.
-- An ordinary open, including after upgrade, syncs the validated prefix in place; neither an unsynced ordinary update nor an absent length hint calls for a copy.
-- Before a journal write, truncate or sync, the hub marks a per-handle witness nonempty; it clears it when the last overlapping operation finishes without a writeback fault.
-- A nonempty witness at recovery means a writeback error was observed or the previous hub stopped before it could report the outcome.
-- Only then does recovery rewrite the validated lines to a fresh inode, sync it, atomically install it and sync the directory: a later successful sync of the original inode cannot re-dirty failed pages.
+- On open, the hub validates the journal in place, truncates any torn tail, syncs the file with `fdatasync`, then syncs its directory.
 - A human-answerable `permission` or `elicitation` waits for `fdatasync` before publication, without a deadline; a stalled disk delays that session's shutdown as well as the question.
 - A policy decision (`permission_auto`) never offers a question to clients and adds no sync barrier.
 - Lifecycle events retain their background syncs; SIGTERM also syncs the journal.
@@ -666,14 +661,16 @@ While faulted:
 - `prompt` and `revive` get `faulted`. No `err` event is sent: the Summary's `fault` is the signal.
 - The agent's `exit`, once it has happened, is held back until the fault clears.
 - On `acp.revive`, on `acp.kill`, and every 60 s, the hub probes the journal.
-- If rollback is complete and the prefix is known good, the probe appends the outstanding death-invariant lines, including the held-back `exit`, or a `notice{warn}` if there are none.
+- If rollback is complete and no sync error is latched, the probe appends the outstanding death-invariant lines, including the held-back `exit`, or a `notice{warn}` if there are none.
 - On success the fault clears and the session is an ordinary dead session; a triggering `acp.revive` then proceeds under the normal rules.
-- All syncs of the live journal share one error state: a background sync that observes a writeback error prevents a later question from passing its publication barrier.
-- Neither a successful shrink nor a successful later sync clears a writeback error; appends remain blocked until recovery opens a known-good prefix.
+- All syncs for the journal share one gate, including background syncs and the question barrier.
+- Once `fdatasync` fails, the hub publishes no further question on that journal for the life of the process; even a successful sync of a rollback does not clear the fault.
 - Revive checks the journal before starting a child; failure to record `spawn` returns `faulted` without sending `initialize` to that child.
 
 A crash may lose or reuse a seq from an unsynced tail, including ordinary updates and automatically decided permissions.
 The no-reuse guarantee covers only human-answerable questions published through the sync barrier; upgrading cannot protect a number an older hub published and then lost.
+It assumes storage that has not reported a write error.
+After a hub restart without a reboot, the hub does not try to detect pages an earlier process failed to write: Linux reports such an error once, and a later sync can succeed without writing those pages.
 If both the question sync and the following truncate fail, a crash loses the in-memory rollback boundary and may leave a complete, never-offered question in history.
 That phantom event is not reuse of a published request number.
 
@@ -681,8 +678,9 @@ That phantom event is not reuse of a published request number.
 - Every session (both kinds) loads in its own task under `catch_unwind` plus error handling.
 - A torn journal tail is the bytes after the last `\n`. They are truncated away and logged. A failed truncation is a load failure.
 - On any ACP recovery I/O failure (including lack of space), keep the session's filenames intact and register the dead `load_failed` Summary below without opening it for appends.
-- A later start retries recovery; until then even `kill{forget:true}` returns `faulted`, since the hub cannot establish ownership from unavailable files.
-- For invalid contents, including a complete line that does not parse or a `seq` that is not the previous one plus 1 (starting at 1), or a loader panic, quarantine the session's files as `<sid>.quarantine-<ms>.<ext>` and register a dead Summary with:
+- A later start retries recovery unless the caller explicitly requests `kill{forget:true}`.
+- Forget deletes the session's files and releases its id only after deletion succeeds; on a deletion error the caller gets `internal` and can retry on the same registration.
+- For invalid contents, including a complete line that does not parse or a `seq` that is not the previous one plus 1 (starting at 1), quarantine the session's files as `<sid>.quarantine-<ms>.<ext>` and register a dead Summary with:
   - `fault={code:"load_failed", message}`;
   - `createdAt=now`;
   - `revivable:false`;
