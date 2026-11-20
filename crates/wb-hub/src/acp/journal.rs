@@ -1,6 +1,6 @@
 //! The per-session ACP journal `acp/<sid>.jsonl`: one `JournalEvent` per line,
-//! appended fail-closed (DESIGN §3.4.4, H-9). Memory never runs ahead of disk, so a
-//! seq is never issued twice.
+//! appended fail-closed (DESIGN §3.4.4, H-9). A question's seq is durable before
+//! it can reach a client as an answerable request id.
 //!
 //! Each line is written with one `pwrite(2)` at the tracked end of the last complete
 //! line, never with `O_APPEND`. Bytes a failed write leaves behind (when even the
@@ -47,13 +47,17 @@ pub struct Journal {
     /// Seq of the last line written; 0 for an empty journal.
     head: u64,
     offsets: Vec<u64>,
+    /// A complete but unsynced question could not be truncated. Its newline
+    /// must not survive a shorter replacement record.
+    truncate_before_write: bool,
     /// The append of this seq fails once after writing half its line (fault injection).
     #[cfg(any(test, debug_assertions))]
     fail_at: Option<u64>,
+    #[cfg(test)]
+    pub(super) fail_sync: bool,
 }
 
-/// An append that did not complete. The journal was truncated back to its last
-/// complete line, so nothing of the event is on disk and its seq was not used.
+/// An append that did not commit. Its seq was not published.
 #[derive(Debug)]
 pub struct WriteFault {
     pub error: io::Error,
@@ -77,6 +81,7 @@ impl Journal {
         let mut reader = BufReader::new(&file);
         let mut head = 0;
         let mut end = 0u64;
+        let mut has_question = false;
         let mut offsets = Vec::new();
         let mut line = Vec::new();
         loop {
@@ -110,38 +115,78 @@ impl Journal {
             end += n as u64;
             head = ev.seq;
             checkpoint(&mut offsets, head, end);
+            has_question |= is_question(&ev.body);
             visit(ev);
         }
+        // A process-only crash can leave a complete question in the page cache
+        // between pwrite and fdatasync. Make it durable before replay can expose it.
+        if has_question {
+            file.sync_data().context("syncing recovered questions")?;
+        }
+        // fdatasync on the file alone doesn't commit a newly created directory entry.
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        File::open(dir)?
+            .sync_all()
+            .context("syncing journal directory")?;
         Ok(Journal {
             file,
             end,
             head,
             offsets,
+            truncate_before_write: false,
             #[cfg(any(test, debug_assertions))]
             fail_at: fail_at_from_env(),
+            #[cfg(test)]
+            fail_sync: false,
         })
     }
 
-    /// Writes `body` as the next event with one `write(2)`. Only a complete write
-    /// advances the head; on any failure the file is truncated back and the fault
-    /// returned.
+    /// One pwrite per event. A human-answerable question also requires a successful
+    /// fdatasync before its seq can advance the head or reach a viewer.
     pub fn append(&mut self, body: EventBody, ts: u64) -> Result<JournalEvent, WriteFault> {
         let ev = JournalEvent {
             seq: self.head + 1,
             ts,
             body,
         };
+        if self.truncate_before_write {
+            self.file
+                .set_len(self.end)
+                .map_err(|error| WriteFault { error })?;
+            self.truncate_before_write = false;
+        }
         let bytes = line::encode(&ev);
         if let Err(error) = self.write(&bytes) {
-            if let Err(e) = self.file.set_len(self.end) {
-                error!(error = %e, end = self.end, "cannot truncate the journal after a failed append");
-            }
-            return Err(WriteFault { error });
+            return Err(self.rollback(error, false));
+        }
+        if is_question(&ev.body)
+            && let Err(error) = self.sync_question()
+        {
+            return Err(self.rollback(error, true));
         }
         self.end += bytes.len() as u64;
         self.head = ev.seq;
         checkpoint(&mut self.offsets, self.head, self.end);
         Ok(ev)
+    }
+
+    fn rollback(&mut self, error: io::Error, complete_line: bool) -> WriteFault {
+        if let Err(e) = self.file.set_len(self.end) {
+            error!(error = %e, end = self.end, "cannot truncate the journal after a failed append");
+            self.truncate_before_write = complete_line;
+        }
+        WriteFault { error }
+    }
+
+    fn sync_question(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_sync {
+            return Err(io::Error::other("injected journal sync fault"));
+        }
+        self.file.sync_data()
     }
 
     /// Startup normalisation (DESIGN §3.4.4, 10 §3 step 5). When `facts`, the fold of
@@ -220,6 +265,13 @@ impl Journal {
             ))
         }
     }
+}
+
+fn is_question(body: &EventBody) -> bool {
+    matches!(
+        body,
+        EventBody::Permission { .. } | EventBody::Elicitation { .. }
+    )
 }
 
 /// `WB_HUB_TEST_FAIL_WRITE_AT=N`, in debug builds only (DESIGN §4; also compiled into

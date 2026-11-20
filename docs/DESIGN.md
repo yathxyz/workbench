@@ -289,7 +289,7 @@ The error codes are a closed set:
 - **`Pending`:**
   - `kind` is `"permission"` or `"elicitation"`;
   - `req` is the seq of the immutable journal event that announced the question, not the agent's JSON-RPC id;
-  - within the same incarnation and journal history, `(sid, epoch, req)` identifies exactly one question: answering or cancelling consumes it, and another question gets a fresh seq even if the agent reuses its id;
+  - within an incarnation, `(sid, epoch, req)` identifies exactly one published question, even after a crash loses the unsynced journal tail: answering or cancelling consumes it, and another question gets a fresh seq even if the agent reuses its id;
   - `title` is the permission's `toolCall.title` or the elicitation's `message`, cut to 200 characters for both kinds. It is `""` when the request has none.
 - **`AcpSessionInfo`:** `{protocolVersion, agentInfo, agentCapabilities, promptCapabilities, authMethods, modes, configOptions, availableCommands, plan, usage}`. It holds the latest materialised values; absent optional values are omitted. `Summary.acp.configOptions` is always present, with `null` when absent.
 - Snapshots and watch events publish live and restored summaries unchanged, including the full option list, whenever they fit in a single-summary page with the longest request ID.
@@ -552,7 +552,10 @@ acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one ge
 ```
 - The loader considers only `<sid>.json` files whose stem matches the sid regex. Quarantined names contain a dot, so they never match.
 - `.json` and `.snap` are written atomically: tmp, fsync, rename, fsync the directory.
-- The journal is appended with one `pwrite(2)` per event at the tracked end of its last complete line, never with `O_APPEND`. If a failed append cannot even be truncated away, what is left is a prefix of a line with no `\n`: the next append overwrites it, and the next open truncates it. `fdatasync` runs on `session`, `setup_error`, `turn_end`, `turn_error`, `exit` and SIGTERM.
+- The journal is appended with one `pwrite(2)` per event at the tracked end, never with `O_APPEND`.
+- Opening a journal syncs its directory entry and, if it contains human-answerable questions, its recovered contents before replay.
+- Appending `permission` or `elicitation` waits for `fdatasync` before publishing its `req`; a policy decision (`permission_auto`) never offers a question to clients.
+- Lifecycle events retain their background syncs; SIGTERM also syncs the journal.
 
 **Web `stateDir`** (`…/workbench/web`): `web.lock`, `artifacts/<node>/…`, artifact `db.json`. **There is no `index.db`**: the notes index lives in memory.
 
@@ -634,13 +637,14 @@ Each line is `{"seq":N,"ts":…,"e":KIND,…}`.
 
 At startup, a journal whose last `spawn` has no `exit` gets these lines with `reason:"hub_restart"` and `code:"interrupted"`. `Facts::apply` is the single fold used both live and at startup.
 
-**Write rule, fail-closed.** `record(body)`:
+**Write rule, fail-closed.** For each event:
 1. assign `seq = head+1`;
 2. write the full line at the tracked end;
-3. **only on a complete write** advance head, fold, fan out and publish.
+3. for `permission` and `elicitation`, wait for `fdatasync` of that line and everything before it;
+4. only after success advance head, fold, fan out and publish.
 
-On a short or failed write:
-- `ftruncate` back to the last good length;
+On a short write, write error or required sync failure:
+- `ftruncate` back to the last good length; if a complete unsynced line cannot be truncated, retry the truncation before any later append;
 - set `fault = {code:"journal_write"}`;
 - record nothing more;
 - fail every unapplied initial configuration entry with `faulted`, release the batch gate and answer the creating open, even if spawning failed before an agent process existed;
@@ -652,7 +656,7 @@ While faulted:
 - The agent's `exit`, once it has happened, is held back until the fault clears.
 - On `acp.revive`, on `acp.kill`, and every 60 s, the hub probes the journal. If the death-invariant lines are outstanding, it appends them, including the held-back `exit`. Otherwise it appends a `notice{warn}`. On success the fault clears and the session is an ordinary dead session; a triggering `acp.revive` then proceeds under the normal rules.
 
-Memory never runs ahead of disk, so seqs are never reissued.
+A crash can lose an unsynced tail, but no `req` a client could have answered is in that tail.
 
 **Load and quarantine.**
 - Every session (both kinds) loads in its own task under `catch_unwind` plus error handling.

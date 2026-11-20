@@ -894,7 +894,7 @@ impl Acp {
                 Event::Cmd(None) => return,
                 Event::Worktree(result) => self.worktree_done(result).await,
                 Event::Replayed(r) => self.replayed(&r),
-                Event::Out(Some(Out::Msg(msg))) => self.agent_message(msg),
+                Event::Out(Some(Out::Msg(msg))) => self.agent_message(msg).await,
                 Event::Out(Some(Out::Eof) | None) => self.stdout_closed(),
                 Event::Exited(st) => self.child_exited(st),
                 Event::Drained => self.drained(),
@@ -2561,7 +2561,7 @@ impl Acp {
         self.stop_failed_setup();
     }
 
-    fn agent_message(&mut self, msg: Map<String, Value>) {
+    async fn agent_message(&mut self, msg: Map<String, Value>) {
         self.setup_at = Some(Instant::now() + SETUP_IDLE_TIMEOUT);
         match rpc::classify(msg) {
             Incoming::Response { id, outcome } => {
@@ -2570,7 +2570,9 @@ impl Acp {
                     None => self.log(&format!("dropped a response to unknown id {id}")),
                 }
             }
-            Incoming::Request { id, method, params } => self.agent_request(id, &method, params),
+            Incoming::Request { id, method, params } => {
+                self.agent_request(id, &method, params).await
+            }
             Incoming::Notification { method, params } => self.notification(&method, params),
             Incoming::Dropped(why) => self.log(&format!("dropped {why}")),
             Incoming::Junk(m) => {
@@ -2800,7 +2802,7 @@ impl Acp {
         self.stop_agent(Cause::Setup);
     }
 
-    fn agent_request(&mut self, id: Value, method: &str, params: Value) {
+    async fn agent_request(&mut self, id: Value, method: &str, params: Value) {
         match method {
             "session/request_permission" => {
                 let tool_call = params.get("toolCall").cloned().unwrap_or(Value::Null);
@@ -2860,11 +2862,13 @@ impl Acp {
                     .filter_map(|o| o.get("optionId")?.as_str().map(str::to_owned))
                     .collect();
                 let body = EventBody::Permission { tool_call, options };
-                self.hold(id, PendingKind::Permission, option_ids, body);
+                self.hold(id, PendingKind::Permission, option_ids, body)
+                    .await;
             }
             "elicitation/create" => {
                 let body = EventBody::Elicitation { request: params };
-                self.hold(id, PendingKind::Elicitation, Vec::new(), body);
+                self.hold(id, PendingKind::Elicitation, Vec::new(), body)
+                    .await;
             }
             _ => {
                 self.log(&format!("answered the agent request {method} with -32601"));
@@ -2875,14 +2879,41 @@ impl Acp {
 
     /// Journals an agent request and holds it until a viewer, a cancel, the agent or
     /// the agent's death answers it. A request that cannot be journaled is cancelled.
-    fn hold(&mut self, rpc_id: Value, kind: PendingKind, option_ids: Vec<String>, body: EventBody) {
-        if self.record(body) {
-            let held = HeldReq {
-                rpc_id,
-                kind,
-                option_ids,
-            };
-            self.held.insert(self.facts.head_seq, held);
+    async fn hold(
+        &mut self,
+        rpc_id: Value,
+        kind: PendingKind,
+        option_ids: Vec<String>,
+        body: EventBody,
+    ) {
+        if self.fault.is_none()
+            && let Some(mut journal) = self.journal.take()
+        {
+            // Wait in this actor only. No replay, answer or later append can overtake the sync.
+            let (journal, result) = tokio::task::spawn_blocking(move || {
+                let result = journal.append(body, now_ms());
+                (journal, result)
+            })
+            .await
+            .expect("journal worker panicked");
+            self.journal = Some(journal);
+            match result {
+                Ok(ev) => {
+                    self.held.insert(
+                        ev.seq,
+                        HeldReq {
+                            rpc_id,
+                            kind,
+                            option_ids,
+                        },
+                    );
+                    self.applied(ev);
+                }
+                Err(fault) => {
+                    self.send(&rpc::result(&rpc_id, to_agent(kind, cancelled(kind))));
+                    self.journal_fault(&fault);
+                }
+            }
         } else {
             self.send(&rpc::result(&rpc_id, to_agent(kind, cancelled(kind))));
         }
@@ -3301,6 +3332,139 @@ mod tests {
         serde_json::from_slice(&line).unwrap()
     }
 
+    async fn lost_question_tail(kind: PendingKind) {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut old, _rx) = dormant(dir.path()).await;
+        let path = old.path("jsonl");
+        let epoch = old.created_at;
+        let session = |via| EventBody::Session {
+            via,
+            session_id: "s".into(),
+            modes: None,
+            config_options: None,
+        };
+        let prompt = || EventBody::Prompt {
+            prompt: vec![json!({"type":"text","text":"go"})],
+        };
+        assert!(old.record(EventBody::Spawn {
+            pid: 1,
+            via: SpawnVia::New
+        }));
+        assert!(old.record(session(SessionVia::New)));
+        old.journal.as_ref().unwrap().sync().await.unwrap().unwrap();
+        let stable_end = fs::metadata(&path).unwrap().len();
+        assert!(old.record(prompt()));
+        // At restart, exit + spawn + session + prompt will occupy these four seqs.
+        for _ in 0..3 {
+            assert!(old.record(EventBody::Update {
+                update: json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}}),
+                session_id: None,
+            }));
+        }
+        let (method, question, answer): (_, fn(&str) -> Value, _) = match kind {
+            PendingKind::Permission => (
+                "session/request_permission",
+                |title| json!({"toolCall":{"title":title},"options":[{"optionId":"allow"}]}),
+                json!({"outcome":"selected","optionId":"allow"}),
+            ),
+            PendingKind::Elicitation => (
+                "elicitation/create",
+                |message| json!({"message":message}),
+                json!({"action":"decline"}),
+            ),
+            PendingKind::Unknown => unreachable!(),
+        };
+        let queue = Arc::new(OutQ::default());
+        lock(&old.shared.viewers).push(Attached {
+            viewer: Viewer {
+                id: 1,
+                outq: queue.clone(),
+            },
+            backlog: None,
+        });
+        let before_question = fs::metadata(&path).unwrap().len();
+        old.journal.as_mut().unwrap().fail_sync = true;
+        old.agent_request(json!(7), method, question("old question"))
+            .await;
+        queue.finish();
+        let mut published_req = None;
+        while let Some(line) = queue.pop().await {
+            let msg: Value = serde_json::from_slice(&line).unwrap();
+            if let Some(req) = msg["ev"]["seq"]
+                .as_u64()
+                .or_else(|| msg.pointer("/summary/acp/pending/0/req")?.as_u64())
+            {
+                published_req = Some(req);
+            }
+        }
+        let after_question = fs::metadata(&path).unwrap().len();
+        let fault = old.fault.take();
+        let ctx = old.ctx.clone();
+        drop(old);
+
+        // Lose everything after the last successful sync, not just a torn JSON line.
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(stable_end)
+            .unwrap();
+        let loaded = read(&ctx, "a").await.unwrap().unwrap();
+        assert_eq!(loaded.meta.created_at, epoch);
+        let mut new = Acp::new(ctx, "a".into(), epoch, Arc::default());
+        new.begin(Start::Loaded(Box::new(loaded)));
+        assert!(new.record(EventBody::Spawn {
+            pid: 2,
+            via: SpawnVia::Revive
+        }));
+        assert!(new.record(session(SessionVia::Resume)));
+        assert!(new.record(prompt()));
+        new.agent_request(json!(7), method, question("different question"))
+            .await;
+        let req = new.facts.pending[0].req;
+        if let Some(stale) = published_req {
+            assert_eq!(stale, req, "the lost tail must exercise a real collision");
+            let queue_for_answer = Arc::new(OutQ::default());
+            new.answer(
+                stale,
+                epoch,
+                kind,
+                answer.clone(),
+                Reply::for_test(1, queue_for_answer.clone()),
+            );
+            assert_ne!(
+                next_reply(&queue_for_answer).await["t"],
+                "ok",
+                "the old answer consumed the replacement question"
+            );
+        }
+        assert_eq!(published_req, None, "the unsynced question was published");
+        assert_eq!(
+            before_question, after_question,
+            "failed sync left a complete line"
+        );
+        assert!(matches!(
+            fault,
+            Some(Fault {
+                code: FaultCode::JournalWrite,
+                ..
+            })
+        ));
+        let reply = Arc::new(OutQ::default());
+        new.answer(req, epoch, kind, answer, Reply::for_test(2, reply.clone()));
+        assert_eq!(next_reply(&reply).await["t"], "ok");
+    }
+
+    #[tokio::test]
+    async fn lost_permission_tail() {
+        lost_question_tail(PendingKind::Permission).await;
+    }
+
+    #[tokio::test]
+    async fn lost_elicitation_tail() {
+        lost_question_tail(PendingKind::Elicitation).await;
+    }
+
     async fn actions_during_drain(exit_first: bool) {
         let dir = tempfile::tempdir().unwrap();
         let (mut acp, _rx) = dormant(dir.path()).await;
@@ -3325,9 +3489,11 @@ mod tests {
             modes: Some(json!({"availableModes": [{"id": "ask"}]})),
             config_options: Some(json!([{"id": "flag", "type": "boolean"}])),
         }));
-        acp.agent_request(json!(10), "session/request_permission", json!({}));
+        acp.agent_request(json!(10), "session/request_permission", json!({}))
+            .await;
         let permission = acp.facts.head_seq;
-        acp.agent_request(json!(11), "elicitation/create", json!({}));
+        acp.agent_request(json!(11), "elicitation/create", json!({}))
+            .await;
         let elicitation = acp.facts.head_seq;
 
         let agent = &mut acp.proc.as_mut().unwrap().agent;
