@@ -8374,7 +8374,11 @@ function mountPdf(n: PdfNode, L: LiveEntry) {
   scroll.tabIndex = 0; scroll.setAttribute('aria-label', 'PDF ' + n.name);
   L.body!.append(scroll, note); L.note = note;
   const P: PdfLive = L.pdf = { doc: null, load: null, err: '', scroll, pages: [], w: 0, texts: [] };
-  scroll.addEventListener('scroll', () => { pdfSoon(80); pdfPosSave(n); }, { passive: true });
+  scroll.addEventListener('scroll', () => {
+    const jump = pdfQuoteJump;
+    if (jump?.owner === P && jump.clampedTop !== scroll.scrollTop) jump.clampedTop = undefined;
+    pdfSoon(80); pdfPosSave(n);
+  }, { passive: true });
   scroll.addEventListener('pointerdown', () => activate(n.id));
   L.ro = new ResizeObserver(() => { if (pdfLayout(n)) pdfSoon(60); }); L.ro.observe(L.body!);
   P.load = pdfOpen(n, L);
@@ -8401,7 +8405,7 @@ async function pdfOpen(n: PdfNode, L: LiveEntry): Promise<PdfJsDocument | null> 
     first = await doc.getPage(1);
   } catch (e) {
     if (live[n.id] !== L) return null;   // pdfClose destroyed the task while it was loading
-    pdfClose(L); pdfError(n, L.pdf!, e);
+    pdfReset(L.pdf!); pdfError(n, L.pdf!, e);
     return null;
   }
   if (live[n.id] !== L) return null;
@@ -8422,6 +8426,9 @@ async function pdfOpen(n: PdfNode, L: LiveEntry): Promise<PdfJsDocument | null> 
 function pdfClose(L: LiveEntry) {
   const P = L.pdf; if (!P) return;
   if (pdfQuoteJump?.owner === P) pdfQuoteJump.finish();
+  pdfReset(P);
+}
+function pdfReset(P: PdfLive) {
   for (const p of P.pages) { pdfEvict(p); pdfDropText(p); }
   P.task?.destroy().catch(() => {}); P.task = null; P.doc = null; P.pages = []; clearTimeout(P.posT);
 }
@@ -8549,7 +8556,6 @@ function pdfTextLayer(P: PdfLive, p: PdfPageLive, page: PdfJsPage) {
   }).catch(() => {}).then(() => {
     if (p.text !== div) return;
     p.textTask = null;
-    pdfQuoteReady(P, p);
   });
 }
 function pdfDropText(p: PdfPageLive) {
@@ -8671,8 +8677,15 @@ function pdfQuoteDraw(P: PdfLive) {
   const jump = pdfQuoteJump;
   if (jump?.owner !== P || !jump.page) return;
   const p = jump.page;
+  if (!p.text && p.page) pdfTextLayer(P, p, p.page);
   if (p.textTask === null) pdfQuoteReady(P, p);
-  else if (!p.text && p.page) pdfTextLayer(P, p, p.page);
+  else {
+    // Join this layer after any find already waiting for it.
+    const ready = p.textReady;
+    void ready?.then(() => {
+      if (pdfQuoteJump === jump && p.textReady === ready) pdfQuoteReady(P, p);
+    });
+  }
 }
 function pdfQuoteReady(P: PdfLive, p: PdfPageLive) {
   const jump = pdfQuoteJump;

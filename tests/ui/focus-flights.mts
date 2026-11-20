@@ -101,7 +101,7 @@ async function interruptedQuote(p: Page, id: string, shell: string, action: 'car
   check(`N50: leaving via ${action} during PDF text lookup cancels the quote scroll and focus`, result.navigated && !result.scrolled && !result.focused, JSON.stringify(result));
 }
 
-async function quoteDuringRender(p: Page, id: string, other: string, action: 'layout' | 'clamp' | 'quote-scroll' | 'close' | 'switch' | 'manual' | 'manual-layout') {
+async function quoteDuringRender(p: Page, id: string, other: string, action: 'layout' | 'clamp' | 'clamp-return' | 'quote-scroll' | 'close' | 'switch' | 'manual' | 'manual-layout') {
   const size = p.viewportSize()!;
   if (action === 'layout') {
     await p.exposeFunction('n50ResizePdf', (width: number) => p.setViewportSize({ ...size, width }));
@@ -136,13 +136,13 @@ async function quoteDuringRender(p: Page, id: string, other: string, action: 'la
         async pull(controller) {
           await render.release.promise;
           if (render.cancelled) return;
-          if (action !== 'manual' && action !== 'quote-scroll' && action !== 'clamp') controller.enqueue(content);
+          if (action !== 'manual' && action !== 'quote-scroll' && action !== 'clamp' && action !== 'clamp-return') controller.enqueue(content);
           controller.close();
         },
         cancel() { render.cancelled = true; render.release.resolve(); },
       });
     };
-    P.scroll.focus = function (options) { focused = true; saveFocus.call(this, options); if (manual) done.resolve(); };
+    P.scroll.focus = function (options) { focused = true; saveFocus.call(this, options); if (manual || action === 'clamp-return') done.resolve(); };
     try {
       if (manual) {
         C.jumpNode(n);
@@ -170,6 +170,33 @@ async function quoteDuringRender(p: Page, id: string, other: string, action: 'la
         const landed = C.pdfWhere(n).page, hit = !!pg.el.querySelector('.textLayer .pdf-hit');
         return { ok: before === 2 && clamped === 1 && removed && !focusedEarly && cancelled === 3 && landed === 2 && hit && focused,
           before, clamped, removed, focusedEarly, cancelled, landed, hit, focused };
+      }
+      if (action === 'clamp-return') {
+        const layout = Promise.withResolvers<void>(), scroll = P.scroll;
+        const observer = new MutationObserver(() => { if (!initial.isConnected) layout.resolve(); });
+        observer.observe(pg.el, { childList: true });
+        try {
+          C.focusOpen(n);
+          await wait('replacing the clamped layout', layout.promise);
+        } finally { observer.disconnect(); }
+        const clamped = scroll.scrollTop, clampedPage = C.pdfWhere(n).page;
+        const scrollTo = async (top: number) => {
+          const moved = Promise.withResolvers<void>(), abort = new AbortController();
+          scroll.addEventListener('scroll', () => moved.resolve(), { once: true, signal: abort.signal });
+          try { scroll.scrollTop = top; await wait(`observing scroll to ${top}`, moved.promise); }
+          finally { abort.abort(); }
+          return scroll.scrollTop;
+        };
+        const away = await scrollTo(pg.el.offsetTop);
+        await wait('holding the replacement render', renders[1].started.promise);
+        const returned = await scrollTo(0);
+        const focusedEarly = focused;
+        renders[1].release.resolve(); renders[0].release.resolve();
+        await wait('rendering the layer without spans', pg.textReady!);
+        await wait('finishing the quote after returning to the top', done.promise);
+        const landed = scroll.scrollTop, hit = !!pg.el.querySelector('.pdf-hit');
+        return { ok: before === 2 && clamped === 0 && clampedPage === 1 && away > 100 &&
+          returned === 0 && !focusedEarly && landed === 0 && !hit, before, clamped, clampedPage, away, returned, focusedEarly, landed, hit };
       }
       if (action === 'manual-layout' || action === 'clamp') {
         C.focusOpen(n);
@@ -215,6 +242,7 @@ async function quoteDuringRender(p: Page, id: string, other: string, action: 'la
   const name = {
     layout: 'a quote follows repeated layout replacements without waiting for discarded text layers',
     clamp: 'a quote with no spans restores the target page when the layout clamps it',
+    'clamp-return': 'returning to the top during a clamped quote render preserves the user scroll',
     'quote-scroll': 'a quote with no spans preserves a scroll made during rendering without a resize',
     close: 'closing a PDF settles its pending quote and cancels the discarded render',
     switch: 'switching PDFs settles the pending quote without waiting for the old render',
@@ -224,17 +252,128 @@ async function quoteDuringRender(p: Page, id: string, other: string, action: 'la
   check(`N50: ${name}`, result.ok, JSON.stringify(result));
 }
 
+async function quoteAfterFind(p: Page, id: string) {
+  const result = await p.evaluate(async id => {
+    const C = window.__canvas, n = C.S.nodes[id], P: PdfLive = C.live[id].pdf;
+    async function wait<T>(stage: string, promise: Promise<T>): Promise<T> {
+      let timer: number;
+      try {
+        return await Promise.race([promise, new Promise<never>((_, reject) => {
+          timer = window.setTimeout(() => reject(new Error(`PDF find then quote: ${stage} timed out`)), 5000);
+        })]);
+      } finally { clearTimeout(timer!); }
+    }
+    await wait('loading fixture', P.load!);
+    await wait('warming lookup', C.pdfText(n));
+    const pg = P.pages[1], page = pg.page!, scroll = P.scroll, stream = page.streamTextContent;
+    const content = await wait('reading fixture text', page.getTextContent());
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(), positioned = Promise.withResolvers<void>();
+    const frame = () => new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    const top = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop')!;
+    const a = 'manual find alpha', b = 'manual find omega';
+    let renders = 0;
+    page.streamTextContent = function () {
+      renders++; entered.resolve();
+      return new ReadableStream({
+        async pull(controller) { await release.promise; controller.enqueue(content); controller.close(); },
+      });
+    };
+    try {
+      await wait('activating PDF', new Promise<void>(done => C.jumpNode(n, 1, done)));
+      C.CMDS.find((c: PaletteItem) => c.l === 'PDF: find in the active PDF…').run();
+      document.querySelector<HTMLInputElement>('#ask-in')!.value = a;
+      document.querySelector<HTMLFormElement>('#ask-form')!.requestSubmit();
+      await wait('entering the manual find render', entered.promise);
+      const layer = pg.text;
+      Object.defineProperty(scroll, 'scrollTop', {
+        configurable: true, get: () => top.get!.call(scroll),
+        set: y => { top.set!.call(scroll, y); positioned.resolve(); },
+      });
+      C.jumpRef({ text: b, src: { node: id, page: 2 } });
+      await wait('positioning the quote at the shared page', positioned.promise);
+      await wait('joining the shared text layer', frame());
+      release.resolve();
+      await wait('rendering the shared text layer', pg.textReady!);
+      await wait('finishing both continuations', frame());
+      const spans = [...layer!.querySelectorAll('span')];
+      const where = (text: string) => {
+        const span = spans.find(span => span.textContent === text)!;
+        return Math.min(scroll.scrollHeight - scroll.clientHeight, pg.el.offsetTop - P.pages[0].el.offsetTop + Math.max(0, span.offsetTop - 60));
+      };
+      const alpha = where(a), omega = where(b), landed = scroll.scrollTop;
+      return { ok: pg.text === layer && renders === 1 && omega - alpha > 100 && Math.abs(landed - omega) <= 1 &&
+        spans.some(s => s.textContent === b && s.classList.contains('pdf-hit')),
+        renders, shared: pg.text === layer, alpha, omega, landed };
+    } finally {
+      release.resolve(); delete (scroll as Partial<HTMLElement>).scrollTop; page.streamTextContent = stream;
+    }
+  }, id);
+  check('N50: a quote takes precedence over an earlier find waiting for the same text layer', result.ok, JSON.stringify(result));
+}
+
+async function quoteWhileLoadFails(p: Page) {
+  const path = '/n50-delayed-missing.pdf';
+  const match = (url: URL) => url.pathname === '/api/raw' && url.searchParams.get('path') === path;
+  const release = Promise.withResolvers<void>();
+  await p.route(match, async route => { await release.promise; await route.fulfill({ status: 404, body: 'missing PDF' }); });
+  let ids: { id: string; ref: string } | undefined;
+  try {
+    const requested = p.waitForRequest(r => match(new URL(r.url())), { timeout: 5000 });
+    ids = await p.evaluate(({ path, quote }) => {
+      const C = window.__canvas;
+      const n = C.addNode({ kind: 'pdf', name: 'n50-missing', path, x: 18000, y: 14000, w: 510, h: 320 });
+      const r = C.addNode({ kind: 'ref', name: 'n50-reference', ...quote, src: { node: n.id, page: 1 }, x: 0, y: 0, w: 300, h: 180 });
+      return { id: n.id, ref: r.id };
+    }, { path, quote });
+    await requested;
+    await p.exposeFunction('n50FailPdf', () => release.resolve());
+    const result = await p.evaluate(async ({ id, ref }) => {
+      const C = window.__canvas, L = C.live[id], P: PdfLive = L.pdf;
+      async function wait<T>(stage: string, promise: Promise<T>): Promise<T> {
+        let timer: number;
+        try {
+          return await Promise.race([promise, new Promise<never>((_, reject) => {
+            timer = window.setTimeout(() => reject(new Error(`PDF load failure: ${stage} timed out`)), 5000);
+          })]);
+        } finally { clearTimeout(timer!); }
+      }
+      await wait('activating the reference', new Promise<void>(done => C.jumpNode(C.S.nodes[ref], 1, done)));
+      const button = (C.live[ref].el as HTMLElement).querySelector<HTMLButtonElement>('button[title="Jump to the source"]')!;
+      const load = P.load!, entered = Promise.withResolvers<void>();
+      Object.defineProperty(P, 'load', { configurable: true, get: () => { entered.resolve(); return load; } });
+      try {
+        button.focus();
+        if (document.activeElement !== button || P.doc || P.err) throw new Error('reference must own focus while the PDF is still loading');
+        button.click();
+        await wait('quote waiting for the file', entered.promise);
+        const fail = Reflect.get(window, 'n50FailPdf') as () => Promise<void>;
+        await wait('releasing the failing response', fail());
+        await wait('settling the failed load', load);
+        await wait('finishing the quote continuation', new Promise<void>(resolve => requestAnimationFrame(() => resolve())));
+        const mounted = C.live[id] === L && P.scroll.isConnected, failed = !P.doc && !!P.err;
+        const reader = document.activeElement === P.scroll, reference = document.activeElement === button;
+        return { ok: mounted && failed && reader, mounted, failed, reader, reference, active: C.activeId === id };
+      } finally { Object.defineProperty(P, 'load', { configurable: true, writable: true, value: load }); }
+    }, ids);
+    check('N50: jumping to a PDF that fails to load still focuses its mounted reader', result.ok, JSON.stringify(result));
+  } finally {
+    release.resolve();
+    await p.unroute(match);
+    if (ids) await p.evaluate(({ id, ref }) => { const C = window.__canvas; C.removeNode(ref); C.removeNode(id); }, ids);
+  }
+}
+
 export async function focusFlights(p: Page, shell: string) {
   const paper = await p.context().newPage();
   let src: string;
   try {
-    await paper.setContent('<p>First page</p><p style="break-before:page">The focus flight quote</p>');
+    await paper.setContent('<p>First page</p><p style="break-before:page">The focus flight quote<br>manual find alpha</p><p style="margin-top: 420px">manual find omega</p>');
     src = 'data:application/pdf;base64,' + (await paper.pdf()).toString('base64');
   } finally { await paper.close(); }
   await p.bringToFront();
-  await rootSelection(p, shell);
   const add = (name: string) => p.evaluate(({ src, name }) => window.__canvas.addNode({ kind: 'pdf', name, src, in: null, x: 18000, y: 14000, w: 510, h: 320 }).id, { src, name });
   const close = (id: string) => p.evaluate(id => { const C = window.__canvas; C.focusClose(id); if (C.S.nodes[id]) C.removeNode(id); }, id);
+  await rootSelection(p, shell);
   const cold = await add('n50-paper-cold');
   try { await quoteFlight(p, cold, false); } finally { await close(cold); }
   const other = await add('n50-paper-other');
@@ -300,4 +439,14 @@ export async function focusFlights(p: Page, shell: string) {
       }
     } finally { await p.evaluate(name => { delete window.__canvas.S.views[name]; }, name); }
   } finally { await close(id); }
+
+  const find = await add('n50-find-then-quote');
+  try { await quoteAfterFind(p, find); } finally { await close(find); }
+  const size = p.viewportSize()!;
+  await p.setViewportSize({ ...size, height: 1700 }); // Taller than the stale pages, but not the enlarged layout.
+  try {
+    const clamp = await add('n50-clamp-return');
+    try { await quoteDuringRender(p, clamp, '', 'clamp-return'); } finally { await close(clamp); }
+  } finally { await p.setViewportSize(size); }
+  await quoteWhileLoadFails(p);
 }
