@@ -3323,24 +3323,102 @@ fn hub_kill_forget_outlasts_a_stubborn_agent_then_respawns_fresh() {
     fold_equals_live(&mut hub);
 }
 
+/// Unlike `wait_gone`, this also waits for a zombie to disappear.
+fn wait_reaped(pid: u32) {
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    eventually(PATIENCE, "the agent leader is reaped", || {
+        !proc.try_exists().unwrap()
+    });
+}
+
+// Keep a TERM-resistant witness in the fake's process group. Record the leader's
+// state from the signal handler so the test need not catch the grace window.
+const GROUP_WITNESS: &str = r#"
+witness=$1
+shift
+leader=$$
+(
+    exec 3<>"$witness"
+    trap 'IFS= read -r stat 2>/dev/null <"/proc/$leader/stat" || stat=missing
+          printf "%s\n" "$stat" >"$witness.term"
+          trap "" TERM
+          exec sleep 30' TERM
+    printf '%s\n' "$BASHPID" >"$witness.pid"
+    read -r -t 30 -u 3
+) </dev/null >/dev/null 2>&1 &
+exec "$@"
+"#;
+
+fn hub_with_group_witness(scenario: &str) -> Hub {
+    Hub::with_scenarios_and(&[scenario], |config| {
+        let state = PathBuf::from(config["stateDir"].as_str().unwrap());
+        let witness = state.with_file_name("group-witness");
+        rustix::fs::mkfifoat(rustix::fs::CWD, &witness, rustix::fs::Mode::RWXU).unwrap();
+        let bash = config["shells"][0]["paths"][0].clone();
+        let fake = &mut config["agents"][scenario]["argv"];
+        let mut argv = vec![
+            bash,
+            json!("-c"),
+            json!(GROUP_WITNESS),
+            json!("group-witness"),
+            json!(witness),
+        ];
+        argv.append(fake.as_array_mut().unwrap());
+        *fake = json!(argv);
+    })
+}
+
+fn sigterm_witness_pid(hub: &Hub, pgid: u32) -> u32 {
+    let witness = hub.dir.join("group-witness.pid");
+    let witness_pid = || {
+        fs::read_to_string(&witness)
+            .ok()?
+            .strip_suffix('\n')?
+            .parse::<u32>()
+            .ok()
+    };
+    eventually(PATIENCE, "the SIGTERM witness is ready", || {
+        witness_pid().is_some()
+    });
+    let witness_pid = witness_pid().unwrap();
+    assert!(group_members(pgid).contains(&witness_pid));
+    witness_pid
+}
+
 #[test]
 fn hub_kills_what_a_crashed_agent_left_in_its_group() {
-    let mut hub = Hub::with_scenarios(&["crash-leave-child"]);
+    let mut hub = hub_with_group_witness("crash-leave-child");
     let mut c = hub.connect();
     let (_, evs) = spawn_until(&mut c, &hub, "a1", "crash-leave-child", "session");
     let pgid = agent_pid(&evs);
+    let witness_pid = sigterm_witness_pid(&hub, pgid);
     assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
-    c.event("a1", "exit");
+    let exit = c.event("a1", "exit");
+    assert_eq!(exit["reason"], "exited");
+    assert_eq!(exit["code"], 1);
+
+    let term = hub.dir.join("group-witness.term");
+    eventually(PATIENCE, "the survivor receives SIGTERM", || {
+        fs::read_to_string(&term).is_ok_and(|s| s.ends_with('\n'))
+    });
+    let stat = fs::read_to_string(term).unwrap();
+    assert_eq!(
+        stat.rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().next()),
+        Some("Z"),
+        "the leader must still pin the group during escalation; witness saw {stat:?}"
+    );
+
     let note = hub
         .record("crash-leave-child")
         .into_iter()
         .find(|e| e["note"] == "child")
         .expect("a child note");
     let child = u32::try_from(note["childPid"].as_u64().unwrap()).unwrap();
-    eventually(Duration::from_secs(3), "the group is empty", || {
-        group_members(pgid).is_empty()
+    eventually(PATIENCE, "both crash survivors are terminated", || {
+        !running(child) && !running(witness_pid) && group_members(pgid).is_empty()
     });
-    assert!(!running(child));
+    wait_reaped(pgid);
     drop(c);
     fold_equals_live(&mut hub);
 }
@@ -3349,7 +3427,8 @@ fn hub_kills_what_a_crashed_agent_left_in_its_group() {
 fn hub_leaves_a_child_that_left_the_group() {
     let mut hub = Hub::with_scenarios(&["setsid-child"]);
     let mut c = hub.connect();
-    ready(&mut c, &hub, "a1", "setsid-child");
+    let (_, evs) = spawn_until(&mut c, &hub, "a1", "setsid-child", "session");
+    let leader = agent_pid(&evs);
     assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
     c.event("a1", "exit");
     let note = hub
@@ -3358,8 +3437,9 @@ fn hub_leaves_a_child_that_left_the_group() {
         .find(|e| e["note"] == "child")
         .expect("a child note");
     let child = u32::try_from(note["childPid"].as_u64().unwrap()).unwrap();
-    std::thread::sleep(Duration::from_secs(3));
-    let survived = running(child);
+    // No live group member remained. Wait for cleanup before checking the escapee.
+    wait_reaped(leader);
+    let survived = group_members(child) == [child];
     common::signal(child, rustix::process::Signal::KILL);
     assert!(
         survived,

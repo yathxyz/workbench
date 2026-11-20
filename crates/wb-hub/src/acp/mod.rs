@@ -3646,6 +3646,110 @@ mod tests {
         cfg.agents.get_mut("offline").unwrap().argv = vec![shell, "-c".into(), script.into()];
     }
 
+    mod group_cleanup {
+        use super::*;
+        use rustix::process::{Pid, WaitOptions, waitpid};
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+        use tokio::process::{Child, ChildStdin, Command};
+
+        // Exit 42 on TERM if the leader is still pinned, 43 if the number was
+        // released. Closing the gate instead exits 0. An unrelated group can
+        // thus prove it received neither TERM nor KILL, without a timing sample.
+        async fn witness(group: i32) -> (Child, ChildStdin) {
+            let mut child = Command::new("sh")
+                .args([
+                    "-c",
+                    r#"trap 'test -d "/proc/$1" && exit 42; exit 43' TERM; printf R; read -r line; exit 0"#,
+                    "witness",
+                    &group.to_string(),
+                ])
+                .process_group(group)
+                .kill_on_drop(true)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let ready = watchdog(child.stdout.take().unwrap().read_u8())
+                .await
+                .unwrap();
+            assert_eq!(ready, b'R');
+            let gate = child.stdin.take().unwrap();
+            (child, gate)
+        }
+
+        #[tokio::test]
+        async fn panic_during_exit_drain_signals_only_the_pinned_group() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut actor, rx) = dormant(dir.path()).await;
+            configure_test_agent(&mut actor, READ_INPUT);
+            actor.spawn(SpawnVia::New).unwrap();
+            let agent = &mut actor.proc.as_mut().unwrap().agent;
+            let pid = agent.pid();
+            let (mut member, _gate) = witness(pid as i32).await;
+            let (mut unrelated, release) = witness(0).await;
+            agent.stdin = None;
+            let st = wait_success(agent).await;
+            actor.child_exited(Ok(st));
+
+            // Queue the panic before the actor polls again. Hold the drain open
+            // so it cannot finalise instead, even on a slow test machine.
+            actor.proc.as_mut().unwrap().eof = true;
+            actor.proc.as_mut().unwrap().drain_until = None;
+            let ctx = actor.ctx.clone();
+            ctx.registry
+                .deliver(
+                    "a",
+                    Cmd::Act {
+                        epoch: None,
+                        act: Act::Panic,
+                        reply: Reply::for_test(1, Arc::default()),
+                    },
+                )
+                .await;
+            let supervisor = tokio::spawn(supervise(actor, rx, None));
+            assert_eq!(watchdog(member.wait()).await.unwrap().code(), Some(42));
+            watchdog(async {
+                while !child::peek_exit(pid).is_err_and(|e| child::is_echild(&e)) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            drop(release);
+            assert!(watchdog(unrelated.wait()).await.unwrap().success());
+            supervisor.abort();
+        }
+
+        #[tokio::test]
+        async fn echild_never_signals_a_still_addressable_group() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut actor, _rx) = dormant(dir.path()).await;
+            configure_test_agent(&mut actor, READ_INPUT);
+            actor.spawn(SpawnVia::New).unwrap();
+            let agent = &mut actor.proc.as_mut().unwrap().agent;
+            let pid = Pid::from_raw(agent.pid() as i32).unwrap();
+            // Keep a witness at the old number: unlike relying on rapid pid
+            // reuse after a group empties, any stale killpg is observable.
+            let (mut member, release) = witness(pid.as_raw_nonzero().get()).await;
+            agent.stdin = None;
+            let e = tokio::task::spawn_blocking(move || {
+                waitpid(Some(pid), WaitOptions::empty()).unwrap();
+                waitpid(Some(pid), WaitOptions::NOHANG).unwrap_err()
+            })
+            .await
+            .unwrap();
+            assert_eq!(e, rustix::io::Errno::CHILD);
+            actor.child_exited(Err(e.into()));
+            actor.stdout_closed();
+            actor.ctx.escalations.finish();
+            drop(release);
+            assert!(
+                watchdog(member.wait()).await.unwrap().success(),
+                "signalled after ECHILD"
+            );
+        }
+    }
+
     const READ_INPUT: &str = "while read -r line; do :; done";
 
     mod revive_journal {
