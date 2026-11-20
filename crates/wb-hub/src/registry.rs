@@ -529,7 +529,14 @@ mod tests {
     use super::*;
 
     fn open(dir: &Path) -> Registry {
-        Registry::open(dir, &crate::lock_instance(dir).unwrap()).unwrap()
+        let file = File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("hub.lock"))
+            .unwrap();
+        await_successor_lock(&file);
+        Registry::open(dir, &file).unwrap()
     }
 
     async fn create(hub: &Registry, now: u64) -> u64 {
@@ -607,6 +614,19 @@ mod tests {
         unpause
     }
 
+    // Other tests fork concurrently: CLOEXEC instance fds in their children
+    // need not be closed until exec. Require eventual, not instantaneous, handoff.
+    fn await_successor_lock(successor: &File) {
+        let fd = successor.try_clone().unwrap();
+        let (send, recv) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(fd.lock());
+        });
+        recv.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("successor never acquired hub.lock")
+            .unwrap();
+    }
+
     #[test]
     fn shutdown_handoff_waits_for_cancelled_creators_writer() {
         use rustix::fs::{FlockOperation::NonBlockingLockExclusive, flock};
@@ -635,7 +655,7 @@ mod tests {
 
             unpause.send(()).unwrap();
             handoff.await;
-            flock(&successor, NonBlockingLockExclusive).unwrap();
+            await_successor_lock(&successor);
             let next = Registry::open(dir.path(), &successor).unwrap();
             assert_eq!(create(&next, 90).await, 101);
         });
@@ -659,9 +679,11 @@ mod tests {
                 "detached writer lost the instance lock on unwind"
             );
             unpause.send(()).unwrap();
+            // Do not shut down the runtime with the writer merely queued. The
+            // single blocking worker must finish it before this sentinel can run.
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
         });
-        // Dropping the runtime joined its blocking pool, including the writer.
-        flock(&successor, NonBlockingLockExclusive).unwrap();
+        await_successor_lock(&successor);
         assert_eq!(
             std::fs::read_to_string(dir.path().join(EPOCH_FILE)).unwrap(),
             "100"
