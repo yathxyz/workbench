@@ -3328,23 +3328,122 @@ fn hub_kill_forget_outlasts_a_stubborn_agent_then_respawns_fresh() {
 }
 
 #[test]
-fn hub_kills_what_a_crashed_agent_left_in_its_group() {
-    let mut hub = Hub::with_scenarios(&["crash-leave-child"]);
+fn hub_kills_and_reaps_an_agent_that_left_its_group() {
+    use rustix::process::{Pid, PidfdFlags, Signal, getpgid, pidfd_open, setpgid};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    if let Ok(group) = std::env::var("WB_TEST_AGENT_GROUP") {
+        // Running as the stub: leave the original group and ignore stdin EOF.
+        setpgid(None, Some(Pid::from_raw(group.parse().unwrap()).unwrap())).unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+        return;
+    }
+
+    // Give the stub a private destination group. Its other member must survive.
+    let mut peer = Command::new("cat")
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let hub = Hub::start_with(|cfg| {
+        cfg["agents"]["escape"] = json!({
+            "label": "escape",
+            "argv": [std::env::current_exe().unwrap(), "--exact", "hub_kills_and_reaps_an_agent_that_left_its_group"],
+            "env": {"WB_TEST_AGENT_GROUP": peer.id().to_string()}
+        });
+    });
     let mut c = hub.connect();
-    let (_, evs) = spawn_until(&mut c, &hub, "a1", "crash-leave-child", "session");
+    let (_, evs) = spawn_until(&mut c, &hub, "a1", "escape", "spawn");
+    let pid = Pid::from_raw(agent_pid(&evs) as i32).unwrap();
+    let fd = pidfd_open(pid, PidfdFlags::empty()).unwrap();
+    eventually(PATIENCE, "the agent joined the peer's group", || {
+        getpgid(Some(pid)) == Ok(Pid::from_child(&peer))
+    });
+
+    c.ok(json!({"t": "acp.kill", "sid": "a1", "forget": true}));
+    let exit = c.event("a1", "exit");
+    assert_eq!(exit["reason"], "killed");
+    assert_eq!(exit["signal"], Signal::KILL.as_raw());
+    // The test is not the parent. This pidfd reports -1 only after reaping.
+    let info = format!("/proc/self/fdinfo/{}", fd.as_raw_fd());
+    eventually(PATIENCE, "the escaped agent is reaped", || {
+        fs::read_to_string(&info)
+            .unwrap()
+            .lines()
+            .any(|line| line == "Pid:\t-1")
+    });
+    assert!(peer.wait().unwrap().success()); // wait closes cat's stdin.
+}
+
+/// Unlike `wait_gone`, this also waits for a zombie to disappear.
+fn wait_reaped(pid: u32) {
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    eventually(PATIENCE, "the agent leader is reaped", || {
+        !proc.try_exists().unwrap()
+    });
+}
+
+#[test]
+fn hub_kills_what_a_crashed_agent_left_in_its_group() {
+    let scenario = "crash-leave-child";
+    let mut hub = Hub::with_scenarios_and(&[scenario], |config| {
+        let state = PathBuf::from(config["stateDir"].as_str().unwrap());
+        let survivor = state.with_file_name("group-survivor.pid");
+        let bash = config["shells"][0]["paths"][0].clone();
+        let fake = &mut config["agents"][scenario]["argv"];
+        // Publish readiness only after ignoring TERM, so this member needs KILL.
+        let script = r#"
+(
+    trap '' TERM
+    printf '%s\n' "$BASHPID" >"$1"
+    exec sleep 60
+) </dev/null >/dev/null 2>&1 &
+shift
+exec "$@"
+"#;
+        let mut argv = vec![
+            bash,
+            json!("-c"),
+            json!(script),
+            json!("survivor"),
+            json!(survivor),
+        ];
+        argv.append(fake.as_array_mut().unwrap());
+        *fake = json!(argv);
+    });
+    let mut c = hub.connect();
+    let (_, evs) = spawn_until(&mut c, &hub, "a1", scenario, "session");
     let pgid = agent_pid(&evs);
+    let survivor = hub.dir.join("group-survivor.pid");
+    let survivor_pid = || {
+        fs::read_to_string(&survivor)
+            .ok()?
+            .strip_suffix('\n')?
+            .parse::<u32>()
+            .ok()
+    };
+    eventually(PATIENCE, "the stubborn group member is ready", || {
+        survivor_pid().is_some()
+    });
+    let survivor_pid = survivor_pid().unwrap();
+    assert!(group_members(pgid).contains(&survivor_pid));
     assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
-    c.event("a1", "exit");
+    let exit = c.event("a1", "exit");
+    assert_eq!(exit["reason"], "exited");
+    assert_eq!(exit["code"], 1);
+
     let note = hub
-        .record("crash-leave-child")
+        .record(scenario)
         .into_iter()
         .find(|e| e["note"] == "child")
         .expect("a child note");
     let child = u32::try_from(note["childPid"].as_u64().unwrap()).unwrap();
-    eventually(Duration::from_secs(3), "the group is empty", || {
-        group_members(pgid).is_empty()
+    eventually(PATIENCE, "both crash survivors are terminated", || {
+        !running(child) && !running(survivor_pid) && group_members(pgid).is_empty()
     });
-    assert!(!running(child));
+    wait_reaped(pgid);
     drop(c);
     fold_equals_live(&mut hub);
 }
@@ -3353,7 +3452,8 @@ fn hub_kills_what_a_crashed_agent_left_in_its_group() {
 fn hub_leaves_a_child_that_left_the_group() {
     let mut hub = Hub::with_scenarios(&["setsid-child"]);
     let mut c = hub.connect();
-    ready(&mut c, &hub, "a1", "setsid-child");
+    let (_, evs) = spawn_until(&mut c, &hub, "a1", "setsid-child", "session");
+    let leader = agent_pid(&evs);
     assert_eq!(c.acp_prompt("a1", "go")["t"], "ok");
     c.event("a1", "exit");
     let note = hub
@@ -3362,8 +3462,9 @@ fn hub_leaves_a_child_that_left_the_group() {
         .find(|e| e["note"] == "child")
         .expect("a child note");
     let child = u32::try_from(note["childPid"].as_u64().unwrap()).unwrap();
-    std::thread::sleep(Duration::from_secs(3));
-    let survived = running(child);
+    // No live group member remained. Wait for cleanup before checking the escapee.
+    wait_reaped(leader);
+    let survived = group_members(child) == [child];
     common::signal(child, rustix::process::Signal::KILL);
     assert!(
         survived,

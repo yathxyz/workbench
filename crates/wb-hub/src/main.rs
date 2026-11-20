@@ -4,9 +4,11 @@
 #![deny(unsafe_code)]
 
 mod acp;
+mod child;
 mod config;
 mod conn;
 mod env;
+mod escalation;
 mod outq;
 mod procfs;
 mod pty;
@@ -42,7 +44,7 @@ pub struct Ctx {
     /// The umask the hub was started with, restored in its children.
     pub child_umask: Mode,
     pub registry: Registry,
-    pub escalations: Arc<pty::Escalations>,
+    escalations: Arc<escalation::Escalations>,
     reaper: std::sync::mpsc::Sender<std::process::Child>,
     pub started_at: u64,
     /// `stateDir/pty`.
@@ -80,7 +82,7 @@ impl Ctx {
             child_umask: Mode::empty(),
             registry: Registry::open(dir, &lock_file).unwrap(),
             escalations: Arc::default(),
-            reaper: pty::reaper::start().unwrap(),
+            reaper: child::start_reaper().unwrap(),
             started_at: 1,
             pty_dir,
             acp_dir,
@@ -177,7 +179,7 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
         child_umask,
         registry,
         escalations: Arc::default(),
-        reaper: pty::reaper::start().context("starting PTY reaper")?,
+        reaper: child::start_reaper().context("starting child reaper")?,
         started_at: now_ms(),
         pty_dir,
         acp_dir,

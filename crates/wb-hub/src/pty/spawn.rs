@@ -8,12 +8,11 @@ use std::io;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Child, Command, Stdio};
 
 use rustix::fs::{Mode, OFlags};
 use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
 use rustix::termios::{Winsize, tcsetwinsize};
-use tokio::process::{Child, Command};
 
 /// An inherited SIG_IGN discards exit status; an inherited mask can hide exit wakeups.
 pub(crate) fn reset_sigchld() -> io::Result<()> {
@@ -75,7 +74,7 @@ pub fn spawn(
     let (arg0, args) = argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty argv"))?;
-    let mut cmd = std::process::Command::new(program);
+    let mut cmd = Command::new(program);
     cmd.arg0(arg0)
         .args(args)
         .env_clear()
@@ -113,8 +112,7 @@ pub fn spawn_agent(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(false);
+        .process_group(0);
     // SAFETY: as in `spawn`; the closure only calls rustix syscall wrappers.
     unsafe {
         cmd.pre_exec(move || {

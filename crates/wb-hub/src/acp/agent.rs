@@ -5,24 +5,31 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStderr};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+use rustix::process::{Pid, Signal, WaitIdStatus, kill_process, kill_process_group};
 use serde_json::{Map, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncWriteExt, BufReader, Interest};
+use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use wb_proto::limits::{MAX_LINE, PROMPT_MAX};
 
 use super::lines::{Read, read_line_capped};
+use crate::child::{self, ExitWatch};
 use crate::config::{ChildConfig, HostConfig};
 use crate::env::Identity;
+use crate::escalation::Escalations;
 use crate::pty::spawn::spawn_agent;
 use crate::{Ctx, lock};
 
@@ -34,6 +41,7 @@ const LOG_MAX: u64 = 1 << 20;
 const STDOUT_NOTE_MAX: usize = 4 << 10;
 /// How much of an unterminated stderr line is kept for the exit notice.
 const TAIL_MAX: usize = 4 << 10;
+const STDERR_CHUNK: usize = 8 << 10;
 /// Objects read from stdout that wait for the actor; backpressure on the agent.
 const STDOUT_QUEUE: usize = 4;
 
@@ -43,19 +51,94 @@ pub enum Out {
     Eof,
 }
 
-/// A running agent. Dropping it stops its I/O tasks; the process is not signalled.
+/// Dropping a live agent transfers its owned group to panic cleanup.
 pub struct Agent {
-    pub pid: u32,
-    pub child: Child,
+    pub watch: ExitWatch,
+    #[cfg(test)]
+    pub(super) fail_exit_peek: bool,
+    group: Option<Group>,
+    escalations: Arc<Escalations>,
     /// `None` once closed: the writer sends what is queued, then closes the pipe.
     pub stdin: Option<Stdin>,
     pub stdout: mpsc::Receiver<Out>,
     pub log: Log,
+    stderr: Arc<AsyncFd<ChildStderr>>,
     tasks: [JoinHandle<()>; 3],
+}
+
+impl Agent {
+    pub fn pid(&self) -> u32 {
+        self.group.as_ref().unwrap().child.as_ref().unwrap().id()
+    }
+
+    pub fn signal(&self, sig: Signal) {
+        if let Some(group) = &self.group {
+            group.signal(sig);
+        }
+    }
+
+    /// Reaping or ECHILD releases the number. Never signal it again, even on unwind.
+    pub fn discard_group(&mut self) {
+        if let Some(mut group) = self.group.take() {
+            group.child.take();
+        }
+    }
+
+    /// After a failed observation, try once more without reaping. Only use the
+    /// reaping fallback if the non-reaping syscall itself still fails.
+    pub fn probe_exit(&mut self) -> io::Result<Option<(Option<i32>, Option<i32>)>> {
+        match self.peek_exit() {
+            Ok(status) => Ok(status.map(|s| (s.exit_status(), s.terminating_signal()))),
+            Err(e) if child::is_echild(&e) => Err(e),
+            Err(_) => {
+                let group = self.group.as_mut().expect("waiting for an owned group");
+                let child = group.child.as_mut().expect("owned group leader");
+                let Some(status) = child.try_wait()? else {
+                    return Ok(None);
+                };
+                self.discard_group();
+                Ok(Some((status.code(), status.signal())))
+            }
+        }
+    }
+
+    fn peek_exit(&self) -> io::Result<Option<WaitIdStatus>> {
+        #[cfg(test)]
+        if self.fail_exit_peek {
+            return Err(rustix::io::Errno::IO.into());
+        }
+        child::peek_exit(self.pid())
+    }
+
+    pub fn end_group(&mut self, grace: Duration) {
+        if let Some(group) = self.group.take() {
+            group.signal(Signal::TERM);
+            self.escalations.arm_group(group, grace);
+        }
+    }
+
+    /// Include pending pipe bytes in the death notice, not future writes by descendants.
+    pub fn finish_stderr(&self) -> String {
+        let pipe = self.stderr.get_ref();
+        let mut log = lock(&self.log.0);
+        // The reader takes this same lock before reading: no chunk can be in flight.
+        let mut pending =
+            rustix::io::retry_on_intr(|| rustix::io::ioctl_fionread(pipe)).unwrap_or(0) as usize;
+        let mut buf = [0; STDERR_CHUNK];
+        while pending > 0 {
+            let len = pending.min(buf.len());
+            match log.read_stderr(pipe, &mut buf[..len]) {
+                Ok(n @ 1..) => pending -= n,
+                _ => break,
+            }
+        }
+        log.last_line()
+    }
 }
 
 impl Drop for Agent {
     fn drop(&mut self) {
+        self.end_group(super::PANIC_GRACE);
         for task in &self.tasks {
             task.abort();
         }
@@ -83,14 +166,25 @@ pub fn start(
         std::env::var_os(n)
     });
     let (program, args) = argv.split_first().ok_or("empty argv")?;
-    let mut child = spawn_agent(Path::new(program), args, &env, cwd, ctx.child_umask)
-        .map_err(|e| format!("spawn failed: {e}"))?;
-    let pid = child.id().ok_or("the agent was reaped at once")?;
-    let (Some(stdin), Some(stdout), Some(stderr)) =
-        (child.stdin.take(), child.stdout.take(), child.stderr.take())
-    else {
-        return Err("the agent's pipes are missing".into());
+    let setup_error = |e| format!("spawn failed: {e}");
+    let child =
+        spawn_agent(Path::new(program), args, &env, cwd, ctx.child_umask).map_err(setup_error)?;
+    // Arm cleanup before any fallible post-spawn setup.
+    let mut group = Group {
+        child: Some(child),
+        reaper: ctx.reaper.clone(),
     };
+    let child = group.child.as_mut().unwrap();
+    let watch = ExitWatch::new(child.id()).map_err(setup_error)?;
+    let stdin =
+        ChildStdin::from_std(child.stdin.take().expect("piped stdin")).map_err(setup_error)?;
+    let stdout =
+        ChildStdout::from_std(child.stdout.take().expect("piped stdout")).map_err(setup_error)?;
+    let stderr = child.stderr.take().expect("piped stderr");
+    rustix::io::ioctl_fionbio(&stderr, true)
+        .map_err(std::io::Error::from)
+        .map_err(setup_error)?;
+    let stderr = Arc::new(AsyncFd::with_interest(stderr, Interest::READABLE).map_err(setup_error)?);
     let log = Log::open(log);
     let queued = Arc::new(AtomicUsize::new(0));
     let (in_tx, in_rx) = mpsc::unbounded_channel();
@@ -98,14 +192,18 @@ pub fn start(
     let tasks = [
         tokio::spawn(write_stdin(stdin, in_rx, queued.clone())),
         tokio::spawn(read_stdout(stdout, out_tx, log.clone())),
-        tokio::spawn(read_stderr(stderr, log.clone())),
+        tokio::spawn(read_stderr(stderr.clone(), log.clone())),
     ];
     Ok(Agent {
-        pid,
-        child,
+        watch,
+        #[cfg(test)]
+        fail_exit_peek: false,
+        group: Some(group),
+        escalations: ctx.escalations.clone(),
         stdin: Some(Stdin { tx: in_tx, queued }),
         stdout: out_rx,
         log,
+        stderr,
         tasks,
     })
 }
@@ -227,11 +325,14 @@ async fn read_stdout(stdout: ChildStdout, tx: mpsc::Sender<Out>, log: Log) {
     let _ = tx.send(Out::Eof).await;
 }
 
-async fn read_stderr(mut stderr: ChildStderr, log: Log) {
-    let mut buf = vec![0; 8 << 10];
-    while let Ok(n @ 1..) = stderr.read(&mut buf).await {
-        log.stderr(&buf[..n]);
-    }
+async fn read_stderr(stderr: Arc<AsyncFd<ChildStderr>>, log: Log) {
+    let mut buf = vec![0; STDERR_CHUNK];
+    while let Ok(1..) = stderr
+        .async_io(Interest::READABLE, |pipe| {
+            lock(&log.0).read_stderr(pipe, &mut buf)
+        })
+        .await
+    {}
 }
 
 /// `acp/<sid>.stderr.log`: the agent's stderr, the stdout lines that are not JSON-RPC
@@ -274,36 +375,42 @@ impl Log {
         let text = String::from_utf8_lossy(&line[..line.len().min(STDOUT_NOTE_MAX)]);
         self.write(format!("[stdout] {text}\n").as_bytes());
     }
+}
 
-    fn stderr(&self, chunk: &[u8]) {
-        let mut log = lock(&self.0);
-        log.write(chunk);
-        log.tail.extend_from_slice(chunk);
-        while let Some(end) = log.tail.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = log.tail.drain(..=end).collect();
+impl LogFile {
+    fn read_stderr(&mut self, pipe: &ChildStderr, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = rustix::io::retry_on_intr(|| rustix::io::read(pipe, &mut *buf))?;
+        if n > 0 {
+            self.stderr(&buf[..n]);
+        }
+        Ok(n)
+    }
+
+    fn stderr(&mut self, chunk: &[u8]) {
+        self.write(chunk);
+        self.tail.extend_from_slice(chunk);
+        while let Some(end) = self.tail.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.tail.drain(..=end).collect();
             let text = String::from_utf8_lossy(&line);
             if !text.trim().is_empty() {
-                log.last = text.trim().to_owned();
+                self.last = text.trim().to_owned();
             }
         }
-        if log.tail.len() > TAIL_MAX {
-            let cut = log.tail.len() - TAIL_MAX;
-            log.tail.drain(..cut);
+        if self.tail.len() > TAIL_MAX {
+            let cut = self.tail.len() - TAIL_MAX;
+            self.tail.drain(..cut);
         }
     }
 
     /// The last non-empty stderr line, an unterminated one included.
-    pub fn last_line(&self) -> String {
-        let log = lock(&self.0);
-        let tail = String::from_utf8_lossy(&log.tail);
+    fn last_line(&self) -> String {
+        let tail = String::from_utf8_lossy(&self.tail);
         match tail.trim() {
-            "" => log.last.clone(),
+            "" => self.last.clone(),
             tail => tail.to_owned(),
         }
     }
-}
 
-impl LogFile {
     fn write(&mut self, bytes: &[u8]) {
         if self.size > 0 && self.size + bytes.len() as u64 > LOG_MAX {
             let mut old = self.path.clone().into_os_string();
@@ -329,30 +436,30 @@ fn open_log(path: &Path) -> Option<File> {
         .ok()
 }
 
-/// Sends `sig` to the process group `pgid`.
-pub fn signal_group(pgid: u32, sig: Signal) {
-    if let Some(pid) = i32::try_from(pgid).ok().and_then(Pid::from_raw) {
+/// Sole wait owner from spawn through the last killpg. Never give a timer just the pid.
+pub(crate) struct Group {
+    child: Option<Child>,
+    reaper: Sender<Child>,
+}
+
+impl Group {
+    fn signal(&self, sig: Signal) {
+        let pid = Pid::from_child(self.child.as_ref().expect("owned group leader"));
         let _ = kill_process_group(pid, sig);
+        if sig == Signal::KILL {
+            // The direct child can change groups; its unreaped pid is still ours.
+            let _ = kill_process(pid, sig);
+        }
     }
 }
 
-/// Whether the process group `pgid` still has members.
-pub fn group_alive(pgid: u32) -> bool {
-    i32::try_from(pgid)
-        .ok()
-        .and_then(Pid::from_raw)
-        .is_some_and(|pid| test_kill_process_group(pid).is_ok())
-}
-
-/// SIGTERM to the group now and SIGKILL to what is left of it after `grace`.
-pub fn end_group(pgid: u32, grace: Duration) {
-    signal_group(pgid, Signal::TERM);
-    tokio::spawn(async move {
-        tokio::time::sleep(grace).await;
-        if group_alive(pgid) {
-            signal_group(pgid, Signal::KILL);
+impl Drop for Group {
+    fn drop(&mut self) {
+        if self.child.is_some() {
+            self.signal(Signal::KILL);
+            child::reap(self.child.take().unwrap(), &self.reaper);
         }
-    });
+    }
 }
 
 #[cfg(test)]
@@ -434,6 +541,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
         let log = Log::open(dir.join("s.stderr.log"));
+        let mut log = lock(&log.0);
         log.stderr(b"first\n\n  \nbo");
         assert_eq!(log.last_line(), "bo");
         log.stderr(b"om\n");
