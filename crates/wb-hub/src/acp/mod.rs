@@ -107,6 +107,7 @@ const HISTORY: [&str; 6] = [
 const FILES: [&str; 4] = ["json", "jsonl", "stderr.log", "stderr.log.1"];
 const JOURNAL_FAILED: &str = "the journal could not be written";
 const NOT_RUNNING: &str = "the agent is not running";
+const ENQUEUE_FAILED: &str = "could not queue input for the agent";
 const NO_WORKTREE_GIT: &str = "git is not configured for managed worktrees";
 const WORKTREE_BUSY: &str = "worktree operation in progress";
 
@@ -626,7 +627,7 @@ struct Proc {
 }
 
 impl Proc {
-    /// Queues `msg` for the agent; false if it is not reading stdin.
+    /// True only if the stdin queue accepted `msg`, not if the agent read it.
     fn send(&self, msg: &Value) -> bool {
         self.agent
             .stdin
@@ -1266,8 +1267,7 @@ impl Acp {
         Ok(())
     }
 
-    /// Sends a request to the agent. The purpose comes back if the agent is not reading
-    /// stdin.
+    /// Returns the purpose to its caller if the stdin queue rejects the request.
     fn request(
         &mut self,
         purpose: Purpose,
@@ -1285,7 +1285,7 @@ impl Acp {
         Ok(())
     }
 
-    /// Queues `msg` for the agent; false if there is none or it is not reading stdin.
+    /// Queues `msg` for the agent, if the process and its stdin queue are available.
     fn send(&self, msg: &Value) -> bool {
         self.proc.as_ref().is_some_and(|p| p.send(msg))
     }
@@ -1810,7 +1810,17 @@ impl Acp {
         self.set_seen(self.facts.head_seq);
         match self.request(Purpose::Prompt, |id| rpc::prompt(id, &session, blocks)) {
             Ok(()) => reply.done(),
-            Err(_) => reply.err(ErrorCode::Internal, "agent not reading stdin"),
+            Err(_) => {
+                if self.record(EventBody::TurnError {
+                    code: TurnErrorCode::AgentError,
+                    message: ENQUEUE_FAILED.into(),
+                    rpc: None,
+                }) {
+                    reply.err(ErrorCode::Internal, ENQUEUE_FAILED);
+                } else {
+                    reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
+                }
+            }
         }
     }
 
@@ -1818,22 +1828,25 @@ impl Acp {
         if self.draining() {
             return reply.err(ErrorCode::NotAlive, NOT_RUNNING);
         }
+        let mut queued = true;
         if self.facts.activity == Activity::Turn {
             self.turn_cancelled = true;
+            if let Some(session) = &self.facts.agent_session_id {
+                queued = self.send(&rpc::cancel(session));
+            }
         }
-        if self.facts.activity == Activity::Turn
-            && let Some(session) = &self.facts.agent_session_id
-        {
-            self.send(&rpc::cancel(session));
-        }
-        let held: Vec<(u64, PendingKind)> = self.held.iter().map(|(r, h)| (*r, h.kind)).collect();
-        for (req, kind) in held {
-            if !self.resolve(req, cancelled(kind), ResolvedBy::Cancel) {
-                break;
+        while let Some((&req, held)) = self.held.first_key_value() {
+            match self.resolve(req, cancelled(held.kind), ResolvedBy::Cancel) {
+                Some(sent) => queued &= sent,
+                None => return reply.err(ErrorCode::Faulted, JOURNAL_FAILED),
             }
         }
         self.set_seen(self.facts.head_seq);
-        reply.done();
+        if queued {
+            reply.done();
+        } else {
+            reply.err(ErrorCode::Internal, ENQUEUE_FAILED);
+        }
     }
 
     /// `acp.permission` and `acp.elicitation`: the first answer wins.
@@ -1864,20 +1877,20 @@ impl Acp {
         if let Err((code, msg)) = checked {
             return reply.err(code, msg);
         }
-        if !self.resolve(req, answer, ResolvedBy::User) {
+        let Some(queued) = self.resolve(req, answer, ResolvedBy::User) else {
             return reply.err(ErrorCode::Faulted, JOURNAL_FAILED);
-        }
+        };
         self.set_seen(self.facts.head_seq);
-        reply.done();
+        if queued {
+            reply.done();
+        } else {
+            reply.err(ErrorCode::Internal, ENQUEUE_FAILED);
+        }
     }
 
-    /// Answers the held request `req` with `answer`, journal first so a fault never
-    /// leaves the agent with two answers. False if nothing could be journaled.
-    fn resolve(&mut self, req: u64, answer: Value, by: ResolvedBy) -> bool {
-        let Some(held) = self.held.get(&req) else {
-            return false;
-        };
-        let (kind, rpc_id) = (held.kind, held.rpc_id.clone());
+    /// None if not resolved; otherwise whether the journaled answer was queued.
+    fn resolve(&mut self, req: u64, answer: Value, by: ResolvedBy) -> Option<bool> {
+        let kind = self.held.get(&req)?.kind;
         let body = match kind {
             PendingKind::Permission => EventBody::PermissionResolved {
                 req,
@@ -1891,15 +1904,15 @@ impl Acp {
             },
         };
         if !self.record(body) {
-            return false;
+            return None;
         }
-        self.held.remove(&req);
-        self.send(&rpc::result(&rpc_id, to_agent(kind, answer)));
+        let held = self.held.remove(&req).expect("just journaled a held answer");
+        let queued = self.send(&rpc::result(&held.rpc_id, to_agent(kind, answer)));
         if self.held.is_empty() {
             // Deviation 8: the setup clock restarts once nobody is waited for.
             self.setup_at = Some(Instant::now() + SETUP_IDLE_TIMEOUT);
         }
-        true
+        Some(queued)
     }
     fn set_policy(&mut self, epoch: u64, policy: Policy, reply: Reply) {
         if epoch != self.created_at {
@@ -2957,7 +2970,7 @@ impl Acp {
                 };
                 let held = self.held.iter().find(|(_, h)| &h.rpc_id == id);
                 if let Some((req, kind)) = held.map(|(r, h)| (*r, h.kind)) {
-                    self.resolve(req, cancelled(kind), ResolvedBy::Agent);
+                    let _ = self.resolve(req, cancelled(kind), ResolvedBy::Agent);
                 }
             }
             _ => self.log(&format!("dropped the notification {method}")),
@@ -3332,9 +3345,107 @@ mod tests {
         serde_json::from_slice(&line).unwrap()
     }
 
+    fn configure_test_agent(acp: &mut Acp, script: &str) {
+        let shell = std::env::var("BASH").unwrap_or_else(|_| "/bin/sh".into());
+        let cfg = &mut Arc::get_mut(&mut acp.ctx).unwrap().cfg;
+        cfg.shells.push(crate::config::ShellConfig {
+            name: "bash".into(),
+            paths: vec![shell.clone()],
+            args: vec![],
+        });
+        cfg.agents.get_mut("offline").unwrap().argv = vec![shell, "-c".into(), script.into()];
+    }
+
+    const READ_INPUT: &str = "while read -r line; do :; done";
+
+    #[tokio::test]
+    async fn rejected_prompt_enqueue_ends_the_journaled_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut acp, _rx) = dormant(dir.path()).await;
+        configure_test_agent(&mut acp, READ_INPUT);
+        acp.spawn(SpawnVia::New).unwrap();
+        assert!(acp.record(EventBody::Session {
+            via: SessionVia::New,
+            session_id: "s".into(),
+            modes: None,
+            config_options: None,
+        }));
+        acp.proc.as_mut().unwrap().agent.stdin.take();
+        let out = Arc::new(OutQ::default());
+        acp.prompt(
+            vec![json!({"type":"text","text":"hi"})],
+            Reply::for_test(1, out.clone()),
+        );
+        assert_eq!(next_reply(&out).await["code"], "internal");
+        assert_eq!(acp.facts.activity, Activity::None);
+        let log = fs::read_to_string(acp.path("jsonl")).unwrap();
+        let mut tail = log
+            .lines()
+            .rev()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap());
+        let terminal = tail.next().unwrap();
+        assert_eq!(terminal["e"], "turn_error");
+        assert_eq!(terminal["code"], "agent_error");
+        assert_eq!(tail.next().unwrap()["e"], "prompt");
+    }
+
+    #[tokio::test]
+    async fn rejected_cancel_and_answer_enqueues_report_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut acp, _rx) = dormant(dir.path()).await;
+        configure_test_agent(&mut acp, READ_INPUT);
+        acp.spawn(SpawnVia::New).unwrap();
+        assert!(acp.record(EventBody::Session {
+            via: SessionVia::New,
+            session_id: "s".into(),
+            modes: None,
+            config_options: None,
+        }));
+        let out = Arc::new(OutQ::default());
+        acp.prompt(
+            vec![json!({"type":"text","text":"go"})],
+            Reply::for_test(1, out.clone()),
+        );
+        assert_eq!(next_reply(&out).await["t"], "ok");
+        acp.proc.as_mut().unwrap().agent.stdin.take();
+        acp.cancel(Reply::for_test(2, out.clone()));
+        let turn_cancel = next_reply(&out).await;
+        assert!(acp.record(EventBody::TurnEnd {
+            stop_reason: "cancelled".into()
+        }));
+        acp.agent_request(json!(1), "elicitation/create", json!({}))
+            .await;
+        let req = acp.facts.head_seq;
+        acp.answer(
+            req,
+            acp.created_at,
+            PendingKind::Elicitation,
+            json!({"action":"decline"}),
+            Reply::for_test(3, out.clone()),
+        );
+        let answer = next_reply(&out).await;
+        acp.answer(
+            req,
+            acp.created_at,
+            PendingKind::Elicitation,
+            json!({"action":"decline"}),
+            Reply::for_test(4, out.clone()),
+        );
+        assert_eq!(next_reply(&out).await["code"], "already_resolved");
+        acp.agent_request(json!(2), "session/request_permission", json!({}))
+            .await;
+        acp.cancel(Reply::for_test(5, out.clone()));
+        let idle_cancel = next_reply(&out).await;
+        assert!(acp.facts.pending.is_empty());
+        assert_eq!(turn_cancel["code"], "internal");
+        assert_eq!(answer["code"], "internal");
+        assert_eq!(idle_cancel["code"], "internal");
+    }
+
     async fn lost_question_tail(kind: PendingKind) {
         let dir = tempfile::tempdir().unwrap();
         let (mut old, _rx) = dormant(dir.path()).await;
+        configure_test_agent(&mut old, READ_INPUT);
         let path = old.path("jsonl");
         let epoch = old.created_at;
         let session = |via| EventBody::Session {
@@ -3413,10 +3524,7 @@ mod tests {
         assert_eq!(loaded.meta.created_at, epoch);
         let mut new = Acp::new(ctx, "a".into(), epoch, Arc::default());
         new.begin(Start::Loaded(Box::new(loaded)));
-        assert!(new.record(EventBody::Spawn {
-            pid: 2,
-            via: SpawnVia::Revive
-        }));
+        new.spawn(SpawnVia::Revive).unwrap();
         assert!(new.record(session(SessionVia::Resume)));
         assert!(new.record(prompt()));
         new.agent_request(json!(7), method, question("different question"))
@@ -3468,20 +3576,13 @@ mod tests {
     async fn actions_during_drain(exit_first: bool) {
         let dir = tempfile::tempdir().unwrap();
         let (mut acp, _rx) = dormant(dir.path()).await;
-        let shell = std::env::var("BASH").unwrap_or_else(|_| "/bin/sh".into());
-        let cfg = &mut Arc::get_mut(&mut acp.ctx).unwrap().cfg;
-        cfg.shells.push(crate::config::ShellConfig {
-            name: "bash".into(),
-            paths: vec![shell.clone()],
-            args: vec![],
-        });
         // Drive the two actor inputs separately, without racing its select loop.
         let script = if exit_first {
             "exit 0"
         } else {
             "exec 1>&-; while read -r line; do :; done"
         };
-        cfg.agents.get_mut("offline").unwrap().argv = vec![shell, "-c".into(), script.into()];
+        configure_test_agent(&mut acp, script);
         acp.spawn(SpawnVia::New).unwrap();
         assert!(acp.record(EventBody::Session {
             via: SessionVia::New,

@@ -318,7 +318,7 @@ Every row except `pty.input` and `pty.resize` carries a `rid`.
 | `pty.capture` | `sid, lines?` (default 200, max 1000) | `{text}` | plain text from the VT state, each row right-trimmed and blank rows after the last text left out; works on dead sessions |
 | `acp.open` | `sid, since, epoch?, spawn?: SpawnAcp` | `{new, summary, session, head, from, reset, configErrors?: ConfigError[]}` | then the replay as `acp.ev`, then `acp.replayed`, then live events. With a non-empty spawn config, the initiating reply waits for the hub-owned batch or its termination. Rules below. |
 | `acp.detach` | `sid` | `{}` | |
-| `acp.prompt` | `sid, prompt: ContentBlock[], epoch?` | `{}` once written | needs `alive` (`not_alive`), `activity=="none"` (`busy`) and no fault (`faulted`). Blocks non-empty, ≤ `PROMPT_MAX`. `image`, `audio` and `resource` need the matching `promptCapabilities`. Journals `prompt`, sets `seenSeq=headSeq`. |
+| `acp.prompt` | `sid, prompt: ContentBlock[], epoch?` | `{}` once queued | needs `alive` (`not_alive`), `activity=="none"` (`busy`) and no fault (`faulted`). Blocks non-empty, ≤ `PROMPT_MAX`. `image`, `audio` and `resource` need the matching `promptCapabilities`. Journals `prompt`, sets `seenSeq=headSeq`. |
 | `acp.cancel` | `sid, epoch?` | `{}` | sends the `session/cancel` notification when a turn is running, answers every pending request with cancelled (`by:"cancel"`), sets `seenSeq=headSeq`. Later permissions in that same turn bypass policy and ask through the ordinary manual path. With no turn and nothing pending it only sets `seenSeq`. |
 | `acp.permission` | `sid, req, epoch, outcome` | `{}` | `epoch` mismatch → `stale`. First answer wins; later answers get `already_resolved`. An unknown `optionId` gets `bad_option`. |
 | `acp.elicitation` | `sid, req, epoch, response` | `{}` | `epoch` mismatch → `stale`. First answer wins. `content` must be an object of string, number, boolean or string[]. |
@@ -352,6 +352,10 @@ On prompt, cancel, set_mode and the kind-specific kills, an optional `epoch` bin
 On set_config_option the wire epoch has always been required; `checkEpochFirst:true` selects the same precondition semantics instead of the legacy check order below.
 For these guarded actions, an unknown sid gives `not_found`; an existing sid with a different epoch gives `stale` before kind or actor-state checks, with no action on the replacement.
 This holds even if a command was queued as the old session was being forgotten.
+
+A successful enqueue means the agent's stdin queue accepted the message, not that the agent read it.
+If the queue rejects a journaled prompt, the hub records `turn_error{agent_error}` and returns `internal`; if it cannot record that error, it returns `faulted`.
+Cancel and question answers also report `internal` on enqueue failure; a resolution already journaled remains final, so retrying the answer returns `already_resolved`.
 
 Once the actor observes child exit or stdout EOF, it drains the remaining output or waits for the exit status before publishing the final `exit`.
 During that interval it refuses prompt, mode, config, cancel and answers to still-pending questions with `not_alive`, without queuing agent input, journaling a client action or advancing `seenSeq`.
@@ -612,15 +616,15 @@ Each line is `{"seq":N,"ts":…,"e":KIND,…}`.
 | `session` | `via: "new"\|"resume"\|"load", sessionId, modes?, configOptions?` | setup succeeded |
 | `setup_error` | `code: auth_required\|agent_error\|timeout\|revive_failed\|spawn_failed\|agent_exited\|interrupted, message, rpc?` | setup failed or was cut. An exec failure writes this with no `spawn`/`exit`. |
 | `authenticate` | `methodId` | an accepted `acp.authenticate`; activity re-enters `setup` |
-| `prompt` | `prompt` | a prompt was sent |
+| `prompt` | `prompt` | a prompt was accepted for enqueue |
 | `update` | `update`, plus `sessionId` only when it differs from `agentSessionId` | every `session/update`, unknown variants included |
 | `turn_end` | `stopReason` | the `session/prompt` response arrived |
 | `turn_error` | `code: agent_error\|agent_exited\|interrupted, message, rpc?` | the prompt failed, or the agent died or was killed mid-turn |
 | `permission` | `toolCall, options` | `session/request_permission` arrived; `req` = this seq |
-| `permission_resolved` | `req, outcome, by: "user"\|"cancel"\|"hub"\|"agent"` | the answer was sent; `agent` = the agent's own `$/cancel_request` |
+| `permission_resolved` | `req, outcome, by: "user"\|"cancel"\|"hub"\|"agent"` | the question was resolved; `agent` = the agent's own `$/cancel_request` |
 | `permission_auto` | `toolCall, options, outcome, policy:{rule, action}` | one atomic request-and-answer event for policy; zero-based rule index, `allow` or `reject`, selected once-only option. No `permission` or `permission_resolved` event is written for it. Its seq identifies the resolved request. |
 | `elicitation` | `request` (verbatim params) | `elicitation/create` arrived; `req` = seq |
-| `elicitation_resolved` | `req, response, by` | the answer was sent |
+| `elicitation_resolved` | `req, response, by` | the question was resolved |
 | `elicitation_complete` | `elicitationId` | `elicitation/complete` arrived (url mode) |
 | `mode` | `modeId` | `session/set_mode` succeeded |
 | `config` | `configOptions` (full list) | `session/set_config_option` succeeded; written before its hub reply |
