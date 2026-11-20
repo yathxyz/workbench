@@ -1151,7 +1151,10 @@ impl Acp {
                 cancel: Some(cancel),
             });
             self.git.spawn(async move {
-                let git = ctx.cfg.git.as_deref().expect("validated worktree request");
+                let git = worktree::Git {
+                    program: ctx.cfg.git.as_deref().expect("validated worktree request"),
+                    reaper: &ctx.reaper,
+                };
                 WorktreeResult::Created(
                     worktree::create(
                         git,
@@ -2427,7 +2430,10 @@ impl Acp {
         let sid = self.sid.clone();
         self.worktree_op = Some(op);
         self.git.spawn(async move {
-            let git = ctx.cfg.git.as_deref().expect("configured worktree removal");
+            let git = worktree::Git {
+                program: ctx.cfg.git.as_deref().expect("configured worktree removal"),
+                reaper: &ctx.reaper,
+            };
             WorktreeResult::Removed(worktree::remove(git, &record, &sid).await)
         });
     }

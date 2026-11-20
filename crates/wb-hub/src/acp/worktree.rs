@@ -6,20 +6,23 @@ use std::fs::Metadata;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use rustix::fs::OFlags;
 use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdout, Command};
+use tokio::process::{ChildStderr, ChildStdout};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use wb_proto::hub::{ErrorCode, ManagedWorktree, WorktreeRequest};
 use wb_proto::limits::{GIT_TIMEOUT, GIT_WORKTREE_TIMEOUT};
 
-use crate::child::is_echild;
+use crate::child::{is_echild, reap};
 
 type Error = (ErrorCode, String);
 
@@ -93,12 +96,48 @@ async fn first_error(pipe: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
     }
 }
 
-struct KillGroup(Option<Pid>);
+#[derive(Clone, Copy)]
+pub(super) struct Git<'a> {
+    pub program: &'a Path,
+    pub reaper: &'a Sender<Child>,
+}
 
-impl Drop for KillGroup {
+struct GitChild<'a> {
+    child: Option<Child>,
+    reaper: &'a Sender<Child>,
+}
+
+impl GitChild<'_> {
+    async fn wait(&mut self) -> io::Result<ExitStatus> {
+        // Subscribe before probing so an exit between the probe and recv isn't lost.
+        let mut sigchld = signal(SignalKind::child())?;
+        loop {
+            let status = self.child.as_mut().unwrap().try_wait();
+            if matches!(status, Ok(Some(_))) || status.as_ref().is_err_and(is_echild) {
+                // A std Child has no drop-time waiter. Neither Drop nor the reaper
+                // may use the released number after a successful wait or ECHILD.
+                self.child.take();
+            }
+            if let Some(status) = status? {
+                return Ok(status);
+            }
+            sigchld
+                .recv()
+                .await
+                .ok_or_else(|| io::Error::other("SIGCHLD stream closed"))?;
+        }
+    }
+}
+
+fn kill_helper(child: &Child) {
+    let _ = kill_process_group(Pid::from_child(child), Signal::KILL);
+}
+
+impl Drop for GitChild<'_> {
     fn drop(&mut self) {
-        if let Some(id) = self.0 {
-            let _ = kill_process_group(id, Signal::KILL);
+        if let Some(child) = self.child.take() {
+            kill_helper(&child);
+            reap(child, self.reaper);
         }
     }
 }
@@ -118,14 +157,14 @@ impl RunError {
 }
 
 async fn run_with<T>(
-    git: &Path,
+    git: Git<'_>,
     cwd: &Path,
     args: &[&str],
     limit: Duration,
     cancel: Option<&mut oneshot::Receiver<()>>,
     read_stdout: impl AsyncFnOnce(ChildStdout) -> io::Result<T>,
 ) -> Result<Output<T>, RunError> {
-    let mut cmd = Command::new(git);
+    let mut cmd = Command::new(git.program);
     cmd.current_dir(cwd)
         .args(["--no-lazy-fetch", "-c", "core.hooksPath=/dev/null"])
         // Newer git can register hooks in config, independently of hooksPath.
@@ -154,20 +193,21 @@ async fn run_with<T>(
             cmd.env(key, value);
         }
     }
-    let mut child = cmd.spawn().map_err(RunError::Io)?;
-    let mut group = KillGroup(child.id().and_then(|id| Pid::from_raw(id as i32)));
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
+    let mut helper = GitChild {
+        child: Some(cmd.spawn().map_err(RunError::Io)?),
+        reaper: git.reaper,
+    };
+    let child = helper.child.as_mut().unwrap();
+    let stdout =
+        ChildStdout::from_std(child.stdout.take().expect("piped stdout")).map_err(RunError::Io)?;
+    let stderr =
+        ChildStderr::from_std(child.stderr.take().expect("piped stderr")).map_err(RunError::Io)?;
     let collect = async {
         // Don't reap the group leader until the pipes close: a filter can inherit a
         // pipe, outlive git and hang the request. Its group ID stays ours to kill.
         let (stdout, stderr) = tokio::try_join!(read_stdout(stdout), first_error(stderr))?;
-        let status = child.wait().await;
-        if status.is_ok() || status.as_ref().is_err_and(is_echild) {
-            group.0 = None; // The leader no longer pins the group number.
-        }
         io::Result::Ok(Output {
-            status: status?,
+            status: helper.wait().await?,
             stdout,
             stderr,
         })
@@ -190,16 +230,16 @@ async fn run_with<T>(
             Err(RunError::Interrupted((ErrorCode::Timeout, format!("git {command} timed out"))))
         }
     };
-    if group.0.is_some() {
+    if let Some(child) = &helper.child {
         // Reap the killed command before starting any cleanup of its registration.
-        drop(group);
-        let _ = child.wait().await;
+        kill_helper(child);
+        let _ = helper.wait().await;
     }
     result
 }
 
 async fn run(
-    git: &Path,
+    git: Git<'_>,
     cwd: &Path,
     args: &[&str],
     limit: Duration,
@@ -299,7 +339,7 @@ async fn scan(
 }
 
 async fn worktrees(
-    git: &Path,
+    git: Git<'_>,
     cwd: &Path,
     branch: Option<&str>,
     target: Option<&Path>,
@@ -324,7 +364,7 @@ async fn worktrees(
     Ok(list)
 }
 
-async fn main_checkout(git: &Path, cwd: &Path) -> Result<String, Error> {
+async fn main_checkout(git: Git<'_>, cwd: &Path) -> Result<String, Error> {
     let top = run(
         git,
         cwd,
@@ -412,7 +452,7 @@ async fn main_checkout(git: &Path, cwd: &Path) -> Result<String, Error> {
 }
 
 async fn prepare_branch(
-    git: &Path,
+    git: Git<'_>,
     cwd: &Path,
     request: &WorktreeRequest,
     target: &Path,
@@ -577,7 +617,7 @@ enum Undo {
 }
 
 async fn rollback(
-    git: &Path,
+    git: Git<'_>,
     cwd: &Path,
     path: &str,
     ours: &Metadata,
@@ -649,7 +689,7 @@ fn worktree_parent(main_root: &str, worktree_root: Option<&Path>) -> Result<Path
     Ok(parent)
 }
 
-async fn check_destination_parent(git: &Path, cwd: &Path, parent: &Path) -> Result<(), Error> {
+async fn check_destination_parent(git: Git<'_>, cwd: &Path, parent: &Path) -> Result<(), Error> {
     let out = run(
         git,
         cwd,
@@ -692,7 +732,7 @@ async fn check_destination_parent(git: &Path, cwd: &Path, parent: &Path) -> Resu
 }
 
 pub(super) async fn create(
-    git: &Path,
+    git: Git<'_>,
     cwd: &Path,
     worktree_root: Option<&Path>,
     request: &WorktreeRequest,
@@ -806,7 +846,7 @@ pub(super) async fn create(
     })
 }
 
-async fn remove_clean(git: &Path, cwd: &Path, path: &str) -> Result<(), Error> {
+async fn remove_clean(git: Git<'_>, cwd: &Path, path: &str) -> Result<(), Error> {
     // worktree remove's internal `git status --porcelain` otherwise honors a
     // status.showUntrackedFiles=no setting and deletes non-ignored untracked files.
     let removed = run(
@@ -829,7 +869,11 @@ async fn remove_clean(git: &Path, cwd: &Path, path: &str) -> Result<(), Error> {
 
 /// False means this record is stale; no removal was attempted. A git or I/O
 /// failure is not evidence of a stale record and must not make the actor clear it.
-pub(super) async fn remove(git: &Path, record: &ManagedWorktree, sid: &str) -> Result<bool, Error> {
+pub(super) async fn remove(
+    git: Git<'_>,
+    record: &ManagedWorktree,
+    sid: &str,
+) -> Result<bool, Error> {
     let Some(marker) = marker_path(Path::new(&record.path)).await? else {
         return Ok(false);
     };

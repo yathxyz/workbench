@@ -100,6 +100,19 @@ fn request(branch: &str, base: Option<&str>) -> WorktreeRequest {
 
 const SID: &str = "fixture-session";
 
+fn test_git(program: &Path) -> Git<'_> {
+    static REAPER: std::sync::LazyLock<Sender<Child>> =
+        std::sync::LazyLock::new(|| crate::child::start_reaper().unwrap());
+    Git {
+        program,
+        reaper: &REAPER,
+    }
+}
+
+async fn remove(program: &Path, record: &ManagedWorktree, sid: &str) -> Result<bool, Error> {
+    super::remove(test_git(program), record, sid).await
+}
+
 async fn create(
     git: &Path,
     cwd: &Path,
@@ -115,7 +128,7 @@ async fn create_at(
     request: &WorktreeRequest,
 ) -> Result<ManagedWorktree, Error> {
     let (_tx, rx) = oneshot::channel();
-    super::create(git, cwd, root, request, SID, rx)
+    super::create(test_git(git), cwd, root, request, SID, rx)
         .await
         .map_err(|failure| match failure {
             CreateFailure::Clean(err) => err,
@@ -316,7 +329,7 @@ async fn stale_records_leave_no_worktree_and_replacements_alone() {
     fs::remove_dir(wt).unwrap();
 
     let (_tx, rx) = oneshot::channel();
-    let other = super::create(&f.git, &repo, None, &req, "other", rx)
+    let other = super::create(test_git(&f.git), &repo, None, &req, "other", rx)
         .await
         .unwrap();
     assert!(!remove(&f.git, &original, SID).await.unwrap());
@@ -445,7 +458,7 @@ async fn cancel_unregistered_unlocked_and_replaced_add() {
         let fake = slow_add(&f, &wt, body);
         let req = request(branch, None);
         let (tx, rx) = oneshot::channel();
-        let creation = super::create(&fake, &repo, None, &req, SID, rx);
+        let creation = super::create(test_git(&fake), &repo, None, &req, SID, rx);
         let ready = repo.join("ready");
         let interrupt = async {
             wait_for("interrupted add fixture", || ready.is_file()).await;
@@ -651,7 +664,7 @@ async fn destination_parent_reports_dangling_path_or_unexpected_git_failure() {
 
     let git = f.temp.join("broken-git");
     script(&git, "echo 'common directory unavailable' >&2; exit 1");
-    let error = check_destination_parent(&git, &repo, &f.temp)
+    let error = check_destination_parent(test_git(&git), &repo, &f.temp)
         .await
         .unwrap_err();
     assert_eq!(
@@ -913,6 +926,33 @@ fn exited(pid: u32) -> bool {
 }
 
 #[tokio::test]
+async fn git_echild_leaves_the_old_group_alone() {
+    let child = Command::new("true").process_group(0).spawn().unwrap();
+    let pid = Pid::from_child(&child);
+    // A live member makes a stray signal to the released leader's group observable.
+    let mut member = tokio::process::Command::new("cat")
+        .process_group(pid.as_raw_nonzero().get())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = member.stdin.take().unwrap();
+    rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty()).unwrap();
+    let (reaper, _rx) = std::sync::mpsc::channel();
+    let mut helper = GitChild {
+        child: Some(child),
+        reaper: &reaper,
+    };
+    assert!(is_echild(&helper.wait().await.unwrap_err()));
+    assert!(
+        helper.child.is_none(),
+        "released child retained for a second wait"
+    );
+    drop(helper);
+    drop(stdin);
+    assert!(member.wait().await.unwrap().success());
+}
+
+#[tokio::test]
 async fn git_deadline_includes_descendants_holding_the_pipes() {
     let f = Fixture::new();
     let fake = f.temp.join("sleeping-git");
@@ -926,7 +966,7 @@ async fn git_deadline_includes_descendants_holding_the_pipes() {
         ),
     );
     let command = run(
-        &fake,
+        test_git(&fake),
         &f.temp,
         &[
             "-c",
@@ -963,7 +1003,9 @@ async fn output_and_error_lines_are_bounded_and_strip_controls() {
         &fake,
         "printf 'Preparing worktree\\nfatal: \\033\\r\\tx' >&2\ni=0\nwhile [ \"$i\" -lt 3000 ]; do printf '12345678'; printf '12345678' >&2; i=$((i+1)); done\nexit 1",
     );
-    let output = run(&fake, &f.temp, &["noisy"], GIT_TIMEOUT).await.unwrap();
+    let output = run(test_git(&fake), &f.temp, &["noisy"], GIT_TIMEOUT)
+        .await
+        .unwrap();
     assert_eq!(
         (output.stdout.len(), output.stderr.len()),
         (PIPE_BYTES, PIPE_BYTES / 2)
