@@ -238,13 +238,13 @@ pub fn open(
         // The second round covers an actor that was forgotten between the lookup and
         // the send; it removed its registry entry before it stopped receiving.
         for _ in 0..2 {
-            match ctx.registry.route(&sid, open.spawn.is_some()) {
-                Route::Send(tx) => {
+            match ctx.registry.route(&sid, open.spawn.is_some()).await {
+                Ok(Route::Send(tx)) => {
                     if let Ok(permit) = tx.reserve().await {
                         return permit.send(Cmd::Open(open));
                     }
                 }
-                Route::Created { created_at, rx } => {
+                Ok(Route::Created { created_at, rx }) => {
                     return start(
                         ctx.clone(),
                         sid,
@@ -254,12 +254,17 @@ pub fn open(
                         Start::Create(Box::new(open)),
                     );
                 }
-                Route::NotFound => {
+                Ok(Route::NotFound) => {
                     return open
                         .reply
                         .err(ErrorCode::NotFound, format!("no session {sid}"));
                 }
-                Route::Stopping => return open.reply.err(ErrorCode::Internal, "hub stopping"),
+                Ok(Route::Stopping) => return open.reply.err(ErrorCode::Internal, "hub stopping"),
+                Err(e) => {
+                    return open
+                        .reply
+                        .err(ErrorCode::Internal, format!("reserving epoch: {e}"));
+                }
             }
         }
         open.reply.err(ErrorCode::Internal, "session actor is gone");
@@ -275,20 +280,54 @@ fn checked_task(task: Option<String>) -> Result<Option<String>, &'static str> {
     }
 }
 
-/// Registers and starts the session `sid` found at startup. A failed load publishes a
-/// dead, faulted session; an I/O failure leaves its files in place for the next start.
-pub async fn load(ctx: &Arc<Ctx>, sid: String) {
-    let shared = Arc::<Shared>::default();
-    let (created_at, from) = match read(ctx, &sid, shared.sync.clone()).await {
-        Ok(Some(loaded)) => (
-            Some(loaded.meta.created_at),
-            Start::Loaded(Box::new(loaded)),
-        ),
-        Ok(None) => return,
-        Err(fault) => (None, Start::Faulted(fault)),
+/// Seed from valid metadata even if the PTY namespace shadows it or its journal
+/// cannot be loaded. Defer quarantine until the seed is durable.
+pub async fn restore(
+    ctx: &Arc<Ctx>,
+    sid: String,
+    shadowed: bool,
+    high: &mut u64,
+) -> Result<(), (String, anyhow::Error)> {
+    let meta = match read_meta(ctx, &sid).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return Ok(()),
+        Err(_) if shadowed => return Ok(()),
+        Err(fault) => return Err((sid, fault)),
     };
-    let (created_at, rx) = ctx.registry.load(&sid, created_at);
-    start(ctx.clone(), sid, created_at, rx, shared, from);
+    let created_at = meta.created_at;
+    *high = (*high).max(created_at);
+    if shadowed {
+        return Ok(());
+    }
+    let shared = Arc::<Shared>::default();
+    let loaded = match read_journal(ctx, meta, shared.sync.clone()).await {
+        Ok(loaded) => loaded,
+        Err(fault) => return Err((sid, fault)),
+    };
+    let rx = ctx.registry.restore(&sid, created_at);
+    start(
+        ctx.clone(),
+        sid,
+        created_at,
+        rx,
+        shared,
+        Start::Loaded(Box::new(loaded)),
+    );
+    Ok(())
+}
+
+pub async fn load_faulted(ctx: &Arc<Ctx>, sid: String, error: anyhow::Error) -> io::Result<()> {
+    let (created_at, rx) = ctx.registry.register_faulted(&sid).await?;
+    let fault = load_failure(ctx, &sid, error).await;
+    start(
+        ctx.clone(),
+        sid,
+        created_at,
+        rx,
+        Arc::default(),
+        Start::Faulted(fault),
+    );
+    Ok(())
 }
 
 /// What a session's actor starts from.
@@ -327,40 +366,61 @@ struct Meta {
     managed_worktree: Option<ManagedWorktree>,
 }
 
-/// Reads the session `sid` off the calling task and completes a journal that a hub
-/// stop or crash left with a live agent (startup normalisation). `Ok(None)` means no
-/// session. Only invalid content goes to quarantine.
-async fn read(ctx: &Ctx, sid: &str, sync: Arc<SyncGate>) -> Result<Option<Loaded>, String> {
-    let (dir, s) = (ctx.acp_dir.clone(), sid.to_owned());
-    let attempt: anyhow::Result<_> = async {
-        let files = tokio::task::spawn_blocking(move || read_files(&dir, &s, sync))
-            .await
-            .context("session load task failed")??;
-        let Some((loaded, appended)) = files else {
-            return Ok(None);
+async fn read_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .context("session load task failed")?
+}
+
+async fn read_meta(ctx: &Ctx, sid: &str) -> anyhow::Result<Option<Meta>> {
+    let (dir, sid) = (ctx.acp_dir.clone(), sid.to_owned());
+    read_blocking(move || {
+        let name = format!("{sid}.json");
+        let text = match fs::read(dir.join(&name)) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).context(name),
         };
-        if appended {
-            loaded
-                .journal
-                .sync()
-                .await
-                .context("journal sync task failed")?
-                .context("syncing completed journal")?;
+        let meta: Meta = serde_json::from_slice(&text).with_context(|| name.clone())?;
+        if meta.sid != sid {
+            bail!("{name} holds sid {:?}", meta.sid);
         }
-        Ok(Some(loaded))
-    }
-    .await;
-    let error = match attempt {
-        Ok(loaded) => return Ok(loaded),
-        Err(error) => error,
+        Ok(Some(meta))
+    })
+    .await
+}
+
+async fn read(ctx: &Ctx, sid: &str, sync: Arc<SyncGate>) -> anyhow::Result<Option<Loaded>> {
+    let Some(meta) = read_meta(ctx, sid).await? else {
+        return Ok(None);
     };
+    read_journal(ctx, meta, sync).await.map(Some)
+}
+
+async fn read_journal(ctx: &Ctx, meta: Meta, sync: Arc<SyncGate>) -> anyhow::Result<Loaded> {
+    let dir = ctx.acp_dir.clone();
+    let (loaded, appended) = read_blocking(move || load_journal(&dir, meta, sync)).await?;
+    if appended {
+        loaded
+            .journal
+            .sync()
+            .await
+            .context("journal sync task failed")?
+            .context("syncing completed journal")?;
+    }
+    Ok(loaded)
+}
+
+async fn load_failure(ctx: &Ctx, sid: &str, error: anyhow::Error) -> String {
     let message = format!("{error:#}");
     if error
         .chain()
         .any(|cause| cause.is::<io::Error>() || cause.is::<JoinError>())
     {
         warn!(%sid, "leaving session files in place for the next start: {message}");
-        return Err(message);
+        return message;
     }
 
     warn!(%sid, "quarantining the session: {message}");
@@ -371,29 +431,16 @@ async fn read(ctx: &Ctx, sid: &str, sync: Arc<SyncGate>) -> Result<Option<Loaded
     if let Err(e) = &moved {
         warn!(%sid, "quarantining the session: {e}");
     }
-    Err(message)
+    message
 }
 
 /// The record, the journal and its fold, normalised; whether normalisation appended.
-fn read_files(
-    dir: &Path,
-    sid: &str,
-    sync: Arc<SyncGate>,
-) -> anyhow::Result<Option<(Loaded, bool)>> {
-    let name = format!("{sid}.json");
-    let text = match fs::read(dir.join(&name)) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).context(name),
-    };
-    let meta: Meta = serde_json::from_slice(&text).context(name.clone())?;
-    if meta.sid != sid {
-        bail!("{name} holds sid {:?}", meta.sid);
-    }
+fn load_journal(dir: &Path, meta: Meta, sync: Arc<SyncGate>) -> anyhow::Result<(Loaded, bool)> {
     let mut facts = Facts::default();
     let mut announced = BTreeMap::new();
     let mut policy_notice = false;
-    let mut journal = Journal::open(&dir.join(format!("{sid}.jsonl")), sync, |ev| {
+    let path = dir.join(format!("{}.jsonl", meta.sid));
+    let mut journal = Journal::open(&path, sync, |ev| {
         facts.apply(&ev);
         announce(&mut announced, &ev);
         match &ev.body {
@@ -438,7 +485,7 @@ fn read_files(
         policy,
         announced,
     };
-    Ok(Some((loaded, appended)))
+    Ok((loaded, appended))
 }
 
 /// Notes the kind of a permission or elicitation request by its `req`.
@@ -533,7 +580,7 @@ async fn supervise(mut acp: Acp, mut rx: mpsc::Receiver<Cmd>, mut first: Option<
                 }
                 return;
             }
-            Err(fault) => Start::Faulted(fault),
+            Err(error) => Start::Faulted(load_failure(&ctx, &sid, error).await),
         };
         rx = next;
         acp = Acp::new(ctx.clone(), sid.clone(), created_at, shared.clone());
@@ -3389,11 +3436,13 @@ mod tests {
                 .unwrap(),
         );
         let ctx = Arc::new(ctx);
-        let (epoch, rx) = ctx.registry.load("a", None);
-        let mut acp = Acp::new(ctx, "a".into(), epoch, Arc::default());
+        let Route::Created { created_at, rx } = ctx.registry.route("a", true).await.unwrap() else {
+            panic!("expected a new sid");
+        };
+        let mut acp = Acp::new(ctx, "a".into(), created_at, Arc::default());
         acp.meta = Meta {
             sid: acp.sid.clone(),
-            created_at: epoch,
+            created_at,
             agent: "offline".into(),
             cwd: dir.to_str().unwrap().into(),
             ..Meta::default()
@@ -4202,6 +4251,12 @@ mod tests {
         );
     }
 
+    // Re-run the startup scan with the files intact but no previous registration.
+    async fn restart(ctx: &Arc<Ctx>, epoch: u64) {
+        ctx.registry.forget("a", epoch, &[]);
+        crate::load_sessions(ctx).await.unwrap();
+    }
+
     #[tokio::test]
     async fn load_io_fault_preserves_files_through_actions_stop_and_retry() {
         async fn attach(ctx: &Arc<Ctx>) -> Value {
@@ -4236,7 +4291,7 @@ mod tests {
             fs::rename(&path, &original).unwrap();
             std::os::unix::fs::symlink(&backing, &backing).unwrap();
             std::os::unix::fs::symlink(&backing, &path).unwrap();
-            load(&ctx, "a".into()).await;
+            restart(&ctx, epoch).await;
             let opened = attach(&ctx).await;
             assert_eq!(opened["summary"]["fault"]["code"], "load_failed");
             assert_eq!(opened["summary"]["alive"], false);
@@ -4260,7 +4315,7 @@ mod tests {
             assert_eq!(fs::read(&meta).unwrap(), metadata);
             assert_eq!(fs::read(&journal).unwrap(), prefix);
 
-            load(&ctx, "a".into()).await;
+            restart(&ctx, opened["summary"]["createdAt"].as_u64().unwrap()).await;
             let opened = attach(&ctx).await;
             assert_eq!(opened["summary"]["fault"], Value::Null);
             assert_eq!(opened["summary"]["createdAt"], epoch);
@@ -4274,10 +4329,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (actor, _rx) = dormant(dir.path()).await;
         let (ctx, journal, meta) = (actor.ctx.clone(), actor.path("jsonl"), actor.path("json"));
+        let epoch = actor.created_at;
         drop(actor);
         fs::remove_file(&journal).unwrap();
         fs::create_dir(&journal).unwrap(); // Both open-for-write and unlink fail, even as root.
-        load(&ctx, "a".into()).await;
+        restart(&ctx, epoch).await;
         let forget = || {
             let q = Arc::new(OutQ::default());
             let cmd = Cmd::Act {

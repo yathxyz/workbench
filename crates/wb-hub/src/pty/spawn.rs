@@ -1,12 +1,12 @@
-//! Starting a PTY child or an ACP agent. This is the only module of the hub with `unsafe`
-//! code: the `pre_exec` closures, which run between `fork` and `exec` and therefore make
-//! only async-signal-safe raw syscalls (rustix's linux_raw backend: no allocation, no
-//! locks).
+//! Starting a PTY child or an ACP agent. Unsafe code is confined to the startup
+//! signal disposition and the `pre_exec` closures, which use only async-signal-safe
+//! raw syscalls between `fork` and `exec`.
 #![allow(unsafe_code)]
 
 use std::ffi::OsString;
 use std::io;
 use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -15,8 +15,39 @@ use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
 use rustix::termios::{Winsize, tcsetwinsize};
 use tokio::process::{Child, Command};
 
+/// An inherited SIG_IGN discards exit status; an inherited mask can hide exit wakeups.
+pub(crate) fn reset_sigchld() -> io::Result<()> {
+    // SAFETY: called at startup before Tokio installs handlers or any child exists.
+    // SIG_DFL is a valid disposition and installs no Rust signal handler.
+    if unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } == libc::SIG_ERR {
+        return Err(io::Error::last_os_error());
+    }
+    unblock_sigchld()
+}
+
+fn sigchld_set() -> libc::sigset_t {
+    // SAFETY: initialize a sigset_t with just the valid SIGCHLD signal.
+    unsafe {
+        let mut set = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGCHLD);
+        set
+    }
+}
+
+fn unblock_sigchld() -> io::Result<()> {
+    // SAFETY: the set is initialized; only the calling thread's mask is changed.
+    let err =
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &sigchld_set(), std::ptr::null_mut()) };
+    if err != 0 {
+        return Err(io::Error::from_raw_os_error(err));
+    }
+    Ok(())
+}
+
 pub struct Spawned {
-    pub child: Child,
+    /// Unlike Tokio's Child, Drop does not hand a released pid to an orphan reaper.
+    pub child: std::process::Child,
     /// Non-blocking and close-on-exec. The hub holds no slave fd, so reads return EOF
     /// once every process has closed the slave.
     pub master: OwnedFd,
@@ -39,11 +70,12 @@ pub fn spawn(
     unlockpt(&master)?;
     let slave = ioctl_tiocgptpeer(&master, flags)?;
     tcsetwinsize(&master, size)?;
+    rustix::io::ioctl_fionbio(&master, true)?;
 
     let (arg0, args) = argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty argv"))?;
-    let mut cmd = Command::new(program);
+    let mut cmd = std::process::Command::new(program);
     cmd.arg0(arg0)
         .args(args)
         .env_clear()
@@ -51,8 +83,7 @@ pub fn spawn(
         .current_dir(cwd)
         .stdin(Stdio::from(slave.try_clone()?))
         .stdout(Stdio::from(slave.try_clone()?))
-        .stderr(Stdio::from(slave))
-        .kill_on_drop(false);
+        .stderr(Stdio::from(slave));
     // SAFETY: the closure runs in the forked child before exec. It only calls rustix
     // syscall wrappers, which neither allocate nor take locks.
     unsafe {
@@ -61,7 +92,6 @@ pub fn spawn(
     let child = cmd.spawn()?;
     // The command still owns the three slave fds; close them in the hub.
     drop(cmd);
-    rustix::io::ioctl_fionbio(&master, true)?;
     Ok(Spawned { child, master })
 }
 
@@ -116,4 +146,30 @@ fn child_setup(umask: Mode) -> io::Result<()> {
     let stdin = unsafe { BorrowedFd::borrow_raw(0) };
     rustix::process::ioctl_tiocsctty(stdin)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_unblocks_sigchld() {
+        // Test the mask step alone: disposition is process-wide and other tests use Tokio.
+        // SAFETY: both outputs are valid; restore this thread's original mask before asserting.
+        unsafe {
+            let mut saved = std::mem::zeroed();
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &sigchld_set(), &mut saved),
+                0
+            );
+            let result = unblock_sigchld();
+            let mut actual = std::mem::zeroed();
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_SETMASK, &saved, &mut actual),
+                0
+            );
+            result.unwrap();
+            assert_eq!(libc::sigismember(&actual, libc::SIGCHLD), 0);
+        }
+    }
 }

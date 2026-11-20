@@ -1,7 +1,6 @@
 //! `wb-hub`: owns the PTY and ACP sessions of one host and serves them on `hub.sock`.
 //!
-//! `unsafe` is denied everywhere except `pty/spawn.rs`, which allows it for the
-//! `pre_exec` closure.
+//! `unsafe` is confined to startup signal setup and `pre_exec` in `pty/spawn.rs`.
 #![deny(unsafe_code)]
 
 mod acp;
@@ -16,9 +15,10 @@ mod shutdown;
 mod snapshot;
 mod store;
 
-use std::fs::{DirBuilder, OpenOptions, Permissions};
+use std::collections::BTreeMap;
+use std::fs::{DirBuilder, File, OpenOptions, Permissions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -42,6 +42,8 @@ pub struct Ctx {
     /// The umask the hub was started with, restored in its children.
     pub child_umask: Mode,
     pub registry: Registry,
+    pub escalations: Arc<pty::Escalations>,
+    reaper: std::sync::mpsc::Sender<std::process::Child>,
     pub started_at: u64,
     /// `stateDir/pty`.
     pub pty_dir: PathBuf,
@@ -54,12 +56,18 @@ pub struct Ctx {
 
 #[cfg(test)]
 impl Ctx {
-    fn for_test(dir: &std::path::Path) -> Self {
+    fn for_test(dir: &Path) -> Self {
+        Self::for_test_run(dir).0
+    }
+
+    /// The context and the separate instance-lock owner kept by `run`.
+    fn for_test_run(dir: &Path) -> (Self, File) {
+        let lock_file = lock_instance(dir).unwrap();
         let pty_dir = dir.join("pty");
         let acp_dir = dir.join("acp");
         std::fs::create_dir(&pty_dir).unwrap();
         std::fs::create_dir(&acp_dir).unwrap();
-        Self {
+        let ctx = Self {
             cfg: serde_json::from_value(serde_json::json!({
                 "stateDir": dir, "host": "host", "shells": [], "defaultShell": "", "child": {}
             }))
@@ -70,13 +78,16 @@ impl Ctx {
                 logname: "user".into(),
             },
             child_umask: Mode::empty(),
-            registry: Registry::default(),
+            registry: Registry::open(dir, &lock_file).unwrap(),
+            escalations: Arc::default(),
+            reaper: pty::reaper::start().unwrap(),
             started_at: 1,
             pty_dir,
             acp_dir,
             #[cfg(debug_assertions)]
             test_panic_input: None,
-        }
+        };
+        (ctx, lock_file)
     }
 }
 
@@ -93,8 +104,7 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let [flag, path] = args.as_slice() else {
         eprintln!("usage: wb-hub --config PATH");
@@ -112,7 +122,10 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .with_max_level(level)
         .init();
-    match run(PathBuf::from(path)).await {
+    match pty::spawn::reset_sigchld()
+        .context("resetting SIGCHLD disposition and mask")
+        .and_then(|()| run(PathBuf::from(path)))
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("{e:#}");
@@ -121,21 +134,8 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(config: PathBuf) -> anyhow::Result<()> {
-    let cfg = config::load(&config)?;
-    let ident = Identity::from_env()?;
-    let child_umask = rustix::process::umask(Mode::from_raw_mode(0o077));
-
-    let pty_dir = cfg.state_dir.join("pty");
-    let acp_dir = cfg.state_dir.join("acp");
-    for dir in [&pty_dir, &acp_dir] {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
-    }
-    let lock_path = cfg.state_dir.join("hub.lock");
+fn lock_instance(dir: &Path) -> anyhow::Result<File> {
+    let lock_path = dir.join("hub.lock");
     let lock_file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -145,14 +145,39 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
         .with_context(|| format!("opening {}", lock_path.display()))?;
     flock(&lock_file, FlockOperation::NonBlockingLockExclusive)
         .with_context(|| format!("another wb-hub holds {}", lock_path.display()))?;
+    Ok(lock_file)
+}
+
+#[tokio::main]
+async fn run(config: PathBuf) -> anyhow::Result<()> {
+    let cfg = config::load(&config)?;
+    let ident = Identity::from_env()?;
+    let child_umask = rustix::process::umask(Mode::from_raw_mode(0o077));
+
+    let create_dir = |dir: &Path| {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("creating {}", dir.display()))
+    };
+    create_dir(&cfg.state_dir)?;
+    let lock_file = lock_instance(&cfg.state_dir)?;
+    let registry = Registry::open(&cfg.state_dir, &lock_file)
+        .context("loading session epoch high-water mark")?;
+    let pty_dir = cfg.state_dir.join("pty");
+    let acp_dir = cfg.state_dir.join("acp");
     for dir in [&pty_dir, &acp_dir] {
+        create_dir(dir)?;
         store::remove_tmp(dir).with_context(|| format!("cleaning {}", dir.display()))?;
     }
     let ctx = Arc::new(Ctx {
         cfg,
         ident,
         child_umask,
-        registry: Registry::default(),
+        registry,
+        escalations: Arc::default(),
+        reaper: pty::reaper::start().context("starting PTY reaper")?,
         started_at: now_ms(),
         pty_dir,
         acp_dir,
@@ -204,26 +229,46 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
 /// Starts a dead actor for every PTY and ACP record in the state directory. A record
 /// that fails to load is quarantined and its session shows the fault.
 async fn load_sessions(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
+    // Restore healthy sessions as we read them; only quarantine reasons need to
+    // survive the scan. A pending PTY fault still owns its sid ahead of ACP.
+    let mut pty_faults = BTreeMap::new();
+    let mut high = 0;
     let sids =
         store::sids(&ctx.pty_dir).with_context(|| format!("listing {}", ctx.pty_dir.display()))?;
     for sid in sids {
-        let (created_at, from) =
-            match store::load_or_quarantine(ctx.pty_dir.clone(), sid.clone()).await {
-                Ok(Some(rec)) => (Some(rec.created_at), Start::Loaded(rec)),
-                Ok(None) => continue,
-                Err(fault) => (None, Start::Faulted(fault)),
-            };
-        let (created_at, rx) = ctx.registry.load(&sid, created_at);
-        pty::start(ctx.clone(), sid, created_at, rx, from);
+        let rec = match store::load_or_quarantine(ctx.pty_dir.clone(), sid.clone()).await {
+            Ok(Some(rec)) => rec,
+            Ok(None) => continue,
+            Err(fault) => {
+                pty_faults.insert(sid, fault);
+                continue;
+            }
+        };
+        let created_at = rec.created_at;
+        high = high.max(created_at);
+        let rx = ctx.registry.restore(&sid, created_at);
+        pty::start(ctx.clone(), sid, created_at, rx, Start::Loaded(rec));
     }
+    let mut acp_faults = Vec::new();
     let sids =
         store::sids(&ctx.acp_dir).with_context(|| format!("listing {}", ctx.acp_dir.display()))?;
     for sid in sids {
-        if ctx.registry.kind(&sid).is_some() {
+        let shadowed = ctx.registry.kind(&sid).is_some() || pty_faults.contains_key(&sid);
+        if shadowed {
             warn!(%sid, "an ACP record has the sid of a PTY session; not loading it");
-            continue;
         }
-        acp::load(ctx, sid).await;
+        if let Err(fault) = acp::restore(ctx, sid, shadowed, &mut high).await {
+            acp_faults.push(fault);
+        }
+    }
+
+    ctx.registry.seed_recovered(high).await?;
+    for (sid, fault) in pty_faults {
+        let (created_at, rx) = ctx.registry.register_faulted(&sid).await?;
+        pty::start(ctx.clone(), sid, created_at, rx, Start::Faulted(fault));
+    }
+    for (sid, fault) in acp_faults {
+        acp::load_faulted(ctx, sid, fault).await?;
     }
     info!(sessions = ctx.registry.published_count(), "loaded");
     Ok(())
