@@ -17,9 +17,9 @@ mod snapshot;
 mod store;
 
 use std::collections::BTreeMap;
-use std::fs::{DirBuilder, OpenOptions, Permissions};
+use std::fs::{DirBuilder, File, OpenOptions, Permissions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -56,12 +56,18 @@ pub struct Ctx {
 
 #[cfg(test)]
 impl Ctx {
-    fn for_test(dir: &std::path::Path) -> Self {
+    fn for_test(dir: &Path) -> Self {
+        Self::for_test_run(dir).0
+    }
+
+    /// The context and the separate instance-lock owner kept by `run`.
+    fn for_test_run(dir: &Path) -> (Self, File) {
+        let lock_file = lock_instance(dir).unwrap();
         let pty_dir = dir.join("pty");
         let acp_dir = dir.join("acp");
         std::fs::create_dir(&pty_dir).unwrap();
         std::fs::create_dir(&acp_dir).unwrap();
-        Self {
+        let ctx = Self {
             cfg: serde_json::from_value(serde_json::json!({
                 "stateDir": dir, "host": "host", "shells": [], "defaultShell": "", "child": {}
             }))
@@ -72,14 +78,15 @@ impl Ctx {
                 logname: "user".into(),
             },
             child_umask: Mode::empty(),
-            registry: Registry::open(dir).unwrap(),
+            registry: Registry::open(dir, &lock_file).unwrap(),
             escalations: Arc::default(),
             started_at: 1,
             pty_dir,
             acp_dir,
             #[cfg(debug_assertions)]
             test_panic_input: None,
-        }
+        };
+        (ctx, lock_file)
     }
 }
 
@@ -124,6 +131,20 @@ async fn main() -> ExitCode {
     }
 }
 
+fn lock_instance(dir: &Path) -> anyhow::Result<File> {
+    let lock_path = dir.join("hub.lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    flock(&lock_file, FlockOperation::NonBlockingLockExclusive)
+        .with_context(|| format!("another wb-hub holds {}", lock_path.display()))?;
+    Ok(lock_file)
+}
+
 async fn run(config: PathBuf) -> anyhow::Result<()> {
     let cfg = config::load(&config)?;
     let ident = Identity::from_env()?;
@@ -138,21 +159,12 @@ async fn run(config: PathBuf) -> anyhow::Result<()> {
             .create(dir)
             .with_context(|| format!("creating {}", dir.display()))?;
     }
-    let lock_path = cfg.state_dir.join("hub.lock");
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    flock(&lock_file, FlockOperation::NonBlockingLockExclusive)
-        .with_context(|| format!("another wb-hub holds {}", lock_path.display()))?;
+    let lock_file = lock_instance(&cfg.state_dir)?;
     for dir in [&pty_dir, &acp_dir] {
         store::remove_tmp(dir).with_context(|| format!("cleaning {}", dir.display()))?;
     }
-    let registry =
-        Registry::open(&cfg.state_dir).context("loading session epoch high-water mark")?;
+    let registry = Registry::open(&cfg.state_dir, &lock_file)
+        .context("loading session epoch high-water mark")?;
     let ctx = Arc::new(Ctx {
         cfg,
         ident,
@@ -213,6 +225,7 @@ async fn load_sessions(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
     // Restore healthy sessions as we read them; only quarantine reasons need to
     // survive the scan. A pending PTY fault still owns its sid ahead of ACP.
     let mut pty_faults = BTreeMap::new();
+    let mut high = 0;
     let sids =
         store::sids(&ctx.pty_dir).with_context(|| format!("listing {}", ctx.pty_dir.display()))?;
     for sid in sids {
@@ -225,6 +238,7 @@ async fn load_sessions(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
             }
         };
         let created_at = rec.created_at;
+        high = high.max(created_at);
         let rx = ctx.registry.restore(&sid, created_at);
         pty::start(ctx.clone(), sid, created_at, rx, Start::Loaded(rec));
     }
@@ -232,16 +246,16 @@ async fn load_sessions(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
     let sids =
         store::sids(&ctx.acp_dir).with_context(|| format!("listing {}", ctx.acp_dir.display()))?;
     for sid in sids {
-        if ctx.registry.kind(&sid).is_some() || pty_faults.contains_key(&sid) {
+        let shadowed = ctx.registry.kind(&sid).is_some() || pty_faults.contains_key(&sid);
+        if shadowed {
             warn!(%sid, "an ACP record has the sid of a PTY session; not loading it");
-            continue;
         }
-        if let Err(fault) = acp::restore(ctx, sid).await {
+        if let Err(fault) = acp::restore(ctx, sid, shadowed, &mut high).await {
             acp_faults.push(fault);
         }
     }
 
-    ctx.registry.seed_recovered().await?;
+    ctx.registry.seed_recovered(high).await?;
     for (sid, fault) in pty_faults {
         let (created_at, rx) = ctx.registry.register_faulted(&sid).await?;
         pty::start(ctx.clone(), sid, created_at, rx, Start::Faulted(fault));

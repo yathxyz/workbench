@@ -6,6 +6,7 @@
 //! critical section.
 
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -26,6 +27,9 @@ const EPOCH_FILE: &str = "last-created";
 struct Epochs {
     dir: PathBuf,
     last: u64,
+    // A duplicate of run's flocked descriptor (the same open file description).
+    // Even if run unwinds, a detached persist keeps the lock through its rename.
+    instance_lock: Option<File>,
 }
 
 impl Epochs {
@@ -226,7 +230,7 @@ pub enum Route<C> {
 }
 
 impl Registry {
-    pub fn open(dir: &Path) -> io::Result<Self> {
+    pub fn open(dir: &Path, instance_lock: &File) -> io::Result<Self> {
         let last = match std::fs::read_to_string(dir.join(EPOCH_FILE)) {
             Ok(text) => text
                 .parse()
@@ -239,6 +243,7 @@ impl Registry {
             epochs: Arc::new(AsyncMutex::new(Epochs {
                 dir: dir.to_owned(),
                 last,
+                instance_lock: Some(instance_lock.try_clone()?),
             })),
         })
     }
@@ -389,19 +394,13 @@ impl Registry {
         Ok(Route::Created { created_at, rx })
     }
 
-    /// Register a recovered session with its original epoch. Startup seeds the
-    /// durable mark from all these entries before allocating or accepting requests.
+    /// Register a recovered session with its original epoch.
     pub fn restore<C: SessionCmd>(&self, sid: &str, created_at: u64) -> mpsc::Receiver<C> {
         lock(&self.inner).insert(sid, created_at)
     }
 
-    pub async fn seed_recovered(&self) -> io::Result<()> {
-        let high = lock(&self.inner)
-            .sessions
-            .values()
-            .map(|e| e.created_at)
-            .max()
-            .unwrap_or_default();
+    /// Make the maximum valid on-disk epoch durable before quarantine or allocation.
+    pub async fn seed_recovered(&self, high: u64) -> io::Result<()> {
         let epochs = self.epochs.clone().lock_owned().await;
         if high > epochs.last {
             drop(Epochs::persist(epochs, high).await?);
@@ -409,7 +408,7 @@ impl Registry {
         Ok(())
     }
 
-    /// A quarantined session has no recoverable epoch; issue it a new one.
+    /// A quarantined session gets a new incarnation above the recovery seed.
     pub async fn register_faulted<C: SessionCmd>(
         &self,
         sid: &str,
@@ -512,7 +511,7 @@ impl Registry {
             inner.stopping = true;
             inner.sessions.values().map(|e| e.tx.clone()).collect()
         };
-        drop(self.epochs.lock().await);
+        drop(self.epochs.lock().await.instance_lock.take());
         senders
     }
 }
@@ -529,6 +528,10 @@ async fn send_to<C: SessionCmd>(sid: &str, tx: mpsc::Sender<C>, cmd: C) {
 mod tests {
     use super::*;
 
+    fn open(dir: &Path) -> Registry {
+        Registry::open(dir, &crate::lock_instance(dir).unwrap()).unwrap()
+    }
+
     async fn create(hub: &Registry, now: u64) -> u64 {
         match hub.route_with_clock::<pty::Cmd>("job", true, || now).await {
             Ok(Route::Created { created_at, .. }) => created_at,
@@ -539,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn forgotten_epoch_cannot_guard_replacement_after_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let restart = || Registry::open(dir.path()).unwrap();
+        let restart = || open(dir.path());
         let hub = restart();
         let old = create(&hub, 100).await;
         hub.forget("job", old, &[]);
@@ -563,76 +566,106 @@ mod tests {
     #[tokio::test]
     async fn forget_immediately_after_upgrade_preserves_restored_epoch() {
         let dir = tempfile::tempdir().unwrap();
-        let hub = Registry::open(dir.path()).unwrap();
+        let hub = open(dir.path());
         let epoch = 200;
         let _rx = hub.restore::<acp::Cmd>("job", epoch);
-        hub.seed_recovered().await.unwrap();
+        hub.seed_recovered(epoch).await.unwrap();
         hub.forget("job", epoch, &[]);
         drop(hub);
-        assert!(create(&Registry::open(dir.path()).unwrap(), 40).await > epoch);
+        assert!(create(&open(dir.path()), 40).await > epoch);
     }
 
-    #[test]
-    fn shutdown_handoff_waits_for_cancelled_creators_writer() {
-        use rustix::fs::{FlockOperation::NonBlockingLockExclusive, flock};
-        use std::fs::File;
-        use std::future::ready;
-        use tokio::sync::oneshot;
-
-        // Occupy the only blocking worker. A polled reservation has passed both
-        // routing checks but its write cannot start until we release the worker.
+    fn paused_writer_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
             .build()
             .unwrap()
-            .block_on(async {
-                let dir = tempfile::tempdir().unwrap();
-                let path = dir.path().join("hub.lock");
-                let owner = File::create(&path).unwrap();
-                let successor = File::open(&path).unwrap();
-                flock(&owner, NonBlockingLockExclusive).unwrap();
-                let ctx = crate::Ctx::for_test(dir.path());
-                let (unpause, paused) = oneshot::channel::<()>();
-                let (entered, busy) = oneshot::channel();
-                tokio::task::spawn_blocking(move || {
-                    entered.send(()).unwrap();
-                    let _ = paused.blocking_recv();
-                });
-                busy.await.unwrap();
+    }
 
-                tokio::select! {
-                    biased;
-                    _ = ctx.registry.route_with_clock::<pty::Cmd>("job", true, || 100) => {
-                        panic!("paused write completed");
-                    },
-                    () = ready(()) => {}
-                }
-                // select! cancelled the route, not its detached blocking write.
-                assert!(ctx.registry.epochs.try_lock().is_err());
+    async fn pause_cancelled_writer(ctx: &crate::Ctx) -> tokio::sync::oneshot::Sender<()> {
+        use tokio::sync::oneshot;
 
-                let mut handoff = std::pin::pin!(async {
-                    crate::shutdown::run(&ctx).await;
-                    drop(owner);
-                });
-                let finished = tokio::select! {
-                    biased;
-                    () = &mut handoff => true,
-                    () = ready(()) => false,
-                };
-                assert_eq!(
-                    flock(&successor, NonBlockingLockExclusive),
-                    Err(rustix::io::Errno::WOULDBLOCK),
-                    "successor took hub.lock with old writer still paused"
-                );
-                assert!(!finished);
-                assert!(lock(&ctx.registry.inner).stopping);
+        // Occupy the only blocking worker. A polled reservation has passed both
+        // routing checks but its write cannot start until we release the worker.
+        let (unpause, paused) = oneshot::channel::<()>();
+        let (entered, busy) = oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            let _ = paused.blocking_recv();
+        });
+        busy.await.unwrap();
+        tokio::select! {
+            biased;
+            _ = ctx.registry.route_with_clock::<pty::Cmd>("job", true, || 100) => {
+                panic!("paused write completed");
+            },
+            () = std::future::ready(()) => {}
+        }
+        // select! cancelled the route, not its detached blocking write.
+        assert!(ctx.registry.epochs.try_lock().is_err());
+        unpause
+    }
 
-                unpause.send(()).unwrap();
-                handoff.await;
-                flock(&successor, NonBlockingLockExclusive).unwrap();
-                assert_eq!(create(&Registry::open(dir.path()).unwrap(), 90).await, 101);
+    #[test]
+    fn shutdown_handoff_waits_for_cancelled_creators_writer() {
+        use rustix::fs::{FlockOperation::NonBlockingLockExclusive, flock};
+
+        paused_writer_runtime().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, owner) = crate::Ctx::for_test_run(dir.path());
+            let successor = std::fs::File::open(dir.path().join("hub.lock")).unwrap();
+            let unpause = pause_cancelled_writer(&ctx).await;
+            let mut handoff = std::pin::pin!(async {
+                crate::shutdown::run(&ctx).await;
+                drop(owner);
             });
+            let finished = tokio::select! {
+                biased;
+                () = &mut handoff => true,
+                () = std::future::ready(()) => false,
+            };
+            assert_eq!(
+                flock(&successor, NonBlockingLockExclusive),
+                Err(rustix::io::Errno::WOULDBLOCK),
+                "successor took hub.lock with old writer still paused"
+            );
+            assert!(!finished);
+            assert!(lock(&ctx.registry.inner).stopping);
+
+            unpause.send(()).unwrap();
+            handoff.await;
+            flock(&successor, NonBlockingLockExclusive).unwrap();
+            let next = Registry::open(dir.path(), &successor).unwrap();
+            assert_eq!(create(&next, 90).await, 101);
+        });
+    }
+
+    #[test]
+    fn unwind_handoff_waits_for_cancelled_creators_writer() {
+        use rustix::fs::{FlockOperation::NonBlockingLockExclusive, flock};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, owner) = crate::Ctx::for_test_run(dir.path());
+        let successor = std::fs::File::open(dir.path().join("hub.lock")).unwrap();
+        paused_writer_runtime().block_on(async {
+            let unpause = pause_cancelled_writer(&ctx).await;
+            // No shutdown::run, no Registry::stop, and no surviving context.
+            drop(ctx);
+            drop(owner);
+            assert_eq!(
+                flock(&successor, NonBlockingLockExclusive),
+                Err(rustix::io::Errno::WOULDBLOCK),
+                "detached writer lost the instance lock on unwind"
+            );
+            unpause.send(()).unwrap();
+        });
+        // Dropping the runtime joined its blocking pool, including the writer.
+        flock(&successor, NonBlockingLockExclusive).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(EPOCH_FILE)).unwrap(),
+            "100"
+        );
     }
 
     #[tokio::test]
@@ -640,9 +673,15 @@ mod tests {
         use serde_json::json;
         use std::fs;
 
-        // Without last-created, either kind may hold the highest recoverable epoch.
+        // Without last-created, any valid metadata can hold the maximum, whether
+        // or not we can restore its actor. Make each case independently highest.
         let high = u64::MAX - 4;
-        for (pty_epoch, acp_epoch) in [(high, high - 1), (high - 1, high)] {
+        for [pty_epoch, acp_epoch, corrupt_epoch, shadowed_epoch] in [
+            [high, 1, 2, 3],
+            [1, high, 2, 3],
+            [1, 2, high, 3],
+            [1, 2, 3, high],
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let ctx = Arc::new(crate::Ctx::for_test(dir.path()));
             fs::write(ctx.pty_dir.join("bad-pty.json"), b"!").unwrap();
@@ -653,7 +692,11 @@ mod tests {
                 .to_string(),
             )
             .unwrap();
-            for (sid, epoch) in [("bad-acp", 1), ("good-acp", acp_epoch), ("bad-pty", 2)] {
+            for (sid, epoch) in [
+                ("bad-acp", corrupt_epoch),
+                ("good-acp", acp_epoch),
+                ("bad-pty", shadowed_epoch),
+            ] {
                 fs::write(
                     ctx.acp_dir.join(format!("{sid}.json")),
                     json!({"sid":sid, "agent":"offline", "cwd":"/", "createdAt":epoch, "seenSeq":0})
@@ -686,9 +729,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_seed_failure_keeps_valid_metadata_before_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(crate::Ctx::for_test(dir.path()));
+        let meta = ctx.acp_dir.join("bad.json");
+        std::fs::write(
+            &meta,
+            br#"{"sid":"bad","agent":"offline","cwd":"/","createdAt":100,"seenSeq":0}"#,
+        )
+        .unwrap();
+        std::fs::write(ctx.acp_dir.join("bad.jsonl"), b"!\n").unwrap();
+        std::fs::create_dir(dir.path().join("last-created.tmp")).unwrap();
+        assert!(crate::load_sessions(&ctx).await.is_err());
+        assert!(
+            meta.exists(),
+            "the only copy of the old epoch was quarantined before seeding"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_epoch_write_does_not_register_session() {
         let dir = tempfile::tempdir().unwrap();
-        let hub = Registry::open(dir.path()).unwrap();
+        let hub = open(dir.path());
         std::fs::create_dir(dir.path().join(EPOCH_FILE)).unwrap();
         assert!(hub.route::<acp::Cmd>("job", true).await.is_err());
         assert!(hub.kind("job").is_none());
