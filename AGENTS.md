@@ -32,7 +32,7 @@ Never pick an `F-A` or `N` number yourself. Ask the orchestrator if you need one
 ## Flake checks
 
 Run a check with `nix build .#checks.x86_64-linux.<name>`.
-Names from `flake.nix` and `nix/checks.nix`: `package`, `clippy`, `fmt`, `web-keys`, `typecheck`, `edit-address`, `conformance`, `security`, `ui`, `adapters`, `vm`, `module`.
+Names from `flake.nix` and `nix/checks.nix`: `package`, `debug-tests`, `clippy`, `fmt`, `web-keys`, `typecheck`, `edit-address`, `conformance`, `security`, `ui`, `adapters`, `vm`, `module`.
 `vm` requires KVM. If the sandbox cannot fetch a flake input, record the blocked check and move on; do not work around it.
 
 ## Git

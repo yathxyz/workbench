@@ -1570,7 +1570,9 @@ The stream ends when wb-web shuts down.
   - group kill after `crash-leave-child`;
   - `setsid` survivor;
   - `revive_failed` makes the session not revivable;
-  - journal fault injection: `WB_HUB_TEST_FAIL_WRITE_AT=N`, a `cfg(debug_assertions)`-only hook, gives `faulted`, a successful probe clears it, and no seq is reused. The hook affects only the first journal the process opens, writes half a line at seq N and fires once. The release-profile test run does not run this test;
+  - journal fault injection: `WB_HUB_TEST_FAIL_WRITE_AT=N`, a `cfg(debug_assertions)`-only hook, gives `faulted`, a successful probe clears it, and no seq is reused.
+    The hook affects only the first journal the process opens, writes half a line at seq N and fires once.
+    The `debug-tests` check exercises this hook; the release `package` check does not.
   - quarantine of a garbage `.jsonl`: the garbage must include a complete line, because a torn tail is truncated rather than quarantined.
 
 ---
@@ -1794,7 +1796,7 @@ The flake builds the workspace with `buildRustPackage` (`cargoLock.lockFile`), b
 | Layer | Runs in | Owner (file) | Gate |
 |---|---|---|---|
 | Rust unit tests, including the `derive` table, the floor `check()` table, VT fixtures, fold/replay/journal, parsers (golden files from the Python prototype) | `nix flake check` → `package` | each crate's work package | every merge |
-| Hub integration (`crates/wb-hub/tests/{pty,acp}.rs`, real binary, `wb-fake-acp`) | `package` | hub work packages | every merge |
+| Hub integration (`crates/wb-hub/tests/{pty,acp,worktree}.rs`, real binary, `wb-fake-acp`) | `package` (release), `debug-tests` (includes fault injection) | hub work packages | every merge |
 | Web integration (`crates/wb-web/tests/*`, real binary, fake hub) | `package` | web work packages | every merge |
 | `clippy -D warnings`, `fmt --check` | `clippy`, `fmt` | – | every merge |
 | Black-box conformance (`tests/test_daemon.py`, real hub + web via `harness.py`) | `conformance` | web work packages | every merge |
@@ -1873,7 +1875,7 @@ N1-N26 are the baseline checks of the UI suite run by `tests/ui.mts`.
 N12-N15 were written anew for M5-F.
 
 ### 9.6 v1 acceptance
-1. `nix flake check` is green on a kvm-capable host: package, clippy, fmt, conformance, security, ui, adapters, module and vm.
+1. `nix flake check` is green on a kvm-capable host: package, debug-tests, clippy, fmt, conformance, security, ui, adapters, module and vm.
 2. The offline adapter check (`lib.adapterCheck`) is green for the configured agents.
 3. A deployed instance behind the reverse proxy passes its smoke checks, including:
    - a web restart keeps the shell PID;
