@@ -353,7 +353,15 @@ On set_config_option the wire epoch has always been required; `checkEpochFirst:t
 For these guarded actions, an unknown sid gives `not_found`; an existing sid with a different epoch gives `stale` before kind or actor-state checks, with no action on the replacement.
 This holds even if a command was queued as the old session was being forgotten.
 
-**Check order.** While a non-empty initial configuration batch is active (including its preceding setup), `acp.prompt`, `acp.cancel`, `acp.set_mode`, `acp.set_config_option`, `acp.revive` and `acp.authenticate` fail with `busy` before their normal actor checks. They are rejected, never queued for a future turn. Permission and elicitation answers, `acp.seen` and `acp.kill` remain usable. Otherwise, when a request fails several checks, the first in this list applies:
+Once the actor observes child exit or stdout EOF, it drains the remaining output or waits for the exit status before publishing the final `exit`.
+During that interval it refuses prompt, mode, config, cancel and answers to still-pending questions with `not_alive`, without queuing agent input, journaling a client action or advancing `seenSeq`.
+Epoch preconditions, answer lookup (`bad_request` or `already_resolved`) and existing journal faults retain their usual precedence.
+
+**Check order.** Outside that drain interval, while a non-empty initial configuration batch is active (including its preceding setup), `acp.prompt`, `acp.cancel`, `acp.set_mode` and `acp.set_config_option` fail with `busy` before their normal actor checks.
+The batch also blocks `acp.revive` and `acp.authenticate` with `busy` until it ends.
+These actions are rejected, never queued for a future turn.
+Permission and elicitation answers, `acp.seen` and `acp.kill` are not blocked by the batch.
+Otherwise, when a request fails several checks, the first in this list applies:
 - `acp.prompt`: `faulted`, `not_alive`, `bad_request` (no ACP session yet), `busy`, then the content rules.
 - `acp.set_config_option`: `faulted`, `not_alive`, `bad_request` (no ACP session yet), `stale` (epoch differs from `createdAt`), then `bad_option` (unknown id, unsupported option type or wrong/unoffered value). Registry errors `not_found` and `kind_mismatch` apply before these actor checks.
 - `acp.set_policy`: registry `not_found`/`kind_mismatch`, then `stale`, `faulted`, `bad_request` (invalid policy). It is usable during setup, an initial config batch, a turn, or while dead.

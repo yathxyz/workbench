@@ -106,6 +106,7 @@ const HISTORY: [&str; 6] = [
 /// The files of a session, by extension.
 const FILES: [&str; 4] = ["json", "jsonl", "stderr.log", "stderr.log.1"];
 const JOURNAL_FAILED: &str = "the journal could not be written";
+const NOT_RUNNING: &str = "the agent is not running";
 const NO_WORKTREE_GIT: &str = "git is not configured for managed worktrees";
 const WORKTREE_BUSY: &str = "worktree operation in progress";
 
@@ -1712,6 +1713,9 @@ impl Acp {
                     | Act::Authenticate(_)
             )
         {
+            if !matches!(act, Act::Revive | Act::Authenticate(_)) && self.draining() {
+                return reply.err(ErrorCode::NotAlive, NOT_RUNNING);
+            }
             return reply.err(ErrorCode::Busy, "startup configuration is being applied");
         }
         match act {
@@ -1757,13 +1761,20 @@ impl Acp {
         }
     }
 
+    /// Still collecting the final output or wait status, not accepting new agent work.
+    fn draining(&self) -> bool {
+        self.proc
+            .as_ref()
+            .is_some_and(|p| p.status.is_some() || p.eof)
+    }
+
     /// Refuses an action on a session without a working agent and ACP session; the
     /// error, if any.
     fn check_live(&self) -> Result<(), (ErrorCode, &'static str)> {
         if self.fault.is_some() {
             Err((ErrorCode::Faulted, "the session has a fault"))
-        } else if self.proc.is_none() || self.stage.is_some() {
-            Err((ErrorCode::NotAlive, "the agent is not running"))
+        } else if self.proc.is_none() || self.stage.is_some() || self.draining() {
+            Err((ErrorCode::NotAlive, NOT_RUNNING))
         } else if !self.has_session {
             Err((
                 ErrorCode::BadRequest,
@@ -1804,6 +1815,9 @@ impl Acp {
     }
 
     fn cancel(&mut self, reply: Reply) {
+        if self.draining() {
+            return reply.err(ErrorCode::NotAlive, NOT_RUNNING);
+        }
         if self.facts.activity == Activity::Turn {
             self.turn_cancelled = true;
         }
@@ -1840,6 +1854,9 @@ impl Acp {
                 _ => reply.err(ErrorCode::BadRequest, format!("no {name} {req}")),
             };
         };
+        if self.draining() {
+            return reply.err(ErrorCode::NotAlive, NOT_RUNNING);
+        }
         let checked = match kind {
             PendingKind::Permission => check_outcome(&answer, &held.option_ids),
             _ => check_response(&answer),
@@ -3282,6 +3299,86 @@ mod tests {
             .expect("actor did not reply")
             .unwrap();
         serde_json::from_slice(&line).unwrap()
+    }
+
+    async fn actions_during_drain(exit_first: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut acp, _rx) = dormant(dir.path()).await;
+        let shell = std::env::var("BASH").unwrap_or_else(|_| "/bin/sh".into());
+        let cfg = &mut Arc::get_mut(&mut acp.ctx).unwrap().cfg;
+        cfg.shells.push(crate::config::ShellConfig {
+            name: "bash".into(),
+            paths: vec![shell.clone()],
+            args: vec![],
+        });
+        // Drive the two actor inputs separately, without racing its select loop.
+        let script = if exit_first {
+            "exit 0"
+        } else {
+            "exec 1>&-; while read -r line; do :; done"
+        };
+        cfg.agents.get_mut("offline").unwrap().argv = vec![shell, "-c".into(), script.into()];
+        acp.spawn(SpawnVia::New).unwrap();
+        assert!(acp.record(EventBody::Session {
+            via: SessionVia::New,
+            session_id: "s".into(),
+            modes: Some(json!({"availableModes": [{"id": "ask"}]})),
+            config_options: Some(json!([{"id": "flag", "type": "boolean"}])),
+        }));
+        acp.agent_request(json!(10), "session/request_permission", json!({}));
+        let permission = acp.facts.head_seq;
+        acp.agent_request(json!(11), "elicitation/create", json!({}));
+        let elicitation = acp.facts.head_seq;
+
+        let agent = &mut acp.proc.as_mut().unwrap().agent;
+        if exit_first {
+            let status = agent.child.wait().await.unwrap();
+            acp.child_exited(Ok(status));
+        } else {
+            assert!(matches!(agent.stdout.recv().await, Some(Out::Eof)));
+            acp.stdout_closed();
+        }
+        let epoch = acp.created_at;
+        let journal = acp.path("jsonl");
+        let before = fs::read(&journal).unwrap();
+        let seen = acp.meta.seen_seq;
+        for act in [
+            Act::Prompt(vec![json!({"type": "text", "text": "too late"})]),
+            Act::SetMode("ask".into()),
+            Act::SetConfigOption {
+                epoch,
+                config_id: "flag".into(),
+                value: json!(true),
+            },
+            Act::Permission {
+                epoch,
+                req: permission,
+                outcome: json!({"outcome": "cancelled"}),
+            },
+            Act::Elicitation {
+                epoch,
+                req: elicitation,
+                response: json!({"action": "decline"}),
+            },
+            Act::Cancel,
+        ] {
+            let queue = Arc::new(OutQ::default());
+            acp.act(act, Reply::for_test(1, queue.clone()));
+            assert_eq!(next_reply(&queue).await["code"], "not_alive");
+        }
+        assert_eq!(fs::read(journal).unwrap(), before);
+        assert_eq!(acp.meta.seen_seq, seen);
+        assert_eq!(acp.held.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn actions_during_drain_after_exit() {
+        actions_during_drain(true).await;
+    }
+
+    #[tokio::test]
+    async fn actions_during_drain_after_eof() {
+        actions_during_drain(false).await;
     }
 
     #[tokio::test]
