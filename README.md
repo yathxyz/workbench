@@ -116,7 +116,7 @@ Pass `"worktree": {"branch": "feature/x", "base": "main"}` in the session's spaw
 Without it, the base is the requested checkout's `HEAD` and the branch is `workbench/<sid>-<createdAt>`.
 Only committed history is copied, not the owner's dirty files or repository configuration.
 Use a standalone owner clone with a private directory (mode `0700`) at or above its root.
-The transfer refuses linked or nested repositories, shared or redirected Git metadata, and local config outside a small set of clone, tracking and author settings; use a clean owner clone if your usual checkout needs includes, hooks or helpers.
+The source may have linked worktrees of its own, but must be the main checkout: the transfer refuses linked or nested repositories, shared or redirected Git metadata, and local config outside a small set of clone, tracking and author settings; use a clean owner clone if your usual checkout needs includes, hooks or helpers.
 Shallow sources are refused before the hub reserves a branch.
 If seeding fails, the hub releases its reservation only if the branch is still at the original commit and not checked out.
 To import the session's commits, run this as the hub user **before forgetting the session**:

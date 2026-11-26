@@ -68,12 +68,14 @@ fn metadata_tree(gitdir: &Path, uid: u32) -> Result<(), Error> {
     }
     // No path component below .git can now be a symlink. These otherwise
     // ordinary files/directories can redirect Git to another repository or
-    // object store, change the commit graph, or register an external checkout.
+    // object store, or change the commit graph. A main checkout's `worktrees`
+    // directory is not among them: the walk above has shown it is the owner's
+    // and not worker-writable, seeding reads only the object store and refs,
+    // and an import refuses a branch checked out in any worktree.
     for path in [
         "commondir",
         "gitdir",
         "config.worktree",
-        "worktrees",
         "modules",
         "info/grafts",
         "objects/info/alternates",
@@ -289,13 +291,18 @@ mod tests {
             assert!(discover(&worker, &sub).is_err(), "{path:?}");
             disk::remove_file(path).unwrap();
         }
-        for marker in ["commondir", "worktrees", "objects/info/alternates"] {
+        for marker in ["commondir", "objects/info/alternates"] {
             let path = gitdir.join(marker);
             disk::write(&path, "/elsewhere").unwrap();
             mode(&path, 0o644);
             assert!(discover(&worker, &sub).is_err(), "{path:?}");
             disk::remove_file(path).unwrap();
         }
+        // A main checkout that has linked worktrees is still a standalone source.
+        disk::create_dir_all(gitdir.join("worktrees/feature")).unwrap();
+        disk::write(gitdir.join("worktrees/feature/gitdir"), "/elsewhere/.git\n").unwrap();
+        assert!(discover(&worker, &sub).is_ok());
+        disk::remove_dir_all(gitdir.join("worktrees")).unwrap();
         assert!(discover(&parent, &sub).is_err());
         assert!(discover(&worker, &gitdir).is_err());
         symlink(&repo, parent.join("alias")).unwrap();
