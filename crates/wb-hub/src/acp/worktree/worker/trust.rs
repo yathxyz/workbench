@@ -33,6 +33,22 @@ pub(super) fn owner_command(git: Git<'_>, root: &Path) -> Command {
     cmd
 }
 
+fn checked_subdir(entry: disk::DirEntry, uid: u32) -> Result<Option<disk::ReadDir>, Error> {
+    let Some(meta) = if_present(entry.metadata())? else {
+        return Ok(None);
+    };
+    if meta.uid() != uid || meta.mode() & 0o022 != 0 || !(meta.is_dir() || meta.is_file()) {
+        return Err(bad(
+            "Git metadata must be owner-controlled directories and regular files",
+        ));
+    }
+    if meta.is_dir() {
+        if_present(disk::read_dir(entry.path()))
+    } else {
+        Ok(None)
+    }
+}
+
 fn metadata_tree(gitdir: &Path, uid: u32) -> Result<(), Error> {
     // Check each directory *before* walking into it. A non-writable trusted
     // parent pins its entries against replacement by the worker. Linux stores
@@ -44,15 +60,10 @@ fn metadata_tree(gitdir: &Path, uid: u32) -> Result<(), Error> {
             dirs.pop();
             continue;
         };
-        let entry = entry.map_err(internal)?;
-        let meta = entry.metadata().map_err(internal)?; // lstat, including for symlinks
-        if meta.uid() != uid || meta.mode() & 0o022 != 0 || !(meta.is_dir() || meta.is_file()) {
-            return Err(bad(
-                "Git metadata must be owner-controlled directories and regular files",
-            ));
-        }
-        if meta.is_dir() {
-            dirs.push(disk::read_dir(entry.path()).map_err(internal)?);
+        if let Some(entry) = if_present(entry)?
+            && let Some(children) = checked_subdir(entry, uid)?
+        {
+            dirs.push(children);
         }
     }
     // No path component below .git can now be a symlink. These otherwise
@@ -234,6 +245,20 @@ mod tests {
 
     fn mode(path: &Path, mode: u32) {
         disk::set_permissions(path, disk::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn released_git_lock_does_not_interrupt_metadata_walk() {
+        let tmp = private_dir();
+        let lock = tmp.path().join("index.lock");
+        disk::write(&lock, "").unwrap();
+        let entry = disk::read_dir(tmp.path()).unwrap().next().unwrap().unwrap();
+        disk::remove_file(lock).unwrap(); // release after readdir, before lstat
+        assert!(
+            checked_subdir(entry, rustix::process::geteuid().as_raw())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

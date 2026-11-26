@@ -4,7 +4,9 @@
 //! an already prepared update can leave a validated pack for Git GC: after
 //! publication, another writer may have referenced it, so never unlink it.
 
+use std::fs as disk;
 use std::os::unix::fs::PermissionsExt;
+use std::time::SystemTime;
 
 use tokio::net::unix::pipe;
 
@@ -30,6 +32,43 @@ async fn scratch_git(git: Git<'_>, repo: &Path, args: &[&str]) -> Result<Vec<u8>
     checked(out, ErrorCode::BadRequest)
 }
 
+const SCRATCH_PREFIX: &str = ".workbench-import-";
+const SCRATCH_SUFFIX_LEN: usize = 8;
+
+fn new_scratch(packs: &Path) -> Result<tempfile::TempDir, Error> {
+    disk::create_dir_all(packs).map_err(internal)?;
+    let now = SystemTime::now();
+    for entry in disk::read_dir(packs).map_err(internal)? {
+        let Some(entry) = if_present(entry)? else {
+            continue;
+        };
+        let name = entry.file_name();
+        let Some(suffix) = name.as_bytes().strip_prefix(SCRATCH_PREFIX.as_bytes()) else {
+            continue;
+        };
+        if suffix.len() != SCRATCH_SUFFIX_LEN || !suffix.iter().all(u8::is_ascii_alphanumeric) {
+            continue;
+        }
+        let Some(meta) = if_present(entry.metadata())? else {
+            continue;
+        };
+        // fetch() bounds the whole import, not just each of its Git commands.
+        if meta.is_dir()
+            && now
+                .duration_since(meta.modified().map_err(internal)?)
+                .is_ok_and(|age| age > GIT_WORKTREE_TIMEOUT)
+        {
+            if_present(disk::remove_dir_all(entry.path()))?;
+        }
+    }
+    tempfile::Builder::new()
+        .prefix(SCRATCH_PREFIX)
+        .rand_bytes(SCRATCH_SUFFIX_LEN)
+        .permissions(disk::Permissions::from_mode(0o700))
+        .tempdir_in(packs)
+        .map_err(internal)
+}
+
 pub(super) async fn import(
     git: Git<'_>,
     root: &Path,
@@ -50,12 +89,11 @@ pub(super) async fn import(
     )
     .await?;
     let packs = Path::new(absolute_path(dir.strip_suffix(b"\n").unwrap_or_default())?);
-    fs::create_dir_all(packs).await.map_err(internal)?;
+    let pack_dir = packs.to_owned();
     // Same filesystem for publication by hard link, but not in the owner's ODB.
-    let tmp = tempfile::Builder::new()
-        .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir_in(packs)
-        .map_err(internal)?;
+    let tmp = tokio::task::spawn_blocking(move || new_scratch(&pack_dir))
+        .await
+        .map_err(|e| internal(e.into()))??;
     let repo = tmp.path();
     let format = if tip.len() == 40 {
         "--object-format=sha1"
@@ -187,4 +225,31 @@ async fn publish(
     // Prefer Git's diagnostic (including a failed CAS) to a truncated ack.
     let _keep = checked(out, ErrorCode::Conflict)??;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_import_reaps_only_abandoned_quarantines_past_the_deadline() {
+        let packs = tempfile::tempdir().unwrap();
+        let interrupted = new_scratch(packs.path()).unwrap().keep();
+        disk::write(interrupted.join("partial-pack"), b"partial").unwrap();
+        let active = new_scratch(packs.path()).unwrap();
+        let unrelated = packs.path().join(".workbench-import-backup");
+        disk::create_dir(&unrelated).unwrap();
+        let file = packs.path().join(".workbench-import-12345678");
+        disk::write(&file, b"keep").unwrap();
+        let old = SystemTime::now() - GIT_WORKTREE_TIMEOUT - Duration::from_secs(1);
+        for path in [&interrupted, &unrelated, &file] {
+            disk::File::open(path).unwrap().set_modified(old).unwrap();
+        }
+
+        let _next = new_scratch(packs.path()).unwrap();
+        assert!(!interrupted.try_exists().unwrap());
+        assert!(active.path().is_dir());
+        assert!(unrelated.is_dir());
+        assert_eq!(disk::read(file).unwrap(), b"keep");
+    }
 }

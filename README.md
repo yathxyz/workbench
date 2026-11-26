@@ -127,6 +127,7 @@ wb-hub --config /etc/workbench/hub.json fetch-worker SID
 
 The hub validates the full pack and its advertised commit in an empty quarantine before fast-forwarding the recorded branch.
 That branch must still exist and must not be checked out in an owner worktree.
+An interrupted import's `.workbench-import-*` scratch directory is removed by the next import into that repository once it is older than the Git timeout.
 Review the changes before merging or running them.
 Do not fetch directly from the worker's directory or add it to `safe.directory`.
 Workbench does not recursively remove a worker clone: it may contain uncommitted work or other refs.
@@ -135,5 +136,6 @@ This protects the owner from agents, not agents from each other: every session r
 The worker cannot see the owner's home or host `/run/secrets` and `/run/credentials`, even if those trees appear after launch.
 World-readable owner files outside the hidden trees remain readable.
 The worker shares the host network namespace: host abstract Unix sockets remain connectable and have no filesystem permissions to protect them.
+Services on loopback and the host's other network addresses are reachable from the worker and must authenticate their clients.
 Keep owner integrations on pathname sockets in private directories, not abstract sockets.
 The module does not grant trusted Nix access; decide separately whether the worker should be allowed to submit builds to the host's Nix daemon.

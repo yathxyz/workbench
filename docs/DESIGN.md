@@ -1236,6 +1236,7 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
   World-readable owner files outside the hidden trees remain readable.
   The worker has no additional groups, capabilities or trusted Nix privileges.
   It shares the host network namespace: host abstract Unix sockets remain connectable without filesystem permission checks.
+  Services on loopback and the host's other network addresses remain reachable and must authenticate their clients.
   All worker sessions share one UID and can interfere with each other's checkouts, including replacing a directory between `mkdir` and `open` during creation.
   This boundary protects the owner from agents, not agents from each other.
   Owner terminals and remote (SSH) ACP commands keep their original identity, environment and launch path.

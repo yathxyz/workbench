@@ -27,6 +27,15 @@ fn conflict(message: &str) -> Error {
     (ErrorCode::Conflict, message.into())
 }
 
+// A concurrent owner-side Git operation or import may have removed this entry.
+fn if_present<T>(result: io::Result<T>) -> Result<Option<T>, Error> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(internal(e)),
+    }
+}
+
 fn timed_out() -> Error {
     (
         ErrorCode::Timeout,
