@@ -1,7 +1,10 @@
 //! Exchange only bytes with the worker. Its paths are opaque identifiers here:
 //! never pass one to Git, including as a `file:` remote or `safe.directory`.
 
+mod quarantine;
+
 use std::io::SeekFrom;
+use std::os::unix::fs::PermissionsExt;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -51,23 +54,9 @@ fn valid_record(worker: &AgentWorker, record: &ManagedWorktree, sid: &str) -> bo
         && !record.branch.ends_with('.')
 }
 
-async fn owner_dir(worker: &AgentWorker, cwd: &Path) -> Result<PathBuf, Error> {
-    if !cwd.is_absolute() || cwd.starts_with(&worker.root) {
-        return Err(bad(
-            "source must be an owner repository outside the worker root",
-        ));
-    }
-    let cwd = fs::canonicalize(cwd).await.map_err(internal)?;
-    if cwd.starts_with(&worker.root)
-        || fs::metadata(&cwd).await.map_err(internal)?.uid() != rustix::process::geteuid().as_raw()
-    {
-        return Err(bad("source directory is not owned by the hub user"));
-    }
-    Ok(cwd)
-}
+mod trust;
+use trust::{checkout_root, owner_command};
 
-// Do not inherit `safe.directory=*` or a URL rewrite. Only Git builtins in
-// the owner's repository operate on imported data. No remotes of any kind.
 async fn owner_git(
     git: Git<'_>,
     cwd: &Path,
@@ -75,18 +64,8 @@ async fn owner_git(
     stdin: Stdio,
     code: ErrorCode,
 ) -> Result<Vec<u8>, Error> {
-    let mut cmd = command(git, cwd);
-    cmd.args([
-        "--no-replace-objects",
-        "-c",
-        "safe.directory=",
-        "-c",
-        "safe.bareRepository=explicit",
-    ])
-    .env("GIT_CONFIG_GLOBAL", "/dev/null")
-    .env("GIT_CONFIG_NOSYSTEM", "1")
-    .env("GIT_ALLOW_PROTOCOL", "")
-    .stdin(stdin);
+    let mut cmd = owner_command(git, cwd);
+    cmd.stdin(stdin);
     let output = execute(git, cmd, args, GIT_WORKTREE_TIMEOUT, None, prefix)
         .await
         .map_err(RunError::into_error)?;
@@ -95,25 +74,6 @@ async fn owner_git(
 
 async fn query(git: Git<'_>, cwd: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
     owner_git(git, cwd, args, Stdio::null(), ErrorCode::BadRequest).await
-}
-
-async fn checkout_root(git: Git<'_>, worker: &AgentWorker, cwd: &Path) -> Result<PathBuf, Error> {
-    let cwd = owner_dir(worker, cwd).await?;
-    let out = query(
-        git,
-        &cwd,
-        &["rev-parse", "--is-inside-work-tree", "--show-toplevel"],
-    )
-    .await?;
-    let top = out
-        .strip_prefix(b"true\n")
-        .and_then(|s| s.strip_suffix(b"\n"))
-        .ok_or_else(|| bad("source is not a working checkout"))?;
-    let top = owner_dir(worker, Path::new(absolute_path(top)?)).await?;
-    if !cwd.starts_with(&top) {
-        return Err(bad("source is outside its checkout"));
-    }
-    Ok(top)
 }
 
 fn object_id(bytes: &[u8]) -> Result<&str, Error> {
@@ -214,21 +174,13 @@ pub(in crate::acp) async fn create(
     let path = path
         .to_str()
         .ok_or_else(|| CreateFailure::Clean(bad("worker root is not UTF-8")))?;
-    let mut sent = false;
-    let create = async {
+    let branch = &request.branch;
+    let full = format!("refs/heads/{branch}");
+    let deadline = tokio::time::Instant::now() + GIT_WORKTREE_TIMEOUT;
+    let prepare = async {
         let root = checkout_root(git, worker, cwd).await?;
-        let main_root = root
-            .to_str()
-            .ok_or_else(|| bad("owner checkout is not UTF-8"))?;
-        if !query(
-            git,
-            &root,
-            &["rev-parse", "--show-superproject-working-tree"],
-        )
-        .await?
-        .is_empty()
-        {
-            return Err(bad("source checkout is a submodule"));
+        if query(git, &root, &["rev-parse", "--is-shallow-repository"]).await? != b"false\n" {
+            return Err(bad("worker checkouts require a non-shallow source"));
         }
         let base = format!("{}^{{commit}}", request.base.as_deref().unwrap_or("HEAD"));
         let out = query(
@@ -237,20 +189,37 @@ pub(in crate::acp) async fn create(
             &["rev-parse", "--verify", "--end-of-options", &base],
         )
         .await?;
-        let tip = object_id(out.strip_suffix(b"\n").unwrap_or_default())?;
-        let branch = &request.branch;
-        let full = format!("refs/heads/{branch}");
-        owner_git(
-            git,
-            &root,
-            &["branch", "--no-track", "--", branch, tip],
-            Stdio::null(),
-            ErrorCode::Conflict,
-        )
-        .await?;
+        let tip = object_id(out.strip_suffix(b"\n").unwrap_or_default())?.to_owned();
+        Ok((root, tip))
+    };
+    let (root, tip) = tokio::select! {
+        biased;
+        _ = &mut cancel => Err(cancelled()),
+        result = tokio::time::timeout_at(deadline, prepare) => result.unwrap_or_else(|_| Err(timed_out())),
+    }
+    .map_err(CreateFailure::Clean)?;
+    let main_root = root
+        .to_str()
+        .ok_or_else(|| CreateFailure::Clean(bad("owner checkout is not UTF-8")))?;
+    // Do not cancel between the atomic create and learning whether we own the
+    // reservation. In particular, never roll back somebody else's existing ref.
+    owner_git(
+        git,
+        &root,
+        &["update-ref", "--no-deref", &full, &tip, ""],
+        Stdio::null(),
+        ErrorCode::Conflict,
+    )
+    .await
+    .map_err(CreateFailure::Clean)?;
+    let mut sent = false;
+    let seed = async {
         // Git writes/renames its bundle inside a 0700 owner-only directory;
         // even an externally set umask cannot expose it to the worker.
-        let dir = tempfile::tempdir().map_err(internal)?;
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .map_err(internal)?;
         let bundle = dir.path().join("seed.bundle");
         let name = bundle
             .to_str()
@@ -272,13 +241,14 @@ pub(in crate::acp) async fn create(
             ));
         }
         bundle.seek(SeekFrom::Start(0)).await.map_err(internal)?;
-        sent = true;
+        let format = if tip.len() == 40 { "sha1" } else { "sha256" };
         let mut socket = connect(
             worker,
             json!({"op":"create", "cwd":path, "sid":sid,
-            "branch":branch, "format":if tip.len() == 40 {"sha1"} else {"sha256"}, "size":size}),
+            "branch":branch, "format":format, "size":size}),
         )
         .await?;
+        sent = true;
         tokio::io::copy(&mut bundle, socket.get_mut())
             .await
             .map_err(internal)?;
@@ -294,18 +264,55 @@ pub(in crate::acp) async fn create(
     let result = tokio::select! {
         biased;
         _ = &mut cancel => Err(cancelled()),
-        result = timeout(GIT_WORKTREE_TIMEOUT, create) => result.unwrap_or_else(|_| Err(timed_out())),
+        result = tokio::time::timeout_at(deadline, seed) => result.unwrap_or_else(|_| Err(timed_out())),
     };
-    result.map_err(|(code, msg)| {
-        if sent {
-            CreateFailure::PossibleLeftover((
-                code,
-                format!("{msg}; inspect worker checkout {path}"),
-            ))
-        } else {
-            CreateFailure::Clean((code, msg))
+    match result {
+        Ok(record) => Ok(record),
+        Err((code, mut message)) => {
+            // Never delete a ref advanced by the owner during transfer. The final
+            // old-OID check covers a concurrent update after the checkout check.
+            let undo = async {
+                // The owner may have reconfigured or replaced the source during transfer.
+                if checkout_root(git, worker, &root).await? != root {
+                    return Err(conflict("owner checkout was replaced"));
+                }
+                if branch_tip(git, &root, &full).await? == tip {
+                    query(git, &root, &["update-ref", "--no-deref", "-d", &full, &tip]).await?;
+                }
+                Ok::<_, Error>(())
+            };
+            if sent {
+                message.push_str(&format!("; inspect worker checkout {path}"));
+            }
+            Err(match undo.await {
+                Err((_, why)) => CreateFailure::PossibleLeftover((
+                    code,
+                    format!("{message}; inspect owner branch {branch}: {why}"),
+                )),
+                Ok(()) if sent => CreateFailure::PossibleLeftover((code, message)),
+                Ok(()) => CreateFailure::Clean((code, message)),
+            })
         }
-    })
+    }
+}
+
+/// Only a direct branch which is not checked out in any worktree is ours to change.
+async fn branch_tip(git: Git<'_>, root: &Path, full: &str) -> Result<String, Error> {
+    let dst = query(
+        git,
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(objectname)%09%(worktreepath)%09%(symref)%09%(refname)",
+            "--",
+            full,
+        ],
+    )
+    .await?;
+    let fields = dst
+        .strip_suffix(format!("\t\t\t{full}\n").as_bytes())
+        .ok_or_else(|| conflict("owner branch is missing, symbolic or checked out"))?;
+    Ok(object_id(fields)?.to_owned())
 }
 
 pub(in crate::acp) async fn fetch(
@@ -338,66 +345,11 @@ pub(in crate::acp) async fn fetch(
         let full = format!("refs/heads/{}", record.branch);
         let mut body = socket.take(size);
         let tip = bundle_tip(&mut body, &full).await?;
-        let mut pack = fs::File::from_std(tempfile::tempfile().map_err(internal)?);
-        tokio::io::copy(&mut body, &mut pack)
-            .await
-            .map_err(internal)?;
-        if body.limit() != 0 {
-            return Err(bad("truncated worker export"));
-        }
-        drop(body);
-        pack.rewind().await.map_err(internal)?;
-        owner_git(
-            git,
-            &root,
-            &["index-pack", "--strict", "--stdin"],
-            Stdio::from(pack.into_std().await),
-            ErrorCode::BadRequest,
-        )
-        .await?;
-        // Refuse checked-out, missing, or symbolic destinations. Check the
-        // exact old OID both for ancestry and at publication, not just its name.
-        let dst = query(
-            git,
-            &root,
-            &[
-                "for-each-ref",
-                "--format=%(objectname)%09%(worktreepath)%09%(symref)%09%(refname)",
-                "--",
-                &full,
-            ],
-        )
-        .await?;
-        let fields = dst
-            .strip_suffix(format!("\t\t\t{full}\n").as_bytes())
-            .ok_or_else(|| conflict("owner branch is missing, symbolic or checked out"))?;
-        let old = object_id(fields)?;
+        let old = branch_tip(git, &root, &full).await?;
         if old.len() != tip.len() {
             return Err(bad("worker and owner object formats differ"));
         }
-        if query(git, &root, &["cat-file", "-t", &tip]).await? != b"commit\n" {
-            return Err(bad("worker branch does not point to a commit"));
-        }
-        owner_git(
-            git,
-            &root,
-            &["merge-base", "--is-ancestor", old, &tip],
-            Stdio::null(),
-            ErrorCode::Conflict,
-        )
-        .await
-        .map_err(|(_, message)| {
-            conflict(&format!("worker branch is not a fast-forward: {message}"))
-        })?;
-        owner_git(
-            git,
-            &root,
-            &["update-ref", "--no-deref", &full, &tip, old],
-            Stdio::null(),
-            ErrorCode::Conflict,
-        )
-        .await?;
-        Ok(())
+        quarantine::import(git, &root, &full, &old, &tip, &mut body).await
     })
     .await
     .map_err(|_| timed_out())?

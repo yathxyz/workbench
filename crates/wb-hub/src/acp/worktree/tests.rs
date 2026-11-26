@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{DirBuilderExt, symlink};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -7,6 +7,7 @@ use super::*;
 
 #[path = "../../../tests/common/script.rs"]
 mod executable;
+mod worker_import;
 
 fn program(name: &str) -> PathBuf {
     env::split_paths(&env::var_os("PATH").unwrap())
@@ -31,7 +32,7 @@ impl Fixture {
         loop {
             let n = NEXT.fetch_add(1, Ordering::Relaxed);
             let temp = parent.join(format!("wb-worktree-{}-{n}", std::process::id()));
-            match fs::create_dir(&temp) {
+            match fs::DirBuilder::new().mode(0o700).create(&temp) {
                 Ok(()) => {
                     return Self {
                         temp,
@@ -488,6 +489,104 @@ async fn cancel_unregistered_unlocked_and_replaced_add() {
                     .contains(&format!("refs/heads/{branch}"))
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn shallow_worker_source_never_reserves_a_branch() {
+    let f = Fixture::new();
+    let source = f.repo();
+    f.git(
+        &f.temp,
+        &[
+            "clone",
+            "--depth=1",
+            "--no-local",
+            source.to_str().unwrap(),
+            "shallow",
+        ],
+    );
+    let shallow = f.temp.join("shallow");
+    let worker = crate::config::AgentWorker {
+        root: f.temp.join("work"),
+        socket: f.temp.join("absent.sock"),
+    };
+    let (_tx, rx) = oneshot::channel();
+    let err = worker::create(
+        test_git(&f.git),
+        &worker,
+        &shallow,
+        &request("topic", None),
+        SID,
+        1,
+        rx,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, CreateFailure::Clean((ErrorCode::BadRequest, why)) if why.contains("shallow"))
+    );
+    assert!(
+        f.git(&shallow, &["for-each-ref", "--", "refs/heads/topic"])
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn failed_worker_seed_releases_only_its_original_reservation() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let seed = f.git(&repo, &["rev-parse", "HEAD"]);
+    f.git(&repo, &["commit", "--allow-empty", "-m", "owner change"]);
+    let advanced = f.git(&repo, &["rev-parse", "HEAD"]);
+    let worker = crate::config::AgentWorker {
+        root: f.temp.join("work"),
+        socket: f.temp.join("worker.sock"),
+    };
+    let listener = tokio::net::UnixListener::bind(&worker.socket).unwrap();
+    let branch = request("topic", Some(&seed));
+    let full = "refs/heads/topic";
+    for advance in [false, true] {
+        let reject = async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut sock = BufReader::new(socket);
+            let mut line = String::new();
+            sock.read_line(&mut line).await.unwrap();
+            let h: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let size = h["size"].as_u64().unwrap();
+            assert_eq!(
+                tokio::io::copy(&mut (&mut sock).take(size), &mut tokio::io::sink())
+                    .await
+                    .unwrap(),
+                size
+            );
+            assert_eq!(f.git(&repo, &["rev-parse", full]), seed);
+            if advance {
+                f.git(&repo, &["update-ref", full, &advanced, &seed]);
+            }
+            sock.get_mut()
+                .write_all(b"{\"error\":\"clone refused\"}\n")
+                .await
+                .unwrap();
+        };
+        let (_tx, rx) = oneshot::channel();
+        let (result, ()) = tokio::join!(
+            worker::create(test_git(&f.git), &worker, &repo, &branch, SID, 1, rx),
+            // A failure before the worker receives the bundle must fail the test, not hang it.
+            async {
+                tokio::time::timeout(Duration::from_secs(10), reject)
+                    .await
+                    .unwrap()
+            }
+        );
+        assert!(
+            matches!(result, Err(CreateFailure::PossibleLeftover((_, why))) if why.contains("clone refused"))
+        );
+        let actual = f.git(
+            &repo,
+            &["for-each-ref", "--format=%(objectname)", "--", full],
+        );
+        assert_eq!(actual, if advance { advanced.as_str() } else { "" });
     }
 }
 
