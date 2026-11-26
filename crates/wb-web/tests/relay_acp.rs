@@ -328,7 +328,7 @@ async fn hello_carries_state_and_session_and_info_omits_an_unchanged_session() {
                 "agent": "claude", "agentSessionId": "s-1", "revivable": true,
                 "activity": activity, "pending": [], "last": null, "headSeq": head,
                 "seenSeq": 0, "title": null, "modeId": "default",
-                "configOptions": null,
+                "configOptions": null, "workerClone": false,
             },
             "state": state,
             "repoRoot": null, "repo": null, "worktree": null, "branch": null,
