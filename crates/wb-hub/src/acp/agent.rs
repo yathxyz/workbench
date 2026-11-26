@@ -1,7 +1,7 @@
-//! One agent process (10-hub §7.1): its spawn and environment, the stdin writer, the
-//! stdout reader and the stderr log, and signals to its process group.
+//! ACP byte streams, either a child owned by the hub or a worker unit owned by
+//! the lifetime of its Unix socket. Only a hub child can be signalled by pid.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
@@ -19,15 +19,19 @@ use std::time::Duration;
 use rustix::process::{Pid, Signal, WaitIdStatus, kill_process, kill_process_group};
 use serde_json::{Map, Value};
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncWriteExt, BufReader, Interest};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Interest,
+};
+use tokio::net::UnixStream;
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use wb_proto::limits::{MAX_LINE, PROMPT_MAX};
 
 use super::lines::{Read, read_line_capped};
+use super::worker_unit::Unit;
 use crate::child::{self, ExitWatch};
-use crate::config::{ChildConfig, HostConfig};
+use crate::config::{AgentConfig, AgentWorker, ChildConfig, HostConfig};
 use crate::env::Identity;
 use crate::escalation::Escalations;
 use crate::pty::spawn::spawn_agent;
@@ -44,6 +48,8 @@ const TAIL_MAX: usize = 4 << 10;
 const STDERR_CHUNK: usize = 8 << 10;
 /// Objects read from stdout that wait for the actor; backpressure on the agent.
 const STDOUT_QUEUE: usize = 4;
+/// The launcher's first line (including its newline), never the agent's ACP bytes.
+const WORKER_HEADER_MAX: usize = 16 * 1024;
 
 /// What the stdout reader delivers.
 pub enum Out {
@@ -53,7 +59,9 @@ pub enum Out {
 
 /// Dropping a live agent transfers its owned group to panic cleanup.
 pub struct Agent {
-    pub watch: ExitWatch,
+    pid: u32,
+    pub watch: Option<ExitWatch>,
+    pub(super) unit: Option<Unit>,
     #[cfg(test)]
     pub(super) fail_exit_peek: bool,
     group: Option<Group>,
@@ -62,18 +70,22 @@ pub struct Agent {
     pub stdin: Option<Stdin>,
     pub stdout: mpsc::Receiver<Out>,
     pub log: Log,
-    stderr: Arc<AsyncFd<ChildStderr>>,
-    tasks: [JoinHandle<()>; 3],
+    stderr: Option<(Arc<AsyncFd<ChildStderr>>, JoinHandle<()>)>,
+    tasks: [JoinHandle<()>; 2],
 }
 
 impl Agent {
     pub fn pid(&self) -> u32 {
-        self.group.as_ref().unwrap().child.as_ref().unwrap().id()
+        self.pid
     }
 
     pub fn signal(&self, sig: Signal) {
         if let Some(group) = &self.group {
             group.signal(sig);
+        } else if self.unit.is_some() {
+            // Dropping the socket write half forces RDHUP even if the writer is
+            // blocked on a full socket. The worker's supervisor owns all signals.
+            self.tasks[0].abort();
         }
     }
 
@@ -119,7 +131,10 @@ impl Agent {
 
     /// Include pending pipe bytes in the death notice, not future writes by descendants.
     pub fn finish_stderr(&self) -> String {
-        let pipe = self.stderr.get_ref();
+        let Some((stderr, _)) = &self.stderr else {
+            return String::new(); // Worker stderr belongs to the unit journal.
+        };
+        let pipe = stderr.get_ref();
         let mut log = lock(&self.log.0);
         // The reader takes this same lock before reading: no chunk can be in flight.
         let mut pending =
@@ -139,6 +154,9 @@ impl Agent {
 impl Drop for Agent {
     fn drop(&mut self) {
         self.end_group(super::PANIC_GRACE);
+        if let Some((_, task)) = &self.stderr {
+            task.abort();
+        }
         for task in &self.tasks {
             task.abort();
         }
@@ -175,7 +193,8 @@ pub fn start(
         reaper: ctx.reaper.clone(),
     };
     let child = group.child.as_mut().unwrap();
-    let watch = ExitWatch::new(child.id()).map_err(setup_error)?;
+    let pid = child.id();
+    let watch = ExitWatch::new(pid).map_err(setup_error)?;
     let stdin =
         ChildStdin::from_std(child.stdin.take().expect("piped stdin")).map_err(setup_error)?;
     let stdout =
@@ -186,26 +205,137 @@ pub fn start(
         .map_err(setup_error)?;
     let stderr = Arc::new(AsyncFd::with_interest(stderr, Interest::READABLE).map_err(setup_error)?);
     let log = Log::open(log);
-    let queued = Arc::new(AtomicUsize::new(0));
-    let (in_tx, in_rx) = mpsc::unbounded_channel();
-    let (out_tx, out_rx) = mpsc::channel(STDOUT_QUEUE);
-    let tasks = [
-        tokio::spawn(write_stdin(stdin, in_rx, queued.clone())),
-        tokio::spawn(read_stdout(stdout, out_tx, log.clone())),
-        tokio::spawn(read_stderr(stderr.clone(), log.clone())),
-    ];
+    let stderr_task = tokio::spawn(read_stderr(stderr.clone(), log.clone()));
+    let (stdin, stdout, tasks) = streams(stdin, BufReader::with_capacity(64 << 10, stdout), &log);
     Ok(Agent {
-        watch,
+        pid,
+        watch: Some(watch),
+        unit: None,
         #[cfg(test)]
         fail_exit_peek: false,
         group: Some(group),
         escalations: ctx.escalations.clone(),
-        stdin: Some(Stdin { tx: in_tx, queued }),
-        stdout: out_rx,
+        stdin: Some(stdin),
+        stdout,
         log,
-        stderr,
+        stderr: Some((stderr, stderr_task)),
         tasks,
     })
+}
+
+/// Worker mode sends names, never environment values or a command. The root-owned
+/// launcher constructs the worker's own environment from its configuration.
+pub(super) async fn start_worker(
+    ctx: &Ctx,
+    worker: &AgentWorker,
+    sid: &str,
+    meta: &super::Meta,
+    cfg: &AgentConfig,
+    via: super::SpawnVia,
+    log: PathBuf,
+) -> Result<Agent, String> {
+    let child = &ctx.cfg.child;
+    let names: BTreeSet<_> = child
+        .pass_env
+        .iter()
+        .filter(|n| std::env::var_os(n).is_some())
+        .chain(child.set_env.keys())
+        .chain(cfg.env.keys())
+        .map(String::as_str)
+        .chain(["HOME", "USER", "LOGNAME", "SHELL", "WB_SESSION"])
+        .collect();
+    let mut header = serde_json::to_vec(&serde_json::json!({
+        // An older, one-phase launcher must reject this op, never exec optimistically.
+        "op": "admit-agent", "agent": meta.agent, "sid": sid, "cwd": meta.cwd, "env": names,
+    }))
+    .map_err(|e| e.to_string())?;
+    header.push(b'\n');
+    if header.len() > WORKER_HEADER_MAX {
+        return Err("worker header too large".into());
+    }
+    let connect = async {
+        let socket = UnixStream::connect(&worker.socket).await?;
+        let (read, mut write) = socket.into_split();
+        write.write_all(&header).await?;
+        let mut read = BufReader::with_capacity(64 << 10, read);
+        let hello = worker_reply(&mut read).await?;
+        let group = hello["cgroup"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("missing worker lifetime witness"))?
+            .to_owned();
+        Ok::<_, io::Error>((group, write, read))
+    };
+    let err = |e: io::Error| format!("starting worker agent: {e}");
+    let timeout = Duration::from_secs(15);
+    let (group, mut write, mut read) = tokio::time::timeout(timeout, connect)
+        .await
+        .map_err(|_| "worker handshake timed out")?
+        .map_err(err)?;
+    // Never time out a detached write of the receipt: a late rename must not
+    // replace a newer launch's identity after the actor processes another open.
+    let unit = Unit::reserve(&ctx.acp_dir, sid, group, via == super::SpawnVia::Revive)
+        .await
+        .map_err(err)?;
+    let launch = async {
+        write.write_all(b"+").await?;
+        let reply = worker_reply(&mut read).await?;
+        let pid = reply["pid"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|&n| n > 1)
+            .ok_or_else(|| io::Error::other("invalid worker reply"))?;
+        Ok::<_, io::Error>(pid)
+    };
+    let pid = tokio::time::timeout(timeout, launch)
+        .await
+        .map_err(|_| "worker launch timed out")?
+        .map_err(err)?;
+    let log = Log::open(log);
+    let (stdin, stdout, tasks) = streams(write, read, &log);
+    Ok(Agent {
+        pid,
+        watch: None,
+        unit: Some(unit),
+        #[cfg(test)]
+        fail_exit_peek: false,
+        group: None,
+        escalations: ctx.escalations.clone(),
+        stdin: Some(stdin),
+        stdout,
+        log,
+        stderr: None,
+        tasks,
+    })
+}
+
+async fn worker_reply(read: &mut (impl AsyncBufRead + Unpin)) -> io::Result<Value> {
+    let mut answer = Vec::new();
+    read.take(WORKER_HEADER_MAX as u64)
+        .read_until(b'\n', &mut answer)
+        .await?;
+    if answer.last() != Some(&b'\n') {
+        return Err(io::Error::other("missing or oversized worker reply"));
+    }
+    let reply: Value = serde_json::from_slice(&answer)?;
+    if let Some(error) = reply["error"].as_str() {
+        return Err(io::Error::other(error.to_owned()));
+    }
+    Ok(reply)
+}
+
+fn streams(
+    write: impl AsyncWrite + Unpin + Send + 'static,
+    read: impl AsyncBufRead + Unpin + Send + 'static,
+    log: &Log,
+) -> (Stdin, mpsc::Receiver<Out>, [JoinHandle<()>; 2]) {
+    let queued = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (out_tx, out_rx) = mpsc::channel(STDOUT_QUEUE);
+    let tasks = [
+        tokio::spawn(write_stdin(write, rx, queued.clone())),
+        tokio::spawn(read_stdout(read, out_tx, log.clone())),
+    ];
+    (Stdin { tx, queued }, out_rx, tasks)
 }
 
 /// The command that starts agent `agent` of another host for session `sid` in `cwd`:
@@ -288,7 +418,7 @@ impl Stdin {
 }
 
 async fn write_stdin(
-    mut stdin: ChildStdin,
+    mut stdin: impl AsyncWrite + Unpin,
     mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
     queued: Arc<AtomicUsize>,
 ) {
@@ -301,8 +431,7 @@ async fn write_stdin(
     }
 }
 
-async fn read_stdout(stdout: ChildStdout, tx: mpsc::Sender<Out>, log: Log) {
-    let mut r = BufReader::with_capacity(64 << 10, stdout);
+async fn read_stdout(mut r: impl AsyncBufRead + Unpin, tx: mpsc::Sender<Out>, log: Log) {
     loop {
         let line = match read_line_capped(&mut r, MAX_LINE).await {
             Ok(Read::Line(line)) => line,

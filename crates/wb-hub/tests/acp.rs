@@ -3780,7 +3780,7 @@ fn restored_summaries_only_use_wire_bounds_on_overflow() {
         "cwd": CWD, "fault": null, "acp": {
             "agent": "basic", "agentSessionId": agent_id, "revivable": false, "activity": "none",
             "pending": pending, "last": null, "headSeq": PENDING + 2, "seenSeq": 0,
-            "title": "", "modeId": null, "configOptions": null
+            "title": "", "modeId": null, "configOptions": null, "workerClone": false
         }
     }))
     .unwrap();

@@ -230,6 +230,22 @@ in
 
   vm = pkgs.testers.runNixOSTest (import ./vm.nix { inherit self; });
 
+  worker-launcher =
+    let
+      src = lib.fileset.toSource {
+        root = ../.;
+        fileset = lib.fileset.unions [
+          ./worker.py
+          ./worker_checkout.py
+          ../tests/worker_launcher.py
+        ];
+      };
+    in
+    pkgs.runCommand "workbench-worker-launcher" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+      python3 -I ${src}/tests/worker_launcher.py
+      touch $out
+    '';
+
   # Fail a bad config at evaluation rather than the next hub restart, and check what the unit
   # actually receives in /etc/workbench/hub.json.
   module =
@@ -254,9 +270,19 @@ in
           };
         };
       badRoot = [ "services.workbench.worktreeRoot must be an absolute path" ];
+      badWorker = [ "services.workbench.agentUser must differ" ];
       expect = {
         valid = [ ];
         configuredRoot = [ ];
+        worker = [ ];
+        workerIsOwner = badWorker;
+        workerIsRoot = badWorker;
+        overlappingHomes = [ "services.workbench.agentUser requires its own unprivileged" ];
+        workerPrivileges = [
+          "services.workbench.agentUser requires gitPackage"
+          "services.workbench.agentUser requires its own unprivileged"
+          "services.workbench.agentUser must not be a trusted Nix user"
+        ];
         relativeRoot = badRoot;
         dotRoot = badRoot;
         parentRoot = badRoot;
@@ -275,6 +301,31 @@ in
       systems = lib.mapAttrs (_: evaluate) {
         valid = { };
         configuredRoot.services.workbench.worktreeRoot = "/srv/.worktrees/";
+        worker.services.workbench = {
+          agentUser = "wb-agent";
+          environment.EDITOR = "vi";
+          agents.stub = {
+            label = "Stub";
+            package = workbench.fake;
+            exe = "bin/wb-fake-acp";
+            args = [ "acp" ];
+            env.STUB = "1";
+          };
+        };
+        workerIsOwner.services.workbench.agentUser = "alice";
+        workerIsRoot.services.workbench.agentUser = "root";
+        overlappingHomes = {
+          services.workbench.agentUser = "wb-agent";
+          users.users.alice.home = "/var/lib/wb-agent/owner";
+        };
+        workerPrivileges = {
+          services.workbench = {
+            agentUser = "wb-agent";
+            gitPackage = null;
+          };
+          users.groups.wheel.members = [ "wb-agent" ];
+          nix.settings.trusted-users = [ "@wb-agent" ];
+        };
         relativeRoot.services.workbench.worktreeRoot = "worktrees";
         dotRoot.services.workbench.worktreeRoot = "/srv/./wt";
         parentRoot.services.workbench.worktreeRoot = "/srv/wt/..";
@@ -331,17 +382,42 @@ in
         )
       ) systems;
       hubJson = sys: sys.config.environment.etc."workbench/hub.json".source;
+      off = systems.valid.config;
+      on = systems.worker.config;
+      account = on.users.users.wb-agent;
+      socket = on.systemd.sockets.workbench-worker.socketConfig;
+      service = on.systemd.services."workbench-worker@".serviceConfig;
       matches = lib.mapAttrs (
         case: prefixes:
         lib.length got.${case} == lib.length prefixes
         && lib.all (p: lib.any (lib.hasPrefix p) got.${case}) prefixes
       ) expect;
     in
+    assert !(off.systemd.sockets ? workbench-worker);
+    assert !(off.systemd.services ? "workbench-worker@");
+    assert !(off.environment.etc ? "workbench/worker.json");
+    assert account.isSystemUser && account.group == "wb-agent" && account.extraGroups == [ ];
+    assert account.createHome && account.home == "/var/lib/wb-agent" && account.homeMode == "700";
+    assert on.users.users.alice.extraGroups == off.users.users.alice.extraGroups;
+    assert socket.Accept && socket.SocketUser == "alice" && socket.SocketMode == "0600";
+    assert socket.ListenStream == "/run/workbench-worker/agent.sock";
+    assert service.User == "wb-agent" && service.Group == "wb-agent" && service.NoNewPrivileges;
+    assert service.ProtectHome && service.ProtectSystem == "strict" && service.PrivateTmp && service.PrivatePIDs;
+    assert service.ReadWritePaths == [ account.home ];
+    assert service.KillMode == "control-group" && service.TimeoutStopSec == 2;
     pkgs.runCommand "workbench-module" { nativeBuildInputs = [ pkgs.jq ]; } (
       if lib.all lib.id (lib.attrValues matches) then
         ''
-          jq -e 'has("worktreeRoot") | not' ${hubJson systems.valid}
+          jq -e 'has("worktreeRoot") or has("agentWorker") | not' ${hubJson systems.valid}
           jq -e '.worktreeRoot == "/srv/.worktrees/"' ${hubJson systems.configuredRoot}
+          jq -e '.agentWorker == {root: "/var/lib/wb-agent/work", socket: "/run/workbench-worker/agent.sock"}' ${hubJson systems.worker}
+          jq -e '
+            .root == "/var/lib/wb-agent/work" and .git == "/etc/workbench/bin/git"
+            and .shell == "/run/current-system/sw/bin/bash"
+            and .agents.stub == {argv:["/etc/workbench/agents/stub/bin/wb-fake-acp", "acp"], env:{STUB:"1"}}
+            and .env.EDITOR == "vi"
+            and (.env.PATH | contains("/var/lib/wb-agent/.nix-profile/bin") and (contains("alice") | not))
+          ' ${on.environment.etc."workbench/worker.json".source}
           touch $out
         ''
       else

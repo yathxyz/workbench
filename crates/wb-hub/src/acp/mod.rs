@@ -11,11 +11,13 @@ mod journal;
 mod lines;
 mod replay;
 mod rpc;
+mod worker_unit;
 mod worktree;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,7 +35,7 @@ use tracing::{Instrument, error, info, info_span, warn};
 use wb_proto::hub::{
     AcpFacts, AcpOpenReply, AcpSessionInfo, Activity, ConfigError, ConfigOption, ErrorCode,
     ExitReason, Fault, FaultCode, HubMessage, Kind, ManagedWorktree, PendingKind, SpawnAcp,
-    Summary,
+    Summary, WorktreeRequest,
 };
 use wb_proto::journal::{
     EventBody, JournalEvent, NoticeLevel, ResolvedBy, SessionVia, SetupErrorCode, SpawnVia,
@@ -104,7 +106,7 @@ const HISTORY: [&str; 6] = [
     "plan",
 ];
 /// The files of a session, by extension.
-const FILES: [&str; 4] = ["json", "jsonl", "stderr.log", "stderr.log.1"];
+const FILES: [&str; 5] = ["json", "jsonl", "stderr.log", "stderr.log.1", "worker-unit"];
 const JOURNAL_FAILED: &str = "the journal could not be written";
 const NOT_RUNNING: &str = "the agent is not running";
 const ENQUEUE_FAILED: &str = "could not queue input for the agent";
@@ -380,6 +382,9 @@ struct Meta {
     seen_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     managed_worktree: Option<ManagedWorktree>,
+    /// Never revive a worker checkout under the owner's uid, even after a switch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    worker_clone: bool,
 }
 
 async fn read_blocking<T: Send + 'static>(
@@ -392,20 +397,52 @@ async fn read_blocking<T: Send + 'static>(
 
 async fn read_meta(ctx: &Ctx, sid: &str) -> anyhow::Result<Option<Meta>> {
     let (dir, sid) = (ctx.acp_dir.clone(), sid.to_owned());
-    read_blocking(move || {
-        let name = format!("{sid}.json");
-        let text = match fs::read(dir.join(&name)) {
-            Ok(text) => text,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e).context(name),
-        };
-        let meta: Meta = serde_json::from_slice(&text).with_context(|| name.clone())?;
-        if meta.sid != sid {
-            bail!("{name} holds sid {:?}", meta.sid);
-        }
-        Ok(Some(meta))
-    })
-    .await
+    read_blocking(move || read_meta_at(&dir, &sid)).await
+}
+
+fn read_meta_at(dir: &Path, sid: &str) -> anyhow::Result<Option<Meta>> {
+    let name = format!("{sid}.json");
+    let text = match fs::read(dir.join(&name)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context(name),
+    };
+    let meta: Meta = serde_json::from_slice(&text).with_context(|| name.clone())?;
+    if meta.sid != sid {
+        bail!("{name} holds sid {:?}", meta.sid);
+    }
+    Ok(Some(meta))
+}
+
+/// Owner command: the destination repository and ref come from the hub's private
+/// session record, never from the worker. The daemon need not be stopped.
+#[tokio::main(flavor = "current_thread")]
+pub(crate) async fn fetch_worker(config: &Path, sid: &str) -> anyhow::Result<()> {
+    if !crate::conn::valid_sid(sid) {
+        bail!("invalid session id");
+    }
+    let cfg = crate::config::load(config)?;
+    if fs::metadata(&cfg.state_dir)?.uid() != rustix::process::geteuid().as_raw() {
+        bail!("run fetch-worker as the hub state directory's owner");
+    }
+    let worker = cfg
+        .agent_worker
+        .as_ref()
+        .context("no agent worker configured")?;
+    let meta = read_meta_at(&cfg.state_dir.join("acp"), sid)?.context("no such ACP session")?;
+    if !meta.worker_clone || meta.host.is_some() {
+        bail!("session has no worker clone");
+    }
+    let record = meta
+        .managed_worktree
+        .context("session checkout was removed")?;
+    let git = worktree::Git {
+        program: cfg.git.as_deref().context("no git configured")?,
+        reaper: &child::start_reaper()?,
+    };
+    worktree::worker::fetch(git, worker, &record, sid)
+        .await
+        .map_err(|(_, message)| anyhow!(message))
 }
 
 async fn read(ctx: &Ctx, sid: &str, sync: Arc<SyncGate>) -> anyhow::Result<Option<Loaded>> {
@@ -973,13 +1010,14 @@ impl Acp {
             let rpc_at = self.rpc_deadline();
             let stage_at = self.stage.and_then(|(_, at)| at);
             let (info_at, meta_at, probe_at) = (self.info_at, self.meta_at, self.probe_at);
-            let (out, watch, drain_until) = match &mut self.proc {
+            let (out, watch, unit, drain_until) = match &mut self.proc {
                 Some(p) => (
                     (!p.eof).then_some(&mut p.agent.stdout),
-                    p.status.is_none().then_some(&mut p.agent.watch),
+                    p.agent.watch.as_mut().filter(|_| p.status.is_none()),
+                    p.agent.unit.as_ref().filter(|_| p.status.is_none()),
                     p.drain_until,
                 ),
-                None => (None, None, None),
+                None => (None, None, None, None),
             };
             let event = tokio::select! {
                 cmd = rx.recv() => Event::Cmd(cmd),
@@ -987,6 +1025,7 @@ impl Acp {
                 Some(r) = self.replayed_rx.recv() => Event::Replayed(r),
                 out = recv(out) => Event::Out(out),
                 st = child::wait(watch) => Event::Exited(st),
+                () = worker_unit::Unit::wait(unit) => Event::Exited(Ok(WaitNotice::Exited(None, None))),
                 () = sleep_until(drain_until) => Event::Drained,
                 () = sleep_until(setup_at) => Event::SetupIdle,
                 () = sleep_until(rpc_at) => Event::RpcTimeout,
@@ -1101,7 +1140,7 @@ impl Acp {
                     reply.done();
                 }
             }
-            Cmd::Act { act, reply, .. } => self.act(act, reply),
+            Cmd::Act { act, reply, .. } => self.act(act, reply).await,
             Cmd::Shutdown { done } => self.shutdown(done).await,
         }
     }
@@ -1141,6 +1180,14 @@ impl Acp {
                 return self.abandon(o.reply, Clean((ErrorCode::BadRequest, msg)));
             }
         }
+        let created_at = self.created_at;
+        self.meta.worker_clone = spawn.host.is_none() && self.ctx.cfg.agent_worker.is_some();
+        if self.meta.worker_clone && spawn.worktree.is_none() {
+            spawn.worktree = Some(WorktreeRequest {
+                branch: format!("workbench/{}-{created_at}", self.sid),
+                base: None,
+            });
+        }
         if let Some(request) = spawn.worktree.take() {
             let ctx = self.ctx.clone();
             let sid = self.sid.clone();
@@ -1155,7 +1202,18 @@ impl Acp {
                     program: ctx.cfg.git.as_deref().expect("validated worktree request"),
                     reaper: &ctx.reaper,
                 };
-                WorktreeResult::Created(
+                let result = if let Some(worker) = &ctx.cfg.agent_worker {
+                    worktree::worker::create(
+                        git,
+                        worker,
+                        Path::new(&cwd),
+                        &request,
+                        &sid,
+                        created_at,
+                        cancelled,
+                    )
+                    .await
+                } else {
                     worktree::create(
                         git,
                         Path::new(&cwd),
@@ -1164,8 +1222,9 @@ impl Acp {
                         &sid,
                         cancelled,
                     )
-                    .await,
-                )
+                    .await
+                };
+                WorktreeResult::Created(result)
             });
         } else {
             self.finish_create(o, None).await;
@@ -1184,6 +1243,7 @@ impl Acp {
             host: spawn.host,
             created_at: self.created_at,
             managed_worktree,
+            worker_clone: self.meta.worker_clone,
             ..Meta::default()
         };
         self.policy = match spawn
@@ -1261,7 +1321,7 @@ impl Acp {
         }
         self.quiet = false;
         if spawn.config.is_empty() {
-            let _ = self.spawn(SpawnVia::New);
+            let _ = self.spawn(SpawnVia::New).await;
             self.open(o, true);
         } else {
             self.startup_config = Some(StartupConfig {
@@ -1270,7 +1330,7 @@ impl Acp {
                 current: None,
                 errors: Vec::new(),
             });
-            let _ = self.spawn(SpawnVia::New);
+            let _ = self.spawn(SpawnVia::New).await;
         }
     }
 
@@ -1323,7 +1383,7 @@ impl Acp {
     /// Starts the agent and sends `initialize` only after recording `spawn`.
     /// An agent start failure is `spawn_failed` if its `setup_error` was recorded;
     /// a journal failure in either path is `faulted` (DESIGN §3.4.4).
-    fn spawn(&mut self, via: SpawnVia) -> Result<(), (ErrorCode, String)> {
+    async fn spawn(&mut self, via: SpawnVia) -> Result<(), (ErrorCode, String)> {
         // A previous background sync can have latched EIO without the actor noticing.
         let journal = self.journal.as_ref().expect("spawn requires a journal");
         if let Err(error) = journal.healthy() {
@@ -1333,7 +1393,12 @@ impl Acp {
         let (sid, meta, log) = (&self.sid, &self.meta, self.path("stderr.log"));
         let started = match &meta.host {
             None => match self.ctx.cfg.agents.get(&meta.agent) {
-                Some(cfg) => agent::start(&self.ctx, sid, &cfg.argv, &cfg.env, &meta.cwd, log),
+                Some(cfg) => match &self.ctx.cfg.agent_worker {
+                    Some(worker) => {
+                        agent::start_worker(&self.ctx, worker, sid, meta, cfg, via, log).await
+                    }
+                    None => agent::start(&self.ctx, sid, &cfg.argv, &cfg.env, &meta.cwd, log),
+                },
                 None => Err(format!("agent {} is not in the hub's table", meta.agent)),
             },
             Some(host) => match self.ctx.cfg.hosts.get(host) {
@@ -1581,6 +1646,10 @@ impl Acp {
         self.publish();
     }
 
+    fn same_agent_identity(&self) -> bool {
+        self.meta.host.is_some() || self.meta.worker_clone == self.ctx.cfg.agent_worker.is_some()
+    }
+
     /// The wire Summary and session info as they are now.
     fn snapshot(&self, updated_at: u64) -> (Summary, AcpSessionInfo) {
         let viewers = lock(&self.shared.viewers).len();
@@ -1604,7 +1673,7 @@ impl Acp {
             acp: Some(AcpFacts {
                 agent: self.meta.agent.clone(),
                 agent_session_id: facts.agent_session_id.clone(),
-                revivable: facts.revivable(self.meta.init.as_ref()),
+                revivable: self.same_agent_identity() && facts.revivable(self.meta.init.as_ref()),
                 activity: if self.startup_config.is_some() {
                     Activity::Setup
                 } else {
@@ -1619,6 +1688,7 @@ impl Acp {
                 policy: facts.policy.clone(),
                 config_options: facts.config_options.clone(),
                 managed_worktree: self.meta.managed_worktree.clone(),
+                worker_clone: Some(self.meta.worker_clone),
                 task: facts.task.clone(),
             }),
         };
@@ -1825,7 +1895,7 @@ impl Acp {
         }
     }
 
-    fn act(&mut self, act: Act, reply: Reply) {
+    async fn act(&mut self, act: Act, reply: Reply) {
         if self.startup_config.is_some()
             && matches!(
                 &act,
@@ -1880,7 +1950,7 @@ impl Acp {
                 self.set_seen(seq);
                 reply.done();
             }
-            Act::Revive => self.revive(reply),
+            Act::Revive => self.revive(reply).await,
             Act::Authenticate(method_id) => self.authenticate(&method_id, reply),
             Act::Kill { forget } => self.kill(forget, reply),
             Act::RemoveWorktree => self.remove_worktree(reply),
@@ -2329,12 +2399,25 @@ impl Acp {
             .map_err(io::Error::other)?
     }
 
-    fn revive(&mut self, reply: Reply) {
+    async fn revive(&mut self, reply: Reply) {
         self.probe();
         if self.fault.is_some() {
             return reply.err(ErrorCode::Faulted, "the session has a fault");
         }
-        if self.proc.is_none() && self.meta.host.is_none() && !Path::new(&self.meta.cwd).is_dir() {
+        if !self.same_agent_identity() {
+            return reply.err(
+                ErrorCode::NotRevivable,
+                "the session was created under a different local agent identity",
+            );
+        }
+        if self.proc.is_none()
+            && self.meta.host.is_none()
+            && if self.meta.worker_clone {
+                self.meta.managed_worktree.is_none()
+            } else {
+                !Path::new(&self.meta.cwd).is_dir()
+            }
+        {
             return reply.err(
                 ErrorCode::NotRevivable,
                 format!(
@@ -2347,7 +2430,7 @@ impl Acp {
             return reply.err(ErrorCode::NotRevivable, "the session cannot be revived");
         }
         self.set_seen(self.facts.head_seq);
-        match self.spawn(SpawnVia::Revive) {
+        match self.spawn(SpawnVia::Revive).await {
             Ok(()) => reply.done(),
             Err((code, message)) => reply.err(code, message),
         }
@@ -2363,7 +2446,11 @@ impl Acp {
                 return reply.err(ErrorCode::BadOption, msg);
             }
             Some(m) if m.get("type").is_some() => {
-                let msg = "this method needs a terminal: log in from a terminal card, then start a new session";
+                let msg = if self.meta.worker_clone {
+                    "this method needs a terminal: provision the provider login as the agent worker, then start a new session"
+                } else {
+                    "this method needs a terminal: log in from a terminal card, then start a new session"
+                };
                 return reply.err(ErrorCode::BadOption, msg);
             }
             Some(_) => {}
@@ -2428,13 +2515,22 @@ impl Acp {
     fn start_remove(&mut self, op: WorktreeOp, record: ManagedWorktree) {
         let ctx = self.ctx.clone();
         let sid = self.sid.clone();
+        let worker_clone = self.meta.worker_clone;
         self.worktree_op = Some(op);
         self.git.spawn(async move {
             let git = worktree::Git {
                 program: ctx.cfg.git.as_deref().expect("configured worktree removal"),
                 reaper: &ctx.reaper,
             };
-            WorktreeResult::Removed(worktree::remove(git, &record, &sid).await)
+            let result = if worker_clone {
+                match &ctx.cfg.agent_worker {
+                    Some(worker) => worktree::worker::remove(git, worker, &record, &sid).await,
+                    None => Err((ErrorCode::BadRequest, "no agent worker configured".into())),
+                }
+            } else {
+                worktree::remove(git, &record, &sid).await
+            };
+            WorktreeResult::Removed(result)
         });
     }
 
@@ -3142,7 +3238,7 @@ impl Acp {
             Ok(WaitNotice::ProbeChild) => p.agent.probe_exit(),
             Err(e) if !child::is_echild(&e) => {
                 warn!("observing agent exit: {e}; switching to child wait");
-                p.agent.watch.use_child_wait();
+                p.agent.watch.as_mut().unwrap().use_child_wait();
                 return;
             }
             Err(e) => Err(e),
@@ -3157,7 +3253,7 @@ impl Acp {
             }
             Err(e) => {
                 warn!("waiting for owned agent child: {e}");
-                p.agent.watch.retry_child();
+                p.agent.watch.as_mut().unwrap().retry_child();
                 return;
             }
         });
@@ -3176,7 +3272,7 @@ impl Acp {
         if p.status.is_some() {
             self.finalise();
         } else {
-            warn!("the agent closed stdout but did not exit; killing its process group");
+            warn!("the agent closed stdout but did not exit; forcing teardown");
             p.agent.signal(Signal::KILL);
         }
     }
@@ -3514,7 +3610,7 @@ mod tests {
             let (mut actor, _rx) = dormant(dir.path()).await;
             configure_test_agent(&mut actor, "printf 'last words\\n' >&2; exit 1");
             let q = attach(&actor);
-            actor.spawn(SpawnVia::New).unwrap();
+            actor.spawn(SpawnVia::New).await.unwrap();
 
             // Do not yield this current-thread runtime between spawn and exit:
             // the child can write and exit, but the stderr task cannot run.
@@ -3695,7 +3791,7 @@ mod tests {
     }
 
     async fn wait_success(agent: &mut Agent) -> WaitNotice {
-        let status = child::wait(Some(&mut agent.watch)).await.unwrap();
+        let status = child::wait(agent.watch.as_mut()).await.unwrap();
         assert!(matches!(status, WaitNotice::Exited(Some(0), None)));
         status
     }
@@ -3715,7 +3811,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut actor, _rx) = dormant(dir.path()).await;
         configure_test_agent(&mut actor, "while read -r line; do :; done; exit 37");
-        actor.spawn(SpawnVia::New).unwrap();
+        actor.spawn(SpawnVia::New).await.unwrap();
         let agent = &mut actor.proc.as_mut().unwrap().agent;
         let pid = agent.pid();
         agent.fail_exit_peek = reap;
@@ -3735,7 +3831,7 @@ mod tests {
         actor.child_exited(Err(rustix::io::Errno::IO.into()));
         assert!(actor.proc.as_ref().unwrap().status.is_none());
         let p = actor.proc.as_mut().unwrap();
-        let probe = watchdog(child::wait(Some(&mut p.agent.watch))).await;
+        let probe = watchdog(child::wait(p.agent.watch.as_mut())).await;
         assert!(matches!(probe, Ok(WaitNotice::ProbeChild)));
         actor.child_exited(probe);
         let p = actor.proc.as_mut().unwrap();
@@ -3748,7 +3844,7 @@ mod tests {
         p.agent.stdin = None;
         watchdog(async {
             while let Some(p) = actor.proc.as_mut().filter(|p| p.status.is_none()) {
-                let notice = child::wait(Some(&mut p.agent.watch)).await;
+                let notice = child::wait(p.agent.watch.as_mut()).await;
                 actor.child_exited(notice);
             }
         })
@@ -3843,7 +3939,7 @@ mod tests {
             let (escalations, kill_gate) = crate::escalation::Escalations::gated_for_test();
             Arc::get_mut(&mut actor.ctx).unwrap().escalations = Arc::new(escalations);
             let ctx = actor.ctx.clone(); // Own the pending group even after actor unwind.
-            actor.spawn(SpawnVia::New).unwrap();
+            actor.spawn(SpawnVia::New).await.unwrap();
             let agent = &mut actor.proc.as_mut().unwrap().agent;
             let pid = agent.pid() as i32;
             let leader = pidfd_open(Pid::from_raw(pid).unwrap(), PidfdFlags::empty()).unwrap();
@@ -3916,7 +4012,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let (mut actor, _rx) = dormant(dir.path()).await;
             configure_test_agent(&mut actor, READ_INPUT);
-            actor.spawn(SpawnVia::New).unwrap();
+            actor.spawn(SpawnVia::New).await.unwrap();
             let agent = &mut actor.proc.as_mut().unwrap().agent;
             let pid = Pid::from_raw(agent.pid() as i32).unwrap();
             // Keep a witness at the old number: unlike relying on rapid pid
@@ -3955,8 +4051,26 @@ mod tests {
 
         async fn revive(acp: &mut Acp) -> Value {
             let out = Arc::new(OutQ::default());
-            acp.act(Act::Revive, Reply::for_test(1, out.clone()));
+            acp.act(Act::Revive, Reply::for_test(1, out.clone())).await;
             next_reply(&out).await
+        }
+
+        #[tokio::test]
+        async fn disabling_worker_cannot_revive_its_agent_as_the_owner() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut acp, _rx) = dormant_revivable(dir.path()).await;
+            configure_test_agent(&mut acp, READ_INPUT);
+            acp.meta.worker_clone = true;
+            acp.meta.managed_worktree = Some(ManagedWorktree {
+                path: acp.meta.cwd.clone(),
+                main_root: acp.meta.cwd.clone(),
+                branch: "topic".into(),
+            });
+            assert!(!acp.snapshot(0).0.acp.unwrap().revivable);
+            assert_eq!(revive(&mut acp).await["code"], "not_revivable");
+            assert!(acp.proc.is_none());
+            acp.meta.managed_worktree = None;
+            assert_eq!(acp.snapshot(0).0.acp.unwrap().worker_clone, Some(true));
         }
 
         #[tokio::test]
@@ -4069,7 +4183,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut acp, _rx) = dormant(dir.path()).await;
         configure_test_agent(&mut acp, READ_INPUT);
-        acp.spawn(SpawnVia::New).unwrap();
+        acp.spawn(SpawnVia::New).await.unwrap();
         assert!(acp.record(EventBody::Session {
             via: SessionVia::New,
             session_id: "s".into(),
@@ -4100,7 +4214,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut acp, _rx) = dormant(dir.path()).await;
         configure_test_agent(&mut acp, READ_INPUT);
-        acp.spawn(SpawnVia::New).unwrap();
+        acp.spawn(SpawnVia::New).await.unwrap();
         assert!(acp.record(EventBody::Session {
             via: SessionVia::New,
             session_id: "s".into(),
@@ -4233,7 +4347,7 @@ mod tests {
         assert_eq!(loaded.meta.created_at, epoch);
         let mut new = Acp::new(ctx, "a".into(), epoch, shared);
         new.begin(Start::Loaded(Box::new(loaded)));
-        new.spawn(SpawnVia::Revive).unwrap();
+        new.spawn(SpawnVia::Revive).await.unwrap();
         assert!(new.record(session(SessionVia::Resume)));
         assert!(new.record(prompt()));
         new.agent_request(json!(7), method, question("different question"))
@@ -4292,7 +4406,7 @@ mod tests {
             "exec 1>&-; while read -r line; do :; done"
         };
         configure_test_agent(&mut acp, script);
-        acp.spawn(SpawnVia::New).unwrap();
+        acp.spawn(SpawnVia::New).await.unwrap();
         assert!(acp.record(EventBody::Session {
             via: SessionVia::New,
             session_id: "s".into(),
@@ -4339,7 +4453,7 @@ mod tests {
             Act::Cancel,
         ] {
             let queue = Arc::new(OutQ::default());
-            acp.act(act, Reply::for_test(1, queue.clone()));
+            acp.act(act, Reply::for_test(1, queue.clone())).await;
             assert_eq!(next_reply(&queue).await["code"], "not_alive");
         }
         assert_eq!(fs::read(journal).unwrap(), before);
@@ -4785,6 +4899,7 @@ mod tests {
             init: Some(json!({"protocolVersion": 1})),
             seen_seq: 3,
             managed_worktree: None,
+            worker_clone: false,
         };
         let v = serde_json::to_value(&meta).unwrap();
         assert_eq!(
@@ -4846,7 +4961,7 @@ mod tests {
 
         // Answer each outstanding request through the real pipes. Drive the actor inputs
         // separately so its last response is buffered when it first observes the exit.
-        fn spawn(acp: &mut Acp, via: SpawnVia, replies: &[Value], eof_first: bool) {
+        async fn spawn(acp: &mut Acp, via: SpawnVia, replies: &[Value], eof_first: bool) {
             let mut script = String::from(
                 r#"for reply in "$@"; do read -r request || exit 1; printf '%s\n' "$reply"; done"#,
             );
@@ -4859,7 +4974,7 @@ mod tests {
             let argv = &mut cfg.agents.get_mut("offline").unwrap().argv;
             argv.push("setup-test-agent".into()); // shell's $0
             argv.extend(replies.iter().map(Value::to_string));
-            acp.spawn(via).unwrap();
+            acp.spawn(via).await.unwrap();
         }
 
         async fn output(acp: &mut Acp) -> Out {
@@ -4910,7 +5025,7 @@ mod tests {
         async fn failed_setup_refuses_authenticate_after_exit_or_eof() {
             for eof_first in [false, true] {
                 case(async |acp| {
-                    spawn(acp, SpawnVia::New, &[init(), auth_required()], eof_first);
+                    spawn(acp, SpawnVia::New, &[init(), auth_required()], eof_first).await;
                     response(acp).await;
                     response(acp).await;
                     let last = acp.facts.last.as_ref().unwrap();
@@ -4925,7 +5040,8 @@ mod tests {
                     acp.act(
                         Act::Authenticate("login".into()),
                         Reply::for_test(1, q.clone()),
-                    );
+                    )
+                    .await;
                     no_next_request(acp, writes);
                     assert_eq!(read_reply(&q).await["code"], "not_alive");
                     assert_eq!(acp.meta.seen_seq, seen);
@@ -4939,14 +5055,15 @@ mod tests {
         async fn buffered_authenticate_answers_without_opening_a_session() {
             case(async |acp| {
                 let ok = json!({"jsonrpc":"2.0","id":3,"result":{}});
-                spawn(acp, SpawnVia::New, &[init(), auth_required(), ok], false);
+                spawn(acp, SpawnVia::New, &[init(), auth_required(), ok], false).await;
                 response(acp).await;
                 response(acp).await;
                 let q = Arc::new(OutQ::default());
                 acp.act(
                     Act::Authenticate("login".into()),
                     Reply::for_test(1, q.clone()),
-                );
+                )
+                .await;
                 let writes = begin_drain(acp, false).await;
                 response(acp).await;
                 no_next_request(acp, writes);
@@ -4961,7 +5078,7 @@ mod tests {
                 acp.facts.agent_session_id = Some("old".into());
                 let failed =
                     json!({"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"no resume"}});
-                spawn(acp, SpawnVia::Revive, &[init(), failed], false);
+                spawn(acp, SpawnVia::Revive, &[init(), failed], false).await;
                 response(acp).await;
                 let writes = begin_drain(acp, false).await;
                 response(acp).await;
@@ -5015,7 +5132,7 @@ mod tests {
                     json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s","configOptions":options(false)}}),
                     json!({"jsonrpc":"2.0","id":3,"result":{"configOptions":options(true)}}),
                 ];
-                spawn(acp, SpawnVia::New, &replies[..responses], false);
+                spawn(acp, SpawnVia::New, &replies[..responses], false).await;
                 for _ in 1..responses {
                     response(acp).await;
                 }
@@ -5063,7 +5180,7 @@ mod tests {
         async fn buffered_setup_error_is_recorded_but_unattempted_options_are_not_alive() {
             case(async |acp| {
                 let q = initial_batch(acp);
-                spawn(acp, SpawnVia::New, &[init(), auth_required()], false);
+                spawn(acp, SpawnVia::New, &[init(), auth_required()], false).await;
                 response(acp).await;
                 let writes = begin_drain(acp, false).await;
                 response(acp).await;
