@@ -99,6 +99,33 @@ reverse_proxy 192.0.2.2:8090 {
 }
 ```
 
-Cards are interactive non-login shells of the configured user. They run with
+Terminal cards are interactive non-login shells of the configured user. They run with
 `NoNewPrivileges`, without access to `/run/user`, and with `~/.ssh` and the user's systemd unit
 directories read-only. These are guard-rails, not a sandbox: a card can do what the user can.
+
+### Run local agents as a separate user
+
+Set `services.workbench.agentUser = "wb-agent";` and restart `workbench-hub` at a session boundary: a deploy intentionally does not restart it.
+The default is `null`. With it set, the module creates a system user with a private home at `/var/lib/wb-agent`.
+Every new local ACP session starts in a separate clone of the requested Git checkout; terminals and SSH launches still run as before.
+Give the worker its own provider login and Git author identity, not access to the owner's home, credential sockets or `.git`.
+Configure adapters at paths the worker can execute, for example with `services.workbench.agents.<name>.package`.
+
+Pass `"worktree": {"branch": "feature/x", "base": "main"}` in the session's spawn request to name the branch and its starting revision.
+Without it, the base is the requested checkout's `HEAD` and the branch is `workbench/<sid>-<createdAt>`.
+Only committed history is copied, not the owner's dirty files or repository configuration.
+Creation reserves a new branch in the owner's repository; choose a fresh name even when retrying a failed transfer.
+To import the session's commits, run this as the hub user **before forgetting the session**:
+
+```sh
+wb-hub --config /etc/workbench/hub.json fetch-worker SID
+```
+
+This fast-forwards the recorded branch without checking it out; it must still exist and must not be checked out in any owner worktree.
+Review the changes before merging or running them.
+Do not fetch directly from the worker's directory or add it to `safe.directory`.
+Workbench does not recursively remove a worker clone: it may contain uncommitted work or other refs.
+After import, remove the clone as the worker and retry **Remove worktree** to clear its record.
+Worker sessions share a uid and home, not an isolation boundary from one another.
+Worker processes cannot use the owner's `wb`, editor or SSH-agent sockets; configure a separate integration if the host needs one.
+The module does not grant trusted Nix access; decide separately whether the worker should be allowed to submit builds to the host's Nix daemon.

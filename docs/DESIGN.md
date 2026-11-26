@@ -389,7 +389,7 @@ Otherwise, when a request fails several checks, the first in this list applies:
 **`SpawnAcp`** = `{agent, cwd: absolute existing directory, config?: ConfigOption[], task?: string, policy?: Policy, worktree?: {branch: string, base?: string}}` (remote `host` rules in §3.8.5).
 - **`ConfigValue`** is a JSON string or boolean, never a number, null, array or object. **`ConfigOption`** = `{id: string, value: ConfigValue}`. The optional `config` array is ordered: at most 16 entries, with distinct ids. The hub rejects an invalid batch with `bad_request` before spawning. Absent or empty `config` preserves the old asynchronous open behaviour; serializers omit the empty array.
 - **`ConfigError`** = `{id: string, value: ConfigValue, code: ErrorCode, error: string}`. `AcpOpenReply.configErrors` reports failed entries in input order, retaining their requested values and a required hub error code. It is omitted when empty and defaults to an empty array when absent. These errors belong only to the initiating open reply, not to the session facts or later attaches.
-- **Managed worktree (F-A52).** A request with `worktree` requires a local agent and an absolute `cwd` inside a non-bare git checkout, including a subdirectory of a linked worktree, but not a submodule.
+- **Managed worktree (F-A52, default local identity).** A request with `worktree` requires a local agent and an absolute `cwd` inside a non-bare git checkout, including a subdirectory of a linked worktree, but not a submodule.
   The same rule applies to `branch` and `base`: 1–255 ASCII bytes in `[A-Za-z0-9._/-]`, not `HEAD`, no initial `-`, no `..`, and no empty slash-separated component or component starting with `.` or ending with `.lock`.
   Invalid names are `bad_request` before git runs.
   For git's resolved main worktree root `R` and branch `B` with each `/` replaced by `-`, the default destination is `R-wt/B`.
@@ -413,6 +413,18 @@ Otherwise, when a request fails several checks, the first in this list applies:
   Only a timed-out or cancelled `worktree add` permits forced cleanup: the hub verifies the reserved directory's device and inode before it unlocks and force-removes the incomplete checkout; no agent has run in it.
   If the hub itself stops before creation completes, an incomplete, locked worktree can remain without a session record; inspect the path and recover it manually as described in F-A52.
   A panic in the git creation task can likewise skip rollback and leave a marked checkout without a record; use the same manual recovery in F-A52.
+- **Separate local agent identity (§3.7.2).** Every new local session, with or without `worktree`, takes its starting history from a Git checkout and runs in a worker-owned clone.
+  The requested `base` defaults to that checkout's `HEAD`; the requested branch must be new and defaults to `workbench/<sid>-<createdAt>`.
+  The clone has its own objects and refs, not a gitfile pointing into the owner's `.git`; the owner does not grant the worker filesystem access to the source.
+  `managedWorktree` records the worker path, the owner's repository and the import branch.
+  The hub's private metadata also records that this is a worker clone: changing the local agent identity cannot revive an old worker session as the owner or silently convert an owner session.
+  As the hub user, `wb-hub --config /etc/workbench/hub.json fetch-worker SID` imports the session branch before the record is forgotten.
+  Only bundle bytes cross the socket: the exporting Git runs as the repository's owner on each side, so the hub never starts Git in the worker's clone, reads its config as instructions, runs its hooks, or needs a `safe.directory` exception.
+  Import does not check out a tree, update tags, force a branch backward or merge it for the owner.
+  Transfers carry one full branch bundle (at most 2 GiB) and time out after 120 seconds.
+  Once reserved, the owner's branch survives a failed or interrupted transfer; an incomplete clone may need manual cleanup.
+  The hub never recursively removes a worker clone: import the commits to keep and remove the clone as the worker before retrying `acp.remove_worktree`.
+  Committed code is still untrusted; review imported changes before running them.
 - **`task`** is a free-text reference (F-A51): reject Unicode control characters, line and paragraph separators (U+2028 and U+2029), and bidirectional controls (U+061C, U+200E, U+200F, U+202A–U+202E and U+2066–U+2069) anywhere in the input.
   Trim surrounding whitespace, then reject more than `TASK_MAX` UTF-8 bytes; an empty result means no task.
   Invalid input returns `bad_request`, never a truncated value.
@@ -1187,21 +1199,35 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
 
   The hub also refuses to start without `HOME`, `USER` and `LOGNAME` in its environment.
 - **`hosts`** (optional; Nix writes `services.workbench.hosts`) names the other hosts the hub starts agents on: §3.8.5. Absent, `hub.json` is byte for byte what it was, so adding the option restarts no hub.
-- **`git`** (optional) is the absolute path to the executable used only for managed local ACP worktrees.
+- **`git`** (optional) is the absolute path to the executable used for local ACP worktrees and worker clone transfers.
   `services.workbench.gitPackage` defaults to `pkgs.git`; the module links its executable at `/etc/workbench/bin/git` and writes that stable path in `hub.json`.
   Set the option to `null` to omit `git` and disable the capability.
   The hub executes argv directly with no stdin, disables hooks with `-c core.hooksPath=/dev/null`, uses an end-of-options marker before request-derived operands, and bounds command output and runtime.
   Its cleared git environment carries only the hub's own `HOME`, `XDG_CONFIG_HOME` and `PATH` if set, plus `GIT_TERMINAL_PROMPT=0` and `LC_ALL=C`.
-  This is not confinement: the agent retains its ordinary filesystem access, and git uses repository and user configuration, including filters that run on checkout.
+  With the default local identity this is not confinement: the agent retains its ordinary filesystem access, and git uses repository and user configuration, including filters that run on checkout.
   A checkout filter must be resolvable on that `PATH` or named by absolute path; a required filter that cannot run fails the request.
 - **`worktreeRoot`** (optional) sets the directory under which the hub mirrors each main checkout's absolute path for new managed worktrees (§3.2.7).
   `services.workbench.worktreeRoot` defaults to `null`, so the module omits the key and the hub keeps the sibling layout.
   The hub user needs write access; a root inside a checkout is allowed, but the destination must be outside the repository's common git directory.
   With `worktreeRoot` set to `/`, the worktree is placed directly in the main checkout at `<main-root>/<flattened-branch>`; an occupied name returns 409.
   Use a root outside any checkout or ignore it in the containing checkout to keep it out of `git status`.
+- **`agentWorker`** (optional) gives the worker socket and checkout root as absolute paths.
+  `services.workbench.agentUser` defaults to `null`, which omits the key and keeps local ACP agents on the existing three pipes.
+  Setting it creates a separate system account and requires Git.
+  The hub connects to a Unix socket owned by the hub user, mode `0600`; systemd accepts one connection per `workbench-worker@.service` instance.
+  For an agent connection the hub sends one bounded JSON line with the configured agent name, checkout path, session id and environment **names**; it never sends an executable, shell command or environment values.
+  The worker launcher validates and pins the checkout below its root, selects argv and non-secret environment from the module configuration, and sets the identity variables from the worker account.
+  After one launcher acknowledgement the remaining stream carries ACP stdin and stdout; agent stderr goes to the service journal.
+  The reported agent PID is local to the unit's PID namespace; the hub neither signals it nor infers an exit status from EOF.
+  The launcher monitors the peer independently of the adapter; disconnect, including a hub crash, ends the service and its descendants without a cross-user signal from the hub.
+  The worker home and checkouts are writable, the system is read-only, `/home`, `/run/secrets` and `/run/credentials` are inaccessible, and temporary files are private to the unit.
+  The worker has no additional groups, capabilities or trusted Nix privileges.
+  This separates the worker from the owner, not one worker session from another or the worker from the network.
+  Owner terminals and remote (SSH) ACP commands keep their original identity, environment and launch path.
 - **Test configs:** take the shell path from `$BASH`, because the sandbox has no `/run/current-system`. The harness also configures `sh` as a second shell (§7, N-6).
 
 #### 3.7.3 Child environment (built from scratch)
+The list below describes children of the hub; `agentWorker` uses the same configured environment names with worker-local values (§3.7.2).
 1. **Fixed:**
    - `HOME`, `USER`, `LOGNAME` from the hub's environment;
    - `SHELL`: for PTYs, the chosen shell's resolved path; for ACP agents, the resolved path of the configured shell named `bash`, because agent tool runners expect a POSIX shell;
@@ -1725,7 +1751,8 @@ Like the Details disclosure, grouping is local to this page and resets on reload
 
 ## 7. Nix and deploy
 
-The flake builds the workspace with `buildRustPackage` (`cargoLock.lockFile`), builds the JavaScript vendor bundle with `importNpmLock`, and ships a NixOS module with two units (hub and web). The points below are binding.
+The flake builds the workspace with `buildRustPackage` (`cargoLock.lockFile`), builds the JavaScript vendor bundle with `importNpmLock`, and ships a NixOS module with hub and web services.
+The optional local agent identity adds a socket and a service template (§3.7.2).
 
 | # | Design point | File |
 |---|---|---|
@@ -1886,7 +1913,7 @@ N1-N26 are the baseline checks of the UI suite run by `tests/ui.mts`.
 N12-N15 were written anew for M5-F.
 
 ### 9.6 v1 acceptance
-1. `nix flake check` is green on a kvm-capable host: package, debug-tests, clippy, fmt, conformance, security, ui, adapters, module and vm.
+1. `nix flake check` is green on a kvm-capable host: package, debug-tests, clippy, fmt, conformance, security, ui, adapters, module, worker-launcher and vm.
 2. The offline adapter check (`lib.adapterCheck`) is green for the configured agents.
 3. A deployed instance behind the reverse proxy passes its smoke checks, including:
    - a web restart keeps the shell PID;

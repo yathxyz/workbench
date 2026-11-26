@@ -8,6 +8,7 @@
 # restart leaving it alone, and edit.sock refused to another uid (R16.12). Step 11 is `wb` board tools
 # (DESIGN 3.3, fix 4): web.sock's modes, and `wb read_node` from a card without a page (exit 7) and
 # with wbctl's page open on /rpc (the page's text, exit 0).
+# Step 12 switches to the optional agent uid and exercises its real socket, checkout and lifetime.
 { self }:
 let
   secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -103,6 +104,28 @@ in
           services.workbench.logLevel = lib.mkForce "debug";
           systemd.slices.workbench.sliceConfig.MemoryMax = lib.mkForce "500M";
         };
+        specialisation.isolated.configuration.services.workbench =
+          let
+            hooks = pkgs.linkFarm "worker-probe-hooks" [
+              {
+                name = "reference-transaction";
+                path = "${pkgs.coreutils}/bin/false";
+              }
+            ];
+          in
+          {
+            agentUser = "wb-agent";
+            agents.probe = {
+              label = "VM worker probe";
+              package = pkgs.python3;
+              exe = "bin/python3";
+              args = [
+                "-I"
+                "${../tests/worker_probe.py}"
+                "${hooks}"
+              ];
+            };
+          };
 
         environment.systemPackages = [
           pkgs.git
@@ -137,6 +160,7 @@ in
   testScript =
     { nodes, ... }:
     ''
+      import errno
       import json
       import re
       import shlex
@@ -483,5 +507,99 @@ in
           lines = [json.loads(line) for line in proxy.succeed("cat /tmp/page.out").splitlines()]
           assert {"cmd": {"tool": "read_node", "input": {"path": "x"}}} in lines, lines
           assert lines[-1] == {"done": True, "answered": 1, "closed": None}, lines
+
+      with subtest("12: isolated local ACP, private clone, owner fetch and worker disconnect"):
+          # The current system is now the changed specialisation; both are children of the booted system.
+          wb.succeed("/run/booted-system/specialisation/isolated/bin/switch-to-configuration test")
+          wb.succeed("systemctl restart workbench-hub")
+          wb.wait_for_unit("workbench-hub.service")
+          wb.wait_for_unit("workbench-worker.socket")
+          wb.wait_for_unit("workbench-web.service")
+          wb.succeed("test -S /run/workbench-worker/agent.sock")
+          assert wb.succeed("stat -c '%U %a' /run/workbench-worker/agent.sock").strip() == "alice 600"
+
+          def owner(cmd):
+              return wb.succeed(f"runuser -u alice -- {cmd}").strip()
+
+          owner_uid, worker_uid = int(owner("id -u")), int(wb.succeed("id -u wb-agent"))
+          assert owner_uid != worker_uid
+          # Make the file's mode, not an unsearchable home directory, the DAC boundary.
+          wb.succeed("echo owner-only >/run/worker-probe-owner-file && chown alice /run/worker-probe-owner-file && chmod 0400 /run/worker-probe-owner-file")
+          assert owner("cat /run/worker-probe-owner-file") == "owner-only"
+          assert wb.succeed("stat -c '%U %a' /run/workbench-hub").strip() == "alice 700"
+          owner(f"wbctl --hub {HUB_SOCK} sessions")  # Live listener, not a stale socket inode.
+          wb.succeed("install -d -m 0755 /run/secrets && echo mount-canary >/run/secrets/worker-probe && chmod 0444 /run/secrets/worker-probe")
+          assert wb.succeed("runuser -u wb-agent -- cat /run/secrets/worker-probe").strip() == "mount-canary"
+
+          # PTYs still run as the owner even with agentUser enabled.
+          r = wbctl("pty-open iso_owner --spawn --send 'echo OWNER=$(id -u)' --expect 'OWNER=[0-9]+'", retry=True)
+          assert int(first(r"OWNER=([0-9]+)", r["output"])) == owner_uid, r
+          repo = f"{HOME}/work/private-source"
+          owner(f"install -d -m 0700 {repo}")
+
+          def owner_git(args):
+              return owner(f"git -C {repo} {args}")
+
+          owner_git("init -b main")
+          for msg in ["seed", "advanced"]:
+              owner_git(f"-c user.name=VM -c user.email=owner@example.invalid commit --allow-empty -m {msg}")
+              if msg == "seed":
+                  owner_git("branch chosen-base")
+          base, owner_head = owner_git("rev-parse chosen-base"), owner_git("rev-parse HEAD")
+          assert base != owner_head
+
+          def live_instance(report):
+              # The worker has its own PID namespace. Map both reported PIDs to guest PIDs
+              # through the actual Accept=yes instance, rather than probing /proc/<inner-pid>.
+              units = wb.succeed("systemctl list-units --state=active --type=service --full --plain --no-legend 'workbench-worker@*.service'").splitlines()
+              assert len(units) == 1, units
+              unit = shlex.quote(units[0].split()[0])
+              group = wb.succeed(f"systemctl show -p ControlGroup --value {unit}").strip()
+              assert group.startswith("/") and group != "/", group
+              cg = shlex.quote(f"/sys/fs/cgroup{group}")
+              rows = wb.succeed(f"for p in $(cat {cg}/cgroup.procs); do awk -v p=$p '/^NSpid:/ {{print $NF, p}}' /proc/$p/status; done")
+              host_pids = {int(ns): int(host) for ns, host in (line.split() for line in rows.splitlines())}
+              pid, stray = host_pids[report["pid"]], host_pids[report["stray"]]
+              wb.succeed(f"grep -aq worker_probe.py /proc/{pid}/cmdline && grep -Fxq sleep /proc/{stray}/comm")
+              return unit, cg, pid, stray
+
+          def wait_reaped(instance):
+              unit, cg, pid, stray = instance
+              wb.wait_until_succeeds(f"! systemctl is-active --quiet {unit} && (test ! -e {cg}/cgroup.events || grep -Fxq 'populated 0' {cg}/cgroup.events)", timeout=30)
+              wb.fail(f"kill -0 {pid}")
+              wb.fail(f"kill -0 {stray}")
+
+          sid, branch = "iso_probe", "feature/worker"
+          req = {"t": "acp.open", "rid": 1, "sid": sid, "since": 0, "spawn": {
+              "agent": "probe", "cwd": repo, "worktree": {"branch": branch, "base": "chosen-base"}}}
+          owner(f"wbctl --hub {HUB_SOCK} raw {shlex.quote(json.dumps(req))}")
+          wb.wait_until_succeeds(f"grep -Eq '\"e\"[[:space:]]*:[[:space:]]*\"session\"' {ACP_DIR}/{sid}.jsonl", timeout=30)
+          report = json.loads(wbctl(f"acp-attach {sid} --prompt inspect")["text"])
+          assert (report["uid"], report["home"], report["sid"]) == (worker_uid, "/var/lib/wb-agent", sid), report
+          assert report["ownerFile"] == errno.EACCES and report["socket"] == errno.EACCES, report
+          assert report["secret"] in (errno.EACCES, errno.ENOENT), report
+          assert report["branch"] == branch and report["base"] == base and report["hookRefused"], report
+          clone = report["cwd"]
+          assert clone.startswith("/var/lib/wb-agent/work/"), clone
+          clone = shlex.quote(clone)
+          assert wb.succeed(f"test -d {clone}/.git && stat -c %U {clone} {clone}/.git").split() == ["wb-agent", "wb-agent"]
+          wb.fail(f"runuser -u alice -- cat {clone}/.git/config")
+          instance = live_instance(report)
+          wbctl(f"acp-kill {sid}")
+          wait_reaped(instance)
+
+          # The private clone's blocking reference-transaction hook operates there, never in Alice's repo.
+          owner(f"wb-hub --config /etc/workbench/hub.json fetch-worker {sid}")
+          assert owner_git(f"rev-parse refs/heads/{branch}") == report["commit"]
+          assert owner_git(f"rev-parse {branch}^") == base
+          assert owner_git(f"show {branch}:from-worker") == "committed by the isolated ACP adapter"
+          assert owner_git("symbolic-ref --short HEAD") == "main" and owner_git("rev-parse HEAD") == owner_head
+
+          # A lost hub cannot send a shutdown message. Dropping its connection must suffice even
+          # for an adapter that stays alive after EOF and a descendant in another process group.
+          crash = json.loads(wbctl(f"acp-new iso_loss --agent probe --cwd {repo} --prompt inspect")["text"])
+          instance = live_instance(crash)
+          wb.succeed("systemctl kill --kill-whom=main --signal=SIGKILL workbench-hub.service")
+          wait_reaped(instance)
     '';
 }

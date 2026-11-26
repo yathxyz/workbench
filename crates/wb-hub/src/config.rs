@@ -45,6 +45,15 @@ pub struct Config {
     pub git: Option<PathBuf>,
     /// Mirror new managed worktrees here instead of beside the main checkout.
     pub worktree_root: Option<PathBuf>,
+    /// Present only when a separate systemd service owns local ACP sessions.
+    pub agent_worker: Option<AgentWorker>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentWorker {
+    pub socket: PathBuf,
+    pub root: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +163,25 @@ impl Config {
             bail!(
                 "worktreeRoot must be an absolute path without NUL or components named ., .. or .git"
             );
+        }
+        if let Some(worker) = &self.agent_worker {
+            if self.git.is_none() {
+                bail!("agentWorker requires git for worker checkouts");
+            }
+            if !worker.socket.to_str().is_some_and(absolute)
+                || worker.socket.as_os_str().len() >= SUN_PATH
+            {
+                bail!("agentWorker.socket must be an absolute Unix socket path");
+            }
+            if !worker.root.to_str().is_some_and(|s| {
+                absolute(s)
+                    && s != "/"
+                    && s[1..]
+                        .split('/')
+                        .all(|part| !matches!(part, "" | "." | ".."))
+            }) {
+                bail!("agentWorker.root must be a normalized absolute directory below /");
+            }
         }
         let mut seen = BTreeSet::new();
         for shell in &self.shells {

@@ -569,19 +569,20 @@ impl WorktreeRequest {
         de.deserialize_map(Object).map(Some)
     }
 
+    pub fn valid_name(s: &str) -> bool {
+        (1..=crate::limits::GIT_NAME_MAX).contains(&s.len())
+            && s != "HEAD"
+            && !s.starts_with('-')
+            && !s.contains("..")
+            && s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"._/-".contains(&c))
+            && s.split('/')
+                .all(|p| !p.is_empty() && !p.starts_with('.') && !p.ends_with(".lock"))
+    }
+
     /// Both names use the same restricted grammar before they ever reach git.
     pub fn valid(&self) -> bool {
-        fn valid_name(s: &str) -> bool {
-            (1..=crate::limits::GIT_NAME_MAX).contains(&s.len())
-                && s != "HEAD"
-                && !s.starts_with('-')
-                && !s.contains("..")
-                && s.bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"._/-".contains(&c))
-                && s.split('/')
-                    .all(|p| !p.is_empty() && !p.starts_with('.') && !p.ends_with(".lock"))
-        }
-        valid_name(&self.branch) && self.base.as_deref().is_none_or(valid_name)
+        Self::valid_name(&self.branch) && self.base.as_deref().is_none_or(Self::valid_name)
     }
 }
 

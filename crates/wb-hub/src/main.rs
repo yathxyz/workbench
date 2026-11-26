@@ -108,14 +108,17 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let [flag, path] = args.as_slice() else {
-        eprintln!("usage: wb-hub --config PATH");
-        return ExitCode::from(2);
+    let usage = "usage: wb-hub --config PATH [fetch-worker SID]";
+    let (path, fetch_sid) = match args.as_slice() {
+        [flag, path] if flag == "--config" => (Path::new(path), None),
+        [flag, path, command, sid] if flag == "--config" && command == "fetch-worker" => {
+            (Path::new(path), Some(sid))
+        }
+        _ => {
+            eprintln!("{usage}");
+            return ExitCode::from(2);
+        }
     };
-    if flag != "--config" {
-        eprintln!("usage: wb-hub --config PATH");
-        return ExitCode::from(2);
-    }
     let level = std::env::var("RUST_LOG")
         .ok()
         .and_then(|l| l.parse::<LevelFilter>().ok())
@@ -126,8 +129,10 @@ fn main() -> ExitCode {
         .init();
     match pty::spawn::reset_sigchld()
         .context("resetting SIGCHLD disposition and mask")
-        .and_then(|()| run(PathBuf::from(path)))
-    {
+        .and_then(|()| match fetch_sid {
+            Some(sid) => acp::fetch_worker(path, sid.to_str().context("invalid session id")?),
+            None => run(path.to_owned()),
+        }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("{e:#}");

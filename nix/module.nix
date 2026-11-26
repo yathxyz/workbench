@@ -20,31 +20,49 @@ let
   pinnedRelease = self.packages.${system}.release;
   userCfg = config.users.users.${cfg.user};
   home = userCfg.home;
+  worker = cfg.agentUser;
+  workerEnabled = worker != null;
+  distinctWorker = workerEnabled && worker != "root" && worker != cfg.user;
+  workerHome = "/var/lib/${worker}";
+  workerRoot = "${workerHome}/work";
+  workerSocket = "/run/workbench-worker/agent.sock";
+  workerSources = lib.fileset.toSource {
+    root = ./.;
+    fileset = lib.fileset.unions [
+      ./worker.py
+      ./worker_checkout.py
+    ];
+  };
   json = pkgs.formats.json { };
 
   # The non-secret variables a NixOS login would provide, as literal stable paths.
   # __NIXOS_SET_ENVIRONMENT_DONE stops /etc/bashrc and /etc/profile from sourcing
   # /etc/set-environment, which may export secrets from environment.sessionVariables.
-  profiles = [
-    "${home}/.nix-profile"
-    "${home}/.local/state/nix/profile"
-    "/etc/profiles/per-user/${cfg.user}"
-    "/nix/var/nix/profiles/default"
-    "/run/current-system/sw"
-  ];
-  under = suffix: lib.concatMapStringsSep ":" (p: "${p}/${suffix}") profiles;
-  childSetEnv = {
-    __NIXOS_SET_ENVIRONMENT_DONE = "1";
-    PATH = "/run/wrappers/bin:" + under "bin";
-    NIX_PROFILES = lib.concatStringsSep " " (lib.reverseList profiles);
-    TERMINFO_DIRS = under "share/terminfo";
-    XDG_CONFIG_DIRS = "/etc/xdg:" + under "etc/xdg";
-    XDG_DATA_DIRS = under "share";
-    LOCALE_ARCHIVE = "/run/current-system/sw/lib/locale/locale-archive";
-    TZDIR = "/etc/zoneinfo";
-    NIX_PATH = lib.concatStringsSep ":" config.nix.nixPath;
-    WB_SOCKET = "/run/workbench-web/web.sock";
-  };
+  childEnv =
+    user: userHome:
+    let
+      profiles = [
+        "${userHome}/.nix-profile"
+        "${userHome}/.local/state/nix/profile"
+        "/etc/profiles/per-user/${user}"
+        "/nix/var/nix/profiles/default"
+        "/run/current-system/sw"
+      ];
+      under = suffix: lib.concatMapStringsSep ":" (p: "${p}/${suffix}") profiles;
+    in
+    {
+      __NIXOS_SET_ENVIRONMENT_DONE = "1";
+      PATH = "/run/wrappers/bin:" + under "bin";
+      NIX_PROFILES = lib.concatStringsSep " " (lib.reverseList profiles);
+      TERMINFO_DIRS = under "share/terminfo";
+      XDG_CONFIG_DIRS = "/etc/xdg:" + under "etc/xdg";
+      XDG_DATA_DIRS = under "share";
+      LOCALE_ARCHIVE = "/run/current-system/sw/lib/locale/locale-archive";
+      TZDIR = "/etc/zoneinfo";
+      NIX_PATH = lib.concatStringsSep ":" config.nix.nixPath;
+      WB_SOCKET = "/run/workbench-web/web.sock";
+    };
+  childSetEnv = childEnv cfg.user home;
 
   # wb-hub sets these in every PTY child itself (DESIGN 3.7.3 step 1) and refuses them in
   # child.passEnv and child.setEnv.
@@ -69,6 +87,18 @@ let
   // cfg.environment;
 
   agentArgv0 = name: a: if a.package != null then "/etc/workbench/agents/${name}/${a.exe}" else a.exe;
+  agentCommands = lib.mapAttrs (name: a: {
+    inherit (a) env;
+    argv = [ (agentArgv0 name a) ] ++ a.args;
+  }) cfg.agents;
+
+  workerJson = json.generate "workbench-worker.json" {
+    root = workerRoot;
+    git = "/etc/workbench/bin/git";
+    agents = agentCommands;
+    env = hubEnv // childEnv worker workerHome;
+    shell = "/run/current-system/sw/bin/bash";
+  };
 
   allShellPaths = lib.concatMap (s: s.paths) (lib.attrValues cfg.shells);
 
@@ -87,10 +117,13 @@ let
         passEnv = lib.attrNames hubEnv;
         setEnv = childSetEnv;
       };
-      agents = lib.mapAttrs (name: a: {
-        inherit (a) label env;
-        argv = [ (agentArgv0 name a) ] ++ a.args;
-      }) cfg.agents;
+      agents = lib.mapAttrs (name: a: agentCommands.${name} // { inherit (a) label; }) cfg.agents;
+    }
+    // lib.optionalAttrs workerEnabled {
+      agentWorker = {
+        root = workerRoot;
+        socket = workerSocket;
+      };
     }
     // lib.optionalAttrs (cfg.gitPackage != null) {
       git = "/etc/workbench/bin/git";
@@ -224,7 +257,7 @@ in
       type = types.nullOr types.package;
       default = pkgs.git;
       defaultText = lib.literalExpression "pkgs.git";
-      description = "Git used by the hub to create and remove local ACP worktrees; null disables this capability.";
+      description = "Git for local ACP worktrees and isolated clones. Null disables managed worktrees and is incompatible with agentUser.";
     };
 
     worktreeRoot = mkOption {
@@ -234,7 +267,7 @@ in
       description = ''
         Absolute runtime directory under which the hub mirrors main checkout paths for new managed
         local ACP worktrees. It must be writable by the service user. When null, the hub places
-        worktrees beside the main checkout instead.
+        worktrees beside the main checkout instead. This option does not apply to agentUser's clones.
       '';
     };
 
@@ -260,7 +293,19 @@ in
 
     user = mkOption {
       type = types.str;
-      description = "The user both units, every shell and every agent run as. The home directory comes from users.users.<user>.home.";
+      description = "User for the hub, web, owner terminals and SSH launches. Local agents also run as this user unless agentUser is set. The home directory comes from users.users.<user>.home.";
+    };
+
+    agentUser = mkOption {
+      type = types.nullOr (types.strMatching "[a-z_][a-z0-9_-]{0,30}");
+      default = null;
+      example = "wb-agent";
+      description = ''
+        Optional dedicated system user and group for local ACP agents. Use a new name, distinct
+        from the owner. The module creates a private home in /var/lib and starts each local agent
+        over a private socket in its own systemd unit. Its checkout is a worker-owned clone, not
+        a worktree in the owner's repository. Requires gitPackage. PTYs and SSH launches are unchanged.
+      '';
     };
 
     host = mkOption {
@@ -603,6 +648,58 @@ in
   config = mkIf cfg.enable {
     assertions = [
       {
+        assertion = !workerEnabled || distinctWorker;
+        message = "services.workbench.agentUser must differ from root and services.workbench.user.";
+      }
+      {
+        assertion = !workerEnabled || cfg.gitPackage != null;
+        message = "services.workbench.agentUser requires gitPackage for its private clones.";
+      }
+      {
+        assertion =
+          !distinctWorker
+          || (
+            let
+              u = config.users.users.${worker};
+              g = config.users.groups.${worker};
+            in
+            u.name == worker
+            && u.isSystemUser
+            && !u.isNormalUser
+            && u.createHome
+            && u.home == workerHome
+            && !(lib.hasPrefix "${lib.removeSuffix "/" (toString home)}/" "${workerHome}/")
+            && !(lib.hasPrefix "${workerHome}/" "${home}/")
+            && lib.elem u.homeMode [ "700" "0700" ]
+            && u.uid != 0
+            && (u.uid == null || u.uid != userCfg.uid)
+            && u.group == worker
+            && u.extraGroups == [ ]
+            && lib.all (group: !lib.elem worker group.members) (lib.attrValues config.users.groups)
+            && g.name == worker
+            && !builtins.hasAttr worker config.ids.gids
+            && (g.gid == null || !(lib.elem g.gid (lib.attrValues config.ids.gids)))
+            && g.members == [ ]
+            && lib.all (other: other.name == worker || other.group != worker) (lib.attrValues config.users.users)
+          );
+        message = "services.workbench.agentUser requires its own unprivileged account and group, with no supplementary groups.";
+      }
+      {
+        assertion =
+          let
+            # extra-trusted-users is free-form in nix.settings, so it may also be a
+            # single whitespace-separated string.
+            entries =
+              (config.nix.settings.trusted-users or [ ])
+              ++ lib.toList (config.nix.settings.extra-trusted-users or [ ]);
+            names = lib.filter builtins.isString (
+              builtins.split "[[:space:]]+" (lib.concatStringsSep " " entries)
+            );
+          in
+          !distinctWorker || lib.intersectLists [ worker "@${worker}" "*" ] names == [ ];
+        message = "services.workbench.agentUser must not be a trusted Nix user, directly or through its group.";
+      }
+      {
         assertion = !config.networking.nftables.enable;
         message = "services.workbench: the source restriction uses networking.firewall.extraCommands (iptables); port it before enabling networking.nftables.";
       }
@@ -720,9 +817,24 @@ in
       }
     ];
 
+    users.users = lib.optionalAttrs distinctWorker {
+      ${worker} = {
+        isSystemUser = true;
+        description = "Workbench local ACP worker";
+        group = worker;
+        home = workerHome;
+        createHome = true;
+        homeMode = "700";
+      };
+    };
+    users.groups = lib.optionalAttrs distinctWorker { ${worker} = { }; };
+
     environment.etc = {
       "workbench/hub.json".source = hubJson;
       "workbench/web.json".source = webJson;
+    }
+    // lib.optionalAttrs workerEnabled {
+      "workbench/worker.json".source = workerJson;
     }
     // lib.optionalAttrs (cfg.gitPackage != null) {
       "workbench/bin/git".source = lib.getExe' cfg.gitPackage "git";
@@ -738,7 +850,8 @@ in
     # existing parent's mode alone.
     systemd.tmpfiles.rules =
       map (d: "d ${d} - ${cfg.user} ${userCfg.group} -") pinnedUserPaths
-      ++ map (d: "d ${d} 0700 ${cfg.user} ${userCfg.group} -") readOnlyUserPaths;
+      ++ map (d: "d ${d} 0700 ${cfg.user} ${userCfg.group} -") readOnlyUserPaths
+      ++ lib.optional workerEnabled "d ${workerRoot} 0700 ${worker} ${worker} -";
 
     # R13.5: only shells inside Workbench (the hub sets WB_SESSION) get the editor variables.
     environment.interactiveShellInit = mkIf (edit.socket != null && edit.setEditor) ''
@@ -783,9 +896,68 @@ in
       };
     };
 
+    systemd.sockets.workbench-worker = mkIf workerEnabled {
+      description = "Workbench local agent worker socket";
+      wantedBy = [ "sockets.target" ];
+      socketConfig = {
+        ListenStream = workerSocket;
+        Accept = true;
+        # systemd owns the parent; only the hub UID (not everyone in its primary group) may connect.
+        DirectoryMode = "0755";
+        SocketUser = cfg.user;
+        SocketMode = "0600";
+        RemoveOnStop = true;
+      };
+    };
+
+    systemd.services."workbench-worker@" = mkIf workerEnabled {
+      description = "Workbench local agent worker";
+      # A rejected request must not leave a permanently failed instance in PID 1.
+      unitConfig.CollectMode = "inactive-or-failed";
+      serviceConfig = {
+        Type = "exec";
+        ExecStart = "${pkgs.python3}/bin/python3 -I ${workerSources}/worker.py /etc/workbench/worker.json";
+        StandardInput = "socket";
+        StandardOutput = "socket";
+        StandardError = "journal";
+        User = worker;
+        Group = worker;
+        Slice = "workbench.slice";
+        UMask = "0077";
+        KillMode = "control-group";
+        TimeoutStopSec = 2;
+        # The launcher is PID 1 in a namespace per connection: neither this agent nor
+        # another instance sharing its UID can SIGSTOP the hangup monitor.
+        PrivatePIDs = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
+        NoNewPrivileges = true;
+        ProtectHome = true;
+        ProtectSystem = "strict";
+        # Pin the home, whose parent is root-owned. Never resolve the worker-writable
+        # child "work" as root; the launcher and checkout code open it without following links.
+        ReadWritePaths = [ workerHome ];
+        InaccessiblePaths = [
+          "-${home}"
+          "-/run/secrets"
+          "-/run/credentials"
+        ];
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        RestrictSUIDSGID = true;
+        RestrictRealtime = true;
+        LockPersonality = true;
+        CapabilityBoundingSet = "";
+      };
+    };
+
     systemd.services.workbench-hub = {
       description = "Workbench hub (PTYs and ACP agents)";
       wantedBy = [ "multi-user.target" ];
+      wants = lib.optional workerEnabled "workbench-worker.socket";
+      after = lib.optional workerEnabled "workbench-worker.socket";
       # A deploy never restarts the hub: that would end every session.
       restartIfChanged = false;
       environment = hubEnv // {

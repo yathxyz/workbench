@@ -1,5 +1,7 @@
 //! Explicitly managed local git worktrees. Only a killed, unpublished add can force-remove.
 
+pub(super) mod worker;
+
 use std::env;
 use std::ffi::OsStr;
 use std::fs::Metadata;
@@ -159,14 +161,7 @@ impl RunError {
     }
 }
 
-async fn run_with<T>(
-    git: Git<'_>,
-    cwd: &Path,
-    args: &[&str],
-    limit: Duration,
-    cancel: Option<&mut oneshot::Receiver<()>>,
-    read_stdout: impl AsyncFnOnce(ChildStdout) -> io::Result<T>,
-) -> Result<Output<T>, RunError> {
+fn command(git: Git<'_>, cwd: &Path) -> Command {
     let mut cmd = Command::new(git.program);
     cmd.current_dir(cwd)
         .args(["--no-lazy-fetch", "-c", "core.hooksPath=/dev/null"])
@@ -183,7 +178,6 @@ async fn run_with<T>(
             "-c",
             "core.fsmonitor=false",
         ])
-        .args(args)
         .env_clear()
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("LC_ALL", "C")
@@ -196,6 +190,29 @@ async fn run_with<T>(
             cmd.env(key, value);
         }
     }
+    cmd
+}
+
+async fn run_with<T>(
+    git: Git<'_>,
+    cwd: &Path,
+    args: &[&str],
+    limit: Duration,
+    cancel: Option<&mut oneshot::Receiver<()>>,
+    read_stdout: impl AsyncFnOnce(ChildStdout) -> io::Result<T>,
+) -> Result<Output<T>, RunError> {
+    execute(git, command(git, cwd), args, limit, cancel, read_stdout).await
+}
+
+async fn execute<T>(
+    git: Git<'_>,
+    mut cmd: Command,
+    args: &[&str],
+    limit: Duration,
+    cancel: Option<&mut oneshot::Receiver<()>>,
+    read_stdout: impl AsyncFnOnce(ChildStdout) -> io::Result<T>,
+) -> Result<Output<T>, RunError> {
+    cmd.args(args);
     let mut helper = GitChild {
         child: Some(cmd.spawn().map_err(RunError::Io)?),
         reaper: git.reaper,
