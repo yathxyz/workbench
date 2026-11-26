@@ -716,6 +716,10 @@ pub struct AcpFacts {
     pub config_options: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_worktree: Option<ManagedWorktree>,
+    /// Whether the cwd is a worker checkout, even after its removal. Older hubs
+    /// omit this field; clients cannot assume those ACP paths belong to the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_clone: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
     /// Current permission rules; an empty policy is represented by absence.

@@ -53,6 +53,7 @@ fn summary(sid: &str, head_seq: u64) -> Summary {
             mode_id: Some("default".into()),
             config_options: None,
             managed_worktree: None,
+            worker_clone: Some(false),
             task: None,
             policy: None,
         }),

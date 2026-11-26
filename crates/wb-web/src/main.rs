@@ -96,33 +96,51 @@ pub struct App {
 pub type AppState = Arc<App>;
 
 impl App {
-    /// Web-only enrichment; a remote host's cwd must never be read locally.
+    /// Local worker checkouts supply only the facts recorded by the hub.
     pub fn session_summary(&self, summary: &Summary) -> Value {
+        use git_metadata::Source;
+
         let mut value = hub::with_state(summary);
-        let enrich = |metadata: &git_metadata::Metadata| {
+        fn basename(path: &str) -> Option<&str> {
+            Path::new(path).file_name()?.to_str()
+        }
+        let enrich = |repo_root: Option<&str>,
+                      repo: Option<&str>,
+                      worktree: Option<&str>,
+                      branch: Option<&str>,
+                      project_root: Option<&str>| {
             for (key, field) in [
-                ("repoRoot", &metadata.repo_root),
-                ("repo", &metadata.repo),
-                ("worktree", &metadata.worktree),
-                ("branch", &metadata.branch),
-                ("projectRoot", &metadata.project_root),
+                ("repoRoot", repo_root),
+                ("repo", repo),
+                ("worktree", worktree),
+                ("branch", branch),
+                ("projectRoot", project_root),
             ] {
-                value[key] = serde_json::to_value(field).unwrap_or_default();
+                value[key] = field.into();
             }
-            value["project"] = metadata
-                .project_root
-                .as_deref()
-                .or(Some(summary.cwd.as_str()))
-                .and_then(|path| Path::new(path).file_name())
-                .and_then(|name| name.to_str())
+            value["project"] = basename(project_root.unwrap_or(&summary.cwd))
                 .unwrap_or("(no cwd)")
                 .into();
             value
         };
-        if summary.host == self.cfg.host {
-            self.git_metadata.with(&summary.cwd, enrich)
-        } else {
-            enrich(&git_metadata::Metadata::default())
+        match Source::for_session(summary, &self.cfg.host) {
+            Source::Cwd(cwd) => self.git_metadata.with(cwd, |m| {
+                enrich(
+                    m.repo_root.as_deref(),
+                    m.repo.as_deref(),
+                    m.worktree.as_deref(),
+                    m.branch.as_deref(),
+                    m.project_root.as_deref(),
+                )
+            }),
+            Source::Recorded(wt) => enrich(
+                Some(&wt.main_root),
+                basename(&wt.main_root),
+                None, // An independent clone, not a linked worktree.
+                Some(&wt.branch),
+                Some(&wt.path),
+            ),
+            Source::None => enrich(None, None, None, None, None),
         }
     }
 

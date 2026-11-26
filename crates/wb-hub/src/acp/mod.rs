@@ -1694,6 +1694,7 @@ impl Acp {
                 policy: facts.policy.clone(),
                 config_options: facts.config_options.clone(),
                 managed_worktree: self.meta.managed_worktree.clone(),
+                worker_clone: Some(self.meta.worker_clone),
                 task: facts.task.clone(),
             }),
         };
@@ -4078,6 +4079,8 @@ mod tests {
             assert!(!acp.snapshot(0).0.acp.unwrap().revivable);
             assert_eq!(revive(&mut acp).await["code"], "not_revivable");
             assert!(acp.proc.is_none());
+            acp.meta.managed_worktree = None;
+            assert_eq!(acp.snapshot(0).0.acp.unwrap().worker_clone, Some(true));
         }
 
         #[tokio::test]

@@ -157,6 +157,7 @@ mod tests {
             mode_id: None,
             config_options: None,
             managed_worktree: None,
+            worker_clone: Some(false),
             task: None,
             policy: None,
         };

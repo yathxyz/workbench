@@ -178,6 +178,7 @@ fn summary(sid: &str, host: &str) -> Summary {
             mode_id: Some("default".into()),
             config_options: None,
             managed_worktree: None,
+            worker_clone: Some(false),
             task: None,
             policy: None,
         }),
@@ -422,6 +423,76 @@ async fn info_and_sessions_are_the_hubs() {
     assert_eq!(
         res.json(),
         json!({"error": "a1 is not a pty", "code": "kind_mismatch"})
+    );
+}
+
+#[tokio::test]
+async fn worker_git_metadata_uses_only_the_hubs_record() {
+    use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
+    use std::{fs, os::unix::fs::symlink, time::Duration};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let clone = tmp.path().join("worker");
+    fs::create_dir_all(clone.join(".git")).unwrap();
+    let private = tmp.path().join("owner-only");
+    fs::write(&private, "ref: refs/heads/secret\n").unwrap();
+    symlink(&private, clone.join(".git/HEAD")).unwrap();
+    let watch = inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC).unwrap();
+    inotify::add_watch(&watch, &private, WatchFlags::OPEN).unwrap();
+
+    let mut worker = summary("worker", "testhost");
+    worker.cwd = clone.to_str().unwrap().to_owned();
+    let facts = worker.acp.as_mut().unwrap();
+    facts.worker_clone = Some(true);
+    facts.managed_worktree = Some(ManagedWorktree {
+        path: worker.cwd.clone(),
+        main_root: "/owner/project".into(),
+        branch: "topic".into(),
+    });
+
+    // A PTY populates the cache. Even without a checkout record a worker with
+    // that exact cwd must not borrow the PTY's cached branch.
+    let owner = tmp.path().join("owner");
+    fs::create_dir_all(owner.join(".git")).unwrap();
+    fs::write(owner.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let mut pty = pty_summary("pty", EPOCH, true, false);
+    pty.cwd = owner.to_str().unwrap().to_owned();
+    let mut removed = worker.clone();
+    removed.sid = "removed".into();
+    removed.cwd = pty.cwd.clone();
+    removed.acp.as_mut().unwrap().managed_worktree = None;
+    let mut legacy = removed.clone();
+    legacy.sid = "legacy".into();
+    legacy.acp.as_mut().unwrap().worker_clone = None;
+    let hub = FakeHub::start();
+    hub.set_sessions(vec![worker, removed, legacy, pty]);
+    let api = Api::without_hub(hub).await;
+    api.web.wait_hub("up").await;
+    timeout(WAIT, async {
+        while api.get("/v1/sessions/pty").await.json()["branch"] != "main" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("local discovery did not run");
+    let active = api.get("/v1/sessions/worker").await.json();
+    assert_eq!(active["repoRoot"], "/owner/project");
+    assert_eq!(active["repo"], "project");
+    assert_eq!(active["branch"], "topic");
+    assert_eq!(active["projectRoot"], clone.to_str().unwrap());
+    assert_eq!(active["worktree"], Value::Null);
+    let removed = api.get("/v1/sessions/removed").await.json();
+    assert_eq!(removed["acp"]["workerClone"], true);
+    for field in ["repoRoot", "repo", "branch", "projectRoot", "worktree"] {
+        assert_eq!(removed[field], Value::Null, "{field}");
+    }
+    let legacy = api.get("/v1/sessions/legacy").await.json();
+    assert!(legacy["acp"].get("workerClone").is_none());
+    assert_eq!(legacy["branch"], Value::Null);
+    assert_eq!(
+        rustix::io::read(&watch, &mut [0u8; 128][..]),
+        Err(rustix::io::Errno::AGAIN),
+        "the web process opened a worker-controlled symlink"
     );
 }
 

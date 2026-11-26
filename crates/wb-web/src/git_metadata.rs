@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use rustix::fs::{Mode, OFlags};
 use serde::Serialize;
+use wb_proto::hub::{Kind, ManagedWorktree, Summary};
 
 pub const TTL: Duration = Duration::from_secs(3);
 const READ_MAX: u64 = 8 << 10;
@@ -23,6 +24,30 @@ pub struct Metadata {
     pub worktree: Option<String>,
     pub branch: Option<String>,
     pub project_root: Option<String>,
+}
+
+/// Only owner sessions on this host may submit a cwd for discovery or read its cache entry.
+pub enum Source<'a> {
+    Cwd(&'a str),
+    Recorded(&'a ManagedWorktree),
+    None,
+}
+
+impl<'a> Source<'a> {
+    pub fn for_session(session: &'a Summary, host: &str) -> Self {
+        if session.host != host {
+            return Self::None;
+        }
+        match (session.kind, session.acp.as_ref()) {
+            (Kind::Pty, None) => Self::Cwd(&session.cwd),
+            (Kind::Acp, Some(acp)) if acp.worker_clone == Some(false) => Self::Cwd(&session.cwd),
+            (Kind::Acp, Some(acp)) => acp
+                .managed_worktree
+                .as_ref()
+                .map_or(Self::None, Self::Recorded),
+            _ => Self::None,
+        }
+    }
 }
 
 struct Entry {
@@ -105,9 +130,11 @@ pub async fn refresh(app: crate::AppState) {
         tokio::select! {
             () = app.stopped() => return,
             _ = tick.tick() => {
-                for session in app.hub.sessions().into_iter().filter(|s| s.host == app.cfg.host) {
-                    if app.git_metadata.start(&session.cwd) {
-                        let cwd = session.cwd.clone();
+                for session in app.hub.sessions() {
+                    if let Source::Cwd(cwd) = Source::for_session(&session, &app.cfg.host)
+                        && app.git_metadata.start(cwd)
+                    {
+                        let cwd = cwd.to_owned();
                         jobs.spawn_blocking(move || {
                             let metadata = derive(Path::new(&cwd)).unwrap_or_default();
                             (cwd, metadata)
@@ -118,7 +145,9 @@ pub async fn refresh(app: crate::AppState) {
             Some(Ok((cwd, metadata))) = jobs.join_next(), if !jobs.is_empty() => {
                 if app.git_metadata.finish(&cwd, metadata) {
                     let state = app.hub.state();
-                    for session in state.sessions.values().filter(|s| s.host == app.cfg.host && s.cwd == cwd) {
+                    for session in state.sessions.values().filter(|s| {
+                        matches!(Source::for_session(s, &app.cfg.host), Source::Cwd(path) if path == cwd)
+                    }) {
                         let _ = app.feed.send(crate::FeedMsg::Session(session.clone()));
                     }
                 }
