@@ -524,12 +524,13 @@ in
           owner_uid, worker_uid = int(owner("id -u")), int(wb.succeed("id -u wb-agent"))
           assert owner_uid != worker_uid
           # Make the file's mode, not an unsearchable home directory, the DAC boundary.
-          wb.succeed("echo owner-only >/run/worker-probe-owner-file && chown alice /run/worker-probe-owner-file && chmod 0400 /run/worker-probe-owner-file")
-          assert owner("cat /run/worker-probe-owner-file") == "owner-only"
+          wb.succeed("echo owner-only >/var/lib/wb-owner-canary && chown alice /var/lib/wb-owner-canary && chmod 0400 /var/lib/wb-owner-canary")
+          assert owner("cat /var/lib/wb-owner-canary") == "owner-only"
           assert wb.succeed("stat -c '%U %a' /run/workbench-hub").strip() == "alice 700"
-          owner(f"wbctl --hub {HUB_SOCK} sessions")  # Live listener, not a stale socket inode.
-          wb.succeed("install -d -m 0755 /run/secrets && echo mount-canary >/run/secrets/worker-probe && chmod 0444 /run/secrets/worker-probe")
-          assert wb.succeed("runuser -u wb-agent -- cat /run/secrets/worker-probe").strip() == "mount-canary"
+          # Expose the real owner listener outside the masked /run to exercise DAC too.
+          wb.succeed("mkdir /var/lib/wb-owner-socket && mount --bind /run/workbench-hub /var/lib/wb-owner-socket")
+          owner("wbctl --hub /var/lib/wb-owner-socket/hub.sock sessions")
+          wb.succeed("test ! -e /run/secrets")
 
           # PTYs still run as the owner even with agentUser enabled.
           r = wbctl("pty-open iso_owner --spawn --send 'echo OWNER=$(id -u)' --expect 'OWNER=[0-9]+'", retry=True)
@@ -574,6 +575,9 @@ in
               "agent": "probe", "cwd": repo, "worktree": {"branch": branch, "base": "chosen-base"}}}
           owner(f"wbctl --hub {HUB_SOCK} raw {shlex.quote(json.dumps(req))}")
           wb.wait_until_succeeds(f"grep -Eq '\"e\"[[:space:]]*:[[:space:]]*\"session\"' {ACP_DIR}/{sid}.jsonl", timeout=30)
+          # The unit already exists. A host secrets provider creates a public canary *now*.
+          wb.succeed("install -d -m 0755 /run/secrets && echo mount-canary >/run/secrets/worker-probe && chmod 0444 /run/secrets/worker-probe")
+          assert wb.succeed("runuser -u wb-agent -- cat /run/secrets/worker-probe").strip() == "mount-canary"
           report = json.loads(wbctl(f"acp-attach {sid} --prompt inspect")["text"])
           assert (report["uid"], report["home"], report["sid"]) == (worker_uid, "/var/lib/wb-agent", sid), report
           assert report["ownerFile"] == errno.EACCES and report["socket"] == errno.EACCES, report
@@ -601,5 +605,51 @@ in
           instance = live_instance(crash)
           wb.succeed("systemctl kill --kill-whom=main --signal=SIGKILL workbench-hub.service")
           wait_reaped(instance)
+
+          # A holder outside the unit can half-close the adapter's transferred
+          # stdout and keep it open indefinitely. Freeze only PID 1 from the
+          # host so the actor must distinguish that EOF from actual teardown.
+          def wait_relay():
+              proxy.wait_until_succeeds("curl -fsS -o /dev/null http://wb.test/api/sessions", timeout=30)
+
+          wait_relay()
+          half = json.loads(wbctl(f"acp-new iso_half --agent probe --cwd {repo} --prompt inspect")["text"])
+          instance = live_instance(half)
+          unit, cg, pid, stray = instance
+          wb.succeed("systemd-run --unit=worker-output-holder --property=User=wb-agent --property=RuntimeDirectory=worker-output-holder /run/current-system/sw/bin/python3 -I ${../tests/worker_probe.py} --hold-output")
+          wb.wait_until_succeeds("test -e /run/worker-output-holder/ready", timeout=30)
+          wbctl("acp-attach iso_half --prompt lend-output")
+          wb.succeed(f"systemctl kill --kill-whom=main --signal=SIGSTOP {unit}")
+          wb.succeed("systemctl kill --kill-whom=main --signal=SIGUSR1 worker-output-holder")
+          # The EOF went all the way through the hub and back to adapter stdin.
+          wb.wait_until_succeeds(f"test -e /run/worker-output-holder/half-closed && test -f {shlex.quote(half['cwd'])}/.probe-stdin-eof", timeout=30)
+          refused = wbctl_any("acp-revive iso_half")
+          assert not refused["ok"] and any(e.get("code") == "not_revivable" for e in refused["errors"]), refused
+          wb.succeed(f"kill -0 {pid} && kill -0 {stray} && grep -Fxq 'populated 1' {cg}/cgroup.events")
+
+          # A fresh hub has no live actor, but it may not grant a second
+          # adapter until the kernel says the recorded unit is empty.
+          old = wb.succeed("systemctl show -p InvocationID --value workbench-hub").strip()
+          wb.succeed("systemctl kill --kill-whom=main --signal=SIGKILL workbench-hub.service")
+          wb.wait_until_succeeds(f"test $(systemctl show -p InvocationID --value workbench-hub) != {old} && wbctl --hub {HUB_SOCK} sessions", timeout=30)
+          wait_relay()
+          refused = wbctl_any("acp-revive iso_half")
+          assert not refused["ok"] and "previous worker unit still populated" in json.dumps(refused), refused
+          # Simulate a persisted pre-receipt session. Its unit cannot be
+          # attributed to a sid, so even this revive must wait for a drain.
+          wb.succeed(f"rm {ACP_DIR}/iso_half.worker-unit")
+          refused = wbctl_any("acp-revive iso_half")
+          assert not refused["ok"] and "drain worker units" in json.dumps(refused), refused
+          def spawns():
+              return [e for e in map(json.loads, wb.succeed(f"cat {ACP_DIR}/iso_half.jsonl").splitlines()) if e["e"] == "spawn"]
+          assert len(spawns()) == 1
+          wb.succeed(f"systemctl kill --kill-whom=main --signal=SIGCONT {unit}")
+          wait_reaped(instance)
+          # The other service still has the ACP descriptor; it isn't a witness.
+          wb.succeed("systemctl is-active --quiet worker-output-holder")
+          wbctl("acp-revive iso_half", retry=True)
+          assert len(spawns()) == 2
+          wbctl("acp-kill iso_half")
+          wb.succeed("systemctl stop worker-output-holder")
     '';
 }

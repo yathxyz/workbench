@@ -107,6 +107,7 @@ directories read-only. These are guard-rails, not a sandbox: a card can do what 
 
 Set `services.workbench.agentUser = "wb-agent";` and restart `workbench-hub` at a session boundary: a deploy intentionally does not restart it.
 The default is `null`. With it set, the module creates a system user with a private home at `/var/lib/wb-agent`.
+When upgrading a host already using worker sessions, drain its old `workbench-worker@` instances first: older hubs did not record which service owned each checkout.
 Every new local ACP session starts in a separate clone of the requested Git checkout; terminals and SSH launches still run as before.
 Give the worker its own provider login and Git author identity, not access to the owner's home, credential sockets or `.git`.
 Configure adapters at paths the worker can execute, for example with `services.workbench.agents.<name>.package`.
@@ -114,18 +115,25 @@ Configure adapters at paths the worker can execute, for example with `services.w
 Pass `"worktree": {"branch": "feature/x", "base": "main"}` in the session's spawn request to name the branch and its starting revision.
 Without it, the base is the requested checkout's `HEAD` and the branch is `workbench/<sid>-<createdAt>`.
 Only committed history is copied, not the owner's dirty files or repository configuration.
-Creation reserves a new branch in the owner's repository; choose a fresh name even when retrying a failed transfer.
+Use a standalone owner clone with a private directory (mode `0700`) at or above its root.
+The transfer refuses linked or nested repositories, shared or redirected Git metadata, and local config outside a small set of clone, tracking and author settings; use a clean owner clone if your usual checkout needs includes, hooks or helpers.
+Shallow sources are refused before the hub reserves a branch.
+If seeding fails, the hub releases its reservation only if the branch is still at the original commit and not checked out.
 To import the session's commits, run this as the hub user **before forgetting the session**:
 
 ```sh
 wb-hub --config /etc/workbench/hub.json fetch-worker SID
 ```
 
-This fast-forwards the recorded branch without checking it out; it must still exist and must not be checked out in any owner worktree.
+The hub validates the full pack and its advertised commit in an empty quarantine before fast-forwarding the recorded branch.
+That branch must still exist and must not be checked out in an owner worktree.
 Review the changes before merging or running them.
 Do not fetch directly from the worker's directory or add it to `safe.directory`.
 Workbench does not recursively remove a worker clone: it may contain uncommitted work or other refs.
 After import, remove the clone as the worker and retry **Remove worktree** to clear its record.
-Worker sessions share a uid and home, not an isolation boundary from one another.
-Worker processes cannot use the owner's `wb`, editor or SSH-agent sockets; configure a separate integration if the host needs one.
+This protects the owner from agents, not agents from each other: every session runs as the same worker and can modify another session's checkout, including during its creation.
+The worker cannot see the owner's home or host `/run/secrets` and `/run/credentials`, even if those trees appear after launch.
+World-readable owner files outside the hidden trees remain readable.
+The worker shares the host network namespace: host abstract Unix sockets remain connectable and have no filesystem permissions to protect them.
+Keep owner integrations on pathname sockets in private directories, not abstract sockets.
 The module does not grant trusted Nix access; decide separately whether the worker should be allowed to submit builds to the host's Nix daemon.

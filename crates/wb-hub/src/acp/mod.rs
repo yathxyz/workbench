@@ -11,6 +11,7 @@ mod journal;
 mod lines;
 mod replay;
 mod rpc;
+mod worker_unit;
 mod worktree;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -105,7 +106,7 @@ const HISTORY: [&str; 6] = [
     "plan",
 ];
 /// The files of a session, by extension.
-const FILES: [&str; 4] = ["json", "jsonl", "stderr.log", "stderr.log.1"];
+const FILES: [&str; 5] = ["json", "jsonl", "stderr.log", "stderr.log.1", "worker-unit"];
 const JOURNAL_FAILED: &str = "the journal could not be written";
 const NOT_RUNNING: &str = "the agent is not running";
 const ENQUEUE_FAILED: &str = "could not queue input for the agent";
@@ -1009,13 +1010,14 @@ impl Acp {
             let rpc_at = self.rpc_deadline();
             let stage_at = self.stage.and_then(|(_, at)| at);
             let (info_at, meta_at, probe_at) = (self.info_at, self.meta_at, self.probe_at);
-            let (out, watch, drain_until) = match &mut self.proc {
+            let (out, watch, unit, drain_until) = match &mut self.proc {
                 Some(p) => (
                     (!p.eof).then_some(&mut p.agent.stdout),
                     p.agent.watch.as_mut().filter(|_| p.status.is_none()),
+                    p.agent.unit.as_ref().filter(|_| p.status.is_none()),
                     p.drain_until,
                 ),
-                None => (None, None, None),
+                None => (None, None, None, None),
             };
             let event = tokio::select! {
                 cmd = rx.recv() => Event::Cmd(cmd),
@@ -1023,6 +1025,7 @@ impl Acp {
                 Some(r) = self.replayed_rx.recv() => Event::Replayed(r),
                 out = recv(out) => Event::Out(out),
                 st = child::wait(watch) => Event::Exited(st),
+                () = worker_unit::Unit::wait(unit) => Event::Exited(Ok(WaitNotice::Exited(None, None))),
                 () = sleep_until(drain_until) => Event::Drained,
                 () = sleep_until(setup_at) => Event::SetupIdle,
                 () = sleep_until(rpc_at) => Event::RpcTimeout,
@@ -1392,16 +1395,7 @@ impl Acp {
             None => match self.ctx.cfg.agents.get(&meta.agent) {
                 Some(cfg) => match &self.ctx.cfg.agent_worker {
                     Some(worker) => {
-                        agent::start_worker(
-                            &self.ctx,
-                            worker,
-                            sid,
-                            &meta.agent,
-                            cfg,
-                            &meta.cwd,
-                            log,
-                        )
-                        .await
+                        agent::start_worker(&self.ctx, worker, sid, meta, cfg, via, log).await
                     }
                     None => agent::start(&self.ctx, sid, &cfg.argv, &cfg.env, &meta.cwd, log),
                 },
@@ -3230,10 +3224,6 @@ impl Acp {
     fn stdout_closed(&mut self) {
         let Some(p) = &mut self.proc else { return };
         p.eof = true;
-        // A worker isn't our child. Socket EOF is its only exit notification.
-        if p.agent.watch.is_none() {
-            p.status = Some((None, None));
-        }
         if p.status.is_some() {
             self.finalise();
         } else {
@@ -3282,7 +3272,7 @@ impl Acp {
         if p.status.is_some() {
             self.finalise();
         } else {
-            warn!("the agent closed stdout but did not exit; killing its process group");
+            warn!("the agent closed stdout but did not exit; forcing teardown");
             p.agent.signal(Signal::KILL);
         }
     }

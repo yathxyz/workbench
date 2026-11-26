@@ -1,5 +1,6 @@
 """Header framing, allowlists and fd-based cwd confinement for the worker launcher."""
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import socket
@@ -33,6 +34,28 @@ class Framing(unittest.TestCase):
                         worker.read_header(b)
 
 
+class Admission(unittest.TestCase):
+    def test_grant_precedes_fork_without_consuming_acp(self):
+        hub, launcher = socket.socketpair()
+        with hub, launcher, ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(worker.authorize_agent, launcher)
+            hello = worker.read_header(hub)
+            self.assertEqual(set(hello), {"cgroup"})
+            self.assertFalse(pending.done())
+            hub.sendall(b"+ACP\n")
+            pending.result(timeout=3)
+            self.assertEqual(launcher.recv(4), b"ACP\n")
+
+    def test_denied_grant_never_forks(self):
+        hub, launcher = socket.socketpair()
+        with hub, launcher, patch.object(os, "fork") as fork:
+            hub.sendall(b'{"op":"admit-agent"}\n-')
+            worker.serve({}, launcher)
+            self.assertIn("cgroup", worker.read_header(hub))
+            self.assertEqual(worker.read_header(hub), {"error": "agent launch not authorized"})
+            fork.assert_not_called()
+
+
 class AgentCommand(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -49,7 +72,7 @@ class AgentCommand(unittest.TestCase):
             "agents": {"stub": {"argv": [sys.executable, "-I"], "env": {"LANG": "C.UTF-8"}}},
         }
         self.header = {
-            "op": "agent", "agent": "stub", "cwd": str(self.cwd), "sid": "s",
+            "op": "admit-agent", "agent": "stub", "cwd": str(self.cwd), "sid": "s",
             "env": ["PATH", "LANG", "USER", "HOME", "LOGNAME", "SHELL", "WB_SESSION"],
         }
         env = patch.dict(os.environ, {"HOME": "/var/lib/worker", "USER": "worker", "LOGNAME": "worker",

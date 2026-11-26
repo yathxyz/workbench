@@ -937,10 +937,13 @@ in
         # Pin the home, whose parent is root-owned. Never resolve the worker-writable
         # child "work" as root; the launcher and checkout code open it without following links.
         ReadWritePaths = [ workerHome ];
-        InaccessiblePaths = [
-          "-${home}"
-          "-/run/secrets"
-          "-/run/credentials"
+        InaccessiblePaths = [ "-${home}" ];
+        # Mask the parent, not today's secret directories or symlink targets:
+        # credential providers can create or replace either after this instance starts.
+        TemporaryFileSystem = [ "/run:ro" ];
+        BindReadOnlyPaths = [
+          "/run/current-system"
+          "-/etc/resolv.conf"
         ];
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
@@ -1038,6 +1041,9 @@ in
         # Boards, notes, state and /api/mv; the read-only paths below take precedence inside it.
         ReadWritePaths = [ home ];
         ReadOnlyPaths = readOnlyUserPaths;
+        # Metadata for worker sessions comes from the hub, never from the
+        # worker's filesystem, including PTY cwd aliases into that home.
+        InaccessiblePaths = lib.optional workerEnabled workerHome;
         BindPaths = pinnedUserPaths;
         PrivateDevices = true;
         ProtectClock = true;

@@ -49,7 +49,7 @@ def read_header(sock):
 
 
 def agent_command(cfg, header):
-    if header.keys() != {"op", "agent", "sid", "cwd", "env"} or header["op"] != "agent":
+    if header.keys() != {"op", "agent", "sid", "cwd", "env"} or header["op"] != "admit-agent":
         raise ValueError("invalid agent header fields")
     name, sid, cwd, names = (header[k] for k in ("agent", "sid", "cwd", "env"))
     if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9-]{1,32}", name) or name not in cfg["agents"]:
@@ -97,12 +97,30 @@ def reply(sock, obj):
     sock.sendall(json.dumps(obj).encode("ascii") + b"\n")
 
 
+def authorize_agent(sock):
+    # Only PID 1 holds the service connection at this point. Don't fork, or give
+    # an adapter any copy of the socket, until the hub has recorded our unit.
+    group = next((line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines()
+                  if line.startswith("0::")), "")
+    reply(sock, {"cgroup": group})
+    sock.settimeout(15)
+    try:
+        grant = sock.recv(1)
+        if not grant:
+            return False  # The hub refused admission or died before giving it.
+        if grant != b"+":
+            raise ValueError("agent launch not authorized")
+        return True
+    finally:
+        sock.setblocking(True)
+
+
 def run_child(cfg, header, sock):
     op = header.get("op")
     if op in ("create", "export", "remove"):
         worker_checkout.handle(cfg, header, sock)
         return
-    if op != "agent":
+    if op != "admit-agent":
         raise ValueError("unknown worker operation")
     try:
         argv, env, cwd = agent_command(cfg, header)
@@ -122,6 +140,8 @@ def run_child(cfg, header, sock):
 def serve(cfg, sock):
     try:
         header = read_header(sock)
+        if header.get("op") == "admit-agent" and not authorize_agent(sock):
+            return
     except (ValueError, OSError, RecursionError) as e:
         reply(sock, {"error": str(e)[:512]})
         return

@@ -296,7 +296,8 @@ The error codes are a closed set:
 - Snapshots and watch events publish live and restored summaries unchanged, including the full option list, whenever they fit in a single-summary page with the longest request ID.
   Only on overflow does the hub shorten the wire summary; it leaves the journal and session records unchanged.
 - **`Summary.acp.managedWorktree`** is present only for a recorded worktree: `{path, branch, mainRoot}`, with both paths absolute.
-  This record is independent of the web's best-effort top-level git metadata (`repo`, `worktree`, `branch`).
+  For owner sessions this record is independent of the web's best-effort top-level Git metadata (`repo`, `worktree`, `branch`).
+  `Summary.acp.workerClone` reports whether the session runs in a worker clone, even after `managedWorktree` has been removed.
 - **`Summary.acp.policy`:** the session's non-empty `Policy` (§3.4.5), omitted when none. It is a hub fact, not an agent config option. Optional rule `programs` is an ordinary policy field, preserved along with roots and command regexes through validation, installation, journaling and replay.
 - **Incarnation:** a sid can be forgotten and recreated, and `createdAt` distinguishes the incarnations.
   - It is persisted in `<kind>/<sid>.json` and survives hub restarts, revive and PTY respawn.
@@ -416,13 +417,19 @@ Otherwise, when a request fails several checks, the first in this list applies:
 - **Separate local agent identity (§3.7.2).** Every new local session, with or without `worktree`, takes its starting history from a Git checkout and runs in a worker-owned clone.
   The requested `base` defaults to that checkout's `HEAD`; the requested branch must be new and defaults to `workbench/<sid>-<createdAt>`.
   The clone has its own objects and refs, not a gitfile pointing into the owner's `.git`; the owner does not grant the worker filesystem access to the source.
+  The source must be a standalone owner checkout with a private ancestor (or private root), no untrusted writable path components and only owner-controlled ordinary files and directories in `.git`.
+  The hub rejects linked or nested repositories, redirected object stores, local config includes, hook registrations and settings outside the basic repository, remote/tracking and author fields it accepts.
+  It checks local config without expanding includes before running Git in the repository; system and global config are disabled for the transfer.
   `managedWorktree` records the worker path, the owner's repository and the import branch.
-  The hub's private metadata also records that this is a worker clone: changing the local agent identity cannot revive an old worker session as the owner or silently convert an owner session.
+  The persisted `workerClone` flag survives worktree removal and identity changes; the web front takes worker repository and branch metadata only from the hub's record, never by reading the recorded `cwd`.
+  Changing the local agent identity cannot revive an old worker session as the owner or silently convert an owner session.
   As the hub user, `wb-hub --config /etc/workbench/hub.json fetch-worker SID` imports the session branch before the record is forgotten.
   Only bundle bytes cross the socket: the exporting Git runs as the repository's owner on each side, so the hub never starts Git in the worker's clone, reads its config as instructions, runs its hooks, or needs a `safe.directory` exception.
+  The owner validates the full pack in quarantine, requires the advertised tip to be a commit in that pack and verifies ancestry before publishing any objects or changing the branch.
   Import does not check out a tree, update tags, force a branch backward or merge it for the owner.
   Transfers carry one full branch bundle (at most 2 GiB) and time out after 120 seconds.
-  Once reserved, the owner's branch survives a failed or interrupted transfer; an incomplete clone may need manual cleanup.
+  A shallow source is refused before reserving a branch.
+  A failed or cancelled seed removes the reservation only if the branch is still at its original commit and not checked out; an incomplete clone may need manual cleanup.
   The hub never recursively removes a worker clone: import the commits to keep and remove the clone as the worker before retrying `acp.remove_worktree`.
   Committed code is still untrusted; review imported changes before running them.
 - **`task`** is a free-text reference (F-A51): reject Unicode control characters, line and paragraph separators (U+2028 and U+2029), and bidirectional controls (U+061C, U+200E, U+200F, U+202A–U+202E and U+2066–U+2069) anywhere in the input.
@@ -568,6 +575,7 @@ last-created                              decimal high-water mark for allocated 
 pty/<sid>.json                            {sid, shell (name), argv (argv[0] = the resolved shell path), cwd, env (client-supplied only), createdAt, cols, rows, exit|null}
 pty/<sid>.snap                            last VT snapshot (on exit, on SIGTERM, every 30 s while dirty)
 acp/<sid>.json                            {sid, agent, cwd, createdAt, agentSessionId|null, init|null, seenSeq, managedWorktree?}
+acp/<sid>.worker-unit                     owner-only worker admission receipt: cgroup and inode
 acp/<sid>.jsonl                           journal (§3.4.4)
 acp/<sid>.stderr.log[.1]                  agent stderr, rotated at 1 MiB (one generation kept)
 <kind>/<sid>.quarantine-<ms>.<ext>        files of a session that failed to load (kept for inspection, never loaded)
@@ -1217,12 +1225,19 @@ Only after the floor passes can a request get 404 (unknown upgrade path; only `/
   The hub connects to a Unix socket owned by the hub user, mode `0600`; systemd accepts one connection per `workbench-worker@.service` instance.
   For an agent connection the hub sends one bounded JSON line with the configured agent name, checkout path, session id and environment **names**; it never sends an executable, shell command or environment values.
   The worker launcher validates and pins the checkout below its root, selects argv and non-secret environment from the module configuration, and sets the identity variables from the worker account.
-  After one launcher acknowledgement the remaining stream carries ACP stdin and stdout; agent stderr goes to the service journal.
+  Before forking the agent, the supervisor identifies its systemd service cgroup to the hub and waits for admission.
+  The hub durably records that identity before granting the launch; teardown is complete only when the kernel reports that cgroup empty or gone, not when the adapter half-closes its ACP output.
+  Revive checks the previous admission even after a hub restart.
+  After admission and launch acknowledgement, the remaining stream carries ACP stdin and stdout; agent stderr goes to the service journal.
   The reported agent PID is local to the unit's PID namespace; the hub neither signals it nor infers an exit status from EOF.
   The launcher monitors the peer independently of the adapter; disconnect, including a hub crash, ends the service and its descendants without a cross-user signal from the hub.
-  The worker home and checkouts are writable, the system is read-only, `/home`, `/run/secrets` and `/run/credentials` are inaccessible, and temporary files are private to the unit.
+  The worker home and checkouts are writable, the system is read-only, the owner's home is hidden, and temporary files are private to the unit.
+  A private read-only `/run` exposes the system profile and permits name resolution but not host secrets or credentials, including trees created or replaced after launch.
+  World-readable owner files outside the hidden trees remain readable.
   The worker has no additional groups, capabilities or trusted Nix privileges.
-  This separates the worker from the owner, not one worker session from another or the worker from the network.
+  It shares the host network namespace: host abstract Unix sockets remain connectable without filesystem permission checks.
+  All worker sessions share one UID and can interfere with each other's checkouts, including replacing a directory between `mkdir` and `open` during creation.
+  This boundary protects the owner from agents, not agents from each other.
   Owner terminals and remote (SSH) ACP commands keep their original identity, environment and launch path.
 - **Test configs:** take the shell path from `$BASH`, because the sandbox has no `/run/current-system`. The harness also configures `sh` as a second shell (§7, N-6).
 
@@ -1435,7 +1450,13 @@ Agents determines observed attach eligibility from the registry's validated `att
 
 Texts are excerpts: cut to `OBS_TEXT_MAX` (a tail line to 240 bytes) at a character boundary, with `…`. A tool's `input` is the first present of `command`, `file_path`, `path`, `pattern`, `url`, `description` of the tool input, else its compact JSON.
 
-**Repository derivation (normative).** A reporter MUST derive these facts from the session's files on its host, without executing `git`. `wb-web` MUST derive the same facts for a hub agent or shell session only when its `host` equals wb-web's configured host; it MUST NOT inspect a local path on behalf of another host. Hub summaries exposed by wb-web, including `/rpc`, carry the four nullable fields without extending the hub protocol. For a hub-only session, first find `projectRoot`, the nearest directory at or above its absolute cwd holding `.git`; its existing project fallback remains available when derivation fails.
+**Repository derivation (normative).**
+A reporter derives these facts from the session's files on its host, without executing `git`.
+`wb-web` must not inspect a local path on behalf of another host.
+For a local worker session, or an ACP summary from a hub that does not report `workerClone`, the web front uses only recorded metadata, never filesystem discovery or cached results for that `cwd`.
+For local owner sessions, `wb-web` derives the same facts as a reporter using the rules below.
+Hub summaries exposed by wb-web, including `/rpc`, carry the four nullable repository fields.
+For a hub-only owner session, first find `projectRoot`, the nearest directory at or above its absolute cwd holding `.git`; its existing project fallback remains available when derivation fails.
 
 1. When `projectRoot/.git` is a directory, that is the git directory and `projectRoot` is the repository root.
 2. Otherwise `.git` MUST be a file containing `gitdir: PATH`. Resolve a relative PATH against `projectRoot` to obtain the worktree's git directory. Its `commondir` file, when present, names the common git directory (relative to the worktree's git directory); without that file, use the worktree's git directory itself. If the common directory is named `.git`, the repository root is its parent; otherwise the common directory itself is the repository root (a bare repository). Resolve relative path components before comparing roots.

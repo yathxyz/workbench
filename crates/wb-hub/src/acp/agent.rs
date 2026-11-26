@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 use wb_proto::limits::{MAX_LINE, PROMPT_MAX};
 
 use super::lines::{Read, read_line_capped};
+use super::worker_unit::Unit;
 use crate::child::{self, ExitWatch};
 use crate::config::{AgentConfig, AgentWorker, ChildConfig, HostConfig};
 use crate::env::Identity;
@@ -60,6 +61,7 @@ pub enum Out {
 pub struct Agent {
     pid: u32,
     pub watch: Option<ExitWatch>,
+    pub(super) unit: Option<Unit>,
     #[cfg(test)]
     pub(super) fail_exit_peek: bool,
     group: Option<Group>,
@@ -80,7 +82,7 @@ impl Agent {
     pub fn signal(&self, sig: Signal) {
         if let Some(group) = &self.group {
             group.signal(sig);
-        } else if self.watch.is_none() {
+        } else if self.unit.is_some() {
             // Dropping the socket write half forces RDHUP even if the writer is
             // blocked on a full socket. The worker's supervisor owns all signals.
             self.tasks[0].abort();
@@ -208,6 +210,7 @@ pub fn start(
     Ok(Agent {
         pid,
         watch: Some(watch),
+        unit: None,
         #[cfg(test)]
         fail_exit_peek: false,
         group: Some(group),
@@ -222,13 +225,13 @@ pub fn start(
 
 /// Worker mode sends names, never environment values or a command. The root-owned
 /// launcher constructs the worker's own environment from its configuration.
-pub async fn start_worker(
+pub(super) async fn start_worker(
     ctx: &Ctx,
     worker: &AgentWorker,
     sid: &str,
-    agent: &str,
+    meta: &super::Meta,
     cfg: &AgentConfig,
-    cwd: &str,
+    via: super::SpawnVia,
     log: PathBuf,
 ) -> Result<Agent, String> {
     let child = &ctx.cfg.child;
@@ -242,7 +245,8 @@ pub async fn start_worker(
         .chain(["HOME", "USER", "LOGNAME", "SHELL", "WB_SESSION"])
         .collect();
     let mut header = serde_json::to_vec(&serde_json::json!({
-        "op": "agent", "agent": agent, "sid": sid, "cwd": cwd, "env": names,
+        // An older, one-phase launcher must reject this op, never exec optimistically.
+        "op": "admit-agent", "agent": meta.agent, "sid": sid, "cwd": meta.cwd, "env": names,
     }))
     .map_err(|e| e.to_string())?;
     header.push(b'\n');
@@ -254,34 +258,44 @@ pub async fn start_worker(
         let (read, mut write) = socket.into_split();
         write.write_all(&header).await?;
         let mut read = BufReader::with_capacity(64 << 10, read);
-        let mut answer = Vec::new();
-        (&mut read)
-            .take(WORKER_HEADER_MAX as u64)
-            .read_until(b'\n', &mut answer)
-            .await?;
-        if answer.last() != Some(&b'\n') {
-            return Err(io::Error::other("missing or oversized worker reply"));
-        }
-        let reply: Value = serde_json::from_slice(&answer)?;
-        if let Some(error) = reply["error"].as_str() {
-            return Err(io::Error::other(error.to_owned()));
-        }
+        let hello = worker_reply(&mut read).await?;
+        let group = hello["cgroup"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("missing worker lifetime witness"))?
+            .to_owned();
+        Ok::<_, io::Error>((group, write, read))
+    };
+    let err = |e: io::Error| format!("starting worker agent: {e}");
+    let timeout = Duration::from_secs(15);
+    let (group, mut write, mut read) = tokio::time::timeout(timeout, connect)
+        .await
+        .map_err(|_| "worker handshake timed out")?
+        .map_err(err)?;
+    // Never time out a detached write of the receipt: a late rename must not
+    // replace a newer launch's identity after the actor processes another open.
+    let unit = Unit::reserve(&ctx.acp_dir, sid, group, via == super::SpawnVia::Revive)
+        .await
+        .map_err(err)?;
+    let launch = async {
+        write.write_all(b"+").await?;
+        let reply = worker_reply(&mut read).await?;
         let pid = reply["pid"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
             .filter(|&n| n > 1)
             .ok_or_else(|| io::Error::other("invalid worker reply"))?;
-        Ok((pid, write, read))
+        Ok::<_, io::Error>(pid)
     };
-    let (pid, write, read) = tokio::time::timeout(Duration::from_secs(15), connect)
+    let pid = tokio::time::timeout(timeout, launch)
         .await
-        .map_err(|_| "worker handshake timed out")?
-        .map_err(|e| format!("starting worker agent: {e}"))?;
+        .map_err(|_| "worker launch timed out")?
+        .map_err(err)?;
     let log = Log::open(log);
     let (stdin, stdout, tasks) = streams(write, read, &log);
     Ok(Agent {
         pid,
         watch: None,
+        unit: Some(unit),
         #[cfg(test)]
         fail_exit_peek: false,
         group: None,
@@ -292,6 +306,21 @@ pub async fn start_worker(
         stderr: None,
         tasks,
     })
+}
+
+async fn worker_reply(read: &mut (impl AsyncBufRead + Unpin)) -> io::Result<Value> {
+    let mut answer = Vec::new();
+    read.take(WORKER_HEADER_MAX as u64)
+        .read_until(b'\n', &mut answer)
+        .await?;
+    if answer.last() != Some(&b'\n') {
+        return Err(io::Error::other("missing or oversized worker reply"));
+    }
+    let reply: Value = serde_json::from_slice(&answer)?;
+    if let Some(error) = reply["error"].as_str() {
+        return Err(io::Error::other(error.to_owned()));
+    }
+    Ok(reply)
 }
 
 fn streams(
